@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hermit-util",
+    "crates/hermit-keyframes",
+    # crates are added here as each PortJob's SCAFFOLD stage lands them.
+    # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
+    #   Wave 0: hermit-util, hermit-keyframes
+    #   Wave 1: hermit-model
+    #   Wave 2: hermit-common, hermit-naming, hermit-networking, hermit-health
+    #   Wave 3: hermit-db          Wave 4: hermit-traits
+    #   Wave 5: hermit-mediaencoding, hermit-hls, hermit-drawing, hermit-providers, hermit-livetv(stub)
+    #   Wave 6: hermit-core        Wave 7: hermit-api        Wave 8: apps/hermit-server
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"          # matches the GPL-3.0-only package metadata on the Jellyfin crates being ported
+publish = false
+repository = "https://github.com/kensmith/hermit"   # placeholder
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# product names in docs (SQLite, ffmpeg, DLNA, …) trip doc_markdown — allow it
+doc_markdown = "allow"
+
+[workspace.dependencies]
+# ── intra-workspace (path deps added as crates land) ───────────────
+hermit-util = { path = "crates/hermit-util" }
+
+# ── http / async ───────────────────────────────────────────────────
+axum = "0.8"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tokio = { version = "1", features = ["full"] }
+
+# ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"] }
+
+# ── serde / errors ─────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+
+# ── observability / net ────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# ── openapi ────────────────────────────────────────────────────────
+utoipa = "5"
+
+# ── domain helpers ─────────────────────────────────────────────────
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+argon2 = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+config = "0.15"
+clap = { version = "4.5", features = ["derive"] }
+bitflags = "2"
+regex = "1"
+fancy-regex = "0.14"    # for C# regexes that use lookaround
+
+# ── dev / test ─────────────────────────────────────────────────────
+rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration
+insta = { version = "1", features = ["json"] }   # golden-file parity snapshots

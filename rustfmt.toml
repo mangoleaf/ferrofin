@@ -1,0 +1,3 @@
+edition = "2024"
+# ponytail: group_imports/imports_granularity are nightly-only and would just warn
+# on the pinned stable toolchain — omitted until/unless we move to nightly rustfmt.

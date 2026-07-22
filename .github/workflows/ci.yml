@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      # 80% line-coverage gate. Applied per-ported-crate via the allowlist until
+      # every crate is ported, then flip to `--workspace`. See brain/PLAN_HERMIT_PORT.md.
+      # ffmpeg is only needed by integration tests in later waves; unit/parity tests avoid it.
+      - name: coverage gate (ported crates)
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkgs=()
+          while read -r crate; do
+            [ -z "$crate" ] && continue
+            case "$crate" in \#*) continue ;; esac
+            pkgs+=(-p "$crate")
+          done < .port/gated-crates.txt
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "no crates gated yet — skipping"; exit 0
+          fi
+          # line coverage only — branch coverage (-Z coverage-options=branch) is nightly-only; we pin stable
+          cargo llvm-cov nextest --fail-under-lines 80 "${pkgs[@]}"

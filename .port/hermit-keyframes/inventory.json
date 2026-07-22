@@ -1,0 +1,131 @@
+{
+  "crate": "hermit-keyframes",
+  "source_project": "/home/mango/dev/3rdparty/jellyfin/src/Jellyfin.MediaEncoding.Keyframes",
+  "test_project": "/home/mango/dev/3rdparty/jellyfin/tests/Jellyfin.MediaEncoding.Keyframes.Tests",
+  "summary": "Small library: a KeyframeData record plus three keyframe extractors (FfProbe, FfTool-stub, Matroska). Port KeyframeData + the FfProbe extractor faithfully (the FfProbe tests are the parity oracle). The Matroska extractor depends on the C# NEbml package's random-access EbmlReader (ReadAt/EnterContainer/LeaveContainer over absolute stream positions); no Rust EBML crate offers the same seek-based cursor idiomatically, so it is DEFERRED for Wave 0.",
+  "portable_types": [
+    {
+      "name": "KeyframeData",
+      "cs_file": "KeyframeData.cs",
+      "kind": "data-struct",
+      "note": "Public class: `long TotalDuration` (ticks) + `IReadOnlyList<long> KeyframeTicks`. Port as a plain Rust struct with pub fields `total_duration: i64` and `keyframe_ticks: Vec<i64>` (or `Box<[i64]>`). Add `#[derive(Serialize, Deserialize)]` with PascalCase field renames (`TotalDuration`, `KeyframeTicks`) so it round-trips the *_result.json parity fixtures via serde_json. C# ctor arg order is (totalDuration, keyframeTicks)."
+    },
+    {
+      "name": "FfProbeKeyframeExtractor",
+      "cs_file": "FfProbe/FfProbeKeyframeExtractor.cs",
+      "kind": "static-extractor",
+      "note": "Two functions. (1) `GetKeyframeData(ffProbePath, filePath)` spawns the ffprobe process with the exact arg string and pipes stdout into ParseStream — port as a function that runs std::process::Command and feeds the reader to parse. (2) `ParseStream(reader)` is the CORE PORTABLE LOGIC and the test target: read CSV lines; on `packet,<ptsTime>,<flags>` lines whose flags start with `K_`, parse ptsTime as invariant-culture f64 and push `(pts * 10_000_000).round-to-i64` ticks (TicksPerSecond = 10_000_000); on `stream,<dur>` set streamDuration if it parses as f64; on `format,<dur>` set formatDuration. Non-parseable values (e.g. `stream,N/A`) are ignored. Final duration = streamDuration if >0 else formatDuration; TotalDuration = (duration_seconds * 10_000_000) as ticks via TimeSpan.FromSeconds(d).Ticks. IMPORTANT precision notes: keyframe conversion uses Convert.ToInt64(keyframe * 10_000_000) which is banker's/round-half-to-even on the raw double — must match to pass parity; duration goes through TimeSpan.FromSeconds which truncates to 100ns tick resolution. lineType comparisons are OrdinalIgnoreCase. Split on FIRST comma for type, then the rest split again on its first comma for packet time/flags."
+    }
+  ],
+  "deferred": [
+    {
+      "name": "FfToolKeyframeExtractor",
+      "reason": "C# body is `=> throw new NotImplementedException()`. No logic to port. Reproduce as a stub function returning an Err/unimplemented (or a `NotImplemented`-style error) to preserve the API surface; no tests exercise it."
+    },
+    {
+      "name": "MatroskaKeyframeExtractor",
+      "reason": "DEFERRED for Wave 0 per PortJob instructions. Reads MKV via the NEbml `EbmlReader`, which exposes a random-access cursor: ReadSeekHead (parse SeekHead for Info/Tracks/Cues absolute positions), ReadAt(position) to seek, EnterContainer/LeaveContainer, ReadUInt/ReadFloat/ReadBinary, FindElement by element id. Rust EBML crates (ebml-iterable/webm-iterable) are pull-iterators without the same ReadAt seek-by-offset semantics, and matroska/symphonia-format-mkv are metadata/demux layers that don't expose Cue CuePoint positions the same way. Porting requires either (a) a minimal custom EBML reader supporting vint id/size + absolute seek, or (b) wrapping a crate and re-deriving Cues positions. No test fixture / parity oracle exists for the Matroska path in this test project, so it is safe to defer. Depends on the DEFERRED helper types below."
+    },
+    {
+      "name": "MatroskaConstants",
+      "cs_file": "Matroska/MatroskaConstants.cs",
+      "reason": "EBML element-id constants (SegmentContainer, SeekHead, Seek, Info, TimestampScale, Duration, Tracks, TrackEntry, TrackNumber, TrackType, TrackTypeVideo=0x1, TrackTypeSubtitle=0x11, Cues, CueTime, CuePoint, CueTrackPositions, CuePointTrackNumber). Only meaningful together with the deferred Matroska extractor; port as `const u64`/enum when Matroska lands in Wave 5."
+    },
+    {
+      "name": "EbmlReaderExtensions",
+      "cs_file": "Matroska/Extensions/EbmlReaderExtensions.cs",
+      "reason": "Extension methods over NEbml's EbmlReader (FindElement, ReadUIntFromBinary, ReadSeekHead, ReadInfo, FindFirstTrackNumberByType). Tightly coupled to NEbml's API; ports only alongside the chosen Rust EBML strategy in Wave 5."
+    },
+    {
+      "name": "Info (Matroska.Models.Info)",
+      "cs_file": "Matroska/Models/Info.cs",
+      "reason": "Internal data holder: `long TimestampScale` (ns) + `double? Duration`. Trivial struct, but only used by the deferred Matroska extractor; defer with it."
+    },
+    {
+      "name": "SeekHead (Matroska.Models.SeekHead)",
+      "cs_file": "Matroska/Models/SeekHead.cs",
+      "reason": "Internal data holder: InfoPosition/TracksPosition/CuesPosition (i64 relative offsets). Only used by the deferred Matroska extractor; defer with it."
+    }
+  ],
+  "constants_of_note": [
+    {
+      "name": "TimeSpan.TicksPerSecond",
+      "value": 10000000,
+      "note": "1 tick = 100 ns. Load-bearing for both TotalDuration and per-keyframe tick conversion; NOT a candidate setting — it is a fixed .NET semantic the parity fixtures encode."
+    }
+  ],
+  "test_files": [
+    "tests/Jellyfin.MediaEncoding.Keyframes.Tests/FfProbe/FfProbeKeyframeExtractorTests.cs"
+  ],
+  "test_cases": {
+    "facts": 0,
+    "theories": 1,
+    "inline_data_rows": 2,
+    "total_cases": 2,
+    "detail": [
+      {
+        "method": "ParseStream_Valid_Success",
+        "kind": "Theory",
+        "rows": 2,
+        "cases": [
+          {
+            "input": "keyframes.txt",
+            "expected": "keyframes_result.json",
+            "asserts": "TotalDuration == 7063360000 (stream duration is 'N/A' -> falls back to format=706.336s); KeyframeTicks list equal.",
+            "exercises": "format-duration fallback path + K_ packet filtering + tick rounding"
+          },
+          {
+            "input": "keyframes_streamduration.txt",
+            "expected": "keyframes_streamduration_result.json",
+            "asserts": "TotalDuration == 1000000000 (stream=100 present -> prefers stream over format=101); KeyframeTicks list equal.",
+            "exercises": "stream-preferred-over-format duration path"
+          }
+        ]
+      }
+    ]
+  },
+  "test_data_fixtures": [
+    {
+      "file": "FfProbe/Test Data/keyframes.txt",
+      "role": "input",
+      "note": "16937 lines of ffprobe CSV output. Mostly `packet,<pts>,K_|__` lines, ending with `stream,N/A` and `format,706.336000`. Copy verbatim into the Rust crate's test fixtures."
+    },
+    {
+      "file": "FfProbe/Test Data/keyframes_result.json",
+      "role": "expected",
+      "note": "Golden JSON: {\"TotalDuration\":7063360000,\"KeyframeTicks\":[...]}. Deserialized into KeyframeData in C#; use as serde_json golden in Rust."
+    },
+    {
+      "file": "FfProbe/Test Data/keyframes_streamduration.txt",
+      "role": "input",
+      "note": "2398 lines. Same packet format, ends with `stream,100` and `format,101`."
+    },
+    {
+      "file": "FfProbe/Test Data/keyframes_streamduration_result.json",
+      "role": "expected",
+      "note": "Golden JSON: {\"TotalDuration\":1000000000,\"KeyframeTicks\":[...]}. 29 keyframes."
+    }
+  ],
+  "parity_oracle": "FfProbeKeyframeExtractorTests.ParseStream_Valid_Success (2 InlineData rows). Rust port should replicate as an rstest #[case]-parametrized test that reads each *.txt fixture through the ported ParseStream and asserts equality against the serde-deserialized *_result.json.",
+  "porting_plan_wave0": [
+    "Port KeyframeData struct with serde PascalCase rename to round-trip the golden JSON fixtures.",
+    "Port ParseStream(reader) — the CSV line parser — matching C# rounding (Convert.ToInt64 = round-half-to-even on the raw f64 * 1e7) and duration semantics (TimeSpan.FromSeconds tick truncation, stream-preferred-else-format).",
+    "Port GetKeyframeData(ffprobe_path, file_path) wrapping std::process::Command with the exact ffprobe arg string.",
+    "Stub FfTool + Matroska extractors (unimplemented) to keep API shape; mark Matroska as the Wave 5 follow-up.",
+    "Copy the 4 Test Data fixtures; write the 2-case rstest parity test."
+  ],
+  "real_deps": ["serde", "serde_json"],
+  "dev_deps": ["rstest"],
+  "needs_external_crate": [
+    "For the DEFERRED Matroska path (Wave 5): candidate Rust EBML/MKV crates surveyed — ebml-iterable / webm-iterable (low-level EBML iterator, closest to NEbml but no ReadAt seek), matroska (metadata parser), symphonia-format-mkv (demuxer). None is a drop-in for NEbml's random-access ReadAt cursor; a minimal custom EBML seek reader is likely required. Not needed for Wave 0."
+  ],
+  "behavioral_constants": [
+    "TicksPerSecond = 10_000_000 (1 tick = 100ns) — used for both TotalDuration and per-keyframe conversion.",
+    "Keyframe tick = round_half_to_even(pts_seconds * 10_000_000) as i64 (C# Convert.ToInt64 of a double).",
+    "TotalDuration = TimeSpan.FromSeconds(duration).Ticks — truncates to 100ns resolution.",
+    "duration = stream_duration if stream_duration > 0 else format_duration.",
+    "Only packets whose flags field starts with 'K_' are counted as keyframes.",
+    "Numeric parsing is InvariantCulture / AllowDecimalPoint; unparseable values (e.g. 'N/A') are silently skipped.",
+    "Line-type match is case-insensitive (OrdinalIgnoreCase); split on first comma for type, remainder split on its first comma for packet pts/flags."
+  ]
+}

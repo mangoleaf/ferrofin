@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+# per-crate PortJob artifacts (inventory/coverage/report JSON) — kept locally, not committed
+/.port/*/coverage.json
+# local media/data used for manual First-Light testing
+/data
+*.db
+*.db-shm
+*.db-wal
+# insta review leftovers
+*.snap.new
+
+brain/

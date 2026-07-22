@@ -1,0 +1,5 @@
+# Crates that have passed a PortJob and are under the 80% line-coverage CI gate.
+# One crate name per line. The INTEGRATE stage appends a crate here on success.
+# Flip CI to `--workspace` once every planned crate is listed.
+hermit-util
+hermit-keyframes
