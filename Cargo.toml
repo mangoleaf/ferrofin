@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/hermit-util",
     "crates/hermit-keyframes",
+    "crates/hermit-model",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
     #   Wave 0: hermit-util, hermit-keyframes
@@ -31,6 +32,7 @@ doc_markdown = "allow"
 [workspace.dependencies]
 # ── intra-workspace (path deps added as crates land) ───────────────
 hermit-util = { path = "crates/hermit-util" }
+hermit-model = { path = "crates/hermit-model" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"

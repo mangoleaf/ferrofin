@@ -3,3 +3,4 @@
 # Flip CI to `--workspace` once every planned crate is listed.
 hermit-util
 hermit-keyframes
+hermit-model
