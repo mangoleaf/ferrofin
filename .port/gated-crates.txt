@@ -8,3 +8,4 @@ hermit-common
 hermit-naming
 hermit-networking
 hermit-health
+hermit-db
