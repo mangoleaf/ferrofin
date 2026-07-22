@@ -10,6 +10,7 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+mod authentication_result;
 mod client_capabilities;
 mod general_command;
 mod message_command;
@@ -18,6 +19,7 @@ mod player_state_info;
 mod requests;
 mod transcoding_info;
 
+pub use authentication_result::AuthenticationResult;
 pub use client_capabilities::ClientCapabilities;
 pub use general_command::GeneralCommand;
 pub use message_command::MessageCommand;

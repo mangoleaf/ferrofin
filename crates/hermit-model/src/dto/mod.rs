@@ -27,6 +27,7 @@ mod playlist_dto;
 mod recommendation_dto;
 mod session_info_dto;
 mod trickplay_info_dto;
+mod user_dto;
 mod user_item_data_dto;
 
 pub use base_item::BaseItemDto;
@@ -42,6 +43,7 @@ pub use playlist_dto::PlaylistDto;
 pub use recommendation_dto::RecommendationDto;
 pub use session_info_dto::SessionInfoDto;
 pub use trickplay_info_dto::TrickplayInfoDto;
+pub use user_dto::UserDto;
 pub use user_item_data_dto::{UpdateUserItemDataDto, UserItemDataDto};
 
 /// The type of a media source.

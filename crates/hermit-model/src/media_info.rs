@@ -6,15 +6,20 @@
 //! `AudioIndexSource` / `LiveStreamRequest` structs.
 //!
 //! The `MediaInfo`, `LiveStreamResponse`, and `PlaybackInfoResponse` structs
-//! depend on `MediaSourceInfo` (and `BaseItemPerson`), which is ported in a
-//! later unit; they are deferred until that dependency lands.
+//! live here too, now that their `MediaSourceInfo` / `BaseItemPerson`
+//! dependencies have landed.
+
+use std::collections::HashMap;
 
 use bitflags::bitflags;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::entities_media::MediaStream;
+use crate::dlna::PlaybackErrorCode;
+use crate::dto::{BaseItemPerson, MediaSourceInfo};
+use crate::entities_media::{ChapterInfo, MediaStream};
 
 /// Enum `MediaProtocol` — how a media source is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
@@ -228,6 +233,111 @@ impl Default for LiveStreamRequest {
     }
 }
 
+/// Class `PlaybackInfoResponse` — the response to a playback-info request.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackInfoResponse {
+    /// Gets or sets the media sources.
+    pub media_sources: Vec<MediaSourceInfo>,
+    /// Gets or sets the play session identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub play_session_id: Option<String>,
+    /// Gets or sets the error code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<PlaybackErrorCode>,
+}
+
+/// Class `LiveStreamResponse` — the response to opening a live stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveStreamResponse {
+    /// Gets or sets the media source.
+    pub media_source: MediaSourceInfo,
+}
+
+impl LiveStreamResponse {
+    /// Initializes a new instance of the [`LiveStreamResponse`] struct.
+    #[must_use]
+    pub fn new(media_source: MediaSourceInfo) -> Self {
+        Self { media_source }
+    }
+}
+
+/// Class `MediaInfo` — a [`MediaSourceInfo`] enriched with item metadata.
+///
+/// Upstream this derives from `MediaSourceInfo`; here the base source is
+/// flattened so the wire shape (base fields alongside the extra metadata
+/// fields) is preserved.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaInfo {
+    /// The underlying media source (flattened onto this object).
+    #[serde(flatten)]
+    pub media_source: MediaSourceInfo,
+
+    /// Gets or sets the chapters.
+    pub chapters: Vec<ChapterInfo>,
+
+    /// Gets or sets the album.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+
+    /// Gets or sets the artists.
+    pub artists: Vec<String>,
+
+    /// Gets or sets the album artists.
+    pub album_artists: Vec<String>,
+
+    /// Gets or sets the studios.
+    pub studios: Vec<String>,
+
+    /// Gets or sets the genres.
+    pub genres: Vec<String>,
+
+    /// Gets or sets the show name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_name: Option<String>,
+
+    /// Gets or sets the forced sort name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forced_sort_name: Option<String>,
+
+    /// Gets or sets the index number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_number: Option<i32>,
+
+    /// Gets or sets the parent index number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_index_number: Option<i32>,
+
+    /// Gets or sets the production year.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+
+    /// Gets or sets the premiere date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "date-time")]
+    pub premiere_date: Option<DateTime<Utc>>,
+
+    /// Gets or sets the people.
+    pub people: Vec<BaseItemPerson>,
+
+    /// Gets or sets the provider ids.
+    pub provider_ids: HashMap<String, String>,
+
+    /// Gets or sets the official rating.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_rating: Option<String>,
+
+    /// Gets or sets the official rating description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_rating_description: Option<String>,
+
+    /// Gets or sets the overview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +451,63 @@ mod tests {
         assert_eq!(json["DirectPlayProtocols"], serde_json::json!(["Http"]));
         let back: LiveStreamRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn playback_info_response_field_names_and_round_trip() {
+        let resp = PlaybackInfoResponse {
+            media_sources: vec![MediaSourceInfo::default()],
+            play_session_id: Some("pss".to_owned()),
+            error_code: Some(PlaybackErrorCode::NoCompatibleStream),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("MediaSources").is_some());
+        assert_eq!(json["PlaySessionId"], "pss");
+        assert_eq!(json["ErrorCode"], "NoCompatibleStream");
+        let back: PlaybackInfoResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn playback_info_response_omits_optional_when_none() {
+        let json = serde_json::to_value(PlaybackInfoResponse::default()).unwrap();
+        assert!(json.get("PlaySessionId").is_none());
+        assert!(json.get("ErrorCode").is_none());
+        assert_eq!(json["MediaSources"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn live_stream_response_new_and_round_trip() {
+        let resp = LiveStreamResponse::new(MediaSourceInfo::default());
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("MediaSource").is_some());
+        let back: LiveStreamResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn media_info_field_names_and_round_trip() {
+        let info = MediaInfo {
+            album: Some("Album".to_owned()),
+            artists: vec!["Artist".to_owned()],
+            album_artists: vec!["AlbumArtist".to_owned()],
+            genres: vec!["Rock".to_owned()],
+            index_number: Some(3),
+            production_year: Some(1999),
+            overview: Some("An overview.".to_owned()),
+            ..MediaInfo::default()
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["Album"], "Album");
+        assert_eq!(json["Artists"], serde_json::json!(["Artist"]));
+        assert_eq!(json["AlbumArtists"], serde_json::json!(["AlbumArtist"]));
+        assert_eq!(json["Genres"], serde_json::json!(["Rock"]));
+        assert_eq!(json["IndexNumber"], 3);
+        assert_eq!(json["ProductionYear"], 1999);
+        assert_eq!(json["Overview"], "An overview.");
+        // Flattened base-source field is present at the top level.
+        assert!(json.get("Protocol").is_some());
+        let back: MediaInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info, back);
     }
 }
