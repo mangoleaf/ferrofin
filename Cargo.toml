@@ -4,6 +4,10 @@ members = [
     "crates/hermit-util",
     "crates/hermit-keyframes",
     "crates/hermit-model",
+    "crates/hermit-common",
+    "crates/hermit-naming",
+    "crates/hermit-networking",
+    "crates/hermit-health",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
     #   Wave 0: hermit-util, hermit-keyframes
@@ -33,6 +37,10 @@ doc_markdown = "allow"
 # ── intra-workspace (path deps added as crates land) ───────────────
 hermit-util = { path = "crates/hermit-util" }
 hermit-model = { path = "crates/hermit-model" }
+hermit-common = { path = "crates/hermit-common" }
+hermit-naming = { path = "crates/hermit-naming" }
+hermit-networking = { path = "crates/hermit-networking" }
+hermit-health = { path = "crates/hermit-health" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
@@ -63,6 +71,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 argon2 = "0.5"
+pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
+sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)
+sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 config = "0.15"
 clap = { version = "4.5", features = ["derive"] }

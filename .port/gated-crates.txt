@@ -4,3 +4,7 @@
 hermit-util
 hermit-keyframes
 hermit-model
+hermit-common
+hermit-naming
+hermit-networking
+hermit-health

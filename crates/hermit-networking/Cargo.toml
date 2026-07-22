@@ -1,0 +1,21 @@
+[package]
+name = "hermit-networking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Network/bind/published-URL resolution for Hermit (port of Jellyfin.Networking)."
+
+[lints]
+workspace = true
+
+[dependencies]
+hermit-common.workspace = true
+hermit-model.workspace = true
+hermit-util.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+fancy-regex.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

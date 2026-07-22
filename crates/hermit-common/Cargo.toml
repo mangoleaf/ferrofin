@@ -1,0 +1,22 @@
+[package]
+name = "hermit-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Common infra for Hermit (port of MediaBrowser.Common): config, app-paths, crypto."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+uuid.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

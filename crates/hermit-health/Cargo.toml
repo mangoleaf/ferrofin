@@ -1,0 +1,23 @@
+[package]
+name = "hermit-health"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Lean health-check router for Hermit (local replacement for rest's mlstudios-health)."
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+utoipa.workspace = true
+serde.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true }
+serde_json.workspace = true
