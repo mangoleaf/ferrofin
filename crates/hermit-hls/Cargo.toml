@@ -1,0 +1,23 @@
+[package]
+name = "hermit-hls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HLS playlist generation for Hermit (port of Jellyfin.MediaEncoding.Hls)."
+
+[lints]
+workspace = true
+
+[dependencies]
+hermit-mediaencoding.workspace = true
+hermit-keyframes.workspace = true
+hermit-model.workspace = true
+hermit-traits.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

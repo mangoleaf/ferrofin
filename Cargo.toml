@@ -10,6 +10,11 @@ members = [
     "crates/hermit-health",
     "crates/hermit-db",
     "crates/hermit-traits",
+    "crates/hermit-mediaencoding",
+    "crates/hermit-hls",
+    "crates/hermit-drawing",
+    "crates/hermit-providers",
+    "crates/hermit-livetv",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
     #   Wave 0: hermit-util, hermit-keyframes
@@ -38,6 +43,7 @@ doc_markdown = "allow"
 [workspace.dependencies]
 # ── intra-workspace (path deps added as crates land) ───────────────
 hermit-util = { path = "crates/hermit-util" }
+hermit-keyframes = { path = "crates/hermit-keyframes" }
 hermit-model = { path = "crates/hermit-model" }
 hermit-common = { path = "crates/hermit-common" }
 hermit-naming = { path = "crates/hermit-naming" }
@@ -45,6 +51,11 @@ hermit-networking = { path = "crates/hermit-networking" }
 hermit-health = { path = "crates/hermit-health" }
 hermit-db = { path = "crates/hermit-db" }
 hermit-traits = { path = "crates/hermit-traits" }
+hermit-mediaencoding = { path = "crates/hermit-mediaencoding" }
+hermit-hls = { path = "crates/hermit-hls" }
+hermit-drawing = { path = "crates/hermit-drawing" }
+hermit-providers = { path = "crates/hermit-providers" }
+hermit-livetv = { path = "crates/hermit-livetv" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
@@ -84,6 +95,7 @@ clap = { version = "4.5", features = ["derive"] }
 bitflags = "2"
 regex = "1"
 fancy-regex = "0.14"    # for C# regexes that use lookaround
+quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (hermit-providers)
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration

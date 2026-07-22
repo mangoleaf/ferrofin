@@ -1,0 +1,25 @@
+[package]
+name = "hermit-drawing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Image processing for Hermit (port of Jellyfin.Drawing + Emby.Photos)."
+
+[lints]
+workspace = true
+
+[dependencies]
+hermit-traits.workspace = true
+hermit-model.workspace = true
+hermit-common.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+image.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

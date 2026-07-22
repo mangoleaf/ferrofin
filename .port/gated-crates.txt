@@ -9,3 +9,8 @@ hermit-naming
 hermit-networking
 hermit-health
 hermit-db
+hermit-mediaencoding
+hermit-drawing
+hermit-providers
+hermit-livetv
+hermit-hls

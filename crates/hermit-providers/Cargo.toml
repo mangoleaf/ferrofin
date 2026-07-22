@@ -1,0 +1,36 @@
+[package]
+name = "hermit-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Metadata providers for Hermit (port of MediaBrowser.Providers + XbmcMetadata + LocalMetadata)."
+
+[lints]
+workspace = true
+
+[features]
+# Remote API providers (need keys, network) — deferred/off by default for First-Light.
+default = []
+tmdb = []
+musicbrainz = []
+omdb = []
+
+[dependencies]
+hermit-traits.workspace = true
+hermit-model.workspace = true
+hermit-common.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+quick-xml.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true

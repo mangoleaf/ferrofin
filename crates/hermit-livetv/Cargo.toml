@@ -1,0 +1,17 @@
+[package]
+name = "hermit-livetv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Live TV for Hermit — deferred; provides the DisabledLiveTvManager stub."
+
+[lints]
+workspace = true
+
+[dependencies]
+hermit-traits.workspace = true
+hermit-model.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]

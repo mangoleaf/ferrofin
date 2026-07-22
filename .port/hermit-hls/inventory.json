@@ -1,0 +1,184 @@
+{
+  "crate": "hermit-hls",
+  "source_project": "/home/mango/dev/3rdparty/jellyfin/src/Jellyfin.MediaEncoding.Hls",
+  "test_project": "/home/mango/dev/3rdparty/jellyfin/tests/Jellyfin.MediaEncoding.Hls.Tests",
+  "scope": "Port DynamicHlsPlaylistGenerator: build .m3u8 VOD playlists from keyframe/segment timing (consumes hermit-keyframes KeyframeData). Transliterate the Hls.Tests cases. Only the Playlist/ subtree is in scope.",
+  "summary": "Tiny crate: one public generator (DynamicHlsPlaylistGenerator) with a public CreateMainPlaylist(request) -> String entry point plus three internal timing/extension helpers (ComputeSegments, ComputeEqualLengthSegments, IsExtractionAllowedForFile) and a private keyframe-extraction fan-out (TryExtractKeyframes). The parity oracle (DynamicHlsPlaylistGeneratorTests) ONLY exercises the three internal helpers — pure timing math + extension matching — never CreateMainPlaylist end-to-end and never the extractor plumbing. So the port's tested core is deterministic and dependency-free; the CreateMainPlaylist string assembly and the IKeyframeExtractor fan-out are untested-but-portable glue. There is NO single hermit-traits trait to implement; expose an inherent DynamicHlsPlaylistGenerator API (constructor taking a keyframe-extractor list + a way to read the allowed-extensions config, and a create_main_playlist method).",
+  "no_hermit_trait": "IDynamicHlsPlaylistGenerator is a 1-method C# DI interface with a single production impl. Per PortJob instruction, do NOT invent a hermit-traits trait; expose DynamicHlsPlaylistGenerator as a concrete public struct with an inherent create_main_playlist(&self, CreateMainPlaylistRequest) -> String. Only introduce a KeyframeExtractor trait *locally in hermit-hls* (see UNIT 3) to model the C# IKeyframeExtractor collection.",
+  "ordered_port_plan": [
+    {
+      "unit": 1,
+      "name": "CreateMainPlaylistRequest + timing helpers (the parity core)",
+      "depends_on": [],
+      "contents": [
+        "CreateMainPlaylistRequest.cs -> a plain request struct: media_source_id: Option<Uuid>, file_path: String, desired_segment_length_ms: i32, total_runtime_ticks: i64, segment_container: String, endpoint_prefix: String, query_string: String, is_remuxing_video: bool. (Ctor arg order preserved; all fields read-only getters -> pub fields or builder.)",
+        "compute_equal_length_segments(desired_segment_length_ms: i32, total_runtime_ticks: i64) -> Result<Vec<f64>>. Ticks math: segment_length_ticks = desired_ms * 10_000 (TimeSpan.FromMilliseconds(ms).Ticks = ms*TicksPerMillisecond=10_000). whole = total/segment_length_ticks (integer div), remaining = total % segment_length_ticks. len = whole + (remaining==0?0:1). Fill whole entries with desired_segment_length.total_seconds() = ms/1000.0; if remaining!=0 last = remaining as f64 / 10_000_000.0 (TimeSpan.FromTicks(remaining).TotalSeconds). Return Err(InvalidOperation) when desired_ms==0 OR total_runtime_ticks==0.",
+        "compute_segments(keyframe_data: &KeyframeData, desired_segment_length_ms: i32) -> Vec<f64>. If keyframe_ticks non-empty AND total_duration < last keyframe tick, rebind total_duration := last keyframe tick (the overshoot clamp). desired_segment_length_ticks = desired_ms*10_000; running desired_cut_time starts there; last_keyframe=0. For each keyframe tick in order: if tick >= desired_cut_time -> push (tick-last_keyframe) as seconds (ticks/1e7), last_keyframe=tick, desired_cut_time += segment_length_ticks. After loop, remaining = total_duration - last_keyframe; if remaining>0 push remaining as seconds.",
+        "is_extraction_allowed_for_file(file_path: &str, allowed_extensions: &[String]) -> bool. Path.GetExtension: take substring from last '.' INCLUDING the dot; empty (no dot / trailing) -> false. Strip leading dot from the file's ext; for each allowed, TrimStart('.') then case-insensitive (OrdinalIgnoreCase / ASCII) equality. NOTE C# GetExtension('testfile')=='' -> false (Invalid test); '/some/.../testfile.mkv' with allowed 'mkv' (no dot) -> true.",
+        "Ticks/seconds conversion constant TICKS_PER_SECOND=10_000_000, TICKS_PER_MILLISECOND=10_000 (reuse from hermit-keyframes if re-exported, else local consts)."
+      ],
+      "notes": "This unit is the entire parity oracle. Keep the three helpers as free/associated fns (they are `internal static` in C#) so tests call them directly. seconds = ticks as f64 / 1e7 (matches TimeSpan.FromTicks(t).TotalSeconds within f64). ComputeEqualLength total_seconds for whole segments uses ms/1000.0 exactly (test expects 6.0, 3.0, 2.123, 1.234). Watch the [^1] last-element writes."
+    },
+    {
+      "unit": 2,
+      "name": "Playlist string assembly (CreateMainPlaylist body) + segment extension helper",
+      "depends_on": [1],
+      "contents": [
+        "get_segment_file_extension(segment_container: &str) -> String: if container is not whitespace-only -> \".\"+container else \".ts\". (Ported inline from EncodingHelper.GetSegmentFileExtension — NOT yet in hermit-mediaencoding; small enough to co-locate here or add to hermit-mediaencoding::encoding_helper and re-use. Prefer adding to hermit-mediaencoding to avoid duplication, but a local helper is acceptable if that crate's API isn't ready.)",
+        "The .m3u8 builder from CreateMainPlaylist (lines 49-106): header (#EXTM3U, #EXT-X-PLAYLIST-TYPE:VOD, #EXT-X-VERSION:{7 if .mp4 else 3}, #EXT-X-TARGETDURATION:{ceil(max segment or desired_ms)}, #EXT-X-MEDIA-SEQUENCE:0); optional #EXT-X-MAP for fMP4 (.mp4) init segment; per-segment #EXTINF:{len:.6} , nodesc + URL line ({endpoint_prefix}{index}{ext}{query_string}&runtimeTicks={cumulative}&actualSegmentLengthTicks={lengthTicks}); #EXT-X-ENDLIST.",
+        "Formatting fidelity: length formatted \"0.000000\" (6 decimals, invariant culture -> Rust format!(\"{:.6}\")); lengthTicks = round(length * 10_000_000) as i64 (Convert.ToInt64 = round-half-to-even); currentRuntimeInSeconds accumulates lengthTicks (misnamed in C#: it's ticks). TARGETDURATION uses Math.Ceiling of a double and appends it (C# prints e.g. '11' via double ToString — reproduce integer-looking output; ceil then format).",
+        "is_hls_in_fmp4 = segment_extension.eq_ignore_ascii_case(\".mp4\")."
+      ],
+      "notes": "UNTESTED by the oracle but load-bearing for real use. Reproduce byte-for-byte: AppendLine emits \\n (Jellyfin normalizes; C# Environment.NewLine — but tests don't assert this string, so match \\n and document). The '&runtimeTicks=0&actualSegmentLengthTicks=0' literal on the MAP line and the ', nodesc' suffix are literal. Math.Ceiling double->string: format as an integer when whole (use ceil then cast/format without decimals to mirror C# double.ToString of an integral value)."
+    },
+    {
+      "unit": 3,
+      "name": "KeyframeExtractor trait + TryExtractKeyframes fan-out + generator wiring",
+      "depends_on": [1, 2],
+      "contents": [
+        "Local trait KeyframeExtractor (port of Extractors/IKeyframeExtractor.cs, which lives in hermit-keyframes' sibling namespace but is only consumed here): is_metadata_based() -> bool; try_extract_keyframes(item_id: Uuid, file_path: &str) -> Option<KeyframeData>. Define in hermit-hls (the C# type is in the Hls assembly's Extractors namespace, not Keyframes).",
+        "DynamicHlsPlaylistGenerator struct: holds Vec<Arc<dyn KeyframeExtractor>> FILTERED to is_metadata_based()==true at construction (mirrors ctor .Where(e => e.IsMetadataBased)), plus access to the allowed-extensions config (EncodingOptions.allow_on_demand_metadata_based_keyframe_extraction_for_extensions from hermit-model; take an IServerConfigurationManager-equivalent from hermit-traits OR accept the Vec<String> directly — prefer a trait/closure so config can be read per-call like C#).",
+        "try_extract_keyframes(&self, item_id, file_path) -> Option<KeyframeData>: gate on is_extraction_allowed_for_file(file_path, allowed_exts); then iterate extractors, return first Some.",
+        "create_main_playlist(&self, request) -> String: if request.is_remuxing_video && media_source_id.is_some() && try_extract_keyframes(id, &file_path).is_some() -> compute_segments(&kf, desired_ms) else compute_equal_length_segments(desired_ms, total_runtime_ticks) (propagate/expect the InvalidOperation on 0s — C# lets it throw). Then run the UNIT 2 builder."
+      ],
+      "notes": "Untested plumbing. The C# IServerConfigurationManager.GetEncodingOptions() call is a per-invocation config read; model it with a hermit-traits config accessor (e.g. ServerConfigurationManager) or a Fn/closure returning EncodingOptions, so live config changes are honored. Keep the trait object shape (Vec of extractors) to match the DI collection."
+    }
+  ],
+  "deferred": [
+    {
+      "name": "IKeyframeExtractor concrete implementations (FfProbeKeyframeExtractor, MatroskaKeyframeExtractor, FfToolKeyframeExtractor)",
+      "reason": "These live under Jellyfin.MediaEncoding.Hls/Extractors and are NOT in this port's scope (scope is Playlist/DynamicHlsPlaylistGenerator). The FfProbe/FfTool extraction logic already ported in hermit-keyframes (ff_probe.rs, ff_tool.rs stub) as free functions; Matroska is deferred there (Wave 5 EBML). hermit-hls only needs the KeyframeExtractor TRAIT (UNIT 3) to fan out over injected extractors — concrete impls are supplied by callers/tests, not ported here. No test in Hls.Tests constructs a real extractor."
+    },
+    {
+      "name": "EncodingHelper.GetSegmentFileExtension (canonical home)",
+      "reason": "Not yet present in hermit-mediaencoding::encoding_helper. Trivially ported inline in UNIT 2. If/when hermit-mediaencoding grows this helper, hermit-hls should depend on it instead of keeping a local copy (extract-don't-duplicate). Flagged, not blocking."
+    },
+    {
+      "name": "CreateMainPlaylist newline/culture exactness",
+      "reason": "C# uses StringBuilder.AppendLine (Environment.NewLine) and InvariantCulture double formatting. No test asserts the assembled playlist string, so exact newline bytes are unverified by the oracle. Port with \\n and format!(\"{:.6}\") + documented assumption; revisit only if a byte-parity fixture is added."
+    }
+  ],
+  "constants_of_note": [
+    {
+      "name": "TICKS_PER_SECOND",
+      "value": 10000000,
+      "note": "1 tick = 100ns. Load-bearing for every seconds<->ticks conversion in both compute helpers and the EXTINF/actualSegmentLengthTicks output. Fixed .NET semantic encoded by the test expectations — NOT a candidate setting."
+    },
+    {
+      "name": "TICKS_PER_MILLISECOND",
+      "value": 10000,
+      "note": "desired_segment_length_ms * 10_000 = segment length in ticks (TimeSpan.FromMilliseconds). Fixed .NET semantic — not a setting."
+    },
+    {
+      "name": "hls_version_fmp4 / hls_version_ts",
+      "value": "7 / 3",
+      "note": "HLS protocol versions: 7 for fMP4 (.mp4 segments), 3 otherwise. Spec-mandated literals, not tuning knobs — not a candidate setting."
+    },
+    {
+      "name": "StringBuilder initial capacity 128",
+      "value": 128,
+      "note": "Micro-optimization hint only (new StringBuilder(128)); no behavioral effect. Ignore / use String::with_capacity if desired. Not a setting."
+    }
+  ],
+  "test_files": [
+    "tests/Jellyfin.MediaEncoding.Hls.Tests/Playlist/DynamicHlsPlaylistGeneratorTests.cs"
+  ],
+  "parity_oracle": "DynamicHlsPlaylistGeneratorTests — 6 test methods, all targeting the 3 internal static helpers (compute_segments, compute_equal_length_segments, is_extraction_allowed_for_file). NO test covers create_main_playlist or the extractor fan-out. Replicate as rstest #[case] parametrized tests. Use MsToTicks(ms) = ms*10_000 helper in test setup.",
+  "test_cases": {
+    "facts": 2,
+    "theories": 4,
+    "total_methods": 6,
+    "total_case_rows": 20,
+    "detail": [
+      {
+        "method": "ComputeSegments_Valid_Success",
+        "kind": "Theory (MemberData)",
+        "rows": 4,
+        "target": "compute_segments",
+        "cases": [
+          {"keyframe_data": "total=35000ms, ticks=[0,10427ms,20854ms,31240ms]", "desired_ms": 6000, "expected": [10.427, 10.427, 10.386, 3.760], "exercises": "normal multi-cut + final remainder"},
+          {"keyframe_data": "total=10000ms, ticks=[0,1000ms,2000ms,3000ms,4000ms,5000ms]", "desired_ms": 2000, "expected": [2.0, 2.0, 6.0], "exercises": "cuts finish before last keyframe; big final remainder"},
+          {"keyframe_data": "total=10000ms, ticks=[0]", "desired_ms": 6000, "expected": [10.0], "exercises": "single keyframe at 0 -> whole duration is remainder"},
+          {"keyframe_data": "total=10000ms, ticks=[] (empty)", "desired_ms": 6000, "expected": [10.0], "exercises": "empty keyframe list -> whole duration is remainder; overshoot-clamp guard must not index empty list"}
+        ]
+      },
+      {
+        "method": "ComputeSegments_ZeroDurationOvershoot_ClampsToDuration",
+        "kind": "Fact",
+        "rows": 1,
+        "target": "compute_segments",
+        "cases": [
+          {"keyframe_data": "total=0, ticks=[10000ms]", "desired_ms": 6000, "expected": [10.0], "exercises": "total_duration(0) < last keyframe -> rebind total to last keyframe tick; single segment"}
+        ]
+      },
+      {
+        "method": "ComputeSegments_MinorDurationOvershoot_ClampsToDuration",
+        "kind": "Fact",
+        "rows": 1,
+        "target": "compute_segments",
+        "cases": [
+          {"keyframe_data": "total=9900ms, ticks=[0,5000ms,10000ms]", "desired_ms": 6000, "expected": [10.0], "exercises": "total(9900ms) < last(10000ms) -> clamp to 10000ms; only the 10000 cut fires -> one 10s segment (remaining 0 not pushed)"}
+        ]
+      },
+      {
+        "method": "ComputeEqualLengthSegments_Valid_Success",
+        "kind": "Theory (MemberData)",
+        "rows": 5,
+        "target": "compute_equal_length_segments",
+        "cases": [
+          {"desired_ms": 6000, "total": "13000ms", "expected": [6.0, 6.0, 1.0]},
+          {"desired_ms": 3000, "total": "15000ms", "expected": [3.0, 3.0, 3.0, 3.0, 3.0], "exercises": "no remainder (exact multiple)"},
+          {"desired_ms": 6000, "total": "25000ms", "expected": [6.0, 6.0, 6.0, 6.0, 1.0]},
+          {"desired_ms": 6000, "total": "20123ms", "expected": [6.0, 6.0, 6.0, 2.123], "exercises": "fractional remainder via FromTicks.TotalSeconds"},
+          {"desired_ms": 6000, "total": "1234ms", "expected": [1.234], "exercises": "total < one segment -> single remainder segment"}
+        ]
+      },
+      {
+        "method": "ComputeEqualLengthSegments_Invalid_ThrowsInvalidOperationException",
+        "kind": "Theory (InlineData)",
+        "rows": 2,
+        "target": "compute_equal_length_segments",
+        "cases": [
+          {"desired_ms": 0, "total": 1000000, "expected": "Err(InvalidOperation)"},
+          {"desired_ms": 1000, "total": 0, "expected": "Err(InvalidOperation)"}
+        ]
+      },
+      {
+        "method": "IsExtractionAllowedForFile_Valid_Success",
+        "kind": "Theory (InlineData)",
+        "rows": 4,
+        "target": "is_extraction_allowed_for_file",
+        "cases": [
+          {"file_path": "testfile.mkv", "allowed": [], "expected": false, "exercises": "empty allow-list"},
+          {"file_path": "testfile.flv", "allowed": [".mp4", ".mkv", ".ts"], "expected": false, "exercises": "ext not in list"},
+          {"file_path": "testfile.flv", "allowed": [".mp4", ".mkv", ".ts", ".flv"], "expected": true, "exercises": "dotted allow entries match"},
+          {"file_path": "/some/arbitrarily/long/path/testfile.mkv", "allowed": ["mkv"], "expected": true, "exercises": "dotless allow entry + full path; TrimStart('.') on allowed"}
+        ]
+      },
+      {
+        "method": "IsExtractionAllowedForFile_Invalid_ReturnsFalse",
+        "kind": "Theory (InlineData)",
+        "rows": 1,
+        "target": "is_extraction_allowed_for_file",
+        "cases": [
+          {"file_path": "testfile", "allowed": [".mp4"], "expected": false, "exercises": "no extension (Path.GetExtension empty) -> false"}
+        ]
+      }
+    ]
+  },
+  "behavioral_constants": [
+    "seconds = ticks as f64 / 10_000_000.0 (TimeSpan.FromTicks(t).TotalSeconds).",
+    "segment_length_ticks = desired_segment_length_ms * 10_000 (TimeSpan.FromMilliseconds(ms).Ticks).",
+    "compute_equal_length_segments: whole = total/seg_ticks (integer div), remaining = total % seg_ticks; whole segments = desired_ms/1000.0 seconds each; trailing partial = remaining/1e7 seconds; throw on desired_ms==0 || total==0.",
+    "compute_segments overshoot clamp: if keyframe_ticks non-empty && total_duration < keyframe_ticks[last], set total_duration = keyframe_ticks[last] before scanning (must guard against empty list).",
+    "compute_segments: emit a segment each time a keyframe tick >= running desired_cut_time (advance last_keyframe and desired_cut_time by seg_ticks); append final (total_duration - last_keyframe) only if > 0.",
+    "is_extraction_allowed_for_file: false if path has no extension; compare file ext (leading dot stripped) case-insensitively against each allowed entry with its leading dots trimmed.",
+    "lengthTicks in playlist = round-half-to-even(length_seconds * 1e7) as i64 (Convert.ToInt64 of double).",
+    "hls version = 7 for .mp4 segment ext (fMP4), else 3; fMP4 also emits an #EXT-X-MAP init line.",
+    "EXTINF length formatted with exactly 6 decimals, invariant culture.",
+    "extractors collection filtered to is_metadata_based()==true at construction; try_extract returns the first extractor that yields data, gated by is_extraction_allowed_for_file against the configured allowed-extensions."
+  ],
+  "real_deps": ["hermit-keyframes (KeyframeData)", "hermit-model (EncodingOptions.allow_on_demand... config)", "hermit-traits (server-configuration accessor, optional)", "uuid (Guid -> media_source_id / item_id)", "thiserror (InvalidOperation error)"],
+  "dev_deps": ["rstest"],
+  "notes_on_existing_crate": "crates/hermit-hls currently only has a doc-comment lib.rs and a Cargo.toml already depending on hermit-mediaencoding, hermit-keyframes, hermit-model, hermit-traits, async-trait, tokio, thiserror, rstest. The generator logic is fully synchronous — async-trait/tokio deps are likely unnecessary for this port (the C# CreateMainPlaylist is sync; extraction is sync). Consider dropping async-trait/tokio unless a caller needs an async extractor trait. Add uuid if not already transitive."
+}
