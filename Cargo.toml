@@ -9,6 +9,7 @@ members = [
     "crates/hermit-networking",
     "crates/hermit-health",
     "crates/hermit-db",
+    "crates/hermit-traits",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
     #   Wave 0: hermit-util, hermit-keyframes
@@ -43,6 +44,7 @@ hermit-naming = { path = "crates/hermit-naming" }
 hermit-networking = { path = "crates/hermit-networking" }
 hermit-health = { path = "crates/hermit-health" }
 hermit-db = { path = "crates/hermit-db" }
+hermit-traits = { path = "crates/hermit-traits" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"

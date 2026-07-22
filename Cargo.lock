@@ -696,6 +696,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-traits"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hermit-db",
+ "hermit-model",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "hermit-util"
 version = "0.1.0"
 dependencies = [

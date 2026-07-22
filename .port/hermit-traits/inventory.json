@@ -1,0 +1,219 @@
+{
+  "crate": "hermit-traits",
+  "role": "DI seam: #[async_trait] traits only + the option/param types those signatures need. NO impls (they live in hermit-core, Wave 6).",
+  "source_project": "/home/mango/dev/3rdparty/jellyfin/MediaBrowser.Controller",
+  "depends_on": ["hermit-model", "hermit-db", "uuid", "async-trait", "thiserror", "serde", "axum (http::request::Parts only, feature-light)"],
+  "verification_summary": "Verified against the ACTUAL hermit-model (crates/hermit-model/src) and hermit-db (crates/hermit-db/src/entities) sources plus the C# interfaces under MediaBrowser.Controller. All 6 option/param types in the port list are confirmed NOT already present in hermit-model or hermit-db -> they must be ported here. The QueryResult<T> generic, BaseItemDto, MediaSourceInfo, SessionInfoDto, UserItemDataDto, SystemInfo, and UserPolicy already exist and MUST be reused. THREE types the design's REUSE list names -- UserDto, AuthenticationResult, PlaybackInfoResponse -- are NOT yet defined anywhere in hermit-model/hermit-db (hermit-model's own inventory PLANNED them for units 3/5 but they are not yet ported). They are wire DTOs and belong in hermit-model, not hermit-traits: FLAGGED below, do not define them here.",
+
+  "hermit_db_entity_paths": {
+    "note": "Entities are NOT re-exported from crate root or entities::mod; reference them through their submodule path (hermit_db::entities::<area>::<Entity>). Each is a #[derive(sqlx::FromRow)] row struct. IMPORTANT: BaseItemEntity.id is a String (hyphenated Guid as stored), NOT a Uuid -- identity ARGS in signatures still use uuid::Uuid per the design rules; only the row struct's own id field is String.",
+    "BaseItem row (item OUT of a repository)": "hermit_db::entities::base_items::BaseItemEntity",
+    "BaseItemImageInfo": "hermit_db::entities::base_items::BaseItemImageInfoEntity",
+    "Chapter": "hermit_db::entities::base_items::ChapterEntity",
+    "MediaStream": "hermit_db::entities::base_items::MediaStreamInfoEntity",
+    "MediaAttachment": "hermit_db::entities::base_items::AttachmentStreamInfoEntity",
+    "People": "hermit_db::entities::base_items::PeopleEntity",
+    "PeopleBaseItemMap": "hermit_db::entities::base_items::PeopleBaseItemMapEntity",
+    "Keyframe": "hermit_db::entities::base_items::KeyframeDataEntity",
+    "LinkedChild": "hermit_db::entities::base_items::LinkedChildEntity",
+    "AncestorId": "hermit_db::entities::base_items::AncestorIdEntity",
+    "ItemValue": "hermit_db::entities::base_items::ItemValueEntity",
+    "ItemValueMap": "hermit_db::entities::base_items::ItemValueMapEntity",
+    "BaseItemProvider": "hermit_db::entities::base_items::BaseItemProviderEntity",
+    "BaseItemTrailerType": "hermit_db::entities::base_items::BaseItemTrailerTypeEntity",
+    "BaseItemMetadataField": "hermit_db::entities::base_items::BaseItemMetadataFieldEntity",
+    "User (domain entity — for UserManager / AuthorizationInfo / AuthenticationManager / sort(user))": "hermit_db::entities::users::UserEntity",
+    "AccessSchedule": "hermit_db::entities::users::AccessScheduleEntity",
+    "Permission": "hermit_db::entities::users::PermissionEntity",
+    "Preference": "hermit_db::entities::users::PreferenceEntity",
+    "UserImageInfo": "hermit_db::entities::users::ImageInfoEntity",
+    "ActivityLog": "hermit_db::entities::users::ActivityLogEntity",
+    "ApiKey (auth/AuthenticationManager)": "hermit_db::entities::security::ApiKeyEntity",
+    "Device (DeviceManager)": "hermit_db::entities::security::DeviceEntity",
+    "DeviceOptions": "hermit_db::entities::security::DeviceOptionsEntity",
+    "UserData (UserDataManager repo layer)": "hermit_db::entities::playback::UserDataEntity",
+    "TrickplayInfo (TrickplayManager repo layer)": "hermit_db::entities::playback::TrickplayInfoEntity",
+    "MediaSegment (MediaSegmentManager repo layer)": "hermit_db::entities::playback::MediaSegmentEntity",
+    "DisplayPreferences (DisplayPreferencesManager repo layer)": "hermit_db::entities::display_preferences::DisplayPreferencesEntity",
+    "HomeSection": "hermit_db::entities::display_preferences::HomeSectionEntity",
+    "ItemDisplayPreferences": "hermit_db::entities::display_preferences::ItemDisplayPreferencesEntity",
+    "CustomItemDisplayPreferences": "hermit_db::entities::display_preferences::CustomItemDisplayPreferencesEntity"
+  },
+
+  "hermit_model_reuse_paths": {
+    "note": "These already exist in hermit-model — reference by these exact paths in DTO-OUT / API-layer signatures; do NOT duplicate.",
+    "QueryResult<T>": "hermit_model::querying::QueryResult",
+    "QueryResult siblings": ["hermit_model::querying::ThemeMediaResult", "hermit_model::querying::AllThemeMediaResult"],
+    "ItemFields (referenced by DtoOptions.Fields)": "hermit_model::querying::ItemFields",
+    "ItemFilter": "hermit_model::querying::ItemFilter",
+    "QueryFilters / QueryFiltersLegacy": "hermit_model::querying::{QueryFilters, QueryFiltersLegacy}",
+    "BaseItemDto (item OUT of DtoService)": "hermit_model::dto::BaseItemDto",
+    "BaseItemPerson": "hermit_model::dto::BaseItemPerson",
+    "MediaSourceInfo (MediaSourceManager API layer)": "hermit_model::dto::MediaSourceInfo",
+    "SessionInfoDto (SessionManager)": "hermit_model::dto::SessionInfoDto",
+    "UserItemDataDto (UserDataManager DTO-out)": "hermit_model::dto::UserItemDataDto",
+    "UpdateUserItemDataDto": "hermit_model::dto::UpdateUserItemDataDto",
+    "ItemCounts (ItemCountService / GetGenres-tuple)": "hermit_model::dto::ItemCounts",
+    "ImageInfo": "hermit_model::dto::ImageInfo",
+    "TrickplayInfoDto": "hermit_model::dto::TrickplayInfoDto",
+    "DisplayPreferencesDto": "hermit_model::dto::DisplayPreferencesDto",
+    "ClientCapabilitiesDto / DeviceInfoDto / PlaylistDto / RecommendationDto": "hermit_model::dto::{ClientCapabilitiesDto, DeviceInfoDto, PlaylistDto, RecommendationDto}",
+    "SystemInfo / PublicSystemInfo (SystemManager / ServerApplicationHost)": "hermit_model::system::{SystemInfo, PublicSystemInfo}",
+    "System storage DTOs": "hermit_model::system::{SystemStorageInfo, LibraryStorageInfo, FolderStorageInfo, LogFile, CastReceiverApplication}",
+    "UserPolicy (UserManager)": "hermit_model::users::UserPolicy",
+    "UserConfiguration": "hermit_model::configuration::UserConfiguration",
+    "ServerConfiguration (ServerConfigurationManager)": "hermit_model::configuration::ServerConfiguration",
+    "SearchHint / SearchHintResult / SearchQuery (SearchManager)": "hermit_model::search::{SearchHint, SearchHintResult, SearchQuery}",
+    "SessionMessageType / GeneralCommand / PlayRequest / PlaystateRequest (SessionManager / WebSocket)": "hermit_model::session::{SessionMessageType, GeneralCommand, PlayRequest, PlaystateRequest, PlaybackProgressInfo, PlaybackStopInfo, MessageCommand}",
+    "MediaProtocol / LiveStreamRequest / SubtitleTrackInfo (MediaSourceManager / SubtitleEncoder)": "hermit_model::media_info::{MediaProtocol, LiveStreamRequest, SubtitleTrackInfo, SubtitleTrackEvent}",
+    "ImageType / MediaStreamType enums (used by DtoOptions, ItemImageInfo, ImageProcessingOptions)": "hermit_model::entities (verify exact submodule — enum ported in foundation-enums unit)",
+    "ImageFormat / ImageOrientation (drawing, for ImageProcessor/ImageEncoder)": "hermit_model::drawing::*"
+  },
+
+  "options_to_port": [
+    {
+      "name": "DtoOptions",
+      "csharp": "MediaBrowser.Controller/Dto/DtoOptions.cs",
+      "confirmed_absent_in_model": true,
+      "fields": "Fields: Vec<ItemFields> (reuse hermit_model::querying::ItemFields), ImageTypes: Vec<ImageType> (reuse hermit_model ImageType), image_type_limit: i32, enable_images: bool, add_program_recording_info: bool, enable_user_data: bool, add_current_program: bool",
+      "logic_to_keep": "DtoOptions(bool allFields) builder ctor, ContainsField(ItemFields), GetImageLimit(ImageType) -> port as Default + a builder + methods; TEST all three.",
+      "notes": "Not wire-serialized (server-internal). Correctly belongs in hermit-traits."
+    },
+    {
+      "name": "InternalItemsQuery",
+      "csharp": "MediaBrowser.Controller/Entities/InternalItemsQuery.cs",
+      "confirmed_absent_in_model": true,
+      "notes": "~144 fields, the central repository query struct. #[derive(Default)]. C# replaces the domain 'User User' field with user_id: Uuid (design rule). Server-internal, not wire-serialized -> belongs here. Test: Default + a couple of field toggles."
+    },
+    {
+      "name": "InternalPeopleQuery",
+      "csharp": "MediaBrowser.Controller/Entities/InternalPeopleQuery.cs",
+      "confirmed_absent_in_model": true,
+      "notes": "#[derive(Default)]. Feeds PeopleRepository. Server-internal."
+    },
+    {
+      "name": "ImageProcessingOptions",
+      "csharp": "MediaBrowser.Controller/Drawing/ImageProcessingOptions.cs",
+      "confirmed_absent_in_model": true,
+      "notes": "Replace 'BaseItem Item' with item_id: Uuid + an ItemImageInfo field (design rule). References ImageFormat/ImageOrientation from hermit_model::drawing. Server-internal."
+    },
+    {
+      "name": "ImageCollageOptions",
+      "csharp": "MediaBrowser.Controller/Drawing/ImageCollageOptions.cs",
+      "confirmed_absent_in_model": true,
+      "notes": "Small (input paths + width/height). Server-internal."
+    },
+    {
+      "name": "DeleteOptions",
+      "csharp": "MediaBrowser.Controller/Library/DeleteOptions.cs",
+      "confirmed_absent_in_model": true,
+      "notes": "Used by LibraryManager.DeleteItem. Small bool-flag struct. #[derive(Default)]. Server-internal."
+    },
+    {
+      "name": "ItemImageInfo",
+      "csharp": "MediaBrowser.Controller/Entities/ItemImageInfo.cs",
+      "confirmed_absent_in_model": true,
+      "fields": "path: String, image_type: ImageType (reuse hermit-model), date_modified: DateTime<Utc>, width: i32, height: i32, blur_hash: Option<String>, is_local_file() computed (!path.starts_with(\"http\"))",
+      "notes": "Small value struct embedded in ImageProcessingOptions. NOTE: distinct from the DB row BaseItemImageInfoEntity — this is the Controller-level value object. It IS effectively serializable in the API; borderline, but the design assigns it to hermit-traits (embedded in server-internal ImageProcessingOptions) — keep here. Test Default/round-trip if it derives Serialize."
+    },
+    {
+      "name": "AuthorizationInfo",
+      "csharp": "MediaBrowser.Controller/Net/AuthorizationInfo.cs",
+      "confirmed_absent_in_model": true,
+      "fields": "user: Option<UserEntity> (design rule: User -> hermit_db::entities::users::UserEntity), user_id() derived from user (Uuid::nil() when None), device_id/device/client/version/token: Option<String>, is_api_key: bool, is_authenticated: bool, has_token() derived",
+      "notes": "Consumed by AuthorizationContext / AuthService traits (net.rs). Server-internal (holds a live user entity) -> belongs here, NOT hermit-model."
+    }
+  ],
+
+  "options_reuse_from_model": [
+    "QueryResult<T> -> hermit_model::querying::QueryResult (do NOT re-declare; the design's reuse note is CORRECT and verified)",
+    "MediaSourceInfo -> hermit_model::dto::MediaSourceInfo (verified present)",
+    "BaseItemDto -> hermit_model::dto::BaseItemDto (verified present)",
+    "SystemInfo -> hermit_model::system::SystemInfo (verified present)",
+    "SessionInfoDto -> hermit_model::dto::SessionInfoDto (verified present)",
+    "UserItemDataDto -> hermit_model::dto::UserItemDataDto (verified present)",
+    "UserPolicy -> hermit_model::users::UserPolicy (verified present)",
+    "UserConfiguration -> hermit_model::configuration::UserConfiguration (verified present)"
+  ],
+
+  "belongs_in_hermit_model_flag_only": [
+    {
+      "type": "UserDto",
+      "csharp": "MediaBrowser.Model/Dto/UserDto.cs",
+      "status": "NOT YET DEFINED in hermit-model (grep of crates/hermit-model/src found no UserDto struct; hermit-model's own inventory PLANNED it in the 'dto-core' unit but it is not present). It is a wire DTO in MediaBrowser.MODEL -> belongs in hermit-model, NOT hermit-traits.",
+      "action": "Do NOT define here. hermit-traits signatures that return the domain user use hermit_db::entities::users::UserEntity (per design rule 'User (domain) -> user entity'). Any trait that must return the user DTO (e.g. AuthenticationResult composition) is blocked until hermit-model ports UserDto. FLAG: hermit-model is missing UserDto."
+    },
+    {
+      "type": "AuthenticationResult",
+      "csharp": "MediaBrowser.Controller/Authentication/AuthenticationResult.cs",
+      "status": "NOT YET DEFINED anywhere. Lives under MediaBrowser.CONTROLLER, but its body is purely wire DTOs { UserDto User; SessionInfoDto SessionInfo; string AccessToken; string ServerId } and it IS the /Users/AuthenticateByName response body -> it is a WIRE type and belongs in hermit-model (alongside UserDto/SessionInfoDto), despite its C# namespace.",
+      "action": "Do NOT define here. FLAG for hermit-model: add AuthenticationResult (depends on UserDto being added first). AuthenticationManager/SessionManager trait methods that return it are blocked until then."
+    },
+    {
+      "type": "PlaybackInfoResponse",
+      "csharp": "MediaBrowser.Model/MediaInfo/PlaybackInfoResponse.cs",
+      "status": "NOT YET DEFINED in hermit-model (only PlaybackProgressInfo/PlaybackStopInfo structs exist under session; PlaybackInfoResponse itself is absent — hermit-model's inventory listed it for the 'entities-media' unit but it is not present). Wire DTO in MediaBrowser.MODEL -> belongs in hermit-model.",
+      "action": "Do NOT define here. FLAG for hermit-model: add PlaybackInfoResponse (+ its input PlaybackInfoRequest if the trait needs it). MediaSourceManager.get_playback_info style methods are blocked until then."
+    }
+  ],
+
+  "signature_type_mapping_confirmed": {
+    "verified_against": ["MediaBrowser.Controller/Library/ILibraryManager.cs", "MediaBrowser.Controller/Persistence/IItemRepository.cs", "MediaBrowser.Controller/Dto/IDtoService.cs", "MediaBrowser.Controller/Net/AuthorizationInfo.cs"],
+    "examples": [
+      "ILibraryManager.GetItemById(Guid id) -> BaseItem?  ==>  async fn get_item_by_id(&self, id: Uuid) -> Result<Option<hermit_db::entities::base_items::BaseItemEntity>, ServiceError>  (collapses the generic GetItemById<T>)",
+      "IItemRepository.GetItems(InternalItemsQuery filter) -> QueryResult<BaseItem>  ==>  async fn get_items(&self, filter: InternalItemsQuery) -> Result<hermit_model::querying::QueryResult<BaseItemEntity>, ServiceError>",
+      "IItemRepository.GetGenres(InternalItemsQuery) -> QueryResult<(BaseItem, ItemCounts)>  ==>  QueryResult<(BaseItemEntity, hermit_model::dto::ItemCounts)>",
+      "IDtoService.GetBaseItemDto(BaseItem item, DtoOptions options, User? user) -> BaseItemDto  ==>  async fn get_base_item_dto(&self, item: &BaseItemEntity, options: &DtoOptions, user: Option<&UserEntity>) -> Result<hermit_model::dto::BaseItemDto, ServiceError>  (DTO-out -> hermit_model DTO; item-out-of-repo arg -> entity)",
+      "IProgress<double> / CancellationToken -> omitted for v1"
+    ]
+  },
+
+  "error_enum": {
+    "file": "src/error.rs",
+    "type": "ServiceError (thiserror)",
+    "variants": ["NotFound", "Unauthorized", "InvalidInput", "Db(#[from] hermit_db::DbError)", "Backend(String)"],
+    "note": "Db variant can #[from] hermit_db::DbError (re-exported at crate root: hermit_db::DbError)."
+  },
+
+  "object_safety": {
+    "mandatory": true,
+    "reason": "AppState holds Arc<dyn LibraryManager> etc.",
+    "rules": ["no generic methods (collapse GetItemById<T> to one get_item_by_id -> Option<BaseItemEntity>)", "no impl Trait returns", "no Self-by-value"],
+    "assertion_per_trait": "add fn _assert_object_safe(_: &dyn TraitName) {} (or a #[test]) for EVERY ported trait"
+  },
+
+  "modules_to_create": {
+    "library.rs": ["LibraryManager", "UserManager", "UserDataManager", "UserViewManager", "MediaSourceManager", "SearchManager", "MusicManager", "LibraryMonitor", "SimilarItemsManager"],
+    "persistence.rs": ["ItemRepository", "ItemPersistenceService", "ItemCountService", "ChapterRepository", "MediaStreamRepository", "MediaAttachmentRepository", "PeopleRepository", "KeyframeRepository", "LinkedChildrenService", "NextUpService", "ItemTypeLookup"],
+    "dto.rs": ["DtoService"],
+    "drawing.rs": ["ImageProcessor", "ImageEncoder"],
+    "media_encoding.rs": ["MediaEncoder", "TranscodeManager", "SubtitleEncoder", "AttachmentExtractor"],
+    "session.rs": ["SessionManager"],
+    "net.rs": ["AuthorizationContext", "AuthService", "WebSocketConnection", "WebSocketListener", "WebSocketManager"],
+    "security.rs": ["AuthenticationManager", "QuickConnect"],
+    "configuration.rs": ["ServerConfigurationManager", "DisplayPreferencesManager"],
+    "devices.rs": ["DeviceManager"],
+    "system.rs": ["SystemManager", "ServerApplicationHost", "ServerApplicationPaths", "PathManager", "ExternalDataManager"],
+    "subtitles.rs": ["SubtitleManager"],
+    "media_segments.rs": ["MediaSegmentManager"],
+    "trickplay.rs": ["TrickplayManager"],
+    "collections.rs": ["CollectionManager", "PlaylistManager"],
+    "chapters.rs": ["ChapterManager"],
+    "tv.rs": ["TvSeriesManager"],
+    "providers.rs": ["ProviderManager"],
+    "events.rs": ["EventManager", "ClientEventLogger"],
+    "stubs/live_tv.rs": ["LiveTvManager"],
+    "stubs/channels.rs": ["ChannelManager"],
+    "stubs/sync_play.rs": ["SyncPlayManager"],
+    "stubs/plugins.rs": ["PluginManager"],
+    "stubs/lyrics.rs": ["LyricManager"],
+    "options/": ["DtoOptions", "InternalItemsQuery", "InternalPeopleQuery", "ImageProcessingOptions", "ImageCollageOptions", "DeleteOptions", "ItemImageInfo", "AuthorizationInfo"],
+    "error.rs": ["ServiceError"]
+  },
+
+  "skip_confirmed": "All Entities/IHas*.cs, ICollectionFolder, IItemByName, IMetadataContainer; all Providers/ per-strategy interfaces; Resolvers/* and Sorting/* strategy interfaces; per-provider similar/search strategies; Plugins/IHasEmbeddedImage; WebSocketMessages shape interfaces. Become entity/DTO fields or match-on-BaseItemKind free functions in hermit-core later.",
+
+  "http_context_rule": "Do NOT leak HttpContext/HttpRequest. Use &axum::http::request::Parts (feature-light) or a small abstraction. AuthorizationContext consumes request Parts and produces AuthorizationInfo.",
+
+  "notes": "Every option type in src/options/ needs a test (Default/builder + serde round-trip where it derives Serialize). BaseItemEntity.id is String (hyphenated Guid); identity args stay Uuid. The three flagged wire DTOs (UserDto, AuthenticationResult, PlaybackInfoResponse) are the only real gaps — they block a small number of trait return types until hermit-model ports them; port those traits' user-facing returns against UserEntity / the entity layer where the design allows, and leave the DTO-returning methods stubbed/blocked-noted for the port stage."
+}
