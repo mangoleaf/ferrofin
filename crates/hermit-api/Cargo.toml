@@ -1,0 +1,50 @@
+[package]
+name = "hermit-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP/REST API for Hermit (port of Jellyfin.Api) — axum handlers over the hermit-traits managers."
+
+[lints]
+workspace = true
+
+[features]
+# Fake `hermit-traits` manager impls (test doubles) for exercising the router,
+# auth, and contract in isolation — pulled in by this crate's own tests via the
+# dev-dependency below. The fakes add only trait *impls*; the entity/DTO types
+# they name come from `hermit-db`, which is now a plain dependency (the real
+# handlers also project `UserManager`/`LibraryManager` results, whose types live
+# in `hermit-db`), so this feature no longer toggles an optional dep.
+test-util = []
+
+[dependencies]
+hermit-traits.workspace = true
+hermit-model.workspace = true
+hermit-health.workspace = true
+# The manager traits return `hermit-db` entity types (`UserEntity`,
+# `BaseItemEntity`, …); the real handlers name them when projecting to DTOs, so
+# this is a plain (non-optional) dependency.
+hermit-db.workspace = true
+axum = { workspace = true, features = ["ws", "macros"] }
+axum-extra.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
+tokio = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Self dev-dependency so unit + integration tests build with the `test-util`
+# fakes (the composition-root deps are unavailable at this layer by design).
+hermit-api = { path = ".", features = ["test-util"] }
+async-trait.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower.workspace = true

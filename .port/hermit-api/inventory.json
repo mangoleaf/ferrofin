@@ -1,0 +1,107 @@
+{
+  "crate": "hermit-api",
+  "role": "HTTP/REST API — axum port of Jellyfin.Api (61 controllers)",
+  "source": "/home/mango/dev/3rdparty/jellyfin/Jellyfin.Api",
+  "contract": {
+    "spec": "/home/mango/dev/hermit/crates/hermit-api/tests/data/jellyfin-openapi-10.11.8.json",
+    "version": "jellyfin-openapi-10.11.8",
+    "paths": 337,
+    "operations": 412,
+    "tags": 69,
+    "strategy": "Register EVERY vendored path+method as an axum route so a real client (Wolphin) never 404s on a known route. First-Light + core routes get REAL handlers; every other route returns 501 Not Implemented via a shared `not_implemented` handler. A HARD-GATE test diffs the registered route table against the vendored spec and asserts hermit-api is a SUPERSET (every vendored path+method is registered)."
+  },
+  "conventions": {
+    "handlers_depend_only_on": "hermit-traits manager traits via AppState (Arc<dyn Trait>) — never hermit-core directly; concrete impls injected at composition root (hermit-server, Wave 8).",
+    "error_taxonomy": "hermit_traits::ServiceError { NotFound->404, Unauthorized->401, InvalidInput->400, Db->500, Backend->500 }; error.rs wraps it in an ApiError newtype with IntoResponse.",
+    "auth_seam": "hermit_traits::net::{RequestContext, AuthorizationContext (parse), AuthService (validate->401)} + options::AuthorizationInfo. Middleware/extractor builds RequestContext from axum headers+query, calls AuthorizationContext::get_authorization_info, injects AuthorizationInfo as a request extension. Jellyfin token: `Authorization`/`X-Emby-Authorization` header (MediaBrowser Token=...) or `api_key`/`ApiKey` query param.",
+    "reference_axum_crate": "hermit-health (Router::new().route(...).with_state(Arc<...>); oneshot tower::ServiceExt tests)"
+  },
+  "units": [
+    {
+      "name": "unit 1 — INFRA",
+      "controllers": [],
+      "contents": [
+        "AppState { library: Arc<dyn LibraryManager>, users: Arc<dyn UserManager>, user_views: Arc<dyn UserViewManager>, user_data: Arc<dyn UserDataManager>, media_sources: Arc<dyn MediaSourceManager>, sessions: Arc<dyn SessionManager>, system: Arc<dyn SystemManager>, app_host: Arc<dyn ServerApplicationHost>, config: Arc<dyn ServerConfigurationManager>, dto: Arc<dyn DtoService>, auth_context: Arc<dyn AuthorizationContext>, auth_service: Arc<dyn AuthService> } — Clone (all Arc).",
+        "error.rs: ApiError(ServiceError) with impl IntoResponse mapping variants to StatusCode + JSON body; From<ServiceError>.",
+        "auth.rs: token middleware/extractor — RequestContext from headers+query -> AuthorizationContext::get_authorization_info -> AuthorizationInfo request extension; RequireAuth extractor calls AuthService::authenticate (401 on failure).",
+        "router.rs: create_router(AppState) -> Router — merges real-handler routes + registers all 412 vendored path+method pairs (un-ported -> not_implemented).",
+        "not_implemented handler: async fn -> StatusCode::NOT_IMPLEMENTED (501) shared across every stub route.",
+        "openapi.rs: utoipa ApiDoc aggregating the real handlers (paths/components).",
+        "tests/contract_superset.rs (HARD GATE): load vendored spec via jq/serde_json, enumerate every (path, method); assert each is present in create_router's registered route table; fail if any vendored path+method is missing."
+      ],
+      "notes": "Path syntax: convert Jellyfin `{itemId}` -> axum `{itemId}`. Case-sensitive paths preserved verbatim (/System/Info, /Users/Me)."
+    },
+    {
+      "name": "unit 2 — FIRST-LIGHT real handlers",
+      "controllers": ["SystemController","UserController","UserViewsController","ItemsController","MediaInfoController","VideosController","ImageController"],
+      "contents": [
+        "GET /System/Info -> SystemManager::get_system_info(&ctx)",
+        "GET /System/Info/Public -> SystemManager::get_public_system_info(&ctx)",
+        "POST /Users/AuthenticateByName -> UserManager::authenticate_user + SessionManager::authenticate_new_session -> AuthenticationResult",
+        "GET /Users/Me -> AuthorizationInfo (extension).user -> UserManager::get_user_by_id -> UserDto",
+        "GET /UserViews -> UserViewManager::get_user_views(user_id) -> QueryResult<BaseItemDto> (via DtoService::get_base_item_dtos)",
+        "GET /Items -> LibraryManager::query_items(InternalItemsQuery) -> DtoService::get_base_item_dtos -> QueryResult<BaseItemDto>",
+        "GET /Items/{itemId} -> LibraryManager::get_item_by_id -> DtoService::get_base_item_dto (404 if None)",
+        "GET /Items/{itemId}/PlaybackInfo -> MediaSourceManager::get_playback_media_sources -> PlaybackInfoResponse",
+        "POST /Items/{itemId}/PlaybackInfo -> MediaSourceManager::get_playback_media_sources (posted body) -> PlaybackInfoResponse",
+        "GET|HEAD /Videos/{itemId}/stream -> LibraryManager::get_item_by_id -> MediaSourceManager::get_static_media_sources -> tokio::fs file body with HTTP Range (206 Partial Content, Accept-Ranges, Content-Range)",
+        "GET|HEAD /Items/{itemId}/Images/{imageType} -> basic file serve from item image path, or 404 (full image pipeline deferred to unit 3)"
+      ],
+      "notes": "First-Light handler->trait map (also in first_light_routes). AuthenticationResult, UserDto, BaseItemDto, QueryResult, PlaybackInfoResponse all in hermit-model. UserData/Resume (GetItemUserData /UserItems/... , GetResumeItems /UserItems/Resume) are 501 in unit 2, real in a later wave."
+    },
+    {
+      "name": "unit 3 — STUB batch: media-streaming + images",
+      "controllers": ["AudioController","VideosController(remaining)","DynamicHlsController","HlsSegmentController","UniversalAudioController","VideoAttachmentsController","ImageController(remaining)","RemoteImageController","TrickplayController","SubtitleController","LyricsController"],
+      "contents": ["~86 ops registered as 501 not_implemented (tags: Audio, Videos, DynamicHls, HlsSegment, UniversalAudio, VideoAttachments, Image, RemoteImage, Trickplay, Subtitle, Lyrics)."]
+    },
+    {
+      "name": "unit 4 — STUB batch: library + items + metadata",
+      "controllers": ["LibraryController","LibraryStructureController","ItemsController(remaining)","ItemLookupController","ItemRefreshController","ItemUpdateController","UserLibraryController","ArtistsController","GenresController","MusicGenresController","StudiosController","PersonsController","YearsController","FilterController","SearchController","SuggestionsController","MoviesController","TvShowsController","TrailersController","CollectionController","PlaylistsController","InstantMixController","MediaInfoController(remaining)","MediaSegmentsController","SegmentEditorController"],
+      "contents": ["~120 ops registered as 501 not_implemented (tags: Library, LibraryStructure, Items, ItemLookup, ItemRefresh, ItemUpdate, UserLibrary, Artists, Genres, MusicGenres, Studios, Persons, Years, Filter, Search, Suggestions, Movies, TvShows, Trailers, Collection, Playlists, InstantMix, MergeVersions, MediaInfo, MediaSegments, SegmentEditor)."]
+    },
+    {
+      "name": "unit 5 — STUB batch: playback + session + sync + devices",
+      "controllers": ["SessionController","PlaystateController","SyncPlayController","DevicesController","QuickConnectController","ApiKeyController","DisplayPreferencesController"],
+      "contents": ["~61 ops registered as 501 not_implemented (tags: Session, Playstate, SyncPlay, Devices, QuickConnect, ApiKey, DisplayPreferences)."]
+    },
+    {
+      "name": "unit 6 — STUB batch: LiveTV",
+      "controllers": ["LiveTvController"],
+      "contents": ["~41 ops registered as 501 not_implemented (tag: LiveTv) — isolated because it is the single largest controller."]
+    },
+    {
+      "name": "unit 7 — STUB batch: system + config + admin + misc",
+      "controllers": ["SystemController(remaining)","StartupController","ConfigurationController","DashboardController","ScheduledTasksController","PluginsController","PackageController","BrandingController","LocalizationController","EnvironmentController","ActivityLogController","ClientLogController","BackupController","TroubleshootingController","TimeSyncController","ChannelsController","UserController(remaining)","UserViewsController(remaining)"],
+      "contents": ["~104 ops registered as 501 not_implemented (tags: System, Startup, Configuration, Dashboard, ScheduledTasks, Plugins, Package, Branding, Localization, Environment, ActivityLog, ClientLog, Backup, Troubleshooting, Visualization, TimeSync, OpenSubtitles, Tmdb, SkipIntro, SkipButtonCss, FileTransformation, Channels, User, UserViews)."]
+    }
+  ],
+  "appstate_managers": [
+    "library: Arc<dyn hermit_traits::library::LibraryManager>",
+    "users: Arc<dyn hermit_traits::library::UserManager>",
+    "user_views: Arc<dyn hermit_traits::library::UserViewManager>",
+    "user_data: Arc<dyn hermit_traits::library::UserDataManager>",
+    "media_sources: Arc<dyn hermit_traits::library::MediaSourceManager>",
+    "sessions: Arc<dyn hermit_traits::session::SessionManager>",
+    "system: Arc<dyn hermit_traits::system::SystemManager>",
+    "app_host: Arc<dyn hermit_traits::system::ServerApplicationHost>",
+    "config: Arc<dyn hermit_traits::configuration::ServerConfigurationManager>",
+    "dto: Arc<dyn hermit_traits::dto::DtoService>",
+    "auth_context: Arc<dyn hermit_traits::net::AuthorizationContext>",
+    "auth_service: Arc<dyn hermit_traits::net::AuthService>"
+  ],
+  "first_light_routes": [
+    "GET /System/Info -> SystemManager::get_system_info",
+    "GET /System/Info/Public -> SystemManager::get_public_system_info",
+    "POST /Users/AuthenticateByName -> UserManager::authenticate_user + SessionManager::authenticate_new_session",
+    "GET /Users/Me -> UserManager::get_user_by_id",
+    "GET /UserViews -> UserViewManager::get_user_views + DtoService::get_base_item_dtos",
+    "GET /Items -> LibraryManager::query_items + DtoService::get_base_item_dtos",
+    "GET /Items/{itemId} -> LibraryManager::get_item_by_id + DtoService::get_base_item_dto",
+    "GET /Items/{itemId}/PlaybackInfo -> MediaSourceManager::get_playback_media_sources",
+    "POST /Items/{itemId}/PlaybackInfo -> MediaSourceManager::get_playback_media_sources",
+    "GET /Videos/{itemId}/stream -> LibraryManager::get_item_by_id + MediaSourceManager::get_static_media_sources (HTTP Range)",
+    "HEAD /Videos/{itemId}/stream -> LibraryManager::get_item_by_id + MediaSourceManager::get_static_media_sources (HTTP Range)",
+    "GET /Items/{itemId}/Images/{imageType} -> item image path file serve or 404",
+    "HEAD /Items/{itemId}/Images/{imageType} -> item image path file serve or 404"
+  ]
+}

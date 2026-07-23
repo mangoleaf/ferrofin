@@ -15,3 +15,4 @@ hermit-providers
 hermit-livetv
 hermit-hls
 hermit-core
+hermit-api
