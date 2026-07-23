@@ -1,0 +1,160 @@
+//! Hermit server — the composition root (port of `Jellyfin.Server`).
+//!
+//! Loads bootstrap [`config`], opens + migrates the SQLite DB, discovers ffmpeg,
+//! constructs the concrete `hermit-core` managers and injects them as the
+//! `Arc<dyn Trait>` fields of `hermit-api`'s `AppState`, seeds a default
+//! administrator on a fresh install, mounts the router, and serves with graceful
+//! shutdown.
+//!
+//! The bring-up is split into small, independently-callable pieces so the binary
+//! (`main.rs`) and the First-Light integration test can each sequence them:
+//!
+//! - [`config`] — bootstrap configuration resolution (CLI > env > file > default).
+//! - [`bootstrap`] — startup side-effects (logging, database, ffmpeg discovery).
+//! - [`state::build_app_state`] — the manager-wiring composition root.
+//! - [`seed::seed_default_admin`] — fresh-install administrator seeding.
+//! - [`media_encoding`] — the ffmpeg-backed transcode/HLS + attachment pair.
+//! - [`run`] — the end-to-end boot-and-serve entry point the binary calls.
+//!
+//! Port bootstrap semantics from `Jellyfin.Server`'s `Program.Main` + `Startup`.
+//! See `brain/PLAN_HERMIT_PORT.md`.
+
+pub mod bootstrap;
+pub mod config;
+pub mod media_encoding;
+pub mod planner;
+pub mod seed;
+pub mod state;
+
+use std::net::SocketAddr;
+
+use anyhow::Context as _;
+
+use crate::bootstrap::{FfmpegPaths, discover_ffmpeg, init_tracing, open_database};
+use crate::config::Config;
+use crate::seed::{SeedOutcome, seed_default_admin};
+use crate::state::build_app_state;
+
+/// Boots the server from a resolved [`Config`] and serves until shutdown.
+///
+/// This is the whole composition root, in order: initialise logging, open +
+/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
+/// it, playback just 500s until configured), wire every concrete manager into the
+/// shared `AppState`, seed a default administrator when the install is fresh, mount
+/// the `hermit-api` router, and `axum::serve` on the configured bind address with
+/// graceful shutdown.
+///
+/// The binary calls this after parsing CLI flags; it is the single entry point so
+/// the boot sequence has exactly one implementation.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened/migrated, manager wiring
+/// fails, seeding fails, the listener cannot bind the configured address, or the
+/// server loop errors.
+pub async fn run(config: Config) -> anyhow::Result<()> {
+    init_tracing(&config);
+    tracing::info!(
+        server_name = %config.server_name,
+        data_dir = %config.data_dir.display(),
+        config_dir = %config.config_dir.display(),
+        cache_dir = %config.cache_dir.display(),
+        web_dir = %config.web_dir.display(),
+        bind = %config.bind_addr,
+        port = config.port,
+        https_port = config.https_port,
+        base_url = %config.base_url,
+        published_url = config.published_url.as_deref().unwrap_or("<auto>"),
+        library_roots = config.library_roots.len(),
+        admin_user = %config.admin_user,
+        admin_password_set = !config.admin_password.is_empty(),
+        version = env!("CARGO_PKG_VERSION"),
+        "hermit-server starting"
+    );
+
+    let db = open_database(&config).await?;
+
+    // ffmpeg is required for playback but not for the server to boot: warn and
+    // continue so the API comes up even on a host without ffmpeg installed.
+    // `system.json` EncoderAppPath is not yet loaded at this bootstrap stage, so
+    // no persisted fallback is supplied here. When discovery fails, wire the
+    // encoder with bare `ffmpeg`/`ffprobe` names so playback 500s (rather than
+    // failing to boot) until a working ffmpeg is configured.
+    let ffmpeg = match discover_ffmpeg(&config, None).await {
+        Ok(paths) => {
+            tracing::info!(
+                ffmpeg = %paths.ffmpeg.display(),
+                ffprobe = %paths.ffprobe.display(),
+                "ffmpeg discovered",
+            );
+            paths
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ffmpeg unavailable — transcoding/playback will be disabled until configured",
+            );
+            FfmpegPaths {
+                ffmpeg: "ffmpeg".into(),
+                ffprobe: "ffprobe".into(),
+            }
+        }
+    };
+
+    // Wire every concrete manager into the shared AppState (the composition root).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+        .await
+        .context("failed to assemble application state")?;
+
+    // Fresh-install seeding: on a database with no users, create the configured
+    // default administrator (port of `UserManager.InitializeAsync` +
+    // startup-wizard `UpdateStartupUser`). A no-op once any user exists.
+    match seed_default_admin(wired.state.users.as_ref(), &config)
+        .await
+        .context("failed to seed the default administrator")?
+    {
+        SeedOutcome::AlreadyInitialized => {
+            tracing::info!("existing users found — skipping fresh-install seeding");
+        }
+        SeedOutcome::SeededWithConfiguredPassword { username } => {
+            tracing::info!(
+                %username,
+                "seeded default administrator with the configured password"
+            );
+        }
+        SeedOutcome::SeededWithGeneratedPassword { username, password } => {
+            // The generated secret only exists here (the DB stores its hash); log
+            // it once, prominently, so the operator can capture it.
+            tracing::warn!(
+                %username,
+                %password,
+                "seeded default administrator with a GENERATED password — record it now, \
+                 it cannot be recovered later"
+            );
+        }
+    }
+
+    let router = hermit_api::create_router(wired.state.clone());
+
+    // Post-startup: flip the host's core-startup flag (mirrors `CoreAppHost`
+    // marking itself ready once services are registered).
+    wired.app_host.mark_core_startup_complete();
+
+    let addr = SocketAddr::new(config.bind_addr, config.port);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?;
+    tracing::info!(%addr, "hermit-server listening");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown_rx.await.ok();
+            tracing::info!("graceful shutdown requested");
+        })
+        .await
+        .context("server error")?;
+
+    tracing::info!("hermit-server stopped");
+    Ok(())
+}

@@ -83,7 +83,7 @@ use hermit_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use hermit_traits::security::{ApiKeyManager, QuickConnect};
-use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use hermit_traits::stubs::LyricManager;
 use hermit_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
 use hermit_traits::system::{ServerApplicationHost, ServerApplicationPaths, SystemManager};
@@ -590,6 +590,10 @@ impl MediaSourceManager for FakeMediaSources {
     }
 }
 
+/// The deterministic access token [`FakeSessions`] mints on authentication, so
+/// handler tests can assert the token is echoed in the `AuthenticationResult`.
+pub const FAKE_ACCESS_TOKEN: &str = "fake-access-token";
+
 /// A fake [`SessionManager`]; every method is unused by INFRA-level tests.
 pub struct FakeSessions;
 
@@ -711,14 +715,20 @@ impl SessionManager for FakeSessions {
     async fn authenticate_new_session(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
-        unimplemented!("fake")
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto::default(),
+            access_token: FAKE_ACCESS_TOKEN.to_owned(),
+        })
     }
     async fn authenticate_direct(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
-        unimplemented!("fake")
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto::default(),
+            access_token: FAKE_ACCESS_TOKEN.to_owned(),
+        })
     }
     async fn report_capabilities(
         &self,

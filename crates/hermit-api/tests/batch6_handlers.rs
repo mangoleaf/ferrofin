@@ -32,7 +32,7 @@ use hermit_traits::library::UserManager;
 use hermit_traits::net::{AuthService, RequestContext};
 use hermit_traits::options::AuthorizationInfo;
 use hermit_traits::security::QuickConnect;
-use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use hermit_traits::system::ServerApplicationPaths;
 use std::sync::Mutex;
 use tower::ServiceExt;
@@ -417,13 +417,13 @@ impl SessionManager for NoopSessions {
     async fn authenticate_new_session(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         unimplemented!("fake")
     }
     async fn authenticate_direct(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         unimplemented!("fake")
     }
     async fn report_capabilities(

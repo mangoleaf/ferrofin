@@ -209,8 +209,26 @@ fn fake_sessions_methods_panic() {
     assert_panics(f.add_additional_user("s", Uuid::nil()));
     assert_panics(f.remove_additional_user("s", Uuid::nil()));
     assert_panics(f.report_now_viewing_item("s", "i"));
-    assert_panics(f.authenticate_new_session(&AuthenticationRequest::default()));
-    assert_panics(f.authenticate_direct(&AuthenticationRequest::default()));
+    // The authenticate methods intentionally succeed (returning a deterministic
+    // token) so handler tests can assert the token is echoed in the
+    // `AuthenticationResult`; they do not panic like the rest of the fake.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let new_session = rt
+        .block_on(f.authenticate_new_session(&AuthenticationRequest::default()))
+        .expect("fake authenticate returns Ok");
+    assert_eq!(
+        new_session.access_token,
+        hermit_api::test_support::FAKE_ACCESS_TOKEN
+    );
+    let direct = rt
+        .block_on(f.authenticate_direct(&AuthenticationRequest::default()))
+        .expect("fake authenticate returns Ok");
+    assert_eq!(
+        direct.access_token,
+        hermit_api::test_support::FAKE_ACCESS_TOKEN
+    );
     assert_panics(
         f.report_capabilities("s", &hermit_model::session::ClientCapabilities::default()),
     );

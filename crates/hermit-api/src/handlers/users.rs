@@ -19,9 +19,11 @@
 //! - `GET  /Users/Me` — the authenticated caller's [`UserDto`].
 //!
 //! Port notes:
-//! - `AuthenticateNewSession` returns an [`AuthenticationResult`] in C#, but the
-//!   ported [`SessionManager::authenticate_new_session`] returns only a
-//!   [`SessionInfoDto`], so the assembled result leaves `access_token` unset.
+//! - `AuthenticateNewSession` returns an [`AuthenticationResult`] in C#; the
+//!   ported [`SessionManager::authenticate_new_session`] returns an
+//!   [`AuthenticationResultData`] (session DTO + minted access token), which the
+//!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
+//!   real `AccessToken` to present on subsequent requests.
 //! - The `[Authorize(Policy = …)]` gates (`RequiresElevation` /
 //!   `IgnoreParentalControl`) are not enforced by a policy middleware here; the
 //!   in-body admin guards the C# controller itself applies (last-admin,
@@ -39,13 +41,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermit_db::entities::users::UserEntity;
 use hermit_model::configuration::UserConfiguration;
-use hermit_model::dto::{SessionInfoDto, UserDto};
+use hermit_model::dto::UserDto;
 use hermit_model::session::AuthenticationResult;
 use hermit_model::users::{
     ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
 };
 use hermit_traits::options::AuthorizationInfo;
-use hermit_traits::session::AuthenticationRequest;
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -227,8 +229,8 @@ async fn authenticate_by_name(
         // available as a request extension here.
         remote_endpoint: None,
     };
-    let session = state.sessions.authenticate_new_session(&request).await?;
-    Ok(Json(authentication_result(session)))
+    let result = state.sessions.authenticate_new_session(&request).await?;
+    Ok(Json(authentication_result(result)))
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -249,14 +251,25 @@ async fn authenticate_with_quick_connect(
         .quick_connect
         .get_authorized_request(&body.secret)
         .await?;
-    Ok(Json(authentication_result(session)))
+    // The Quick Connect trait surfaces only the session DTO (its token is not
+    // carried through this seam), so `access_token` resolves to `None`.
+    Ok(Json(authentication_result(AuthenticationResultData {
+        session,
+        access_token: String::new(),
+    })))
 }
 
-/// Assembles the [`AuthenticationResult`] wire body from the opened session.
+/// Assembles the [`AuthenticationResult`] wire body from an authenticated
+/// session and its minted access token.
 ///
-/// See the module note: the access token is not exposed by the trait, so
-/// `access_token` is left unset.
-fn authentication_result(session: SessionInfoDto) -> AuthenticationResult {
+/// The token is echoed back to the client as `AccessToken` so subsequent
+/// requests can authenticate; a genuinely empty token (e.g. the Quick Connect
+/// seam that does not carry one) collapses to `None`.
+fn authentication_result(result: AuthenticationResultData) -> AuthenticationResult {
+    let AuthenticationResultData {
+        session,
+        access_token,
+    } = result;
     let user = UserDto {
         id: session.user_id,
         name: session.user_name.clone(),
@@ -266,7 +279,7 @@ fn authentication_result(session: SessionInfoDto) -> AuthenticationResult {
     AuthenticationResult {
         user: Some(user),
         session_info: Some(session),
-        access_token: None,
+        access_token: (!access_token.is_empty()).then_some(access_token),
         server_id,
     }
 }

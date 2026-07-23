@@ -228,6 +228,9 @@ impl QuickConnect for HermitQuickConnect {
         }
 
         // Open a session for the authorizing user with the request's device.
+        // The minted access token is not carried through the Quick Connect seam
+        // (its `get_authorized_request` surfaces only the session DTO), so only
+        // the session is retained here.
         let session = self
             .session_manager
             .authenticate_direct(&AuthenticationRequest {
@@ -238,7 +241,8 @@ impl QuickConnect for HermitQuickConnect {
                 app_version: Some(request.app_version.clone()),
                 ..AuthenticationRequest::default()
             })
-            .await?;
+            .await?
+            .session;
 
         // Record the authorized secret and flip the request's flag. Push the
         // expiry one minute out so the client can still observe authorization
@@ -297,7 +301,7 @@ mod tests {
     use hermit_traits::error::ServiceError;
     use hermit_traits::options::AuthorizationInfo;
     use hermit_traits::security::QuickConnect;
-    use hermit_traits::session::{AuthenticationRequest, SessionManager};
+    use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 
     use crate::configuration_manager::default_server_configuration;
 
@@ -346,17 +350,20 @@ mod tests {
         async fn authenticate_direct(
             &self,
             request: &AuthenticationRequest,
-        ) -> Result<SessionInfoDto, ServiceError> {
-            Ok(SessionInfoDto {
-                user_id: request.user_id.unwrap_or_default(),
-                device_id: request.device_id.clone(),
-                ..SessionInfoDto::default()
+        ) -> Result<AuthenticationResultData, ServiceError> {
+            Ok(AuthenticationResultData {
+                session: SessionInfoDto {
+                    user_id: request.user_id.unwrap_or_default(),
+                    device_id: request.device_id.clone(),
+                    ..SessionInfoDto::default()
+                },
+                access_token: "quick-connect-token".to_owned(),
             })
         }
         async fn authenticate_new_session(
             &self,
             _request: &AuthenticationRequest,
-        ) -> Result<SessionInfoDto, ServiceError> {
+        ) -> Result<AuthenticationResultData, ServiceError> {
             unimplemented!()
         }
         async fn log_session_activity(

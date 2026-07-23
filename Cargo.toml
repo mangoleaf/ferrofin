@@ -17,6 +17,7 @@ members = [
     "crates/hermit-livetv",
     "crates/hermit-core",
     "crates/hermit-api",
+    "apps/hermit-server",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
     #   Wave 0: hermit-util, hermit-keyframes

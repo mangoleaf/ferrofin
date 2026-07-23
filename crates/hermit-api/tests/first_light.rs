@@ -1,10 +1,15 @@
 //! First-Light handler behaviour tests, using fake `hermit-traits` impls.
 //!
 //! These exercise the *real* handlers end to end through the assembled router:
-//! the public system-info route projects a manager value to JSON, and the
-//! authenticated routes reject a tokenless request with `401`. Domain managers
-//! not under test reuse the `test_support` fakes (which panic if called), so a
-//! handler straying onto an unexpected manager is caught.
+//! the public system-info route projects a manager value to JSON, the
+//! authenticated routes reject a tokenless request with `401`, and
+//! `AuthenticateByName` echoes the session's minted access token in its
+//! `AuthenticationResult` body (the regression — that field used to serialize as
+//! `null`, so clients could never obtain a working token). Domain managers not
+//! under test reuse the `test_support` fakes (which panic if called), so a
+//! handler straying onto an unexpected manager is caught. The full
+//! token→authenticated-request round trip against real managers is covered by
+//! `apps/hermit-server/tests/first_light.rs`.
 
 use std::sync::Arc;
 
@@ -14,9 +19,9 @@ use axum::http::{Request, StatusCode};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
 use hermit_api::test_support::{
-    FakeAuthContext, FakeAuthService, FakeConfig, FakeDto, FakeLibrary, FakeMediaSources,
-    FakeMusic, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
-    FakeUserData, FakeUserViews, FakeUsers,
+    FAKE_ACCESS_TOKEN, FakeAuthContext, FakeAuthService, FakeConfig, FakeDto, FakeLibrary,
+    FakeMediaSources, FakeMusic, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
+    FakeSimilarItems, FakeUserData, FakeUserViews, FakeUsers,
 };
 use hermit_model::system::{PublicSystemInfo, SystemInfo};
 use hermit_traits::error::ServiceError;
@@ -190,4 +195,42 @@ async fn me_requires_auth() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authenticate_by_name_echoes_the_access_token() {
+    // The regression guard: `AuthenticateByName` must surface the session's
+    // minted access token in the `AuthenticationResult` body so the client can
+    // present it on subsequent requests. It used to be hardcoded to `None`
+    // (serialized `null`), leaving every authenticated request stuck at `401`.
+    let router = create_router(state_with_system("Hermit"));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(
+                    "Authorization",
+                    r#"MediaBrowser Client="First Light", Device="Rig", DeviceId="rig-1", Version="1.0.0""#,
+                )
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"Username":"admin","Pw":"pw"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let token = json["AccessToken"]
+        .as_str()
+        .expect("AuthenticationResult carries a non-null AccessToken");
+    assert!(!token.is_empty(), "the echoed AccessToken is non-empty");
+    assert_eq!(
+        token, FAKE_ACCESS_TOKEN,
+        "the echoed token is the session manager's minted token"
+    );
 }

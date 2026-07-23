@@ -8,10 +8,11 @@
 //!   [`UserEntity`] row; `Device` arguments become [`DeviceEntity`] rows.
 //! - The in-memory `SessionInfo` domain object is **not** ported; session reads
 //!   surface as the [`SessionInfoDto`] wire DTO. The `AuthenticateNewSession` /
-//!   `AuthenticateDirect` methods return a `SessionInfoDto` too — Jellyfin's
-//!   `AuthenticationResult` (a `{ UserDto, SessionInfoDto, AccessToken,
-//!   ServerId }` envelope) is **not yet defined in `hermit-model`**; it is
-//!   flagged in the port report as belonging there. The `ToSessionInfoDto` /
+//!   `AuthenticateDirect` methods return an [`AuthenticationResultData`] — the
+//!   session DTO plus the minted access token — mirroring Jellyfin's
+//!   `AuthenticationResult` carrying its `AccessToken`. The full
+//!   `{ UserDto, SessionInfoDto, AccessToken, ServerId }` wire envelope is
+//!   assembled at the API layer from this data. The `ToSessionInfoDto` /
 //!   `OnSessionControllerConnected` mapping helpers that take the un-ported
 //!   `SessionInfo` are dropped.
 //! - .NET `event`s (`PlaybackStart`, `SessionStarted`, …) are dropped; event
@@ -36,6 +37,24 @@ use hermit_model::session::{
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+
+/// The outcome of authenticating and opening a session: the session DTO plus
+/// the freshly minted access token the client must present on subsequent
+/// requests.
+///
+/// Port shape of the token-carrying half of Jellyfin's `AuthenticationResult`
+/// (`SessionManager.AuthenticateNewSession` returns the result *with* its
+/// `AccessToken`). The full `{ UserDto, SessionInfoDto, AccessToken, ServerId }`
+/// envelope is assembled at the API layer from this data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthenticationResultData {
+    /// The opened session.
+    pub session: SessionInfoDto,
+
+    /// The minted access token backing the session's `Device` row. Clients
+    /// present this on every subsequent authenticated request.
+    pub access_token: String,
+}
 
 /// A request to authenticate and open a new session.
 ///
@@ -72,9 +91,8 @@ pub struct AuthenticationRequest {
 /// commands.
 ///
 /// Port of `ISessionManager` (the object-safe, domain-`SessionInfo`-free
-/// subset). Reads return [`SessionInfoDto`]; the authenticate methods return a
-/// `SessionInfoDto` pending a ported `AuthenticationResult` (see the module
-/// docs).
+/// subset). Reads return [`SessionInfoDto`]; the authenticate methods return an
+/// [`AuthenticationResultData`] (session DTO + minted access token).
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Records session activity for a client, returning the session DTO.
@@ -196,19 +214,23 @@ pub trait SessionManager: Send + Sync {
 
     /// Authenticates a request and opens a new session.
     ///
-    /// Returns the resulting session DTO; see the module docs on the pending
-    /// `AuthenticationResult` envelope.
+    /// Returns the opened session together with the minted access token (see
+    /// [`AuthenticationResultData`]) so the API layer can echo the token in the
+    /// `AuthenticationResult` body.
     async fn authenticate_new_session(
         &self,
         request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError>;
+    ) -> Result<AuthenticationResultData, ServiceError>;
 
     /// Authenticates directly (bypassing the interactive flow), opening a
     /// session.
+    ///
+    /// Returns the opened session together with the minted access token (see
+    /// [`AuthenticationResultData`]).
     async fn authenticate_direct(
         &self,
         request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError>;
+    ) -> Result<AuthenticationResultData, ServiceError>;
 
     /// Records the reported capabilities of a session.
     async fn report_capabilities(

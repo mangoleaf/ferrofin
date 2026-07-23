@@ -1,0 +1,56 @@
+[package]
+name = "hermit-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Hermit server binary — the composition root (port of Jellyfin.Server): config, DB, ffmpeg, wire, serve."
+
+[lints]
+workspace = true
+
+# The composition root lives in the library crate so the binary stays thin and
+# the First-Light integration test can drive the boot sequence directly.
+[lib]
+name = "hermit_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hermit-server"
+path = "src/main.rs"
+
+[dependencies]
+# every impl crate — this is the composition root that assembles them
+hermit-api.workspace = true
+hermit-core.workspace = true
+hermit-traits.workspace = true
+hermit-model.workspace = true
+hermit-db.workspace = true
+hermit-common.workspace = true
+hermit-naming.workspace = true
+hermit-networking.workspace = true
+hermit-health.workspace = true
+hermit-mediaencoding.workspace = true
+hermit-hls.workspace = true
+hermit-drawing.workspace = true
+hermit-providers.workspace = true
+hermit-livetv.workspace = true
+
+axum = { workspace = true, features = ["ws", "macros"] }
+tokio = { workspace = true }
+async-trait.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+config.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# First-Light integration test: drive the real router via tower oneshot and
+# assert JSON bodies.
+tower.workspace = true
+serde_json.workspace = true

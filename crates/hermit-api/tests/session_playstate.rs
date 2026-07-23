@@ -34,7 +34,7 @@ use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
 };
-use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -614,13 +614,13 @@ impl SessionManager for RecordingSessions {
     async fn authenticate_new_session(
         &self,
         _r: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         unimplemented!()
     }
     async fn authenticate_direct(
         &self,
         _r: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         unimplemented!()
     }
     async fn report_transcoding_info(

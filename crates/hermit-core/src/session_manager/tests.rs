@@ -364,22 +364,81 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
         remote_endpoint: Some("1.2.3.4".to_owned()),
         ..AuthenticationRequest::default()
     };
-    let session: SessionInfoDto = mgr.authenticate_direct(&request).await.unwrap();
+    let result = mgr.authenticate_direct(&request).await.unwrap();
+    let session: &SessionInfoDto = &result.session;
     assert_eq!(session.user_id, user_id);
     assert_eq!(session.server_id.as_deref(), Some("server-1"));
 
-    // A device row (with an access token) now exists for the user.
-    let token: String =
+    // The result carries a non-empty minted access token (the bug: it used to be
+    // dropped, leaving the API's `AccessToken` null).
+    assert!(
+        !result.access_token.is_empty(),
+        "authenticate returns a non-empty access token"
+    );
+
+    // A device row (with an access token) now exists for the user, and it is the
+    // *same* token the result returned.
+    let persisted: String =
         sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
             .bind("dev-1")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert!(!token.is_empty());
+    assert!(!persisted.is_empty());
+    assert_eq!(
+        result.access_token, persisted,
+        "the returned token equals the persisted Devices.AccessToken"
+    );
 
     // The freshly minted token resolves back to a session.
     let resolved = mgr
-        .get_session_by_authentication_token(&token, "dev-1", "1.2.3.4")
+        .get_session_by_authentication_token(&result.access_token, "dev-1", "1.2.3.4")
+        .await
+        .unwrap();
+    assert_eq!(resolved.user_id, user_id);
+}
+
+#[tokio::test]
+async fn authenticate_new_session_enforces_password_and_returns_the_token() {
+    // The interactive path (`authenticate_new_session`) runs the password check
+    // (empty password authenticates a passwordless user) and must return the same
+    // minted token it persists — the fix that lets the API echo `AccessToken`.
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
+    set_permission(db.pool(), &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+
+    let request = AuthenticationRequest {
+        username: Some("bob".to_owned()),
+        password: Some(String::new()),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-9".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some("1.2.3.4".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let result = mgr.authenticate_new_session(&request).await.unwrap();
+    assert_eq!(result.session.user_id, user_id);
+    assert!(
+        !result.access_token.is_empty(),
+        "authenticate_new_session returns a non-empty token"
+    );
+
+    let persisted: String =
+        sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
+            .bind("dev-9")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(result.access_token, persisted);
+
+    // The token authenticates future requests.
+    let resolved = mgr
+        .get_session_by_authentication_token(&result.access_token, "dev-9", "1.2.3.4")
         .await
         .unwrap();
     assert_eq!(resolved.user_id, user_id);
@@ -429,13 +488,11 @@ async fn logout_by_token_ends_the_session() {
         device_name: Some("Chrome".to_owned()),
         ..AuthenticationRequest::default()
     };
-    mgr.authenticate_direct(&request).await.unwrap();
-    let token: String =
-        sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
-            .bind("dev-1")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let token = mgr
+        .authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token;
 
     mgr.logout(&token).await.unwrap();
 

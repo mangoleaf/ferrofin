@@ -44,7 +44,7 @@ use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::{
     AuthorizationInfo, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
-use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -581,13 +581,16 @@ impl SessionManager for OkSessions {
     async fn authenticate_new_session(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            id: Some("session-1".to_owned()),
-            user_id: USER_ID,
-            user_name: Some("alice".to_owned()),
-            server_id: Some("server-1".to_owned()),
-            ..SessionInfoDto::default()
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                id: Some("session-1".to_owned()),
+                user_id: USER_ID,
+                user_name: Some("alice".to_owned()),
+                server_id: Some("server-1".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "canned-token".to_owned(),
         })
     }
     async fn log_session_activity(
@@ -712,7 +715,7 @@ impl SessionManager for OkSessions {
     async fn authenticate_direct(
         &self,
         _request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         unimplemented!()
     }
     async fn report_capabilities(
@@ -846,6 +849,8 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["User"]["Id"], USER_ID.to_string());
     assert_eq!(json["User"]["Name"], "alice");
     assert_eq!(json["ServerId"], "server-1");
+    // ...and the minted access token the client must present on later requests.
+    assert_eq!(json["AccessToken"], "canned-token");
 }
 
 #[tokio::test]

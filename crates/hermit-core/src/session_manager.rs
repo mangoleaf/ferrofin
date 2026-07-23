@@ -24,9 +24,10 @@
 //!   small `{ MessageType, Data }` envelope once and `send`s the bytes to every
 //!   controller. The `SessionControllers`/`WebSocketController` indirection of
 //!   the C# collapses into "the session's connection handles".
-//! - **`AuthenticationResult`** now lands in `hermit-model`, so the authenticate
-//!   methods build a real one internally and return its [`SessionInfoDto`] (the
-//!   trait's return type). The access token is minted via [`DeviceManager`].
+//! - **`AuthenticationResult`** now lands in `hermit-model`; the authenticate
+//!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
+//!   the minted access token) from which the API layer assembles the wire
+//!   envelope. The access token is minted via [`DeviceManager`].
 //! - **Idle/inactive timers and `IAsyncDisposable`** are dropped — no real
 //!   scheduler in this crate (that is Wave 8 / scheduled tasks). Automatic
 //!   progress is tracked as a flag on the in-memory session.
@@ -62,7 +63,7 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::events::EventManager;
 use hermit_traits::library::{LibraryManager, UserDataManager, UserManager};
 use hermit_traits::net::WebSocketConnection;
-use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::has_permission;
@@ -794,14 +795,14 @@ impl SessionManager for HermitSessionManager {
     async fn authenticate_new_session(
         &self,
         request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         self.authenticate_internal(request, true).await
     }
 
     async fn authenticate_direct(
         &self,
         request: &AuthenticationRequest,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         self.authenticate_internal(request, false).await
     }
 
@@ -1041,7 +1042,7 @@ impl HermitSessionManager {
         &self,
         request: &AuthenticationRequest,
         enforce_password: bool,
-    ) -> Result<SessionInfoDto, ServiceError> {
+    ) -> Result<AuthenticationResultData, ServiceError> {
         let app = require(request.app.as_deref(), "app")?;
         let device_id = require(request.device_id.as_deref(), "deviceId")?;
         let device_name = require(request.device_name.as_deref(), "deviceName")?;
@@ -1138,16 +1139,20 @@ impl HermitSessionManager {
 
         let mut dto = session_info_to_dto(&session);
         dto.server_id = Some(self.server_id.clone());
-        // The full `AuthenticationResult` envelope (UserDto + AccessToken) is
-        // assembled by the caller; the trait returns the SessionInfoDto. The
-        // freshly minted token is carried on the created device row.
-        let _ = created.access_token;
+        // The full `AuthenticationResult` envelope (UserDto + ServerId) is
+        // assembled by the caller from this data; the freshly minted token
+        // (persisted on the created `Device` row) is returned so the caller can
+        // echo it back to the client.
+        let access_token = created.access_token;
 
         let _ = self
             .event_manager
             .publish("AuthenticationSucceeded", &session.id)
             .await;
-        Ok(dto)
+        Ok(AuthenticationResultData {
+            session: dto,
+            access_token,
+        })
     }
 
     /// Resolves the device row bearing a session access token.

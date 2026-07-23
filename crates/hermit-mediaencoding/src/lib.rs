@@ -22,7 +22,7 @@ pub use attachments::{
 pub use configuration::{
     DirChecker, EncodingConfigurationFactory, EncodingConfigurationStore, RealDirChecker,
 };
-pub use encoder::{MediaEncoderConfig, MediaEncoderImpl};
+pub use encoder::{MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, Transcoder};
 pub use encoding_helper::{
     BaseEncodingJobOptions, EncoderCapabilities, EncodingHelper, EncodingJobInfo,
     NoOptionalEncoders,
