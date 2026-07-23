@@ -13,6 +13,7 @@
 pub mod create_main_playlist_request;
 pub mod dynamic_hls_playlist_generator;
 pub mod error;
+pub mod hls_stream_manager;
 
 pub use create_main_playlist_request::CreateMainPlaylistRequest;
 pub use dynamic_hls_playlist_generator::{
@@ -21,3 +22,4 @@ pub use dynamic_hls_playlist_generator::{
     is_extraction_allowed_for_file,
 };
 pub use error::HlsError;
+pub use hls_stream_manager::{HlsStreamManagerImpl, StreamStatePlanner, TranscodePlan};

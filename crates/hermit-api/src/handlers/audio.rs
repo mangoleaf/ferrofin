@@ -19,7 +19,7 @@
 //! runner) and are not exercised by this port.
 
 use axum::Router;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::response::Response;
 use axum::routing::get;
 use uuid::Uuid;
@@ -51,10 +51,19 @@ async fn get_audio_stream(
 async fn get_audio_stream_by_container(
     State(state): State<AppState>,
     Path((item_id, _container)): Path<(Uuid, String)>,
+    Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
-    serve_static_file(&path, request).await
+    match stream_path(&state, item_id).await {
+        Ok(path) => serve_static_file(&path, request).await,
+        Err(ApiError::NotFound(_)) => {
+            let raw = request.uri().query().map(ToOwned::to_owned);
+            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw);
+            crate::handlers::hls::transcode_stream_fallback(&state, item_id, true, req, request)
+                .await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// `GET`/`HEAD /Audio/{itemId}/universal` — serve the item's audio file.
@@ -66,10 +75,21 @@ async fn get_universal_audio_stream(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(item_id): Path<Uuid>,
+    Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
-    serve_static_file(&path, request).await
+    // Direct-play when a static source exists; otherwise transcode (the
+    // UniversalAudioController fallback), now wired to the real runtime.
+    match stream_path(&state, item_id).await {
+        Ok(path) => serve_static_file(&path, request).await,
+        Err(ApiError::NotFound(_)) => {
+            let raw = request.uri().query().map(ToOwned::to_owned);
+            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw);
+            crate::handlers::hls::transcode_stream_fallback(&state, item_id, true, req, request)
+                .await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Registers this controller's real routes onto `router`.

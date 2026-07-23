@@ -31,6 +31,34 @@ here, kept for consistency).
   - `subtitle_writers`: 22
 - Workspace test run is green end-to-end.
 
+### Real-ffmpeg integration tests (`tests/segment_transcode_ffmpeg.rs`)
+
+The one un-mockable piece — the concrete `TokioSegmentTranscoder` (`tokio::process`
+spawn + stderr→log pump + wait/kill) and the `TranscodeManagerImpl::start_ffmpeg` /
+`wait_for_segment` / kill orchestration driving it — is validated end-to-end against
+a **live ffmpeg 8.1.1**. These tests:
+
+- generate a tiny `testsrc`+`sine` clip, then transcode it to HLS;
+- assert real `.ts`/`.mp4` segments appear on disk, the first segment (the
+  `wait_for_path` target) is non-empty, and the finished VOD playlist is valid
+  (`#EXTM3U` / `#EXT-X-ENDLIST` / ≥1 `#EXTINF`) with ≥2 segments;
+- cover the **fMP4** variant (`out-1.mp4` init + `out0.mp4` + `#EXT-X-VERSION:7`
+  playlist mapping the init segment);
+- kill a long realtime transcode through the manager and assert the child exits,
+  the job is removed, and partial files are deleted;
+- surface a bogus-input non-zero exit as a `start_ffmpeg` error.
+
+They **self-skip** (print a skip line and return) unless `HERMIT_FFMPEG_TESTS` is
+set AND both `ffmpeg` and `ffprobe` are on `PATH`, so ffmpeg-less CI stays green,
+and they never affect the coverage gate (integration `tests/` don't count toward
+`cargo llvm-cov -p hermit-mediaencoding`; `tokio_segment_transcoder.rs` additionally
+carries the `#![cfg_attr(coverage_nightly, coverage(off))]` carve-out — see
+`brain/DEFERRED.md`). Run them with:
+
+```
+HERMIT_FFMPEG_TESTS=1 cargo test -p hermit-mediaencoding --test segment_transcode_ffmpeg
+```
+
 ## What was implemented
 
 Modules under `crates/hermit-mediaencoding/src/`:

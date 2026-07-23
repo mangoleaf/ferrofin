@@ -13,6 +13,8 @@
 //! **reused from `hermit-model`** rather than re-declared, per
 //! `RULES_CODE_REUSE`.
 
+use std::path::PathBuf;
+
 use hermit_model::dlna::{EncodingContext, SubtitleDeliveryMethod};
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities_media::MediaStream;
@@ -245,6 +247,21 @@ pub struct EncodingJobInfo {
     pub supported_video_codecs: Vec<String>,
     /// The audio codecs the target supports (`SupportedAudioCodecs`).
     pub supported_audio_codecs: Vec<String>,
+    /// The segment cut length, in seconds (`StreamState.SegmentLength`).
+    ///
+    /// Drives the segment cache filenames and the forward-gap heuristic. `0`
+    /// marks a non-segmented (progressive) job.
+    pub segment_length_secs: i32,
+    /// The exact segment file `StartFfMpeg` blocks on before returning
+    /// (`StreamState.WaitForPath`); `None` falls back to the output path.
+    pub wait_for_path: Option<PathBuf>,
+    /// The requested HLS segment container (`Request.SegmentContainer`), e.g.
+    /// `"ts"` or `"mp4"`; `None` defaults to `.ts`.
+    pub segment_container: Option<String>,
+    /// The playback-session id this job serves (`Request.PlaySessionId`).
+    pub play_session_id: Option<String>,
+    /// The device id this job streams to (`Request.DeviceId`).
+    pub device_id: Option<String>,
 }
 
 impl EncodingJobInfo {

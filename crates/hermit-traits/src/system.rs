@@ -150,6 +150,16 @@ pub trait ServerApplicationPaths: Send + Sync {
 
     /// The log directory.
     fn log_directory_path(&self) -> String;
+
+    /// The transcoding cache directory (`GetTranscodePath()`), where the HLS
+    /// segment/playlist files a live transcode produces are written and served
+    /// from. Default is a `transcodes` subdirectory of [`cache_path`](Self::cache_path).
+    fn transcode_path(&self) -> String {
+        std::path::Path::new(&self.cache_path())
+            .join("transcodes")
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn _assert_object_safe_server_application_paths(_: &dyn ServerApplicationPaths) {}

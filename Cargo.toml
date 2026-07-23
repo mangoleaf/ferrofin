@@ -36,6 +36,10 @@ repository = "https://github.com/mangoleaf/hermit"
 
 [workspace.lints.rust]
 missing_docs = "warn"
+# `coverage_nightly` is set by cargo-llvm-cov (nightly) to gate the
+# `#[coverage(off)]` carve-outs on un-mockable I/O modules (e.g. the real
+# ffmpeg spawn in hermit-mediaencoding). Register it so stable builds don't warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

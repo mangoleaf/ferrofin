@@ -94,10 +94,13 @@ fn task_info(key: &str, name: &str, hidden: bool) -> TaskInfo {
     }
 }
 
-/// A [`TaskManager`] stub with a fixed task set that records `start_task` calls.
+/// A [`TaskManager`] stub with a fixed task set that records `start_task`,
+/// `cancel_task`, and `update_triggers` calls.
 struct StubTasks {
     tasks: Vec<TaskInfo>,
     started: Arc<Mutex<Vec<String>>>,
+    cancelled: Arc<Mutex<Vec<String>>>,
+    triggered: Arc<Mutex<Vec<(String, usize)>>>,
 }
 
 impl StubTasks {
@@ -105,6 +108,8 @@ impl StubTasks {
         Self {
             tasks,
             started: Arc::new(Mutex::new(Vec::new())),
+            cancelled: Arc::new(Mutex::new(Vec::new())),
+            triggered: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -124,6 +129,32 @@ impl TaskManager for StubTasks {
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
         if self.tasks.iter().any(|t| t.id.as_deref() == Some(task_id)) {
             self.started.lock().expect("lock").push(task_id.to_owned());
+            Ok(())
+        } else {
+            Err(ServiceError::not_found(format!("scheduled task {task_id}")))
+        }
+    }
+    async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        if self.tasks.iter().any(|t| t.id.as_deref() == Some(task_id)) {
+            self.cancelled
+                .lock()
+                .expect("lock")
+                .push(task_id.to_owned());
+            Ok(())
+        } else {
+            Err(ServiceError::not_found(format!("scheduled task {task_id}")))
+        }
+    }
+    async fn update_triggers(
+        &self,
+        task_id: &str,
+        triggers: &[hermit_model::tasks::TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        if self.tasks.iter().any(|t| t.id.as_deref() == Some(task_id)) {
+            self.triggered
+                .lock()
+                .expect("lock")
+                .push((task_id.to_owned(), triggers.len()));
             Ok(())
         } else {
             Err(ServiceError::not_found(format!("scheduled task {task_id}")))
@@ -302,10 +333,87 @@ async fn channels_route_stays_501() {
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
+/// Drives one request with a JSON `body` through a router built from
+/// `tasks`/`authed`.
+async fn send_json(
+    tasks: Arc<StubTasks>,
+    authed: bool,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> StatusCode {
+    use tower::ServiceExt;
+    let router = create_router(state(tasks, authed));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    response.status()
+}
+
 #[tokio::test]
-async fn scheduled_task_triggers_route_stays_501() {
-    // The deferred trigger-update route must still route — as a `501` stub.
-    let tasks = Arc::new(StubTasks::new(Vec::new()));
-    let (status, _body) = send(tasks, true, "POST", "/ScheduledTasks/scan/Triggers").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+async fn stop_task_cancels_and_returns_204() {
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let (status, _body) = send(
+        Arc::clone(&tasks),
+        true,
+        "DELETE",
+        "/ScheduledTasks/Running/scan",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(tasks.cancelled.lock().expect("lock").as_slice(), ["scan"]);
+}
+
+#[tokio::test]
+async fn stop_task_unknown_id_is_404() {
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let (status, _body) = send(
+        Arc::clone(&tasks),
+        true,
+        "DELETE",
+        "/ScheduledTasks/Running/nope",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(tasks.cancelled.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn update_triggers_persists_and_returns_204() {
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let status = send_json(
+        Arc::clone(&tasks),
+        true,
+        "POST",
+        "/ScheduledTasks/scan/Triggers",
+        r#"[{"Type":"IntervalTrigger","IntervalTicks":42}]"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let recorded = tasks.triggered.lock().expect("lock");
+    assert_eq!(recorded.as_slice(), [("scan".to_owned(), 1)]);
+}
+
+#[tokio::test]
+async fn update_triggers_unknown_id_is_404() {
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let status = send_json(
+        Arc::clone(&tasks),
+        true,
+        "POST",
+        "/ScheduledTasks/nope/Triggers",
+        "[]",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(tasks.triggered.lock().expect("lock").is_empty());
 }

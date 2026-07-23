@@ -1240,6 +1240,11 @@ mod tests {
             transcoding_type: hermit_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            segment_length_secs: 0,
+            wait_for_path: None,
+            segment_container: None,
+            play_session_id: None,
+            device_id: None,
         }
     }
 

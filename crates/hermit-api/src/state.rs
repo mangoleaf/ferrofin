@@ -22,11 +22,13 @@ use hermit_traits::library::{
     UserDataManager, UserManager, UserViewManager,
 };
 use hermit_traits::localization::LocalizationManager;
+use hermit_traits::media_encoding::{AttachmentExtractor, HlsStreamManager};
 use hermit_traits::media_segments::MediaSegmentManager;
 use hermit_traits::net::{AuthService, AuthorizationContext};
 use hermit_traits::providers::ProviderManager;
 use hermit_traits::security::{ApiKeyManager, QuickConnect};
 use hermit_traits::session::SessionManager;
+use hermit_traits::stubs::DisabledHlsStreamManager;
 use hermit_traits::stubs::LyricManager;
 use hermit_traits::subtitles::SubtitleManager;
 use hermit_traits::system::{ServerApplicationHost, SystemManager};
@@ -104,6 +106,14 @@ pub struct Inner {
     pub file_system: Arc<dyn FileSystem>,
     /// Enumerates and runs the server's scheduled tasks.
     pub tasks: Arc<dyn TaskManager>,
+    /// The dynamic-HLS + transcode-stream runtime (playlists, segments, the
+    /// transcode branch of `/Videos|Audio/{id}/stream`). Defaults to the
+    /// disabled stub; the composition root injects the ffmpeg-backed impl.
+    pub hls: Arc<dyn HlsStreamManager>,
+    /// Extracts embedded attachments (fonts/covers) for the
+    /// `Videos/{id}/{source}/Attachments/{index}` route. Defaults to the
+    /// disabled stub; the composition root injects the ffmpeg-backed impl.
+    pub attachments: Arc<dyn AttachmentExtractor>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -200,7 +210,37 @@ impl AppState {
             activity,
             file_system,
             tasks,
+            // Default to the disabled stubs; a host with a transcode runtime
+            // overrides them via `with_media_encoding` at the composition root.
+            hls: Arc::new(DisabledHlsStreamManager),
+            attachments: Arc::new(hermit_traits::stubs::DisabledAttachmentExtractor),
         })
+    }
+
+    /// Replaces the media-encoding seams (HLS/transcode runtime + attachment
+    /// extractor) with concrete implementations.
+    ///
+    /// [`new`](Self::new) installs the disabled stubs so the many test
+    /// constructors keep compiling; the composition root calls this to wire the
+    /// ffmpeg-backed [`HlsStreamManager`] and [`AttachmentExtractor`] before the
+    /// state is shared. Panics only if called after the state has been cloned
+    /// (the inner `Arc` is still uniquely held here at construction time).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_media_encoding(
+        mut self,
+        hls: Arc<dyn HlsStreamManager>,
+        attachments: Arc<dyn AttachmentExtractor>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_media_encoding must be called before the state is shared");
+        inner.hls = hls;
+        inner.attachments = attachments;
+        self
     }
 
     /// The parsed-authorization context resolver.

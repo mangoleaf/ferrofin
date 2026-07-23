@@ -15,12 +15,14 @@
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
 pub mod channels;
+pub mod hls_stream;
 pub mod live_tv;
 pub mod lyrics;
 pub mod plugins;
 pub mod sync_play;
 
 pub use channels::ChannelManager;
+pub use hls_stream::{DisabledAttachmentExtractor, DisabledHlsStreamManager};
 pub use live_tv::LiveTvManager;
 pub use lyrics::LyricManager;
 pub use plugins::PluginManager;

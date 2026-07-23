@@ -20,10 +20,24 @@
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
 //! exactly the contract's not-found outcome. `HEAD` shares each handler with
 //! `GET` (the file service is `HEAD`-aware).
+//!
+//! ## Write side
+//!
+//! The item-image *write* routes are ported too:
+//! `POST`/`DELETE /Items/{itemId}/Images/{imageType}[/{imageIndex}]`. The upload
+//! body is base64-encoded image bytes with the MIME type in the `Content-Type`
+//! header (Jellyfin's `[AcceptsImageFile]`), decoded via the shared
+//! [`image_upload`](crate::handlers::image_upload) helpers and handed to
+//! [`ProviderManager::save_image`]/[`ProviderManager::delete_image`]. These call
+//! through to the image-store seam; the concrete shell manager reports the image
+//! pipeline as deferred (as it does for `queue_refresh`), so the request shape,
+//! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
+//! final while the on-disk pipeline is a later wave.
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use hermit_db::entities::users::UserEntity;
@@ -37,6 +51,9 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::image_upload::{
+    decode_base64, image_extension_from_content_type, image_mime_from_content_type,
+};
 use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
 
@@ -449,6 +466,50 @@ async fn get_user_image(
     serve_image_file(&image, request).await
 }
 
+/// `POST /UserImage` — upload a user's profile image.
+///
+/// Port of `ImageController.PostUserImage`. Resolves the target user (the `userId`
+/// query parameter or the caller; a missing user is `404`, a nil effective user a
+/// `400`), validates the `Content-Type` is an image type (`400` otherwise),
+/// base64-decodes the body, and stores it via
+/// [`UserManager::save_profile_image`], which clears any prior image and persists
+/// the user. Returns `204`.
+#[utoipa::path(
+    post,
+    path = "/UserImage",
+    params(("userId" = Option<String>, Query, description = "The user id")),
+    responses(
+        (status = 204, description = "Image updated"),
+        (status = 400, description = "Incorrect content type or user id not provided"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "hermit"
+)]
+async fn post_user_image(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<ImageQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let user = resolve_user_opt(&state, &auth, query.user_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("no user for request".to_owned()))?;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    let mime = image_mime_from_content_type(content_type)
+        .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
+    let extension = image_extension_from_content_type(content_type).unwrap_or_default();
+    let bytes = decode_base64(body.trim())
+        .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
+    state
+        .users
+        .save_profile_image(&user, &bytes, &mime, &extension)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `DELETE /UserImage` — clear a user's profile image.
 ///
 /// Port of `ImageController.DeleteUserImage`. Resolves the target user (the
@@ -481,6 +542,184 @@ async fn delete_user_image(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Reads the raw base64 upload body and its image MIME type, then saves it.
+///
+/// Shared tail of `SetItemImage`/`SetItemImageByIndex`: validates the
+/// `Content-Type` is an image type (`400` otherwise), base64-decodes the body
+/// (`400` on invalid base64), and stores the bytes via
+/// [`ProviderManager::save_image`] at `image_type`/`index`. Returns `204`.
+async fn save_item_image(
+    state: &AppState,
+    item_id: Uuid,
+    image_type: ImageType,
+    image_index: Option<i32>,
+    content_type: Option<&str>,
+    body: &str,
+) -> Result<StatusCode, ApiError> {
+    let mime = image_mime_from_content_type(content_type)
+        .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
+    let bytes = decode_base64(body.trim())
+        .ok_or_else(|| ApiError::BadRequest("image data is not valid base64".to_owned()))?;
+    state
+        .providers
+        .save_image(item_id, &bytes, &mime, image_type, image_index)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /Items/{itemId}/Images/{imageType}` — upload an item's image.
+///
+/// Port of `ImageController.SetItemImage`. A missing item is `404`, a non-image
+/// `Content-Type` (or non-base64 body) is `400`, and on success the image is
+/// saved and the handler returns `204`.
+#[utoipa::path(
+    post,
+    path = "/Items/{itemId}/Images/{imageType}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("imageType" = String, Path, description = "The image type"),
+    ),
+    responses(
+        (status = 204, description = "Image saved"),
+        (status = 400, description = "Incorrect content type"),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn set_item_image(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path((item_id, image_type)): Path<(Uuid, String)>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let image_type = parse_image_type(&image_type)?;
+    require_item(&state, item_id).await?;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    save_item_image(&state, item_id, image_type, None, content_type, &body).await
+}
+
+/// `POST /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed upload.
+///
+/// Port of `ImageController.SetItemImageByIndex`.
+#[utoipa::path(
+    post,
+    path = "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("imageType" = String, Path, description = "The image type"),
+        ("imageIndex" = i32, Path, description = "The image index"),
+    ),
+    responses(
+        (status = 204, description = "Image saved"),
+        (status = 400, description = "Incorrect content type"),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn set_item_image_by_index(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let image_type = parse_image_type(&image_type)?;
+    require_item(&state, item_id).await?;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    save_item_image(
+        &state,
+        item_id,
+        image_type,
+        Some(image_index),
+        content_type,
+        &body,
+    )
+    .await
+}
+
+/// `DELETE /Items/{itemId}/Images/{imageType}` — delete an item's image.
+///
+/// Port of `ImageController.DeleteItemImage`. A missing item is `404`; the image
+/// index comes from the optional `imageIndex` query parameter (default `0`, as in
+/// C#'s `imageIndex ?? 0`). On success the handler returns `204`.
+#[utoipa::path(
+    delete,
+    path = "/Items/{itemId}/Images/{imageType}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("imageType" = String, Path, description = "The image type"),
+        ("imageIndex" = Option<i32>, Query, description = "The image index"),
+    ),
+    responses(
+        (status = 204, description = "Image deleted"),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn delete_item_image(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path((item_id, image_type)): Path<(Uuid, String)>,
+    Query(query): Query<ImageQuery>,
+) -> Result<StatusCode, ApiError> {
+    let image_type = parse_image_type(&image_type)?;
+    require_item(&state, item_id).await?;
+    let index = query.image_index.unwrap_or(0);
+    state
+        .providers
+        .delete_image(item_id, image_type, Some(index))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed delete.
+///
+/// Port of `ImageController.DeleteItemImageByIndex`.
+#[utoipa::path(
+    delete,
+    path = "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("imageType" = String, Path, description = "The image type"),
+        ("imageIndex" = i32, Path, description = "The image index"),
+    ),
+    responses(
+        (status = 204, description = "Image deleted"),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn delete_item_image_by_index(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+) -> Result<StatusCode, ApiError> {
+    let image_type = parse_image_type(&image_type)?;
+    require_item(&state, item_id).await?;
+    state
+        .providers
+        .delete_image(item_id, image_type, Some(image_index))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Resolves an item, mapping a missing one to a `404`.
+///
+/// The shared item-existence guard the write handlers run before mutating.
+async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    state
+        .library
+        .get_item_by_id(item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    Ok(())
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -490,11 +729,17 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/Items/{itemId}/Images/{imageType}",
-            get(get_item_image).head(get_item_image),
+            get(get_item_image)
+                .head(get_item_image)
+                .post(set_item_image)
+                .delete(delete_item_image),
         )
         .route(
             "/Items/{itemId}/Images/{imageType}/{imageIndex}",
-            get(get_item_image_by_index).head(get_item_image_by_index),
+            get(get_item_image_by_index)
+                .head(get_item_image_by_index)
+                .post(set_item_image_by_index)
+                .delete(delete_item_image_by_index),
         )
         .route(
             "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -540,6 +785,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/UserImage",
             get(get_user_image)
                 .head(get_user_image)
+                .post(post_user_image)
                 .delete(delete_user_image),
         )
 }

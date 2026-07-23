@@ -105,14 +105,13 @@ mod tests {
     #[tokio::test]
     async fn stubbed_route_returns_501_not_404() {
         // A contract route with no ported handler still returns `501` (not
-        // `404`). `/Branding/Splashscreen` is a deferred (image-generation)
-        // route registered on the shared stub, even though its sibling
-        // `/Branding/Configuration` now has a real handler.
+        // `404`). `/Channels` is a deferred (Live-TV/channels subsystem) route
+        // registered on the shared stub.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/Branding/Splashscreen")
+                    .uri("/Channels")
                     .body(Body::empty())
                     .unwrap(),
             )

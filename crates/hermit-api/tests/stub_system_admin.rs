@@ -47,13 +47,11 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     // `/System/Configuration/{key}` route is also real (it returns `501` only for
     // unknown keys, behind auth), so it is excluded too.
     // Startup — ported in Batch 6 (real handlers), covered by batch6_handlers.rs.
-    // ScheduledTasks — read/run ported in Batch 15 (real, `RequireAuth`-guarded
-    // → `401` for a tokenless probe): `GET /ScheduledTasks`,
+    // ScheduledTasks — read/run ported in Batch 15 and the cancel + trigger-config
+    // routes ported in Batch 16 (all real, `RequireAuth`-guarded → `401` for a
+    // tokenless probe), covered by batch15_handlers.rs: `GET /ScheduledTasks`,
     // `GET /ScheduledTasks/{taskId}`, `POST /ScheduledTasks/Running/{taskId}`,
-    // covered by batch15_handlers.rs. The scheduler-cron routes below stay 501
-    // stubs (cancel — no background run to cancel; trigger-config persistence).
-    (Method::DELETE, "/ScheduledTasks/Running/task-1"),
-    (Method::POST, "/ScheduledTasks/task-1/Triggers"),
+    // `DELETE /ScheduledTasks/Running/{taskId}`, `POST /ScheduledTasks/{taskId}/Triggers`.
     // Plugins
     (Method::GET, "/Plugins"),
     (Method::DELETE, "/Plugins/plugin-1"),
@@ -92,8 +90,8 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     // User — the admin CRUD/policy/config/forgot-password + quick-connect login
     // routes were ported in Batch 6 (real handlers), covered by
     // batch6_handlers.rs; only `AuthenticateByName`/`Me` were real before.
-    // UserViews (excludes real handler: GET /UserViews)
-    (Method::GET, "/UserViews/GroupingOptions"),
+    // UserViews — `GET /UserViews` (First-Light) and `GET /UserViews/GroupingOptions`
+    // (Batch 16) are both real now, covered by their handler tests.
     // Intro-skipper plugin: Troubleshooting
     (Method::GET, "/IntroSkipper"),
     (Method::GET, "/IntroSkipper/SupportBundle"),
@@ -156,7 +154,7 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        45,
-        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 = 45 stubs; probe table drifted"
+        42,
+        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) = 42 stubs; probe table drifted"
     );
 }

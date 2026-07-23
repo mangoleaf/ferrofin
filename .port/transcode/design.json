@@ -1,0 +1,232 @@
+{
+  "title": "Hermit HLS / long-running transcode design — StartFfMpeg + segment serving",
+  "stage": "DESIGN",
+  "date": "2026-07-23",
+  "source_refs": {
+    "csharp": [
+      "MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, PingTimer, KillTranscodingJob, DeletePartialStreamFiles, StartThrottler/StartSegmentCleaner)",
+      "Jellyfin.Api/Controllers/DynamicHlsController.cs (GetDynamicSegment, GetSegmentPath, GetSegmentResult, GetCurrentTranscodingIndex, GetCommandLineArguments, GetLiveHlsStream)",
+      "Jellyfin.Api/Controllers/VideosController.cs (GetVideoStream transcode path via FileStreamResponseHelpers.GetTranscodedFile)",
+      "Jellyfin.Api/Controllers/HlsSegmentController.cs (legacy segment/playlist serving, StopEncodingProcess, OnTranscodeBeginRequest/EndRequest)",
+      "Jellyfin.Api/Controllers/UniversalAudioController.cs (GetUniversalAudioStream: direct/redirect/HLS branch)",
+      "Jellyfin.Api/Helpers/HlsHelpers.cs (WaitForMinimumSegmentCount)"
+    ],
+    "rust_current": [
+      "crates/hermit-mediaencoding/src/encoder/transcoder.rs (Transcoder seam — probe-only today)",
+      "crates/hermit-mediaencoding/src/transcoding/manager.rs (TranscodeManagerImpl job registry)",
+      "crates/hermit-mediaencoding/src/encoding_helper/{helper.rs,transcode_state.rs} (arg builder + EncodingJobInfo/StreamState subset)",
+      "crates/hermit-hls/src/dynamic_hls_playlist_generator.rs (playlist generation, done)",
+      "crates/hermit-traits/src/media_encoding.rs (MediaEncoder/TranscodeManager/TranscodingJobHandle traits)",
+      "crates/hermit-api/src/{router.rs,routes.rs,handlers/mod.rs} (REAL_ROUTES vs 501 stub)"
+    ]
+  },
+
+  "part1_seam_extension": {
+    "goal": "Add ONE long-running, segment-producing spawn method behind a seam so all orchestration is unit-testable with a fake, and only the real tokio::process spawn is ffmpeg-gated/coverage-carved.",
+    "decision": "Add a NEW sibling trait `SegmentTranscoder` in hermit-mediaencoding (NOT a method on the existing probe-only `Transcoder` — probes return captured output; a long-running job returns a live handle, so keeping them separate keeps each trait honest and object-safe). The existing `Transcoder` (get_process_output/get_process_exit_code) is untouched.",
+    "new_trait": {
+      "path": "crates/hermit-mediaencoding/src/transcoding/segment_transcoder.rs",
+      "definition": "#[async_trait] pub trait SegmentTranscoder: Send + Sync { async fn start_transcode(&self, req: &SpawnRequest) -> Result<Box<dyn TranscodeChild>, String>; }",
+      "SpawnRequest": {
+        "fields": [
+          "program: String            // resolved ffmpeg path (MediaEncoder::encoder_path())",
+          "arguments: Vec<String>     // fully-built ffmpeg args (from encoding_helper); Vec<String> not a single string so the fake and the real spawn agree on tokenization",
+          "working_dir: Option<PathBuf>",
+          "output_dir: PathBuf        // the per-session segment cache dir; created by orchestration BEFORE calling the seam",
+          "log_path: PathBuf          // FFmpeg.Transcode-*.log target (stderr is streamed here)"
+        ]
+      }
+    },
+    "handle_type": {
+      "name": "TranscodeChild",
+      "definition": "#[async_trait] pub trait TranscodeChild: Send + Sync { fn has_exited(&self) -> bool; fn exit_code(&self) -> Option<i32>; async fn wait(&self) -> i32; async fn kill(&self) -> Result<(), String>; }",
+      "notes": [
+        "has_exited()/exit_code() are the sync polls StartFfMpeg + GetSegmentResult read in their wait loops (mirror TranscodingJob.HasExited / ExitCode).",
+        "wait() awaits process exit (drives the OnFfMpegProcessExited equivalent — flips has_exited, records exit_code).",
+        "kill() is the SIGKILL/Process.Stop equivalent used by KillTranscodingJob.",
+        "Object-safe: `_assert_object_safe` fn on both traits, like the existing traits."
+      ]
+    },
+    "concrete_impl": {
+      "name": "TokioSegmentTranscoder",
+      "path": "crates/hermit-mediaencoding/src/transcoding/tokio_segment_transcoder.rs",
+      "behavior": "start_transcode spawns tokio::process::Command(program).args(arguments).current_dir(working_dir).stdin(piped).stderr(piped); wraps the Child in TokioTranscodeChild that stores an Arc<AtomicBool> exited + Arc<Mutex<Option<i32>>> exit_code, spawns a task that pipes stderr->log_path and awaits child.wait() to set those, and holds the kill sender.",
+      "coverage": "This ONE module (the spawn + child wrapper) is the un-mockable real I/O. It is exercised ONLY by the ffmpeg-gated integration test (part5). It is carved out of the unit-coverage gate (part-coverage_carveout)."
+    },
+    "fake_for_tests": {
+      "name": "FakeSegmentTranscoder",
+      "behavior": "start_transcode writes N fake segment files (hls{index}.ts etc.) into output_dir on a schedule (or immediately), returns a FakeTranscodeChild whose has_exited/exit_code are script-controlled. Lets every orchestration path (segment-exists / wait-for-segment / kill / cleanup / failed-start) run deterministically under unit tests with zero ffmpeg."
+    }
+  },
+
+  "part2_streamstate_job_shape": {
+    "reuse": "EncodingJobInfo/BaseEncodingJobOptions in encoding_helper/transcode_state.rs already carry the arg-builder subset (output_file_path, transcoding_type, run_time_ticks, media_source, output_container, live_stream_id via base_request). Extend minimally rather than a new type.",
+    "additions_to_StreamState": [
+      "segment_length_secs: i32   // state.SegmentLength — segment cut length; drives GetCommandLineArguments and the segmentGapRequiringTranscodingChange = 24/segment_length heuristic",
+      "wait_for_path: Option<PathBuf> // state.WaitForPath — the exact segment file StartFfMpeg blocks on before returning",
+      "segment_container: Option<String> // state.Request.SegmentContainer — 'ts' | 'mp4'; default '.ts' (get_segment_file_extension already ports this)",
+      "play_session_id: Option<String>, device_id: Option<String> // needed to register the job + kill by session"
+    ],
+    "TranscodeJob_request": {
+      "note": "The registry already has TranscodingJobHandle (play_session_id, path, job_type, device_id). StartFfMpeg produces one of these AND needs the live child + a cancel flag. Introduce an internal RunningJob (owned only inside the impl, NOT in hermit-traits):",
+      "RunningJob_fields": [
+        "handle: TranscodingJobHandle",
+        "child: Box<dyn TranscodeChild>",
+        "output_dir: PathBuf     // segment cache dir to delete on kill (DeleteHlsPartialStreamFiles)",
+        "playlist_path: PathBuf  // .m3u8 the segments index",
+        "segment_extension: String"
+      ],
+      "carries_from_request": "media source path (state.media_source / output_file_path), fully-built ffmpeg args (from encoding_helper GetCommandLineArguments/GetProgressiveVideoFullCommandLine), output/segment dir, play-session-id, segment container, job_type (Hls|Progressive)."
+    }
+  },
+
+  "part3_startffmpeg_orchestration": {
+    "location": "New method on TranscodeManagerImpl (or a StartFfMpeg free fn taking &impl SegmentTranscoder + &TranscodeManagerImpl). Depends ONLY on the SegmentTranscoder seam + filesystem, so it is fully unit-tested with FakeSegmentTranscoder.",
+    "signature": "pub async fn start_ffmpeg(&self, transcoder: &dyn SegmentTranscoder, state: &StreamState, output_path: &Path, args: Vec<String>, job_type: TranscodingJobType) -> Result<TranscodingJobHandle, String>",
+    "steps": [
+      "1. directory = output_path.parent(); create_dir_all(directory)  // Directory.CreateDirectory",
+      "2. (AcquireResources / attachment extraction / user-permission check are DEFERRED — noted; software path only for v1)",
+      "3. Build SpawnRequest { program = media_encoder.encoder_path(), arguments = args, working_dir, output_dir = directory, log_path }",
+      "4. register the job in the registry FIRST (OnTranscodeBeginning) so a concurrent segment request finds it; register_job(handle) already exists",
+      "5. child = transcoder.start_transcode(&req).await? ; on Err -> on_transcode_failed_to_start (remove job) and return Err",
+      "6. store RunningJob { handle, child, output_dir, playlist_path, segment_extension }",
+      "7. AWAIT-UNTIL-SEGMENT-EXISTS: let target = state.wait_for_path.unwrap_or(output_path); loop { if target.exists() || child.has_exited() { break } sleep(POLL_INTERVAL_MS=100).await } with an overall TIMEOUT (WAIT_FOR_FILE_TIMEOUT_MS, default 30000 — NEW setting candidate; C# loops unbounded on the CTS, we add a bound to avoid a hung request)",
+      "8. if child has_exited && exit_code != 0 -> Err(ffmpeg exited with code N)",
+      "9. (StartThrottler/StartSegmentCleaner are DEFERRED — flagged; not needed for first correct playback)",
+      "10. return the handle"
+    ],
+    "segment_cache_dir_strategy": {
+      "root": "server transcode path (ServerConfigurationManager.GetTranscodePath()) — reuse the configured cache path; DeleteEncodedMediaCache clears it on startup (port later).",
+      "per_session": "playlist file lives at <transcode_root>/<hash>.m3u8; segments are <transcode_root>/<hash>{index}.<ext> (mirror GetSegmentPath: folder + filenameWithoutExt + index + ext). The 'hash' is Jellyfin's deterministic output-file id (StreamingHelpers) — port the id derivation so a re-request reuses the same dir/playlist (enables OnTranscodeBeginRequest reuse instead of respawn).",
+      "wait_until_segment_N": "GetSegmentPath(state, playlist, index) => folder.join(filename + index + ext). 'Segment N ready' = file exists AND (child.has_exited() OR segment N+1 exists) — port GetSegmentResult verbatim; poll every 100ms until cancel/exit."
+    },
+    "cleanup": {
+      "kill": "kill_transcoding_jobs already removes from registry + notifies SessionReporter. Extend the impl so kill also calls child.kill().await and (when delete_files) removes every file in output_dir whose name contains the playlist stem (DeleteHlsPartialStreamFiles). This filesystem delete moves behind the existing SessionReporter.on_job_killed seam OR a small FileCleaner seam so it stays unit-testable with a temp dir.",
+      "ping_timeout": "PROGRESSIVE_PING_TIMEOUT_MS=10000 / HLS_PING_TIMEOUT_MS=60000 already ported. The actual kill-timer task (OnTranscodeKillTimerStopped) is the remaining piece: a tokio task per job that fires kill when now-last_ping >= ping_timeout. Unit-test with a fake clock / manual tick."
+    },
+    "settings_candidates_to_raise_with_user": [
+      "WAIT_FOR_FILE_TIMEOUT_MS (default 30000) — how long StartFfMpeg blocks for the first segment before erroring",
+      "SEGMENT_READY_POLL_INTERVAL_MS (default 100) — GetSegmentResult / StartFfMpeg poll cadence (C# hardcodes 100)",
+      "segmentGapRequiringTranscodingChange divisor 24 (C#: 24/segment_length) — the max forward gap before respawn"
+    ]
+  },
+
+  "part4_api_endpoints": {
+    "note": "All endpoints below are currently 501 stubs in hermit-api. This design WIRES them; they are this phase's scope, NOT the later portable-TODO phase.",
+    "endpoints": [
+      {"route": "GET /Videos/{itemId}/master.m3u8 (+HEAD)", "does": "build master playlist listing the variant (main.m3u8) stream(s) — DynamicHlsHelper.GetMasterPlaylist; no transcode spawn, just StreamState + playlist text", "trait_calls": ["MediaEncoder (probe/args)", "TranscodeManager none (master is static text)"]},
+      {"route": "GET /Videos/{itemId}/main.m3u8", "does": "the VOD variant playlist — DynamicHlsPlaylistGenerator::create_main_playlist (ALREADY DONE in hermit-hls). Just adapt StreamState->CreateMainPlaylistRequest and return the string.", "trait_calls": ["DynamicHlsPlaylistGenerator (done)"]},
+      {"route": "GET /Videos/{itemId}/live.m3u8", "does": "GetLiveHlsStream: event playlist; spawns ffmpeg (StartFfMpeg) then WaitForMinimumSegmentCount(minSegments) then returns live playlist text", "trait_calls": ["SegmentTranscoder::start_transcode", "TranscodeManager registry"]},
+      {"route": "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}", "does": "GetDynamicSegment: the core segment endpoint — if segment file exists serve it (OnTranscodeBeginRequest); else lock, decide startTranscoding (currentTranscodingIndex null / requested<current / gap>24/len), KillTranscodingJobs+DeleteLastFile if respawn, StartFfMpeg, then GetSegmentResult (wait-until-ready loop) and stream the .ts/.mp4", "trait_calls": ["TranscodeManager get/begin/end/kill", "SegmentTranscoder::start_transcode", "TranscodeChild has_exited"]},
+      {"route": "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer} (legacy) + GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8", "does": "HlsSegmentController: ValidateTranscodePath (path-traversal guard) then serve from transcode dir; OnTranscodeBeginRequest/OnTranscodeEndRequest around the response", "trait_calls": ["TranscodeManager on_transcode_begin_request/on_transcode_end_request"]},
+      {"route": "GET /Videos/{itemId}/stream.{container} (+ the transcode branch of /Videos/{itemId}/stream, already partly done for direct-play)", "does": "Progressive transcode: if not direct-play, GetProgressiveVideoFullCommandLine -> StartFfMpeg (Progressive) -> stream the growing output file (ProgressiveFileStream). Direct-play + Range is already implemented.", "trait_calls": ["SegmentTranscoder::start_transcode (Progressive)", "TranscodeManager registry"]},
+      {"route": "DELETE /Videos/ActiveEncodings", "does": "StopEncodingProcess: KillTranscodingJobs(deviceId, playSessionId, deleteFiles=true) -> 204", "trait_calls": ["TranscodeManager::kill_transcoding_jobs (extended to kill child + delete files)"]},
+      {"route": "GET /Audio/{itemId}/master.m3u8 (+HEAD) + /Audio/{itemId}/main.m3u8 + /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container} + legacy /Audio/{itemId}/hls/{segmentId}/stream.{aac,mp3}", "does": "audio HLS: same machinery as video but audio-only StreamState (GetMasterHlsAudioPlaylist/GetVariantHlsAudioPlaylist/GetHlsAudioSegment)", "trait_calls": ["same as video HLS"]},
+      {"route": "GET /Audio/{itemId}/universal (+HEAD)", "does": "GetUniversalAudioStream: decide direct-play (static file) vs 302 redirect vs transcode-to-HLS (delegates to the audio master.m3u8 path). First-light can implement direct + redirect; HLS branch reuses the audio HLS machinery.", "trait_calls": ["MediaEncoder probe", "DynamicHls audio path"]},
+      {"route": "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}", "does": "AttachmentExtractor::get_attachment(item_id, media_source_id, index) -> stream bytes with the attachment's mime; already have the trait, needs the concrete extractor + handler wiring", "trait_calls": ["AttachmentExtractor::get_attachment"]}
+    ]
+  },
+
+  "part5_integration_tests": {
+    "location": "crates/hermit-mediaencoding/tests/segment_transcode_ffmpeg.rs (integration dir → NOT part of the unit-coverage gate)",
+    "gating": "Each test starts with: if std::env::var('HERMIT_FFMPEG_TESTS').is_err() { eprintln!('skip'); return; } and also which('ffmpeg')/which('ffprobe') guard. So absent-ffmpeg CI is green; the gate runs only when the env is set on a host with ffmpeg.",
+    "plan": [
+      "1. generate a tiny clip: ffmpeg -f lavfi -i testsrc=duration=6:size=128x72:rate=10 -f lavfi -i sine=frequency=440:duration=6 -c:v libx264 -c:a aac /tmp/clip.mp4 (in a #[ctor]-style once, or per-test in a tempdir)",
+      "2. build real ffmpeg HLS args (mpegts, -hls_list_size 0, -hls_playlist_type vod, output <dir>/out%d.ts + out.m3u8) via encoding_helper or a fixed arg vector",
+      "3. TokioSegmentTranscoder::start_transcode(req).await -> child",
+      "4. run start_ffmpeg orchestration with wait_for_path = out0.ts; assert it returns Ok and out0.ts exists and is non-empty",
+      "5. child.wait().await == 0; assert out.m3u8 parses (contains #EXTM3U, #EXT-X-ENDLIST, >=1 #EXTINF) and at least 2 .ts segments exist",
+      "6. mp4/fmp4 variant: assert out-1.mp4 init segment + out0.mp4 appear; version 7 playlist",
+      "7. kill test: start a longer transcode, child.kill().await, assert has_exited() and (with delete) segment files removed",
+      "8. failure test: bogus args -> exit_code != 0 surfaces as Err from start_ffmpeg"
+    ],
+    "excluded_from_unit_gate": "tests/ integration tests never count toward `cargo llvm-cov` unit lines; additionally the concrete TokioSegmentTranscoder module carries the coverage carve-out (part-coverage_carveout) so the crate stays >=80% unit."
+  },
+
+  "coverage_carveout": {
+    "needed": true,
+    "target": "The single module crates/hermit-mediaencoding/src/transcoding/tokio_segment_transcoder.rs (real tokio::process spawn + Child stderr-pump/wait/kill wrapper).",
+    "mechanism": "Module-level `#![cfg_attr(coverage_nightly, coverage(off))]` (matching the hermit-traits definitions-crate exemption precedent) scoped to just this file, plus adding the file to a documented carve-out note. Everything else (SpawnRequest build, start_ffmpeg orchestration, wait-until-segment loop, GetSegmentResult ready logic, kill/cleanup, playlist adapters, all API handlers' non-ffmpeg logic) is unit-tested via FakeSegmentTranscoder and stays counted.",
+    "record_in": "brain/DEFERRED.md — add a row under the HLS/transcode entry noting the tokio_segment_transcoder carve-out + the HERMIT_FFMPEG_TESTS integration gate, mirroring the existing Transcoder-seam rationale."
+  },
+
+  "part6_portable_todo_routes": {
+    "explanation": "Of the 194 still-501 routes, the subsystem-deferred ones (LiveTv, Plugins/Packages/Repositories, SyncPlay, Intros/IntroSkipper, Channels, Backup, Trickplay tiles, RemoteSearch providers, FallbackFont, FileTransformation, SkipButtonCss, Tmdb, OpenSubtitles plugin) are NOT portable-TODO — they are whole missing subsystems. The HLS/streaming routes are THIS design's scope (part4). The remainder below are self-contained, in-model, portable handlers for a later phase — grouped.",
+    "groups": {
+      "image_write_upload_delete": [
+        "post /Items/{itemId}/Images/{imageType}",
+        "delete /Items/{itemId}/Images/{imageType}",
+        "post /Items/{itemId}/Images/{imageType}/{imageIndex}",
+        "delete /Items/{itemId}/Images/{imageType}/{imageIndex}",
+        "post /UserImage"
+      ],
+      "by_name_images": [
+        "get|head /Artists/{name}/Images/{imageType}/{imageIndex}",
+        "get|head /Genres/{name}/Images/{imageType}",
+        "get|head /Genres/{name}/Images/{imageType}/{imageIndex}",
+        "get|head /MusicGenres/{name}/Images/{imageType}",
+        "get /MusicGenres/{name}/Images/{imageType}/{imageIndex}"
+      ],
+      "similar_items": [
+        "get /Albums/{itemId}/Similar",
+        "get /Artists/{itemId}/Similar",
+        "get /Items/{itemId}/Similar",
+        "get /Movies/{itemId}/Similar",
+        "get /Trailers/{itemId}/Similar"
+      ],
+      "by_name_detail_and_instantmix": [
+        "get /Artists/{name}",
+        "get /MusicGenres/{name}/InstantMix"
+      ],
+      "shows_episodes_seasons": [
+        "get /Shows/{seriesId}/Episodes",
+        "get /Shows/{seriesId}/Seasons"
+      ],
+      "merge_split_versions": [
+        "post /MergeVersions/MergeEpisodes",
+        "post /MergeVersions/MergeMovies",
+        "post /MergeVersions/SplitEpisodes",
+        "post /MergeVersions/SplitMovies"
+      ],
+      "scheduler_cancel_trigger": [
+        "delete /ScheduledTasks/Running/{taskId}",
+        "post /ScheduledTasks/{taskId}/Triggers"
+      ],
+      "metadata_editor": [
+        "get /Items/{itemId}/MetadataEditor"
+      ],
+      "userviews_grouping": [
+        "get /UserViews/GroupingOptions"
+      ],
+      "playlists_crud": [
+        "get|post /Playlists/{playlistId}",
+        "get|post|delete /Playlists/{playlistId}/Items",
+        "get /Playlists/{playlistId}/Users",
+        "get|post|delete /Playlists/{playlistId}/Users/{userId}"
+      ],
+      "media_segments_api": [
+        "get /MediaSegmentsApi",
+        "post /MediaSegmentsApi/{itemId}",
+        "delete /MediaSegmentsApi/{segmentId}"
+      ],
+      "episode_timestamps": [
+        "get|post /Episode/{Id}/Timestamps"
+      ],
+      "library_virtual_folders_and_folders": [
+        "get|post|delete /Library/VirtualFolders",
+        "post /Library/VirtualFolders/LibraryOptions",
+        "post /Library/VirtualFolders/Name",
+        "post|delete /Library/VirtualFolders/Paths",
+        "post /Library/VirtualFolders/Paths/Update",
+        "get /Library/MediaFolders",
+        "get /Library/PhysicalPaths",
+        "get /Libraries/AvailableOptions",
+        "post /Library/{Media,Movies,Series}/{Added,Updated}"
+      ],
+      "branding_splashscreen": [
+        "get|post|delete /Branding/Splashscreen"
+      ]
+    },
+    "note": "The virtual-folders / library-folders group borders on a subsystem (library management); listed as portable because the handlers are CRUD over already-ported library models. Confirm scope when the phase starts."
+  }
+}

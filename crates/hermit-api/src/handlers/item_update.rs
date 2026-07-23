@@ -8,6 +8,9 @@
 //!   content-type override for the item's folder in the server configuration.
 //! - `POST /Items/{itemId}/Refresh` — queues a metadata/image refresh for the
 //!   item at high priority.
+//! - `GET /Items/{itemId}/MetadataEditor` — the reference data (parental ratings,
+//!   countries, cultures, external-id descriptors, content-type options) a client
+//!   needs to render the item's metadata editor.
 //!
 //! Faithfulness notes / deferrals: the C# `UpdateItem` cascades edits onto a
 //! series' seasons/episodes and an album's tracks (and queues a provider refresh
@@ -18,16 +21,39 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use hermit_db::entities::base_items::BaseItemEntity;
-use hermit_model::dto::{BaseItemDto, NameValuePair};
+use hermit_model::dto::{BaseItemDto, MetadataEditorInfo, NameValuePair};
 use hermit_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// The content-type options offered by the metadata editor for a single item.
+///
+/// Port of `ItemUpdateController.GetContentTypeOptions(isForItem: true)`: the
+/// `Inherit` (empty value) option plus the per-item collection types. The
+/// `!isForItem` extras (`Books`, `MixedContent`) are omitted, matching the C#
+/// call the editor makes with `isForItem = true`. Names are the English labels
+/// (the C# `GetLocalizedString` pass is identity for the default culture).
+fn item_content_type_options() -> Vec<NameValuePair> {
+    [
+        ("Inherit", ""),
+        ("Movies", "movies"),
+        ("Music", "music"),
+        ("Shows", "tvshows"),
+        ("HomeVideos", "homevideos"),
+        ("MusicVideos", "musicvideos"),
+        ("Photos", "photos"),
+    ]
+    .into_iter()
+    .map(|(name, value)| NameValuePair::new(name, value))
+    .collect()
+}
 
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
 ///
@@ -339,6 +365,62 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(update_item_content_type),
         )
         .route("/Items/{itemId}/Refresh", post(refresh_item))
+        .route("/Items/{itemId}/MetadataEditor", get(get_metadata_editor))
+}
+
+/// `GET /Items/{itemId}/MetadataEditor` — the item's metadata-editor descriptor.
+///
+/// Port of `ItemUpdateController.GetMetadataEditorInfo`: resolves the item (`404`
+/// when absent), then assembles the reference data — parental ratings, countries,
+/// cultures (deduped by display name, name-ordered), the item's external-id
+/// descriptors, and the per-item content-type options.
+///
+/// Port note — content type: C# refines `ContentType`/`ContentTypeOptions` from
+/// the folder's inherited vs configured collection type
+/// (`GetInheritedContentType`/`GetConfiguredContentType`), which need the
+/// un-ported collection-folder tree. The portable seam always offers the full
+/// per-item option set with an unset `ContentType`; the descriptor shape and the
+/// reference lists are already the final ones.
+#[utoipa::path(
+    get,
+    path = "/Items/{itemId}/MetadataEditor",
+    params(("itemId" = String, Path, description = "The item id")),
+    responses(
+        (status = 200, description = "Metadata editor returned", body = MetadataEditorInfo),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn get_metadata_editor(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<MetadataEditorInfo>, ApiError> {
+    if state.library.get_item_by_id(item_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+
+    let external_id_infos = state.providers.get_external_id_infos(item_id).await?;
+
+    // Dedupe cultures by display name (case-insensitively) and order by it, as in
+    // C#'s `DistinctBy(...).OrderBy(c => c.DisplayName)`.
+    let mut cultures = state.localization.get_cultures();
+    cultures.sort_by(|a, b| {
+        a.display_name
+            .to_ascii_lowercase()
+            .cmp(&b.display_name.to_ascii_lowercase())
+    });
+    cultures.dedup_by(|a, b| a.display_name.eq_ignore_ascii_case(&b.display_name));
+
+    let info = MetadataEditorInfo {
+        parental_rating_options: state.localization.get_parental_ratings(),
+        countries: state.localization.get_countries(),
+        cultures,
+        external_id_infos,
+        content_type: None,
+        content_type_options: item_content_type_options(),
+    };
+    Ok(Json(info))
 }
 
 #[cfg(test)]

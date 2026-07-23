@@ -10,8 +10,16 @@
 //! [`SessionReporter`] seam so unit tests inject a fake.
 
 pub mod manager;
+pub mod segment_transcoder;
+pub mod tokio_segment_transcoder;
 
 pub use manager::{
-    HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS, SessionReporter,
-    TranscodeManagerImpl,
+    FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter,
+    PROGRESSIVE_PING_TIMEOUT_MS, SEGMENT_READY_POLL_INTERVAL_MS, SessionReporter,
+    TranscodeManagerImpl, WAIT_FOR_FILE_TIMEOUT_MS,
 };
+pub use segment_transcoder::{
+    FakeScript, FakeSegmentTranscoder, FakeTranscodeChild, SegmentTranscoder, SpawnRequest,
+    TranscodeChild,
+};
+pub use tokio_segment_transcoder::TokioSegmentTranscoder;

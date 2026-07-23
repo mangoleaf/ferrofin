@@ -22,6 +22,7 @@ mod display_preferences_dto;
 mod image_info;
 mod item_counts;
 mod media_source_info;
+mod metadata_editor_info;
 mod name_pairs;
 mod playlist_dto;
 mod recommendation_dto;
@@ -39,6 +40,7 @@ pub use display_preferences_dto::{DisplayPreferencesDto, ScrollDirection, SortOr
 pub use image_info::ImageInfo;
 pub use item_counts::ItemCounts;
 pub use media_source_info::MediaSourceInfo;
+pub use metadata_editor_info::MetadataEditorInfo;
 pub use name_pairs::{NameGuidPair, NameIdPair, NameValuePair};
 pub use playlist_dto::PlaylistDto;
 pub use recommendation_dto::RecommendationDto;

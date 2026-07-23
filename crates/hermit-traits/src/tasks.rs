@@ -18,7 +18,7 @@
 //! Reuses the `hermit-model` wire DTO [`TaskInfo`] verbatim.
 
 use async_trait::async_trait;
-use hermit_model::tasks::TaskInfo;
+use hermit_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::error::ServiceError;
 
@@ -50,6 +50,35 @@ pub trait TaskManager: Send + Sync {
     /// [`ServiceError::InvalidInput`] when it is already running; or whatever
     /// error the task body itself returns.
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError>;
+
+    /// Cancels a running task.
+    ///
+    /// Ports `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`. This
+    /// scheduler-less registry never runs a task in the background, so cancelling
+    /// an idle task is a no-op; the observable behaviour is the C# one — a missing
+    /// task is [`ServiceError::NotFound`], otherwise it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no task has that id.
+    async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError>;
+
+    /// Replaces a task's configured triggers.
+    ///
+    /// Ports `ScheduledTasksController.UpdateTask` → `task.Triggers = triggerInfos`.
+    /// The stored triggers are surfaced in the task's [`TaskInfo`]; this registry
+    /// has no scheduler, so they are advisory (never fired) but do persist across
+    /// reads, exactly as the C# assignment updates the configurable task's
+    /// trigger list.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no task has that id.
+    async fn update_triggers(
+        &self,
+        task_id: &str,
+        triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_task_manager(_: &dyn TaskManager) {}

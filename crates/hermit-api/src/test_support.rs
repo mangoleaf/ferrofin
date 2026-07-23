@@ -58,7 +58,7 @@ use hermit_model::session::{
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
 };
 use hermit_model::system::{PublicSystemInfo, SystemInfo, SystemStorageInfo};
-use hermit_model::tasks::TaskInfo;
+use hermit_model::tasks::{TaskInfo, TaskTriggerInfo};
 use hermit_model::users::UserPolicy;
 use hermit_traits::activity::{ActivityLogQuery, ActivityManager};
 use hermit_traits::collections::{CollectionCreationOptions, CollectionManager, PlaylistManager};
@@ -1659,6 +1659,16 @@ impl TaskManager for FakeTasks {
         unimplemented!("fake")
     }
     async fn start_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn cancel_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_triggers(
+        &self,
+        _task_id: &str,
+        _triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
 }

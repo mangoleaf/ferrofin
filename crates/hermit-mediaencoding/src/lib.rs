@@ -28,6 +28,8 @@ pub use encoding_helper::{
     NoOptionalEncoders,
 };
 pub use transcoding::{
-    HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS, SessionReporter,
-    TranscodeManagerImpl,
+    FakeScript, FakeSegmentTranscoder, FakeTranscodeChild, FileCleaner, FsFileCleaner,
+    HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS,
+    SEGMENT_READY_POLL_INTERVAL_MS, SegmentTranscoder, SessionReporter, SpawnRequest,
+    TokioSegmentTranscoder, TranscodeChild, TranscodeManagerImpl, WAIT_FOR_FILE_TIMEOUT_MS,
 };

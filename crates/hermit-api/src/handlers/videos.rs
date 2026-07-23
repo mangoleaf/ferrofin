@@ -58,10 +58,22 @@ async fn get_video_stream(
 async fn get_video_stream_by_container(
     State(state): State<AppState>,
     Path((item_id, _container)): Path<(Uuid, String)>,
+    Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
-    serve_static_file(&path, request).await
+    // Direct-play the static file when the item has one; otherwise fall back to
+    // the progressive-transcode branch (VideosController.GetVideoStream), now
+    // wired to the real transcode runtime via the HlsStreamManager seam.
+    match stream_path(&state, item_id).await {
+        Ok(path) => serve_static_file(&path, request).await,
+        Err(ApiError::NotFound(_)) => {
+            let raw = request.uri().query().map(ToOwned::to_owned);
+            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw);
+            crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request)
+                .await
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Query parameters for `GET /Videos/{itemId}/AdditionalParts`.

@@ -7,12 +7,13 @@
 //! - `GET /ScheduledTasks/{taskId}` — one task by id (`404` when missing).
 //! - `POST /ScheduledTasks/Running/{taskId}` — run a task now (`204`; `404` when
 //!   missing).
-//!
-//! Deferred (kept on the shared `501` stub, per the batch's scheduled-task-cron
-//! deferral): `DELETE /ScheduledTasks/Running/{taskId}` (`ITaskManager.Cancel` —
-//! there is no background execution to cancel) and
-//! `POST /ScheduledTasks/{taskId}/Triggers` (`IConfigurableScheduledTask.Triggers`
-//! — trigger-config persistence). Both need the un-ported cron scheduler.
+//! - `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task (`204`; `404` when
+//!   missing). This registry runs nothing in the background, so cancelling is a
+//!   state reset — the observable `404`/`204` outcome matches the C# `StopTask`.
+//! - `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's configured
+//!   triggers (`204`; `404` when missing). The triggers are persisted on the task
+//!   and surfaced on its next read; with no scheduler they never fire, exactly as
+//!   the C# `task.Triggers = triggerInfos` assignment is advisory here.
 //!
 //! Elevation-policy enforcement (`Policies.RequiresElevation`) is deferred to the
 //! composition root, matching the other admin controllers; every handler here
@@ -22,7 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use hermit_model::tasks::TaskInfo;
+use hermit_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
@@ -134,10 +135,67 @@ async fn start_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /ScheduledTasks/Running/{taskId}` — cancel a task.
+///
+/// Port of `ScheduledTasksController.StopTask` → `ITaskManager.Cancel`. Returns
+/// `204 No Content`; a missing task is `404`. This registry runs nothing in the
+/// background, so cancellation is a state reset (see the module docs).
+#[utoipa::path(
+    delete,
+    path = "/ScheduledTasks/Running/{taskId}",
+    params(("taskId" = String, Path, description = "Task Id.")),
+    responses(
+        (status = 204, description = "Task stopped"),
+        (status = 404, description = "Task not found"),
+    ),
+    tag = "hermit"
+)]
+async fn stop_task(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.tasks.cancel_task(&task_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's triggers.
+///
+/// Port of `ScheduledTasksController.UpdateTask` → `task.Triggers = triggerInfos`.
+/// Persists the posted trigger list on the task (surfaced on its next read) and
+/// returns `204 No Content`; a missing task is `404`.
+#[utoipa::path(
+    post,
+    path = "/ScheduledTasks/{taskId}/Triggers",
+    params(("taskId" = String, Path, description = "Task Id.")),
+    request_body = [TaskTriggerInfo],
+    responses(
+        (status = 204, description = "Task triggers updated"),
+        (status = 404, description = "Task not found"),
+    ),
+    tag = "hermit"
+)]
+async fn update_task_triggers(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(task_id): Path<String>,
+    Json(triggers): Json<Vec<TaskTriggerInfo>>,
+) -> Result<StatusCode, ApiError> {
+    state.tasks.update_triggers(&task_id, &triggers).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/ScheduledTasks", get(get_tasks))
         .route("/ScheduledTasks/{taskId}", get(get_task))
-        .route("/ScheduledTasks/Running/{taskId}", post(start_task))
+        .route(
+            "/ScheduledTasks/Running/{taskId}",
+            post(start_task).delete(stop_task),
+        )
+        .route(
+            "/ScheduledTasks/{taskId}/Triggers",
+            post(update_task_triggers),
+        )
 }

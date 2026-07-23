@@ -147,3 +147,39 @@ async fn probed_contract_routes_never_404() {
         );
     }
 }
+
+/// `REAL_ROUTES` must have no duplicate `(method, path)` rows.
+///
+/// Duplicates are harmless to the router (which mounts real handlers by
+/// membership, not by iterating this table), but they inflate the "REAL vs 501"
+/// route count and mislead the contract accounting. This guard keeps the table
+/// a true set so the counts in `PORT_REPORT.md` stay honest.
+#[test]
+fn real_routes_have_no_duplicates() {
+    use hermit_api::handlers::REAL_ROUTES;
+
+    let mut seen = BTreeSet::new();
+    let mut dups = Vec::new();
+    for (method, path) in REAL_ROUTES {
+        if !seen.insert((*method, *path)) {
+            dups.push((*method, *path));
+        }
+    }
+    assert!(
+        dups.is_empty(),
+        "REAL_ROUTES contains duplicate (method, path) rows: {dups:?}"
+    );
+    // Every real route must also be a genuine contract operation (no orphans).
+    let vendored: BTreeSet<(String, String)> = VENDORED_ROUTES
+        .iter()
+        .map(|(m, p)| (m.to_string(), normalize_contract_path(p)))
+        .collect();
+    let orphans: Vec<_> = REAL_ROUTES
+        .iter()
+        .filter(|(m, p)| !vendored.contains(&(m.to_string(), (*p).to_string())))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "REAL_ROUTES has entries absent from the vendored contract: {orphans:?}"
+    );
+}

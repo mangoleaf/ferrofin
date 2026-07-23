@@ -1,12 +1,54 @@
-//! Port of the job-registry half of `TranscodeManager`.
+//! Port of the job-registry half of `TranscodeManager`, plus the `StartFfMpeg`
+//! spawn orchestration.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hermit_traits::error::ServiceError;
 use hermit_traits::media_encoding::{
     TranscodeManager, TranscodingJobHandle, TranscodingJobType, TranscodingProgress,
 };
+
+use crate::encoding_helper::EncodingJobInfo;
+
+use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
+
+/// How long `start_ffmpeg` blocks for the first segment before erroring, in
+/// milliseconds.
+///
+/// The C# `StartFfMpeg` loops unbounded on the cancellation token; this port
+/// adds a bound so a wedged ffmpeg cannot hang the request forever. Configurable
+/// candidate (default 30 s).
+pub const WAIT_FOR_FILE_TIMEOUT_MS: u64 = 30_000;
+
+/// The poll cadence for the "wait until the segment file exists" loops, in
+/// milliseconds. Port of the hard-coded `Task.Delay(100)` in `StartFfMpeg` and
+/// `GetSegmentResult`.
+pub const SEGMENT_READY_POLL_INTERVAL_MS: u64 = 100;
+
+/// The inputs to [`TranscodeManagerImpl::start_ffmpeg`].
+///
+/// Bundles the `StartFfMpeg` arguments (`outputPath`, `commandLineArguments`,
+/// `workingDirectory`, the log target) into one value so the call stays under
+/// the argument-count lint and reads as a request.
+#[derive(Debug, Clone)]
+pub struct StartFfMpegRequest<'a> {
+    /// The resolved ffmpeg binary path (`MediaEncoder::encoder_path`).
+    pub program: &'a str,
+    /// The job state (`StreamState`) — supplies wait-for-path, session/device
+    /// ids, transcode type, and the segment container.
+    pub state: &'a EncodingJobInfo,
+    /// The playlist/output file path ffmpeg writes (`outputPath`).
+    pub output_path: &'a Path,
+    /// The fully-built ffmpeg arguments (`commandLineArguments`).
+    pub arguments: Vec<String>,
+    /// The stderr log target for this transcode (`FFmpeg.Transcode-*.log`).
+    pub log_path: PathBuf,
+    /// The process working directory, if any (`workingDirectory`).
+    pub working_dir: Option<PathBuf>,
+}
 
 /// The kill-timer duration for a progressive stream, in milliseconds.
 ///
@@ -50,9 +92,59 @@ impl SessionReporter for NoopSessionReporter {
     async fn on_job_killed(&self, _job: &TranscodingJobHandle, _delete_files: bool) {}
 }
 
+/// Deletes a killed HLS job's partial segment files from its cache directory.
+///
+/// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
+/// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
+/// unit-testable against a temp dir without touching a real transcode cache.
+pub trait FileCleaner: Send + Sync {
+    /// Deletes every file in `output_dir` whose filename contains
+    /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
+    fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
+}
+
+/// The real [`FileCleaner`]: deletes files with `std::fs`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsFileCleaner;
+
+impl FileCleaner for FsFileCleaner {
+    fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
+        let Ok(entries) = std::fs::read_dir(output_dir) else {
+            return;
+        };
+        let stem_lower = playlist_stem.to_ascii_lowercase();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains(&stem_lower)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// The live half of a job spawned by `start_ffmpeg`: the process handle plus the
+/// cache-directory metadata kill/cleanup needs.
+///
+/// Owned only inside the impl (never exposed through `hermit-traits`). Port of
+/// the ffmpeg-`Process` + output-path members of the C# `TranscodingJob`.
+struct RunningJob {
+    /// The live process handle.
+    child: Box<dyn TranscodeChild>,
+    /// The segment cache directory to purge on kill (`DeleteHlsPartialStreamFiles`).
+    output_dir: PathBuf,
+    /// The `.m3u8`/output path whose stem selects the files to delete.
+    playlist_path: PathBuf,
+    /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
+    #[allow(dead_code)]
+    segment_extension: String,
+}
+
 /// A registered transcode job: its identifying [`TranscodingJobHandle`] plus the
 /// mutable bookkeeping the registry tracks.
-#[derive(Debug, Clone)]
 struct RegisteredJob {
     handle: TranscodingJobHandle,
     is_user_paused: bool,
@@ -60,6 +152,9 @@ struct RegisteredJob {
     /// Number of active output requests (`ActiveRequestCount`); a job with zero
     /// begins its idle countdown toward kill.
     active_request_count: i32,
+    /// The live process + cache metadata when this job was spawned via
+    /// `start_ffmpeg`; `None` for registry-only jobs (lookup tests).
+    running: Option<RunningJob>,
 }
 
 impl RegisteredJob {
@@ -71,28 +166,40 @@ impl RegisteredJob {
     }
 }
 
-/// The `hermit-traits` [`TranscodeManager`] implementation (job registry only).
+/// The `hermit-traits` [`TranscodeManager`] implementation plus `StartFfMpeg`.
 ///
-/// Generic over the [`SessionReporter`] seam. `StartFfMpeg` and session wiring
-/// are deferred; this owns the active-job list and its lifecycle operations.
-pub struct TranscodeManagerImpl<S: SessionReporter> {
+/// Generic over the [`SessionReporter`] and [`FileCleaner`] seams. Owns the
+/// active-job list, spawns transcodes through a [`SegmentTranscoder`], and tears
+/// them down on kill.
+pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileCleaner> {
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
+    file_cleaner: C,
 }
 
-impl<S: SessionReporter> TranscodeManagerImpl<S> {
-    /// Creates an empty registry reporting through `reporter`.
+impl<S: SessionReporter> TranscodeManagerImpl<S, FsFileCleaner> {
+    /// Creates an empty registry reporting through `reporter`, deleting partial
+    /// files with the real [`FsFileCleaner`].
     pub fn new(reporter: S) -> Self {
+        Self::with_file_cleaner(reporter, FsFileCleaner)
+    }
+}
+
+impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
+    /// Creates an empty registry with an explicit `file_cleaner` seam (tests
+    /// inject a recording cleaner over a temp dir).
+    pub fn with_file_cleaner(reporter: S, file_cleaner: C) -> Self {
         Self {
             jobs: Mutex::new(Vec::new()),
             reporter,
+            file_cleaner,
         }
     }
 
     /// Registers a new job and returns its handle.
     ///
     /// Port of the `_activeTranscodingJobs.Add(job)` in `OnTranscodeBeginning`;
-    /// exposed so the deferred `StartFfMpeg` implementation can enrol jobs.
+    /// exposed so `start_ffmpeg` (and callers) can enrol jobs.
     ///
     /// # Panics
     ///
@@ -103,6 +210,7 @@ impl<S: SessionReporter> TranscodeManagerImpl<S> {
             is_user_paused: false,
             active_request_count: 1,
             handle: handle.clone(),
+            running: None,
         };
         self.jobs.lock().expect("jobs lock poisoned").push(job);
         handle
@@ -137,10 +245,269 @@ impl<S: SessionReporter> TranscodeManagerImpl<S> {
             })
             .map(|j| j.ping_timeout_ms)
     }
+
+    /// Spawns an ffmpeg transcode and blocks until its first segment exists.
+    ///
+    /// Port of `TranscodeManager.StartFfMpeg`: create the output directory,
+    /// register the job *first* (so a concurrent segment request finds it),
+    /// spawn through the [`SegmentTranscoder`] seam, then poll until the target
+    /// file exists or the process exits — surfacing a non-zero exit as an error.
+    /// The `AcquireResources` / attachment-extraction / user-permission steps and
+    /// the throttler / segment-cleaner tasks are deferred (software path only).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output directory cannot be created, the process
+    /// cannot be spawned, ffmpeg exits non-zero, or the first segment does not
+    /// appear within [`WAIT_FOR_FILE_TIMEOUT_MS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn start_ffmpeg(
+        &self,
+        transcoder: &dyn SegmentTranscoder,
+        request: StartFfMpegRequest<'_>,
+    ) -> Result<TranscodingJobHandle, String> {
+        let StartFfMpegRequest {
+            program,
+            state,
+            output_path,
+            arguments,
+            log_path,
+            working_dir,
+        } = request;
+
+        // 1. Directory.CreateDirectory(Path.GetDirectoryName(outputPath)).
+        let directory = output_path
+            .parent()
+            .ok_or_else(|| format!("output path {} has no parent", output_path.display()))?
+            .to_path_buf();
+        std::fs::create_dir_all(&directory)
+            .map_err(|e| format!("create output dir {}: {e}", directory.display()))?;
+
+        // 3. Build the spawn request (steps 2 = Acquire/attachment deferred).
+        let req = SpawnRequest {
+            program: program.to_owned(),
+            arguments,
+            working_dir,
+            output_dir: directory.clone(),
+            log_path,
+        };
+
+        let segment_extension = segment_file_extension(state.segment_container.as_deref());
+        let handle = TranscodingJobHandle {
+            play_session_id: state.play_session_id.clone(),
+            path: output_path.to_string_lossy().into_owned(),
+            job_type: state.transcoding_type,
+            device_id: state.device_id.clone(),
+        };
+
+        // 4. Register the job FIRST (OnTranscodeBeginning).
+        self.register_job(handle.clone());
+
+        // 5. Spawn; on failure remove the job (OnTranscodeFailedToStart).
+        let child = match transcoder.start_transcode(&req).await {
+            Ok(child) => child,
+            Err(e) => {
+                self.remove_job_by_path(&handle.path, handle.job_type);
+                return Err(e);
+            }
+        };
+
+        // 6. Store the live job so kill/cleanup can reach the child + cache dir.
+        self.attach_running(
+            &handle,
+            RunningJob {
+                child,
+                output_dir: directory,
+                playlist_path: output_path.to_path_buf(),
+                segment_extension,
+            },
+        );
+
+        // 7. Wait until the target file exists OR the process exits, bounded.
+        let target = state
+            .wait_for_path
+            .clone()
+            .unwrap_or_else(|| output_path.to_path_buf());
+        let deadline_polls = WAIT_FOR_FILE_TIMEOUT_MS / SEGMENT_READY_POLL_INTERVAL_MS.max(1);
+        let mut polls = 0u64;
+        loop {
+            let exited = self.with_running(&handle, |r| r.child.has_exited());
+            if target.exists() || exited == Some(true) {
+                break;
+            }
+            polls += 1;
+            if polls > deadline_polls {
+                self.kill_and_remove(&handle, true).await;
+                return Err(format!(
+                    "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
+                    target.display()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
+        }
+
+        // 8. A finished job that failed is an error (mirror the FfmpegException).
+        let exited = self.with_running(&handle, |r| r.child.has_exited());
+        if exited == Some(true) {
+            let code = self
+                .with_running(&handle, |r| r.child.exit_code())
+                .flatten();
+            if code.unwrap_or(0) != 0 {
+                self.remove_job_by_path(&handle.path, handle.job_type);
+                return Err(format!("FFmpeg exited with code {}", code.unwrap_or(-1)));
+            }
+        }
+
+        // 9. Throttler / segment-cleaner deferred. 10. Return the handle.
+        Ok(handle)
+    }
+
+    /// Waits until segment `index` is ready to serve for `playlist_path`.
+    ///
+    /// Port of `GetSegmentResult`: a segment is ready when its file exists AND
+    /// (the job has exited OR segment `index + 1` exists). Polls every
+    /// [`SEGMENT_READY_POLL_INTERVAL_MS`] until ready or the job exits; returns
+    /// `true` if the segment ends up on disk. The `<hash>{index}.<ext>` naming
+    /// mirrors `GetSegmentPath`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn wait_for_segment(
+        &self,
+        handle: &TranscodingJobHandle,
+        playlist_path: &Path,
+        index: i32,
+    ) -> bool {
+        let ext = self
+            .with_running(handle, |r| r.segment_extension.clone())
+            .unwrap_or_else(|| ".ts".to_owned());
+        let seg = segment_path(playlist_path, index, &ext);
+        let next = segment_path(playlist_path, index + 1, &ext);
+
+        loop {
+            let exited = self
+                .with_running(handle, |r| r.child.has_exited())
+                .unwrap_or(true);
+            if seg.exists() && (exited || next.exists()) {
+                return true;
+            }
+            if exited {
+                return seg.exists();
+            }
+            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
+        }
+    }
+
+    /// Kills the process behind `handle` (if any) and removes it, deleting its
+    /// partial segment files when `delete_files` is set. Shared by the timeout
+    /// path, the kill-timer, and `kill_transcoding_jobs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn kill_and_remove(&self, handle: &TranscodingJobHandle, delete_files: bool) {
+        let running = {
+            let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+            let idx = jobs.iter().position(|j| {
+                j.handle.job_type == handle.job_type
+                    && j.handle.path.eq_ignore_ascii_case(&handle.path)
+            });
+            idx.and_then(|i| jobs.remove(i).running)
+        };
+        if let Some(running) = running {
+            let _ = running.child.kill().await;
+            if delete_files {
+                let stem = running
+                    .playlist_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.file_cleaner
+                    .delete_partial_stream_files(&running.output_dir, &stem);
+            }
+        }
+        self.reporter.on_job_killed(handle, delete_files).await;
+    }
+
+    /// Runs the kill-timer for `handle`: after `ping_timeout` with no ping, the
+    /// job is killed. Port of `OnTranscodeKillTimerStopped`; `sleep` is injected
+    /// so a fake clock can drive it deterministically in unit tests.
+    pub async fn run_kill_timer<F, Fut>(
+        &self,
+        handle: &TranscodingJobHandle,
+        ping_timeout: Duration,
+        sleep: F,
+    ) where
+        F: FnOnce(Duration) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        sleep(ping_timeout).await;
+        self.kill_and_remove(handle, true).await;
+    }
+
+    /// Removes the registered job for `path`/`job_type` (no child teardown).
+    fn remove_job_by_path(&self, path: &str, job_type: TranscodingJobType) {
+        self.jobs.lock().expect("jobs lock poisoned").retain(|j| {
+            !(j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path))
+        });
+    }
+
+    /// Attaches the live [`RunningJob`] to the registered entry for `handle`.
+    fn attach_running(&self, handle: &TranscodingJobHandle, running: RunningJob) {
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        if let Some(job) = jobs.iter_mut().find(|j| {
+            j.handle.job_type == handle.job_type && j.handle.path.eq_ignore_ascii_case(&handle.path)
+        }) {
+            job.running = Some(running);
+        }
+    }
+
+    /// Reads the [`RunningJob`] for `handle` under the lock, mapping it with `f`.
+    fn with_running<R>(
+        &self,
+        handle: &TranscodingJobHandle,
+        f: impl FnOnce(&RunningJob) -> R,
+    ) -> Option<R> {
+        let jobs = self.jobs.lock().expect("jobs lock poisoned");
+        jobs.iter()
+            .find(|j| {
+                j.handle.job_type == handle.job_type
+                    && j.handle.path.eq_ignore_ascii_case(&handle.path)
+            })
+            .and_then(|j| j.running.as_ref())
+            .map(f)
+    }
+}
+
+/// The segment file extension for `segment_container` (`.ts` default).
+///
+/// Port of `EncodingHelper.GetSegmentFileExtension` (mirrors the `hermit-hls`
+/// helper) so the cache-dir naming here agrees with the playlist generator.
+fn segment_file_extension(segment_container: Option<&str>) -> String {
+    match segment_container.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("mp4") => ".mp4".to_owned(),
+        _ => ".ts".to_owned(),
+    }
+}
+
+/// The on-disk path of segment `index` for `playlist`.
+///
+/// Port of `GetSegmentPath`: `<folder>/<playlist-stem><index><ext>`.
+fn segment_path(playlist: &Path, index: i32, extension: &str) -> PathBuf {
+    let folder = playlist.parent().unwrap_or_else(|| Path::new(""));
+    let stem = playlist
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    folder.join(format!("{stem}{index}{extension}"))
 }
 
 #[async_trait]
-impl<S: SessionReporter> TranscodeManager for TranscodeManagerImpl<S> {
+impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerImpl<S, C> {
     async fn get_transcoding_job_by_session(
         &self,
         play_session_id: &str,
@@ -199,11 +566,13 @@ impl<S: SessionReporter> TranscodeManager for TranscodeManagerImpl<S> {
         play_session_id: Option<&str>,
         delete_files: bool,
     ) -> Result<(), ServiceError> {
+        // Collect the matching handles under the lock, then tear each down via
+        // `kill_and_remove` (child.kill + partial-file delete + reporter) so a
+        // live spawned job's process is actually stopped, not just dropped.
         let killed: Vec<TranscodingJobHandle> = {
-            let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
-            let mut killed = Vec::new();
-            jobs.retain(|j| {
-                let matches = match play_session_id {
+            let jobs = self.jobs.lock().expect("jobs lock poisoned");
+            jobs.iter()
+                .filter(|j| match play_session_id {
                     Some(psid) if !psid.trim().is_empty() => j
                         .handle
                         .play_session_id
@@ -214,17 +583,13 @@ impl<S: SessionReporter> TranscodeManager for TranscodeManagerImpl<S> {
                         .device_id
                         .as_deref()
                         .is_some_and(|d| d.eq_ignore_ascii_case(device_id)),
-                };
-                if matches {
-                    killed.push(j.handle.clone());
-                }
-                !matches
-            });
-            killed
+                })
+                .map(|j| j.handle.clone())
+                .collect()
         };
 
         for job in &killed {
-            self.reporter.on_job_killed(job, delete_files).await;
+            self.kill_and_remove(job, delete_files).await;
         }
         Ok(())
     }
@@ -459,5 +824,316 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+}
+
+/// Tests for the `start_ffmpeg` spawn orchestration, driven by the
+/// [`FakeSegmentTranscoder`] seam so no real ffmpeg is involved.
+#[cfg(test)]
+mod start_ffmpeg_tests {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use hermit_model::dto::MediaSourceInfo;
+    use hermit_traits::media_encoding::{TranscodeManager, TranscodingJobType};
+
+    use crate::encoding_helper::{BaseEncodingJobOptions, EncodingJobInfo};
+    use crate::transcoding::segment_transcoder::{FakeScript, FakeSegmentTranscoder};
+
+    use super::{
+        FileCleaner, FsFileCleaner, NoopSessionReporter, StartFfMpegRequest, TranscodeManagerImpl,
+    };
+
+    /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`, its
+    /// log alongside the playlist.
+    fn ffmpeg_req<'a>(
+        state: &'a EncodingJobInfo,
+        output_path: &'a Path,
+        args: Vec<String>,
+    ) -> StartFfMpegRequest<'a> {
+        StartFfMpegRequest {
+            program: "ffmpeg",
+            state,
+            output_path,
+            arguments: args,
+            log_path: output_path.with_extension("log"),
+            working_dir: None,
+        }
+    }
+
+    /// Builds an HLS `EncodingJobInfo` writing its playlist at `output_path`.
+    fn state(output_path: &Path, wait_for: Option<&Path>) -> EncodingJobInfo {
+        EncodingJobInfo {
+            base_request: BaseEncodingJobOptions::default(),
+            video_stream: None,
+            audio_stream: None,
+            subtitle_stream: None,
+            media_source: MediaSourceInfo::default(),
+            output_video_codec: None,
+            output_audio_codec: None,
+            output_video_bitrate: None,
+            output_audio_bitrate: None,
+            output_audio_channels: None,
+            output_container: None,
+            output_video_sync: None,
+            output_file_path: output_path.to_string_lossy().into_owned(),
+            input_container: None,
+            is_input_video: true,
+            subtitle_delivery_method: hermit_model::dlna::SubtitleDeliveryMethod::Encode,
+            run_time_ticks: None,
+            transcoding_type: TranscodingJobType::Hls,
+            supported_video_codecs: Vec::new(),
+            supported_audio_codecs: Vec::new(),
+            segment_length_secs: 6,
+            wait_for_path: wait_for.map(Path::to_path_buf),
+            segment_container: Some("ts".to_owned()),
+            play_session_id: Some("sess".to_owned()),
+            device_id: Some("dev".to_owned()),
+        }
+    }
+
+    fn manager() -> TranscodeManagerImpl<NoopSessionReporter> {
+        TranscodeManagerImpl::new(NoopSessionReporter)
+    }
+
+    #[tokio::test]
+    async fn start_ffmpeg_creates_dir_registers_job_and_waits_for_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("session");
+        let playlist = out_dir.join("out.m3u8");
+        // Fake writes the playlist (the wait target) synchronously on spawn.
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+
+        let handle = m
+            .start_ffmpeg(
+                &fake,
+                ffmpeg_req(&st, &playlist, vec!["-i".to_owned(), "in.mkv".to_owned()]),
+            )
+            .await
+            .expect("start_ffmpeg");
+
+        assert!(out_dir.exists(), "output dir created");
+        assert!(playlist.exists(), "wait target created");
+        assert_eq!(m.active_job_count(), 1);
+        assert_eq!(handle.job_type, TranscodingJobType::Hls);
+        // The seam received the fully-built args.
+        let reqs = fake.requests.lock().unwrap();
+        assert_eq!(
+            reqs[0].arguments,
+            vec!["-i".to_owned(), "in.mkv".to_owned()]
+        );
+        assert_eq!(reqs[0].output_dir, out_dir);
+    }
+
+    #[tokio::test]
+    async fn start_ffmpeg_errors_when_seam_spawn_fails() {
+        struct FailingSeam;
+        #[async_trait::async_trait]
+        impl crate::transcoding::segment_transcoder::SegmentTranscoder for FailingSeam {
+            async fn start_transcode(
+                &self,
+                _req: &crate::transcoding::segment_transcoder::SpawnRequest,
+            ) -> Result<Box<dyn crate::transcoding::segment_transcoder::TranscodeChild>, String>
+            {
+                Err("boom".to_owned())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let m = manager();
+        let st = state(&playlist, None);
+        let err = m
+            .start_ffmpeg(&FailingSeam, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        // Failed start removes the job (OnTranscodeFailedToStart).
+        assert_eq!(m.active_job_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn start_ffmpeg_surfaces_nonzero_exit_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        // Child exits immediately with a non-zero code; the wait target is
+        // written so the loop breaks on exit, then the exit code is checked.
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let err = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exited with code 1"), "got: {err}");
+        assert_eq!(m.active_job_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_ready_when_next_segment_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        // Fake writes out0.ts, out1.ts and the playlist up front: segment 0 is
+        // ready because segment 1 (next) exists.
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned(), "out1.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_ready_when_job_has_exited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        // Only segment 0 exists (no next), but the job exited → ready.
+        assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+    }
+
+    /// A [`FileCleaner`] that records the deletions it was asked to perform, and
+    /// still performs them, so kill/cleanup is observable over a temp dir.
+    #[derive(Clone)]
+    struct RecordingCleaner {
+        calls: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+    }
+
+    impl FileCleaner for RecordingCleaner {
+        fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((output_dir.to_path_buf(), playlist_stem.to_owned()));
+            FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_transcoding_jobs_kills_child_and_deletes_partial_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned(), "out1.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let cleaner = RecordingCleaner {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let m = TranscodeManagerImpl::with_file_cleaner(NoopSessionReporter, cleaner.clone());
+        let st = state(&playlist, Some(&playlist));
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        assert!(playlist.exists());
+
+        m.kill_transcoding_jobs("dev", Some("sess"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(m.active_job_count(), 0);
+        let calls = cleaner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "out"); // playlist stem
+        // The partial files (containing the stem "out") are gone.
+        assert!(!out_dir.join("out0.ts").exists());
+        assert!(!playlist.exists());
+    }
+
+    #[tokio::test]
+    async fn kill_without_delete_keeps_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        m.kill_and_remove(&handle, false).await;
+        assert_eq!(m.active_job_count(), 0);
+        assert!(playlist.exists(), "files kept when delete_files=false");
+    }
+
+    #[tokio::test]
+    async fn kill_timer_fires_kill_after_timeout_with_fake_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+
+        // Fake clock: records the requested duration, returns instantly.
+        let slept = Arc::new(Mutex::new(None));
+        let slept2 = Arc::clone(&slept);
+        m.run_kill_timer(&handle, Duration::from_mins(1), move |d| {
+            *slept2.lock().unwrap() = Some(d);
+            async {}
+        })
+        .await;
+
+        assert_eq!(*slept.lock().unwrap(), Some(Duration::from_mins(1)));
+        assert_eq!(m.active_job_count(), 0, "kill timer removed the job");
+    }
+
+    #[test]
+    fn segment_path_mirrors_get_segment_path() {
+        use super::{segment_file_extension, segment_path};
+        let ext = segment_file_extension(Some("ts"));
+        assert_eq!(ext, ".ts");
+        let p = segment_path(Path::new("/cache/abcd.m3u8"), 3, &ext);
+        assert_eq!(p, Path::new("/cache/abcd3.ts"));
+        assert_eq!(segment_file_extension(Some("mp4")), ".mp4");
+        assert_eq!(segment_file_extension(Some("  ")), ".ts");
+        assert_eq!(segment_file_extension(None), ".ts");
     }
 }

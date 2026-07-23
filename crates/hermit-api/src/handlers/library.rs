@@ -9,15 +9,27 @@
 //!   soundtrack result, matching C#).
 //! - `GET /Items/{itemId}/File` — the item's original on-disk file.
 //! - `POST /Library/Refresh` — queues a full library scan.
+//! - `GET /Library/MediaFolders` — the server's media (collection) folders,
+//!   name-sorted, projected to [`BaseItemDto`](hermit_model::dto::BaseItemDto).
 //!
-//! The remaining `LibraryController` routes stay on the shared `501` stub as
-//! intentional deferrals, because each depends on a subsystem Hermit does not
-//! model at this portable seam:
-//! - `GET /Library/PhysicalPaths`, `GET /Library/MediaFolders`,
-//!   `GET /Libraries/AvailableOptions` — the on-disk *collection-folder* tree,
-//!   its per-library `LibraryOptions`, and the metadata-plugin registry (none of
-//!   which are ported; `LibraryOptions` is deliberately impl-internal and absent
-//!   from every trait seam).
+//! The remaining `LibraryController`/`LibraryStructureController` routes stay on
+//! the shared `501` stub as intentional deferrals, because each depends on a
+//! subsystem Hermit does not model at this portable seam:
+//! - `GET /Library/PhysicalPaths` — the physical on-disk locations of each
+//!   collection folder (`Folder.PhysicalLocations`), which the portable
+//!   [`BaseItemEntity`] rows do not carry.
+//! - `GET|POST|DELETE /Library/VirtualFolders` and the `Name`/`Paths`/
+//!   `LibraryOptions` mutation routes — `ILibraryManager.GetVirtualFolders`/
+//!   `AddVirtualFolder`/`RemoveVirtualFolder`/… over the on-disk collection-folder
+//!   tree and its per-library `LibraryOptions` persistence, which is deliberately
+//!   impl-internal and absent from every trait seam.
+//! - `GET /Libraries/AvailableOptions` — assembled from the metadata-plugin
+//!   registry (`GetAllMetadataPlugins`) plus the static representative-type /
+//!   default-image tables, none of which are ported (no metadata plugins exist at
+//!   this seam).
+//! - The `isHidden` filter on `/Library/MediaFolders` — the per-folder hidden
+//!   flag lives in the un-ported `LibraryOptions`, so the folders are returned
+//!   unfiltered (the query still succeeds and the folder set is faithful).
 //! - `POST /Library/Series/Added|Updated`, `Movies/Added|Updated`,
 //!   `Media/Updated` — the `ILibraryMonitor.ReportFileSystemChanged` hook, which
 //!   is a filesystem watcher not surfaced on `AppState`.
@@ -28,6 +40,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hermit_model::dto::BaseItemDto;
 use hermit_model::dto::SortOrder;
 use hermit_model::entities::ExtraType;
 use hermit_model::live_tv::ItemSortBy;
@@ -321,6 +334,49 @@ async fn refresh_library(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// The query parameters accepted by `GET /Library/MediaFolders`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct MediaFoldersQuery {
+    /// Optional. Filter by folders marked hidden, or not. Accepted for contract
+    /// compatibility but unread — the per-folder hidden flag is not modelled at
+    /// this seam (see the module docs), so the folders are returned unfiltered.
+    #[serde(default)]
+    is_hidden: Option<bool>,
+}
+
+/// `GET /Library/MediaFolders` — the server's media (collection) folders.
+///
+/// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
+/// name-sorted, projected to [`BaseItemDto`] as a
+/// [`QueryResult`](hermit_model::querying::QueryResult). The `isHidden` filter and
+/// the `LibraryOptions.Enabled` gate need the un-ported per-folder options and are
+/// documented deferrals (see the module docs); the folder set and projection are
+/// already the final ones.
+#[utoipa::path(
+    get,
+    path = "/Library/MediaFolders",
+    params(("isHidden" = Option<bool>, Query, description = "Filter by folders marked hidden")),
+    responses((status = 200, description = "Media folders returned (QueryResult<BaseItemDto>)")),
+    tag = "hermit"
+)]
+async fn get_media_folders(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(_query): Query<MediaFoldersQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    // The user-root collection folders are the media folders; the view seam
+    // already returns them name-sorted.
+    let folders = state.user_views.get_user_views(Uuid::nil()).await?;
+    let options = DtoOptions::default();
+    let dtos = state
+        .dto
+        .get_base_item_dtos(&folders, &options, None, None, true)
+        .await?;
+    Ok(Json(QueryResult::from_items(dtos)))
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -329,4 +385,5 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/ThemeMedia", get(get_theme_media))
         .route("/Items/{itemId}/File", get(get_file))
         .route("/Library/Refresh", post(refresh_library))
+        .route("/Library/MediaFolders", get(get_media_folders))
 }

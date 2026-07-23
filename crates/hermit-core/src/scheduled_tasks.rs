@@ -76,6 +76,11 @@ struct Registration {
     task: Arc<dyn ScheduledTask>,
     state: TaskState,
     last_result: Option<TaskResult>,
+    /// Triggers set via [`HermitTaskManager::set_triggers`], overriding the
+    /// task's [`default_triggers`](ScheduledTask::default_triggers). `None` until
+    /// a client configures them (the C# `IConfigurableScheduledTask.Triggers`
+    /// starts from the defaults, then is overwritten by an assignment).
+    triggers_override: Option<Vec<TaskTriggerInfo>>,
 }
 
 impl Registration {
@@ -88,7 +93,10 @@ impl Registration {
             current_progress_percentage: None,
             id: Some(key.clone()),
             last_execution_result: self.last_result.clone(),
-            triggers: self.task.default_triggers(),
+            triggers: self
+                .triggers_override
+                .clone()
+                .unwrap_or_else(|| self.task.default_triggers()),
             description: Some(self.task.description().to_string()),
             category: Some(self.task.category().to_string()),
             is_hidden: self.task.is_hidden(),
@@ -136,6 +144,7 @@ impl HermitTaskManager {
             task,
             state: TaskState::Idle,
             last_result: None,
+            triggers_override: None,
         };
         // A poisoned lock means a prior panic while holding it; recover the guard
         // rather than propagate — the map itself is still consistent.
@@ -247,6 +256,48 @@ impl HermitTaskManager {
         );
         outcome
     }
+
+    /// Cancels a task, returning the task to [`Idle`](TaskState::Idle).
+    ///
+    /// The manual `Cancel`/`StopTask` path. This registry runs nothing in the
+    /// background, so cancelling is a state reset to `Idle`; a missing task is
+    /// reported so the caller can map it to a `404` (mirroring the C# guard).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::NotFound`] if no task has that key.
+    pub fn cancel(&self, key: &str) -> Result<(), ServiceError> {
+        if self.set_state(key, TaskState::Idle).is_none() {
+            return Err(ServiceError::not_found(format!("scheduled task {key}")));
+        }
+        Ok(())
+    }
+
+    /// Replaces a task's configured triggers, surfaced on its next
+    /// [`TaskInfo`] read.
+    ///
+    /// The manual `task.Triggers = …` path. Persists the trigger list on the
+    /// registration; there is no scheduler, so the triggers are advisory but
+    /// visible to clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::NotFound`] if no task has that key.
+    pub fn set_triggers(
+        &self,
+        key: &str,
+        triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        let mut guard = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = guard
+            .get_mut(key)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+        reg.triggers_override = Some(triggers.to_vec());
+        Ok(())
+    }
 }
 
 /// Bridges the concrete registry onto the `hermit-traits` [`TaskManager`] seam
@@ -268,6 +319,18 @@ impl hermit_traits::tasks::TaskManager for HermitTaskManager {
 
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
         self.run_now(task_id).await
+    }
+
+    async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.cancel(task_id)
+    }
+
+    async fn update_triggers(
+        &self,
+        task_id: &str,
+        triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        self.set_triggers(task_id, triggers)
     }
 }
 
@@ -398,6 +461,95 @@ mod tests {
         mgr.run_now("counting").await.expect("run");
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_resets_state_and_missing_is_not_found() {
+        let mgr = HermitTaskManager::new();
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+
+        // Force the task into `Running`, then cancel it back to `Idle`.
+        mgr.set_state("counting", TaskState::Running);
+        mgr.cancel("counting").expect("cancel");
+        assert_eq!(mgr.get("counting").expect("info").state, TaskState::Idle);
+
+        // A missing task is NotFound.
+        assert!(matches!(mgr.cancel("nope"), Err(ServiceError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn set_triggers_overrides_and_missing_is_not_found() {
+        use hermit_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
+
+        let mgr = HermitTaskManager::new();
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+
+        // Defaults are empty (CountingTask uses the trait default).
+        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+
+        let triggers = vec![TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(42),
+            ..TaskTriggerInfo::default()
+        }];
+        mgr.set_triggers("counting", &triggers).expect("set");
+
+        let info = mgr.get("counting").expect("info");
+        assert_eq!(info.triggers.len(), 1);
+        assert_eq!(info.triggers[0].interval_ticks, Some(42));
+        assert_eq!(info.triggers[0].type_, TaskTriggerInfoType::IntervalTrigger);
+
+        // A missing task is NotFound.
+        assert!(matches!(
+            mgr.set_triggers("nope", &triggers),
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn trait_cancel_and_update_triggers_delegate() {
+        use hermit_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
+        use hermit_traits::tasks::TaskManager;
+
+        let mgr = HermitTaskManager::new();
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+
+        TaskManager::cancel_task(&mgr, "counting")
+            .await
+            .expect("cancel");
+        assert!(matches!(
+            TaskManager::cancel_task(&mgr, "nope").await,
+            Err(ServiceError::NotFound(_))
+        ));
+
+        let triggers = vec![TaskTriggerInfo {
+            type_: TaskTriggerInfoType::StartupTrigger,
+            ..TaskTriggerInfo::default()
+        }];
+        TaskManager::update_triggers(&mgr, "counting", &triggers)
+            .await
+            .expect("update");
+        let info = TaskManager::get_task(&mgr, "counting")
+            .await
+            .expect("get")
+            .expect("info");
+        assert_eq!(info.triggers.len(), 1);
+        assert!(matches!(
+            TaskManager::update_triggers(&mgr, "nope", &triggers).await,
+            Err(ServiceError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

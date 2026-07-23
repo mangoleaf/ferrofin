@@ -62,6 +62,28 @@ segments on remux video, disallowed-extension fallback to equal-length, fMP4 map
 header + version 7, equal-length TS three-segment playlist, zero-runtime-without-
 keyframes → `InvalidOperation`.
 
+### Real-ffmpeg end-to-end test (`tests/hls_stream_manager_ffmpeg.rs`)
+
+`HlsStreamManagerImpl` — the composition of the playlist generator + the live
+transcode runtime (`start_ffmpeg` / `wait_for_segment` / the real
+`TokioSegmentTranscoder` spawn from `hermit-mediaencoding`) — is validated
+end-to-end against a **live ffmpeg**. The test drives the *same seam the HTTP
+layer serves*: it asks the manager for the master playlist, the variant
+`main.m3u8`, then a dynamic segment, and asserts the returned `ServedFile` points
+at a real, non-empty `.ts` segment (with the `0x47` mpegts sync byte) that a live
+ffmpeg produced, then stops the encoding and asserts the partial files are
+deleted. The un-ported request→plan glue (`StreamStatePlanner`) is supplied by a
+test planner that generates a clip and emits real HLS args; everything below it is
+production code.
+
+It **self-skips** unless `HERMIT_FFMPEG_TESTS` is set AND `ffmpeg` is on `PATH`,
+and never affects the coverage gate (integration `tests/` don't count toward
+`cargo llvm-cov -p hermit-hls`). Run it with:
+
+```
+HERMIT_FFMPEG_TESTS=1 cargo test -p hermit-hls --test hls_stream_manager_ffmpeg
+```
+
 ## Coverage
 
 `cargo llvm-cov nextest -p hermit-hls --fail-under-lines 80 --summary-only`

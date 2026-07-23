@@ -327,6 +327,185 @@ pub trait AttachmentExtractor: Send + Sync {
 /// Compile-time assertion that [`AttachmentExtractor`] is object-safe.
 fn _assert_object_safe_attachment_extractor(_: &dyn AttachmentExtractor) {}
 
+/// A parked HLS/transcode streaming request — the query-string surface the
+/// `DynamicHls`/`Videos`/`UniversalAudio` controllers accept, reduced to the
+/// fields the software transcode path needs.
+///
+/// Port of the shared `StreamingRequestDto`/`VideoRequestDto` fields consumed by
+/// `StreamingHelpers.GetStreamingState`. The full C# DTO carries the entire
+/// device-profile/codec/bitrate matrix; the fields that drive **which file to
+/// transcode, into what container, at what segment length, for which
+/// session/device** are carried here, and the rest of the matrix is resolved
+/// from server defaults by the implementation (see `hermit-mediaencoding`). The
+/// raw `query_string` is preserved verbatim so the generated playlist's segment
+/// URLs carry the client's parameters forward (the C# `Request.QueryString`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HlsStreamRequest {
+    /// The item being streamed (`itemId`).
+    pub item_id: Uuid,
+    /// The chosen media source id (`mediaSourceId`), if the client pinned one.
+    pub media_source_id: Option<String>,
+    /// The playback-session id this stream belongs to (`playSessionId`).
+    pub play_session_id: Option<String>,
+    /// The requesting device id (`deviceId`) — the kill/keep-alive scope.
+    pub device_id: Option<String>,
+    /// The desired segment container, e.g. `"ts"` or `"mp4"` (`segmentContainer`).
+    pub segment_container: Option<String>,
+    /// The desired segment length in seconds (`segmentLength`).
+    pub segment_length: Option<i32>,
+    /// The desired output audio codec (`audioCodec`).
+    pub audio_codec: Option<String>,
+    /// The desired output video codec (`videoCodec`).
+    pub video_codec: Option<String>,
+    /// Whether the client asked for a static (direct) stream (`static`).
+    pub is_static: bool,
+    /// The raw request query string (including the leading `?`), forwarded into
+    /// the generated playlist's segment URLs (`Request.QueryString`).
+    pub query_string: String,
+}
+
+/// A resolved on-disk artifact to serve, with the MIME type to serve it as.
+///
+/// Port of the `(path, MimeTypes.GetMimeType(path))` pair the streaming
+/// controllers hand to `FileStreamResponseHelpers.GetStaticFileResult`. The
+/// caller (a `hermit-api` handler) streams the file at [`path`](Self::path) with
+/// [`content_type`](Self::content_type); the transcode job that produced it is
+/// kept alive / torn down by the [`HlsStreamManager`] internally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedFile {
+    /// The absolute path of the file to serve.
+    pub path: String,
+    /// The MIME type to serve it as (e.g. `video/mp2t`, `application/x-mpegURL`).
+    pub content_type: String,
+}
+
+/// Serves the dynamic-HLS + transcode-stream flow behind one seam.
+///
+/// Port of the request→response essence of `DynamicHlsController` +
+/// `HlsSegmentController` + the transcode branch of `VideosController` /
+/// `UniversalAudioController`. Everything a handler needs — build a playlist
+/// string, start-or-reuse a segment transcode and resolve the produced segment
+/// file, resolve a legacy transcode-folder file, and run the progressive
+/// transcode branch — lives here, so `hermit-api` handlers stay trait-only and
+/// the `StreamState`/arg-building/ffmpeg-spawn machinery stays in the
+/// implementation crate.
+///
+/// Implementations own the `TranscodeManager` job registry, the ffmpeg spawn
+/// (via the segment-transcoder seam), and the `DynamicHlsPlaylistGenerator`; a
+/// disabled implementation ([`crate::stubs::DisabledHlsStreamManager`]) returns
+/// [`ServiceError::NotFound`] so hosts without a transcode runtime still route.
+#[async_trait]
+pub trait HlsStreamManager: Send + Sync {
+    /// Builds the **master** HLS playlist (`master.m3u8`) for `request`.
+    ///
+    /// Port of `DynamicHlsController.GetMasterHls{Video,Audio}Playlist` →
+    /// `DynamicHlsHelper.GetMasterHlsPlaylist`. `is_audio` selects the audio
+    /// controller's master playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the item/source cannot be resolved or the
+    /// playlist cannot be produced.
+    async fn master_playlist(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<String, ServiceError>;
+
+    /// Builds the **variant** HLS playlist (`main.m3u8`) for `request`.
+    ///
+    /// Port of `GetVariantHls{Video,Audio}Playlist` → `GetVariantPlaylistInternal`
+    /// → `DynamicHlsPlaylistGenerator.CreateMainPlaylist`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the item/source cannot be resolved or the
+    /// playlist cannot be produced.
+    async fn variant_playlist(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<String, ServiceError>;
+
+    /// Builds the **live** HLS playlist (`live.m3u8`) for `request`.
+    ///
+    /// Port of `DynamicHlsController.GetLiveHlsStream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the live stream cannot be resolved.
+    async fn live_playlist(&self, request: &HlsStreamRequest) -> Result<String, ServiceError>;
+
+    /// Starts (or reuses) the transcode for `request` and resolves segment
+    /// `segment_id` on disk, ready to serve.
+    ///
+    /// Port of `GetHlsVideoSegment`/`GetHlsAudioSegment` → `GetDynamicSegment`
+    /// (+ `StartFfMpeg` / `GetSegmentResult`). Waits until the segment exists or
+    /// the transcode ends; a segment that never materialises is
+    /// [`ServiceError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the transcode cannot be started or the
+    /// segment does not appear.
+    async fn dynamic_segment(
+        &self,
+        request: &HlsStreamRequest,
+        segment_id: i32,
+        is_audio: bool,
+    ) -> Result<ServedFile, ServiceError>;
+
+    /// Resolves a file inside the transcode cache directory by name, guarding
+    /// against path traversal.
+    ///
+    /// Port of `HlsSegmentController.ValidateTranscodePath` + the
+    /// `GetHlsVideoSegmentLegacy`/`GetHlsPlaylistLegacy`/`GetHlsAudioSegmentLegacy`
+    /// serve path: `file_name` (`<segmentId><ext>`) must resolve *inside* the
+    /// transcode folder. `require_m3u8` rejects a non-playlist match (the
+    /// playlist-legacy route). Marks the owning job as begun so its keep-alive
+    /// timer is refreshed. [`ServiceError::InvalidInput`] on a traversal/miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InvalidInput`] when `file_name` escapes the
+    /// transcode folder or does not resolve to an on-disk file.
+    async fn resolve_transcode_file(
+        &self,
+        file_name: &str,
+        require_m3u8: bool,
+    ) -> Result<ServedFile, ServiceError>;
+
+    /// Runs the **progressive transcode** branch of `/Videos/{id}/stream` (and
+    /// the audio equivalent), returning the produced file to serve.
+    ///
+    /// Port of the transcoding branch of `VideosController.GetVideoStream` /
+    /// `UniversalAudioController` (when the source is not direct-playable).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the transcode cannot be produced.
+    async fn transcode_stream(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<ServedFile, ServiceError>;
+
+    /// Stops the active encoding(s) for `request`'s device / play session,
+    /// deleting their partial files.
+    ///
+    /// Port of `HlsSegmentController.StopEncodingProcess` → `KillTranscodingJobs`.
+    /// Only [`device_id`](HlsStreamRequest::device_id) and
+    /// [`play_session_id`](HlsStreamRequest::play_session_id) are read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the kill cannot be dispatched.
+    async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError>;
+}
+
+/// Compile-time assertion that [`HlsStreamManager`] is object-safe.
+fn _assert_object_safe_hls_stream_manager(_: &dyn HlsStreamManager) {}
+
 #[cfg(test)]
 mod tests {
     use super::{TranscodingJobType, TranscodingProgress};

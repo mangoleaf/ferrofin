@@ -149,6 +149,30 @@ pub trait ProviderManager: Send + Sync {
         image_index: Option<i32>,
     ) -> Result<(), ServiceError>;
 
+    /// Deletes an item's image of `image_type` at `image_index` (default `0`).
+    ///
+    /// Port of `BaseItem.DeleteImageAsync(imageType, index)` (the fan-in target of
+    /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): removes the
+    /// on-disk file and the stored image row. The default implementation reports
+    /// the image pipeline as deferred, mirroring [`save_image`](Self::save_image)
+    /// in the shell manager; a host with the ported image store overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] while the image store is deferred, or whatever
+    /// error the concrete deletion surfaces.
+    async fn delete_image(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, image_type, image_index);
+        Err(ServiceError::backend(
+            "delete_image is deferred until the image pipeline lands",
+        ))
+    }
+
     /// Gets the remote images available for an item.
     async fn get_available_remote_images(
         &self,

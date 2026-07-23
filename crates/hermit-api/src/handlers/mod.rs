@@ -57,6 +57,8 @@ pub mod display_preferences;
 pub mod environment;
 pub mod filter;
 pub mod genres;
+pub mod hls;
+pub(crate) mod image_upload;
 pub mod images;
 pub mod instant_mix;
 pub mod item_lookup;
@@ -79,6 +81,7 @@ pub mod scheduled_tasks;
 pub mod search;
 pub mod session;
 pub(crate) mod session_ctx;
+pub mod similar;
 pub mod startup;
 pub(crate) mod streaming;
 pub mod studios;
@@ -316,6 +319,31 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Videos/{itemId}/AdditionalParts"),
     ("post", "/Videos/MergeVersions"),
     ("delete", "/Videos/{itemId}/AlternateSources"),
+    // HLS / dynamic-transcode streaming (DynamicHlsController +
+    // HlsSegmentController + VideoAttachmentsController). Playlists, dynamic
+    // segments, the legacy segment/playlist serve, stop-encoding, and attachment
+    // serve — wired to the real transcode runtime + hermit-hls generator via the
+    // `HlsStreamManager` seam. Normalized axum paths (the `.container`/`.m3u8`
+    // literals are dropped from multi-param segments; `stream.m3u8` /
+    // `stream.{aac,mp3}` keep their literal trailing segment). The
+    // `stream.{container}` transcode branch reuses the already-real
+    // `/Videos|Audio/{itemId}/{container}` + `/Audio/{itemId}/universal` routes.
+    ("get", "/Videos/{itemId}/master.m3u8"),
+    ("head", "/Videos/{itemId}/master.m3u8"),
+    ("get", "/Videos/{itemId}/main.m3u8"),
+    ("get", "/Videos/{itemId}/live.m3u8"),
+    ("get", "/Videos/{itemId}/hls1/{playlistId}/{segmentId}"),
+    ("get", "/Videos/{itemId}/hls/{playlistId}/{segmentId}"),
+    ("get", "/Videos/{itemId}/hls/{playlistId}/stream.m3u8"),
+    ("get", "/Audio/{itemId}/master.m3u8"),
+    ("head", "/Audio/{itemId}/master.m3u8"),
+    ("get", "/Audio/{itemId}/main.m3u8"),
+    ("get", "/Audio/{itemId}/hls1/{playlistId}/{segmentId}"),
+    ("get", "/Audio/{itemId}/hls/{segmentId}/stream.aac"),
+    ("get", "/Audio/{itemId}/hls/{segmentId}/stream.mp3"),
+    ("delete", "/Videos/ActiveEncodings"),
+    // Attachment serve normalizes `{videoId}/{mediaSourceId}` → `{itemId}/{container}`.
+    ("get", "/Videos/{itemId}/{container}/Attachments/{index}"),
     // Live streams + bitrate test (MediaInfoController).
     ("post", "/LiveStreams/Open"),
     ("post", "/LiveStreams/Close"),
@@ -378,7 +406,7 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/System/Configuration/{key}"),
     // Activity log.
     ("get", "/System/ActivityLog/Entries"),
-    // Branding reads (Splashscreen GET/POST/DELETE stay on the 501 stub).
+    // Branding reads (Splashscreen GET/POST/DELETE are real in Batch 16).
     ("get", "/Branding/Configuration"),
     ("get", "/Branding/Css"),
     ("get", "/Branding/Css.css"),
@@ -427,6 +455,48 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/ScheduledTasks"),
     ("get", "/ScheduledTasks/{taskId}"),
     ("post", "/ScheduledTasks/Running/{taskId}"),
+    // Batch 16 — the last portable stubs.
+    // Similar-items aliases (`LibraryController.GetSimilarItems`); `Shows/…/Similar`
+    // is already real in Batch 8.
+    ("get", "/Albums/{itemId}/Similar"),
+    ("get", "/Artists/{itemId}/Similar"),
+    ("get", "/Items/{itemId}/Similar"),
+    ("get", "/Movies/{itemId}/Similar"),
+    ("get", "/Trailers/{itemId}/Similar"),
+    // Image write side (`ImageController` upload/delete). The indexed HEAD-Genres
+    // and GET-MusicGenres by-name *read* variants are already listed above in the
+    // by-name image block; do not re-add them here or REAL_ROUTES gains duplicate
+    // rows (they are harmless to the router, which mounts by handler membership,
+    // but they inflate the route count and mislead the contract accounting).
+    ("post", "/Items/{itemId}/Images/{imageType}"),
+    ("delete", "/Items/{itemId}/Images/{imageType}"),
+    ("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}"),
+    ("delete", "/Items/{itemId}/Images/{imageType}/{imageIndex}"),
+    ("post", "/UserImage"),
+    // Scheduler cancel + trigger-config (`ScheduledTasksController`).
+    ("delete", "/ScheduledTasks/Running/{taskId}"),
+    ("post", "/ScheduledTasks/{taskId}/Triggers"),
+    // Metadata-editor descriptor + user-view grouping options.
+    ("get", "/Items/{itemId}/MetadataEditor"),
+    ("get", "/UserViews/GroupingOptions"),
+    // Deferred — third-party PLUGIN routes with no core-Jellyfin controller to
+    // port from (they need the un-ported dynamic plugin host); they stay on the
+    // `501` stub: `/MergeVersions/{Merge,Split}{Episodes,Movies}` (the
+    // `MergeVersions` plugin), `GET|POST /Episode/{Id}/Timestamps` (the
+    // `IntroSkipper`/`SkipIntro` plugin), and `/MediaSegmentsApi/*` (the
+    // `SegmentEditor` plugin). The core in-tree merge surface is already real at
+    // `POST /Videos/MergeVersions` (Batch 10).
+    // Library structure — the media-folder listing (`LibraryController`). The
+    // `/Library/VirtualFolders*` CRUD, `/Library/PhysicalPaths`, and
+    // `/Libraries/AvailableOptions` stay on the `501` stub: each needs an unported
+    // subsystem — the on-disk collection-folder tree + per-library
+    // `LibraryOptions` persistence, the folder physical-location list, or the
+    // metadata-plugin registry (see `handlers::library`).
+    ("get", "/Library/MediaFolders"),
+    // Branding splashscreen (`ImageController`).
+    ("get", "/Branding/Splashscreen"),
+    ("post", "/Branding/Splashscreen"),
+    ("delete", "/Branding/Splashscreen"),
 ];
 
 /// Mounts every real First-Light handler onto `router`, overriding the matching
@@ -442,6 +512,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = media_info::register(router);
     let router = videos::register(router);
     let router = audio::register(router);
+    let router = hls::register(router);
     let router = images::register(router);
     let router = genres::register(router);
     let router = music_genres::register(router);
@@ -486,5 +557,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = item_lookup::register(router);
     let router = system::register(router);
     // Batch 15 — ScheduledTasks read/run.
-    scheduled_tasks::register(router)
+    let router = scheduled_tasks::register(router);
+    // Batch 16 — the last portable stubs.
+    similar::register(router)
 }
