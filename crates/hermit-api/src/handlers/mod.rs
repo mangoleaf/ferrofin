@@ -65,6 +65,7 @@ pub mod item_lookup;
 pub mod item_update;
 pub mod items;
 pub mod library;
+pub mod library_structure;
 pub mod localization;
 pub mod lyrics;
 pub mod media_info;
@@ -89,6 +90,7 @@ pub mod subtitles;
 pub mod suggestions;
 pub mod system;
 pub mod time_sync;
+pub mod tmdb;
 pub mod trailers;
 pub mod trickplay;
 pub mod tv_shows;
@@ -371,11 +373,24 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/RemoteSearch/Subtitles/{language}"),
     ("post", "/Items/{itemId}/RemoteSearch/Subtitles/{language}"),
     ("get", "/Providers/Subtitles/Subtitles/{subtitleId}"),
-    // Deferred (stay on the 501 stub): on-the-fly subtitle conversion
-    // (`Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}` + the HLS
-    // `subtitles.m3u8` playlist — need the un-ported SubtitleEncoder); the
-    // FallbackFont routes (encoding-options config not surfaced at the config
-    // seam); and `/MediaSegmentsApi/*` (plugin host).
+    // On-the-fly subtitle conversion (SubtitleEncoder seam) + FallbackFont
+    // (encoding-options config seam + FileSystem). The `Stream.{format}` routes
+    // normalize to a `{routeFormat}` capture; the ticks route adds a second one.
+    (
+        "get",
+        "/Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8",
+    ),
+    (
+        "get",
+        "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}",
+    ),
+    (
+        "get",
+        "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}/{routeFormat}",
+    ),
+    ("get", "/FallbackFont/Fonts"),
+    ("get", "/FallbackFont/Fonts/{name}"),
+    // Deferred (stay on the 501 stub): `/MediaSegmentsApi/*` (plugin host).
     // Batch 12 — Devices + ApiKeys + ClientLog.
     ("get", "/Devices"),
     ("delete", "/Devices"),
@@ -432,20 +447,39 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/GetUtcTime"),
     // Batch 14 — Library reads/serve/scan + item external-id descriptors.
     // Theme media (songs/videos/combined), the original-file serve, and the
-    // library-scan trigger. The virtual-folder mutation/read routes
-    // (`/Library/VirtualFolders*`, `/Library/PhysicalPaths`,
-    // `/Library/MediaFolders`, `/Libraries/AvailableOptions`), the
-    // external-source change reports (`/Library/Series|Movies|Media/*`), and the
-    // remote-metadata search/apply routes (`/Items/RemoteSearch/*`) stay on the
-    // 501 stub — each needs an unported subsystem (on-disk collection-folder
-    // tree + LibraryOptions, the filesystem monitor, or network metadata
-    // fetchers). See `handlers::library` / `handlers::item_lookup`.
+    // library-scan trigger. See `handlers::library` / `handlers::item_lookup`.
     ("get", "/Items/{itemId}/ThemeSongs"),
     ("get", "/Items/{itemId}/ThemeVideos"),
     ("get", "/Items/{itemId}/ThemeMedia"),
     ("get", "/Items/{itemId}/File"),
     ("post", "/Library/Refresh"),
     ("get", "/Items/{itemId}/ExternalIdInfos"),
+    // Batch 4 — remote metadata search + apply (`ItemLookupController`). Each
+    // typed search route collapses its `RemoteSearchQuery<XInfo>` into the
+    // object-safe `ProviderManager::remote_search` seam; the remote fetchers
+    // (TMDb/TVDb/MusicBrainz) are deferred, so with none registered the search
+    // faithfully returns `[]`. Apply resolves the item then drives the real
+    // `refresh_full_item` seam (the refresh pipeline is the deferred piece).
+    ("post", "/Items/RemoteSearch/Movie"),
+    ("post", "/Items/RemoteSearch/Trailer"),
+    ("post", "/Items/RemoteSearch/MusicVideo"),
+    ("post", "/Items/RemoteSearch/Series"),
+    ("post", "/Items/RemoteSearch/BoxSet"),
+    ("post", "/Items/RemoteSearch/MusicArtist"),
+    ("post", "/Items/RemoteSearch/MusicAlbum"),
+    ("post", "/Items/RemoteSearch/Person"),
+    ("post", "/Items/RemoteSearch/Book"),
+    ("post", "/Items/RemoteSearch/Apply/{itemId}"),
+    // Batch 2 (this unit) — filesystem-monitor change-report webhooks
+    // (`LibraryController.PostUpdated{Series,Movies,Media}`). Each selects the
+    // affected items (Series by TVDB id; Movies by IMDb/TMDb id; Media by the
+    // supplied update paths) and reports every path to the `LibraryMonitor` seam
+    // on `AppState`. See `handlers::library`.
+    ("post", "/Library/Series/Added"),
+    ("post", "/Library/Series/Updated"),
+    ("post", "/Library/Movies/Added"),
+    ("post", "/Library/Movies/Updated"),
+    ("post", "/Library/Media/Updated"),
     // Batch 15 — ScheduledTasks read/run.
     // List, fetch-by-id, and manual run-now. The scheduler-cron machinery stays
     // on the 501 stub: `DELETE /ScheduledTasks/Running/{taskId}` (cancel — no
@@ -472,6 +506,10 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("delete", "/Items/{itemId}/Images/{imageType}"),
     ("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}"),
     ("delete", "/Items/{itemId}/Images/{imageType}/{imageIndex}"),
+    (
+        "post",
+        "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
+    ),
     ("post", "/UserImage"),
     // Scheduler cancel + trigger-config (`ScheduledTasksController`).
     ("delete", "/ScheduledTasks/Running/{taskId}"),
@@ -479,6 +517,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     // Metadata-editor descriptor + user-view grouping options.
     ("get", "/Items/{itemId}/MetadataEditor"),
     ("get", "/UserViews/GroupingOptions"),
+    // Batch 6 — portable extras: TMDb client image configuration
+    // (`TmdbController`); served static while the live TMDb provider is deferred.
+    ("get", "/Tmdb/ClientConfiguration"),
     // Deferred — third-party PLUGIN routes with no core-Jellyfin controller to
     // port from (they need the un-ported dynamic plugin host); they stay on the
     // `501` stub: `/MergeVersions/{Merge,Split}{Episodes,Movies}` (the
@@ -486,13 +527,24 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     // `IntroSkipper`/`SkipIntro` plugin), and `/MediaSegmentsApi/*` (the
     // `SegmentEditor` plugin). The core in-tree merge surface is already real at
     // `POST /Videos/MergeVersions` (Batch 10).
-    // Library structure — the media-folder listing (`LibraryController`). The
-    // `/Library/VirtualFolders*` CRUD, `/Library/PhysicalPaths`, and
-    // `/Libraries/AvailableOptions` stay on the `501` stub: each needs an unported
-    // subsystem — the on-disk collection-folder tree + per-library
-    // `LibraryOptions` persistence, the folder physical-location list, or the
-    // metadata-plugin registry (see `handlers::library`).
+    // Library structure — the media-folder listing (`LibraryController`).
     ("get", "/Library/MediaFolders"),
+    // Batch 1 (this unit) — Library admin / virtual folders. The
+    // filesystem-backed `LibraryStructureController` CRUD + the two
+    // `LibraryController` structure reads, over the `VirtualFolderManager` seam
+    // (see `handlers::library_structure` / `handlers::library`). No route here
+    // stays on the 501 stub; `AvailableOptions` returns empty provider lists
+    // faithfully (no metadata plugins registered at this seam).
+    ("get", "/Library/VirtualFolders"),
+    ("post", "/Library/VirtualFolders"),
+    ("delete", "/Library/VirtualFolders"),
+    ("post", "/Library/VirtualFolders/Name"),
+    ("post", "/Library/VirtualFolders/LibraryOptions"),
+    ("post", "/Library/VirtualFolders/Paths"),
+    ("post", "/Library/VirtualFolders/Paths/Update"),
+    ("delete", "/Library/VirtualFolders/Paths"),
+    ("get", "/Library/PhysicalPaths"),
+    ("get", "/Libraries/AvailableOptions"),
     // Branding splashscreen (`ImageController`).
     ("get", "/Branding/Splashscreen"),
     ("post", "/Branding/Splashscreen"),
@@ -554,10 +606,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = time_sync::register(router);
     // Batch 14 — library reads/serve/scan + item external-id descriptors.
     let router = library::register(router);
+    // Batch 1 — library admin / virtual folders (LibraryStructureController).
+    let router = library_structure::register(router);
     let router = item_lookup::register(router);
     let router = system::register(router);
     // Batch 15 — ScheduledTasks read/run.
     let router = scheduled_tasks::register(router);
+    // Batch 6 — portable extras: TMDb client config (TmdbController).
+    let router = tmdb::register(router);
     // Batch 16 — the last portable stubs.
     similar::register(router)
 }

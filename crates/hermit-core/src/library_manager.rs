@@ -28,12 +28,12 @@ use async_trait::async_trait;
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use hermit_model::data::CollectionType;
 use hermit_model::dto::ItemCounts;
-use hermit_model::entities::MediaStreamType;
+use hermit_model::entities::{ImageType, MediaStreamType};
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
-use hermit_traits::library::LibraryManager;
+use hermit_traits::library::{LibraryManager, image_type_allows_multiple};
 use hermit_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use hermit_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
@@ -94,6 +94,26 @@ impl LibraryManager for HermitLibraryManager {
             return Ok(Vec::new());
         }
         self.items.get_image_infos(item_id).await
+    }
+
+    async fn swap_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError> {
+        // Only backdrops and chapters may hold multiple images and thus be
+        // reordered; any other type is a bad request (C# `AllowsMultipleImages`
+        // guard throwing `ArgumentException` → 400).
+        if !image_type_allows_multiple(image_type) {
+            return Err(ServiceError::invalid_input(
+                "The change index operation is only applicable to backdrops and chapters",
+            ));
+        }
+        self.items
+            .swap_item_images(item_id, image_type, index1, index2)
+            .await
     }
 
     async fn query_items(
@@ -355,6 +375,7 @@ mod tests {
     };
     use hermit_db::Database;
     use hermit_model::data::BaseItemKind;
+    use hermit_model::entities::ImageType;
 
     /// Builds a manager backed by real repositories over the given database.
     fn manager(db: &Database) -> HermitLibraryManager {
@@ -384,6 +405,42 @@ mod tests {
                 .expect("nil")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn swap_images_rejects_non_multiple_type_and_swaps_backdrops() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0xA100);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Swappable").await;
+        for (n, path) in [(0u128, "/one.jpg"), (1, "/two.jpg")] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 0, 2, ?2, ?3, 0)"#,
+            )
+            .bind(Uuid::from_u128(0xA110 + n).to_string())
+            .bind(item.to_string())
+            .bind(path)
+            .execute(db.pool())
+            .await
+            .expect("insert backdrop");
+        }
+        let mgr = manager(&db);
+
+        // Primary does not allow multiple images → InvalidInput (the 400).
+        let err = mgr
+            .swap_images(item, ImageType::Primary, 0, 1)
+            .await
+            .expect_err("primary rejected");
+        assert!(matches!(err, ServiceError::InvalidInput(_)));
+
+        // Backdrop is reorderable and the swap goes through to the repository.
+        mgr.swap_images(item, ImageType::Backdrop, 0, 1)
+            .await
+            .expect("swap");
+        let images = mgr.get_item_images(item).await.expect("images");
+        assert_eq!(images[0].path, "/two.jpg");
+        assert_eq!(images[1].path, "/one.jpg");
     }
 
     #[tokio::test]

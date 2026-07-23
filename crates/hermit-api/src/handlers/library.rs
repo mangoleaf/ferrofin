@@ -11,28 +11,31 @@
 //! - `POST /Library/Refresh` — queues a full library scan.
 //! - `GET /Library/MediaFolders` — the server's media (collection) folders,
 //!   name-sorted, projected to [`BaseItemDto`](hermit_model::dto::BaseItemDto).
+//! - `GET /Library/PhysicalPaths` — the physical on-disk locations of every
+//!   virtual folder, from the
+//!   [`VirtualFolderManager`](hermit_traits::library::VirtualFolderManager) seam
+//!   (`RootFolder.Children.SelectMany(c => c.PhysicalLocations)`).
+//! - `GET /Libraries/AvailableOptions` — the library options info; the
+//!   representative-item-type shell is assembled here, and the provider lists are
+//!   empty because no metadata plugins are registered at this seam (a faithful
+//!   projection — Jellyfin returns empty arrays when no plugin matches).
 //!
-//! The remaining `LibraryController`/`LibraryStructureController` routes stay on
-//! the shared `501` stub as intentional deferrals, because each depends on a
-//! subsystem Hermit does not model at this portable seam:
-//! - `GET /Library/PhysicalPaths` — the physical on-disk locations of each
-//!   collection folder (`Folder.PhysicalLocations`), which the portable
-//!   [`BaseItemEntity`] rows do not carry.
-//! - `GET|POST|DELETE /Library/VirtualFolders` and the `Name`/`Paths`/
-//!   `LibraryOptions` mutation routes — `ILibraryManager.GetVirtualFolders`/
-//!   `AddVirtualFolder`/`RemoveVirtualFolder`/… over the on-disk collection-folder
-//!   tree and its per-library `LibraryOptions` persistence, which is deliberately
-//!   impl-internal and absent from every trait seam.
-//! - `GET /Libraries/AvailableOptions` — assembled from the metadata-plugin
-//!   registry (`GetAllMetadataPlugins`) plus the static representative-type /
-//!   default-image tables, none of which are ported (no metadata plugins exist at
-//!   this seam).
+//! The external-source **change-report webhooks** are also ported here, over the
+//! [`LibraryMonitor`](hermit_traits::library::LibraryMonitor) seam on `AppState`:
+//! - `POST /Library/Series/Added` / `Updated` — reports the on-disk path of every
+//!   `Series` whose TVDB id matches `tvdbId`.
+//! - `POST /Library/Movies/Added` / `Updated` — reports every `Movie` matching
+//!   `imdbId` (preferred) or else `tmdbId`; neither ⇒ no items (matching C#).
+//! - `POST /Library/Media/Updated` — reports each path in the request body.
+//!
+//! The `LibraryStructureController` virtual-folder CRUD lives in the sibling
+//! [`library_structure`](crate::handlers::library_structure) module. A few
+//! `LibraryController` routes stay on the shared `501` stub as intentional
+//! deferrals, because each depends on a subsystem Hermit does not model at this
+//! portable seam:
 //! - The `isHidden` filter on `/Library/MediaFolders` — the per-folder hidden
 //!   flag lives in the un-ported `LibraryOptions`, so the folders are returned
 //!   unfiltered (the query still succeeds and the folder set is faithful).
-//! - `POST /Library/Series/Added|Updated`, `Movies/Added|Updated`,
-//!   `Media/Updated` — the `ILibraryMonitor.ReportFileSystemChanged` hook, which
-//!   is a filesystem watcher not surfaced on `AppState`.
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
@@ -40,9 +43,12 @@ use axum::extract::{Path, Query, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hermit_model::configuration::LibraryOptionsResultDto;
+use hermit_model::data::BaseItemKind;
 use hermit_model::dto::BaseItemDto;
 use hermit_model::dto::SortOrder;
 use hermit_model::entities::ExtraType;
+use hermit_model::entities_media::MetadataProvider;
 use hermit_model::live_tv::ItemSortBy;
 use hermit_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
@@ -346,6 +352,106 @@ struct MediaFoldersQuery {
     is_hidden: Option<bool>,
 }
 
+/// `GET /Library/PhysicalPaths` — the physical on-disk paths of every library.
+///
+/// Port of `LibraryController.GetPhysicalPaths`
+/// (`RootFolder.Children.SelectMany(c => c.PhysicalLocations)`): the union of
+/// every virtual folder's resolved `.mblink` shortcut targets, served by the
+/// [`VirtualFolderManager`](hermit_traits::library::VirtualFolderManager) seam.
+#[utoipa::path(
+    get,
+    path = "/Library/PhysicalPaths",
+    responses((status = 200, description = "Physical paths returned", body = [String])),
+    tag = "hermit"
+)]
+async fn get_physical_paths(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<Json<Vec<String>>, ApiError> {
+    Ok(Json(state.virtual_folders.get_physical_paths().await?))
+}
+
+/// The query parameters of `GET /Libraries/AvailableOptions`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailableOptionsQuery {
+    /// Optional. The library content (collection) type to scope the options to.
+    #[serde(default)]
+    library_content_type: Option<hermit_model::data::CollectionType>,
+    /// Optional. Whether this is a new library (accepted for parity; it only
+    /// affects `DefaultEnabled` flags, which are all empty at this seam).
+    #[serde(default)]
+    is_new_library: bool,
+}
+
+/// The representative item types for a collection type.
+///
+/// Port of `LibraryController.GetRepresentativeItemTypes`: maps a collection type
+/// to the item kinds whose metadata/image options a library of that type exposes.
+fn representative_item_types(
+    content_type: Option<hermit_model::data::CollectionType>,
+) -> Vec<&'static str> {
+    use hermit_model::data::CollectionType;
+    match content_type {
+        Some(CollectionType::boxsets) => vec!["BoxSet"],
+        Some(CollectionType::playlists) => vec!["Playlist"],
+        Some(CollectionType::movies) => vec!["Movie"],
+        Some(CollectionType::tvshows) => vec!["Series", "Season", "Episode"],
+        Some(CollectionType::books) => vec!["Book", "AudioBook"],
+        Some(CollectionType::music) => vec!["MusicArtist", "MusicAlbum", "Audio", "MusicVideo"],
+        Some(CollectionType::homevideos | CollectionType::photos) => vec!["Video", "Photo"],
+        Some(CollectionType::musicvideos) => vec!["MusicVideo"],
+        _ => vec!["Series", "Season", "Episode", "Movie"],
+    }
+}
+
+/// `GET /Libraries/AvailableOptions` — the library options info.
+///
+/// Port of `LibraryController.GetLibraryOptionsInfo`: assembles the available
+/// metadata/subtitle/lyric/image providers from the metadata-plugin registry,
+/// grouped by the representative item types of `libraryContentType`.
+///
+/// **No metadata plugins are registered at this seam** (the provider registry is
+/// a later-wave subsystem), so every provider list is empty — a faithful
+/// projection (Jellyfin returns empty arrays when no plugin matches the type).
+/// The per-type blocks are still emitted (one per representative item type) with
+/// empty fetcher/image lists, so the shape a client sees is correct.
+#[utoipa::path(
+    get,
+    path = "/Libraries/AvailableOptions",
+    params(
+        ("libraryContentType" = Option<hermit_model::data::CollectionType>, Query, description = "Library content type"),
+        ("isNewLibrary" = Option<bool>, Query, description = "Whether this is a new library")
+    ),
+    responses((status = 200, description = "Library options info returned", body = LibraryOptionsResultDto)),
+    tag = "hermit"
+)]
+async fn get_available_options(
+    State(_state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<AvailableOptionsQuery>,
+) -> Result<Json<LibraryOptionsResultDto>, ApiError> {
+    use hermit_model::configuration::LibraryTypeOptionsDto;
+
+    // With no metadata plugins registered, the saver/reader/fetcher lists are all
+    // empty; only the per-type shell is populated (one block per representative
+    // item type), matching the C# assembly with an empty plugin set.
+    let type_options = representative_item_types(query.library_content_type)
+        .into_iter()
+        .map(|type_name| LibraryTypeOptionsDto {
+            type_: Some(type_name.to_owned()),
+            ..LibraryTypeOptionsDto::default()
+        })
+        .collect();
+
+    let _ = query.is_new_library; // Only affects DefaultEnabled flags (none set).
+
+    Ok(Json(LibraryOptionsResultDto {
+        type_options,
+        ..LibraryOptionsResultDto::default()
+    }))
+}
+
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.
 ///
 /// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
@@ -377,6 +483,213 @@ async fn get_media_folders(
     Ok(Json(QueryResult::from_items(dtos)))
 }
 
+/// Query parameters of `POST /Library/Series/Added` / `Updated`.
+///
+/// Ports `LibraryController.PostUpdatedSeries`'s `tvdbId` binding.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeriesUpdatedQuery {
+    /// Optional. The TVDB id of the series whose files changed.
+    #[serde(default)]
+    tvdb_id: Option<String>,
+}
+
+/// Query parameters of `POST /Library/Movies/Added` / `Updated`.
+///
+/// Ports `LibraryController.PostUpdatedMovies`'s `tmdbId` / `imdbId` binding.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoviesUpdatedQuery {
+    /// Optional. The TMDb id of the movie whose files changed.
+    #[serde(default)]
+    tmdb_id: Option<String>,
+    /// Optional. The IMDb id of the movie whose files changed (preferred over
+    /// `tmdbId` when both are supplied).
+    #[serde(default)]
+    imdb_id: Option<String>,
+}
+
+/// One path entry of a [`MediaUpdateInfoDto`] batch.
+///
+/// Port of Jellyfin's `MediaUpdateInfoPathDto`. `UpdateType` (`Created` /
+/// `Modified` / `Deleted`) is accepted for contract parity but unused — the
+/// monitor only needs the changed path.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MediaUpdateInfoPathDto {
+    /// The changed media path.
+    #[serde(default)]
+    path: Option<String>,
+    /// The kind of change (`Created` / `Modified` / `Deleted`). Accepted for
+    /// parity; not read.
+    #[serde(default)]
+    update_type: Option<String>,
+}
+
+/// The request body of `POST /Library/Media/Updated`.
+///
+/// Port of Jellyfin's `MediaUpdateInfoDto`: a batch of changed media paths.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MediaUpdateInfoDto {
+    /// The list of path updates to report.
+    #[serde(default)]
+    updates: Vec<MediaUpdateInfoPathDto>,
+}
+
+/// Reports every changed `path` to the library monitor.
+///
+/// Ports the `foreach (item) _libraryMonitor.ReportFileSystemChanged(item.Path)`
+/// loop shared by all three webhook actions. Empty paths are skipped (the C#
+/// item paths are never empty for a real item; the monitor also rejects empties).
+async fn report_paths(
+    state: &AppState,
+    paths: impl IntoIterator<Item = String>,
+) -> Result<(), ApiError> {
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        state
+            .library_monitor
+            .report_file_system_changed(&path)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Resolves the on-disk paths of every item of `kind` whose `provider` id equals
+/// `value` (case-insensitive), via the [`LibraryManager`] query seam.
+///
+/// Mirrors the C# `GetItemList(IncludeItemTypes = kind).Where(i =>
+/// i.GetProviderId(provider) == value)` selection, but pushes the exact
+/// provider-id match into the query
+/// ([`InternalItemsQuery::any_provider_id_equals`]) so the database does the
+/// filtering. Items without a stored path contribute nothing.
+async fn paths_by_provider_id(
+    state: &AppState,
+    kind: BaseItemKind,
+    provider: MetadataProvider,
+    value: &str,
+) -> Result<Vec<String>, ApiError> {
+    let items = state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![kind],
+            any_provider_id_equals: vec![(provider.as_name().to_owned(), value.to_owned())],
+            ..InternalItemsQuery::default()
+        })
+        .await?;
+    Ok(items.into_iter().filter_map(|i| i.path).collect())
+}
+
+/// `POST /Library/Series/Added` / `Updated` — report changed series files.
+///
+/// Port of `LibraryController.PostUpdatedSeries`: reports the path of every
+/// `Series` whose TVDB id equals `tvdbId`. With no `tvdbId` no series match, so
+/// nothing is reported — the same faithful no-op the C# `Where` yields. Always
+/// `204`.
+#[utoipa::path(
+    post,
+    path = "/Library/Series/Updated",
+    params(("tvdbId" = Option<String>, Query, description = "The TVDB id of the updated series")),
+    responses((status = 204, description = "Report success")),
+    tag = "hermit"
+)]
+async fn post_updated_series(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<SeriesUpdatedQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    if let Some(tvdb_id) = query.tvdb_id.as_deref().filter(|v| !v.is_empty()) {
+        let paths = paths_by_provider_id(
+            &state,
+            BaseItemKind::Series,
+            MetadataProvider::Tvdb,
+            tvdb_id,
+        )
+        .await?;
+        report_paths(&state, paths).await?;
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `POST /Library/Movies/Added` / `Updated` — report changed movie files.
+///
+/// Port of `LibraryController.PostUpdatedMovies`: reports the path of every
+/// `Movie` matching `imdbId` (preferred), else `tmdbId`. With neither supplied
+/// no movies match (C# assigns an empty list), so nothing is reported. Always
+/// `204`.
+#[utoipa::path(
+    post,
+    path = "/Library/Movies/Updated",
+    params(
+        ("tmdbId" = Option<String>, Query, description = "The TMDb id of the updated movie"),
+        ("imdbId" = Option<String>, Query, description = "The IMDb id of the updated movie")
+    ),
+    responses((status = 204, description = "Report success")),
+    tag = "hermit"
+)]
+async fn post_updated_movies(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<MoviesUpdatedQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    // IMDb takes precedence over TMDb, matching the C# `if/else if` chain.
+    let selector = query
+        .imdb_id
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(|v| (MetadataProvider::Imdb, v))
+        .or_else(|| {
+            query
+                .tmdb_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| (MetadataProvider::Tmdb, v))
+        });
+
+    if let Some((provider, value)) = selector {
+        let paths = paths_by_provider_id(&state, BaseItemKind::Movie, provider, value).await?;
+        report_paths(&state, paths).await?;
+    }
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `POST /Library/Media/Updated` — report a batch of changed media paths.
+///
+/// Port of `LibraryController.PostUpdatedMedia`: reports each `Path` in the
+/// request body. C# throws `ArgumentException` (mapped to `400`) on a null path;
+/// here a missing/empty path in an entry is a [`ApiError::BadRequest`]. Always
+/// `204` on success.
+#[utoipa::path(
+    post,
+    path = "/Library/Media/Updated",
+    request_body = (),
+    responses(
+        (status = 204, description = "Report success"),
+        (status = 400, description = "An update entry has no path")
+    ),
+    tag = "hermit"
+)]
+async fn post_updated_media(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(dto): Json<MediaUpdateInfoDto>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let mut paths = Vec::with_capacity(dto.updates.len());
+    for update in dto.updates {
+        let path = update
+            .path
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ApiError::BadRequest("Item path can't be null.".to_owned()))?;
+        let _ = update.update_type; // Accepted for parity; the monitor ignores it.
+        paths.push(path);
+    }
+    report_paths(&state, paths).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -386,4 +699,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/File", get(get_file))
         .route("/Library/Refresh", post(refresh_library))
         .route("/Library/MediaFolders", get(get_media_folders))
+        .route("/Library/PhysicalPaths", get(get_physical_paths))
+        .route("/Libraries/AvailableOptions", get(get_available_options))
+        .route("/Library/Series/Added", post(post_updated_series))
+        .route("/Library/Series/Updated", post(post_updated_series))
+        .route("/Library/Movies/Added", post(post_updated_movies))
+        .route("/Library/Movies/Updated", post(post_updated_movies))
+        .route("/Library/Media/Updated", post(post_updated_media))
 }

@@ -184,6 +184,57 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         }
     }
 
+    /// Produces a subtitle track in `output_format`, as bytes, for a time window.
+    ///
+    /// Port of `ISubtitleEncoder.GetSubtitles`: resolve the readable file
+    /// ([`get_readable_file`](Self::get_readable_file)), read + charset-normalize
+    /// it ([`get_subtitle_stream`](Self::get_subtitle_stream)), then — unless the
+    /// stream is already in the requested format (ASS being a superset of SSA) —
+    /// re-parse and re-emit it ([`convert_subtitles`](Self::convert_subtitles))
+    /// over `[start, end]`. The caller resolves the [`MediaSourceInfo`] and the
+    /// target subtitle stream from the item + media-source id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the readable file cannot be resolved/read,
+    /// or when `output_format` has no writer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_subtitles(
+        &self,
+        media_source: &MediaSourceInfo,
+        subtitle_stream: &MediaStream,
+        output_format: &str,
+        start_time_ticks: i64,
+        end_time_ticks: i64,
+        preserve_original_timestamps: bool,
+    ) -> Result<Vec<u8>, String> {
+        let info = self
+            .get_readable_file(media_source, subtitle_stream)
+            .await?;
+        let stream = self.get_subtitle_stream(&info).await?;
+
+        // Return the original when the same format is requested. ASS is a
+        // superset of SSA, so an SSA source satisfies an ASS request verbatim
+        // (styles preserved). Character encoding was handled in
+        // `get_subtitle_stream`.
+        if info.format.eq_ignore_ascii_case(output_format)
+            || (info.format.eq_ignore_ascii_case(subtitle_format::SSA)
+                && output_format.eq_ignore_ascii_case(subtitle_format::ASS))
+        {
+            return Ok(stream.into_bytes());
+        }
+
+        self.convert_subtitles(
+            stream.bytes(),
+            &info,
+            output_format,
+            start_time_ticks,
+            end_time_ticks,
+            preserve_original_timestamps,
+        )
+        .await
+    }
+
     /// Converts a parsed subtitle stream to `output_format` over a time window.
     ///
     /// Port of `SubtitleEncoder.ConvertSubtitles`: parse → [`filter_events`] →
@@ -248,6 +299,63 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             let bytes = self.io.read_file(&file_info.path).await?;
             Ok(SubtitleStream::new(bytes, false))
         }
+    }
+
+    /// Resolves the on-disk (or extracted) path of a subtitle stream.
+    ///
+    /// Port of `SubtitleEncoder.GetSubtitleFilePath`: the readable-file path
+    /// (extraction runs first when the stream is embedded/`.mks`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the readable file cannot be resolved.
+    pub async fn get_subtitle_file_path(
+        &self,
+        media_source: &MediaSourceInfo,
+        subtitle_stream: &MediaStream,
+    ) -> Result<String, String> {
+        Ok(self
+            .get_readable_file(media_source, subtitle_stream)
+            .await?
+            .path)
+    }
+
+    /// Detects the character-set name ffmpeg should be told to decode a subtitle
+    /// stream with.
+    ///
+    /// Port of `SubtitleEncoder.GetSubtitleFileCharacterSet`: an already-UTF-8
+    /// (or UTF-16, which ffmpeg auto-converts) `.ass`/`.ssa`/`.srt` needs no
+    /// charset hint and yields the empty string; otherwise the detected legacy
+    /// encoding name (e.g. `windows-1252`) is returned. The `.mks` extraction
+    /// branch of the C# is handled by the caller resolving the path first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the subtitle bytes cannot be read.
+    pub async fn get_subtitle_file_character_set(
+        &self,
+        subtitle_stream: &MediaStream,
+    ) -> Result<String, String> {
+        let path = subtitle_stream.path.clone().unwrap_or_default();
+        let protocol = self.io.path_protocol(&path);
+        let bytes = self.read_bytes(&path, protocol).await?;
+
+        let charset = match detect_charset(&bytes) {
+            DetectedCharset::Utf8OrAscii => String::new(),
+            DetectedCharset::Other(encoding) => encoding.name().to_ascii_lowercase(),
+        };
+
+        // UTF-16 is auto-converted to UTF-8 by ffmpeg for these containers, so no
+        // explicit character encoding should be specified.
+        if (ends_with_ignore_ascii_case(&path, ".ass")
+            || ends_with_ignore_ascii_case(&path, ".ssa")
+            || ends_with_ignore_ascii_case(&path, ".srt"))
+            && (charset == "utf-16le" || charset == "utf-16be")
+        {
+            return Ok(String::new());
+        }
+
+        Ok(charset)
     }
 
     /// Reads bytes from a path over its protocol (HTTP or local file).

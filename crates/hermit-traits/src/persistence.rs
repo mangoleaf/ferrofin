@@ -32,7 +32,7 @@ use hermit_db::entities::base_items::{
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::ItemCounts;
-use hermit_model::entities::MediaStreamType;
+use hermit_model::entities::{ImageType, MediaStreamType};
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -160,6 +160,31 @@ pub trait ItemRepository: Send + Sync {
     /// layer serves or projects into an `ImageInfo` DTO. An item with no images
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
+
+    /// Swaps the two `image_type` images at `index1` and `index2` for an item,
+    /// reordering them.
+    ///
+    /// Port of the persistence side of `BaseItem.SwapImagesAsync`: C# swaps the
+    /// on-disk files backing the two rows and clears their cached dimensions;
+    /// against the stored image rows the equivalent is to exchange the two rows'
+    /// `Path` (and reset `Width`/`Height` to `0` and stamp `DateModified`), so the
+    /// image that was at `index1` now resolves at `index2` and vice versa.
+    ///
+    /// Indices are `0`-based positions **within** the `image_type` group, in the
+    /// same order [`get_image_infos`](Self::get_image_infos) returns. When either
+    /// index is out of range the swap is a no-op (mirroring C#'s "nothing to do"
+    /// when `GetImageInfo` returns `null`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn swap_item_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError>;
 
     /// Gets genres with their item counts.
     async fn get_genres(

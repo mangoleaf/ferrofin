@@ -1,0 +1,483 @@
+//! `LibraryStructureController` — the virtual-folder (library-structure) admin
+//! routes.
+//!
+//! Ports every route of Jellyfin's `LibraryStructureController`
+//! (`[Route("Library/VirtualFolders")]`):
+//!
+//! - `GET  /Library/VirtualFolders` — list the configured virtual folders.
+//! - `POST /Library/VirtualFolders` — add a virtual folder.
+//! - `DELETE /Library/VirtualFolders` — remove a virtual folder.
+//! - `POST /Library/VirtualFolders/Name` — rename a virtual folder.
+//! - `POST /Library/VirtualFolders/LibraryOptions` — replace a library's options.
+//! - `POST /Library/VirtualFolders/Paths` — add a media path to a library.
+//! - `POST /Library/VirtualFolders/Paths/Update` — update a media path.
+//! - `DELETE /Library/VirtualFolders/Paths` — remove a media path.
+//!
+//! Each handler calls the [`VirtualFolderManager`](hermit_traits::library::VirtualFolderManager)
+//! seam on [`AppState`], which is backed at the composition root by the
+//! filesystem `HermitVirtualFolderManager` (see `handlers::library` for the two
+//! `LibraryController` structure reads, `PhysicalPaths` + `AvailableOptions`).
+//!
+//! The C# `refreshLibrary` query flag and the `ILibraryMonitor` stop/start dance
+//! are accepted-but-unused: the scan pipeline and filesystem watcher are
+//! later-wave subsystems, so a mutation takes effect on disk immediately and the
+//! requested refresh is a documented no-op (matching `POST /Library/Refresh`).
+
+use axum::Router;
+use axum::extract::{Json, Query, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
+use hermit_model::entities::CollectionTypeOptions;
+use hermit_model::entities_media::VirtualFolderInfo;
+use uuid::Uuid;
+
+use crate::auth::RequireAuth;
+use crate::error::ApiError;
+use crate::state::AppState;
+
+/// `GET /Library/VirtualFolders` — the configured virtual folders.
+///
+/// Port of `LibraryStructureController.GetVirtualFolders`.
+#[utoipa::path(
+    get,
+    path = "/Library/VirtualFolders",
+    responses((status = 200, description = "Virtual folders retrieved", body = [VirtualFolderInfo])),
+    tag = "hermit"
+)]
+async fn get_virtual_folders(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<Json<Vec<VirtualFolderInfo>>, ApiError> {
+    Ok(Json(state.virtual_folders.get_virtual_folders().await?))
+}
+
+/// The request body of `POST /Library/VirtualFolders`.
+///
+/// Port of `AddVirtualFolderDto`: an optional wrapper carrying the library
+/// options. The name/collection-type/paths are bound from the query string.
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "PascalCase")]
+struct AddVirtualFolderBody {
+    /// The library options; defaulted when the body (or field) is absent.
+    #[serde(default)]
+    library_options: Option<LibraryOptions>,
+}
+
+/// The query parameters of `POST /Library/VirtualFolders`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddVirtualFolderQuery {
+    /// The name of the virtual folder.
+    #[serde(default)]
+    name: Option<String>,
+    /// The collection type of the library.
+    #[serde(default)]
+    collection_type: Option<CollectionTypeOptions>,
+    /// The media paths (comma-delimited).
+    #[serde(default)]
+    paths: Option<String>,
+    /// Whether to refresh the library after adding (accepted, unused — the scan
+    /// pipeline is a later-wave subsystem).
+    #[serde(default)]
+    #[allow(dead_code)]
+    refresh_library: bool,
+}
+
+/// `POST /Library/VirtualFolders` — add a virtual folder.
+///
+/// Port of `LibraryStructureController.AddVirtualFolder`: the name must be
+/// non-empty (`400` otherwise, mirroring the C# `RegularExpression` guard), the
+/// query `paths` (if any) override the body's `PathInfos`, and each media path
+/// must exist on disk. The optional `AddVirtualFolderDto` body supplies the rest
+/// of the library options.
+#[utoipa::path(
+    post,
+    path = "/Library/VirtualFolders",
+    params(
+        ("name" = Option<String>, Query, description = "The name of the virtual folder"),
+        ("collectionType" = Option<CollectionTypeOptions>, Query, description = "The collection type"),
+        ("paths" = Option<String>, Query, description = "Comma-delimited media paths"),
+        ("refreshLibrary" = Option<bool>, Query, description = "Whether to refresh the library")
+    ),
+    request_body = Option<AddVirtualFolderBody>,
+    responses((status = 204, description = "Folder added")),
+    tag = "hermit"
+)]
+async fn add_virtual_folder(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<AddVirtualFolderQuery>,
+    body: Option<Json<AddVirtualFolderBody>>,
+) -> Result<StatusCode, ApiError> {
+    let name = query.name.unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "Library name cannot be empty or have leading/trailing spaces.".to_owned(),
+        ));
+    }
+
+    let mut options = body
+        .and_then(|Json(b)| b.library_options)
+        .unwrap_or_default();
+
+    // The query `paths` (comma-delimited) override the body's PathInfos, exactly
+    // as the C# controller assigns `libraryOptions.PathInfos` when `paths` is
+    // non-empty.
+    if let Some(raw) = query.paths.as_deref() {
+        let paths: Vec<MediaPathInfo> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| MediaPathInfo { path: p.to_owned() })
+            .collect();
+        if !paths.is_empty() {
+            options.path_infos = paths;
+        }
+    }
+
+    state
+        .virtual_folders
+        .add_virtual_folder(&name, query.collection_type, &options)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The query parameters of `DELETE /Library/VirtualFolders`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveVirtualFolderQuery {
+    /// The name of the folder.
+    #[serde(default)]
+    name: Option<String>,
+    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
+    /// later-wave subsystem).
+    #[serde(default)]
+    #[allow(dead_code)]
+    refresh_library: bool,
+}
+
+/// `DELETE /Library/VirtualFolders` — remove a virtual folder.
+///
+/// Port of `LibraryStructureController.RemoveVirtualFolder`: a missing folder is
+/// a `404` (mirroring the C# `FileNotFoundException`).
+#[utoipa::path(
+    delete,
+    path = "/Library/VirtualFolders",
+    params(
+        ("name" = Option<String>, Query, description = "The name of the folder"),
+        ("refreshLibrary" = Option<bool>, Query, description = "Whether to refresh the library")
+    ),
+    responses(
+        (status = 204, description = "Folder removed"),
+        (status = 404, description = "Folder not found")
+    ),
+    tag = "hermit"
+)]
+async fn remove_virtual_folder(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<RemoveVirtualFolderQuery>,
+) -> Result<StatusCode, ApiError> {
+    let name = query.name.unwrap_or_default();
+    state.virtual_folders.remove_virtual_folder(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The query parameters of `POST /Library/VirtualFolders/Name`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameVirtualFolderQuery {
+    /// The current name of the virtual folder.
+    #[serde(default)]
+    name: Option<String>,
+    /// The new name.
+    #[serde(default)]
+    new_name: Option<String>,
+    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
+    /// later-wave subsystem).
+    #[serde(default)]
+    #[allow(dead_code)]
+    refresh_library: bool,
+}
+
+/// `POST /Library/VirtualFolders/Name` — rename a virtual folder.
+///
+/// Port of `LibraryStructureController.RenameVirtualFolder`: a missing `name`/
+/// `newName` is a `400` (C# `ArgumentNullException`), a missing source folder is
+/// a `404`, and a target name that already exists is a `409`.
+#[utoipa::path(
+    post,
+    path = "/Library/VirtualFolders/Name",
+    params(
+        ("name" = Option<String>, Query, description = "The current name"),
+        ("newName" = Option<String>, Query, description = "The new name"),
+        ("refreshLibrary" = Option<bool>, Query, description = "Whether to refresh the library")
+    ),
+    responses(
+        (status = 204, description = "Folder renamed"),
+        (status = 404, description = "Library does not exist"),
+        (status = 409, description = "Library already exists")
+    ),
+    tag = "hermit"
+)]
+async fn rename_virtual_folder(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<RenameVirtualFolderQuery>,
+) -> Result<StatusCode, ApiError> {
+    let name = query.name.unwrap_or_default();
+    let new_name = query.new_name.unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".to_owned()));
+    }
+    if new_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("newName must not be empty".to_owned()));
+    }
+    state
+        .virtual_folders
+        .rename_virtual_folder(&name, &new_name)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The request body of `POST /Library/VirtualFolders/Paths`.
+///
+/// Port of `MediaPathDto`: the library `Name` plus either a raw `Path` or a
+/// full `PathInfo` (at least one must be present).
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "PascalCase")]
+struct MediaPathBody {
+    /// The name of the library.
+    #[serde(default)]
+    name: Option<String>,
+    /// The path to add.
+    #[serde(default)]
+    path: Option<String>,
+    /// The full path info.
+    #[serde(default)]
+    path_info: Option<MediaPathInfo>,
+}
+
+/// The query parameters of `POST /Library/VirtualFolders/Paths` and
+/// `DELETE /Library/VirtualFolders/Paths`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaPathQuery {
+    /// The name of the library (delete only).
+    #[serde(default)]
+    name: Option<String>,
+    /// The path to remove (delete only).
+    #[serde(default)]
+    path: Option<String>,
+    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
+    /// later-wave subsystem).
+    #[serde(default)]
+    #[allow(dead_code)]
+    refresh_library: bool,
+}
+
+/// `POST /Library/VirtualFolders/Paths` — add a media path to a library.
+///
+/// Port of `LibraryStructureController.AddMediaPath`: the `PathInfo` (or a bare
+/// `Path`) is added to the named library; a request with neither is a `400`.
+#[utoipa::path(
+    post,
+    path = "/Library/VirtualFolders/Paths",
+    params(("refreshLibrary" = Option<bool>, Query, description = "Whether to refresh the library")),
+    request_body = MediaPathBody,
+    responses((status = 204, description = "Media path added")),
+    tag = "hermit"
+)]
+async fn add_media_path(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(_query): Query<MediaPathQuery>,
+    Json(body): Json<MediaPathBody>,
+) -> Result<StatusCode, ApiError> {
+    let name = body.name.unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "The name of the library may not be empty.".to_owned(),
+        ));
+    }
+    let path_info = match (body.path_info, body.path) {
+        (Some(info), _) => info,
+        (None, Some(path)) => MediaPathInfo { path },
+        (None, None) => {
+            return Err(ApiError::BadRequest(
+                "PathInfo and Path can't both be null.".to_owned(),
+            ));
+        }
+    };
+    state
+        .virtual_folders
+        .add_media_path(&name, &path_info)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The request body of `POST /Library/VirtualFolders/Paths/Update`.
+///
+/// Port of `UpdateMediaPathRequestDto`: the library `Name` plus the full
+/// `PathInfo` to update (both required).
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateMediaPathBody {
+    /// The library name.
+    #[serde(default)]
+    name: Option<String>,
+    /// The path info to update.
+    #[serde(default)]
+    path_info: Option<MediaPathInfo>,
+}
+
+/// `POST /Library/VirtualFolders/Paths/Update` — update a media path.
+///
+/// Port of `LibraryStructureController.UpdateMediaPath`: an empty `Name` is a
+/// `400` (C# `ArgumentNullException`).
+#[utoipa::path(
+    post,
+    path = "/Library/VirtualFolders/Paths/Update",
+    request_body = UpdateMediaPathBody,
+    responses((status = 204, description = "Media path updated")),
+    tag = "hermit"
+)]
+async fn update_media_path(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(body): Json<UpdateMediaPathBody>,
+) -> Result<StatusCode, ApiError> {
+    let name = body.name.unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "Name must not be null or empty".to_owned(),
+        ));
+    }
+    let path_info = body
+        .path_info
+        .ok_or_else(|| ApiError::BadRequest("PathInfo must not be null".to_owned()))?;
+    state
+        .virtual_folders
+        .update_media_path(&name, &path_info)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /Library/VirtualFolders/Paths` — remove a media path.
+///
+/// Port of `LibraryStructureController.RemoveMediaPath`: an empty `name`/`path`
+/// is a `400` (C# `ArgumentException`).
+#[utoipa::path(
+    delete,
+    path = "/Library/VirtualFolders/Paths",
+    params(
+        ("name" = Option<String>, Query, description = "The name of the library"),
+        ("path" = Option<String>, Query, description = "The path to remove"),
+        ("refreshLibrary" = Option<bool>, Query, description = "Whether to refresh the library")
+    ),
+    responses((status = 204, description = "Media path removed")),
+    tag = "hermit"
+)]
+async fn remove_media_path(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Query(query): Query<MediaPathQuery>,
+) -> Result<StatusCode, ApiError> {
+    let name = query.name.unwrap_or_default();
+    let path = query.path.unwrap_or_default();
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name must not be empty".to_owned()));
+    }
+    if path.trim().is_empty() {
+        return Err(ApiError::BadRequest("path must not be empty".to_owned()));
+    }
+    state
+        .virtual_folders
+        .remove_media_path(&name, &path)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The request body of `POST /Library/VirtualFolders/LibraryOptions`.
+///
+/// Port of `UpdateLibraryOptionsDto`: the library item `Id` plus the new
+/// `LibraryOptions`.
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateLibraryOptionsBody {
+    /// The library item id.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    id: Option<Uuid>,
+    /// The library name (Hermit's filesystem seam resolves by name; see below).
+    #[serde(default)]
+    name: Option<String>,
+    /// The new library options.
+    #[serde(default)]
+    library_options: Option<LibraryOptions>,
+}
+
+/// `POST /Library/VirtualFolders/LibraryOptions` — replace a library's options.
+///
+/// Port of `LibraryStructureController.UpdateLibraryOptions`: creates a shortcut
+/// for any newly-referenced media path, then persists the new options.
+///
+/// **Id vs name.** C# looks the library up by its `CollectionFolder` item id
+/// (`GetItemById<CollectionFolder>(request.Id)`). Hermit's virtual-folder seam is
+/// the on-disk directory tree and does not model that DB item id, so the folder
+/// is resolved by its `Name` (its directory name). Clients that only have the id
+/// must supply the name; a request with neither (or an unknown library) is a
+/// `404`, mirroring the C# `NotFound`.
+#[utoipa::path(
+    post,
+    path = "/Library/VirtualFolders/LibraryOptions",
+    request_body = UpdateLibraryOptionsBody,
+    responses(
+        (status = 204, description = "Library updated"),
+        (status = 404, description = "Item not found")
+    ),
+    tag = "hermit"
+)]
+async fn update_library_options(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(body): Json<UpdateLibraryOptionsBody>,
+) -> Result<StatusCode, ApiError> {
+    let options = body.library_options.unwrap_or_default();
+    let name = body.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
+        ApiError::NotFound(format!(
+            "library {} (a library name is required at this seam)",
+            body.id.map(|i| i.to_string()).unwrap_or_default()
+        ))
+    })?;
+    state
+        .virtual_folders
+        .update_library_options(&name, &options)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Registers this controller's real routes onto `router`.
+pub fn register(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route(
+            "/Library/VirtualFolders",
+            get(get_virtual_folders)
+                .post(add_virtual_folder)
+                .delete(remove_virtual_folder),
+        )
+        .route("/Library/VirtualFolders/Name", post(rename_virtual_folder))
+        .route(
+            "/Library/VirtualFolders/LibraryOptions",
+            post(update_library_options),
+        )
+        .route(
+            "/Library/VirtualFolders/Paths",
+            post(add_media_path).delete(remove_media_path),
+        )
+        .route(
+            "/Library/VirtualFolders/Paths/Update",
+            post(update_media_path),
+        )
+}

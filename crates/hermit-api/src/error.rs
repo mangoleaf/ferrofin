@@ -45,6 +45,12 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The operation conflicts with existing state → `409`. Ported from the
+    /// controllers' `Conflict(…)` returns (e.g. renaming a library to a name
+    /// that already exists).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// The caller is authenticated but not permitted to perform the operation
     /// → `403`. Ported from the controllers' `StatusCode(403, …)` returns (e.g.
     /// updating another user without elevation, disabling the last admin).
@@ -64,6 +70,7 @@ impl ApiError {
             Self::Service(ServiceError::InvalidInput(_)) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::Service(ServiceError::Conflict(_)) | Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             // `Db`/`Backend` (and any future non-exhaustive variant) are internal

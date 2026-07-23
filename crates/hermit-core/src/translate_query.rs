@@ -714,6 +714,28 @@ fn append_provider_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
                 .push(")");
         }
     }
+
+    // Exact provider-id value match (`AnyProviderIdEquals`): the row qualifies if
+    // it has a `BaseItemProviders` entry whose key AND value equal any requested
+    // pair (case-insensitive), matching the C# `GetProviderId(..) == value` filter.
+    if !filter.any_provider_id_equals.is_empty() {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "BaseItemProviders" p WHERE p."ItemId" = bi."Id" AND ("#,
+        );
+        let mut first = true;
+        for (key, value) in &filter.any_provider_id_equals {
+            if !first {
+                qb.push(" OR ");
+            }
+            first = false;
+            qb.push(r#"(lower(p."ProviderId") = "#)
+                .push_bind(key.to_lowercase())
+                .push(r#" AND lower(p."ProviderValue") = "#)
+                .push_bind(value.to_lowercase())
+                .push(")");
+        }
+        qb.push("))");
+    }
 }
 
 /// Appends the ancestor / top-parent predicates.

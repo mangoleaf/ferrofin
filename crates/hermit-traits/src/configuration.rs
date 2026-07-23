@@ -28,7 +28,7 @@ use hermit_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
 use hermit_model::branding::BrandingOptions;
-use hermit_model::configuration::ServerConfiguration;
+use hermit_model::configuration::{EncodingOptions, ServerConfiguration};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -65,6 +65,25 @@ pub trait ServerConfigurationManager: Send + Sync {
     /// Persists a replacement branding configuration
     /// (C# `SaveConfiguration("branding", …)`).
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError>;
+
+    /// The current ffmpeg encoding options (C# `GetEncodingOptions()`, i.e.
+    /// `GetConfiguration<EncodingOptions>("encoding")`).
+    ///
+    /// Jellyfin stores this as a named configuration in a pluggable store;
+    /// Hermit persists it alongside the main configuration. The default
+    /// implementation returns [`EncodingOptions::default`] so the many manager
+    /// impls that do not surface encoding config keep compiling; the concrete
+    /// `HermitServerConfigurationManager` overrides it to read the persisted
+    /// document. Consumed by the `FallbackFont` endpoints to resolve
+    /// `FallbackFontPath`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] if the persisted configuration cannot be read or
+    /// parsed.
+    async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+        Ok(EncodingOptions::default())
+    }
 }
 
 fn _assert_object_safe_server_configuration_manager(_: &dyn ServerConfigurationManager) {}

@@ -15,8 +15,10 @@ use uuid::Uuid;
 use crate::error::ServiceError;
 use crate::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
+    SubtitleEncoder,
 };
 use hermit_model::dto::MediaSourceInfo;
+use hermit_model::entities_media::MediaStream;
 
 /// A no-op [`HlsStreamManager`]: every flow reports "no transcode runtime".
 ///
@@ -117,5 +119,63 @@ impl AttachmentExtractor for DisabledAttachmentExtractor {
         Err(ServiceError::NotFound(
             "attachment extraction is not available on this server".to_owned(),
         ))
+    }
+}
+
+/// A no-op [`SubtitleEncoder`]: every request reports "no transcode runtime".
+///
+/// The on-the-fly subtitle-conversion routes
+/// (`Videos/{id}/{source}/Subtitles/{index}/{format}` and the HLS subtitle
+/// playlist) need a [`SubtitleEncoder`] in `AppState`; this default lets
+/// pre-seam test constructors keep compiling and reports a subtitle it cannot
+/// produce as [`ServiceError::NotFound`]. The composition root replaces it with
+/// the concrete ffmpeg-backed encoder.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DisabledSubtitleEncoder;
+
+impl DisabledSubtitleEncoder {
+    /// The uniform "subtitle encoding is unavailable on this host" error.
+    fn unavailable() -> ServiceError {
+        ServiceError::NotFound("subtitle conversion is not available on this server".to_owned())
+    }
+}
+
+#[async_trait]
+impl SubtitleEncoder for DisabledSubtitleEncoder {
+    async fn get_subtitles(
+        &self,
+        _item_id: Uuid,
+        _media_source_id: &str,
+        _subtitle_stream_index: i32,
+        _output_format: &str,
+        _start_time_ticks: i64,
+        _end_time_ticks: i64,
+        _preserve_original_timestamps: bool,
+    ) -> Result<Vec<u8>, ServiceError> {
+        Err(Self::unavailable())
+    }
+
+    async fn get_subtitle_file_character_set(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _language: &str,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<String, ServiceError> {
+        Err(Self::unavailable())
+    }
+
+    async fn get_subtitle_file_path(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<String, ServiceError> {
+        Err(Self::unavailable())
+    }
+
+    async fn extract_all_extractable_subtitles(
+        &self,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<(), ServiceError> {
+        Err(Self::unavailable())
     }
 }

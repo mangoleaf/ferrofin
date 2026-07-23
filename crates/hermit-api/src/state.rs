@@ -18,18 +18,21 @@ use hermit_traits::dto::DtoService;
 use hermit_traits::events::ClientEventLogger;
 use hermit_traits::filesystem::FileSystem;
 use hermit_traits::library::{
-    LibraryManager, MediaSourceManager, MusicManager, SearchManager, SimilarItemsManager,
-    UserDataManager, UserManager, UserViewManager,
+    LibraryManager, LibraryMonitor, MediaSourceManager, MusicManager, SearchManager,
+    SimilarItemsManager, UserDataManager, UserManager, UserViewManager, VirtualFolderManager,
 };
 use hermit_traits::localization::LocalizationManager;
-use hermit_traits::media_encoding::{AttachmentExtractor, HlsStreamManager};
+use hermit_traits::media_encoding::{AttachmentExtractor, HlsStreamManager, SubtitleEncoder};
 use hermit_traits::media_segments::MediaSegmentManager;
 use hermit_traits::net::{AuthService, AuthorizationContext};
 use hermit_traits::providers::ProviderManager;
 use hermit_traits::security::{ApiKeyManager, QuickConnect};
 use hermit_traits::session::SessionManager;
 use hermit_traits::stubs::DisabledHlsStreamManager;
+use hermit_traits::stubs::DisabledSubtitleEncoder;
+use hermit_traits::stubs::DisabledVirtualFolderManager;
 use hermit_traits::stubs::LyricManager;
+use hermit_traits::stubs::NoopLibraryMonitor;
 use hermit_traits::subtitles::SubtitleManager;
 use hermit_traits::system::{ServerApplicationHost, SystemManager};
 use hermit_traits::tasks::TaskManager;
@@ -114,6 +117,25 @@ pub struct Inner {
     /// `Videos/{id}/{source}/Attachments/{index}` route. Defaults to the
     /// disabled stub; the composition root injects the ffmpeg-backed impl.
     pub attachments: Arc<dyn AttachmentExtractor>,
+    /// Converts subtitle tracks on the fly (charset-normalize + reformat) for the
+    /// `Videos/{id}/{source}/Subtitles/{index}/{format}` + HLS-playlist routes.
+    /// Defaults to the disabled stub; the composition root injects the
+    /// ffmpeg-backed `SubtitleEncoderImpl`.
+    pub subtitle_encoder: Arc<dyn SubtitleEncoder>,
+    /// The on-disk virtual-folder (library-structure) admin surface backing
+    /// `/Library/VirtualFolders*` and `/Library/PhysicalPaths`. Defaults to the
+    /// disabled stub (empty reads, rejected writes); the composition root injects
+    /// the filesystem-backed `HermitVirtualFolderManager` rooted at
+    /// `DefaultUserViewsPath` via [`AppState::with_virtual_folders`].
+    pub virtual_folders: Arc<dyn VirtualFolderManager>,
+
+    /// The filesystem-change monitor backing the external-source change-report
+    /// webhooks (`/Library/Movies/*`, `/Library/Series/*`,
+    /// `/Library/Media/Updated`). Defaults to the no-op monitor (change reports
+    /// are validated and logged, succeed, and touch no filesystem); the
+    /// composition root injects the watcher-backed `HermitLibraryMonitor` via
+    /// [`AppState::with_library_monitor`].
+    pub library_monitor: Arc<dyn LibraryMonitor>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -214,6 +236,13 @@ impl AppState {
             // overrides them via `with_media_encoding` at the composition root.
             hls: Arc::new(DisabledHlsStreamManager),
             attachments: Arc::new(hermit_traits::stubs::DisabledAttachmentExtractor),
+            subtitle_encoder: Arc::new(DisabledSubtitleEncoder),
+            // Default to the disabled virtual-folder store; the composition root
+            // overrides it via `with_virtual_folders`.
+            virtual_folders: Arc::new(DisabledVirtualFolderManager),
+            // Default to the no-op library monitor; the composition root overrides
+            // it via `with_library_monitor` once the filesystem watcher is wired.
+            library_monitor: Arc::new(NoopLibraryMonitor),
         })
     }
 
@@ -240,6 +269,64 @@ impl AppState {
             .expect("with_media_encoding must be called before the state is shared");
         inner.hls = hls;
         inner.attachments = attachments;
+        self
+    }
+
+    /// Replaces the subtitle encoder with a concrete implementation.
+    ///
+    /// [`new`](Self::new) installs the disabled stub (every conversion reports
+    /// "subtitle conversion is not available") so the test constructors keep
+    /// compiling; the composition root calls this to wire the ffmpeg-backed
+    /// `SubtitleEncoderImpl` before the state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_subtitle_encoder(mut self, subtitle_encoder: Arc<dyn SubtitleEncoder>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_subtitle_encoder must be called before the state is shared");
+        inner.subtitle_encoder = subtitle_encoder;
+        self
+    }
+
+    /// Replaces the virtual-folder store with a concrete implementation.
+    ///
+    /// [`new`](Self::new) installs the disabled stub (empty reads, rejected
+    /// writes) so the many test constructors keep compiling; the composition root
+    /// calls this to wire the filesystem-backed
+    /// `HermitVirtualFolderManager` (rooted at `DefaultUserViewsPath`) before the
+    /// state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_virtual_folders(mut self, virtual_folders: Arc<dyn VirtualFolderManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_virtual_folders must be called before the state is shared");
+        inner.virtual_folders = virtual_folders;
+        self
+    }
+
+    /// Replaces the library monitor with a concrete implementation.
+    ///
+    /// [`new`](Self::new) installs the no-op monitor (change reports succeed and
+    /// are logged, no filesystem is touched) so every test constructor keeps
+    /// compiling; the composition root calls this to wire the watcher-backed
+    /// `HermitLibraryMonitor` before the state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_library_monitor(mut self, library_monitor: Arc<dyn LibraryMonitor>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_library_monitor must be called before the state is shared");
+        inner.library_monitor = library_monitor;
         self
     }
 

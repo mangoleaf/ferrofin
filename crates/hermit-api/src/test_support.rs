@@ -69,10 +69,12 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::events::ClientEventLogger;
 use hermit_traits::filesystem::{FileMetadata, FileSystem};
 use hermit_traits::library::{
-    LibraryManager, MediaSourceManager, MusicManager, SearchManager, SearchResult,
+    LibraryManager, LibraryMonitor, MediaSourceManager, MusicManager, SearchManager, SearchResult,
     SimilarItemsManager, SimilarItemsRecommendation, UserDataManager, UserManager, UserViewManager,
+    VirtualFolderManager,
 };
 use hermit_traits::localization::LocalizationManager;
+use hermit_traits::media_encoding::SubtitleEncoder;
 use hermit_traits::media_segments::{MediaSegmentManager, MediaSegmentProviderInfo};
 use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::{
@@ -259,6 +261,23 @@ impl AuthService for FakeAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Err(ServiceError::unauthorized("no credentials"))
+    }
+}
+
+/// A fake [`AuthService`] that always authenticates, so `RequireAuth`-guarded
+/// routes reach their handler in tests exercising handler logic (not auth).
+pub struct AuthedAuthService;
+
+#[async_trait]
+impl AuthService for AuthedAuthService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
     }
 }
 
@@ -1708,4 +1727,364 @@ impl FileSystem for FakeFileSystem {
     fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
         unimplemented!("fake")
     }
+}
+
+/// A configurable in-memory [`VirtualFolderManager`] test double.
+///
+/// Models the on-disk virtual-folder tree as a `Vec<VirtualFolderInfo>` behind a
+/// `Mutex`, with just enough behaviour to exercise the library-structure handlers
+/// end-to-end (add/list/remove/rename/media-path/options) without touching a real
+/// filesystem — `hermit-api` must never dev-depend on `hermit-core`. A `fail`
+/// flag makes every operation return a [`ServiceError`] so error paths can be
+/// probed too.
+#[derive(Default)]
+pub struct FakeVirtualFolders {
+    /// The in-memory folders.
+    folders: std::sync::Mutex<Vec<hermit_model::entities_media::VirtualFolderInfo>>,
+    /// When set, every method fails with a backend error.
+    fail: bool,
+}
+
+impl FakeVirtualFolders {
+    /// A working (non-failing) fake, seeded empty.
+    #[must_use]
+    pub fn working() -> Self {
+        Self::default()
+    }
+
+    /// A fake whose every method fails (to probe error mapping).
+    #[must_use]
+    pub fn failing() -> Self {
+        Self {
+            fail: true,
+            folders: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The uniform failure used when [`Self::fail`] is set.
+    fn guard(&self) -> Result<(), ServiceError> {
+        if self.fail {
+            Err(ServiceError::backend("fake virtual-folder failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl VirtualFolderManager for FakeVirtualFolders {
+    async fn get_virtual_folders(
+        &self,
+    ) -> Result<Vec<hermit_model::entities_media::VirtualFolderInfo>, ServiceError> {
+        self.guard()?;
+        Ok(self.folders.lock().expect("lock").clone())
+    }
+
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<hermit_model::entities::CollectionTypeOptions>,
+        options: &hermit_model::configuration::LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.guard()?;
+        if name.trim().is_empty() {
+            return Err(ServiceError::invalid_input("empty name"));
+        }
+        self.folders
+            .lock()
+            .expect("lock")
+            .push(hermit_model::entities_media::VirtualFolderInfo {
+                name: Some(name.to_owned()),
+                locations: options.path_infos.iter().map(|p| p.path.clone()).collect(),
+                collection_type,
+                library_options: Some(options.clone()),
+                ..hermit_model::entities_media::VirtualFolderInfo::default()
+            });
+        Ok(())
+    }
+
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
+        self.guard()?;
+        let mut folders = self.folders.lock().expect("lock");
+        let before = folders.len();
+        folders.retain(|f| f.name.as_deref() != Some(name));
+        if folders.len() == before {
+            return Err(ServiceError::not_found(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError> {
+        self.guard()?;
+        let mut folders = self.folders.lock().expect("lock");
+        if folders.iter().any(|f| f.name.as_deref() == Some(new_name)) {
+            return Err(ServiceError::conflict(new_name.to_owned()));
+        }
+        let folder = folders
+            .iter_mut()
+            .find(|f| f.name.as_deref() == Some(name))
+            .ok_or_else(|| ServiceError::not_found(name.to_owned()))?;
+        folder.name = Some(new_name.to_owned());
+        Ok(())
+    }
+
+    async fn add_media_path(
+        &self,
+        virtual_folder_name: &str,
+        path_info: &hermit_model::configuration::MediaPathInfo,
+    ) -> Result<(), ServiceError> {
+        self.guard()?;
+        let mut folders = self.folders.lock().expect("lock");
+        let folder = folders
+            .iter_mut()
+            .find(|f| f.name.as_deref() == Some(virtual_folder_name))
+            .ok_or_else(|| ServiceError::not_found(virtual_folder_name.to_owned()))?;
+        folder.locations.push(path_info.path.clone());
+        Ok(())
+    }
+
+    async fn update_media_path(
+        &self,
+        virtual_folder_name: &str,
+        _path_info: &hermit_model::configuration::MediaPathInfo,
+    ) -> Result<(), ServiceError> {
+        self.guard()?;
+        let folders = self.folders.lock().expect("lock");
+        if folders
+            .iter()
+            .any(|f| f.name.as_deref() == Some(virtual_folder_name))
+        {
+            Ok(())
+        } else {
+            Err(ServiceError::not_found(virtual_folder_name.to_owned()))
+        }
+    }
+
+    async fn remove_media_path(
+        &self,
+        virtual_folder_name: &str,
+        path: &str,
+    ) -> Result<(), ServiceError> {
+        self.guard()?;
+        let mut folders = self.folders.lock().expect("lock");
+        let folder = folders
+            .iter_mut()
+            .find(|f| f.name.as_deref() == Some(virtual_folder_name))
+            .ok_or_else(|| ServiceError::not_found(virtual_folder_name.to_owned()))?;
+        folder.locations.retain(|l| l != path);
+        Ok(())
+    }
+
+    async fn update_library_options(
+        &self,
+        virtual_folder_name: &str,
+        options: &hermit_model::configuration::LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.guard()?;
+        let mut folders = self.folders.lock().expect("lock");
+        let folder = folders
+            .iter_mut()
+            .find(|f| f.name.as_deref() == Some(virtual_folder_name))
+            .ok_or_else(|| ServiceError::not_found(virtual_folder_name.to_owned()))?;
+        folder.library_options = Some(options.clone());
+        Ok(())
+    }
+}
+
+/// Builds an [`AppState`] whose virtual-folder store is `vf` and whose auth
+/// always authenticates ([`AuthedAuthService`]), so the library-structure
+/// handlers are reached (rather than short-circuited with `401`).
+///
+/// Every other manager is the panic-on-call [`fake_state`] double — the
+/// library-structure handlers touch only the virtual-folder store and the auth
+/// service.
+#[must_use]
+pub fn authed_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+    .with_virtual_folders(vf)
+}
+
+/// Builds an authenticating [`AppState`] for the subtitle-conversion +
+/// FallbackFont routes, injecting the four managers those handlers touch
+/// (`library`, `config`, `file_system`, `media_sources`) and the subtitle
+/// encoder.
+///
+/// Every other manager is the panic-on-call [`fake_state`] double, so a handler
+/// that strays outside those seams is caught. Authentication always succeeds
+/// ([`AuthedAuthService`]) so the `RequireAuth`-guarded FallbackFont/playlist
+/// routes reach their handler.
+#[must_use]
+pub fn authed_state_for_subtitles(
+    library: Arc<dyn LibraryManager>,
+    config: Arc<dyn ServerConfigurationManager>,
+    file_system: Arc<dyn FileSystem>,
+    media_sources: Arc<dyn MediaSourceManager>,
+    subtitle_encoder: Arc<dyn SubtitleEncoder>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        media_sources,
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        config,
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        file_system,
+        Arc::new(FakeTasks),
+    )
+    .with_subtitle_encoder(subtitle_encoder)
+}
+
+/// Builds an [`AppState`] whose library manager is `library` and whose library
+/// monitor is `monitor`, with always-authenticating auth so the change-report
+/// webhooks (`/Library/Movies/*`, `/Library/Series/*`, `/Library/Media/Updated`)
+/// are reached.
+///
+/// Every other manager is the panic-on-call [`fake_state`] double — those
+/// webhooks touch only the library manager, the library monitor and the auth
+/// service.
+#[must_use]
+pub fn authed_state_with_library_and_monitor(
+    library: Arc<dyn LibraryManager>,
+    monitor: Arc<dyn LibraryMonitor>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+    .with_library_monitor(monitor)
+}
+
+/// Builds an [`AppState`] whose library manager is `library` and whose provider
+/// manager is `providers`, with always-authenticating auth.
+///
+/// Used by the remote-metadata search + apply routes (`/Items/RemoteSearch/*`),
+/// which touch only the provider manager (for the search / refresh seam) and the
+/// library manager (to resolve the item on `Apply`). Every other manager is the
+/// panic-on-call [`fake_state`] double.
+#[must_use]
+pub fn authed_state_with_library_and_providers(
+    library: Arc<dyn LibraryManager>,
+    providers: Arc<dyn ProviderManager>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        providers,
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
 }

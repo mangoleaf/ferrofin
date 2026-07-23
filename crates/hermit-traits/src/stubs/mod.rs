@@ -16,14 +16,20 @@
 
 pub mod channels;
 pub mod hls_stream;
+pub mod library_monitor;
 pub mod live_tv;
 pub mod lyrics;
 pub mod plugins;
 pub mod sync_play;
+pub mod virtual_folders;
 
 pub use channels::ChannelManager;
-pub use hls_stream::{DisabledAttachmentExtractor, DisabledHlsStreamManager};
+pub use hls_stream::{
+    DisabledAttachmentExtractor, DisabledHlsStreamManager, DisabledSubtitleEncoder,
+};
+pub use library_monitor::NoopLibraryMonitor;
 pub use live_tv::LiveTvManager;
 pub use lyrics::LyricManager;
 pub use plugins::PluginManager;
 pub use sync_play::SyncPlayManager;
+pub use virtual_folders::DisabledVirtualFolderManager;

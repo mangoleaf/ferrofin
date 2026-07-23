@@ -11,11 +11,15 @@
 //!   (via `encoding_rs` + `chardetng`, replacing C# `UtfUnknown`), deterministic
 //!   `ConvertSubtitles` (keyed `tokio::Mutex`, replacing `AsyncKeyedLock`), and
 //!   the ffmpeg-backed extraction behind the [`SubtitleIo`] seam.
+//! - [`service`] — [`SubtitleEncoderImpl`], the object-safe `hermit-traits`
+//!   [`SubtitleEncoder`](hermit_traits::media_encoding::SubtitleEncoder) adapter
+//!   that resolves an item's media source and delegates to [`encoder`].
 
 pub mod encoder;
 pub mod json_writer;
 pub mod model;
 pub mod parser;
+pub mod service;
 pub mod srt;
 pub mod ssa;
 pub mod vtt;
@@ -23,3 +27,4 @@ pub mod vtt;
 pub use encoder::{NoopSubtitleIo, SubtitleEncoder, SubtitleInfo, SubtitleIo, SubtitleStream};
 pub use model::{Paragraph, Subtitle, TimeCode};
 pub use parser::{SubtitleEditParser, SubtitleParser};
+pub use service::SubtitleEncoderImpl;

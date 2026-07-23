@@ -55,10 +55,11 @@ pub struct RemoteSearchResult {
     pub overview: Option<String>,
 
     /// Gets or sets the album artist.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub album_artist: Option<Box<RemoteSearchResult>>,
 
     /// Gets or sets the artists.
+    #[serde(default)]
     pub artists: Vec<RemoteSearchResult>,
 }
 

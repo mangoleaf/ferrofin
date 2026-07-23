@@ -26,13 +26,15 @@
 use async_trait::async_trait;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
-use hermit_model::configuration::UserConfiguration;
+use hermit_model::configuration::{LibraryOptions, MediaPathInfo, UserConfiguration};
 use hermit_model::data::{BaseItemKind, CollectionType};
 use hermit_model::dto::{
     ItemCounts, MediaSourceInfo, NameIdPair, RecommendationType, UpdateUserItemDataDto, UserDto,
     UserItemDataDto,
 };
-use hermit_model::entities::MediaStreamType;
+use hermit_model::entities::CollectionTypeOptions;
+use hermit_model::entities::{ImageType, MediaStreamType};
+use hermit_model::entities_media::VirtualFolderInfo;
 use hermit_model::media_info::LiveStreamRequest;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use hermit_model::search::{SearchHint, SearchQuery};
@@ -85,6 +87,16 @@ pub struct SimilarItemsRecommendation {
     pub items: Vec<BaseItemEntity>,
 }
 
+/// Whether an image type permits an item to hold more than one image of that
+/// type — the only types whose ordering can be changed.
+///
+/// Port of `BaseItem.AllowsMultipleImages`: `true` for [`ImageType::Backdrop`]
+/// and [`ImageType::Chapter`], `false` otherwise.
+#[must_use]
+pub fn image_type_allows_multiple(image_type: ImageType) -> bool {
+    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
+}
+
 /// Orchestrates the item library: queries, counts, people, genres, deletion.
 ///
 /// Port of `ILibraryManager` (the object-safe, domain-tree-free subset). The
@@ -109,6 +121,41 @@ pub trait LibraryManager: Send + Sync {
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         let _ = item_id;
         Ok(Vec::new())
+    }
+
+    /// Reorders an item's images by swapping the two `image_type` images at
+    /// `index1` and `index2`.
+    ///
+    /// Port of `BaseItem.SwapImagesAsync` (the fan-in target of
+    /// `ImageController.UpdateItemImageIndex`): only image types that permit
+    /// multiple images can be reordered — Backdrop and Chapter, per C#
+    /// `AllowsMultipleImages` — so any other type is a
+    /// [`ServiceError::InvalidInput`] (the controller's `400`). An index that is
+    /// out of range is a no-op, mirroring C#'s "nothing to do" branch. The
+    /// concrete manager delegates to
+    /// [`ItemRepository::swap_item_images`](crate::persistence::ItemRepository::swap_item_images).
+    ///
+    /// The default is a no-op so managers without a persistence seam (test
+    /// doubles) compile unchanged; the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] when `image_type` does not allow multiple
+    /// images, or [`ServiceError::Backend`] on a storage failure.
+    async fn swap_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError> {
+        if !image_type_allows_multiple(image_type) {
+            return Err(ServiceError::invalid_input(
+                "The change index operation is only applicable to backdrops and chapters",
+            ));
+        }
+        let _ = (item_id, index1, index2);
+        Ok(())
     }
 
     /// Gets an item's ancestor rows, nearest parent first, walking the
@@ -799,6 +846,140 @@ pub trait LibraryMonitor: Send + Sync {
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 
+/// Manages the on-disk **virtual-folder** tree that backs the library-structure
+/// admin routes (`/Library/VirtualFolders*`, `/Library/PhysicalPaths`).
+///
+/// Port of the virtual-folder surface of `ILibraryManager`
+/// (`GetVirtualFolders`, `AddVirtualFolder`, `RemoveVirtualFolder`,
+/// `AddMediaPath`, `UpdateMediaPath`, `RemoveMediaPath`) plus the rename +
+/// library-option-update flows the `LibraryStructureController` drives directly.
+///
+/// In Jellyfin a "virtual folder" is a directory under
+/// `ApplicationPaths.DefaultUserViewsPath`; each holds `.mblink` shortcut files
+/// (one per media path, containing the target path as plain text), an optional
+/// `<type>.collection` marker file, and an `options.xml` carrying the serialized
+/// [`LibraryOptions`]. This trait models exactly that filesystem contract — it
+/// is independent of the DB-backed item tree, so a concrete impl only needs the
+/// root user-views path and is fully testable over a temp directory.
+///
+/// The `refresh_library` flag and the C# `ILibraryMonitor` stop/start dance are
+/// dropped: the scan pipeline and filesystem watcher are later-wave subsystems,
+/// so mutations take effect on disk immediately and the caller-requested refresh
+/// is a documented no-op at this seam (matching how `queue_library_scan` is a
+/// no-op today).
+#[async_trait]
+pub trait VirtualFolderManager: Send + Sync {
+    /// Lists every configured virtual folder.
+    ///
+    /// Port of `ILibraryManager.GetVirtualFolders`: each directory under the
+    /// user-views root becomes a [`VirtualFolderInfo`] whose `Locations` are the
+    /// resolved `.mblink` shortcut targets (sorted), `CollectionType` comes from
+    /// the `<type>.collection` marker, and `LibraryOptions` from `options.xml`.
+    /// The `ItemId`/`PrimaryImageItemId`/refresh-state fields depend on the
+    /// DB-backed collection-folder rows and refresh queue, which are absent at
+    /// this seam, so they are left unset (Jellyfin leaves them null too when the
+    /// folder has not yet been materialized as an item).
+    async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
+
+    /// Adds a virtual folder with the given name, optional collection type,
+    /// media paths, and library options.
+    ///
+    /// Port of `ILibraryManager.AddVirtualFolder`: the name is sanitized and
+    /// de-duplicated (a numeric suffix is appended when the directory already
+    /// exists), each media path must exist on disk (else
+    /// [`ServiceError::InvalidInput`]), the collection marker + `options.xml` are
+    /// written, and one `.mblink` shortcut is created per media path.
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<CollectionTypeOptions>,
+        options: &LibraryOptions,
+    ) -> Result<(), ServiceError>;
+
+    /// Removes the named virtual folder (its whole directory).
+    ///
+    /// Port of `ILibraryManager.RemoveVirtualFolder`: a missing folder is a
+    /// [`ServiceError::NotFound`] (mirroring the C# `FileNotFoundException` the
+    /// controller maps to `404`).
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// Renames a virtual folder from `name` to `new_name`.
+    ///
+    /// Port of `LibraryStructureController.RenameVirtualFolder`: the source must
+    /// exist ([`ServiceError::NotFound`] otherwise) and — unless the rename is a
+    /// pure case change of the same path — the target must not already exist
+    /// ([`ServiceError::Conflict`] otherwise). A case-only rename goes via a
+    /// temporary directory, matching the C# case-insensitive handling.
+    async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError>;
+
+    /// Adds a media path (and its `.mblink` shortcut) to an existing library.
+    ///
+    /// Port of `ILibraryManager.AddMediaPath`: the library must exist and the
+    /// path must exist on disk; the shortcut is created and the path is appended
+    /// to the library's `options.xml` `PathInfos`.
+    async fn add_media_path(
+        &self,
+        virtual_folder_name: &str,
+        path_info: &MediaPathInfo,
+    ) -> Result<(), ServiceError>;
+
+    /// Updates a media path's options within a library.
+    ///
+    /// Port of `ILibraryManager.UpdateMediaPath`: replaces the matching
+    /// `PathInfos` entry (by path) in the library's `options.xml`. The library
+    /// must exist.
+    async fn update_media_path(
+        &self,
+        virtual_folder_name: &str,
+        path_info: &MediaPathInfo,
+    ) -> Result<(), ServiceError>;
+
+    /// Removes a media path (and its `.mblink` shortcut) from a library.
+    ///
+    /// Port of `ILibraryManager.RemoveMediaPath`: deletes the shortcut that
+    /// resolves to `path` and drops the matching `PathInfos` entry from
+    /// `options.xml`. The library must exist ([`ServiceError::NotFound`]
+    /// otherwise).
+    async fn remove_media_path(
+        &self,
+        virtual_folder_name: &str,
+        path: &str,
+    ) -> Result<(), ServiceError>;
+
+    /// Replaces a library's options wholesale.
+    ///
+    /// Port of the `LibraryStructureController.UpdateLibraryOptions` tail
+    /// (`CollectionFolder.UpdateLibraryOptions`): looks the library up by its
+    /// item id, creates a shortcut for any newly-referenced media path, then
+    /// persists the supplied [`LibraryOptions`] to `options.xml`. A library id
+    /// that resolves to no folder is a [`ServiceError::NotFound`].
+    ///
+    /// The lookup is by name here: at this filesystem seam the DB item-id of a
+    /// collection folder is not modeled, so the caller resolves the id to the
+    /// folder name (its directory name) first. Passing the folder name keeps the
+    /// operation self-contained.
+    async fn update_library_options(
+        &self,
+        virtual_folder_name: &str,
+        options: &LibraryOptions,
+    ) -> Result<(), ServiceError>;
+
+    /// Lists the physical (resolved) locations across every virtual folder.
+    ///
+    /// Port of `LibraryController.GetPhysicalPaths`
+    /// (`RootFolder.Children.SelectMany(c => c.PhysicalLocations)`): the union of
+    /// every virtual folder's resolved `.mblink` targets.
+    async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
+        let mut paths = Vec::new();
+        for folder in self.get_virtual_folders().await? {
+            paths.extend(folder.locations);
+        }
+        Ok(paths)
+    }
+}
+
+fn _assert_object_safe_virtual_folder_manager(_: &dyn VirtualFolderManager) {}
+
 /// Finds items similar to a seed and builds recommendation categories.
 ///
 /// Port of `ISimilarItemsManager`. The generic `GetSimilarItemsProviders<T>` and
@@ -833,8 +1014,30 @@ fn _assert_object_safe_similar_items_manager(_: &dyn SimilarItemsManager) {}
 mod tests {
     use uuid::Uuid;
 
-    use super::{SearchResult, SimilarItemsRecommendation};
+    use super::{SearchResult, SimilarItemsRecommendation, image_type_allows_multiple};
     use hermit_model::dto::RecommendationType;
+    use hermit_model::entities::ImageType;
+
+    #[test]
+    fn only_backdrop_and_chapter_allow_multiple_images() {
+        assert!(image_type_allows_multiple(ImageType::Backdrop));
+        assert!(image_type_allows_multiple(ImageType::Chapter));
+        for other in [
+            ImageType::Primary,
+            ImageType::Art,
+            ImageType::Banner,
+            ImageType::Logo,
+            ImageType::Thumb,
+            ImageType::Disc,
+            ImageType::Box,
+            ImageType::Screenshot,
+            ImageType::Menu,
+            ImageType::BoxRear,
+            ImageType::Profile,
+        ] {
+            assert!(!image_type_allows_multiple(other), "{other:?}");
+        }
+    }
 
     #[test]
     fn search_result_holds_id_and_score() {

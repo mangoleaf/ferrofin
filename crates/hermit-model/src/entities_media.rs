@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::configuration::LibraryOptions;
 use crate::data::{VideoRange, VideoRangeType};
 use crate::dlna::SubtitleDeliveryMethod;
 use crate::entities::{CollectionTypeOptions, MediaStreamType};
@@ -320,9 +321,6 @@ impl LibraryUpdateInfo {
 }
 
 /// Used to hold information about a user's list of configured virtual folders.
-///
-/// The upstream `LibraryOptions` field is deferred to a later port unit and is
-/// intentionally omitted here.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct VirtualFolderInfo {
@@ -334,6 +332,10 @@ pub struct VirtualFolderInfo {
     /// The type of the collection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collection_type: Option<CollectionTypeOptions>,
+    /// The library options associated with the folder (per-library
+    /// `library.xml`/`options.xml` payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_options: Option<LibraryOptions>,
     /// The item identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
@@ -1462,5 +1464,331 @@ mod tests {
         );
         remove_provider_id_for(&mut bag, MetadataProvider::Tmdb);
         assert!(!has_provider_id_for(&bag, MetadataProvider::Tmdb));
+    }
+
+    /// A [`MediaStream`] of the given type with all-neutral fields.
+    fn stream(stream_type: MediaStreamType) -> MediaStream {
+        MediaStream {
+            stream_type,
+            ..MediaStream::default()
+        }
+    }
+
+    #[test]
+    fn resolution_text_spans_every_label_and_interlacing() {
+        let cases = [
+            (256, 144, false, Some("144p")),
+            (256, 144, true, Some("144i")),
+            (426, 240, false, Some("240p")),
+            (640, 360, false, Some("360p")),
+            (682, 384, false, Some("384p")),
+            (720, 404, false, Some("404p")),
+            (854, 480, false, Some("480p")),
+            (960, 544, false, Some("540p")),
+            (1024, 576, false, Some("576p")),
+            (1280, 720, false, Some("720p")),
+            (1920, 1080, false, Some("1080p")),
+            (1920, 1080, true, Some("1080i")),
+            (3840, 2160, false, Some("4K")),
+            (7680, 4320, false, Some("8K")),
+            (99999, 99999, false, None),
+        ];
+        for (w, h, interlaced, expected) in cases {
+            let mut s = stream(MediaStreamType::Video);
+            s.width = Some(w);
+            s.height = Some(h);
+            s.is_interlaced = interlaced;
+            assert_eq!(s.get_resolution_text().as_deref(), expected, "{w}x{h}");
+        }
+        // Missing width/height yields None.
+        assert_eq!(stream(MediaStreamType::Video).get_resolution_text(), None);
+    }
+
+    #[test]
+    fn audio_display_title_assembles_language_codec_channels_and_flags() {
+        let mut s = stream(MediaStreamType::Audio);
+        s.language = Some("eng".to_owned());
+        s.codec = Some("aac".to_owned());
+        s.channels = Some(6);
+        s.is_default = true;
+        s.is_external = true;
+        s.is_original = true;
+        let title = s.display_title().unwrap();
+        assert!(title.contains("Default"));
+        assert!(title.contains("External"));
+        assert!(title.contains("Original"));
+        assert!(title.contains("6 ch"));
+
+        // A special language code (und) is not shown; LC profile expands the codec.
+        let mut s2 = stream(MediaStreamType::Audio);
+        s2.language = Some("und".to_owned());
+        s2.profile = Some("LC".to_owned());
+        s2.codec = Some("aac".to_owned());
+        s2.channel_layout = Some("stereo".to_owned());
+        let title2 = s2.display_title().unwrap();
+        assert!(!title2.to_lowercase().contains("und"));
+        assert!(title2.contains("Stereo"));
+    }
+
+    #[test]
+    fn video_display_title_uses_resolution_codec_and_range() {
+        let mut s = stream(MediaStreamType::Video);
+        s.width = Some(1920);
+        s.height = Some(1080);
+        s.codec = Some("hevc".to_owned());
+        s.color_transfer = Some("smpte2084".to_owned());
+        let title = s.display_title().unwrap();
+        assert!(title.contains("1080p"));
+        assert!(title.contains("HEVC"));
+        // smpte2084 → HDR range name is appended (no DoVi title present).
+        assert!(title.contains("HDR"));
+    }
+
+    #[test]
+    fn subtitle_display_title_covers_flags_and_undefined() {
+        let mut s = stream(MediaStreamType::Subtitle);
+        s.is_hearing_impaired = true;
+        s.is_default = true;
+        s.is_forced = true;
+        s.is_external = true;
+        s.codec = Some("srt".to_owned());
+        let title = s.display_title().unwrap();
+        assert!(title.contains("Und")); // no language → Und
+        assert!(title.contains("Hearing Impaired"));
+        assert!(title.contains("Default"));
+        assert!(title.contains("Forced"));
+        assert!(title.contains("External"));
+        assert!(title.contains("SRT"));
+
+        // A non-audio/video/subtitle stream has no display title.
+        assert_eq!(stream(MediaStreamType::Data).display_title(), None);
+    }
+
+    #[test]
+    fn subtitle_format_predicates_classify_codecs() {
+        assert!(MediaStream::is_text_format(Some("srt")));
+        assert!(MediaStream::is_text_format(Some("microdvd")));
+        assert!(!MediaStream::is_text_format(Some("pgssub")));
+        assert!(MediaStream::is_pgs_format(Some("pgssub")));
+        assert!(MediaStream::is_pgs_format(Some("sup")));
+        assert!(MediaStream::is_vob_sub_format(Some("dvdsub")));
+        assert!(MediaStream::is_vob_sub_format(Some("vobsub")));
+
+        let mut text = stream(MediaStreamType::Subtitle);
+        text.codec = Some("srt".to_owned());
+        text.is_external = true;
+        assert!(text.is_text_subtitle_stream());
+        assert!(text.is_extractable_subtitle_stream());
+        assert!(text.supports_subtitle_conversion_to("vtt"));
+        assert!(!text.supports_subtitle_conversion_to("ass"));
+
+        let mut ass = stream(MediaStreamType::Subtitle);
+        ass.codec = Some("ass".to_owned());
+        ass.is_external = true;
+        assert!(!ass.supports_subtitle_conversion_to("vtt"));
+
+        let mut pgs = stream(MediaStreamType::Subtitle);
+        pgs.codec = Some("pgssub".to_owned());
+        pgs.is_external = true;
+        assert!(pgs.is_pgs_subtitle_stream());
+
+        let mut vob = stream(MediaStreamType::Subtitle);
+        vob.codec = Some("dvdsub".to_owned());
+        vob.is_external = true;
+        assert!(vob.is_vob_sub_subtitle_stream());
+
+        // Non-subtitle streams are never any subtitle format.
+        assert!(!stream(MediaStreamType::Video).is_text_subtitle_stream());
+        assert!(!stream(MediaStreamType::Video).is_pgs_subtitle_stream());
+        assert!(!stream(MediaStreamType::Video).is_vob_sub_subtitle_stream());
+    }
+
+    #[test]
+    fn video_color_range_maps_dovi_and_transfer_metadata() {
+        // Dolby Vision profile 5 → HDR/Dovi.
+        let mut dovi = stream(MediaStreamType::Video);
+        dovi.dv_profile = Some(5);
+        dovi.rpu_present_flag = Some(1);
+        dovi.bl_present_flag = Some(1);
+        dovi.dv_bl_signal_compatibility_id = Some(0);
+        assert_eq!(dovi.video_range(), VideoRange::Hdr);
+        assert_eq!(dovi.video_range_type(), VideoRangeType::Dovi);
+        assert_eq!(
+            dovi.video_dovi_title().as_deref(),
+            Some("Dolby Vision Profile 5")
+        );
+
+        // Profile 8 compat 1 → DoviWithHdr10; with HDR10+ flag → DoviWithHdr10Plus.
+        let mut p8 = stream(MediaStreamType::Video);
+        p8.dv_profile = Some(8);
+        p8.rpu_present_flag = Some(1);
+        p8.bl_present_flag = Some(1);
+        p8.dv_bl_signal_compatibility_id = Some(1);
+        assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10);
+        p8.hdr10_plus_present_flag = Some(true);
+        assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10Plus);
+
+        // Plain HDR10 via color transfer.
+        let mut hdr10 = stream(MediaStreamType::Video);
+        hdr10.color_transfer = Some("smpte2084".to_owned());
+        assert_eq!(hdr10.video_range_type(), VideoRangeType::Hdr10);
+        hdr10.hdr10_plus_present_flag = Some(true);
+        assert_eq!(hdr10.video_range_type(), VideoRangeType::Hdr10Plus);
+
+        // HLG.
+        let mut hlg = stream(MediaStreamType::Video);
+        hlg.color_transfer = Some("arib-std-b67".to_owned());
+        assert_eq!(hlg.video_range_type(), VideoRangeType::Hlg);
+
+        // SDR default + non-video short-circuit.
+        assert_eq!(
+            stream(MediaStreamType::Video).video_range(),
+            VideoRange::Sdr
+        );
+        assert_eq!(
+            stream(MediaStreamType::Audio).get_video_color_range(),
+            (VideoRange::Unknown, VideoRangeType::Unknown)
+        );
+    }
+
+    /// A DoVi video stream at `profile`/`compat`, with RPU+BL present.
+    fn dovi(profile: i32, compat: i32) -> MediaStream {
+        let mut s = stream(MediaStreamType::Video);
+        s.dv_profile = Some(profile);
+        s.rpu_present_flag = Some(1);
+        s.bl_present_flag = Some(1);
+        s.dv_bl_signal_compatibility_id = Some(compat);
+        s
+    }
+
+    #[test]
+    fn video_color_range_covers_all_dovi_profiles() {
+        // Profile 8 SDR (compat 2) and HLG (compat 4).
+        assert_eq!(dovi(8, 2).video_range_type(), VideoRangeType::DoviWithSdr);
+        assert_eq!(dovi(8, 4).video_range_type(), VideoRangeType::DoviWithHlg);
+        // Profile 8 with an out-of-spec compat → invalid.
+        assert_eq!(dovi(8, 6).video_range_type(), VideoRangeType::DoviInvalid);
+
+        // Profile 7 → DoviWithEl; with HDR10+ flag → DoviWithElhdr10Plus.
+        assert_eq!(dovi(7, 0).video_range_type(), VideoRangeType::DoviWithEl);
+        let mut p7 = dovi(7, 0);
+        p7.hdr10_plus_present_flag = Some(true);
+        assert_eq!(p7.video_range_type(), VideoRangeType::DoviWithElhdr10Plus);
+
+        // Profile 10 across its compat table.
+        assert_eq!(dovi(10, 0).video_range_type(), VideoRangeType::Dovi);
+        assert_eq!(
+            dovi(10, 1).video_range_type(),
+            VideoRangeType::DoviWithHdr10
+        );
+        assert_eq!(dovi(10, 2).video_range_type(), VideoRangeType::DoviWithSdr);
+        assert_eq!(dovi(10, 4).video_range_type(), VideoRangeType::DoviWithHlg);
+        // Compat 6 passes the DoVi flag gate but is out-of-spec for the inner
+        // profile-10 table → invalid.
+        assert_eq!(dovi(10, 6).video_range_type(), VideoRangeType::DoviInvalid);
+
+        // A codec-tag-driven DoVi (no profile) falls back to plain SDR/Sdr.
+        let mut tagged = stream(MediaStreamType::Video);
+        tagged.codec_tag = Some("dvh1".to_owned());
+        assert_eq!(tagged.video_range_type(), VideoRangeType::Sdr);
+    }
+
+    #[test]
+    fn dovi_title_covers_compat_suffixes() {
+        assert_eq!(
+            dovi(8, 2).video_dovi_title().as_deref(),
+            Some("Dolby Vision Profile 8.2 (SDR)")
+        );
+        assert_eq!(
+            dovi(8, 4).video_dovi_title().as_deref(),
+            Some("Dolby Vision Profile 8.4 (HLG)")
+        );
+        assert_eq!(
+            dovi(8, 6).video_dovi_title().as_deref(),
+            Some("Dolby Vision Profile 8.6 (HDR10)")
+        );
+        assert_eq!(
+            dovi(8, 1).video_dovi_title().as_deref(),
+            Some("Dolby Vision Profile 8.1 (HDR10)")
+        );
+        // No RPU → no DoVi title.
+        assert_eq!(stream(MediaStreamType::Video).video_dovi_title(), None);
+    }
+
+    #[test]
+    fn display_title_dedupes_attributes_already_in_title() {
+        // The channels-without-layout branch, plus title-dedup: the title already
+        // contains "AAC" so it is not appended again.
+        let mut s = stream(MediaStreamType::Audio);
+        s.title = Some("My AAC Track".to_owned());
+        s.codec = Some("aac".to_owned());
+        s.channels = Some(2);
+        let title = s.display_title().unwrap();
+        assert!(title.starts_with("My AAC Track"));
+        assert!(title.contains("2 ch"));
+    }
+
+    #[test]
+    fn audio_spatial_format_and_reference_frame_rate() {
+        let mut atmos = stream(MediaStreamType::Audio);
+        atmos.profile = Some("Dolby Atmos".to_owned());
+        assert_eq!(atmos.audio_spatial_format(), AudioSpatialFormat::DolbyAtmos);
+
+        let mut dtsx = stream(MediaStreamType::Audio);
+        dtsx.profile = Some("DTS:X".to_owned());
+        assert_eq!(dtsx.audio_spatial_format(), AudioSpatialFormat::Dtsx);
+
+        // No profile / non-audio → None.
+        assert_eq!(
+            stream(MediaStreamType::Audio).audio_spatial_format(),
+            AudioSpatialFormat::None
+        );
+
+        // Reference frame rate prefers a realistic average, else falls back.
+        let mut fr = stream(MediaStreamType::Video);
+        fr.average_frame_rate = Some(23.976);
+        assert_eq!(fr.reference_frame_rate(), Some(23.976));
+        fr.average_frame_rate = Some(9999.0);
+        fr.real_frame_rate = Some(25.0);
+        assert_eq!(fr.reference_frame_rate(), Some(25.0));
+    }
+
+    #[test]
+    fn media_stream_type_deserializes_from_int_and_string() {
+        // A MediaStream's stream_type accepts both the numeric discriminant and
+        // the PascalCase name on the wire.
+        for (int_wire, str_wire, expected) in [
+            (0, "Audio", MediaStreamType::Audio),
+            (1, "Video", MediaStreamType::Video),
+            (2, "Subtitle", MediaStreamType::Subtitle),
+            (3, "EmbeddedImage", MediaStreamType::EmbeddedImage),
+            (4, "Data", MediaStreamType::Data),
+            (5, "Lyric", MediaStreamType::Lyric),
+        ] {
+            let from_int: MediaStream =
+                serde_json::from_value(serde_json::json!({ "Type": int_wire })).unwrap();
+            assert_eq!(from_int.stream_type, expected);
+            let from_str: MediaStream =
+                serde_json::from_value(serde_json::json!({ "Type": str_wire })).unwrap();
+            assert_eq!(from_str.stream_type, expected);
+        }
+        // Out-of-range int and unknown string both error.
+        assert!(serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 })).is_err());
+        assert!(
+            serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": "Nope" })).is_err()
+        );
+    }
+
+    #[test]
+    fn virtual_folder_info_carries_library_options() {
+        let info = VirtualFolderInfo {
+            name: Some("Movies".to_owned()),
+            library_options: Some(crate::configuration::LibraryOptions::default()),
+            ..VirtualFolderInfo::default()
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("LibraryOptions").is_some());
+        let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back, info);
     }
 }

@@ -14,17 +14,49 @@
 //! deferral rather than silently succeeding. The external-id descriptor set —
 //! which the NFO parsers consume — is fully wired.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use hermit_model::configuration::{MetadataOptions, MetadataPluginSummary};
+use hermit_model::data::BaseItemKind;
 use hermit_model::entities::ImageType;
 use hermit_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
+    ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
+    RemoteImageQuery, RemoteSearchResult,
 };
 use hermit_traits::error::ServiceError;
 use hermit_traits::providers::{
-    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority, RemoteSearchRequest,
 };
 use uuid::Uuid;
+
+/// A single remote metadata-search fetcher (e.g. a TMDb or MusicBrainz plugin).
+///
+/// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced
+/// to the object-safe surface the manager needs: a display name, the item kinds
+/// it serves, and the search itself. The concrete network fetchers are
+/// **deferred** (feature-gated, need API keys); this trait is the seam a host
+/// registers them against when they land, and the one the dedup/merge port in
+/// [`LocalProviderManager::remote_search`] drives.
+#[async_trait]
+pub trait RemoteSearchProvider: Send + Sync {
+    /// The provider's display name, stamped onto every result it returns.
+    fn name(&self) -> &str;
+
+    /// Whether this provider can search for `item_kind`.
+    fn supports(&self, item_kind: BaseItemKind) -> bool;
+
+    /// Runs the search, returning raw candidate results (name/provider-ids set).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the concrete fetcher surfaces; the manager logs and continues on
+    /// a per-provider error rather than failing the whole search.
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError>;
+}
 
 /// A First-Light [`ProviderManager`] providing the descriptor surface and NFO
 /// external-id set, with refresh/image orchestration deferred.
@@ -32,16 +64,50 @@ use uuid::Uuid;
 /// Construct via [`LocalProviderManager::new`]. The external-id descriptors it
 /// advertises can be supplied at construction so downstream NFO parsing sees the
 /// same provider set the manager would.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct LocalProviderManager {
     external_id_infos: Vec<ExternalIdInfo>,
+    remote_search_providers: Vec<Arc<dyn RemoteSearchProvider>>,
+}
+
+impl std::fmt::Debug for LocalProviderManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalProviderManager")
+            .field("external_id_infos", &self.external_id_infos)
+            .field(
+                "remote_search_providers",
+                &self.remote_search_providers.len(),
+            )
+            .finish()
+    }
 }
 
 impl LocalProviderManager {
     /// Creates a manager advertising `external_id_infos` for every item.
+    ///
+    /// No remote-search providers are registered — remote metadata search is
+    /// deferred, so [`remote_search`](Self::remote_search) returns `[]`. Use
+    /// [`with_remote_search_providers`](Self::with_remote_search_providers) to
+    /// register fetchers once they land.
     #[must_use]
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
-        Self { external_id_infos }
+        Self {
+            external_id_infos,
+            remote_search_providers: Vec::new(),
+        }
+    }
+
+    /// Registers the remote-search fetchers this manager queries.
+    ///
+    /// The default set is empty (remote search deferred); a host with real
+    /// network fetchers supplies them here.
+    #[must_use]
+    pub fn with_remote_search_providers(
+        mut self,
+        providers: Vec<Arc<dyn RemoteSearchProvider>>,
+    ) -> Self {
+        self.remote_search_providers = providers;
+        self
     }
 
     /// Builds the "operation deferred" error for the orchestration methods that
@@ -50,6 +116,47 @@ impl LocalProviderManager {
         ServiceError::backend(format!(
             "{op} is deferred until the library-item store / image pipeline lands"
         ))
+    }
+
+    /// Merges `incoming` into `result_list`, deduplicating by shared provider id.
+    ///
+    /// Port of the inner merge in C# `GetRemoteSearchResults`: a result matches an
+    /// existing one when they agree on the value of any provider-id key. On a
+    /// match the existing entry absorbs any provider ids it is missing and adopts
+    /// the incoming image url when it had none; otherwise the incoming result is
+    /// appended.
+    fn merge_search_result(
+        result_list: &mut Vec<RemoteSearchResult>,
+        incoming: RemoteSearchResult,
+    ) {
+        let incoming_ids = incoming.provider_ids.clone().unwrap_or_default();
+
+        let existing = result_list.iter_mut().find(|existing| {
+            let existing_ids = existing.provider_ids.as_ref();
+            incoming_ids.iter().any(|(key, value)| {
+                existing_ids
+                    .and_then(|ids| ids.get(key))
+                    .is_some_and(|existing_value| existing_value.eq_ignore_ascii_case(value))
+            })
+        });
+
+        match existing {
+            Some(existing) => {
+                let ids = existing.provider_ids.get_or_insert_with(Default::default);
+                for (key, value) in incoming_ids {
+                    ids.entry(key).or_insert(value);
+                }
+                if existing
+                    .image_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_none_or(str::is_empty)
+                {
+                    existing.image_url = incoming.image_url;
+                }
+            }
+            None => result_list.push(incoming),
+        }
     }
 }
 
@@ -136,6 +243,40 @@ impl ProviderManager for LocalProviderManager {
         Ok(self.external_id_infos.clone())
     }
 
+    async fn remote_search(
+        &self,
+        request: &RemoteSearchRequest,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        // Select the providers that serve this item kind, then (if a provider
+        // name was supplied) narrow to that provider — a port of the C#
+        // `GetMetadataProvidersInternal(...).OfType<IRemoteSearchProvider>()`
+        // filter chain. With no fetcher registered this set is empty and the
+        // loop below yields `[]`, exactly as Jellyfin returns when nothing
+        // matches.
+        let name_filter = request.search_provider_name.as_deref();
+        let providers = self.remote_search_providers.iter().filter(|p| {
+            p.supports(request.item_kind)
+                && name_filter.is_none_or(|n| p.name().eq_ignore_ascii_case(n))
+        });
+
+        let mut result_list: Vec<RemoteSearchResult> = Vec::new();
+
+        for provider in providers {
+            // Per-provider failures are logged-and-skipped in C#; here we simply
+            // continue so one bad provider can't fail the whole search.
+            let Ok(results) = provider.get_search_results(&request.search_info).await else {
+                continue;
+            };
+
+            for mut result in results {
+                result.search_provider_name = Some(provider.name().to_owned());
+                Self::merge_search_result(&mut result_list, result);
+            }
+        }
+
+        Ok(result_list)
+    }
+
     async fn get_all_metadata_plugins(&self) -> Result<Vec<MetadataPluginSummary>, ServiceError> {
         Ok(Vec::new())
     }
@@ -151,13 +292,230 @@ impl ProviderManager for LocalProviderManager {
 
 #[cfg(test)]
 mod tests {
-    use super::LocalProviderManager;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::{LocalProviderManager, RemoteSearchProvider};
+    use async_trait::async_trait;
+    use hermit_model::data::BaseItemKind;
     use hermit_model::entities::ImageType;
-    use hermit_model::providers::{ExternalIdInfo, RemoteImageQuery};
+    use hermit_model::providers::{
+        ExternalIdInfo, ItemLookupInfo, RemoteImageQuery, RemoteSearchResult,
+    };
+    use hermit_traits::error::ServiceError;
     use hermit_traits::providers::{
         ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+        RemoteSearchRequest,
     };
     use uuid::Uuid;
+
+    /// A synthetic remote-search provider for exercising the merge/dedup port.
+    struct FakeProvider {
+        name: String,
+        kind: BaseItemKind,
+        results: Vec<RemoteSearchResult>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl RemoteSearchProvider for FakeProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn supports(&self, item_kind: BaseItemKind) -> bool {
+            item_kind == self.kind
+        }
+
+        async fn get_search_results(
+            &self,
+            _search_info: &ItemLookupInfo,
+        ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+            if self.fail {
+                return Err(ServiceError::backend("boom"));
+            }
+            Ok(self.results.clone())
+        }
+    }
+
+    fn result_with(name: &str, ids: &[(&str, &str)], image: Option<&str>) -> RemoteSearchResult {
+        let mut map = HashMap::new();
+        for (k, v) in ids {
+            map.insert((*k).to_owned(), (*v).to_owned());
+        }
+        RemoteSearchResult {
+            name: Some(name.to_owned()),
+            provider_ids: Some(map),
+            image_url: image.map(str::to_owned),
+            ..RemoteSearchResult::default()
+        }
+    }
+
+    fn request(kind: BaseItemKind) -> RemoteSearchRequest {
+        RemoteSearchRequest {
+            item_kind: kind,
+            ..RemoteSearchRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_search_is_empty_when_no_provider_registered() {
+        let mgr = LocalProviderManager::default();
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .expect("search succeeds");
+        assert!(out.is_empty(), "deferred remote search returns []");
+    }
+
+    #[tokio::test]
+    async fn remote_search_stamps_provider_name_and_returns_results() {
+        let provider = Arc::new(FakeProvider {
+            name: "TheMovieDb".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![result_with("Inception", &[("Tmdb", "27205")], None)],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![provider as Arc<dyn RemoteSearchProvider>]);
+
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].search_provider_name.as_deref(), Some("TheMovieDb"));
+        assert_eq!(out[0].name.as_deref(), Some("Inception"));
+    }
+
+    #[tokio::test]
+    async fn remote_search_skips_providers_of_other_kinds() {
+        let provider = Arc::new(FakeProvider {
+            name: "MusicBrainz".to_owned(),
+            kind: BaseItemKind::MusicAlbum,
+            results: vec![result_with(
+                "Kind of Blue",
+                &[("MusicBrainzAlbum", "x")],
+                None,
+            )],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![provider as Arc<dyn RemoteSearchProvider>]);
+        // A Movie search must not reach a MusicAlbum provider.
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_search_provider_name_filter_is_case_insensitive() {
+        let provider = Arc::new(FakeProvider {
+            name: "TheMovieDb".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![result_with("Inception", &[("Tmdb", "27205")], None)],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![provider as Arc<dyn RemoteSearchProvider>]);
+
+        let mut req = request(BaseItemKind::Movie);
+        req.search_provider_name = Some("themoviedb".to_owned());
+        assert_eq!(mgr.remote_search(&req).await.unwrap().len(), 1);
+
+        req.search_provider_name = Some("NoSuchProvider".to_owned());
+        assert!(mgr.remote_search(&req).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_search_merges_duplicates_by_shared_provider_id() {
+        // Two providers return the same film under a shared Tmdb id; the second
+        // adds an Imdb id and an image url the first lacked.
+        let a = Arc::new(FakeProvider {
+            name: "A".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![result_with("Inception", &[("Tmdb", "27205")], None)],
+            fail: false,
+        });
+        let b = Arc::new(FakeProvider {
+            name: "B".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![result_with(
+                "Inception",
+                &[("Tmdb", "27205"), ("Imdb", "tt1375666")],
+                Some("http://img/incep.jpg"),
+            )],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default().with_remote_search_providers(vec![
+            a as Arc<dyn RemoteSearchProvider>,
+            b as Arc<dyn RemoteSearchProvider>,
+        ]);
+
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "duplicates collapse to one entry");
+        let ids = out[0].provider_ids.as_ref().unwrap();
+        assert_eq!(ids["Tmdb"], "27205");
+        assert_eq!(ids["Imdb"], "tt1375666", "missing id absorbed from B");
+        assert_eq!(
+            out[0].image_url.as_deref(),
+            Some("http://img/incep.jpg"),
+            "image url adopted from B"
+        );
+        // The first provider that produced the surviving entry wins its name.
+        assert_eq!(out[0].search_provider_name.as_deref(), Some("A"));
+    }
+
+    #[tokio::test]
+    async fn remote_search_distinct_ids_are_not_merged() {
+        let a = Arc::new(FakeProvider {
+            name: "A".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![
+                result_with("Inception", &[("Tmdb", "27205")], None),
+                result_with("Tenet", &[("Tmdb", "577922")], None),
+            ],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_search_providers(vec![a as Arc<dyn RemoteSearchProvider>]);
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_search_swallows_a_failing_provider() {
+        let bad = Arc::new(FakeProvider {
+            name: "Bad".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![],
+            fail: true,
+        });
+        let good = Arc::new(FakeProvider {
+            name: "Good".to_owned(),
+            kind: BaseItemKind::Movie,
+            results: vec![result_with("Dune", &[("Tmdb", "438631")], None)],
+            fail: false,
+        });
+        let mgr = LocalProviderManager::default().with_remote_search_providers(vec![
+            bad as Arc<dyn RemoteSearchProvider>,
+            good as Arc<dyn RemoteSearchProvider>,
+        ]);
+        let out = mgr
+            .remote_search(&request(BaseItemKind::Movie))
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "the good provider's result still lands");
+        assert_eq!(out[0].name.as_deref(), Some("Dune"));
+    }
 
     #[tokio::test]
     async fn external_id_infos_are_advertised() {

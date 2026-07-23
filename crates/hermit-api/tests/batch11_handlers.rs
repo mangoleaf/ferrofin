@@ -817,20 +817,10 @@ async fn deferred_routes_still_return_501() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    // On-the-fly subtitle conversion + HLS subtitle playlist (SubtitleEncoder),
-    // fallback fonts (encoding-options config not surfaced), and the plugin
-    // SegmentEditor routes all remain unimplemented.
+    // The plugin SegmentEditor routes remain unimplemented (they need the plugin
+    // host). On-the-fly subtitle conversion, the HLS subtitle playlist, and the
+    // FallbackFont routes are now real (see `batch5_handlers`).
     for (method, uri) in [
-        (
-            "GET",
-            format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/Stream.vtt"),
-        ),
-        (
-            "GET",
-            format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/subtitles.m3u8"),
-        ),
-        ("GET", "/FallbackFont/Fonts".to_owned()),
-        ("GET", "/FallbackFont/Fonts/font.ttf".to_owned()),
         // The plugin SegmentEditor create route (POST-only in the contract).
         ("POST", format!("/MediaSegmentsApi/{ITEM_ID}")),
     ] {

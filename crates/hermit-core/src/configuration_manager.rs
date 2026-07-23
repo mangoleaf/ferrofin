@@ -31,7 +31,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use hermit_model::branding::BrandingOptions;
-use hermit_model::configuration::ServerConfiguration;
+use hermit_model::configuration::{EncodingOptions, ServerConfiguration};
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
 use hermit_traits::system::ServerApplicationPaths;
@@ -128,6 +128,7 @@ pub struct HermitServerConfigurationManager {
     paths: Arc<HermitServerApplicationPaths>,
     config_file: PathBuf,
     branding_file: PathBuf,
+    encoding_file: PathBuf,
     configuration: RwLock<ServerConfiguration>,
 }
 
@@ -146,6 +147,10 @@ impl HermitServerConfigurationManager {
     /// The on-disk branding configuration file name (Jellyfin's named
     /// `branding` configuration, stored as a sibling JSON document).
     const BRANDING_FILE_NAME: &'static str = "branding.json";
+
+    /// The on-disk encoding configuration file name (Jellyfin's named
+    /// `encoding` configuration, stored as a sibling JSON document).
+    const ENCODING_FILE_NAME: &'static str = "encoding.json";
 
     /// Loads (or initializes) the configuration for the given paths.
     ///
@@ -167,6 +172,7 @@ impl HermitServerConfigurationManager {
             );
         let config_file = config_dir.join(Self::CONFIG_FILE_NAME);
         let branding_file = config_dir.join(Self::BRANDING_FILE_NAME);
+        let encoding_file = config_dir.join(Self::ENCODING_FILE_NAME);
 
         let configuration = if config_file.exists() {
             let bytes = tokio::fs::read(&config_file)
@@ -186,6 +192,7 @@ impl HermitServerConfigurationManager {
             paths,
             config_file,
             branding_file,
+            encoding_file,
             configuration: RwLock::new(configuration),
         })
     }
@@ -288,6 +295,17 @@ impl ServerConfigurationManager for HermitServerConfigurationManager {
         tokio::fs::write(&self.branding_file, json)
             .await
             .map_err(|e| io_err("write branding", &self.branding_file, &e))
+    }
+
+    async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+        if !self.encoding_file.exists() {
+            return Ok(EncodingOptions::default());
+        }
+        let bytes = tokio::fs::read(&self.encoding_file)
+            .await
+            .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
+        serde_json::from_slice::<EncodingOptions>(&bytes)
+            .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
     }
 }
 
@@ -399,6 +417,61 @@ mod tests {
             reloaded.get_branding().await.expect("reload branding"),
             branding
         );
+    }
+
+    #[tokio::test]
+    async fn encoding_options_default_then_reads_persisted_document() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = HermitServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+
+        // No encoding file yet → defaults (and no fallback-font path configured).
+        let initial = mgr.get_encoding_options().await.expect("get encoding");
+        assert_eq!(initial, EncodingOptions::default());
+        assert!(initial.fallback_font_path.is_none());
+
+        // Persist a customized encoding document and observe it reload.
+        let encoding = EncodingOptions {
+            fallback_font_path: Some("/srv/fonts".to_owned()),
+            enable_fallback_font: true,
+            ..EncodingOptions::default()
+        };
+        let json = serde_json::to_vec_pretty(&encoding).expect("serialize encoding");
+        tokio::fs::write(&mgr.encoding_file, json)
+            .await
+            .expect("write encoding");
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("reget encoding"),
+            encoding
+        );
+
+        // A fresh manager over the same paths reads the persisted document.
+        let reloaded = HermitServerConfigurationManager::load(paths)
+            .await
+            .expect("reload");
+        assert_eq!(
+            reloaded
+                .get_encoding_options()
+                .await
+                .expect("reload encoding"),
+            encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn encoding_options_rejects_invalid_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = HermitServerConfigurationManager::load(paths)
+            .await
+            .expect("load");
+
+        tokio::fs::write(&mgr.encoding_file, b"not json")
+            .await
+            .expect("write bad encoding");
+        assert!(mgr.get_encoding_options().await.is_err());
     }
 
     #[tokio::test]

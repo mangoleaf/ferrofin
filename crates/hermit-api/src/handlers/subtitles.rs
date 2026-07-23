@@ -13,11 +13,18 @@
 //! exist (not `501`) and surface the manager's empty/"not enabled" behaviour so
 //! clients see stable semantics.
 //!
-//! On-the-fly subtitle *conversion* (`Videos/{itemId}/{mediaSourceId}/Subtitles/
-//! {index}/Stream.{format}` and the `.m3u8` playlist) needs the un-ported
-//! `SubtitleEncoder` and stays on the `501` stub. The `FallbackFont` routes need
-//! the encoding-options config (`FallbackFontPath`), which is not surfaced at the
-//! `ServerConfigurationManager` seam yet, so they also stay on the `501` stub.
+//! On-the-fly subtitle *conversion* is now real: the
+//! `Videos/{itemId}/{container}/Subtitles/{index}/{format}` (with and without a
+//! start-position segment) routes call the
+//! [`SubtitleEncoder`](hermit_traits::media_encoding::SubtitleEncoder) seam
+//! (ffmpeg-backed `SubtitleEncoderImpl` at the composition root; the disabled
+//! stub `404`s), and the `subtitles.m3u8` route builds the segment playlist from
+//! the media source's runtime. The `FallbackFont` routes resolve
+//! `EncodingOptions.FallbackFontPath` (via the config seam's new
+//! `get_encoding_options`) and enumerate / serve fonts through the
+//! [`FileSystem`](hermit_traits::filesystem::FileSystem) seam.
+
+use std::fmt::Write as _;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -25,14 +32,33 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hermit_model::providers::RemoteSubtitleInfo;
+use hermit_model::subtitles::FontFile;
 use hermit_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::image_upload::decode_base64;
+use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
 use crate::state::AppState;
+
+/// The MIME type Jellyfin serves an HLS subtitle playlist with
+/// (`MimeTypes.GetMimeType("playlist.m3u8")`).
+const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/x-mpegURL";
+
+/// The number of 100-ns ticks in one second (`TimeSpan.TicksPerSecond`), used to
+/// convert the `segmentLength` (seconds) into the tick space the playlist math
+/// and the subtitle encoder operate in.
+const TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// The maximum total size of fallback fonts served by `GET /FallbackFont/Fonts`
+/// (Jellyfin's hard-coded 20 MiB cap; fonts past it are dropped).
+const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
+
+/// The fallback-font file extensions Jellyfin enumerates
+/// (`.woff`/`.woff2`/`.ttf`/`.otf`).
+const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
 /// Ensures an item exists, returning `404` otherwise.
 async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
@@ -243,6 +269,381 @@ fn subtitle_mime(format: &str) -> &'static str {
     }
 }
 
+/// Extracts the subtitle output format from a captured route segment.
+///
+/// The axum route normalizes Jellyfin's `Stream.{routeFormat}` to a single
+/// `{routeFormat}` capture holding the whole segment (e.g. `Stream.vtt`), so the
+/// literal `Stream.` prefix is stripped and the trailing extension taken. A bare
+/// segment without the prefix (defensive) is returned as-is. The C# `js` alias
+/// maps to `json`.
+fn parse_subtitle_format(segment: &str) -> String {
+    let ext = segment
+        .rsplit_once('.')
+        .map_or(segment, |(_, ext)| ext)
+        .to_ascii_lowercase();
+    if ext == "js" { "json".to_owned() } else { ext }
+}
+
+/// Query parameters shared by the on-the-fly subtitle-conversion routes.
+///
+/// The `PascalCase` aliases match the query keys the server emits in its own HLS
+/// subtitle-playlist links (`stream.vtt?CopyTimestamps=true&AddVttTimeMap=…`), so
+/// those `stream.vtt` requests bind correctly regardless of the client's casing.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleStreamQuery {
+    /// Optional. The end position of the subtitle in ticks.
+    #[serde(default, alias = "EndPositionTicks")]
+    end_position_ticks: Option<i64>,
+    /// Optional. Whether to copy (preserve) the original timestamps.
+    #[serde(default, alias = "CopyTimestamps")]
+    copy_timestamps: bool,
+    /// Optional. Whether to prepend a WebVTT `X-TIMESTAMP-MAP` header.
+    #[serde(default, alias = "AddVttTimeMap")]
+    add_vtt_time_map: bool,
+    /// The start position of the subtitle in ticks.
+    #[serde(default, alias = "StartPositionTicks")]
+    start_position_ticks: i64,
+}
+
+/// Serves an encoded subtitle: converts the stream, then wraps the bytes with the
+/// format's MIME type, adding the WebVTT time-map header when requested.
+async fn encode_subtitle_response(
+    state: &AppState,
+    item_id: Uuid,
+    media_source_id: &str,
+    index: i32,
+    format: &str,
+    query: &SubtitleStreamQuery,
+) -> Result<Response, ApiError> {
+    let bytes = state
+        .subtitle_encoder
+        .get_subtitles(
+            item_id,
+            media_source_id,
+            index,
+            format,
+            query.start_position_ticks,
+            query.end_position_ticks.unwrap_or(0),
+            query.copy_timestamps,
+        )
+        .await?;
+
+    let mime = subtitle_mime(format);
+
+    // For WebVTT with AddVttTimeMap, splice the MPEG-TS offset the HLS spec wants
+    // (port of the `WEBVTT` → `WEBVTT\nX-TIMESTAMP-MAP=…` string replace).
+    if format.eq_ignore_ascii_case("vtt") && query.add_vtt_time_map {
+        let text = String::from_utf8_lossy(&bytes).replace(
+            "WEBVTT",
+            "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
+        );
+        return Ok(([(header::CONTENT_TYPE, mime)], text.into_bytes()).into_response());
+    }
+
+    Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
+}
+
+/// `GET /Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}` — convert a
+/// subtitle stream to the requested format on the fly.
+///
+/// Port of `SubtitleController.GetSubtitle` (the `Stream.{format}` route). The
+/// `{container}` segment is the media source id; `{routeFormat}` collapses the
+/// `Stream.{format}` literal. The [`SubtitleEncoder`] resolves the source,
+/// charset-normalizes the stream and converts it over `[start, end]`; with no
+/// encoder wired (disabled stub) this surfaces as `404`.
+#[utoipa::path(
+    get,
+    path = "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("container" = String, Path, description = "The media source id"),
+        ("index" = i32, Path, description = "The subtitle stream index"),
+        ("routeFormat" = String, Path, description = "The requested subtitle format (Stream.{format})"),
+        ("endPositionTicks" = Option<i64>, Query, description = "The end position of the subtitle in ticks"),
+        ("copyTimestamps" = Option<bool>, Query, description = "Whether to copy the timestamps"),
+        ("addVttTimeMap" = Option<bool>, Query, description = "Whether to add a VTT time map"),
+        ("startPositionTicks" = Option<i64>, Query, description = "The start position of the subtitle in ticks")
+    ),
+    responses((status = 200, description = "File returned")),
+    tag = "hermit"
+)]
+async fn get_subtitle(
+    State(state): State<AppState>,
+    Path((item_id, media_source_id, index, route_format)): Path<(Uuid, String, i32, String)>,
+    Query(query): Query<SubtitleStreamQuery>,
+) -> Result<Response, ApiError> {
+    let format = parse_subtitle_format(&route_format);
+    encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
+}
+
+/// `GET /Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}/{routeFormat}`
+/// — convert a subtitle stream, with the start position carried in the path.
+///
+/// Port of `SubtitleController.GetSubtitleWithTicks`: the first trailing segment
+/// is the start-position ticks, the second is the `Stream.{format}` literal. The
+/// path start position wins when the query omits it (matching the C# default).
+#[utoipa::path(
+    get,
+    path = "/Videos/{itemId}/{container}/Subtitles/{index}/{routeStartPositionTicks}/{routeFormat}",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("container" = String, Path, description = "The media source id"),
+        ("index" = i32, Path, description = "The subtitle stream index"),
+        ("routeStartPositionTicks" = i64, Path, description = "The start position of the subtitle in ticks"),
+        ("routeFormat" = String, Path, description = "The requested subtitle format (Stream.{format})"),
+        ("endPositionTicks" = Option<i64>, Query, description = "The end position of the subtitle in ticks"),
+        ("copyTimestamps" = Option<bool>, Query, description = "Whether to copy the timestamps"),
+        ("addVttTimeMap" = Option<bool>, Query, description = "Whether to add a VTT time map")
+    ),
+    responses((status = 200, description = "File returned")),
+    tag = "hermit"
+)]
+async fn get_subtitle_with_ticks(
+    State(state): State<AppState>,
+    Path((item_id, media_source_id, index, start_position_ticks, route_format)): Path<(
+        Uuid,
+        String,
+        i32,
+        i64,
+        String,
+    )>,
+    Query(mut query): Query<SubtitleStreamQuery>,
+) -> Result<Response, ApiError> {
+    // The route-supplied start position wins unless the query overrides it (the
+    // C# `startPositionTicks ?? routeStartPositionTicks`); serde defaults the
+    // query field to 0, so a 0 there yields the route value.
+    if query.start_position_ticks == 0 {
+        query.start_position_ticks = start_position_ticks;
+    }
+    let format = parse_subtitle_format(&route_format);
+    encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
+}
+
+/// Query parameters for `GET …/Subtitles/{index}/subtitles.m3u8`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitlePlaylistQuery {
+    /// The subtitle segment length, in seconds.
+    #[serde(default)]
+    segment_length: i32,
+}
+
+/// `GET /Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8` — the HLS
+/// subtitle playlist for a stream.
+///
+/// Port of `SubtitleController.GetSubtitlePlaylist`: `404` for a missing item,
+/// `400` when the media source has no runtime or `segmentLength` is not positive.
+/// Each segment is a relative `stream.vtt?…` link (with `CopyTimestamps` +
+/// `AddVttTimeMap` + the position window + the caller's `ApiKey`), matching the
+/// C# builder byte-for-byte.
+#[utoipa::path(
+    get,
+    path = "/Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("container" = String, Path, description = "The media source id"),
+        ("index" = i32, Path, description = "The subtitle stream index"),
+        ("segmentLength" = i32, Query, description = "The subtitle segment length")
+    ),
+    responses(
+        (status = 200, description = "Subtitle playlist retrieved"),
+        (status = 404, description = "Item not found")
+    ),
+    tag = "hermit"
+)]
+async fn get_subtitle_playlist(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    // The subtitle stream index is part of the URL but does not affect the
+    // playlist body (the segments all point at the same `stream.vtt`); the C#
+    // suppresses the same unused parameter (CA1801).
+    Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
+    Query(query): Query<SubtitlePlaylistQuery>,
+) -> Result<Response, ApiError> {
+    require_item(&state, item_id).await?;
+
+    let user = resolve_user_opt(&state, &auth, None).await?;
+    let user_id = user
+        .as_ref()
+        .and_then(|u| Uuid::parse_str(&u.id).ok())
+        .unwrap_or_else(Uuid::nil);
+
+    let sources = state
+        .media_sources
+        .get_playback_media_sources(item_id, user_id, false, false)
+        .await?;
+    let media_source = sources
+        .into_iter()
+        .find(|s| s.id.as_deref() == Some(media_source_id.as_str()))
+        .ok_or_else(|| ApiError::NotFound(format!("media source {media_source_id}")))?;
+
+    let runtime = media_source.run_time_ticks.unwrap_or(-1);
+    if runtime <= 0 {
+        return Err(ApiError::BadRequest(
+            "HLS Subtitles are not supported for this media.".to_owned(),
+        ));
+    }
+
+    let segment_length_ticks = i64::from(query.segment_length) * TICKS_PER_SECOND;
+    if segment_length_ticks <= 0 {
+        return Err(ApiError::BadRequest(
+            "segmentLength was not given, or it was given incorrectly. (It should be bigger than 0)"
+                .to_owned(),
+        ));
+    }
+
+    let playlist = build_subtitle_playlist(
+        runtime,
+        query.segment_length,
+        segment_length_ticks,
+        auth.token.as_deref().unwrap_or_default(),
+    );
+    Ok((
+        [(header::CONTENT_TYPE, HLS_PLAYLIST_CONTENT_TYPE)],
+        playlist,
+    )
+        .into_response())
+}
+
+/// Builds the `#EXTM3U` subtitle playlist body.
+///
+/// Split out so the tick arithmetic (segment count, per-segment `#EXTINF`
+/// durations, and the relative `stream.vtt?…` links) is unit-testable without a
+/// request. Mirrors the C# `StringBuilder` output exactly (including the trailing
+/// `#EXT-X-ENDLIST`).
+fn build_subtitle_playlist(
+    runtime_ticks: i64,
+    segment_length_seconds: i32,
+    segment_length_ticks: i64,
+    access_token: &str,
+) -> String {
+    let mut builder = String::new();
+    builder.push_str("#EXTM3U\n");
+    let _ = writeln!(builder, "#EXT-X-TARGETDURATION:{segment_length_seconds}");
+    builder.push_str("#EXT-X-VERSION:3\n");
+    builder.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    builder.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+
+    let mut position_ticks: i64 = 0;
+    while position_ticks < runtime_ticks {
+        let remaining = runtime_ticks - position_ticks;
+        let length_ticks = remaining.min(segment_length_ticks);
+        // Ticks → seconds as a float, matching `TimeSpan.FromTicks(..).TotalSeconds`.
+        #[allow(clippy::cast_precision_loss)]
+        let length_seconds = length_ticks as f64 / TICKS_PER_SECOND as f64;
+        let _ = writeln!(builder, "#EXTINF:{length_seconds},");
+
+        let end_position_ticks = runtime_ticks.min(position_ticks + segment_length_ticks);
+        let _ = writeln!(
+            builder,
+            "stream.vtt?CopyTimestamps=true&AddVttTimeMap=true&StartPositionTicks={position_ticks}&EndPositionTicks={end_position_ticks}&ApiKey={access_token}"
+        );
+
+        position_ticks += segment_length_ticks;
+    }
+
+    builder.push_str("#EXT-X-ENDLIST\n");
+    builder
+}
+
+/// `GET /FallbackFont/Fonts` — list the available fallback font files.
+///
+/// Port of `SubtitleController.GetFallbackFontList`: when `FallbackFontPath` is
+/// configured, enumerate the `.woff`/`.woff2`/`.ttf`/`.otf` files, order them
+/// (size, then name), and yield until the running total would reach the 20 MiB
+/// cap. An unset path yields an empty list (the C# logs a warning and returns
+/// nothing).
+#[utoipa::path(
+    get,
+    path = "/FallbackFont/Fonts",
+    responses((status = 200, description = "Information retrieved", body = [FontFile])),
+    tag = "hermit"
+)]
+async fn get_fallback_font_list(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<Json<Vec<FontFile>>, ApiError> {
+    let options = state.config.get_encoding_options().await?;
+    let Some(path) = options.fallback_font_path.filter(|p| !p.is_empty()) else {
+        return Ok(Json(Vec::new()));
+    };
+
+    let mut files = state.file_system.get_files(&path, FALLBACK_FONT_EXTENSIONS);
+    // Order by size, then name (the C# `OrderBy(Size).ThenBy(Name)`); the later
+    // date tiebreakers never change the size/name ordering for distinct files.
+    files.sort_by(|a, b| a.length.cmp(&b.length).then_with(|| a.name.cmp(&b.name)));
+
+    let mut fonts = Vec::new();
+    let mut size_counter: i64 = 0;
+    for file in files {
+        size_counter += file.length;
+        if size_counter >= FALLBACK_FONT_MAX_TOTAL_BYTES {
+            break;
+        }
+        fonts.push(FontFile {
+            name: Some(file.name),
+            size: file.length,
+            date_created: file.date_created,
+            date_modified: file.date_modified,
+        });
+    }
+    Ok(Json(fonts))
+}
+
+/// `GET /FallbackFont/Fonts/{name}` — serve a single fallback font file.
+///
+/// Port of `SubtitleController.GetFallbackFont`: locate the named file under
+/// `FallbackFontPath` (case-insensitively) and stream it with a font MIME type.
+/// A missing path / font returns `200` with an empty body (the C# returns `Ok()`
+/// rather than `204`, which would break SubtitlesOctopus).
+#[utoipa::path(
+    get,
+    path = "/FallbackFont/Fonts/{name}",
+    params(("name" = String, Path, description = "The name of the fallback font file to get")),
+    responses((status = 200, description = "Fallback font file retrieved")),
+    tag = "hermit"
+)]
+async fn get_fallback_font(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let options = state.config.get_encoding_options().await?;
+    let Some(path) = options.fallback_font_path.filter(|p| !p.is_empty()) else {
+        return Ok(StatusCode::OK.into_response());
+    };
+
+    let file = state
+        .file_system
+        .get_files(&path, &[])
+        .into_iter()
+        .find(|f| f.name.eq_ignore_ascii_case(&name));
+
+    match file {
+        Some(f) if f.length > 0 => {
+            let bytes = state.file_system.read_file(&f.full_name)?;
+            let mime = font_mime(&f.name);
+            Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
+        }
+        // Null/empty font: the C# returns `Ok()` (200, empty) to avoid breaking
+        // the SubtitlesOctopus renderer.
+        _ => Ok(StatusCode::OK.into_response()),
+    }
+}
+
+/// The MIME type for a font file, keyed on its extension (unknown → the generic
+/// `font/sfnt`).
+fn font_mime(name: &str) -> &'static str {
+    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
+        Some(ext) if ext == "woff" => "font/woff",
+        Some(ext) if ext == "woff2" => "font/woff2",
+        Some(ext) if ext == "ttf" => "font/ttf",
+        Some(ext) if ext == "otf" => "font/otf",
+        _ => "font/sfnt",
+    }
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -259,6 +660,20 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Providers/Subtitles/Subtitles/{subtitleId}",
             get(get_remote_subtitles),
         )
+        .route(
+            "/Videos/{itemId}/{container}/Subtitles/{index}/subtitles.m3u8",
+            get(get_subtitle_playlist),
+        )
+        .route(
+            "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}",
+            get(get_subtitle),
+        )
+        .route(
+            "/Videos/{itemId}/{container}/Subtitles/{index}/{routeFormat}/{routeFormat}",
+            get(get_subtitle_with_ticks),
+        )
+        .route("/FallbackFont/Fonts", get(get_fallback_font_list))
+        .route("/FallbackFont/Fonts/{name}", get(get_fallback_font))
 }
 
 #[cfg(test)]

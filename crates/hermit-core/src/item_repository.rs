@@ -230,6 +230,28 @@ fn image_type_from_disc(disc: i32) -> ImageType {
     }
 }
 
+/// Maps a wire [`ImageType`] back to its `BaseItemImageInfos.ImageType` integer
+/// discriminant — the inverse of [`image_type_from_disc`].
+///
+/// The discriminants line up 1:1 with the C# `ImageType` declaration order.
+fn image_type_to_disc(image_type: ImageType) -> i32 {
+    match image_type {
+        ImageType::Primary => 0,
+        ImageType::Art => 1,
+        ImageType::Backdrop => 2,
+        ImageType::Banner => 3,
+        ImageType::Logo => 4,
+        ImageType::Thumb => 5,
+        ImageType::Disc => 6,
+        ImageType::Box => 7,
+        ImageType::Screenshot => 8,
+        ImageType::Menu => 9,
+        ImageType::Chapter => 10,
+        ImageType::BoxRear => 11,
+        ImageType::Profile => 12,
+    }
+}
+
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
 /// [`ItemImageInfo`].
 ///
@@ -363,6 +385,73 @@ impl ItemRepository for HermitItemRepository {
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(image_info_from_row).collect())
+    }
+
+    async fn swap_item_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError> {
+        // A same-index swap is a no-op (matching C#, where swapping a row with
+        // itself changes nothing) and avoids a needless write.
+        if index1 == index2 {
+            return Ok(());
+        }
+        // Load this item's rows for the requested type in the same stable order
+        // get_image_infos exposes, so the caller's 0-based indices address the
+        // same images the read side does.
+        let disc = image_type_to_disc(image_type);
+        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
+            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
+                ORDER BY "Id""#,
+        )
+        .bind(item_id.to_string())
+        .bind(disc)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        // Out-of-range indices are a no-op — the C# `GetImageInfo` returns null and
+        // SwapImagesAsync bails with "nothing to do".
+        let (Ok(i1), Ok(i2)) = (usize::try_from(index1), usize::try_from(index2)) else {
+            return Ok(());
+        };
+        let (Some(first), Some(second)) = (rows.get(i1), rows.get(i2)) else {
+            return Ok(());
+        };
+
+        // C# swaps the two on-disk files and clears the cached dimensions. The
+        // portable equivalent over stored rows is to exchange the two rows' paths
+        // (so the image previously at index1 now resolves at index2) and reset
+        // Width/Height to the "unknown" sentinel, stamping DateModified.
+        let now = Utc::now();
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "BaseItemImageInfos"
+                SET "Path" = ?2, "Width" = 0, "Height" = 0, "DateModified" = ?3
+                WHERE "Id" = ?1"#,
+        )
+        .bind(&first.id)
+        .bind(&second.path)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "BaseItemImageInfos"
+                SET "Path" = ?2, "Width" = 0, "Height" = 0, "DateModified" = ?3
+                WHERE "Id" = ?1"#,
+        )
+        .bind(&second.id)
+        .bind(&first.path)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
     }
 
     async fn get_genres(
@@ -646,6 +735,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn any_provider_id_equals_matches_exact_value_case_insensitively() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        // Two movies: Heat (Imdb tt0113277 + Tmdb 949) and Solaris (Tmdb 296).
+        let heat = Uuid::from_u128(0xA001);
+        let solaris = Uuid::from_u128(0xA002);
+        seed_named_item(&db, heat, BaseItemKind::Movie, "Heat").await;
+        seed_named_item(&db, solaris, BaseItemKind::Movie, "Solaris").await;
+        for (item, provider, value) in [
+            (heat, "Imdb", "tt0113277"),
+            (heat, "Tmdb", "949"),
+            (solaris, "Tmdb", "296"),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
+                   VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(item.to_string())
+            .bind(provider)
+            .bind(value)
+            .execute(db.pool())
+            .await
+            .expect("insert provider");
+        }
+
+        // Exact IMDb match (with a different-case value) selects only Heat.
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            any_provider_id_equals: vec![("imdb".to_owned(), "TT0113277".to_owned())],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository.get_item_list(&query).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, heat.to_string());
+
+        // A non-matching value returns nothing (no partial/prefix matching).
+        let miss = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            any_provider_id_equals: vec![("Tmdb".to_owned(), "0".to_owned())],
+            ..InternalItemsQuery::default()
+        };
+        assert!(
+            repository
+                .get_item_list(&miss)
+                .await
+                .expect("miss")
+                .is_empty()
+        );
+
+        // Multiple pairs are OR-ed: Tmdb 296 OR Tmdb 949 selects both movies.
+        let both = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            any_provider_id_equals: vec![
+                ("Tmdb".to_owned(), "296".to_owned()),
+                ("Tmdb".to_owned(), "949".to_owned()),
+            ],
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            repository.get_item_list(&both).await.expect("both").len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn get_image_infos_reads_rows_ordered_by_type() {
         let db = test_db().await;
         let repository = repo(&db);
@@ -693,6 +848,75 @@ mod tests {
             .await
             .expect("no images");
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn swap_item_images_reorders_two_backdrops() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9200);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Reorder Me").await;
+
+        // Three backdrops (type 2), addressed by index 0/1/2 in Id order.
+        for (n, path) in [(0u128, "/a.jpg"), (1, "/b.jpg"), (2, "/c.jpg")] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+            )
+            .bind(Uuid::from_u128(0x9210 + n).to_string())
+            .bind(item.to_string())
+            .bind(path)
+            .execute(db.pool())
+            .await
+            .expect("insert backdrop");
+        }
+
+        // Swap index 0 (/a.jpg) with index 2 (/c.jpg).
+        repository
+            .swap_item_images(item, ImageType::Backdrop, 0, 2)
+            .await
+            .expect("swap");
+
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images.len(), 3);
+        // Paths are exchanged; the middle one is untouched. Dimensions of the two
+        // swapped rows are reset to the unknown sentinel (0), matching C#.
+        assert_eq!(images[0].path, "/c.jpg");
+        assert_eq!(images[0].width, 0);
+        assert_eq!(images[0].height, 0);
+        assert_eq!(images[1].path, "/b.jpg");
+        assert_eq!(images[1].width, 1920);
+        assert_eq!(images[2].path, "/a.jpg");
+        assert_eq!(images[2].width, 0);
+    }
+
+    #[tokio::test]
+    async fn swap_item_images_out_of_range_index_is_noop() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9300);
+        seed_named_item(&db, item, BaseItemKind::Movie, "One Backdrop").await;
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                VALUES (?1, NULL, NULL, 1080, 2, ?2, '/only.jpg', 1920)"#,
+        )
+        .bind(Uuid::from_u128(0x9310).to_string())
+        .bind(item.to_string())
+        .execute(db.pool())
+        .await
+        .expect("insert backdrop");
+
+        // Index 5 does not exist — a faithful no-op, and the row is untouched.
+        repository
+            .swap_item_images(item, ImageType::Backdrop, 0, 5)
+            .await
+            .expect("noop swap");
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].path, "/only.jpg");
+        assert_eq!(images[0].width, 1920);
     }
 
     #[tokio::test]

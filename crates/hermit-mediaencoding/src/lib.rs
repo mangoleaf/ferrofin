@@ -27,6 +27,7 @@ pub use encoding_helper::{
     BaseEncodingJobOptions, EncoderCapabilities, EncodingHelper, EncodingJobInfo,
     NoOptionalEncoders,
 };
+pub use subtitles::{SubtitleEncoder, SubtitleEncoderImpl, SubtitleIo};
 pub use transcoding::{
     FakeScript, FakeSegmentTranscoder, FakeTranscodeChild, FileCleaner, FsFileCleaner,
     HLS_PING_TIMEOUT_MS, NoopSessionReporter, PROGRESSIVE_PING_TIMEOUT_MS,

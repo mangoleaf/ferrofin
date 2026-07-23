@@ -248,16 +248,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn get_keyframe_data_spawns_and_parses() {
-        let dir = std::env::temp_dir().join(format!("hk_ffprobe_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = write_fake_ffprobe(&dir, "packet,1.0,K_\nstream,1.0");
+        // A per-test unique temp dir (auto-removed on drop) — keying on
+        // `process::id()` alone collides between tests sharing this binary under
+        // nextest's concurrent runner.
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_ffprobe(dir.path(), "packet,1.0,K_\nstream,1.0");
 
         let data = get_keyframe_data(script.to_str().unwrap(), "/does/not/matter.mkv")
             .expect("fake ffprobe should succeed");
         assert_eq!(data.keyframe_ticks, vec![10_000_000]);
         assert_eq!(data.total_duration, 10_000_000);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

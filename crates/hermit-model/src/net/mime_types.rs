@@ -480,4 +480,39 @@ mod tests {
     fn to_extension_valid_returns_correct_result(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(Some(expected), to_extension(input));
     }
+
+    #[test]
+    fn get_mime_type_branch_cases() {
+        // Empty filename returns the supplied default (or DEFAULT_MIME_TYPE).
+        assert_eq!(get_mime_type_or("", Some("x/y")), Some("x/y"));
+        assert_eq!(get_mime_type(""), DEFAULT_MIME_TYPE);
+
+        // Unknown extension → default.
+        assert_eq!(get_mime_type("file.unknownext"), DEFAULT_MIME_TYPE);
+        assert_eq!(get_mime_type_or("file.unknownext", None), None);
+
+        // A known video extension that is not in the primary table falls back to
+        // the generic `video/<ext>` mapping.
+        assert_eq!(get_mime_type("clip.divx"), "video/divx");
+        assert_eq!(get_mime_type("disk.iso"), "video/iso");
+        // A video extension without a dedicated generic entry → video/mp4.
+        assert_eq!(get_mime_type("movie.rmvb"), "video/rmvb");
+    }
+
+    #[test]
+    fn to_extension_and_is_image_branches() {
+        // The `;charset` suffix is stripped before lookup.
+        assert_eq!(
+            to_extension("application/json; charset=UTF-8"),
+            Some(".json")
+        );
+        // Empty and unknown mime types.
+        assert_eq!(to_extension(""), None);
+        assert_eq!(to_extension("application/does-not-exist"), None);
+
+        assert!(is_image("image/png"));
+        assert!(is_image("IMAGE/JPEG"));
+        assert!(!is_image("video/mp4"));
+        assert!(!is_image("img"));
+    }
 }

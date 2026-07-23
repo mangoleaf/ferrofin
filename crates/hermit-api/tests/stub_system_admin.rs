@@ -79,8 +79,6 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     (Method::POST, "/Backup/Create"),
     (Method::GET, "/Backup/Manifest"),
     (Method::POST, "/Backup/Restore"),
-    // Tmdb
-    (Method::GET, "/Tmdb/ClientConfiguration"),
     // Channels
     (Method::GET, "/Channels"),
     (Method::GET, "/Channels/Features"),
@@ -154,7 +152,7 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        42,
-        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) = 42 stubs; probe table drifted"
+        41,
+        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) = 41 stubs; probe table drifted"
     );
 }

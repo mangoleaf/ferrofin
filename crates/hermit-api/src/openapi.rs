@@ -64,6 +64,16 @@ use utoipa::OpenApi;
         crate::handlers::subtitles::search_remote_subtitles,
         crate::handlers::subtitles::download_remote_subtitles,
         crate::handlers::subtitles::get_remote_subtitles,
+        crate::handlers::library::get_physical_paths,
+        crate::handlers::library::get_available_options,
+        crate::handlers::library_structure::get_virtual_folders,
+        crate::handlers::library_structure::add_virtual_folder,
+        crate::handlers::library_structure::remove_virtual_folder,
+        crate::handlers::library_structure::rename_virtual_folder,
+        crate::handlers::library_structure::update_library_options,
+        crate::handlers::library_structure::add_media_path,
+        crate::handlers::library_structure::update_media_path,
+        crate::handlers::library_structure::remove_media_path,
     ),
     tags((name = "hermit", description = "Ported Jellyfin controller endpoints"))
 )]

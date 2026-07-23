@@ -16,14 +16,26 @@
      180 .port/hermit-naming/inventory.json
       88 .port/hermit-networking/inventory.json
      136 .port/hermit-providers/inventory.json
+     223 .port/hermit-server/design.json
      219 .port/hermit-traits/inventory.json
      192 .port/hermit-util/inventory.json
      232 .port/transcode/design.json
-      21 2
-    3971 Cargo.lock
+      22 2
+    3975 Cargo.lock
      112 Cargo.toml
      674 LICENSE
       41 README.md
+      56 apps/hermit-server/Cargo.toml
+     148 apps/hermit-server/PORT_REPORT.md
+     464 apps/hermit-server/src/bootstrap.rs
+     593 apps/hermit-server/src/config.rs
+     160 apps/hermit-server/src/lib.rs
+      19 apps/hermit-server/src/main.rs
+     652 apps/hermit-server/src/media_encoding.rs
+     879 apps/hermit-server/src/planner.rs
+     254 apps/hermit-server/src/seed.rs
+     537 apps/hermit-server/src/state.rs
+     528 apps/hermit-server/tests/first_light.rs
       27 contracts/README.md
    71284 contracts/jellyfin-openapi-10.11.8.json
       54 crates/hermit-api/Cargo.toml
@@ -84,7 +96,7 @@
      607 crates/hermit-api/src/handlers/tv_shows.rs
      616 crates/hermit-api/src/handlers/user_library.rs
      119 crates/hermit-api/src/handlers/user_views.rs
-     752 crates/hermit-api/src/handlers/users.rs
+     765 crates/hermit-api/src/handlers/users.rs
      246 crates/hermit-api/src/handlers/videos.rs
      135 crates/hermit-api/src/handlers/years.rs
       38 crates/hermit-api/src/lib.rs
@@ -92,7 +104,7 @@
      190 crates/hermit-api/src/router.rs
      168 crates/hermit-api/src/routes.rs
      265 crates/hermit-api/src/state.rs
-    1701 crates/hermit-api/src/test_support.rs
+    1711 crates/hermit-api/src/test_support.rs
      714 crates/hermit-api/tests/batch10_handlers.rs
      844 crates/hermit-api/tests/batch11_handlers.rs
      668 crates/hermit-api/tests/batch12_handlers.rs
@@ -109,14 +121,14 @@
      642 crates/hermit-api/tests/by_name_browse.rs
      185 crates/hermit-api/tests/contract_superset.rs
    71284 crates/hermit-api/tests/data/jellyfin-openapi-10.11.8.json
-     193 crates/hermit-api/tests/first_light.rs
-    1532 crates/hermit-api/tests/handler_success_paths.rs
+     236 crates/hermit-api/tests/first_light.rs
+    1537 crates/hermit-api/tests/handler_success_paths.rs
      888 crates/hermit-api/tests/hls_handlers.rs
     1171 crates/hermit-api/tests/session_playstate.rs
      116 crates/hermit-api/tests/stub_livetv.rs
       83 crates/hermit-api/tests/stub_playback_session.rs
      160 crates/hermit-api/tests/stub_system_admin.rs
-     403 crates/hermit-api/tests/test_support_coverage.rs
+     421 crates/hermit-api/tests/test_support_coverage.rs
       22 crates/hermit-common/Cargo.toml
      111 crates/hermit-common/PORT_REPORT.md
       83 crates/hermit-common/src/app_paths.rs
@@ -179,12 +191,12 @@
      288 crates/hermit-core/src/path_manager.rs
      524 crates/hermit-core/src/people_repository.rs
       94 crates/hermit-core/src/plugin_manager.rs
-     624 crates/hermit-core/src/quick_connect_manager.rs
+     631 crates/hermit-core/src/quick_connect_manager.rs
      240 crates/hermit-core/src/resolvers.rs
      606 crates/hermit-core/src/scheduled_tasks.rs
      304 crates/hermit-core/src/search_manager.rs
-    1256 crates/hermit-core/src/session_manager.rs
-     568 crates/hermit-core/src/session_manager/tests.rs
+    1261 crates/hermit-core/src/session_manager.rs
+     625 crates/hermit-core/src/session_manager/tests.rs
      244 crates/hermit-core/src/session_websocket_listener.rs
      201 crates/hermit-core/src/similar_items_manager.rs
      307 crates/hermit-core/src/subtitle_manager.rs
@@ -266,8 +278,9 @@
      213 crates/hermit-mediaencoding/src/encoder/encoder_validator.rs
      153 crates/hermit-mediaencoding/src/encoder/encoding_utils.rs
      536 crates/hermit-mediaencoding/src/encoder/media_encoder.rs
-      23 crates/hermit-mediaencoding/src/encoder/mod.rs
+      25 crates/hermit-mediaencoding/src/encoder/mod.rs
      117 crates/hermit-mediaencoding/src/encoder/test_data.rs
+      90 crates/hermit-mediaencoding/src/encoder/tokio_transcoder.rs
       38 crates/hermit-mediaencoding/src/encoder/transcoder.rs
      108 crates/hermit-mediaencoding/src/encoder/version.rs
     1621 crates/hermit-mediaencoding/src/encoding_helper/helper.rs
@@ -614,22 +627,22 @@ wc: crates/hermit-providers/tests/data/American: No such file or directory
 wc: Gods.nfo: No such file or directory
        4 crates/hermit-providers/tests/data/CommunityRating.nfo
        4 crates/hermit-providers/tests/data/CommunityRating_Comma.nfo
-wc:        4 crates/hermit-providers/tests/data/CommunityRating_OutOfRange.nfo
-crates/hermit-providers/tests/data/Dancing: No such file or directory
+       4 crates/hermit-providers/tests/data/CommunityRating_OutOfRange.nfo
+wc: crates/hermit-providers/tests/data/Dancing: No such file or directory
 wc: Queen.nfo: No such file or directory
       33 crates/hermit-providers/tests/data/Fanart.nfo
-       1 crates/hermit-providers/tests/data/Imdb.nfo
-wc: crates/hermit-providers/tests/data/Justice: No such file or directory
+wc:        1 crates/hermit-providers/tests/data/Imdb.nfo
+crates/hermit-providers/tests/data/Justice: No such file or directory
 wc: League.nfo: No such file or directory
 wc: crates/hermit-providers/tests/data/Lilo: No such file or directory
 wc: '&': No such file or directory
 wc: Stitch.nfo: No such file or directory
        2 crates/hermit-providers/tests/data/Radarr.nfo
-      44 crates/hermit-providers/tests/data/Rising.nfo
-wc: crates/hermit-providers/tests/data/Season: No such file or directory
+wc:       44 crates/hermit-providers/tests/data/Rising.nfo
+crates/hermit-providers/tests/data/Season: No such file or directory
 wc: 01.nfo: No such file or directory
-wc:       34 crates/hermit-providers/tests/data/Sonarr-Thumb.nfo
-crates/hermit-providers/tests/data/Stargate: No such file or directory
+      34 crates/hermit-providers/tests/data/Sonarr-Thumb.nfo
+wc: crates/hermit-providers/tests/data/Stargate: No such file or directory
 wc: Atlantis: No such file or directory
 wc: S01E01-E04.nfo: No such file or directory
 wc: crates/hermit-providers/tests/data/The: No such file or directory
@@ -673,7 +686,7 @@ wc: Orchard.nfo: No such file or directory
      579 crates/hermit-traits/src/persistence.rs
      235 crates/hermit-traits/src/providers.rs
      163 crates/hermit-traits/src/security.rs
-     296 crates/hermit-traits/src/session.rs
+     318 crates/hermit-traits/src/session.rs
       45 crates/hermit-traits/src/stubs/channels.rs
      121 crates/hermit-traits/src/stubs/hls_stream.rs
       39 crates/hermit-traits/src/stubs/live_tv.rs
@@ -705,4 +718,4 @@ wc: Orchard.nfo: No such file or directory
      343 crates/hermit-util/src/string_extensions.rs
        4 rust-toolchain.toml
        3 rustfmt.toml
-  315569 total
+  320359 total

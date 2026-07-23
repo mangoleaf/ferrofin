@@ -708,6 +708,53 @@ async fn delete_item_image_by_index(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The query string of the image-reorder route: the destination index.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateImageIndexQuery {
+    /// The new image index the image at `imageIndex` should move to.
+    new_index: i32,
+}
+
+/// `POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index` — reorder an
+/// item image.
+///
+/// Port of `ImageController.UpdateItemImageIndex`. A missing item is `404`; an
+/// image type that does not allow multiple images (anything but Backdrop and
+/// Chapter, per C# `AllowsMultipleImages`) is a `400`; otherwise the image at
+/// `imageIndex` is swapped with the one at `newIndex` and the handler returns
+/// `204` (an out-of-range index is a faithful no-op, still `204`).
+#[utoipa::path(
+    post,
+    path = "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("imageType" = String, Path, description = "The image type"),
+        ("imageIndex" = i32, Path, description = "The old image index"),
+        ("newIndex" = i32, Query, description = "The new image index"),
+    ),
+    responses(
+        (status = 204, description = "Image index updated"),
+        (status = 400, description = "Image type does not allow reordering"),
+        (status = 404, description = "Item not found"),
+    ),
+    tag = "hermit"
+)]
+async fn update_item_image_index(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Query(query): Query<UpdateImageIndexQuery>,
+) -> Result<StatusCode, ApiError> {
+    let image_type = parse_image_type(&image_type)?;
+    require_item(&state, item_id).await?;
+    state
+        .library
+        .swap_images(item_id, image_type, image_index, query.new_index)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Resolves an item, mapping a missing one to a `404`.
 ///
 /// The shared item-existence guard the write handlers run before mutating.
@@ -740,6 +787,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .head(get_item_image_by_index)
                 .post(set_item_image_by_index)
                 .delete(delete_item_image_by_index),
+        )
+        .route(
+            "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
+            axum::routing::post(update_item_image_index),
         )
         .route(
             "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",

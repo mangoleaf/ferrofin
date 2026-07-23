@@ -210,6 +210,7 @@ pub mod user_data_manager;
 pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_view_manager;
+pub mod virtual_folder_manager;
 
 #[cfg(test)]
 mod test_support;
@@ -266,3 +267,4 @@ pub use tv_series_manager::HermitTvSeriesManager;
 pub use user_data_manager::HermitUserDataManager;
 pub use user_manager::HermitUserManager;
 pub use user_view_manager::HermitUserViewManager;
+pub use virtual_folder_manager::HermitVirtualFolderManager;

@@ -23,5 +23,5 @@ pub use local_images::{
     LocalImageProvider,
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
-pub use provider_manager::LocalProviderManager;
+pub use provider_manager::{LocalProviderManager, RemoteSearchProvider};
 pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};

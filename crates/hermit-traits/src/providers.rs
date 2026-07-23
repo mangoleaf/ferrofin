@@ -29,9 +29,11 @@
 
 use async_trait::async_trait;
 use hermit_model::configuration::{MetadataOptions, MetadataPluginSummary};
+use hermit_model::data::BaseItemKind;
 use hermit_model::entities::ImageType;
 use hermit_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
+    ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
+    RemoteImageQuery, RemoteSearchResult,
 };
 use uuid::Uuid;
 
@@ -101,6 +103,35 @@ pub enum ItemUpdateType {
     MetadataEdit,
     /// Images changed.
     ImageUpdate,
+}
+
+/// A type-erased remote metadata search request.
+///
+/// The C# `GetRemoteSearchResults<TItemType, TLookupType>` is generic over the
+/// item type and the lookup-info type. Those generics cannot cross an
+/// object-safe async boundary, so the handler collapses each concrete
+/// `RemoteSearchQuery<XInfo>` into this single value: the item kind that selects
+/// which remote providers apply, the shared [`ItemLookupInfo`] search criteria,
+/// and the query knobs (`ItemId` reference, provider-name filter, and the
+/// disabled-provider inclusion flag).
+///
+/// The type-specific extension fields of the concrete `*Info` types (album
+/// artists, series name, contained song infos, …) are consumed by the
+/// per-provider fetchers; because those fetchers are deferred, only the shared
+/// base is carried across this seam. When the remote fetchers land, this request
+/// is the natural place to widen with the extra fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteSearchRequest {
+    /// The kind of item being searched for (selects the applicable providers).
+    pub item_kind: BaseItemKind,
+    /// The shared lookup-info search criteria.
+    pub search_info: ItemLookupInfo,
+    /// The id of an existing item used as the search reference (nil when unset).
+    pub item_id: Uuid,
+    /// Restrict the search to the named provider when set.
+    pub search_provider_name: Option<String>,
+    /// Whether disabled providers should be included.
+    pub include_disabled_providers: bool,
 }
 
 /// Orchestrates metadata and image refreshing for library items.
@@ -201,6 +232,34 @@ pub trait ProviderManager: Send + Sync {
         &self,
         item_id: Uuid,
     ) -> Result<Vec<ExternalIdInfo>, ServiceError>;
+
+    /// Runs a remote metadata search and returns the deduplicated candidates.
+    ///
+    /// Port of `IProviderManager.GetRemoteSearchResults<TItemType, TLookupType>`:
+    /// gathers the `IRemoteSearchProvider`s applicable to `request.item_kind`
+    /// (optionally filtered to `request.search_provider_name`), queries each with
+    /// the shared lookup info, stamps every result's `SearchProviderName`, and
+    /// merges duplicates by shared provider id (first hit wins; later hits only
+    /// fill in missing provider ids / image url).
+    ///
+    /// The remote provider fetchers (TMDb/TVDb/MusicBrainz/…) are **deferred** —
+    /// they need network I/O and API keys and are feature-gated off. With no
+    /// provider registered the applicable-provider set is empty, so the default
+    /// implementation returns an empty `Vec`, exactly as Jellyfin returns `[]`
+    /// when no provider matches. A host with real fetchers overrides this.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] if resolving the reference item or a provider query fails
+    /// (individual provider failures are swallowed by the port, matching the C#
+    /// which logs and continues).
+    async fn remote_search(
+        &self,
+        request: &RemoteSearchRequest,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let _ = request;
+        Ok(Vec::new())
+    }
 
     /// Gets a summary of every registered metadata plugin.
     async fn get_all_metadata_plugins(&self) -> Result<Vec<MetadataPluginSummary>, ServiceError>;

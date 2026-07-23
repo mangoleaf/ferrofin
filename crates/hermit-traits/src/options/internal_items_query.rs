@@ -157,6 +157,15 @@ pub struct InternalItemsQuery {
     pub has_official_rating: Option<bool>,
     /// Restrict to items with a TVDB id.
     pub has_tvdb_id: Option<bool>,
+    /// Restrict to items whose external provider ids match *any* of these
+    /// `(provider-key, value)` pairs (case-insensitive on both key and value).
+    ///
+    /// Port of Jellyfin's `InternalItemsQuery.AnyProviderIdEquals`: the
+    /// filesystem-monitor webhooks (`/Library/Movies/*`, `/Library/Series/*`)
+    /// select the items to report by exact provider-id value, which C# does with
+    /// an in-memory `GetProviderId(...)` comparison; here it is pushed into the
+    /// query as an `EXISTS` over `BaseItemProviders` so the DB does the matching.
+    pub any_provider_id_equals: Vec<(String, String)>,
     /// Restrict to items with a theme song.
     pub has_theme_song: Option<bool>,
     /// Restrict to items with a theme video.
@@ -433,6 +442,7 @@ impl Default for InternalItemsQuery {
             has_tmdb_id: None,
             has_official_rating: None,
             has_tvdb_id: None,
+            any_provider_id_equals: Vec::new(),
             has_theme_song: None,
             has_theme_video: None,
             has_subtitles: None,
@@ -589,6 +599,7 @@ impl InternalItemsQuery {
             || self.has_imdb_id.is_some()
             || self.has_tmdb_id.is_some()
             || self.has_tvdb_id.is_some()
+            || !self.any_provider_id_equals.is_empty()
             || self.has_overview.is_some()
             || self.has_official_rating.is_some()
             || self.has_parental_rating.is_some()

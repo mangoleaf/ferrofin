@@ -460,6 +460,16 @@ pub async fn build_app_state(
     );
     let state = state.with_media_encoding(hls, attachments);
 
+    // ---- virtual-folder (library-structure) store -------------------------
+    // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is
+    // filesystem-backed: each library is a directory under `DefaultUserViewsPath`
+    // (`.mblink` shortcuts + `options.json`). Replace the disabled stub
+    // `AppState::new` installed with the real filesystem-backed manager rooted
+    // there (mirrors the C# `ILibraryManager` virtual-folder methods).
+    let state = state.with_virtual_folders(Arc::new(hermit_core::HermitVirtualFolderManager::new(
+        paths.default_user_views_path(),
+    )));
+
     Ok(WiredApp { state, app_host })
 }
 

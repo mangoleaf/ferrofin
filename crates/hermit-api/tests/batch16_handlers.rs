@@ -140,12 +140,35 @@ fn user_entity(id: Uuid, username: &str) -> UserEntity {
 
 /// A [`LibraryManager`] that resolves [`ITEM_ID`] (and nothing else) and returns a
 /// canned set of collection folders for the media-folder route.
-struct StubLibrary;
+#[derive(Default)]
+struct StubLibrary {
+    /// Records each `(item_id, image_type, index1, index2)` swap the handler asks
+    /// for, so the reorder test can assert the request reached the manager.
+    swaps: Mutex<Vec<(Uuid, ImageType, i32, i32)>>,
+}
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok((id == ITEM_ID).then(|| item(ITEM_ID, "The Item")))
+    }
+    async fn swap_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError> {
+        // Mirror the real manager's 400 guard so the "wrong type" test exercises
+        // it, then record the accepted swap.
+        if !matches!(image_type, ImageType::Backdrop | ImageType::Chapter) {
+            return Err(ServiceError::invalid_input("not reorderable"));
+        }
+        self.swaps
+            .lock()
+            .expect("lock")
+            .push((item_id, image_type, index1, index2));
+        Ok(())
     }
     async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
@@ -721,7 +744,7 @@ struct Stubs {
 
 fn stubs(branding: BrandingOptions, data_path: &str) -> Stubs {
     Stubs {
-        library: Arc::new(StubLibrary),
+        library: Arc::new(StubLibrary::default()),
         user_views: Arc::new(StubUserViews),
         users: Arc::new(StubUsers {
             saved: Arc::new(Mutex::new(Vec::new())),
@@ -928,6 +951,75 @@ async fn delete_item_image_missing_item_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- item image reorder (UpdateItemImageIndex) --------------------------------
+
+#[tokio::test]
+async fn update_item_image_index_swaps_and_returns_204() {
+    let s = stubs(default_branding(), "/tmp");
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop/1/Index?newIndex=3"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.library.swaps.lock().expect("lock").as_slice(),
+        [(ITEM_ID, ImageType::Backdrop, 1, 3)]
+    );
+}
+
+#[tokio::test]
+async fn update_item_image_index_non_multiple_type_is_400() {
+    let s = stubs(default_branding(), "/tmp");
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Primary/0/Index?newIndex=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(s.library.swaps.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn update_item_image_index_missing_item_is_404() {
+    let s = stubs(default_branding(), "/tmp");
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{MISSING_ID}/Images/Backdrop/0/Index?newIndex=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(s.library.swaps.lock().expect("lock").is_empty());
+}
+
+// ---- TMDb client configuration ------------------------------------------------
+
+#[tokio::test]
+async fn tmdb_client_configuration_returns_image_config() {
+    let s = stubs(default_branding(), "/tmp");
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let config: hermit_model::dto::ConfigImageTypes =
+        serde_json::from_slice(&body).expect("config");
+    assert_eq!(
+        config.secure_base_url.as_deref(),
+        Some("https://image.tmdb.org/t/p/")
+    );
+    assert!(
+        config
+            .poster_sizes
+            .as_deref()
+            .expect("poster sizes")
+            .contains(&"original".to_owned())
+    );
 }
 
 // ---- user image upload --------------------------------------------------------

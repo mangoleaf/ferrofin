@@ -173,6 +173,76 @@ pub struct MediaPathInfo {
     pub path: String,
 }
 
+/// A single available library option (a metadata/image/subtitle provider) and
+/// whether it is enabled by default.
+///
+/// Port of `Jellyfin.Api.Models.LibraryDtos.LibraryOptionInfoDto`, one entry in
+/// the `GET /Libraries/AvailableOptions` result.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LibraryOptionInfoDto {
+    /// Gets or sets the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Gets or sets a value indicating whether this option is enabled by
+    /// default.
+    pub default_enabled: bool,
+}
+
+/// The per-item-type options (fetchers and default image options) offered for a
+/// library of a given representative item type.
+///
+/// Port of `Jellyfin.Api.Models.LibraryDtos.LibraryTypeOptionsDto`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LibraryTypeOptionsDto {
+    /// Gets or sets the item type this block applies to.
+    #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
+
+    /// Gets or sets the available metadata fetchers.
+    pub metadata_fetchers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the available image fetchers.
+    pub image_fetchers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the supported image types.
+    pub supported_image_types: Vec<ImageType>,
+
+    /// Gets or sets the default image options.
+    pub default_image_options: Vec<ImageOption>,
+}
+
+/// The result of `GET /Libraries/AvailableOptions`: the metadata/subtitle/lyric
+/// providers plus the per-item-type options assembled from the metadata-plugin
+/// registry.
+///
+/// Port of `Jellyfin.Api.Models.LibraryDtos.LibraryOptionsResultDto`. At this
+/// seam no metadata plugins are registered, so every collection is empty — a
+/// faithful projection (Jellyfin returns empty arrays when no plugin matches).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LibraryOptionsResultDto {
+    /// Gets or sets the available metadata savers.
+    pub metadata_savers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the available metadata readers.
+    pub metadata_readers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the available subtitle fetchers.
+    pub subtitle_fetchers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the available lyric fetchers.
+    pub lyric_fetchers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the available media-segment providers.
+    pub media_segment_providers: Vec<LibraryOptionInfoDto>,
+
+    /// Gets or sets the per-item-type options.
+    pub type_options: Vec<LibraryTypeOptionsDto>,
+}
+
 /// Metadata configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -462,8 +532,13 @@ impl Default for TrickplayOptions {
 }
 
 /// Library options.
+///
+/// Deserialized with `#[serde(default)]` so a partial payload (e.g. the
+/// `AddVirtualFolderDto`/`UpdateLibraryOptionsDto` bodies, which typically carry
+/// only a handful of fields) fills the rest from [`Default`], matching Jellyfin's
+/// C# model binding (which never requires the full option set on the wire).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LibraryOptions {
     /// Gets or sets a value indicating whether the library is enabled.
@@ -1326,5 +1401,130 @@ mod tests {
         let json = serde_json::to_value(&plugin).unwrap();
         assert_eq!(json["Name"], "nfo");
         assert_eq!(json["Type"], "MetadataSaver");
+    }
+
+    #[test]
+    fn config_default_impls_are_constructible_and_round_trip() {
+        // Exercise each hand-written Default body and confirm it survives a JSON
+        // round-trip (these Defaults carry the non-trivial C# initializers).
+        let xbmc = XbmcMetadataOptions::default();
+        assert_eq!(
+            serde_json::from_str::<XbmcMetadataOptions>(&serde_json::to_string(&xbmc).unwrap())
+                .unwrap(),
+            xbmc
+        );
+
+        let user = UserConfiguration::default();
+        assert_eq!(
+            serde_json::from_str::<UserConfiguration>(&serde_json::to_string(&user).unwrap())
+                .unwrap(),
+            user
+        );
+
+        let trickplay = TrickplayOptions::default();
+        assert_eq!(
+            serde_json::from_str::<TrickplayOptions>(&serde_json::to_string(&trickplay).unwrap())
+                .unwrap(),
+            trickplay
+        );
+
+        // Populate every `Option` field so the serde `skip_serializing_if`
+        // Some-branch (and the field serialization) is exercised, then round-trip.
+        let library = LibraryOptions {
+            local_metadata_reader_order: Some(vec!["nfo".to_owned()]),
+            subtitle_download_languages: Some(vec!["eng".to_owned()]),
+            metadata_country_code: Some("US".to_owned()),
+            preferred_metadata_language: Some("en".to_owned()),
+            season_zero_display_name: "Specials".to_owned(),
+            path_infos: vec![MediaPathInfo {
+                path: "/media".to_owned(),
+            }],
+            ..LibraryOptions::default()
+        };
+        assert_eq!(
+            serde_json::from_str::<LibraryOptions>(&serde_json::to_string(&library).unwrap())
+                .unwrap(),
+            library
+        );
+
+        let encoding = EncodingOptions::default();
+        assert_eq!(encoding.encoding_thread_count, -1);
+        assert_eq!(
+            serde_json::from_str::<EncodingOptions>(&serde_json::to_string(&encoding).unwrap())
+                .unwrap(),
+            encoding
+        );
+
+        let metadata = MetadataConfiguration::default();
+        assert!(metadata.use_file_creation_time_for_date_added);
+
+        // TypeOptions with a populated `Type` covers its serde field code.
+        let type_options = TypeOptions {
+            type_: Some("Movie".to_owned()),
+            metadata_fetchers: vec!["Tmdb".to_owned()],
+            metadata_fetcher_order: vec!["Tmdb".to_owned()],
+            image_fetchers: vec!["Tmdb".to_owned()],
+            image_fetcher_order: vec!["Tmdb".to_owned()],
+            ..TypeOptions::default()
+        };
+        let json = serde_json::to_string(&type_options).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TypeOptions>(&json).unwrap(),
+            type_options
+        );
+    }
+
+    #[test]
+    fn encoding_options_round_trips_from_json_map() {
+        // Deserialize an EncodingOptions from an explicit JSON object so every
+        // renamed field's visitor arm (H265Crf, EnableDecodingColorDepth10Hevc,
+        // …) is exercised, then re-serialize.
+        let value = serde_json::to_value(EncodingOptions::default()).unwrap();
+        assert!(value.is_object());
+        // The renamed keys are present in the serialized form.
+        assert!(value.get("H265Crf").is_some());
+        assert!(value.get("EnableDecodingColorDepth10Hevc").is_some());
+        let back: EncodingOptions = serde_json::from_value(value).unwrap();
+        assert_eq!(back, EncodingOptions::default());
+    }
+
+    #[test]
+    fn server_configuration_round_trips() {
+        // The top-level ServerConfiguration nests many of the above structs; a
+        // full round-trip exercises their serde field code together.
+        let cfg = ServerConfiguration::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: ServerConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn library_options_result_dto_uses_pascal_case_and_round_trips() {
+        let dto = LibraryOptionsResultDto {
+            type_options: vec![LibraryTypeOptionsDto {
+                type_: Some("Movie".to_owned()),
+                default_image_options: vec![ImageOption::default()],
+                supported_image_types: vec![ImageType::Primary],
+                metadata_fetchers: vec![LibraryOptionInfoDto {
+                    name: Some("Tmdb".to_owned()),
+                    default_enabled: true,
+                }],
+                ..LibraryTypeOptionsDto::default()
+            }],
+            ..LibraryOptionsResultDto::default()
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["TypeOptions"][0]["Type"], "Movie");
+        assert_eq!(
+            json["TypeOptions"][0]["MetadataFetchers"][0]["Name"],
+            "Tmdb"
+        );
+        assert_eq!(
+            json["TypeOptions"][0]["MetadataFetchers"][0]["DefaultEnabled"],
+            true
+        );
+        assert!(json["MetadataSavers"].as_array().unwrap().is_empty());
+        let back: LibraryOptionsResultDto = serde_json::from_value(json).unwrap();
+        assert_eq!(dto, back);
     }
 }
