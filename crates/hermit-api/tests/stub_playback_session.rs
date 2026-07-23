@@ -2,8 +2,10 @@
 //! are registered but **not yet ported**, so every one of their routes must
 //! resolve to `501 Not Implemented` — never `404`.
 //!
-//! These ~61 operations span the `Session`, `Playstate`, `SyncPlay`, `Devices`,
-//! `QuickConnect`, `ApiKey`, and `DisplayPreferences` Jellyfin controllers. A
+//! These operations span the `SyncPlay` and `DisplayPreferences` Jellyfin
+//! controllers (the `Session`, `Playstate`, and `QuickConnect` controllers were
+//! ported in Batches 5–6, and `Devices`/`ApiKey` in Batch 12, so their routes
+//! are real now and covered by their own tests). A
 //! real client (Wolphin) probing any of them must learn "route exists, not
 //! implemented", not "no such route". The auth-context middleware is
 //! non-rejecting and the shared `not_implemented` stub takes no auth extractor,
@@ -22,31 +24,14 @@ use tower::ServiceExt;
 /// A representative `(method, path)` from each Unit-5 controller. Paths use
 /// concrete segment values where the vendored route has a `{param}`.
 const UNIT5_PROBES: &[(Method, &str)] = &[
-    // SessionController
-    (Method::GET, "/Sessions"),
-    (Method::POST, "/Sessions/Capabilities"),
-    (Method::POST, "/Sessions/Logout"),
-    (Method::POST, "/Sessions/Viewing"),
-    (Method::POST, "/Sessions/session-1/Command"),
-    (Method::POST, "/Sessions/session-1/Command/Mute"),
-    (Method::POST, "/Sessions/session-1/Message"),
-    (Method::POST, "/Sessions/session-1/Playing"),
-    (Method::POST, "/Sessions/session-1/Playing/Pause"),
-    (Method::POST, "/Sessions/session-1/System/Restart"),
-    (Method::POST, "/Sessions/session-1/User/user-1"),
-    (Method::DELETE, "/Sessions/session-1/User/user-1"),
-    // PlaystateController
-    (Method::POST, "/Sessions/Playing"),
-    (Method::POST, "/Sessions/Playing/Ping"),
-    (Method::POST, "/Sessions/Playing/Progress"),
-    (Method::POST, "/Sessions/Playing/Stopped"),
-    (Method::POST, "/PlayingItems/item-1"),
-    (Method::DELETE, "/PlayingItems/item-1"),
-    (Method::POST, "/PlayingItems/item-1/Progress"),
-    (Method::POST, "/UserPlayedItems/item-1"),
-    (Method::DELETE, "/UserPlayedItems/item-1"),
-    (Method::GET, "/UserItems/item-1/UserData"),
-    (Method::POST, "/UserItems/item-1/UserData"),
+    // SessionController + PlaystateController were ported in Batch 5 (Playstate +
+    // Sessions playback reporting), so their routes are now real (`RequireAuth`-
+    // guarded → `401` for a tokenless probe) rather than `501` stubs; likewise
+    // `/Auth/Providers` + `/Auth/PasswordResetProviders` (ported alongside the
+    // session controller). They are exercised in `session_playstate.rs` instead.
+    //
+    // Note: `/UserItems/{itemId}/UserData` (GET/POST) was ported in Batch 4
+    // (real user-data read/write), so it is no longer a Unit-5 stub.
     // SyncPlayController
     (Method::GET, "/SyncPlay/List"),
     (Method::GET, "/SyncPlay/group-1"),
@@ -59,26 +44,17 @@ const UNIT5_PROBES: &[(Method, &str)] = &[
     (Method::POST, "/SyncPlay/SetNewQueue"),
     (Method::POST, "/SyncPlay/SetRepeatMode"),
     (Method::POST, "/SyncPlay/SetShuffleMode"),
-    // DevicesController
-    (Method::GET, "/Devices"),
-    (Method::DELETE, "/Devices"),
-    (Method::GET, "/Devices/Info"),
-    (Method::GET, "/Devices/Options"),
-    (Method::POST, "/Devices/Options"),
-    // QuickConnectController
-    (Method::GET, "/QuickConnect/Enabled"),
-    (Method::GET, "/QuickConnect/Connect"),
-    (Method::POST, "/QuickConnect/Initiate"),
-    (Method::POST, "/QuickConnect/Authorize"),
-    // ApiKeyController
-    (Method::GET, "/Auth/Keys"),
-    (Method::POST, "/Auth/Keys"),
-    (Method::DELETE, "/Auth/Keys/some-key"),
-    (Method::GET, "/Auth/Providers"),
-    (Method::GET, "/Auth/PasswordResetProviders"),
-    // DisplayPreferencesController
-    (Method::GET, "/DisplayPreferences/usersettings"),
-    (Method::POST, "/DisplayPreferences/usersettings"),
+    // DevicesController + ApiKeyController were ported in Batch 12, so their
+    // routes are now real (`RequireAuth`-guarded → `401` for a tokenless probe)
+    // and exercised in `batch12_handlers.rs` instead of being 501 stubs here.
+    // QuickConnectController was ported in Batch 6, so its routes are now real
+    // (`/QuickConnect/Enabled`/`Connect`/`Initiate`/`Authorize`); they are
+    // exercised in `batch6_handlers.rs` instead of being 501 stubs here.
+    // `/Auth/Providers` + `/Auth/PasswordResetProviders` are now real (Batch 5).
+    // DisplayPreferencesController was ported in Batch 13, so its
+    // `/DisplayPreferences/{displayPreferencesId}` GET/POST routes are now real
+    // (`RequireAuth`-guarded) and exercised in `batch13_handlers.rs` instead of
+    // being 501 stubs here.
 ];
 
 #[tokio::test]

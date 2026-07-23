@@ -15,7 +15,8 @@ use hermit_api::create_router;
 use hermit_api::state::AppState;
 use hermit_api::test_support::{
     FakeAuthContext, FakeAuthService, FakeConfig, FakeDto, FakeLibrary, FakeMediaSources,
-    FakeSessions, FakeUserData, FakeUserViews, FakeUsers,
+    FakeMusic, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
+    FakeUserData, FakeUserViews, FakeUsers,
 };
 use hermit_model::system::{PublicSystemInfo, SystemInfo};
 use hermit_traits::error::ServiceError;
@@ -112,9 +113,29 @@ fn state_with_system(server_name: &str) -> AppState {
         }),
         Arc::new(StubHost),
         Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
         Arc::new(FakeAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(hermit_api::test_support::FakePlaylists),
+        Arc::new(hermit_api::test_support::FakeCollections),
+        Arc::new(hermit_api::test_support::FakeTvSeries),
+        Arc::new(hermit_api::test_support::FakeSubtitles),
+        Arc::new(hermit_api::test_support::FakeLyrics),
+        Arc::new(hermit_api::test_support::FakeMediaSegments),
+        Arc::new(hermit_api::test_support::FakeTrickplay),
+        Arc::new(hermit_api::test_support::FakeDevices),
+        Arc::new(hermit_api::test_support::FakeClientEventLogger),
+        Arc::new(hermit_api::test_support::FakeApiKeys),
+        Arc::new(hermit_api::test_support::FakeLocalization),
+        Arc::new(hermit_api::test_support::FakeDisplayPreferences),
+        Arc::new(hermit_api::test_support::FakeActivity),
+        Arc::new(hermit_api::test_support::FakeFileSystem),
+        Arc::new(hermit_api::test_support::FakeTasks),
     )
 }
 

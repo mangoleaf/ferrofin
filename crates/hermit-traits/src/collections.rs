@@ -125,6 +125,17 @@ pub trait PlaylistManager: Send + Sync {
     /// Gets all playlists a user has access to.
     async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Gets the member items of a playlist, in playlist order.
+    ///
+    /// Ports the read behind `PlaylistsController.GetPlaylistItems`; the C#
+    /// `playlist.GetManageableItems()` walk over the playlist's children becomes
+    /// a lookup of the playlist's manual linked-children rows.
+    async fn get_playlist_items(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
     /// Adds a user share to a playlist.
     async fn add_user_to_shares(
         &self,

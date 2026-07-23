@@ -10,14 +10,29 @@
 
 use std::sync::Arc;
 
-use hermit_traits::configuration::ServerConfigurationManager;
+use hermit_traits::activity::ActivityManager;
+use hermit_traits::collections::{CollectionManager, PlaylistManager};
+use hermit_traits::configuration::{DisplayPreferencesManager, ServerConfigurationManager};
+use hermit_traits::devices::DeviceManager;
 use hermit_traits::dto::DtoService;
+use hermit_traits::events::ClientEventLogger;
+use hermit_traits::filesystem::FileSystem;
 use hermit_traits::library::{
-    LibraryManager, MediaSourceManager, UserDataManager, UserManager, UserViewManager,
+    LibraryManager, MediaSourceManager, MusicManager, SearchManager, SimilarItemsManager,
+    UserDataManager, UserManager, UserViewManager,
 };
+use hermit_traits::localization::LocalizationManager;
+use hermit_traits::media_segments::MediaSegmentManager;
 use hermit_traits::net::{AuthService, AuthorizationContext};
+use hermit_traits::providers::ProviderManager;
+use hermit_traits::security::{ApiKeyManager, QuickConnect};
 use hermit_traits::session::SessionManager;
+use hermit_traits::stubs::LyricManager;
+use hermit_traits::subtitles::SubtitleManager;
 use hermit_traits::system::{ServerApplicationHost, SystemManager};
+use hermit_traits::tasks::TaskManager;
+use hermit_traits::trickplay::TrickplayManager;
+use hermit_traits::tv::TvSeriesManager;
 
 /// The managers behind [`AppState`], held once and shared via [`Arc`].
 ///
@@ -43,12 +58,52 @@ pub struct Inner {
     pub app_host: Arc<dyn ServerApplicationHost>,
     /// Server configuration read/write.
     pub config: Arc<dyn ServerConfigurationManager>,
+    /// Metadata/image refresh orchestration (queueing item refreshes).
+    pub providers: Arc<dyn ProviderManager>,
+    /// Builds "instant mix" playlists from a seed song/album/artist/genre.
+    pub music: Arc<dyn MusicManager>,
+    /// Finds items similar to a seed and builds recommendation categories.
+    pub similar_items: Arc<dyn SimilarItemsManager>,
+    /// Ranked search-hint queries across the library.
+    pub search: Arc<dyn SearchManager>,
     /// Builds the wire DTOs returned to clients from domain entities.
     pub dto: Arc<dyn DtoService>,
     /// Parses a request's credentials into an authorization context.
     pub auth_context: Arc<dyn AuthorizationContext>,
     /// Validates a request's credentials, rejecting unauthenticated ones.
     pub auth_service: Arc<dyn AuthService>,
+    /// Drives the Quick Connect pairing flow.
+    pub quick_connect: Arc<dyn QuickConnect>,
+    /// Creates and mutates playlists and their shares/membership.
+    pub playlists: Arc<dyn PlaylistManager>,
+    /// Creates and mutates collections (box sets) and their membership.
+    pub collections: Arc<dyn CollectionManager>,
+    /// Computes a user's "Next Up" TV-episode queue.
+    pub tv_series: Arc<dyn TvSeriesManager>,
+    /// Searches/uploads/deletes an item's subtitles.
+    pub subtitles: Arc<dyn SubtitleManager>,
+    /// Serves/searches/uploads an audio item's lyrics.
+    pub lyrics: Arc<dyn LyricManager>,
+    /// Queries an item's media segments (intros/outros/etc.).
+    pub media_segments: Arc<dyn MediaSegmentManager>,
+    /// Serves trickplay (scrubbing-preview) playlists and tiles.
+    pub trickplay: Arc<dyn TrickplayManager>,
+    /// Registers client devices and their per-device options.
+    pub devices: Arc<dyn DeviceManager>,
+    /// Persists client-uploaded diagnostic documents.
+    pub client_event_logger: Arc<dyn ClientEventLogger>,
+    /// Lists, creates, and revokes long-lived server API keys.
+    pub api_keys: Arc<dyn ApiKeyManager>,
+    /// Culture/country/parental-rating reference data.
+    pub localization: Arc<dyn LocalizationManager>,
+    /// Per-user, per-client display preferences.
+    pub display_preferences: Arc<dyn DisplayPreferencesManager>,
+    /// Paged retrieval of server activity-log entries.
+    pub activity: Arc<dyn ActivityManager>,
+    /// Server-side filesystem browsing (Environment endpoints).
+    pub file_system: Arc<dyn FileSystem>,
+    /// Enumerates and runs the server's scheduled tasks.
+    pub tasks: Arc<dyn TaskManager>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -88,9 +143,29 @@ impl AppState {
         system: Arc<dyn SystemManager>,
         app_host: Arc<dyn ServerApplicationHost>,
         config: Arc<dyn ServerConfigurationManager>,
+        providers: Arc<dyn ProviderManager>,
+        music: Arc<dyn MusicManager>,
+        similar_items: Arc<dyn SimilarItemsManager>,
+        search: Arc<dyn SearchManager>,
         dto: Arc<dyn DtoService>,
         auth_context: Arc<dyn AuthorizationContext>,
         auth_service: Arc<dyn AuthService>,
+        quick_connect: Arc<dyn QuickConnect>,
+        playlists: Arc<dyn PlaylistManager>,
+        collections: Arc<dyn CollectionManager>,
+        tv_series: Arc<dyn TvSeriesManager>,
+        subtitles: Arc<dyn SubtitleManager>,
+        lyrics: Arc<dyn LyricManager>,
+        media_segments: Arc<dyn MediaSegmentManager>,
+        trickplay: Arc<dyn TrickplayManager>,
+        devices: Arc<dyn DeviceManager>,
+        client_event_logger: Arc<dyn ClientEventLogger>,
+        api_keys: Arc<dyn ApiKeyManager>,
+        localization: Arc<dyn LocalizationManager>,
+        display_preferences: Arc<dyn DisplayPreferencesManager>,
+        activity: Arc<dyn ActivityManager>,
+        file_system: Arc<dyn FileSystem>,
+        tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
             library,
@@ -102,9 +177,29 @@ impl AppState {
             system,
             app_host,
             config,
+            providers,
+            music,
+            similar_items,
+            search,
             dto,
             auth_context,
             auth_service,
+            quick_connect,
+            playlists,
+            collections,
+            tv_series,
+            subtitles,
+            lyrics,
+            media_segments,
+            trickplay,
+            devices,
+            client_event_logger,
+            api_keys,
+            localization,
+            display_preferences,
+            activity,
+            file_system,
+            tasks,
         })
     }
 

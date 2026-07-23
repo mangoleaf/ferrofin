@@ -56,3 +56,23 @@ pub struct DeviceInfoDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
 }
+
+/// A DTO representing custom options for a device.
+///
+/// Port of `MediaBrowser.Model.Dto.DeviceOptionsDto`. Returned by `GET
+/// /Devices/Options` and accepted (only its [`custom_name`](Self::custom_name))
+/// by `POST /Devices/Options`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeviceOptionsDto {
+    /// Gets or sets the id.
+    pub id: i32,
+
+    /// Gets or sets the device id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+
+    /// Gets or sets the custom name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<String>,
+}

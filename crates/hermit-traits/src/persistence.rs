@@ -37,7 +37,7 @@ use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
-use crate::options::{InternalItemsQuery, InternalPeopleQuery};
+use crate::options::{InternalItemsQuery, InternalPeopleQuery, ItemImageInfo};
 
 /// A genre/studio/artist row paired with its aggregated item counts.
 ///
@@ -141,6 +141,25 @@ pub trait ItemRepository: Send + Sync {
 
     /// Reports whether an item with the given id has been persisted.
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
+
+    /// Returns the item rows whose `PrimaryVersionId` equals `primary_id`.
+    ///
+    /// The alternate versions of a version group point at the group's primary via
+    /// this column; used to enumerate a group (e.g. to clear its links). The
+    /// primary row itself is *not* included (its own `PrimaryVersionId` is null).
+    async fn get_items_by_primary_version(
+        &self,
+        primary_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Gets the image rows attached to an item, ordered by image type then by
+    /// their stored order within a type.
+    ///
+    /// Port of the read side of `BaseItemRepository` image persistence
+    /// (`BaseItemImageInfos`): each row becomes an [`ItemImageInfo`] the API
+    /// layer serves or projects into an `ImageInfo` DTO. An item with no images
+    /// yields an empty vector.
+    async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
     /// Gets genres with their item counts.
     async fn get_genres(

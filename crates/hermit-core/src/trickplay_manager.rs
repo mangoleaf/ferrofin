@@ -13,8 +13,12 @@
 //!   layout) needs the un-ported `Video` domain object, an `IMediaEncoder`, and
 //!   the trickplay directory service; here it is a no-op that leaves any
 //!   existing rows untouched.
-//! - [`Self::get_hls_playlist`] — building the `.m3u8` text from the stored
-//!   tiles is likewise a tiling/HTTP concern and returns `None` for now.
+//!
+//! Real (Batch 11): [`Self::get_hls_playlist`] builds the `.m3u8` text purely
+//! from the stored [`TrickplayInfoEntity`] row (a port of C# `GetHlsPlaylist`),
+//! and [`Self::get_trickplay_tile_path`] resolves a tile's on-disk path from the
+//! [`PathManager`] trickplay directory layout — both are metadata/path concerns
+//! that do not require the deferred tiling.
 //!
 //! The manifest key mirrors C#: trickplay is keyed by *media-source id*, and the
 //! primary media source of an item is the item's own id, so
@@ -22,6 +26,8 @@
 //! string.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use hermit_db::Database;
@@ -29,6 +35,7 @@ use hermit_db::entities::playback::TrickplayInfoEntity;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
+use hermit_traits::system::PathManager;
 use hermit_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
@@ -37,6 +44,7 @@ use crate::db_error::db_err;
 #[derive(Clone)]
 pub struct HermitTrickplayManager {
     db: Database,
+    path_manager: Arc<dyn PathManager>,
 }
 
 impl std::fmt::Debug for HermitTrickplayManager {
@@ -47,10 +55,10 @@ impl std::fmt::Debug for HermitTrickplayManager {
 }
 
 impl HermitTrickplayManager {
-    /// Creates a trickplay manager over the given database.
+    /// Creates a trickplay manager over the given database and path manager.
     #[must_use]
-    pub fn new(db: Database) -> Self {
-        Self { db }
+    pub fn new(db: Database, path_manager: Arc<dyn PathManager>) -> Self {
+        Self { db, path_manager }
     }
 
     /// Fetches all stored trickplay rows for an item, keyed by tile width.
@@ -158,13 +166,104 @@ impl TrickplayManager for HermitTrickplayManager {
 
     async fn get_hls_playlist(
         &self,
-        _item_id: Uuid,
-        _width: i32,
-        _api_key: Option<&str>,
+        item_id: Uuid,
+        width: i32,
+        api_key: Option<&str>,
     ) -> Result<Option<String>, ServiceError> {
-        // The `.m3u8` text is built from the on-disk tiles (deferred tiling).
-        Ok(None)
+        // Port of C# `TrickplayManager.GetHlsPlaylist`: the playlist is derived
+        // wholly from the stored `TrickplayInfo` row, so no on-disk tiles are
+        // needed to emit it.
+        let resolutions = self.resolutions_for(item_id).await?;
+        let Some(info) = resolutions.get(&width) else {
+            return Ok(None);
+        };
+        if info.thumbnail_count <= 0 {
+            return Ok(None);
+        }
+
+        let resolution = format!("{}x{}", info.width, info.height);
+        let layout = format!("{}x{}", info.tile_width, info.tile_height);
+        let thumbnails_per_tile = info.tile_width * info.tile_height;
+        // A malformed row with a zero tile grid would divide by zero; treat it as
+        // "no playlist" rather than panicking.
+        if thumbnails_per_tile <= 0 {
+            return Ok(None);
+        }
+        let thumbnail_duration = f64::from(info.interval) / 1000.0;
+        let tile_count = (info.thumbnail_count + thumbnails_per_tile - 1) / thumbnails_per_tile;
+        let api_key = api_key.unwrap_or("");
+        let item_id_dashless = item_id.simple().to_string();
+
+        let mut out = String::with_capacity(128);
+        out.push_str("#EXTM3U\n");
+        let _ = writeln!(out, "#EXT-X-TARGETDURATION:{tile_count}");
+        out.push_str("#EXT-X-VERSION:7\n");
+        out.push_str("#EXT-X-MEDIA-SEQUENCE:1\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        out.push_str("#EXT-X-IMAGES-ONLY\n");
+
+        for i in 0..tile_count {
+            // Every tile but the last carries a full grid of thumbnails.
+            let per_tile = if i == tile_count - 1 {
+                info.thumbnail_count - (i * thumbnails_per_tile)
+            } else {
+                thumbnails_per_tile
+            };
+            let inf_duration = thumbnail_duration * f64::from(per_tile);
+
+            let _ = writeln!(out, "#EXTINF:{},", format_decimal(inf_duration));
+            let _ = writeln!(
+                out,
+                "#EXT-X-TILES:RESOLUTION={resolution},LAYOUT={layout},DURATION={}",
+                format_decimal(thumbnail_duration)
+            );
+            let _ = writeln!(
+                out,
+                "{i}.jpg?MediaSourceId={item_id_dashless}&ApiKey={api_key}"
+            );
+        }
+
+        out.push_str("#EXT-X-ENDLIST\n");
+        Ok(Some(out))
     }
+
+    async fn get_trickplay_tile_path(
+        &self,
+        item_id: Uuid,
+        width: i32,
+        index: i32,
+    ) -> Result<Option<String>, ServiceError> {
+        // Port of C# `GetTrickplayTilePathAsync`: locate the resolution, then
+        // build `{trickplay-dir}/{width} - {tw}x{th}/{index}.jpg`. The C#
+        // `saveWithMedia` flag (a per-library option) is not modeled at this
+        // seam, so the internal (non-save-with-media) directory is used; the
+        // media path it ignores is passed empty.
+        let resolutions = self.resolutions_for(item_id).await?;
+        let Some(info) = resolutions.get(&width) else {
+            return Ok(None);
+        };
+        let base = self.path_manager.trickplay_directory(item_id, "", false);
+        let subdir = format!("{} - {}x{}", width, info.tile_width, info.tile_height);
+        let path = std::path::Path::new(&base)
+            .join(subdir)
+            .join(format!("{index}.jpg"));
+        Ok(Some(path.to_string_lossy().into_owned()))
+    }
+}
+
+/// Formats a floating-point duration like C#'s `{0:0.###}` — up to three
+/// fractional digits, trailing zeros (and a bare decimal point) trimmed.
+fn format_decimal(value: f64) -> String {
+    let mut s = format!("{value:.3}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -173,11 +272,25 @@ mod tests {
     use hermit_model::data::BaseItemKind;
     use uuid::Uuid;
 
+    use std::sync::Arc;
+
+    use hermit_db::Database;
     use hermit_traits::trickplay::TrickplayManager;
 
+    use crate::app_paths::test_paths;
+    use crate::path_manager::HermitPathManager;
     use crate::test_support::{seed_item, test_db};
 
     use super::HermitTrickplayManager;
+
+    /// Builds a trickplay manager plus a temp-dir path manager, returning the
+    /// temp dir so its lifetime outlives the test.
+    fn manager_with_paths(db: Database) -> (tempfile::TempDir, HermitTrickplayManager) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let pm = Arc::new(HermitPathManager::new(paths));
+        (tmp, HermitTrickplayManager::new(db, pm))
+    }
 
     fn info(item: Uuid, width: i32) -> TrickplayInfoEntity {
         TrickplayInfoEntity {
@@ -197,7 +310,7 @@ mod tests {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Episode).await;
-        let mgr = HermitTrickplayManager::new(db.clone());
+        let (_tmp, mgr) = manager_with_paths(db.clone());
 
         mgr.save_trickplay_info(&info(item, 320))
             .await
@@ -236,19 +349,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_and_hls_are_deferred_noops() {
+    async fn refresh_is_deferred_and_hls_needs_a_row() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Episode).await;
-        let mgr = HermitTrickplayManager::new(db);
+        let (_tmp, mgr) = manager_with_paths(db);
 
         mgr.refresh_trickplay_data(item, true)
             .await
             .expect("refresh");
+        // No stored row → no playlist and no tile path.
         assert!(
             mgr.get_hls_playlist(item, 320, None)
                 .await
                 .expect("hls")
+                .is_none()
+        );
+        assert!(
+            mgr.get_trickplay_tile_path(item, 320, 0)
+                .await
+                .expect("tile")
                 .is_none()
         );
         // Refresh does not fabricate rows.
@@ -257,6 +377,66 @@ mod tests {
                 .await
                 .expect("res")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_playlist_and_tile_path_from_stored_row() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let (_tmp, mgr) = manager_with_paths(db.clone());
+
+        // A 2x2 tile grid with 6 thumbnails → 2 tiles (4 + 2).
+        let stored = TrickplayInfoEntity {
+            item_id: item.to_string(),
+            width: 320,
+            bandwidth: 500_000,
+            height: 180,
+            interval: 10_000,
+            thumbnail_count: 6,
+            tile_height: 2,
+            tile_width: 2,
+        };
+        mgr.save_trickplay_info(&stored).await.expect("save");
+
+        let playlist = mgr
+            .get_hls_playlist(item, 320, Some("KEY"))
+            .await
+            .expect("hls")
+            .expect("some playlist");
+        assert!(playlist.starts_with("#EXTM3U"));
+        assert!(playlist.contains("#EXT-X-IMAGES-ONLY"));
+        assert!(playlist.contains("RESOLUTION=320x180"));
+        assert!(playlist.contains("LAYOUT=2x2"));
+        // Two tiles, addressed 0.jpg / 1.jpg with the dashless id + api key.
+        assert!(playlist.contains(&format!("0.jpg?MediaSourceId={}&ApiKey=KEY", item.simple())));
+        assert!(playlist.contains("1.jpg?MediaSourceId="));
+        assert!(playlist.trim_end().ends_with("#EXT-X-ENDLIST"));
+
+        // Tile path is `{trickplay}/{id}/{width} - {tw}x{th}/{index}.jpg`.
+        let tile = mgr
+            .get_trickplay_tile_path(item, 320, 1)
+            .await
+            .expect("tile")
+            .expect("some path");
+        assert!(
+            tile.ends_with("320 - 2x2/1.jpg"),
+            "unexpected tile path {tile}"
+        );
+
+        // Unknown resolution → no playlist / no tile path.
+        assert!(
+            mgr.get_hls_playlist(item, 999, None)
+                .await
+                .expect("hls")
+                .is_none()
+        );
+        assert!(
+            mgr.get_trickplay_tile_path(item, 999, 0)
+                .await
+                .expect("tile")
+                .is_none()
         );
     }
 }

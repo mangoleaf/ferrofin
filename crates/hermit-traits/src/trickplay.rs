@@ -76,6 +76,21 @@ pub trait TrickplayManager: Send + Sync {
         width: i32,
         api_key: Option<&str>,
     ) -> Result<Option<String>, ServiceError>;
+
+    /// Resolves the on-disk path of the trickplay tile image at `index` for a
+    /// resolution, if that resolution is known.
+    ///
+    /// Port of `GetTrickplayTilePathAsync`. Returns `None` when the item has no
+    /// stored info for `width`; the returned path is not guaranteed to exist on
+    /// disk (the caller checks before serving, mirroring the C# `File.Exists`
+    /// gate). The C# `saveWithMedia` flag (a per-library option) is not modeled
+    /// at this seam, so the internal trickplay directory layout is always used.
+    async fn get_trickplay_tile_path(
+        &self,
+        item_id: Uuid,
+        width: i32,
+        index: i32,
+    ) -> Result<Option<String>, ServiceError>;
 }
 
 fn _assert_object_safe_trickplay_manager(_: &dyn TrickplayManager) {}

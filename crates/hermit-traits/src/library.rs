@@ -27,11 +27,12 @@ use async_trait::async_trait;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::configuration::UserConfiguration;
-use hermit_model::data::CollectionType;
+use hermit_model::data::{BaseItemKind, CollectionType};
 use hermit_model::dto::{
-    ItemCounts, MediaSourceInfo, NameIdPair, RecommendationType, UpdateUserItemDataDto,
+    ItemCounts, MediaSourceInfo, NameIdPair, RecommendationType, UpdateUserItemDataDto, UserDto,
     UserItemDataDto,
 };
+use hermit_model::entities::MediaStreamType;
 use hermit_model::media_info::LiveStreamRequest;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use hermit_model::search::{SearchHint, SearchQuery};
@@ -39,7 +40,9 @@ use hermit_model::users::UserPolicy;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
-use crate::options::{DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery};
+use crate::options::{
+    DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery, ItemImageInfo,
+};
 use crate::persistence::ItemWithCounts;
 
 /// A search match: an item id paired with a relevance score.
@@ -93,6 +96,84 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Gets the image rows attached to an item.
+    ///
+    /// Port of the `BaseItem.ImageInfos` accessor the image controllers read
+    /// before serving or projecting an item's images; the concrete manager
+    /// delegates to [`ItemRepository::get_image_infos`](crate::persistence::ItemRepository::get_image_infos).
+    /// An item with no images yields an empty vector.
+    ///
+    /// The default is the no-image fallback (an empty vector), so impls that do
+    /// not store images — test doubles and managers without a persistence seam —
+    /// compile unchanged; the concrete manager overrides it with the real read.
+    async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
+        let _ = item_id;
+        Ok(Vec::new())
+    }
+
+    /// Gets an item's ancestor rows, nearest parent first, walking the
+    /// `ParentId` chain up to the root.
+    ///
+    /// Port of the `BaseItem.GetParents()` walk that `LibraryController.GetAncestors`
+    /// consumes: starting from the item's parent, each row's [`parent_id`] is
+    /// followed until it is absent or no longer resolves. The seed item itself is
+    /// not included. A missing seed item yields [`None`] so the controller can map
+    /// it to a `404`; a resolvable item with no parent yields an empty list.
+    ///
+    /// The default folds [`Self::get_item_by_id`], so every impl gets the walk for
+    /// free. A `parent_id` that points back into the already-visited set is
+    /// treated as the end of the chain, guarding against a cyclic `ParentId`.
+    ///
+    /// [`parent_id`]: hermit_db::entities::base_items::BaseItemEntity::parent_id
+    async fn get_ancestors(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        let Some(item) = self.get_item_by_id(item_id).await? else {
+            return Ok(None);
+        };
+        let mut ancestors = Vec::new();
+        let mut seen = vec![item_id];
+        let mut next = item
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok());
+        while let Some(parent_id) = next {
+            if seen.contains(&parent_id) {
+                break;
+            }
+            let Some(parent) = self.get_item_by_id(parent_id).await? else {
+                break;
+            };
+            seen.push(parent_id);
+            next = parent
+                .parent_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok());
+            ancestors.push(parent);
+        }
+        Ok(Some(ancestors))
+    }
+
+    /// Gets the user root folder row — the synthetic top of the library tree
+    /// that `Items/Root` (and the `itemId.IsEmpty()` fallbacks across the
+    /// user-library controller) resolve to, or `None` if it has not been
+    /// materialized.
+    ///
+    /// Port of `ILibraryManager.GetUserRootFolder`. Jellyfin lazily creates the
+    /// [`BaseItemKind::UserRootFolder`] on disk; that filesystem side effect is
+    /// out of scope for this portable seam, so the default resolves the single
+    /// persisted `UserRootFolder` row (the first one, mirroring C#
+    /// `FirstOrDefault`) via [`Self::get_item_list`] and reports `None` when
+    /// absent.
+    async fn get_user_root_folder(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::UserRootFolder],
+            ..InternalItemsQuery::default()
+        };
+        Ok(self.get_item_list(&query).await?.into_iter().next())
+    }
+
     /// Runs a query and returns a page of item rows plus the total count.
     async fn query_items(
         &self,
@@ -132,6 +213,44 @@ pub trait LibraryManager: Send + Sync {
     /// Deletes an item, honoring the given [`DeleteOptions`].
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
+    /// Merges several videos into one version group.
+    ///
+    /// Port of `VideosController.MergeVersions`: picks a primary version among
+    /// `ids` (preferring one that already owns multiple sources, else the best by
+    /// video type / resolution) and links every other supplied id to it by
+    /// setting its `PrimaryVersionId`. Returns [`ServiceError::InvalidInput`] when
+    /// fewer than two distinct, resolvable videos are supplied.
+    ///
+    /// The C# `LinkedAlternateVersions` array + linked-child reroute are not
+    /// modeled at this seam (Hermit tracks the version group solely by each row's
+    /// `PrimaryVersionId` pointer); setting that pointer is the portable core of
+    /// the merge.
+    ///
+    /// The default implementation reports the operation as unsupported, so a
+    /// manager that does not persist version groups need not override it; the
+    /// concrete `HermitLibraryManager` does.
+    async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+        let _ = ids;
+        Err(ServiceError::backend("merge_versions not supported"))
+    }
+
+    /// Removes the alternate-version links of a video (and of its whole group).
+    ///
+    /// Port of `VideosController.DeleteAlternateSources`: resolves the item's
+    /// primary version, then clears the `PrimaryVersionId` pointer on the primary
+    /// and on every item linked to it, so each becomes a standalone version again.
+    /// Returns [`ServiceError::NotFound`] when the item does not exist.
+    ///
+    /// The default implementation reports the operation as unsupported (see
+    /// [`merge_versions`](Self::merge_versions)); `HermitLibraryManager` overrides
+    /// it.
+    async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let _ = item_id;
+        Err(ServiceError::backend(
+            "remove_alternate_sources not supported",
+        ))
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,
@@ -169,11 +288,144 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError>;
 
+    /// Gets music genres with their item counts.
+    ///
+    /// Port of `ILibraryManager.GetMusicGenres`. Unlike [`Self::get_genres`],
+    /// this counts against the music-genre by-name kind, so the music-library
+    /// browse (`GET /MusicGenres`) and the music-collection branch of
+    /// `GET /Genres` resolve the same rows Jellyfin does.
+    async fn get_music_genres(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError>;
+
+    /// Gets album artists with their item counts.
+    ///
+    /// Port of `ILibraryManager.GetAlbumArtists`. Restricts the by-name artist
+    /// rows to those referenced as *album* artists, backing
+    /// `GET /Artists/AlbumArtists`.
+    async fn get_album_artists(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError>;
+
+    /// Resolves a single by-name item (genre, studio, artist, person, year, …)
+    /// of the given [`BaseItemKind`] by its name, or `None` when no such row
+    /// exists.
+    ///
+    /// Port of `ILibraryManager`'s by-name resolvers (`GetGenre`, `GetStudio`,
+    /// `GetArtist`, `GetPerson`, `GetMusicGenre`, `GetYear`). Jellyfin's
+    /// versions create the backing folder on disk when absent; that filesystem
+    /// side effect is out of scope for this portable seam, so a missing item is
+    /// reported as `None` and each controller applies its own empty/`404`
+    /// fallback. Matching is by cleaned name (Jellyfin's item-by-name id is
+    /// derived from the name), delegating to [`Self::get_item_list`] filtered to
+    /// `kind`; the first match wins, mirroring C# `FirstOrDefault`.
+    async fn get_named_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let query = InternalItemsQuery {
+            name: Some(name.to_owned()),
+            include_item_types: vec![kind],
+            ..InternalItemsQuery::default()
+        };
+        Ok(self.get_item_list(&query).await?.into_iter().next())
+    }
+
+    /// Resolves the people matching `query` to their by-name `Person` item rows.
+    ///
+    /// Port of `ILibraryManager.GetPeopleItems`: it fetches the credited people
+    /// via [`Self::get_people`], then resolves each name to its `Person`
+    /// [`BaseItemEntity`] (dropping any that no longer resolve), preserving the
+    /// people query's paging. The default folds the two calls so every impl gets
+    /// it for free from [`Self::get_people`] + [`Self::get_named_item`].
+    async fn get_people_items(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let people = self.get_people(query).await?;
+        let mut items = Vec::with_capacity(people.len());
+        for person in people {
+            if let Some(item) = self
+                .get_named_item(BaseItemKind::Person, &person.name)
+                .await?
+            {
+                items.push(item);
+            }
+        }
+        Ok(QueryResult::new(
+            query.start_index,
+            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
+            items,
+        ))
+    }
+
+    /// Gets the library's production years, resolved to their by-name `Year`
+    /// item rows, sorted ascending and paged by `start_index`/`limit`.
+    ///
+    /// Port of `YearsController.GetYears`: Jellyfin walks the (localized) item
+    /// tree, collects each item's distinct `ProductionYear`, and resolves each
+    /// to a `Year` item. Here the distinct years come from
+    /// [`Self::get_query_filters_legacy`] over the same `query`, and each is
+    /// resolved via [`Self::get_named_item`]; years without a materialized row
+    /// are skipped (Jellyfin's `.Where(i => i is not null)`), since on-disk
+    /// creation is out of scope for this portable seam.
+    async fn get_years(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let mut years = self.get_query_filters_legacy(query).await?.years;
+        years.retain(|y| *y > 0);
+        years.sort_unstable();
+        years.dedup();
+        let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
+        let mut items = Vec::new();
+        for year in years.into_iter().skip(start) {
+            if let Some(limit) = query.limit
+                && limit >= 0
+                && items.len() >= usize::try_from(limit).unwrap_or(usize::MAX)
+            {
+                break;
+            }
+            if let Some(item) = self
+                .get_named_item(BaseItemKind::Year, &year.to_string())
+                .await?
+            {
+                items.push(item);
+            }
+        }
+        Ok(QueryResult::new(
+            query.start_index,
+            Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
+            items,
+        ))
+    }
+
     /// Gets aggregated legacy query-filter values for the matching items.
     async fn get_query_filters_legacy(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError>;
+
+    /// Gets the distinct language codes of the matching items' media streams of
+    /// a given [`MediaStreamType`].
+    ///
+    /// Port of `ILibraryManager.GetMediaStreamLanguages(MediaStreamType,
+    /// InternalItemsQuery)`, which backs the audio/subtitle language facets of
+    /// `GET /Items/Filters2`. The distinct codes come from the query's matching
+    /// items' streams; an empty language is normalized to `"und"` (undetermined)
+    /// exactly as Jellyfin does.
+    async fn get_media_stream_languages(
+        &self,
+        stream_type: MediaStreamType,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError>;
 
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
@@ -183,9 +435,8 @@ fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
 
 /// Manages user accounts, authentication, and per-user policy/configuration.
 ///
-/// Port of `IUserManager`. User rows are [`UserEntity`]; the `GetUserDto`
-/// method is deliberately omitted until `UserDto` lands in `hermit-model`
-/// (flagged in the port report).
+/// Port of `IUserManager`. User rows are [`UserEntity`]; [`Self::get_user_dto`]
+/// projects a row into the public [`UserDto`] (policy + configuration).
 #[async_trait]
 pub trait UserManager: Send + Sync {
     /// Gets all user rows.
@@ -244,6 +495,20 @@ pub trait UserManager: Send + Sync {
     /// Lists the available password-reset providers.
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
 
+    /// Projects a user row into the full public [`UserDto`].
+    ///
+    /// Port of `UserManager.GetUserDto`: assembles the user's
+    /// [`UserConfiguration`](hermit_model::configuration::UserConfiguration) and
+    /// [`UserPolicy`](hermit_model::users::UserPolicy) from the `Users` row plus
+    /// its `Permissions`/`Preferences`/`AccessSchedules`. `server_id` is the
+    /// hosting application's system id; `remote_endpoint` is accepted for parity
+    /// (the profile-image cache tag it feeds is not yet ported).
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError>;
+
     /// Updates a user's configuration (stopgap; prefer [`Self::update_user`]).
     async fn update_configuration(
         &self,
@@ -256,6 +521,27 @@ pub trait UserManager: Send + Sync {
 
     /// Clears a user's profile image.
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError>;
+
+    /// Gets a user's profile image (`ImageInfos` row), or `None` when the user
+    /// has no profile image set.
+    ///
+    /// Port of the `User.ProfileImage` accessor the image controller reads before
+    /// serving `GET /UserImage`. The returned [`ItemImageInfo`] carries the
+    /// stored path, last-modified time, and a [`ImageType::Profile`] type; width,
+    /// height, and blurhash are unknown for user images and left at their
+    /// defaults.
+    ///
+    /// [`ImageType::Profile`]: hermit_model::entities::ImageType::Profile
+    ///
+    /// The default is the no-image fallback ([`None`]), so impls without a
+    /// profile-image store compile unchanged; the concrete manager overrides it.
+    async fn get_profile_image(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<ItemImageInfo>, ServiceError> {
+        let _ = user_id;
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_user_manager(_: &dyn UserManager) {}
@@ -297,6 +583,28 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
         reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError>;
+
+    /// Marks an item as played for a user, returning the refreshed data DTO.
+    ///
+    /// Port of `BaseItem.MarkPlayed`: sets `Played`, resets the resume position,
+    /// stamps `LastPlayedDate` (defaulting to now), and — when `date_played` is
+    /// supplied — increments `PlayCount` (always at least one).
+    async fn mark_played(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError>;
+
+    /// Marks an item as unplayed for a user, returning the refreshed data DTO.
+    ///
+    /// Port of `BaseItem.MarkUnplayed` / `ResetPlayedState`: clears `Played`,
+    /// the play count, the resume position, and `LastPlayedDate`.
+    async fn mark_unplayed(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError>;
 
     /// Clears remembered audio/subtitle stream selections for a user/item pair.
     async fn reset_playback_stream_selections(

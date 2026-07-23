@@ -249,6 +249,28 @@ impl HermitTaskManager {
     }
 }
 
+/// Bridges the concrete registry onto the `hermit-traits` [`TaskManager`] seam
+/// the API layer depends on.
+///
+/// Delegates to the inherent [`list`](HermitTaskManager::list) /
+/// [`get`](HermitTaskManager::get) / [`run_now`](HermitTaskManager::run_now)
+/// methods; the read side is infallible here (an in-memory registry), so the
+/// `Result` wrappers always yield `Ok`.
+#[async_trait]
+impl hermit_traits::tasks::TaskManager for HermitTaskManager {
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(self.list())
+    }
+
+    async fn get_task(&self, task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        Ok(self.get(task_id))
+    }
+
+    async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.run_now(task_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -376,5 +398,57 @@ mod tests {
         mgr.run_now("counting").await.expect("run");
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn task_manager_trait_delegates() {
+        use hermit_traits::tasks::TaskManager;
+
+        let mgr = HermitTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(CountingTask {
+            runs: runs.clone(),
+            fail: false,
+            hidden: false,
+        }));
+
+        // `get_tasks` mirrors the inherent list.
+        let tasks = TaskManager::get_tasks(&mgr).await.expect("tasks");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id.as_deref(), Some("counting"));
+
+        // `get_task` hits / misses.
+        assert!(
+            TaskManager::get_task(&mgr, "counting")
+                .await
+                .expect("get")
+                .is_some()
+        );
+        assert!(
+            TaskManager::get_task(&mgr, "nope")
+                .await
+                .expect("get")
+                .is_none()
+        );
+
+        // `start_task` runs it and records a completed result.
+        TaskManager::start_task(&mgr, "counting")
+            .await
+            .expect("start");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let info = TaskManager::get_task(&mgr, "counting")
+            .await
+            .expect("get")
+            .expect("info");
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Completed
+        );
+
+        // Unknown key → NotFound.
+        assert!(matches!(
+            TaskManager::start_task(&mgr, "nope").await,
+            Err(ServiceError::NotFound(_))
+        ));
     }
 }

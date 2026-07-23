@@ -14,13 +14,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use hermit_db::Database;
-use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::ItemValueType;
 use hermit_model::data::{BaseItemKind, CollectionType};
+use hermit_model::entities::ImageType;
 use hermit_model::entities::MediaStreamType;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
+use hermit_traits::options::ItemImageInfo;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -205,6 +208,55 @@ const ALBUM_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::AlbumArtist];
 /// All artist-ish `ItemValues` types (C# `_getAllArtistsValueTypes`).
 const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueType::AlbumArtist];
 
+/// Maps the `BaseItemImageInfos.ImageType` integer discriminant to the wire
+/// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
+/// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
+/// [`ImageType::Primary`] (the C# default when parsing a legacy row).
+fn image_type_from_disc(disc: i32) -> ImageType {
+    match disc {
+        1 => ImageType::Art,
+        2 => ImageType::Backdrop,
+        3 => ImageType::Banner,
+        4 => ImageType::Logo,
+        5 => ImageType::Thumb,
+        6 => ImageType::Disc,
+        7 => ImageType::Box,
+        8 => ImageType::Screenshot,
+        9 => ImageType::Menu,
+        10 => ImageType::Chapter,
+        11 => ImageType::BoxRear,
+        12 => ImageType::Profile,
+        _ => ImageType::Primary,
+    }
+}
+
+/// Projects a persisted [`BaseItemImageInfoEntity`] row into an
+/// [`ItemImageInfo`].
+///
+/// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
+/// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
+/// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
+fn image_info_from_row(row: BaseItemImageInfoEntity) -> ItemImageInfo {
+    let blur_hash = row
+        .blurhash
+        .filter(|b| !b.is_empty())
+        .and_then(|b| String::from_utf8(b).ok());
+    ItemImageInfo {
+        path: row.path,
+        image_type: image_type_from_disc(row.image_type),
+        date_modified: row.date_modified.unwrap_or_else(default_epoch),
+        width: i32::try_from(row.width).unwrap_or(0),
+        height: i32::try_from(row.height).unwrap_or(0),
+        blur_hash,
+    }
+}
+
+/// The Unix epoch as a UTC timestamp — the placeholder for a row with no stored
+/// `DateModified` (C# leaves the `default(DateTime)`).
+fn default_epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
+}
+
 #[async_trait]
 impl ItemRepository for HermitItemRepository {
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -278,6 +330,39 @@ impl ItemRepository for HermitItemRepository {
                 .await
                 .map_err(db_err)?;
         Ok(exists.is_some())
+    }
+
+    async fn get_items_by_primary_version(
+        &self,
+        primary_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if primary_id.is_nil() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, BaseItemEntity>(
+            r#"SELECT * FROM "BaseItems" WHERE "PrimaryVersionId" = ?1 AND "Id" <> ?2"#,
+        )
+        .bind(primary_id.to_string())
+        .bind(PLACEHOLDER_ID)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
+        // Order by image type then id so a multi-image type (e.g. Backdrop) is
+        // returned in a stable order the index-based routes can address, matching
+        // the C# `BaseItem.ImageInfos` insertion order.
+        let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
+            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
+                ORDER BY "ImageType", "Id""#,
+        )
+        .bind(item_id.to_string())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(image_info_from_row).collect())
     }
 
     async fn get_genres(
@@ -523,6 +608,7 @@ mod tests {
         seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, test_db,
     };
     use hermit_db::Database;
+    use hermit_model::entities::ExtraType;
 
     fn repo(db: &Database) -> HermitItemRepository {
         HermitItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
@@ -557,6 +643,56 @@ mod tests {
             .expect("get_items");
         assert_eq!(res.total_record_count, 1);
         assert_eq!(res.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_image_infos_reads_rows_ordered_by_type() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9001);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Imaged").await;
+
+        // A Backdrop (type 2) and a Primary (type 0); the query orders by type so
+        // Primary comes back first regardless of insertion order.
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                VALUES (?1, ?2, NULL, 1080, 2, ?3, '/backdrop.jpg', 1920)"#,
+        )
+        .bind(Uuid::from_u128(0x9101).to_string())
+        .bind("LKO2".as_bytes().to_vec())
+        .bind(item.to_string())
+        .execute(db.pool())
+        .await
+        .expect("insert backdrop");
+
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                VALUES (?1, NULL, NULL, 0, 0, ?2, '/poster.jpg', 0)"#,
+        )
+        .bind(Uuid::from_u128(0x9102).to_string())
+        .bind(item.to_string())
+        .execute(db.pool())
+        .await
+        .expect("insert primary");
+
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].image_type, ImageType::Primary);
+        assert_eq!(images[0].path, "/poster.jpg");
+        assert!(images[0].blur_hash.is_none());
+        assert_eq!(images[1].image_type, ImageType::Backdrop);
+        assert_eq!(images[1].path, "/backdrop.jpg");
+        assert_eq!(images[1].width, 1920);
+        assert_eq!(images[1].blur_hash.as_deref(), Some("LKO2"));
+
+        // An item with no images yields an empty list.
+        let none = repository
+            .get_image_infos(Uuid::from_u128(0xDEAD))
+            .await
+            .expect("no images");
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
@@ -827,5 +963,116 @@ mod tests {
             .await
             .expect("latest books");
         assert!(books.is_empty());
+    }
+
+    #[tokio::test]
+    async fn extra_types_filter_matches_stored_discriminant() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        // Two extras owned by a movie: one trailer, one behind-the-scenes.
+        let owner = Uuid::from_u128(0xE000);
+        seed_item(&db, owner, BaseItemKind::Movie).await;
+        let trailer = Uuid::from_u128(0xE001);
+        seed_named_item(&db, trailer, BaseItemKind::Trailer, "T").await;
+        let behind = Uuid::from_u128(0xE002);
+        seed_named_item(&db, behind, BaseItemKind::Video, "B").await;
+        for (id, extra) in [
+            (trailer, ExtraType::Trailer),
+            (behind, ExtraType::BehindTheScenes),
+        ] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "ExtraType" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(id.to_string())
+            .bind(owner.to_string())
+            .bind(extra as i32)
+            .execute(db.pool())
+            .await
+            .expect("set extra");
+        }
+
+        // Filtering to Trailer extras owned by `owner` returns only the trailer.
+        let query = InternalItemsQuery {
+            owner_ids: vec![owner],
+            extra_types: vec![ExtraType::Trailer],
+            ..InternalItemsQuery::default()
+        };
+        let res = repository.get_item_list(&query).await.expect("extras");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, trailer.to_string());
+
+        // Both display extras (Trailer + BehindTheScenes) return both.
+        let query = InternalItemsQuery {
+            owner_ids: vec![owner],
+            extra_types: vec![ExtraType::Trailer, ExtraType::BehindTheScenes],
+            ..InternalItemsQuery::default()
+        };
+        let res = repository.get_item_list(&query).await.expect("extras");
+        assert_eq!(res.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn is_resumable_filters_on_in_progress_position() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        let user = seed_user(&db, Uuid::from_u128(0xF00D)).await;
+        let resumable = Uuid::from_u128(0xF001);
+        seed_item(&db, resumable, BaseItemKind::Movie).await;
+        let not_resumable = Uuid::from_u128(0xF002);
+        seed_item(&db, not_resumable, BaseItemKind::Movie).await;
+
+        // A user-data row with a non-zero position marks the first item resumable.
+        seed_user_data(&db, Uuid::from_u128(0xF00D), resumable, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "PlaybackPositionTicks" = 5000 WHERE "ItemId" = ?1"#)
+            .bind(resumable.to_string())
+            .execute(db.pool())
+            .await
+            .expect("set position");
+
+        let query = InternalItemsQuery {
+            user: Some(user),
+            is_resumable: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        let res = repository.get_item_list(&query).await.expect("resumable");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, resumable.to_string());
+    }
+
+    #[tokio::test]
+    async fn get_items_by_primary_version_returns_alternates_only() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let primary = Uuid::from_u128(0x0B01);
+        let alt = Uuid::from_u128(0x0B02);
+        let unrelated = Uuid::from_u128(0x0B03);
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, alt, BaseItemKind::Movie).await;
+        seed_item(&db, unrelated, BaseItemKind::Movie).await;
+        // Only `alt` points at `primary`.
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(primary.to_string())
+            .bind(alt.to_string())
+            .execute(db.pool())
+            .await
+            .expect("link alternate");
+
+        let rows = repository
+            .get_items_by_primary_version(primary)
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, alt.to_string());
+
+        // A nil primary short-circuits to empty without hitting the pool.
+        assert!(
+            repository
+                .get_items_by_primary_version(Uuid::nil())
+                .await
+                .expect("nil")
+                .is_empty()
+        );
     }
 }

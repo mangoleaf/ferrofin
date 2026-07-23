@@ -1,0 +1,90 @@
+//! `AudioController` + `UniversalAudioController` — direct audio stream serving.
+//!
+//! Ports the direct-play (static) slice of the two audio streaming controllers:
+//! - `GET`/`HEAD /Audio/{itemId}/stream`
+//! - `GET`/`HEAD /Audio/{itemId}/stream.{container}`
+//! - `GET`/`HEAD /Audio/{itemId}/universal`
+//!
+//! Each resolves the item's static
+//! [`MediaSourceInfo`](hermit_model::dto::MediaSourceInfo) and serves its on-disk
+//! file via the shared [`streaming`](crate::handlers::streaming) helpers (Range /
+//! `HEAD` / `206` / `404`).
+//!
+//! `UniversalAudioController.GetUniversalAudioStream` first resolves playback info
+//! and, when the chosen source supports direct stream (`isStatic`), serves the
+//! original file progressively; only when transcoding is required does it fall
+//! back to HLS. Hermit's static sources always report `supports_direct_stream`, so
+//! the direct-serve branch is taken here. The remote-redirect (`302`) and HLS
+//! branches, plus the full transcoding parameter set, are deferred (no ffmpeg
+//! runner) and are not exercised by this port.
+
+use axum::Router;
+use axum::extract::{Path, Request, State};
+use axum::response::Response;
+use axum::routing::get;
+use uuid::Uuid;
+
+use crate::auth::RequireAuth;
+use crate::error::ApiError;
+use crate::handlers::streaming::{serve_static_file, stream_path};
+use crate::state::AppState;
+
+/// `GET`/`HEAD /Audio/{itemId}/stream` — serve the item's audio file.
+///
+/// Port of `AudioController.GetAudioStream` (direct-stream path only). Range
+/// requests yield `206 Partial Content`; `HEAD` returns headers only.
+async fn get_audio_stream(
+    State(state): State<AppState>,
+    Path(item_id): Path<Uuid>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let path = stream_path(&state, item_id).await?;
+    serve_static_file(&path, request).await
+}
+
+/// `GET`/`HEAD /Audio/{itemId}/stream.{container}` — serve the item's audio file.
+///
+/// Port of `AudioController.GetAudioStreamByContainer` (which delegates to
+/// `GetAudioStream`). After axum path normalization the `stream.{container}`
+/// segment is captured as a single `{container}` parameter; the captured value is
+/// the requested container hint and is ignored for the direct-stream slice.
+async fn get_audio_stream_by_container(
+    State(state): State<AppState>,
+    Path((item_id, _container)): Path<(Uuid, String)>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let path = stream_path(&state, item_id).await?;
+    serve_static_file(&path, request).await
+}
+
+/// `GET`/`HEAD /Audio/{itemId}/universal` — serve the item's audio file.
+///
+/// Port of `UniversalAudioController.GetUniversalAudioStream`, direct-play branch:
+/// the resolved source supports direct stream, so the original file is served
+/// progressively (Range/`HEAD`). Requires authentication (`[Authorize]`).
+async fn get_universal_audio_stream(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(item_id): Path<Uuid>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let path = stream_path(&state, item_id).await?;
+    serve_static_file(&path, request).await
+}
+
+/// Registers this controller's real routes onto `router`.
+pub fn register(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route(
+            "/Audio/{itemId}/stream",
+            get(get_audio_stream).head(get_audio_stream),
+        )
+        .route(
+            "/Audio/{itemId}/{container}",
+            get(get_audio_stream_by_container).head(get_audio_stream_by_container),
+        )
+        .route(
+            "/Audio/{itemId}/universal",
+            get(get_universal_audio_stream).head(get_universal_audio_stream),
+        )
+}

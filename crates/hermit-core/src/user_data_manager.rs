@@ -339,6 +339,57 @@ impl UserDataManager for HermitUserDataManager {
         Ok(played_to_completion)
     }
 
+    async fn mark_played(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        // Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`.
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        // A supplied date is a fresh play → increment the count.
+        if date_played.is_some() {
+            row.play_count += 1;
+        }
+        // Ensure it is at least one.
+        row.play_count = row.play_count.max(1);
+        // `resetPosition` is always true from the controller.
+        row.playback_position_ticks = 0;
+        row.last_played_date = Some(
+            date_played
+                .or(row.last_played_date)
+                .unwrap_or_else(chrono::Utc::now),
+        );
+        row.played = true;
+
+        self.upsert_row(&row).await?;
+        Ok(to_dto(&row, item_id))
+    }
+
+    async fn mark_unplayed(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        // Port of `BaseItem.MarkUnplayed` → `ResetPlayedState`.
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        row.play_count = 0;
+        row.playback_position_ticks = 0;
+        row.last_played_date = None;
+        row.played = false;
+
+        self.upsert_row(&row).await?;
+        Ok(to_dto(&row, item_id))
+    }
+
     async fn reset_playback_stream_selections(
         &self,
         user_id: Uuid,
@@ -383,6 +434,19 @@ mod tests {
         async fn update_configuration(
             &self,
             _configuration: &ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn get_branding(
+            &self,
+        ) -> Result<hermit_model::branding::BrandingOptions, ServiceError> {
+            Ok(hermit_model::branding::BrandingOptions::default())
+        }
+
+        async fn update_branding(
+            &self,
+            _branding: &hermit_model::branding::BrandingOptions,
         ) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -523,5 +587,76 @@ mod tests {
         let cleared = mgr.read_row(item, user).await.expect("read").expect("some");
         assert_eq!(cleared.audio_stream_index, None);
         assert_eq!(cleared.subtitle_stream_index, None);
+    }
+
+    #[tokio::test]
+    async fn mark_played_sets_played_and_increments_count() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        // Seed a resume position so we can prove it is reset.
+        mgr.save_user_data(
+            user,
+            item,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(500),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed");
+
+        let when = chrono::Utc::now();
+        let dto = mgr.mark_played(user, item, Some(when)).await.expect("mark");
+        assert!(dto.played);
+        assert_eq!(dto.play_count, 1);
+        assert_eq!(dto.playback_position_ticks, 0);
+        assert_eq!(dto.last_played_date, Some(when));
+
+        // A second play with a date increments the count again.
+        let dto = mgr
+            .mark_played(user, item, Some(chrono::Utc::now()))
+            .await
+            .expect("mark");
+        assert_eq!(dto.play_count, 2);
+    }
+
+    #[tokio::test]
+    async fn mark_played_without_date_keeps_count_at_least_one() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        let dto = mgr.mark_played(user, item, None).await.expect("mark");
+        assert!(dto.played);
+        assert_eq!(dto.play_count, 1);
+        assert!(dto.last_played_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn mark_unplayed_resets_play_state() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        mgr.mark_played(user, item, Some(chrono::Utc::now()))
+            .await
+            .expect("mark played");
+
+        let dto = mgr.mark_unplayed(user, item).await.expect("mark unplayed");
+        assert!(!dto.played);
+        assert_eq!(dto.play_count, 0);
+        assert_eq!(dto.playback_position_ticks, 0);
+        assert_eq!(dto.last_played_date, None);
     }
 }

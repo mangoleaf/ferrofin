@@ -897,7 +897,7 @@ impl Default for EncodingOptions {
 
 /// The server configuration. Flattens the C# base
 /// `BaseApplicationConfiguration`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfiguration {
@@ -1085,4 +1085,246 @@ pub struct ServerConfiguration {
 
     /// Gets or sets a value indicating whether legacy authorization is enabled.
     pub enable_legacy_authorization: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_defaults_match_csharp() {
+        assert_eq!(
+            ImageSavingConvention::default(),
+            ImageSavingConvention::Legacy
+        );
+        assert_eq!(
+            HlsAudioSeekStrategy::default(),
+            HlsAudioSeekStrategy::TrimCopiedAudio
+        );
+        assert_eq!(
+            TrickplayScanBehavior::default(),
+            TrickplayScanBehavior::NonBlocking
+        );
+        assert_eq!(
+            ProcessPriorityClass::default(),
+            ProcessPriorityClass::BelowNormal
+        );
+        assert_eq!(
+            MetadataPluginType::default(),
+            MetadataPluginType::LocalImageProvider
+        );
+        assert_eq!(
+            EmbeddedSubtitleOptions::default(),
+            EmbeddedSubtitleOptions::AllowAll
+        );
+        assert_eq!(
+            SubtitlePlaybackMode::default(),
+            SubtitlePlaybackMode::Default
+        );
+    }
+
+    #[test]
+    fn enum_wire_names_are_pascal_case() {
+        assert_eq!(
+            serde_json::to_value(ProcessPriorityClass::RealTime).unwrap(),
+            "RealTime"
+        );
+        assert_eq!(
+            serde_json::to_value(EmbeddedSubtitleOptions::AllowNone).unwrap(),
+            "AllowNone"
+        );
+        assert_eq!(
+            serde_json::to_value(SubtitlePlaybackMode::OnlyForced).unwrap(),
+            "OnlyForced"
+        );
+        assert_eq!(
+            serde_json::to_value(MetadataPluginType::MediaSegmentProvider).unwrap(),
+            "MediaSegmentProvider"
+        );
+    }
+
+    #[test]
+    fn image_option_default_and_type_rename() {
+        let opt = ImageOption::default();
+        assert_eq!(opt.limit, 1);
+        assert_eq!(opt.min_width, 0);
+        let json = serde_json::to_value(opt).unwrap();
+        // `type_` is renamed to `Type` on the wire.
+        assert!(json.get("Type").is_some());
+        assert_eq!(json["Limit"], 1);
+        assert_eq!(json["MinWidth"], 0);
+    }
+
+    #[test]
+    fn metadata_configuration_default_is_true() {
+        let cfg = MetadataConfiguration::default();
+        assert!(cfg.use_file_creation_time_for_date_added);
+        let json = serde_json::to_value(cfg).unwrap();
+        assert_eq!(json["UseFileCreationTimeForDateAdded"], true);
+    }
+
+    #[test]
+    fn xbmc_metadata_options_default() {
+        let opts = XbmcMetadataOptions::default();
+        assert_eq!(opts.release_date_format, "yyyy-MM-dd");
+        assert!(opts.save_image_paths_in_nfo);
+        assert!(opts.enable_path_substitution);
+        assert!(!opts.enable_extra_thumbs_duplication);
+        let json = serde_json::to_value(&opts).unwrap();
+        // Explicit rename check.
+        assert_eq!(json["SaveImagePathsInNfo"], true);
+        assert!(json.get("UserId").is_none());
+    }
+
+    #[test]
+    fn user_configuration_default_matches_csharp() {
+        let cfg = UserConfiguration::default();
+        assert!(cfg.play_default_audio_track);
+        assert!(!cfg.display_missing_episodes);
+        assert!(cfg.hide_played_in_latest);
+        assert!(cfg.remember_audio_selections);
+        assert!(cfg.remember_subtitle_selections);
+        assert!(cfg.enable_next_episode_auto_play);
+        assert_eq!(cfg.subtitle_mode, SubtitlePlaybackMode::Default);
+        assert!(cfg.grouped_folders.is_empty());
+    }
+
+    #[test]
+    fn user_configuration_round_trips() {
+        let cfg = UserConfiguration {
+            audio_language_preference: Some("eng".to_owned()),
+            grouped_folders: vec![Uuid::from_u128(3)],
+            cast_receiver_id: Some("cast".to_owned()),
+            ..UserConfiguration::default()
+        };
+        let back: UserConfiguration =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["AudioLanguagePreference"], "eng");
+        assert_eq!(json["PlayDefaultAudioTrack"], true);
+    }
+
+    #[test]
+    fn trickplay_options_default() {
+        let opts = TrickplayOptions::default();
+        assert_eq!(opts.interval, 10_000);
+        assert_eq!(opts.width_resolutions, vec![320]);
+        assert_eq!(opts.tile_width, 10);
+        assert_eq!(opts.tile_height, 10);
+        assert_eq!(opts.qscale, 4);
+        assert_eq!(opts.jpeg_quality, 90);
+        assert_eq!(opts.process_threads, 1);
+        assert_eq!(opts.scan_behavior, TrickplayScanBehavior::NonBlocking);
+        assert_eq!(opts.process_priority, ProcessPriorityClass::BelowNormal);
+    }
+
+    #[test]
+    fn library_options_default_matches_csharp() {
+        #[allow(deprecated)]
+        let opts = LibraryOptions::default();
+        assert!(opts.enabled);
+        assert!(opts.enable_photos);
+        assert_eq!(opts.season_zero_display_name, "Specials");
+        assert!(opts.skip_subtitles_if_audio_track_matches);
+        assert!(opts.require_perfect_subtitle_match);
+        assert!(opts.save_subtitles_with_media);
+        assert_eq!(
+            opts.custom_tag_delimiters,
+            vec![
+                "/".to_owned(),
+                "|".to_owned(),
+                ";".to_owned(),
+                "\\".to_owned()
+            ]
+        );
+        assert_eq!(
+            opts.allow_embedded_subtitles,
+            EmbeddedSubtitleOptions::AllowAll
+        );
+    }
+
+    #[test]
+    fn library_options_round_trips() {
+        let opts = LibraryOptions::default();
+        let back: LibraryOptions =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(opts, back);
+    }
+
+    #[test]
+    fn library_options_wire_renames() {
+        let opts = LibraryOptions::default();
+        let json = serde_json::to_value(&opts).unwrap();
+        assert_eq!(json["EnableLUFSScan"], false);
+        assert_eq!(json["Enabled"], true);
+    }
+
+    #[test]
+    fn encoding_options_default_matches_csharp() {
+        let opts = EncodingOptions::default();
+        assert_eq!(opts.encoding_thread_count, -1);
+        assert!((opts.down_mix_audio_boost - 2.0).abs() < f64::EPSILON);
+        assert_eq!(opts.max_muxing_queue_size, 2048);
+        assert_eq!(opts.throttle_delay_seconds, 180);
+        assert_eq!(opts.segment_keep_seconds, 720);
+        assert_eq!(opts.h264_crf, 23);
+        assert_eq!(opts.h265_crf, 28);
+        assert_eq!(opts.vaapi_device.as_deref(), Some("/dev/dri/renderD128"));
+        assert_eq!(opts.hardware_decoding_codecs, vec!["h264", "vc1"]);
+        assert_eq!(
+            opts.allow_on_demand_metadata_based_keyframe_extraction_for_extensions,
+            vec!["mkv"]
+        );
+    }
+
+    #[test]
+    fn encoding_options_round_trips_and_renames() {
+        let opts = EncodingOptions::default();
+        let json = serde_json::to_value(&opts).unwrap();
+        assert_eq!(json["H264Crf"], 23);
+        assert_eq!(json["H265Crf"], 28);
+        assert_eq!(json["EnableDecodingColorDepth10Hevc"], true);
+        assert_eq!(json["AllowAv1Encoding"], false);
+        let back: EncodingOptions = serde_json::from_value(json).unwrap();
+        assert_eq!(opts, back);
+    }
+
+    #[test]
+    fn server_configuration_default_and_round_trips() {
+        let cfg = ServerConfiguration::default();
+        let json = serde_json::to_value(cfg.clone()).unwrap();
+        // A renamed field is exercised.
+        assert!(json.get("UICulture").is_some());
+        let back: ServerConfiguration = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn small_structs_round_trip() {
+        let mpi = MediaPathInfo {
+            path: "/x".to_owned(),
+        };
+        assert_eq!(
+            serde_json::from_str::<MediaPathInfo>(&serde_json::to_string(&mpi).unwrap()).unwrap(),
+            mpi
+        );
+        assert_eq!(serde_json::to_value(&mpi).unwrap()["Path"], "/x");
+
+        let ps = PathSubstitution {
+            from: "/a".to_owned(),
+            to: "/b".to_owned(),
+        };
+        let json = serde_json::to_value(&ps).unwrap();
+        assert_eq!(json["From"], "/a");
+        assert_eq!(json["To"], "/b");
+
+        let plugin = MetadataPlugin {
+            name: Some("nfo".to_owned()),
+            type_: MetadataPluginType::MetadataSaver,
+        };
+        let json = serde_json::to_value(&plugin).unwrap();
+        assert_eq!(json["Name"], "nfo");
+        assert_eq!(json["Type"], "MetadataSaver");
+    }
 }

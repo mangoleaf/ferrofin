@@ -345,6 +345,14 @@ mod tests {
         ) -> Result<Option<String>, ServiceError> {
             Ok(None)
         }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
     }
 
     #[async_trait]

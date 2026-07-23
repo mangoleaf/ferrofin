@@ -273,6 +273,21 @@ fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Internal
         push_in_list(qb, r#"bi."OwnerId""#, &to_guid_strings(&filter.owner_ids));
     }
 
+    // ExtraTypes: restrict to items whose stored `ExtraType` discriminant is one
+    // of the requested extra types. C# `BaseItemRepository.TranslateQuery` casts
+    // each `ExtraType` to its integer value and matches `e.ExtraType`; the
+    // discriminants are stored verbatim as `INTEGER` here, so the cast is the
+    // enum's `i32` value (`ExtraType::Trailer as i32`, …).
+    if !filter.extra_types.is_empty() {
+        qb.push(r#" AND bi."ExtraType" IS NOT NULL AND "#);
+        let values: Vec<i64> = filter
+            .extra_types
+            .iter()
+            .map(|e| i64::from(*e as i32))
+            .collect();
+        push_in_list(qb, r#"bi."ExtraType""#, &values);
+    }
+
     append_provider_predicates(qb, filter);
 
     if !filter.years.is_empty() {
@@ -542,6 +557,16 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
     }
     if let Some(want) = filter.is_played {
         push_user_data_exists(qb, &uid, r#"ud."Played" = 1"#, want);
+    }
+    if let Some(want) = filter.is_resumable {
+        // A resumable item is one with an in-progress user-data row
+        // (`PlaybackPositionTicks > 0`). C#
+        // `BaseItemRepository.TranslateQuery` also has a series-aggregation
+        // branch (a series is resumable when it has an in-progress or a
+        // partially-watched episode); that aggregation needs the series/episode
+        // walk and is deferred with the other series/box-set aggregation, so this
+        // covers the direct per-item case (C# `else` branch).
+        push_user_data_exists(qb, &uid, r#"ud."PlaybackPositionTicks" > 0"#, want);
     }
 }
 

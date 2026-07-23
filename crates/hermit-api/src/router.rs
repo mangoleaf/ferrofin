@@ -105,14 +105,14 @@ mod tests {
     #[tokio::test]
     async fn stubbed_route_returns_501_not_404() {
         // A contract route with no ported handler still returns `501` (not
-        // `404`). `/System/Info/Storage` is registered but unimplemented, so it
-        // exercises the shared stub even though its sibling `/System/Info` now
-        // has a real handler.
+        // `404`). `/Branding/Splashscreen` is a deferred (image-generation)
+        // route registered on the shared stub, even though its sibling
+        // `/Branding/Configuration` now has a real handler.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/System/Info/Storage")
+                    .uri("/Branding/Splashscreen")
                     .body(Body::empty())
                     .unwrap(),
             )

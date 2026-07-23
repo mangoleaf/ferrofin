@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use hermit_model::entities_media::{ParentalRating, ParentalRatingScore};
-use hermit_model::globalization::{CountryInfo, CultureDto};
+use hermit_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
 
 /// The server default culture, used when no country/culture is supplied.
 const DEFAULT_METADATA_COUNTRY_CODE: &str = "US";
@@ -295,6 +295,40 @@ impl LocalizationManager {
             .collect()
     }
 
+    /// The available UI-language localization options (C# `GetLocalizationOptions`).
+    ///
+    /// Jellyfin derives this from the embedded translation-catalog resource files;
+    /// that catalog is a `hermit-server` asset that this minimal port omits, so
+    /// the list is built from the embedded culture dataset's display names
+    /// (truncated at the first delimiter), always including the base `en-US`
+    /// entry the C# adds explicitly.
+    #[must_use]
+    pub fn get_localization_options(&self) -> Vec<LocalizationOption> {
+        let mut options = vec![LocalizationOption {
+            name: "English".to_owned(),
+            value: "en-US".to_owned(),
+        }];
+        for culture in &self.cultures {
+            if culture.two_letter_iso_language_name.is_empty()
+                || culture.two_letter_iso_language_name == "en"
+            {
+                continue;
+            }
+            let name = culture
+                .display_name
+                .split([';', ','])
+                .next()
+                .unwrap_or(&culture.display_name)
+                .trim()
+                .to_owned();
+            options.push(LocalizationOption {
+                name,
+                value: culture.two_letter_iso_language_name.clone(),
+            });
+        }
+        options
+    }
+
     /// Finds the culture matching a language token by display name, name,
     /// three-letter code, or two-letter code (C# `FindLanguageInfo`).
     #[must_use]
@@ -496,6 +530,32 @@ impl LocalizationManager {
 /// Parses a rating as a number, allowing a trailing `+` (C# `TryParseRatingAsScore`).
 fn parse_rating_as_score(rating: &str) -> Option<i32> {
     rating.trim_end_matches('+').parse::<i32>().ok()
+}
+
+impl hermit_traits::localization::LocalizationManager for LocalizationManager {
+    fn get_cultures(&self) -> Vec<CultureDto> {
+        self.cultures.clone()
+    }
+
+    fn get_countries(&self) -> Vec<CountryInfo> {
+        LocalizationManager::get_countries(self)
+    }
+
+    fn get_parental_ratings(&self) -> Vec<ParentalRating> {
+        LocalizationManager::get_parental_ratings(self)
+    }
+
+    fn get_localization_options(&self) -> Vec<LocalizationOption> {
+        LocalizationManager::get_localization_options(self)
+    }
+
+    fn get_rating_score(
+        &self,
+        rating: &str,
+        country_code: Option<&str>,
+    ) -> Option<ParentalRatingScore> {
+        LocalizationManager::get_rating_score(self, rating, country_code)
+    }
 }
 
 #[cfg(test)]

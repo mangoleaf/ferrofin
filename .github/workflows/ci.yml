@@ -39,14 +39,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pkgs=()
+          # Gate EACH crate independently: `-p a -p b --fail-under-lines` checks the
+          # MERGED total, which lets a sub-80% crate hide behind a stronger sibling.
+          # Line coverage only — branch coverage (-Z coverage-options=branch) is nightly-only; we pin stable.
+          fail=0
           while read -r crate; do
             [ -z "$crate" ] && continue
             case "$crate" in \#*) continue ;; esac
-            pkgs+=(-p "$crate")
+            echo "── coverage: $crate ──"
+            cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only || fail=1
           done < .port/gated-crates.txt
-          if [ ${#pkgs[@]} -eq 0 ]; then
-            echo "no crates gated yet — skipping"; exit 0
-          fi
-          # line coverage only — branch coverage (-Z coverage-options=branch) is nightly-only; we pin stable
-          cargo llvm-cov nextest --fail-under-lines 80 "${pkgs[@]}"
+          exit $fail

@@ -136,6 +136,10 @@
 //!   (no plugins installed);
 //! - [`lyric_manager`] — [`HermitLyricManager`]
 //!   ([`hermit_traits::stubs::LyricManager`]), empty lyrics;
+//! - [`subtitle_manager`] — [`HermitSubtitleManager`]
+//!   ([`hermit_traits::subtitles::SubtitleManager`]), the portable
+//!   stored-external-subtitle slice (delete a stream + its sidecar); the
+//!   provider fan-out (search/download/upload) is a documented deferral;
 //! - [`live_tv_manager`] — [`HermitLiveTvManager`]
 //!   ([`hermit_traits::stubs::LiveTvManager`]), a **placeholder** for the real
 //!   `hermit-livetv` impl injected at Wave 8 (this crate must not depend on
@@ -148,6 +152,8 @@
 //!   a future scheduler wave. `FullSystemBackup`/`BackupService` is deferred
 //!   entirely.
 
+pub mod activity_manager;
+pub mod api_key_manager;
 pub mod app_paths;
 pub mod application_host;
 pub mod auth_providers;
@@ -164,6 +170,7 @@ pub mod display_preferences_manager;
 pub mod dto_service;
 pub mod event_manager;
 pub mod external_data_manager;
+pub mod file_system;
 pub mod item_count_service;
 pub mod item_persistence_service;
 pub mod item_repository;
@@ -192,6 +199,7 @@ pub mod search_manager;
 pub mod session_manager;
 pub mod session_websocket_listener;
 pub mod similar_items_manager;
+pub mod subtitle_manager;
 pub mod sync_play_manager;
 pub mod system_manager;
 pub mod text_util;
@@ -206,6 +214,8 @@ pub mod user_view_manager;
 #[cfg(test)]
 mod test_support;
 
+pub use activity_manager::HermitActivityManager;
+pub use api_key_manager::HermitApiKeyManager;
 pub use app_paths::HermitServerApplicationPaths;
 pub use application_host::{HermitServerApplicationHost, HostNetworkInfo};
 pub use auth_providers::{DefaultAuthenticationProvider, InvalidAuthProvider};
@@ -221,6 +231,7 @@ pub use display_preferences_manager::HermitDisplayPreferencesManager;
 pub use dto_service::HermitDtoService;
 pub use event_manager::{EventConsumer, HermitEventManager};
 pub use external_data_manager::HermitExternalDataManager;
+pub use file_system::HermitFileSystem;
 pub use item_count_service::HermitItemCountService;
 pub use item_persistence_service::HermitItemPersistenceService;
 pub use item_repository::HermitItemRepository;
@@ -247,6 +258,7 @@ pub use search_manager::HermitSearchManager;
 pub use session_manager::HermitSessionManager;
 pub use session_websocket_listener::{HermitSessionWebSocketListener, HermitWebSocketManager};
 pub use similar_items_manager::HermitSimilarItemsManager;
+pub use subtitle_manager::HermitSubtitleManager;
 pub use sync_play_manager::HermitSyncPlayManager;
 pub use system_manager::HermitSystemManager;
 pub use trickplay_manager::HermitTrickplayManager;

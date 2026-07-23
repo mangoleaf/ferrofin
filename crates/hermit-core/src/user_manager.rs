@@ -19,8 +19,10 @@
 //!   yet), so the C# "remote access disabled and caller not on the LAN" check is
 //!   omitted; the disabled-account, lockout, and parental-schedule checks are
 //!   preserved.
-//! - `get_user_dto` is not ported (the `UserDto` assembly belongs to
-//!   `DtoService`); the trait exposes rows, not DTOs.
+//! - `get_user_dto` assembles the full [`UserDto`](hermit_model::dto::UserDto)
+//!   (policy + configuration) from the `Users` row and its
+//!   `Permissions`/`Preferences`/`AccessSchedules`. The C# profile-image cache
+//!   tag is not yet ported, so `PrimaryImageTag` is left unset.
 //! - `update_policy` persists the flat `Users` columns and reflects the two
 //!   load-bearing permission flags into `Permissions`; the broader
 //!   folder/channel/schedule policy mapping is a flagged follow-up.
@@ -31,9 +33,10 @@ use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::{PermissionKind, PreferenceKind};
-use hermit_model::configuration::UserConfiguration;
-use hermit_model::dto::NameIdPair;
-use hermit_model::users::UserPolicy;
+use hermit_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
+use hermit_model::data::UnratedItem;
+use hermit_model::dto::{NameIdPair, UserDto};
+use hermit_model::users::{AccessSchedule, DynamicDayOfWeek, SyncPlayUserAccessType, UserPolicy};
 use sqlx::Sqlite;
 use uuid::Uuid;
 
@@ -47,8 +50,8 @@ use crate::auth_providers::{
 };
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
-    has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
-    set_preference,
+    get_preference, has_permission, is_parental_schedule_allowed, seed_defaults, set_permission,
+    set_permission_tx, set_preference,
 };
 
 /// The C# type name of the default password-reset provider, stored on
@@ -667,6 +670,61 @@ impl UserManager for HermitUserManager {
         }])
     }
 
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        let id = &user.id;
+        let pool = self.db.pool();
+
+        // Config-only list-valued preferences → the DTO's Guid collections.
+        let ordered_views = guid_preference(pool, id, PreferenceKind::OrderedViews).await?;
+        let grouped_folders = guid_preference(pool, id, PreferenceKind::GroupedFolders).await?;
+        let my_media_excludes = guid_preference(pool, id, PreferenceKind::MyMediaExcludes).await?;
+        let latest_items_excludes =
+            guid_preference(pool, id, PreferenceKind::LatestItemExcludes).await?;
+
+        let configuration = UserConfiguration {
+            subtitle_mode: subtitle_mode_from_i32(user.subtitle_mode),
+            hide_played_in_latest: user.hide_played_in_latest,
+            enable_local_password: user.enable_local_password,
+            play_default_audio_track: user.play_default_audio_track,
+            display_collections_view: user.display_collections_view,
+            display_missing_episodes: user.display_missing_episodes,
+            audio_language_preference: user.audio_language_preference.clone(),
+            remember_audio_selections: user.remember_audio_selections,
+            enable_next_episode_auto_play: user.enable_next_episode_auto_play,
+            remember_subtitle_selections: user.remember_subtitle_selections,
+            subtitle_language_preference: Some(
+                user.subtitle_language_preference
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+            ordered_views,
+            grouped_folders,
+            my_media_excludes,
+            latest_items_excludes,
+            cast_receiver_id: user.cast_receiver_id.clone(),
+        };
+
+        let policy = build_user_policy(pool, user).await?;
+
+        Ok(UserDto {
+            name: Some(user.username.clone()),
+            id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil()),
+            server_id,
+            enable_auto_login: Some(user.enable_auto_login),
+            last_login_date: user.last_login_date,
+            last_activity_date: user.last_activity_date,
+            has_password: Some(user.password.is_some()),
+            has_configured_password: Some(user.password.is_some()),
+            configuration: Some(configuration),
+            policy: Some(policy),
+            ..UserDto::default()
+        })
+    }
+
     async fn update_configuration(
         &self,
         user_id: Uuid,
@@ -796,6 +854,149 @@ impl UserManager for HermitUserManager {
             .map_err(db_err)?;
         Ok(())
     }
+
+    async fn get_profile_image(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<hermit_traits::options::ItemImageInfo>, ServiceError> {
+        let row = sqlx::query_as::<_, hermit_db::entities::users::ImageInfoEntity>(
+            r#"SELECT * FROM "ImageInfos" WHERE "UserId" = ?1 LIMIT 1"#,
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| hermit_traits::options::ItemImageInfo {
+            path: r.path,
+            image_type: hermit_model::entities::ImageType::Profile,
+            date_modified: r.last_modified,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }))
+    }
+}
+
+/// Assembles a user's [`UserPolicy`] from the `Users` row plus its
+/// `Permissions`/`Preferences`/`AccessSchedules` (the policy half of C#
+/// `GetUserDto`). Extracted from `get_user_dto` so that method stays small.
+///
+/// The length is inherent: [`UserPolicy`] is a wide, flat 1:1 projection of many
+/// permission flags, and a single struct literal reads best (splitting it would
+/// only scatter the mapping), so the line-count lint is allowed here.
+#[allow(clippy::too_many_lines)]
+async fn build_user_policy(
+    pool: &sqlx::sqlite::SqlitePool,
+    user: &UserEntity,
+) -> Result<UserPolicy, ServiceError> {
+    let id = &user.id;
+
+    let blocked_tags = get_preference(pool, id, PreferenceKind::BlockedTags).await?;
+    let allowed_tags = get_preference(pool, id, PreferenceKind::AllowedTags).await?;
+    let enabled_channels = guid_preference(pool, id, PreferenceKind::EnabledChannels).await?;
+    let enabled_devices = get_preference(pool, id, PreferenceKind::EnabledDevices).await?;
+    let enabled_folders = guid_preference(pool, id, PreferenceKind::EnabledFolders).await?;
+    let content_deletion_folders =
+        get_preference(pool, id, PreferenceKind::EnableContentDeletionFromFolders).await?;
+    let blocked_channels = guid_preference(pool, id, PreferenceKind::BlockedChannels).await?;
+    let blocked_media_folders =
+        guid_preference(pool, id, PreferenceKind::BlockedMediaFolders).await?;
+    let block_unrated_items = unrated_preference(pool, id).await?;
+
+    Ok(UserPolicy {
+        max_parental_rating: user.max_parental_rating_score.map(cast_i32),
+        max_parental_sub_rating: user.max_parental_rating_sub_score.map(cast_i32),
+        enable_user_preference_access: user.enable_user_preference_access,
+        remote_client_bitrate_limit: user.remote_client_bitrate_limit.map_or(0, cast_i32),
+        authentication_provider_id: user.authentication_provider_id.clone(),
+        password_reset_provider_id: user.password_reset_provider_id.clone(),
+        invalid_login_attempt_count: cast_i32(user.invalid_login_attempt_count),
+        login_attempts_before_lockout: user.login_attempts_before_lockout.map_or(-1, cast_i32),
+        max_active_sessions: cast_i32(user.max_active_sessions),
+        is_administrator: has_permission(pool, id, PermissionKind::IsAdministrator).await?,
+        is_hidden: has_permission(pool, id, PermissionKind::IsHidden).await?,
+        is_disabled: has_permission(pool, id, PermissionKind::IsDisabled).await?,
+        enable_shared_device_control: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableSharedDeviceControl,
+        )
+        .await?,
+        enable_remote_access: has_permission(pool, id, PermissionKind::EnableRemoteAccess).await?,
+        enable_live_tv_management: has_permission(pool, id, PermissionKind::EnableLiveTvManagement)
+            .await?,
+        enable_live_tv_access: has_permission(pool, id, PermissionKind::EnableLiveTvAccess).await?,
+        enable_media_playback: has_permission(pool, id, PermissionKind::EnableMediaPlayback)
+            .await?,
+        enable_audio_playback_transcoding: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableAudioPlaybackTranscoding,
+        )
+        .await?,
+        enable_video_playback_transcoding: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableVideoPlaybackTranscoding,
+        )
+        .await?,
+        enable_content_deletion: has_permission(pool, id, PermissionKind::EnableContentDeletion)
+            .await?,
+        enable_content_downloading: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableContentDownloading,
+        )
+        .await?,
+        enable_sync_transcoding: has_permission(pool, id, PermissionKind::EnableSyncTranscoding)
+            .await?,
+        enable_media_conversion: has_permission(pool, id, PermissionKind::EnableMediaConversion)
+            .await?,
+        enable_all_channels: has_permission(pool, id, PermissionKind::EnableAllChannels).await?,
+        enable_all_devices: has_permission(pool, id, PermissionKind::EnableAllDevices).await?,
+        enable_all_folders: has_permission(pool, id, PermissionKind::EnableAllFolders).await?,
+        enable_remote_control_of_other_users: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableRemoteControlOfOtherUsers,
+        )
+        .await?,
+        enable_playback_remuxing: has_permission(pool, id, PermissionKind::EnablePlaybackRemuxing)
+            .await?,
+        force_remote_source_transcoding: has_permission(
+            pool,
+            id,
+            PermissionKind::ForceRemoteSourceTranscoding,
+        )
+        .await?,
+        enable_public_sharing: has_permission(pool, id, PermissionKind::EnablePublicSharing)
+            .await?,
+        enable_collection_management: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableCollectionManagement,
+        )
+        .await?,
+        enable_subtitle_management: has_permission(
+            pool,
+            id,
+            PermissionKind::EnableSubtitleManagement,
+        )
+        .await?,
+        enable_lyric_management: has_permission(pool, id, PermissionKind::EnableLyricManagement)
+            .await?,
+        access_schedules: access_schedules(pool, id).await?,
+        blocked_tags,
+        allowed_tags,
+        enabled_channels,
+        enabled_devices,
+        enabled_folders,
+        enable_content_deletion_from_folders: content_deletion_folders,
+        sync_play_access: sync_play_from_i32(user.sync_play_access),
+        blocked_channels: Some(blocked_channels),
+        blocked_media_folders: Some(blocked_media_folders),
+        block_unrated_items,
+    })
 }
 
 /// Writes a list of [`Uuid`]s to a list-valued preference, stored as their
@@ -809,6 +1010,118 @@ async fn set_uuid_preference(
 ) -> Result<(), ServiceError> {
     let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
     set_preference(pool, user_id, kind, &strings).await
+}
+
+/// Reads a list-valued preference and parses each entry as a [`Uuid`],
+/// discarding any that do not parse (C# `GetPreferenceValues<Guid>`).
+async fn guid_preference(
+    pool: &sqlx::sqlite::SqlitePool,
+    user_id: &str,
+    kind: PreferenceKind,
+) -> Result<Vec<Uuid>, ServiceError> {
+    let values = get_preference(pool, user_id, kind).await?;
+    Ok(values
+        .iter()
+        .filter_map(|v| Uuid::parse_str(v).ok())
+        .collect())
+}
+
+/// Reads the `BlockUnratedItems` preference, parsing each entry as an
+/// [`UnratedItem`] (C# `GetPreferenceValues<UnratedItem>`). Entries are stored
+/// as the enum's PascalCase name; unrecognized entries are skipped.
+async fn unrated_preference(
+    pool: &sqlx::sqlite::SqlitePool,
+    user_id: &str,
+) -> Result<Vec<UnratedItem>, ServiceError> {
+    let values = get_preference(pool, user_id, PreferenceKind::BlockUnratedItems).await?;
+    Ok(values
+        .iter()
+        .filter_map(|v| parse_unrated_item(v))
+        .collect())
+}
+
+/// Loads a user's access schedules as wire [`AccessSchedule`] rows.
+async fn access_schedules(
+    pool: &sqlx::sqlite::SqlitePool,
+    user_id: &str,
+) -> Result<Vec<AccessSchedule>, ServiceError> {
+    let rows: Vec<(i64, i32, f64, f64)> = sqlx::query_as(
+        r#"SELECT "Id", "DayOfWeek", "StartHour", "EndHour"
+           FROM "AccessSchedules" WHERE "UserId" = ?1"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let uid = Uuid::parse_str(user_id).unwrap_or_else(|_| Uuid::nil());
+    Ok(rows
+        .into_iter()
+        .map(|(id, day, start, end)| AccessSchedule {
+            id: cast_i32(id),
+            user_id: uid,
+            day_of_week: dynamic_day_from_i32(day),
+            start_hour: start,
+            end_hour: end,
+        })
+        .collect())
+}
+
+/// Narrows a stored `i64` column to the DTO's `i32`, clamping on overflow.
+fn cast_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+/// Maps a stored `SubtitleMode` discriminant to its enum (C# stores the enum's
+/// ordinal). Unknown values fall back to the default.
+fn subtitle_mode_from_i32(value: i32) -> SubtitlePlaybackMode {
+    match value {
+        1 => SubtitlePlaybackMode::Always,
+        2 => SubtitlePlaybackMode::OnlyForced,
+        3 => SubtitlePlaybackMode::None,
+        4 => SubtitlePlaybackMode::Smart,
+        _ => SubtitlePlaybackMode::Default,
+    }
+}
+
+/// Maps a stored `SyncPlayAccess` discriminant to its enum.
+fn sync_play_from_i32(value: i32) -> SyncPlayUserAccessType {
+    match value {
+        1 => SyncPlayUserAccessType::JoinGroups,
+        2 => SyncPlayUserAccessType::None,
+        _ => SyncPlayUserAccessType::CreateAndJoinGroups,
+    }
+}
+
+/// Maps a stored `DayOfWeek` discriminant to its [`DynamicDayOfWeek`].
+fn dynamic_day_from_i32(value: i32) -> DynamicDayOfWeek {
+    match value {
+        1 => DynamicDayOfWeek::Monday,
+        2 => DynamicDayOfWeek::Tuesday,
+        3 => DynamicDayOfWeek::Wednesday,
+        4 => DynamicDayOfWeek::Thursday,
+        5 => DynamicDayOfWeek::Friday,
+        6 => DynamicDayOfWeek::Saturday,
+        7 => DynamicDayOfWeek::Everyday,
+        8 => DynamicDayOfWeek::Weekday,
+        9 => DynamicDayOfWeek::Weekend,
+        _ => DynamicDayOfWeek::Sunday,
+    }
+}
+
+/// Parses a stored `BlockUnratedItems` entry into an [`UnratedItem`].
+fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
+    match value {
+        "Movie" => Some(UnratedItem::Movie),
+        "Trailer" => Some(UnratedItem::Trailer),
+        "Series" => Some(UnratedItem::Series),
+        "Music" => Some(UnratedItem::Music),
+        "Book" => Some(UnratedItem::Book),
+        "LiveTvChannel" => Some(UnratedItem::LiveTvChannel),
+        "LiveTvProgram" => Some(UnratedItem::LiveTvProgram),
+        "ChannelContent" => Some(UnratedItem::ChannelContent),
+        "Other" => Some(UnratedItem::Other),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -846,6 +1159,60 @@ mod tests {
         // Idempotent: a second call is a no-op.
         mgr.initialize().await.expect("initialize again");
         assert_eq!(mgr.get_users().await.expect("users").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_user_dto_projects_policy_and_config() {
+        let db = test_db().await;
+        let mgr = HermitUserManager::new(db.clone());
+        let user = mgr.create_user("dave").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+
+        // Persist the flat policy columns + the admin permission flag.
+        let policy = UserPolicy {
+            is_administrator: true,
+            max_active_sessions: 3,
+            ..UserPolicy::default()
+        };
+        mgr.update_policy(id, &policy).await.expect("policy");
+
+        // Seed a list-valued preference directly (the read path parses Guids).
+        let folder = Uuid::from_u128(0xF00D);
+        set_uuid_preference(
+            db.pool(),
+            &user.id,
+            PreferenceKind::EnabledFolders,
+            &[folder],
+        )
+        .await
+        .expect("seed pref");
+
+        let excluded = Uuid::from_u128(0xBEEF);
+        let config = UserConfiguration {
+            hide_played_in_latest: false,
+            latest_items_excludes: vec![excluded],
+            subtitle_mode: SubtitlePlaybackMode::Always,
+            ..UserConfiguration::default()
+        };
+        mgr.update_configuration(id, &config).await.expect("config");
+
+        let reloaded = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        let dto = mgr
+            .get_user_dto(&reloaded, Some("srv-1".to_owned()))
+            .await
+            .expect("dto");
+
+        assert_eq!(dto.name.as_deref(), Some("dave"));
+        assert_eq!(dto.id, id);
+        assert_eq!(dto.server_id.as_deref(), Some("srv-1"));
+        let dto_policy = dto.policy.expect("policy");
+        assert!(dto_policy.is_administrator);
+        assert_eq!(dto_policy.max_active_sessions, 3);
+        assert_eq!(dto_policy.enabled_folders, vec![folder]);
+        let dto_config = dto.configuration.expect("config");
+        assert!(!dto_config.hide_played_in_latest);
+        assert_eq!(dto_config.latest_items_excludes, vec![excluded]);
+        assert_eq!(dto_config.subtitle_mode, SubtitlePlaybackMode::Always);
     }
 
     #[tokio::test]

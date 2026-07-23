@@ -44,6 +44,12 @@ pub enum ApiError {
     /// A caller-supplied argument was missing or malformed → `400`.
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    /// The caller is authenticated but not permitted to perform the operation
+    /// → `403`. Ported from the controllers' `StatusCode(403, …)` returns (e.g.
+    /// updating another user without elevation, disabling the last admin).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl ApiError {
@@ -58,6 +64,7 @@ impl ApiError {
             Self::Service(ServiceError::InvalidInput(_)) | Self::BadRequest(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             // `Db`/`Backend` (and any future non-exhaustive variant) are internal
             // failures the client cannot act on.
@@ -133,6 +140,10 @@ mod tests {
         assert_eq!(
             ApiError::BadRequest("bad".into()).status(),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::Forbidden("nope".into()).status(),
+            StatusCode::FORBIDDEN
         );
     }
 }

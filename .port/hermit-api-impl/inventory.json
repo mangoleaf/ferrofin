@@ -1,0 +1,222 @@
+{
+  "meta": {
+    "goal": "Turn the 324 remaining 501 stubs in hermit-api into real handlers.",
+    "contract_total_routes": 412,
+    "contract_distinct_paths": 337,
+    "already_real_routes": 13,
+    "unimplemented_routes": 324,
+    "already_real_route_list": [
+      "GET /System/Info", "GET /System/Info/Public",
+      "POST /Users/AuthenticateByName", "GET /Users/Me",
+      "GET /UserViews", "GET /Items", "GET /Items/{itemId}",
+      "GET /Items/{itemId}/PlaybackInfo", "POST /Items/{itemId}/PlaybackInfo",
+      "GET /Videos/{itemId}/stream", "HEAD /Videos/{itemId}/stream",
+      "GET /Items/{itemId}/Images/{imageType}", "HEAD /Items/{itemId}/Images/{imageType}"
+    ],
+    "key_finding": "hermit-traits already exposes rich manager traits and hermit-core has concrete impls (Hermit* structs) for essentially every non-deferred subsystem. The dominant work is at the hermit-api layer: (a) widen AppState/Inner to hold the extra Arc<dyn ...> managers, (b) write axum handlers that translate query params -> InternalItemsQuery / DTO options and project via DtoService, (c) register over the 501 stub. Very few genuinely-new hermit-traits methods are required; almost no new hermit-core logic is required outside the by-name browse projection and a couple of write paths.",
+    "appstate_currently_wired": [
+      "LibraryManager", "UserManager", "UserViewManager", "UserDataManager",
+      "MediaSourceManager", "SessionManager", "SystemManager",
+      "ServerApplicationHost", "ServerConfigurationManager", "DtoService",
+      "AuthorizationContext", "AuthService"
+    ],
+    "appstate_must_add": [
+      "SearchManager", "MusicManager", "SimilarItemsManager", "TvSeriesManager",
+      "CollectionManager", "PlaylistManager", "DeviceManager",
+      "AuthenticationManager", "QuickConnect", "DisplayPreferencesManager",
+      "ProviderManager", "SubtitleManager", "LyricManager (stub)",
+      "MediaSegmentManager", "TrickplayManager", "ChapterManager",
+      "ClientEventLogger", "EventManager", "ChannelManager (stub)",
+      "ItemRepository/ItemCountService (or expose via LibraryManager)"
+    ]
+  },
+
+  "batches": [
+    {
+      "id": 1,
+      "name": "By-name browse foundation (Genres/MusicGenres/Studios/Persons/Years/Artists)",
+      "rationale": "Most-reused projection: every by-name controller GETs a filtered item list and one item-by-name, reusing InternalItemsQuery + DtoService already proven in Items. Builds the shared 'name-item' handler helper the Image variants (Batch 9) and Filters (Batch 3) lean on. Zero deferred deps.",
+      "controllers": ["GenresController", "MusicGenresController", "StudiosController", "PersonsController", "YearsController", "ArtistsController"],
+      "routes_to_implement": 33,
+      "route_examples": ["GET /Genres", "GET /Genres/{genreName}", "GET /Studios", "GET /Studios/{name}", "GET /Persons", "GET /Persons/{name}", "GET /Years", "GET /Years/{year}", "GET /Artists", "GET /Artists/AlbumArtists", "GET /Artists/{name}", "GET /MusicGenres", "GET /MusicGenres/{genreName}"],
+      "traits_existing": ["LibraryManager::get_genres", "LibraryManager::get_studios", "LibraryManager::get_artists", "LibraryManager::get_people/get_people_names", "ItemRepository::get_music_genres/get_album_artists/get_all_artists", "DtoService::get_base_item_dtos"],
+      "traits_new": ["(none) — Years is derived from an InternalItemsQuery group-by that get_query_filters_legacy already surfaces; a thin LibraryManager::get_years may be added if not derivable"],
+      "needs_new_core": false,
+      "notes": "The per-name Image sub-routes (…/Images/{imageType}[/{imageIndex}]) are Batch 9. This batch delivers only the JSON browse + single-name GETs."
+    },
+    {
+      "id": 2,
+      "name": "Items query completion + writes/delete + ancestors/counts",
+      "rationale": "The widest, most-depended-on surface. Fills out the full GetItems query translation (translate_query.rs already exists in core), item writes (POST /Items/{itemId}, ContentType), delete, Counts, Ancestors, Root, Latest. Everything downstream (Suggestions/Search/Filters/UserLibrary) reuses this translation.",
+      "controllers": ["ItemsController", "ItemUpdateController", "ItemRefreshController"],
+      "routes_to_implement": 16,
+      "route_examples": ["DELETE /Items", "GET /Items/Counts", "GET /Items/Latest", "GET /Items/Root", "DELETE /Items/{itemId}", "POST /Items/{itemId}", "GET /Items/{itemId}/Ancestors", "POST /Items/{itemId}/ContentType", "GET /Items/{itemId}/MetadataEditor", "POST /Items/{itemId}/Refresh"],
+      "traits_existing": ["LibraryManager::query_items/get_item_list/get_latest_item_list/get_item_counts/create_items/update_items/delete_item/queue_library_scan", "ItemCountService::*", "ProviderManager::queue_refresh/get_metadata_options"],
+      "traits_new": ["LibraryManager::get_ancestors (may add) — otherwise walk parent ids via ItemRepository"],
+      "needs_new_core": false,
+      "notes": "translate_query.rs in hermit-core (32k) already maps the wide Jellyfin query; this batch mostly wires its parameters through the handler. MetadataEditor uses ProviderManager::get_metadata_options."
+    },
+    {
+      "id": 3,
+      "name": "Filters + Suggestions + Instant-mix + Similar/Recommendations",
+      "rationale": "Discovery reads built directly on the Batch 2 query + by-name lists. SimilarItemsManager, MusicManager, SearchManager (hints) impls all exist in core.",
+      "controllers": ["FilterController", "SuggestionsController", "InstantMixController", "MoviesController", "TrailersController", "SearchController"],
+      "routes_to_implement": 20,
+      "route_examples": ["GET /Items/Filters", "GET /Items/Filters2", "GET /Items/Suggestions", "GET /Albums/{itemId}/InstantMix", "GET /Artists/InstantMix", "GET /Artists/{itemId}/InstantMix", "GET /Items/{itemId}/InstantMix", "GET /MusicGenres/InstantMix", "GET /Songs/{itemId}/InstantMix", "GET /Playlists/{itemId}/InstantMix", "GET /Movies/Recommendations", "GET /Movies/{itemId}/Similar", "GET /Items/{itemId}/Similar", "GET /Artists/{itemId}/Similar", "GET /Trailers", "GET /Trailers/{itemId}/Similar", "GET /Search/Hints"],
+      "traits_existing": ["LibraryManager::get_query_filters_legacy", "MusicManager::get_instant_mix_from_item/from_artist/from_genres", "SimilarItemsManager::get_similar_items/get_movie_recommendations", "SearchManager::get_search_hints"],
+      "traits_new": ["(none)"],
+      "needs_new_core": false,
+      "notes": "SearchManager and MusicManager and SimilarItemsManager must be added to AppState (Batch does the wiring)."
+    },
+    {
+      "id": 4,
+      "name": "UserLibrary + UserItems + play-state flags",
+      "rationale": "Per-user reads/writes over items: get item (single, already real), favorites, ratings, played flags, resume, local trailers, special features, theme media, intros. All hang off UserDataManager (impl exists) + LibraryManager.",
+      "controllers": ["UserLibraryController", "UserViewsController (remainder)"],
+      "routes_to_implement": 20,
+      "route_examples": ["DELETE /UserFavoriteItems/{itemId}", "POST /UserFavoriteItems/{itemId}", "GET /UserItems/Resume", "DELETE /UserItems/{itemId}/Rating", "POST /UserItems/{itemId}/Rating", "GET /UserItems/{itemId}/UserData", "POST /UserItems/{itemId}/UserData", "DELETE /UserPlayedItems/{itemId}", "POST /UserPlayedItems/{itemId}", "GET /Items/{itemId}/Intros", "GET /Items/{itemId}/LocalTrailers", "GET /Items/{itemId}/SpecialFeatures", "GET /Items/{itemId}/ThemeMedia", "GET /Items/{itemId}/ThemeSongs", "GET /Items/{itemId}/ThemeVideos", "GET /Items/{itemId}/CriticReviews", "GET /UserViews/GroupingOptions"],
+      "traits_existing": ["UserDataManager::save_user_data/get_user_data_dto/get_user_data_batch/update_play_state", "LibraryManager::get_item_list", "UserViewManager::get_user_views/get_latest_items"],
+      "traits_new": ["(none) — theme/special/local-trailer lists are InternalItemsQuery filters on extra-type; CriticReviews returns empty QueryResult like Jellyfin"],
+      "needs_new_core": false
+    },
+    {
+      "id": 5,
+      "name": "Playstate + Sessions playback reporting",
+      "rationale": "Client playback lifecycle. SessionManager impl (47k) already has on_playback_start/progress/stopped, capabilities, commands. PlayingItems + Sessions/Playing* all forward to it.",
+      "controllers": ["PlaystateController", "SessionController"],
+      "routes_to_implement": 27,
+      "route_examples": ["DELETE /PlayingItems/{itemId}", "POST /PlayingItems/{itemId}", "POST /PlayingItems/{itemId}/Progress", "GET /Sessions", "POST /Sessions/Capabilities", "POST /Sessions/Capabilities/Full", "POST /Sessions/Logout", "POST /Sessions/Playing", "POST /Sessions/Playing/Ping", "POST /Sessions/Playing/Progress", "POST /Sessions/Playing/Stopped", "POST /Sessions/Viewing", "POST /Sessions/{sessionId}/Command", "POST /Sessions/{sessionId}/Command/{command}", "POST /Sessions/{sessionId}/Message", "POST /Sessions/{sessionId}/Playing", "POST /Sessions/{sessionId}/System/{command}", "POST /Sessions/{sessionId}/User/{userId}", "DELETE /Sessions/{sessionId}/User/{userId}"],
+      "traits_existing": ["SessionManager::on_playback_start/progress/stopped/get_sessions/report_capabilities/send_general_command/send_message_command/send_play_command/send_playstate_command/logout/add_additional_user/remove_additional_user/report_now_viewing_item"],
+      "traits_new": ["(none)"],
+      "needs_new_core": false
+    },
+    {
+      "id": 6,
+      "name": "Users admin + Startup + QuickConnect + Auth providers",
+      "rationale": "Account CRUD, policy/config, first-run flow, QuickConnect. UserManager + QuickConnect + AuthenticationManager impls exist; only AuthenticateByName/Me are done today.",
+      "controllers": ["UserController (remainder)", "StartupController", "QuickConnectController"],
+      "routes_to_implement": 25,
+      "route_examples": ["GET /Users", "POST /Users", "POST /Users/AuthenticateWithQuickConnect", "POST /Users/Configuration", "POST /Users/ForgotPassword", "POST /Users/ForgotPassword/Pin", "POST /Users/New", "POST /Users/Password", "GET /Users/Public", "GET /Users/{userId}", "DELETE /Users/{userId}", "POST /Users/{userId}/Policy", "GET /Auth/Providers", "GET /Auth/PasswordResetProviders", "POST /Startup/Complete", "GET /Startup/Configuration", "POST /Startup/Configuration", "GET /Startup/FirstUser", "POST /Startup/RemoteAccess", "GET /Startup/User", "POST /Startup/User", "POST /QuickConnect/Authorize", "GET /QuickConnect/Connect", "GET /QuickConnect/Enabled", "POST /QuickConnect/Initiate"],
+      "traits_existing": ["UserManager::get_users/create_user/delete_user/update_user/update_configuration/update_policy/change_password/reset_password/get_authentication_providers/get_password_reset_providers/authenticate_user", "QuickConnect::is_enabled/try_connect/check_request_status/authorize_request/get_authorized_request"],
+      "traits_new": ["(none) — Startup writes reuse ServerConfigurationManager::update_configuration + UserManager"],
+      "needs_new_core": false
+    },
+    {
+      "id": 7,
+      "name": "Playlists + Collections",
+      "rationale": "Playlist/collection CRUD + membership + share users. PlaylistManager + CollectionManager impls (HermitPlaylistManager/HermitCollectionManager) exist with the full method set.",
+      "controllers": ["PlaylistsController", "CollectionController"],
+      "routes_to_implement": 14,
+      "route_examples": ["POST /Playlists", "GET /Playlists/{playlistId}", "POST /Playlists/{playlistId}", "GET /Playlists/{playlistId}/Items", "POST /Playlists/{playlistId}/Items", "DELETE /Playlists/{playlistId}/Items", "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}", "GET /Playlists/{playlistId}/Users", "GET /Playlists/{playlistId}/Users/{userId}", "POST /Playlists/{playlistId}/Users/{userId}", "DELETE /Playlists/{playlistId}/Users/{userId}", "POST /Collections", "POST /Collections/{collectionId}/Items", "DELETE /Collections/{collectionId}/Items"],
+      "traits_existing": ["PlaylistManager::create_playlist/update_playlist/get_playlist_for_user/add_item_to_playlist/remove_item_from_playlist/move_item/add_user_to_shares/remove_user_from_shares", "CollectionManager::create_collection/add_to_collection/remove_from_collection"],
+      "traits_new": ["(none)"],
+      "needs_new_core": false
+    },
+    {
+      "id": 8,
+      "name": "TV shows + Next-up + Seasons/Episodes",
+      "rationale": "Series navigation. TvSeriesManager + NextUpService impls exist (next_up_service.rs 23k, tv_series_manager.rs 28k).",
+      "controllers": ["TvShowsController"],
+      "routes_to_implement": 5,
+      "route_examples": ["GET /Shows/NextUp", "GET /Shows/Upcoming", "GET /Shows/{itemId}/Similar", "GET /Shows/{seriesId}/Episodes", "GET /Shows/{seriesId}/Seasons"],
+      "traits_existing": ["TvSeriesManager::get_next_up", "NextUpService::*", "SimilarItemsManager::get_similar_items", "LibraryManager::get_item_list"],
+      "traits_new": ["(none)"],
+      "needs_new_core": false
+    },
+    {
+      "id": 9,
+      "name": "Image variants (item/by-name/user/remote)",
+      "rationale": "Widens the already-real item-image handler to the full matrix: index/format/dimension variants, by-name entity images (built on Batch 1), user image, remote image search/download. ImageProcessor + ProviderManager remote-image methods exist.",
+      "controllers": ["ImageController (remainder)", "RemoteImageController", "UserController image sub-routes"],
+      "routes_to_implement": 34,
+      "route_examples": ["GET/HEAD /Items/{itemId}/Images", "DELETE/POST /Items/{itemId}/Images/{imageType}", "GET/HEAD/DELETE/POST /Items/{itemId}/Images/{imageType}/{imageIndex}", "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index", "GET .../{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}", "GET/HEAD /Artists|Genres|MusicGenres|Studios|Persons/{name}/Images/{imageType}[/{imageIndex}]", "GET/HEAD/POST/DELETE /UserImage", "GET /Items/{itemId}/RemoteImages", "POST /Items/{itemId}/RemoteImages/Download", "GET /Items/{itemId}/RemoteImages/Providers"],
+      "traits_existing": ["ImageProcessor::process_image/get_item_image_dimensions/get_image_cache_tag", "ProviderManager::get_available_remote_images/save_image_from_url/get_remote_image_provider_info", "UserManager::clear_profile_image", "ItemPersistenceService::save_images"],
+      "traits_new": ["ImageProcessor is NOT yet in AppState and hermit-core has no concrete ImageProcessor/ImageEncoder impl — NEW core work: a skia/image-rs-backed HermitImageProcessor (or a passthrough that serves the original file + 501 on resize). Recommend a minimal file-serving impl first, resize later."],
+      "needs_new_core": true,
+      "notes": "This is the one read-path batch with real NEW core logic (image decode/resize/blurhash). Original-file serving (no transform) can ship first to unblock clients; parametrized resize follows."
+    },
+    {
+      "id": 10,
+      "name": "Videos + Audio streaming completion + Universal + MediaInfo",
+      "rationale": "Extends the real /Videos/{itemId}/stream to the audio static-stream siblings, alternate sources, additional parts, attachments, and PlaybackInfo/LiveStreams open/close. Direct-play/static remux uses MediaSourceManager (impl exists). HLS/transcode segment routes are their own deferred concern (see notes).",
+      "controllers": ["VideosController (remainder)", "AudioController (static)", "UniversalAudioController", "MediaInfoController (remainder)", "VideoAttachmentsController"],
+      "routes_to_implement": 20,
+      "route_examples": ["GET/HEAD /Audio/{itemId}/stream", "GET/HEAD /Audio/{itemId}/stream.{container}", "GET/HEAD /Audio/{itemId}/universal", "GET/HEAD /Videos/{itemId}/stream.{container}", "GET /Videos/{itemId}/AdditionalParts", "DELETE /Videos/{itemId}/AlternateSources", "DELETE /Videos/ActiveEncodings", "POST /Videos/MergeVersions", "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}", "POST /LiveStreams/Open", "POST /LiveStreams/Close", "GET /Playback/BitrateTest", "GET /Items/{itemId}/Download", "GET /Items/{itemId}/File"],
+      "traits_existing": ["MediaSourceManager::get_static_media_sources/get_playback_media_sources/open_live_stream/close_live_stream/get_media_attachments", "MediaAttachmentRepository::get_media_attachments"],
+      "traits_new": ["(none for static/direct serving)"],
+      "needs_new_core": false,
+      "notes": "The transcoding/HLS segment routes (Audio/Videos …/master.m3u8, main.m3u8, hls*/segment, DynamicHls, HlsSegment) require an ffmpeg transcode pipeline (media_encoding trait exists but no runner). Those specific ~24 HLS routes are carved into DEFERRED (see stays_501) — this batch delivers only static/direct-play + playback-info + merge/download/attachments."
+    },
+    {
+      "id": 11,
+      "name": "Subtitles + Lyrics + MediaSegments + Trickplay",
+      "rationale": "Sidecar media assets. SubtitleManager, LyricManager (stub trait), MediaSegmentManager, TrickplayManager impls all exist in core.",
+      "controllers": ["SubtitleController", "LyricsController", "MediaSegmentsController", "TrickplayController"],
+      "routes_to_implement": 24,
+      "route_examples": ["GET /Items/{itemId}/RemoteSearch/Subtitles/{language}", "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}", "POST /Videos/{itemId}/Subtitles", "DELETE /Videos/{itemId}/Subtitles/{index}", "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8", "GET /Providers/Subtitles/Subtitles/{subtitleId}", "GET/POST/DELETE /Audio/{itemId}/Lyrics", "GET /Audio/{itemId}/RemoteSearch/Lyrics", "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}", "GET /Providers/Lyrics/{lyricId}", "GET /MediaSegments/{itemId}", "GET /MediaSegmentsApi", "POST /MediaSegmentsApi/{itemId}", "DELETE /MediaSegmentsApi/{segmentId}", "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8", "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg"],
+      "traits_existing": ["SubtitleManager::search_subtitles/download_subtitles/upload_subtitle/get_remote_subtitles/delete_subtitles/get_supported_providers", "LyricManager::get_lyrics/search_lyrics/download_lyrics/save_lyric/delete_lyrics", "MediaSegmentManager::create_segment/delete_segment/get_segments/get_supported_providers", "TrickplayManager::get_trickplay_manifest/get_hls_playlist/get_trickplay_resolutions"],
+      "traits_new": ["(none)"],
+      "needs_new_core": false,
+      "notes": "Subtitle stream-conversion routes (Stream.{format}) that transcode a sub track may return the stored sidecar directly; on-the-fly conversion deferred if not already in SubtitleManager."
+    },
+    {
+      "id": 12,
+      "name": "Devices + ApiKeys + Sessions device linkage + ClientLog",
+      "rationale": "Device registry + API-key admin + client log intake. DeviceManager impl (21k), SessionManager token revoke, ClientEventLogger impl exist.",
+      "controllers": ["DevicesController", "ApiKeyController", "ClientLogController"],
+      "routes_to_implement": 10,
+      "route_examples": ["GET /Devices", "DELETE /Devices", "GET /Devices/Info", "GET /Devices/Options", "POST /Devices/Options", "GET /Auth/Keys", "POST /Auth/Keys", "DELETE /Auth/Keys/{key}", "POST /ClientLog/Document"],
+      "traits_existing": ["DeviceManager::get_devices/get_device_infos/delete_device/get_device_options/update_device_options", "SessionManager::revoke_user_tokens (api-key issue/list via SessionManager or a keys repo)", "ClientEventLogger::write_document"],
+      "traits_new": ["ApiKey issue/list/revoke — CONFIRM whether SessionManager or a dedicated auth-keys repo backs /Auth/Keys; may add ApiKeyManager methods (list/create/delete) if not present"],
+      "needs_new_core": false,
+      "notes": "One open question: /Auth/Keys backing store. Everything else is direct manager forwards."
+    },
+    {
+      "id": 13,
+      "name": "System admin + Configuration + Branding + Localization + DisplayPreferences",
+      "rationale": "Server config read/write, branding, localization catalogs, logs, activity log, ping/restart/shutdown (mostly wired), display prefs. Managers all exist (ServerConfigurationManager, LocalizationManager, DisplayPreferencesManager).",
+      "controllers": ["SystemController (remainder)", "ConfigurationController", "BrandingController", "LocalizationController", "DisplayPreferencesController", "ActivityLogController", "DashboardController", "EnvironmentController", "TimeSyncController"],
+      "routes_to_implement": 40,
+      "route_examples": ["GET/POST /System/Configuration", "POST /System/Configuration/Branding", "GET /System/Configuration/MetadataOptions/Default", "GET/POST /System/Configuration/{key}", "GET /System/Endpoint", "GET /System/Info/Storage", "GET /System/Logs", "GET /System/Logs/Log", "GET/POST /System/Ping", "POST /System/Restart", "POST /System/Shutdown", "GET /System/ActivityLog/Entries", "GET /Branding/Configuration", "GET /Branding/Css", "GET/POST/DELETE /Branding/Splashscreen", "GET /Localization/Countries", "GET /Localization/Cultures", "GET /Localization/Options", "GET /Localization/ParentalRatings", "GET/POST /DisplayPreferences/{displayPreferencesId}", "GET /Environment/DirectoryContents", "GET /Environment/Drives", "POST /Environment/ValidatePath", "GET /GetUtcTime", "GET /web/ConfigurationPage(s)"],
+      "traits_existing": ["ServerConfigurationManager::configuration/update_configuration", "SystemManager::get_system_info/restart/shutdown/get_system_storage_info", "DisplayPreferencesManager::get_display_preferences/update_display_preferences", "LocalizationManager (concrete in core: cultures/countries/parental ratings)"],
+      "traits_new": ["Localization catalog getters may need a thin trait if LocalizationManager isn't yet an AppState-visible trait (it's a concrete struct in core)", "Environment directory browse -> filesystem read (small NEW core helper) or reuse ServerApplicationPaths"],
+      "needs_new_core": "partial — Environment directory browsing + config-page listing are small new helpers; the rest is manager forwards. web/ConfigurationPages returns [] (no plugins)."
+    },
+    {
+      "id": 14,
+      "name": "Library structure + folders + refresh + merge-versions + item-lookup + external-ids",
+      "rationale": "Library admin: virtual folders CRUD, media folders, physical paths, refresh, merge/split versions, remote metadata search + apply, external id infos. LibraryManager + ProviderManager methods exist.",
+      "controllers": ["LibraryController", "LibraryStructureController", "ItemLookupController", "MergeVersionsController"],
+      "routes_to_implement": 40,
+      "route_examples": ["GET /Library/MediaFolders", "GET /Library/PhysicalPaths", "POST /Library/Refresh", "POST /Library/Media/Updated", "GET/POST/DELETE /Library/VirtualFolders", "POST /Library/VirtualFolders/LibraryOptions", "POST /Library/VirtualFolders/Name", "GET/POST/DELETE /Library/VirtualFolders/Paths", "GET /Libraries/AvailableOptions", "POST /MergeVersions/MergeEpisodes", "POST /MergeVersions/MergeMovies", "POST /MergeVersions/SplitEpisodes", "POST /MergeVersions/SplitMovies", "GET /Items/{itemId}/ExternalIdInfos", "POST /Items/RemoteSearch/Movie|Series|Person|Book|BoxSet|MusicAlbum|MusicArtist|MusicVideo|Trailer", "POST /Items/RemoteSearch/Apply/{itemId}", "GET /Items/{itemId}/RemoteImages/Providers"],
+      "traits_existing": ["LibraryManager::queue_library_scan/create_items/update_items", "ProviderManager::get_external_id_infos/get_external_urls/refresh_full_item/queue_refresh/get_all_metadata_plugins/save_metadata"],
+      "traits_new": ["VirtualFolder CRUD (add/remove library, add/remove path, rename) — CONFIRM present on LibraryManager; likely NEW methods (add_virtual_folder/remove_virtual_folder/add_media_path/...)", "MergeVersions -> LinkedChildrenService or NEW LibraryManager merge/split methods"],
+      "needs_new_core": true,
+      "notes": "Heaviest new-core batch after images: virtual-folder mutation + version merge/split are structural library ops. Sequenced late because it is admin-only and least reused."
+    },
+    {
+      "id": 15,
+      "name": "Channels + ScheduledTasks",
+      "rationale": "Channel browse (stub-trait ChannelManager impl exists) and scheduled-task admin (scheduled_tasks.rs 15k in core). Low reuse, self-contained.",
+      "controllers": ["ChannelsController", "ScheduledTasksController"],
+      "routes_to_implement": 10,
+      "route_examples": ["GET /Channels", "GET /Channels/Features", "GET /Channels/Items/Latest", "GET /Channels/{channelId}/Features", "GET /Channels/{channelId}/Items", "GET /ScheduledTasks", "GET /ScheduledTasks/{taskId}", "POST /ScheduledTasks/Running/{taskId}", "DELETE /ScheduledTasks/Running/{taskId}", "POST /ScheduledTasks/{taskId}/Triggers"],
+      "traits_existing": ["ChannelManager::get_channels/get_channel_features/get_channel_items", "(scheduled tasks concrete in core::scheduled_tasks)"],
+      "traits_new": ["ScheduledTask trait surface for AppState (list/get/start/cancel/update-triggers) if not already trait-fronted"],
+      "needs_new_core": false
+    }
+  ],
+
+  "stays_501": [
+    "LiveTvController (40 routes) — LiveTv is a DEFERRED subsystem; hermit-core live_tv_manager is a minimal stub (info/programs/reset only). All /LiveTv/* stay 501.",
+    "SyncPlayController (22 routes) — SyncPlay DEFERRED; sync_play_manager is a minimal stub (new/join/leave/list). All /SyncPlay/* stay 501.",
+    "PluginsController + PackageController + RepositoriesController (24 routes: /Plugins/*, /Packages/*, /Repositories) — plugin install/enable/disable + package repos are DEFERRED (plugin_manager is a minimal stub). All stay 501.",
+    "BackupController (4 routes: /Backup, /Backup/Create, /Backup/Manifest, /Backup/Restore) — backup/restore subsystem DEFERRED; no core impl.",
+    "HLS/transcoding stream routes (~24: Audio/Videos …/master.m3u8, main.m3u8, live.m3u8, hls/{segment}, hls1/{...}, Audio hls stream.aac/.mp3, LiveTv stream files) — require an ffmpeg transcode/segmenter pipeline (media_encoding trait has no runner). Static/direct-play is delivered in Batch 10; on-the-fly HLS stays 501.",
+    "Third-party PLUGIN routes not part of core Jellyfin (all stay 501): Intros/* + Episode/{id}/IntroSkipperSegments + IntroSkipper/* (IntroSkipper plugin ~11), SkipButtonCss/* (2), FileTransformation/RegisterTransformation (1), Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo (1), Tmdb/ClientConfiguration (1), FallbackFont/Fonts[/{name}] (2 — cosmetic, optional later).",
+    "DashboardController config-page listing beyond web/ConfigurationPages=[] — plugin-driven, stays 501 where plugin-backed."
+  ],
+
+  "total_routes_targeted": 338,
+  "targeting_note": "Per-batch routes_to_implement sum to 338 (33+16+20+20+27+25+14+5+34+20+24+10+40+40+10). These counts are generous — they include method variants (GET/HEAD/POST/DELETE) and a handful of routes whose HLS-transcode sibling actually stays 501 (Batch 10 static-only, Batch 11 sidecar-only), so the count of route SLOTS a batch touches slightly exceeds the count that flips 501->real. Deferred (stays_501) buckets cover ~120-130 of the 324: LiveTv 40, SyncPlay 22, Plugins/Packages/Repositories 24, Backup 4, HLS/transcode-stream ~24, third-party plugin ~18 (overlap accounts for the range). Net outcome after all 15 batches: roughly 190-200 previously-501 routes become real (13 already-real + these), i.e. ~55-60% of the 337-path contract, with the balance being the deliberately-deferred subsystems."
+}

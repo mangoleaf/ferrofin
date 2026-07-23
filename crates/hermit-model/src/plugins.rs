@@ -94,3 +94,37 @@ pub struct PluginPageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub menu_icon: Option<String>,
 }
+
+/// The configuration page info returned by the dashboard controller.
+///
+/// Port of `MediaBrowser.Model.Plugins.ConfigurationPageInfo`. In Jellyfin this
+/// is projected from a plugin's [`PluginPageInfo`] plus the owning plugin id;
+/// Hermit ships no dynamic plugin host, so the list is always empty, but the
+/// type is part of the wire contract.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ConfigurationPageInfo {
+    /// Gets or sets the name.
+    pub name: String,
+
+    /// Gets or sets a value indicating whether the configurations page is
+    /// enabled in the main menu.
+    pub enable_in_main_menu: bool,
+
+    /// Gets or sets the menu section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub menu_section: Option<String>,
+
+    /// Gets or sets the menu icon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub menu_icon: Option<String>,
+
+    /// Gets or sets the display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+
+    /// Gets or sets the plugin id.
+    #[schema(value_type = Option<String>, format = "uuid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<Uuid>,
+}

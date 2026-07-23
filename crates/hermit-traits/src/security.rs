@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::dto::SessionInfoDto;
 use hermit_model::quick_connect::QuickConnectResult;
+use hermit_model::security::AuthenticationInfo;
 use hermit_model::users::UserPolicy;
 use uuid::Uuid;
 
@@ -109,6 +110,35 @@ pub trait QuickConnect: Send + Sync {
 }
 
 fn _assert_object_safe_quick_connect(_: &dyn QuickConnect) {}
+
+/// Manages long-lived server API keys.
+///
+/// Port of the API-key surface of
+/// `MediaBrowser.Controller.Security.IAuthenticationManager` (the
+/// `GetApiKeys`/`CreateApiKey`/`DeleteApiKey` triple used by `ApiKeyController`).
+/// The C# interface's authorization-provider concerns are handled separately by
+/// [`AuthenticationManager`]; this trait is the persistence-backed key store.
+#[async_trait]
+pub trait ApiKeyManager: Send + Sync {
+    /// Lists every stored API key as an [`AuthenticationInfo`].
+    ///
+    /// Mirrors `GetApiKeys`: each key becomes an [`AuthenticationInfo`] whose
+    /// `AppName`/`AccessToken`/`DateCreated` come from the key row and whose
+    /// device fields are empty.
+    async fn get_api_keys(&self) -> Result<Vec<AuthenticationInfo>, ServiceError>;
+
+    /// Creates a new API key named `name`, generating its access token.
+    ///
+    /// Mirrors `CreateApiKey`: the token is a fresh 32-hex-digit GUID and the
+    /// created/last-activity timestamps are set to now.
+    async fn create_api_key(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// Deletes the API key whose access token is `access_token` (a no-op when no
+    /// key matches). Mirrors `DeleteApiKey`.
+    async fn delete_api_key(&self, access_token: &str) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_api_key_manager(_: &dyn ApiKeyManager) {}
 
 #[cfg(test)]
 mod tests {

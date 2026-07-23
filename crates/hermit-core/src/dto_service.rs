@@ -1157,6 +1157,12 @@ mod tests {
         async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(None)
         }
+        async fn get_item_images(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<hermit_traits::options::ItemImageInfo>, ServiceError> {
+            Ok(vec![])
+        }
         async fn query_items(
             &self,
             _query: &hermit_traits::options::InternalItemsQuery,
@@ -1254,11 +1260,36 @@ mod tests {
         > {
             Ok(hermit_model::querying::QueryResult::default())
         }
+        async fn get_music_genres(
+            &self,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
+        async fn get_album_artists(
+            &self,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
         async fn get_query_filters_legacy(
             &self,
             _query: &hermit_traits::options::InternalItemsQuery,
         ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
             Ok(hermit_model::querying::QueryFiltersLegacy::default())
+        }
+        async fn get_media_stream_languages(
+            &self,
+            _stream_type: hermit_model::entities::MediaStreamType,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            Ok(Vec::new())
         }
         async fn queue_library_scan(&self) -> Result<(), ServiceError> {
             Ok(())
@@ -1312,6 +1343,25 @@ mod tests {
             _reported_position_ticks: Option<i64>,
         ) -> Result<bool, ServiceError> {
             Ok(false)
+        }
+        async fn mark_played(
+            &self,
+            _user_id: Uuid,
+            item_id: Uuid,
+            _date_played: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<UserItemDataDto, ServiceError> {
+            self.get_user_data_dto(item_id, _user_id)
+                .await
+                .map(|dto| dto.expect("fake always returns some"))
+        }
+        async fn mark_unplayed(
+            &self,
+            _user_id: Uuid,
+            item_id: Uuid,
+        ) -> Result<UserItemDataDto, ServiceError> {
+            self.get_user_data_dto(item_id, _user_id)
+                .await
+                .map(|dto| dto.expect("fake always returns some"))
         }
         async fn reset_playback_stream_selections(
             &self,
@@ -1595,6 +1645,14 @@ mod tests {
             _item_id: Uuid,
             _width: i32,
             _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: Uuid,
+            _width: i32,
+            _index: i32,
         ) -> Result<Option<String>, ServiceError> {
             Ok(None)
         }
@@ -1973,6 +2031,12 @@ mod tests {
                 .await
                 .map_err(db_err)
         }
+        async fn get_item_images(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<hermit_traits::options::ItemImageInfo>, ServiceError> {
+            Ok(vec![])
+        }
         async fn query_items(
             &self,
             _query: &hermit_traits::options::InternalItemsQuery,
@@ -2070,11 +2134,36 @@ mod tests {
         > {
             Ok(hermit_model::querying::QueryResult::default())
         }
+        async fn get_music_genres(
+            &self,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
+        async fn get_album_artists(
+            &self,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
         async fn get_query_filters_legacy(
             &self,
             _query: &hermit_traits::options::InternalItemsQuery,
         ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
             Ok(hermit_model::querying::QueryFiltersLegacy::default())
+        }
+        async fn get_media_stream_languages(
+            &self,
+            _stream_type: hermit_model::entities::MediaStreamType,
+            _query: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            Ok(Vec::new())
         }
         async fn queue_library_scan(&self) -> Result<(), ServiceError> {
             Ok(())

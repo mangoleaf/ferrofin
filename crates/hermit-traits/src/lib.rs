@@ -17,6 +17,7 @@
 //! so it is exempt from the 80% line-coverage gate; the `options` module (real
 //! logic) carries its own tests. Filled by the Wave 4 PortJob.
 
+pub mod activity;
 pub mod chapters;
 pub mod collections;
 pub mod configuration;
@@ -25,7 +26,9 @@ pub mod drawing;
 pub mod dto;
 pub mod error;
 pub mod events;
+pub mod filesystem;
 pub mod library;
+pub mod localization;
 pub mod media_encoding;
 pub mod media_segments;
 pub mod net;
@@ -37,6 +40,7 @@ pub mod session;
 pub mod stubs;
 pub mod subtitles;
 pub mod system;
+pub mod tasks;
 pub mod trickplay;
 pub mod tv;
 

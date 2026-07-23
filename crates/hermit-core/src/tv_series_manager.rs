@@ -382,6 +382,18 @@ mod tests {
         ) -> Result<Vec<hermit_model::dto::NameIdPair>, ServiceError> {
             Ok(Vec::new())
         }
+        async fn get_user_dto(
+            &self,
+            user: &UserEntity,
+            server_id: Option<String>,
+        ) -> Result<hermit_model::dto::UserDto, ServiceError> {
+            Ok(hermit_model::dto::UserDto {
+                id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
+                name: Some(user.username.clone()),
+                server_id,
+                ..hermit_model::dto::UserDto::default()
+            })
+        }
         async fn update_configuration(
             &self,
             _user_id: Uuid,
@@ -409,6 +421,12 @@ mod tests {
     impl LibraryManager for FakeLibraryManager {
         async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(self.items.get(&id).cloned())
+        }
+        async fn get_item_images(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<hermit_traits::options::ItemImageInfo>, ServiceError> {
+            Ok(vec![])
         }
         async fn query_items(
             &self,
@@ -520,11 +538,44 @@ mod tests {
                 Vec::new(),
             ))
         }
+        async fn get_music_genres(
+            &self,
+            _query: &InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::new(
+                None,
+                None,
+                Vec::new(),
+            ))
+        }
+        async fn get_album_artists(
+            &self,
+            _query: &InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            Ok(hermit_model::querying::QueryResult::new(
+                None,
+                None,
+                Vec::new(),
+            ))
+        }
         async fn get_query_filters_legacy(
             &self,
             _query: &InternalItemsQuery,
         ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
             Ok(hermit_model::querying::QueryFiltersLegacy::default())
+        }
+        async fn get_media_stream_languages(
+            &self,
+            _stream_type: hermit_model::entities::MediaStreamType,
+            _query: &InternalItemsQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            Ok(Vec::new())
         }
         async fn queue_library_scan(&self) -> Result<(), ServiceError> {
             Ok(())
@@ -621,6 +672,17 @@ mod tests {
         async fn update_configuration(
             &self,
             _config: &hermit_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<hermit_model::branding::BrandingOptions, ServiceError> {
+            Ok(hermit_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &hermit_model::branding::BrandingOptions,
         ) -> Result<(), ServiceError> {
             Ok(())
         }

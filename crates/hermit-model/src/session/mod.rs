@@ -570,3 +570,170 @@ pub fn transcode_reasons_unique_names(reasons: TranscodeReasons) -> Vec<&'static
         .map(|(_, name)| *name)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trips an enum through JSON and asserts it serializes to the given
+    /// PascalCase string literal.
+    fn assert_wire<T>(value: T, expected: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug + Copy,
+    {
+        let json = serde_json::to_value(value).unwrap();
+        assert_eq!(json, serde_json::Value::String(expected.to_owned()));
+        let back: T = serde_json::from_value(json).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn enum_defaults() {
+        assert_eq!(PlayMethod::default(), PlayMethod::Transcode);
+        assert_eq!(PlayCommand::default(), PlayCommand::PlayNow);
+        assert_eq!(PlaybackOrder::default(), PlaybackOrder::Default);
+        assert_eq!(RepeatMode::default(), RepeatMode::RepeatNone);
+        assert_eq!(PlaystateCommand::default(), PlaystateCommand::Stop);
+    }
+
+    #[test]
+    fn play_method_wire_names() {
+        assert_wire(PlayMethod::Transcode, "Transcode");
+        assert_wire(PlayMethod::DirectStream, "DirectStream");
+        assert_wire(PlayMethod::DirectPlay, "DirectPlay");
+    }
+
+    #[test]
+    fn play_command_wire_names() {
+        assert_wire(PlayCommand::PlayNow, "PlayNow");
+        assert_wire(PlayCommand::PlayNext, "PlayNext");
+        assert_wire(PlayCommand::PlayLast, "PlayLast");
+        assert_wire(PlayCommand::PlayInstantMix, "PlayInstantMix");
+        assert_wire(PlayCommand::PlayShuffle, "PlayShuffle");
+    }
+
+    #[test]
+    fn playback_order_and_repeat_mode_wire_names() {
+        assert_wire(PlaybackOrder::Default, "Default");
+        assert_wire(PlaybackOrder::Shuffle, "Shuffle");
+        assert_wire(RepeatMode::RepeatNone, "RepeatNone");
+        assert_wire(RepeatMode::RepeatAll, "RepeatAll");
+        assert_wire(RepeatMode::RepeatOne, "RepeatOne");
+    }
+
+    #[test]
+    fn playstate_command_wire_names() {
+        assert_wire(PlaystateCommand::Stop, "Stop");
+        assert_wire(PlaystateCommand::Pause, "Pause");
+        assert_wire(PlaystateCommand::Unpause, "Unpause");
+        assert_wire(PlaystateCommand::NextTrack, "NextTrack");
+        assert_wire(PlaystateCommand::PreviousTrack, "PreviousTrack");
+        assert_wire(PlaystateCommand::Seek, "Seek");
+        assert_wire(PlaystateCommand::Rewind, "Rewind");
+        assert_wire(PlaystateCommand::FastForward, "FastForward");
+        assert_wire(PlaystateCommand::PlayPause, "PlayPause");
+    }
+
+    #[test]
+    fn general_command_type_wire_names() {
+        assert_wire(GeneralCommandType::MoveUp, "MoveUp");
+        assert_wire(GeneralCommandType::SetVolume, "SetVolume");
+        assert_wire(GeneralCommandType::SetPlaybackOrder, "SetPlaybackOrder");
+    }
+
+    #[test]
+    fn session_message_type_wire_names() {
+        assert_wire(SessionMessageType::ForceKeepAlive, "ForceKeepAlive");
+        assert_wire(SessionMessageType::KeepAlive, "KeepAlive");
+        assert_wire(SessionMessageType::UserDataChanged, "UserDataChanged");
+    }
+
+    #[test]
+    fn transcode_reason_wire_names() {
+        assert_wire(
+            TranscodeReason::ContainerNotSupported,
+            "ContainerNotSupported",
+        );
+        assert_wire(
+            TranscodeReason::VideoRotationNotSupported,
+            "VideoRotationNotSupported",
+        );
+    }
+
+    #[test]
+    fn transcode_reason_set_serializes_as_json_array() {
+        let reasons = vec![
+            TranscodeReason::ContainerNotSupported,
+            TranscodeReason::AudioIsExternal,
+        ];
+        let json = serde_json::to_string(&reasons).unwrap();
+        assert_eq!(json, r#"["ContainerNotSupported","AudioIsExternal"]"#);
+        let back: Vec<TranscodeReason> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, reasons);
+    }
+
+    #[test]
+    fn every_transcode_reason_maps_to_a_single_bit() {
+        // Each reason must lift into exactly one flag, and that flag must be
+        // present in the ordered-names table.
+        let all = [
+            TranscodeReason::ContainerNotSupported,
+            TranscodeReason::VideoCodecNotSupported,
+            TranscodeReason::AudioCodecNotSupported,
+            TranscodeReason::SubtitleCodecNotSupported,
+            TranscodeReason::AudioIsExternal,
+            TranscodeReason::SecondaryAudioNotSupported,
+            TranscodeReason::VideoProfileNotSupported,
+            TranscodeReason::VideoLevelNotSupported,
+            TranscodeReason::VideoResolutionNotSupported,
+            TranscodeReason::VideoBitDepthNotSupported,
+            TranscodeReason::VideoFramerateNotSupported,
+            TranscodeReason::RefFramesNotSupported,
+            TranscodeReason::AnamorphicVideoNotSupported,
+            TranscodeReason::InterlacedVideoNotSupported,
+            TranscodeReason::AudioChannelsNotSupported,
+            TranscodeReason::AudioProfileNotSupported,
+            TranscodeReason::AudioSampleRateNotSupported,
+            TranscodeReason::AudioBitDepthNotSupported,
+            TranscodeReason::ContainerBitrateExceedsLimit,
+            TranscodeReason::VideoBitrateNotSupported,
+            TranscodeReason::AudioBitrateNotSupported,
+            TranscodeReason::UnknownVideoStreamInfo,
+            TranscodeReason::UnknownAudioStreamInfo,
+            TranscodeReason::DirectPlayError,
+            TranscodeReason::VideoRangeTypeNotSupported,
+            TranscodeReason::VideoCodecTagNotSupported,
+            TranscodeReason::StreamCountExceedsLimit,
+            TranscodeReason::VideoRotationNotSupported,
+        ];
+        for reason in all {
+            let flag = TranscodeReasons::from(reason);
+            assert_eq!(flag.bits().count_ones(), 1, "{reason:?} is not one bit");
+            let names = transcode_reasons_unique_names(flag);
+            assert_eq!(names.len(), 1, "{reason:?} not in ordered names");
+        }
+    }
+
+    #[test]
+    fn unique_names_are_ordered_by_ascending_bit() {
+        // StreamCountExceedsLimit is bit 26, VideoRangeTypeNotSupported is bit
+        // 24 — so the higher-numbered bit sorts later regardless of insertion.
+        let reasons = TranscodeReasons::CONTAINER_NOT_SUPPORTED
+            | TranscodeReasons::STREAM_COUNT_EXCEEDS_LIMIT
+            | TranscodeReasons::VIDEO_RANGE_TYPE_NOT_SUPPORTED;
+        let names = transcode_reasons_unique_names(reasons);
+        assert_eq!(
+            names,
+            vec![
+                "ContainerNotSupported",
+                "VideoRangeTypeNotSupported",
+                "StreamCountExceedsLimit",
+            ]
+        );
+    }
+
+    #[test]
+    fn unique_names_empty_for_empty_mask() {
+        assert!(transcode_reasons_unique_names(TranscodeReasons::empty()).is_empty());
+    }
+}

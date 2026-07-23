@@ -1191,3 +1191,276 @@ where
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_spatial_format_default_and_wire_names() {
+        assert_eq!(AudioSpatialFormat::default(), AudioSpatialFormat::None);
+        assert_eq!(
+            serde_json::to_value(AudioSpatialFormat::None).unwrap(),
+            "None"
+        );
+        assert_eq!(
+            serde_json::to_value(AudioSpatialFormat::DolbyAtmos).unwrap(),
+            "DolbyAtmos"
+        );
+        // DTS:X is renamed to "DTSX" on the wire.
+        assert_eq!(
+            serde_json::to_value(AudioSpatialFormat::Dtsx).unwrap(),
+            "DTSX"
+        );
+        let back: AudioSpatialFormat = serde_json::from_str("\"DTSX\"").unwrap();
+        assert_eq!(back, AudioSpatialFormat::Dtsx);
+    }
+
+    #[test]
+    fn metadata_provider_as_name_and_all_are_consistent() {
+        // `all()` and `as_name()` must agree, and every name must be distinct.
+        let providers = MetadataProvider::all();
+        assert_eq!(providers.len(), 17);
+        let mut seen = std::collections::HashSet::new();
+        for p in providers {
+            assert!(seen.insert(p.as_name()), "duplicate name for {p:?}");
+        }
+        assert_eq!(MetadataProvider::Imdb.as_name(), "Imdb");
+        assert_eq!(
+            MetadataProvider::MusicBrainzRecording.as_name(),
+            "MusicBrainzRecording"
+        );
+    }
+
+    #[test]
+    fn metadata_provider_discriminants_have_gaps() {
+        // The discriminants mirror upstream verbatim, including gaps.
+        assert_eq!(MetadataProvider::Custom as i32, 0);
+        assert_eq!(MetadataProvider::Imdb as i32, 2);
+        assert_eq!(MetadataProvider::MusicBrainzRecording as i32, 20);
+    }
+
+    #[test]
+    fn chapter_info_round_trips_and_pascal_case() {
+        let info = ChapterInfo {
+            start_position_ticks: 42,
+            name: Some("Intro".to_owned()),
+            image_path: Some("/img".to_owned()),
+            image_date_modified: chrono::DateTime::<chrono::Utc>::default(),
+            image_tag: Some("tag".to_owned()),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["StartPositionTicks"], 42);
+        assert_eq!(json["Name"], "Intro");
+        assert_eq!(json["ImagePath"], "/img");
+        assert_eq!(json["ImageTag"], "tag");
+        let back: ChapterInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info, back);
+    }
+
+    #[test]
+    fn chapter_info_omits_none() {
+        let json = serde_json::to_value(ChapterInfo::default()).unwrap();
+        assert!(json.get("Name").is_none());
+        assert!(json.get("ImagePath").is_none());
+        assert!(json.get("ImageTag").is_none());
+    }
+
+    #[test]
+    fn media_attachment_round_trips() {
+        let att = MediaAttachment {
+            codec: Some("srt".to_owned()),
+            index: 3,
+            file_name: Some("sub.srt".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            ..MediaAttachment::default()
+        };
+        let json = serde_json::to_value(&att).unwrap();
+        assert_eq!(json["Codec"], "srt");
+        assert_eq!(json["Index"], 3);
+        assert_eq!(json["FileName"], "sub.srt");
+        assert_eq!(json["MimeType"], "text/plain");
+        let back: MediaAttachment = serde_json::from_value(json).unwrap();
+        assert_eq!(att, back);
+    }
+
+    #[test]
+    fn media_url_round_trips() {
+        let url = MediaUrl {
+            url: Some("http://x".to_owned()),
+            name: Some("home".to_owned()),
+        };
+        let json = serde_json::to_value(&url).unwrap();
+        assert_eq!(json["Url"], "http://x");
+        assert_eq!(json["Name"], "home");
+        let back: MediaUrl = serde_json::from_value(json).unwrap();
+        assert_eq!(url, back);
+    }
+
+    #[test]
+    fn parental_rating_score_new_and_camel_case() {
+        let score = ParentalRatingScore::new(13, Some(4));
+        assert_eq!(score.score, 13);
+        assert_eq!(score.sub_score, Some(4));
+        let json = serde_json::to_value(score).unwrap();
+        // camelCase renames on this type.
+        assert_eq!(json["score"], 13);
+        assert_eq!(json["subScore"], 4);
+        let back: ParentalRatingScore = serde_json::from_value(json).unwrap();
+        assert_eq!(score, back);
+    }
+
+    #[test]
+    fn parental_rating_score_omits_sub_score_when_none() {
+        let json = serde_json::to_value(ParentalRatingScore::new(0, None)).unwrap();
+        assert!(json.get("subScore").is_none());
+    }
+
+    #[test]
+    fn parental_rating_new_mirrors_score_into_value() {
+        let score = ParentalRatingScore::new(18, None);
+        let rating = ParentalRating::new("R".to_owned(), Some(score));
+        assert_eq!(rating.name, "R");
+        assert_eq!(rating.value, Some(18));
+        assert_eq!(rating.rating_score, Some(score));
+
+        let none = ParentalRating::new("NR".to_owned(), None);
+        assert_eq!(none.value, None);
+        assert_eq!(none.rating_score, None);
+        let json = serde_json::to_value(&none).unwrap();
+        assert_eq!(json["Name"], "NR");
+        assert!(json.get("Value").is_none());
+    }
+
+    #[test]
+    fn parental_rating_entry_and_system_round_trip() {
+        let entry = ParentalRatingEntry {
+            rating_strings: vec!["PG-13".to_owned()],
+            rating_score: ParentalRatingScore::new(13, None),
+        };
+        let system = ParentalRatingSystem {
+            country_code: "US".to_owned(),
+            supports_sub_scores: false,
+            ratings: Some(vec![entry.clone()]),
+        };
+        let json = serde_json::to_value(&system).unwrap();
+        assert_eq!(json["countryCode"], "US");
+        assert_eq!(json["supportsSubScores"], false);
+        assert_eq!(json["ratings"][0]["ratingStrings"][0], "PG-13");
+        let back: ParentalRatingSystem = serde_json::from_value(json).unwrap();
+        assert_eq!(system, back);
+
+        let entry_back: ParentalRatingEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(entry, entry_back);
+    }
+
+    #[test]
+    fn playlist_user_permissions_new_and_pascal_case() {
+        let uid = Uuid::from_u128(9);
+        let perm = PlaylistUserPermissions::new(uid, true);
+        assert_eq!(perm.user_id, uid);
+        assert!(perm.can_edit);
+        let json = serde_json::to_value(perm).unwrap();
+        assert!(json.get("UserId").is_some());
+        assert_eq!(json["CanEdit"], true);
+        let back: PlaylistUserPermissions = serde_json::from_value(json).unwrap();
+        assert_eq!(perm, back);
+    }
+
+    #[test]
+    fn library_update_info_compute_is_empty() {
+        let empty = LibraryUpdateInfo::default();
+        assert!(empty.compute_is_empty());
+
+        let non_empty = LibraryUpdateInfo {
+            items_added: vec!["x".to_owned()],
+            ..LibraryUpdateInfo::default()
+        };
+        assert!(!non_empty.compute_is_empty());
+
+        let json = serde_json::to_value(&non_empty).unwrap();
+        assert_eq!(json["ItemsAdded"][0], "x");
+        assert_eq!(json["IsEmpty"], false);
+        let back: LibraryUpdateInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(non_empty, back);
+    }
+
+    #[test]
+    fn virtual_folder_info_round_trips_and_omits_none() {
+        let info = VirtualFolderInfo {
+            name: Some("Movies".to_owned()),
+            locations: vec!["/movies".to_owned()],
+            refresh_progress: Some(0.5),
+            ..VirtualFolderInfo::default()
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["Name"], "Movies");
+        assert_eq!(json["Locations"][0], "/movies");
+        assert_eq!(json["RefreshProgress"], 0.5);
+        assert!(json.get("ItemId").is_none());
+        let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info, back);
+    }
+
+    /// A minimal [`IHasProviderIds`] implementor to exercise the trait's
+    /// mutable accessors (the free-function extension helpers are covered by
+    /// the integration tests).
+    #[derive(Default)]
+    struct Bag {
+        ids: Option<HashMap<String, String>>,
+    }
+
+    impl IHasProviderIds for Bag {
+        fn provider_ids(&self) -> Option<&HashMap<String, String>> {
+            self.ids.as_ref()
+        }
+        fn provider_ids_mut(&mut self) -> &mut HashMap<String, String> {
+            self.ids.get_or_insert_with(HashMap::new)
+        }
+        fn provider_ids_opt_mut(&mut self) -> &mut Option<HashMap<String, String>> {
+            &mut self.ids
+        }
+    }
+
+    #[test]
+    fn set_provider_id_error_variants() {
+        let mut bag = Bag::default();
+        assert_eq!(
+            set_provider_id(&mut bag, "  ", "v"),
+            Err(SetProviderIdError::NullOrWhitespace)
+        );
+        assert_eq!(
+            set_provider_id(&mut bag, "Imdb", "  "),
+            Err(SetProviderIdError::NullOrWhitespace)
+        );
+        assert_eq!(
+            set_provider_id(&mut bag, "na=me", "v"),
+            Err(SetProviderIdError::ContainsEquals)
+        );
+        assert!(set_provider_id(&mut bag, "imdb", "tt1").is_ok());
+        // Name is canonicalized to the MetadataProvider casing.
+        assert_eq!(get_provider_id(&bag, "Imdb").as_deref(), Some("tt1"));
+    }
+
+    #[test]
+    fn provider_id_helpers_via_metadata_provider() {
+        let mut bag = Bag::default();
+        assert!(try_set_provider_id_for(
+            &mut bag,
+            MetadataProvider::Tmdb,
+            Some("42")
+        ));
+        assert!(has_provider_id_for(&bag, MetadataProvider::Tmdb));
+        assert_eq!(
+            try_get_provider_id_for(&bag, MetadataProvider::Tmdb),
+            Some("42")
+        );
+        assert_eq!(
+            get_provider_id_for(&bag, MetadataProvider::Tmdb).as_deref(),
+            Some("42")
+        );
+        remove_provider_id_for(&mut bag, MetadataProvider::Tmdb);
+        assert!(!has_provider_id_for(&bag, MetadataProvider::Tmdb));
+    }
+}

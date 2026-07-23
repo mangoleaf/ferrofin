@@ -15,36 +15,81 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
-use hermit_db::entities::security::DeviceEntity;
-use hermit_db::entities::users::UserEntity;
-use hermit_model::configuration::{ServerConfiguration, UserConfiguration};
-use hermit_model::data::CollectionType;
-use hermit_model::dto::{
-    BaseItemDto, ItemCounts, MediaSourceInfo, NameIdPair, SessionInfoDto, UpdateUserItemDataDto,
-    UserItemDataDto,
+use hermit_db::entities::display_preferences::{
+    DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
+use hermit_db::entities::playback::TrickplayInfoEntity;
+use hermit_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
+use hermit_db::entities::users::UserEntity;
+use hermit_model::activity::ActivityLogEntry;
+use hermit_model::branding::BrandingOptions;
+use hermit_model::configuration::{
+    MetadataOptions, MetadataPluginSummary, ServerConfiguration, UserConfiguration,
+};
+use hermit_model::data::CollectionType;
+use hermit_model::devices::DeviceInfo;
+use hermit_model::dto::{
+    BaseItemDto, ClientCapabilitiesDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair,
+    SessionInfoDto, UpdateUserItemDataDto, UserDto, UserItemDataDto,
+};
+use hermit_model::entities::ImageType;
+use hermit_model::entities_media::PlaylistUserPermissions;
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
+use hermit_model::entities_media::{ParentalRating, ParentalRatingScore};
+use hermit_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
+use hermit_model::io::FileSystemEntryInfo;
+use hermit_model::lyrics::{LyricDto, RemoteLyricInfoDto};
 use hermit_model::media_info::LiveStreamRequest;
+use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+use hermit_model::playlists::{
+    PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
+    PlaylistUserUpdateRequest,
+};
+use hermit_model::providers::{
+    ExternalIdInfo, ExternalUrl, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
+};
+use hermit_model::providers::{LyricProviderInfo, RemoteSubtitleInfo, SubtitleProviderInfo};
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
+use hermit_model::quick_connect::QuickConnectResult;
+use hermit_model::search::{SearchHint, SearchQuery};
+use hermit_model::security::AuthenticationInfo;
 use hermit_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
 };
 use hermit_model::system::{PublicSystemInfo, SystemInfo, SystemStorageInfo};
+use hermit_model::tasks::TaskInfo;
 use hermit_model::users::UserPolicy;
-use hermit_traits::configuration::ServerConfigurationManager;
+use hermit_traits::activity::{ActivityLogQuery, ActivityManager};
+use hermit_traits::collections::{CollectionCreationOptions, CollectionManager, PlaylistManager};
+use hermit_traits::configuration::{DisplayPreferencesManager, ServerConfigurationManager};
+use hermit_traits::devices::{DeviceManager, DeviceQuery};
 use hermit_traits::dto::DtoService;
 use hermit_traits::error::ServiceError;
+use hermit_traits::events::ClientEventLogger;
+use hermit_traits::filesystem::{FileMetadata, FileSystem};
 use hermit_traits::library::{
-    LibraryManager, MediaSourceManager, UserDataManager, UserManager, UserViewManager,
+    LibraryManager, MediaSourceManager, MusicManager, SearchManager, SearchResult,
+    SimilarItemsManager, SimilarItemsRecommendation, UserDataManager, UserManager, UserViewManager,
 };
+use hermit_traits::localization::LocalizationManager;
+use hermit_traits::media_segments::{MediaSegmentManager, MediaSegmentProviderInfo};
 use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use hermit_traits::persistence::ItemWithCounts;
+use hermit_traits::providers::{
+    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+};
+use hermit_traits::security::{ApiKeyManager, QuickConnect};
 use hermit_traits::session::{AuthenticationRequest, SessionManager};
+use hermit_traits::stubs::LyricManager;
+use hermit_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
 use hermit_traits::system::{ServerApplicationHost, ServerApplicationPaths, SystemManager};
+use hermit_traits::tasks::TaskManager;
+use hermit_traits::trickplay::TrickplayManager;
+use hermit_traits::tv::{NextUpQuery, TvSeriesManager};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -66,10 +111,127 @@ pub fn fake_state() -> AppState {
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
         Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
         Arc::new(FakeAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
     )
+}
+
+/// Builds a minimal [`BaseItemEntity`] with the given id, name, and type key.
+///
+/// Every other column is a neutral zero/`None`, so integration tests that only
+/// need an item to *exist* (or to carry a `Path`/`Width`) don't repeat the full
+/// ~80-field literal. Set the fields a test cares about on the returned value.
+#[must_use]
+pub fn minimal_base_item(id: Uuid, name: &str, type_key: &str) -> BaseItemEntity {
+    BaseItemEntity {
+        id: id.to_string(),
+        album: None,
+        album_artists: None,
+        artists: None,
+        audio: None,
+        channel_id: None,
+        clean_name: None,
+        community_rating: None,
+        critic_rating: None,
+        custom_rating: None,
+        data: None,
+        date_created: None,
+        date_last_media_added: None,
+        date_last_refreshed: None,
+        date_last_saved: None,
+        date_modified: None,
+        end_date: None,
+        episode_title: None,
+        external_id: None,
+        external_series_id: None,
+        external_service_id: None,
+        extra_type: None,
+        forced_sort_name: None,
+        genres: None,
+        height: None,
+        index_number: None,
+        inherited_parental_rating_sub_value: None,
+        inherited_parental_rating_value: None,
+        is_folder: false,
+        is_in_mixed_folder: false,
+        is_locked: false,
+        is_movie: false,
+        is_repeat: false,
+        is_series: false,
+        is_virtual_item: false,
+        lufs: None,
+        media_type: None,
+        name: Some(name.to_owned()),
+        normalization_gain: None,
+        official_rating: None,
+        original_language: None,
+        original_title: None,
+        overview: None,
+        owner_id: None,
+        parent_id: None,
+        parent_index_number: None,
+        path: None,
+        preferred_metadata_country_code: None,
+        preferred_metadata_language: None,
+        premiere_date: None,
+        presentation_unique_key: None,
+        primary_version_id: None,
+        production_locations: None,
+        production_year: None,
+        run_time_ticks: None,
+        season_id: None,
+        season_name: None,
+        series_id: None,
+        series_name: None,
+        series_presentation_unique_key: None,
+        show_id: None,
+        size: None,
+        sort_name: None,
+        start_date: None,
+        studios: None,
+        tagline: None,
+        tags: None,
+        top_parent_id: None,
+        total_bitrate: None,
+        type_: type_key.to_owned(),
+        unrated_type: None,
+        width: None,
+    }
+}
+
+/// A fake [`TvSeriesManager`]; every method is unused by INFRA-level tests.
+pub struct FakeTvSeries;
+
+#[async_trait]
+impl TvSeriesManager for FakeTvSeries {
+    async fn get_next_up(
+        &self,
+        _query: &NextUpQuery,
+        _options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        unimplemented!("fake")
+    }
 }
 
 /// A fake [`AuthorizationContext`] that always resolves to an anonymous,
@@ -186,10 +348,29 @@ impl LibraryManager for FakeLibrary {
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_music_genres(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_album_artists(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn get_query_filters_legacy(
         &self,
         _query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_media_stream_languages(
+        &self,
+        _stream_type: hermit_model::entities::MediaStreamType,
+        _query: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
         unimplemented!("fake")
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
@@ -262,6 +443,13 @@ impl UserManager for FakeUsers {
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_user_dto(
+        &self,
+        _user: &UserEntity,
+        _server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn update_configuration(
         &self,
         _user_id: Uuid,
@@ -331,6 +519,21 @@ impl UserDataManager for FakeUserData {
         _item_id: Uuid,
         _reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn mark_played(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn mark_unplayed(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError> {
         unimplemented!("fake")
     }
     async fn reset_playback_stream_selections(
@@ -714,6 +917,175 @@ impl ServerConfigurationManager for FakeConfig {
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(&self, _branding: &BrandingOptions) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`ProviderManager`]; every method is unused by INFRA-level tests.
+pub struct FakeProviders;
+
+#[async_trait]
+impl ProviderManager for FakeProviders {
+    async fn queue_refresh(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+        _priority: RefreshPriority,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn refresh_full_item(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn refresh_single_item(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+    ) -> Result<ItemUpdateType, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_image_from_url(
+        &self,
+        _item_id: Uuid,
+        _url: &str,
+        _image_type: ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_image(
+        &self,
+        _item_id: Uuid,
+        _content: &[u8],
+        _mime_type: &str,
+        _image_type: ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_available_remote_images(
+        &self,
+        _item_id: Uuid,
+        _query: &RemoteImageQuery,
+    ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_remote_image_provider_info(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ImageProviderInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_metadata(
+        &self,
+        _item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_external_id_infos(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ExternalIdInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_all_metadata_plugins(&self) -> Result<Vec<MetadataPluginSummary>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_metadata_options(&self, _item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`MusicManager`]; every method is unused by INFRA-level tests.
+pub struct FakeMusic;
+
+#[async_trait]
+impl MusicManager for FakeMusic {
+    async fn get_instant_mix_from_item(
+        &self,
+        _item_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_instant_mix_from_artist(
+        &self,
+        _artist_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_instant_mix_from_genres(
+        &self,
+        _genres: &[String],
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`SimilarItemsManager`]; every method is unused by INFRA-level tests.
+pub struct FakeSimilarItems;
+
+#[async_trait]
+impl SimilarItemsManager for FakeSimilarItems {
+    async fn get_similar_items(
+        &self,
+        _item_id: Uuid,
+        _exclude_artist_ids: &[Uuid],
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+        _limit: Option<i32>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_movie_recommendations(
+        &self,
+        _user_id: Option<Uuid>,
+        _parent_id: Uuid,
+        _category_limit: i32,
+        _item_limit: i32,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`SearchManager`]; every method is unused by INFRA-level tests.
+pub struct FakeSearch;
+
+#[async_trait]
+impl SearchManager for FakeSearch {
+    async fn get_search_hints(
+        &self,
+        _query: &SearchQuery,
+    ) -> Result<QueryResult<SearchHint>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_search_results(
+        &self,
+        _query: &SearchQuery,
+    ) -> Result<Vec<SearchResult>, ServiceError> {
+        unimplemented!("fake")
+    }
 }
 
 /// A fake [`DtoService`]; every method is unused by INFRA-level tests.
@@ -753,6 +1125,567 @@ impl DtoService for FakeDto {
         _tagged_item_ids: Option<&[Uuid]>,
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`QuickConnect`]; every method is unused by INFRA-level tests.
+pub struct FakeQuickConnect;
+
+#[async_trait]
+impl QuickConnect for FakeQuickConnect {
+    async fn is_enabled(&self) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn try_connect(
+        &self,
+        _authorization_info: &AuthorizationInfo,
+    ) -> Result<QuickConnectResult, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn check_request_status(
+        &self,
+        _secret: &str,
+    ) -> Result<QuickConnectResult, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`PlaylistManager`]; every method is unused by INFRA-level tests.
+pub struct FakePlaylists;
+
+#[async_trait]
+impl PlaylistManager for FakePlaylists {
+    async fn get_playlist_for_user(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_playlist(
+        &self,
+        _request: &PlaylistCreationRequest,
+    ) -> Result<PlaylistCreationResult, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_playlist(&self, _request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_playlist_items(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn add_user_to_shares(
+        &self,
+        _request: &PlaylistUserUpdateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn remove_user_from_shares(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+        _share: &PlaylistUserPermissions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn add_item_to_playlist(
+        &self,
+        _playlist_id: Uuid,
+        _item_ids: &[Uuid],
+        _position: Option<i32>,
+        _user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn remove_item_from_playlist(
+        &self,
+        _playlist_id: &str,
+        _entry_ids: &[String],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn move_item(
+        &self,
+        _playlist_id: &str,
+        _entry_id: &str,
+        _new_index: i32,
+        _calling_user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`CollectionManager`]; every method is unused by INFRA-level tests.
+pub struct FakeCollections;
+
+#[async_trait]
+impl CollectionManager for FakeCollections {
+    async fn create_collection(
+        &self,
+        _options: &CollectionCreationOptions,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn add_to_collection(
+        &self,
+        _collection_id: Uuid,
+        _item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn remove_from_collection(
+        &self,
+        _collection_id: Uuid,
+        _item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_collections_containing_item(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_collections_folder(
+        &self,
+        _create_if_needed: bool,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`SubtitleManager`]; every method is unused by INFRA-level tests.
+pub struct FakeSubtitles;
+
+#[async_trait]
+impl SubtitleManager for FakeSubtitles {
+    async fn search_subtitles(
+        &self,
+        _request: &SubtitleSearchRequest,
+    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn download_subtitles(
+        &self,
+        _item_id: Uuid,
+        _subtitle_id: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn upload_subtitle(
+        &self,
+        _item_id: Uuid,
+        _response: &SubtitleResponse,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<SubtitleProviderInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`LyricManager`]; every method is unused by INFRA-level tests.
+pub struct FakeLyrics;
+
+#[async_trait]
+impl LyricManager for FakeLyrics {
+    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn download_lyrics(
+        &self,
+        _item_id: Uuid,
+        _lyric_id: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_lyric(
+        &self,
+        _item_id: Uuid,
+        _format: &str,
+        _lyrics: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<LyricProviderInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`MediaSegmentManager`]; every method is unused by INFRA-level tests.
+pub struct FakeMediaSegments;
+
+#[async_trait]
+impl MediaSegmentManager for FakeMediaSegments {
+    async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+        _segment_provider_id: &str,
+    ) -> Result<MediaSegmentDto, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_segment(&self, _segment_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_segments(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_segments(
+        &self,
+        _item_id: Uuid,
+        _type_filter: Option<&[MediaSegmentType]>,
+        _filter_by_provider: bool,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`TrickplayManager`]; every method is unused by INFRA-level tests.
+pub struct FakeTrickplay;
+
+#[async_trait]
+impl TrickplayManager for FakeTrickplay {
+    async fn refresh_trickplay_data(
+        &self,
+        _item_id: Uuid,
+        _replace: bool,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_trickplay_resolutions(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<HashMap<i32, TrickplayInfoEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_trickplay_items(
+        &self,
+        _limit: i32,
+        _offset: i32,
+    ) -> Result<Vec<TrickplayInfoEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_trickplay_info(&self, _info: &TrickplayInfoEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_trickplay_manifest(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_hls_playlist(
+        &self,
+        _item_id: Uuid,
+        _width: i32,
+        _api_key: Option<&str>,
+    ) -> Result<Option<String>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_trickplay_tile_path(
+        &self,
+        _item_id: Uuid,
+        _width: i32,
+        _index: i32,
+    ) -> Result<Option<String>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`DeviceManager`]; every method is unused by INFRA-level tests.
+pub struct FakeDevices;
+
+#[async_trait]
+impl DeviceManager for FakeDevices {
+    async fn create_device(&self, _device: &DeviceEntity) -> Result<DeviceEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn save_capabilities(
+        &self,
+        _device_id: &str,
+        _capabilities: &ClientCapabilities,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_capabilities(
+        &self,
+        _device_id: Option<&str>,
+    ) -> Result<ClientCapabilities, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_device(&self, _id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_devices(
+        &self,
+        _query: &DeviceQuery,
+    ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_device_infos(
+        &self,
+        _query: &DeviceQuery,
+    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_devices_for_user(
+        &self,
+        _user_id: Option<Uuid>,
+    ) -> Result<QueryResult<DeviceInfoDto>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_device(&self, _device: &DeviceEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_device(&self, _device: &DeviceEntity) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn can_access_device(
+        &self,
+        _user: &UserEntity,
+        _device_id: &str,
+    ) -> Result<bool, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_device_options(
+        &self,
+        _device_id: &str,
+        _device_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_device_options(
+        &self,
+        _device_id: &str,
+    ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn to_client_capabilities_dto(
+        &self,
+        _capabilities: &ClientCapabilities,
+    ) -> Result<ClientCapabilitiesDto, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`ClientEventLogger`]; unused by INFRA-level tests.
+pub struct FakeClientEventLogger;
+
+#[async_trait]
+impl ClientEventLogger for FakeClientEventLogger {
+    async fn write_document(
+        &self,
+        _client_name: &str,
+        _client_version: &str,
+        _contents: &[u8],
+    ) -> Result<String, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`ApiKeyManager`]; unused by INFRA-level tests.
+pub struct FakeApiKeys;
+
+#[async_trait]
+impl ApiKeyManager for FakeApiKeys {
+    async fn get_api_keys(&self) -> Result<Vec<AuthenticationInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_api_key(&self, _name: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn delete_api_key(&self, _access_token: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`LocalizationManager`]; every method is unused by INFRA-level tests.
+pub struct FakeLocalization;
+
+impl LocalizationManager for FakeLocalization {
+    fn get_cultures(&self) -> Vec<CultureDto> {
+        unimplemented!("fake")
+    }
+    fn get_countries(&self) -> Vec<CountryInfo> {
+        unimplemented!("fake")
+    }
+    fn get_parental_ratings(&self) -> Vec<ParentalRating> {
+        unimplemented!("fake")
+    }
+    fn get_localization_options(&self) -> Vec<LocalizationOption> {
+        unimplemented!("fake")
+    }
+    fn get_rating_score(
+        &self,
+        _rating: &str,
+        _country_code: Option<&str>,
+    ) -> Option<ParentalRatingScore> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`DisplayPreferencesManager`]; every method is unused by INFRA-level tests.
+pub struct FakeDisplayPreferences;
+
+#[async_trait]
+impl DisplayPreferencesManager for FakeDisplayPreferences {
+    async fn get_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<DisplayPreferencesEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn list_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _client: &str,
+    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn list_custom_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<HashMap<String, Option<String>>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn set_custom_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+        _custom_preferences: &HashMap<String, Option<String>>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_display_preferences(
+        &self,
+        _display_preferences: &DisplayPreferencesEntity,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_item_display_preferences(
+        &self,
+        _item_display_preferences: &ItemDisplayPreferencesEntity,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`ActivityManager`]; every method is unused by INFRA-level tests.
+pub struct FakeActivity;
+
+#[async_trait]
+impl ActivityManager for FakeActivity {
+    async fn get_paged_result(
+        &self,
+        _query: &ActivityLogQuery,
+    ) -> Result<QueryResult<ActivityLogEntry>, ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`TaskManager`]; every method is unused by INFRA-level tests.
+pub struct FakeTasks;
+
+#[async_trait]
+impl TaskManager for FakeTasks {
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_task(&self, _task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn start_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// A fake [`FileSystem`]; every method is unused by INFRA-level tests.
+pub struct FakeFileSystem;
+
+impl FileSystem for FakeFileSystem {
+    fn get_file_system_entries(&self, _path: &str) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("fake")
+    }
+    fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("fake")
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        unimplemented!("fake")
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        unimplemented!("fake")
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        unimplemented!("fake")
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
         unimplemented!("fake")
     }
 }

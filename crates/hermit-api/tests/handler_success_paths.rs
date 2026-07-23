@@ -30,7 +30,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
-use hermit_api::test_support::{FakeConfig, FakeSystem, FakeUserData};
+use hermit_api::test_support::{
+    FakeConfig, FakeMusic, FakeSearch, FakeSimilarItems, FakeSystem, FakeUserData,
+};
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::dto::{BaseItemDto, MediaSourceInfo, SessionInfoDto};
@@ -201,6 +203,18 @@ impl UserManager for OkUsers {
     ) -> Result<Vec<hermit_model::dto::NameIdPair>, ServiceError> {
         unimplemented!()
     }
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        server_id: Option<String>,
+    ) -> Result<hermit_model::dto::UserDto, ServiceError> {
+        Ok(hermit_model::dto::UserDto {
+            id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
+            name: Some(user.username.clone()),
+            server_id,
+            ..hermit_model::dto::UserDto::default()
+        })
+    }
     async fn update_configuration(
         &self,
         _user_id: Uuid,
@@ -348,14 +362,14 @@ impl LibraryManager for OkLibrary {
         _items: &[BaseItemEntity],
         _parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
-        unimplemented!()
+        Ok(())
     }
     async fn delete_item(
         &self,
         _id: Uuid,
         _options: &hermit_traits::options::DeleteOptions,
     ) -> Result<(), ServiceError> {
-        unimplemented!()
+        Ok(())
     }
     async fn get_people(
         &self,
@@ -376,7 +390,11 @@ impl LibraryManager for OkLibrary {
         &self,
         _query: &InternalItemsQuery,
     ) -> Result<hermit_model::dto::ItemCounts, ServiceError> {
-        unimplemented!()
+        Ok(hermit_model::dto::ItemCounts {
+            movie_count: 3,
+            series_count: 1,
+            ..hermit_model::dto::ItemCounts::default()
+        })
     }
     async fn get_genres(
         &self,
@@ -396,10 +414,29 @@ impl LibraryManager for OkLibrary {
     ) -> Result<QueryResult<hermit_traits::persistence::ItemWithCounts>, ServiceError> {
         unimplemented!()
     }
+    async fn get_music_genres(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<hermit_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_album_artists(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<hermit_traits::persistence::ItemWithCounts>, ServiceError> {
+        unimplemented!()
+    }
     async fn get_query_filters_legacy(
         &self,
         _query: &InternalItemsQuery,
     ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_media_stream_languages(
+        &self,
+        _stream_type: hermit_model::entities::MediaStreamType,
+        _query: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
         unimplemented!()
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
@@ -754,9 +791,29 @@ fn ok_state(item_id: Uuid, media_path: &str) -> AppState {
         // FakeAppHost is fine — handlers under test never call it.
         Arc::new(hermit_api::test_support::FakeAppHost),
         Arc::new(FakeConfig),
+        Arc::new(hermit_api::test_support::FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
         Arc::new(OkDto),
         Arc::new(OkAuthContext),
         Arc::new(OkAuthService),
+        Arc::new(hermit_api::test_support::FakeQuickConnect),
+        Arc::new(hermit_api::test_support::FakePlaylists),
+        Arc::new(hermit_api::test_support::FakeCollections),
+        Arc::new(hermit_api::test_support::FakeTvSeries),
+        Arc::new(hermit_api::test_support::FakeSubtitles),
+        Arc::new(hermit_api::test_support::FakeLyrics),
+        Arc::new(hermit_api::test_support::FakeMediaSegments),
+        Arc::new(hermit_api::test_support::FakeTrickplay),
+        Arc::new(hermit_api::test_support::FakeDevices),
+        Arc::new(hermit_api::test_support::FakeClientEventLogger),
+        Arc::new(hermit_api::test_support::FakeApiKeys),
+        Arc::new(hermit_api::test_support::FakeLocalization),
+        Arc::new(hermit_api::test_support::FakeDisplayPreferences),
+        Arc::new(hermit_api::test_support::FakeActivity),
+        Arc::new(hermit_api::test_support::FakeFileSystem),
+        Arc::new(hermit_api::test_support::FakeTasks),
     )
 }
 
@@ -1064,4 +1121,412 @@ async fn item_image_bad_type_is_400() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- Batch 2: item writes/delete + ancestors/counts ---------------------------
+
+/// A [`ProviderManager`] that records the last queued refresh so the
+/// `POST /Items/{itemId}/Refresh` handler can be observed end-to-end.
+struct RecordingProviders {
+    queued: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+}
+
+#[async_trait]
+impl hermit_traits::providers::ProviderManager for RecordingProviders {
+    async fn queue_refresh(
+        &self,
+        item_id: Uuid,
+        _options: &hermit_traits::providers::MetadataRefreshOptions,
+        _priority: hermit_traits::providers::RefreshPriority,
+    ) -> Result<(), ServiceError> {
+        self.queued.lock().unwrap().push(item_id);
+        Ok(())
+    }
+    async fn refresh_full_item(
+        &self,
+        _item_id: Uuid,
+        _options: &hermit_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn refresh_single_item(
+        &self,
+        _item_id: Uuid,
+        _options: &hermit_traits::providers::MetadataRefreshOptions,
+    ) -> Result<hermit_traits::providers::ItemUpdateType, ServiceError> {
+        unimplemented!()
+    }
+    async fn save_image_from_url(
+        &self,
+        _item_id: Uuid,
+        _url: &str,
+        _image_type: hermit_model::entities::ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn save_image(
+        &self,
+        _item_id: Uuid,
+        _content: &[u8],
+        _mime_type: &str,
+        _image_type: hermit_model::entities::ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_available_remote_images(
+        &self,
+        _item_id: Uuid,
+        _query: &hermit_model::providers::RemoteImageQuery,
+    ) -> Result<Vec<hermit_model::providers::RemoteImageInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_remote_image_provider_info(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<hermit_model::providers::ImageProviderInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn save_metadata(
+        &self,
+        _item_id: Uuid,
+        _update_type: hermit_traits::providers::ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_external_urls(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<hermit_model::providers::ExternalUrl>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_external_id_infos(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<hermit_model::providers::ExternalIdInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_all_metadata_plugins(
+        &self,
+    ) -> Result<Vec<hermit_model::configuration::MetadataPluginSummary>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_metadata_options(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<hermit_model::configuration::MetadataOptions, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// Builds an [`AppState`] like [`ok_state`] but with a [`RecordingProviders`] so
+/// the refresh handler's queue call is observable.
+fn state_with_providers(
+    item_id: Uuid,
+    queued: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+) -> AppState {
+    AppState::new(
+        Arc::new(OkLibrary { item_id }),
+        Arc::new(OkUsers),
+        Arc::new(OkUserViews { item_id }),
+        Arc::new(FakeUserData),
+        Arc::new(OkMediaSources {
+            path: String::new(),
+        }),
+        Arc::new(OkSessions),
+        Arc::new(FakeSystem),
+        Arc::new(hermit_api::test_support::FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(RecordingProviders { queued }),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(OkDto),
+        Arc::new(OkAuthContext),
+        Arc::new(OkAuthService),
+        Arc::new(hermit_api::test_support::FakeQuickConnect),
+        Arc::new(hermit_api::test_support::FakePlaylists),
+        Arc::new(hermit_api::test_support::FakeCollections),
+        Arc::new(hermit_api::test_support::FakeTvSeries),
+        Arc::new(hermit_api::test_support::FakeSubtitles),
+        Arc::new(hermit_api::test_support::FakeLyrics),
+        Arc::new(hermit_api::test_support::FakeMediaSegments),
+        Arc::new(hermit_api::test_support::FakeTrickplay),
+        Arc::new(hermit_api::test_support::FakeDevices),
+        Arc::new(hermit_api::test_support::FakeClientEventLogger),
+        Arc::new(hermit_api::test_support::FakeApiKeys),
+        Arc::new(hermit_api::test_support::FakeLocalization),
+        Arc::new(hermit_api::test_support::FakeDisplayPreferences),
+        Arc::new(hermit_api::test_support::FakeActivity),
+        Arc::new(hermit_api::test_support::FakeFileSystem),
+        Arc::new(hermit_api::test_support::FakeTasks),
+    )
+}
+
+/// A `GET /Items` request with a wide filter set is accepted (comma/pipe
+/// parameters parse) and returns the query result.
+#[tokio::test]
+async fn get_items_with_filters_returns_query_result() {
+    let item_id = Uuid::from_u128(0x51);
+    let router = create_router(ok_state(item_id, ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/Items?includeItemTypes=Movie,Series&sortBy=SortName&sortOrder=Descending\
+                     &filters=IsFavorite&genres=Action|Sci-Fi&years=1999,2001&isFavorite=true",
+                )
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["TotalRecordCount"], 1);
+    assert_eq!(json["Items"][0]["Id"], item_id.to_string());
+}
+
+/// A `GET /Items` with an unknown enum token is a `400`.
+#[tokio::test]
+async fn get_items_bad_enum_token_is_400() {
+    let router = create_router(ok_state(Uuid::from_u128(0x52), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/Items?includeItemTypes=Nonsense")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GET /Items/Counts` returns the per-kind counts.
+#[tokio::test]
+async fn item_counts_returns_counts() {
+    let router = create_router(ok_state(Uuid::from_u128(0x53), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/Items/Counts")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["MovieCount"], 3);
+    assert_eq!(json["SeriesCount"], 1);
+}
+
+/// `GET /Items/{itemId}/Ancestors` returns an array (empty for a root item).
+#[tokio::test]
+async fn ancestors_of_root_item_is_empty_array() {
+    let item_id = Uuid::from_u128(0x54);
+    let router = create_router(ok_state(item_id, ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items/{item_id}/Ancestors"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert!(json.as_array().is_some_and(std::vec::Vec::is_empty));
+}
+
+/// `GET /Items/{itemId}/Ancestors` for a missing item is a `404`.
+#[tokio::test]
+async fn ancestors_of_missing_item_is_404() {
+    let router = create_router(ok_state(Uuid::from_u128(0x55), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items/{}/Ancestors", Uuid::from_u128(0xDEAD)))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `DELETE /Items/{itemId}` deletes an existing item (`204`).
+#[tokio::test]
+async fn delete_item_returns_204() {
+    let item_id = Uuid::from_u128(0x56);
+    let router = create_router(ok_state(item_id, ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// `DELETE /Items/{itemId}` for a missing item is a `404`.
+#[tokio::test]
+async fn delete_missing_item_is_404() {
+    let router = create_router(ok_state(Uuid::from_u128(0x57), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Items/{}", Uuid::from_u128(0xBEEF)))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `DELETE /Items?ids=...` deletes each listed item (`204`).
+#[tokio::test]
+async fn delete_items_batch_returns_204() {
+    let item_id = Uuid::from_u128(0x58);
+    let router = create_router(ok_state(item_id, ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Items?ids={item_id}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// `POST /Items/{itemId}` applies an edited item and returns `204`.
+#[tokio::test]
+async fn update_item_returns_204() {
+    let item_id = Uuid::from_u128(0x59);
+    let router = create_router(ok_state(item_id, ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed","Genres":["Action","action"],"LockData":true}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// `POST /Items/{itemId}` for a missing item is a `404`.
+#[tokio::test]
+async fn update_missing_item_is_404() {
+    let router = create_router(ok_state(Uuid::from_u128(0x5A), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{}", Uuid::from_u128(0xF00D)))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"Id":"{}","Type":"Movie","MediaType":"Video","Name":"X"}}"#,
+                    Uuid::from_u128(0xF00D)
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /Items/{itemId}/Refresh` queues a refresh for the item (`204`).
+#[tokio::test]
+async fn refresh_item_queues_and_returns_204() {
+    let item_id = Uuid::from_u128(0x5B);
+    let queued = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = create_router(state_with_providers(item_id, queued.clone()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Items/{item_id}/Refresh?metadataRefreshMode=FullRefresh"
+                ))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(queued.lock().unwrap().as_slice(), &[item_id]);
+}
+
+/// `POST /Items/{itemId}/Refresh` for a missing item is a `404` (never queues).
+#[tokio::test]
+async fn refresh_missing_item_is_404() {
+    let queued = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router = create_router(state_with_providers(Uuid::from_u128(0x5C), queued.clone()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{}/Refresh", Uuid::from_u128(0xC0DE)))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(queued.lock().unwrap().is_empty());
+}
+
+/// `POST /Items/{itemId}/ContentType` for a missing item is a `404` (the
+/// success path needs a full `ServerConfiguration`, exercised in `hermit-core`).
+#[tokio::test]
+async fn content_type_missing_item_is_404() {
+    let router = create_router(ok_state(Uuid::from_u128(0x5D), ""));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Items/{}/ContentType?contentType=movies",
+                    Uuid::from_u128(0xFEED)
+                ))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

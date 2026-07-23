@@ -1,0 +1,96 @@
+//! `MusicGenresController` — browse music genres and resolve one by name.
+//!
+//! Ports:
+//!
+//! - `GET /MusicGenres` — the library's music genres as a
+//!   [`QueryResult<BaseItemDto>`].
+//! - `GET /MusicGenres/{genreName}` — a single music genre by name.
+//!
+//! The `GET /MusicGenres/InstantMix` and `/{name}/InstantMix` routes stay on the
+//! `501` stub (instant-mix is a later batch); the per-name image routes are
+//! Batch 9.
+
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::{Json, Router};
+use hermit_model::data::BaseItemKind;
+use hermit_model::dto::BaseItemDto;
+use hermit_model::querying::QueryResult;
+use hermit_traits::options::DtoOptions;
+
+use crate::auth::RequireAuth;
+use crate::error::ApiError;
+use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
+use crate::handlers::items::resolve_user;
+use crate::state::AppState;
+
+/// `GET /MusicGenres` — the library's music genres.
+///
+/// Port of `MusicGenresController.GetMusicGenres`.
+#[utoipa::path(
+    get,
+    path = "/MusicGenres",
+    // Body schema omitted: `BaseItemDto` recurses in the OpenAPI generator.
+    responses((status = 200, description = "Music genres returned (QueryResult<BaseItemDto>)")),
+    tag = "hermit"
+)]
+async fn get_music_genres(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<ByNameListQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let internal = query.base_query(Some(user.clone()));
+    let result = state.library.get_music_genres(&internal).await?;
+    let options = DtoOptions::with_all_fields(false);
+    let projected = project_query_result(
+        &state,
+        result,
+        &options,
+        query.should_include_item_types(),
+        Some(&user),
+    )
+    .await?;
+    Ok(Json(projected))
+}
+
+/// `GET /MusicGenres/{genreName}` — a single music genre by name.
+///
+/// Port of `MusicGenresController.GetMusicGenre`. A missing music genre is a
+/// `404`, matching the C# `NotFound()`.
+#[utoipa::path(
+    get,
+    path = "/MusicGenres/{genreName}",
+    params(("genreName" = String, Path, description = "The music genre name")),
+    responses(
+        (status = 200, description = "Music genre returned (BaseItemDto)"),
+        (status = 404, description = "Music genre not found")
+    ),
+    tag = "hermit"
+)]
+async fn get_music_genre(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path(genre_name): Path<String>,
+    Query(query): Query<ByNameItemQuery>,
+) -> Result<Json<BaseItemDto>, ApiError> {
+    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let item = state
+        .library
+        .get_named_item(BaseItemKind::MusicGenre, &genre_name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("music genre {genre_name}")))?;
+    let options = DtoOptions::default();
+    let dto = state
+        .dto
+        .get_base_item_dto(&item, &options, Some(&user), None)
+        .await?;
+    Ok(Json(dto))
+}
+
+/// Registers this controller's real routes onto `router`.
+pub fn register(router: Router<AppState>) -> Router<AppState> {
+    router
+        .route("/MusicGenres", get(get_music_genres))
+        .route("/MusicGenres/{genreName}", get(get_music_genre))
+}

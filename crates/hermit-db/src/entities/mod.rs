@@ -19,6 +19,7 @@
 //!   conversion layer.
 //! - `RowVersion` optimistic-concurrency tokens (`INTEGER`) → [`i64`].
 
+pub mod activity;
 pub mod base_items;
 pub mod display_preferences;
 pub mod playback;

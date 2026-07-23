@@ -8,13 +8,20 @@
 //! `TimeSync`, `Channels`, `User`, `UserViews`, `Tmdb`, and the intro-skipper
 //! plugin (`Troubleshooting`, `Visualization`, `SkipIntro`, `SkipButtonCss`,
 //! `FileTransformation`, `OpenSubtitles`) controllers/tags. A real client
-//! (Wolphin) probing any of them must learn "route exists, not implemented", not
-//! "no such route".
+//! (Wolphin) probing any still-unported route must learn "route exists, not
+//! implemented", not "no such route".
 //!
-//! Five of the 104 already have real First-Light handlers (`GET /System/Info`,
+//! 59 of the 104 now have real handlers: 5 from First-Light (`GET /System/Info`,
 //! `GET /System/Info/Public`, `POST /Users/AuthenticateByName`, `GET /Users/Me`,
-//! `GET /UserViews`); those return `401`/`200`, not `501`, so they are excluded
-//! from the stub probe below — leaving 99 pure `501` stubs. The auth-context
+//! `GET /UserViews`), 19 from Batch 6 (the whole `Startup` controller plus the
+//! `User` admin CRUD/policy/config/forgot-password and quick-connect login
+//! routes), 1 from Batch 12 (`POST /ClientLog/Document`), 31 from Batch 13
+//! (the whole `System` admin / `Configuration` / `Branding` / `Localization` /
+//! `Environment` / `Dashboard` / `ActivityLog` / `TimeSync` surface), and 3 from
+//! Batch 15 (`ScheduledTasks` read/run — `GET /ScheduledTasks`,
+//! `GET /ScheduledTasks/{taskId}`, `POST /ScheduledTasks/Running/{taskId}`).
+//! Those return `401`/`200`/`204`, not `501`, so they are excluded from the stub
+//! probe below — leaving 45 pure `501` stubs. The auth-context
 //! middleware is non-rejecting and the shared `not_implemented` stub takes no
 //! auth extractor, so a tokenless probe reaches the stub and yields `501`
 //! deterministically.
@@ -33,38 +40,19 @@ use tower::ServiceExt;
 /// segment values where the vendored route has a `{param}`. 99 stub ops (the 104
 /// tagged ops minus the 5 that now have real First-Light handlers).
 const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
-    // System
-    (Method::GET, "/System/Endpoint"),
-    (Method::GET, "/System/Info/Storage"),
-    (Method::GET, "/System/Logs"),
-    (Method::GET, "/System/Logs/Log"),
-    (Method::GET, "/System/Ping"),
-    (Method::POST, "/System/Ping"),
-    (Method::POST, "/System/Restart"),
-    (Method::POST, "/System/Shutdown"),
-    // Startup
-    (Method::POST, "/Startup/Complete"),
-    (Method::GET, "/Startup/Configuration"),
-    (Method::POST, "/Startup/Configuration"),
-    (Method::GET, "/Startup/FirstUser"),
-    (Method::POST, "/Startup/RemoteAccess"),
-    (Method::GET, "/Startup/User"),
-    (Method::POST, "/Startup/User"),
-    // Configuration
-    (Method::GET, "/System/Configuration"),
-    (Method::POST, "/System/Configuration"),
-    (Method::POST, "/System/Configuration/Branding"),
-    (Method::GET, "/System/Configuration/MetadataOptions/Default"),
-    (Method::GET, "/System/Configuration/network"),
-    (Method::POST, "/System/Configuration/network"),
-    // Dashboard
-    (Method::GET, "/web/ConfigurationPage"),
-    (Method::GET, "/web/ConfigurationPages"),
-    // ScheduledTasks
-    (Method::GET, "/ScheduledTasks"),
+    // System / Configuration / Branding / Localization / Environment / Dashboard
+    // / ActivityLog / TimeSync were ported in Batch 13, so those routes are now
+    // real (`RequireAuth`-guarded → `401` for a tokenless probe) and exercised in
+    // `batch13_handlers.rs` instead of being 501 stubs here. The named-config
+    // `/System/Configuration/{key}` route is also real (it returns `501` only for
+    // unknown keys, behind auth), so it is excluded too.
+    // Startup — ported in Batch 6 (real handlers), covered by batch6_handlers.rs.
+    // ScheduledTasks — read/run ported in Batch 15 (real, `RequireAuth`-guarded
+    // → `401` for a tokenless probe): `GET /ScheduledTasks`,
+    // `GET /ScheduledTasks/{taskId}`, `POST /ScheduledTasks/Running/{taskId}`,
+    // covered by batch15_handlers.rs. The scheduler-cron routes below stay 501
+    // stubs (cancel — no background run to cancel; trigger-config persistence).
     (Method::DELETE, "/ScheduledTasks/Running/task-1"),
-    (Method::POST, "/ScheduledTasks/Running/task-1"),
-    (Method::GET, "/ScheduledTasks/task-1"),
     (Method::POST, "/ScheduledTasks/task-1/Triggers"),
     // Plugins
     (Method::GET, "/Plugins"),
@@ -83,33 +71,16 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     (Method::GET, "/Packages/pkg-1"),
     (Method::GET, "/Repositories"),
     (Method::POST, "/Repositories"),
-    // Branding
-    (Method::GET, "/Branding/Configuration"),
-    (Method::GET, "/Branding/Css"),
-    (Method::GET, "/Branding/Css.css"),
-    // Localization
-    (Method::GET, "/Localization/Countries"),
-    (Method::GET, "/Localization/Cultures"),
-    (Method::GET, "/Localization/Options"),
-    (Method::GET, "/Localization/ParentalRatings"),
-    // Environment
-    (Method::GET, "/Environment/DefaultDirectoryBrowser"),
-    (Method::GET, "/Environment/DirectoryContents"),
-    (Method::GET, "/Environment/Drives"),
-    (Method::GET, "/Environment/NetworkShares"),
-    (Method::GET, "/Environment/ParentPath"),
-    (Method::POST, "/Environment/ValidatePath"),
-    // ActivityLog
-    (Method::GET, "/System/ActivityLog/Entries"),
-    // ClientLog
-    (Method::POST, "/ClientLog/Document"),
+    // Branding / Localization / Environment / ActivityLog / TimeSync — ported in
+    // Batch 13, now real; covered by batch13_handlers.rs.
+    // ClientLogController was ported in Batch 12, so `/ClientLog/Document` is now
+    // real (`RequireAuth`-guarded → `401` for a tokenless probe) and exercised in
+    // `batch12_handlers.rs` instead of being a 501 stub here.
     // Backup
     (Method::GET, "/Backup"),
     (Method::POST, "/Backup/Create"),
     (Method::GET, "/Backup/Manifest"),
     (Method::POST, "/Backup/Restore"),
-    // TimeSync
-    (Method::GET, "/GetUtcTime"),
     // Tmdb
     (Method::GET, "/Tmdb/ClientConfiguration"),
     // Channels
@@ -118,19 +89,9 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     (Method::GET, "/Channels/Items/Latest"),
     (Method::GET, "/Channels/channel-1/Features"),
     (Method::GET, "/Channels/channel-1/Items"),
-    // User (excludes real handlers: POST /Users/AuthenticateByName, GET /Users/Me)
-    (Method::GET, "/Users"),
-    (Method::POST, "/Users"),
-    (Method::POST, "/Users/AuthenticateWithQuickConnect"),
-    (Method::POST, "/Users/Configuration"),
-    (Method::POST, "/Users/ForgotPassword"),
-    (Method::POST, "/Users/ForgotPassword/Pin"),
-    (Method::POST, "/Users/New"),
-    (Method::POST, "/Users/Password"),
-    (Method::GET, "/Users/Public"),
-    (Method::DELETE, "/Users/user-1"),
-    (Method::GET, "/Users/user-1"),
-    (Method::POST, "/Users/user-1/Policy"),
+    // User — the admin CRUD/policy/config/forgot-password + quick-connect login
+    // routes were ported in Batch 6 (real handlers), covered by
+    // batch6_handlers.rs; only `AuthenticateByName`/`Me` were real before.
     // UserViews (excludes real handler: GET /UserViews)
     (Method::GET, "/UserViews/GroupingOptions"),
     // Intro-skipper plugin: Troubleshooting
@@ -187,13 +148,15 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 }
 
 /// Guards the op count: the Unit-7 surface contributes exactly 104 routes to the
-/// contract, of which 5 have real First-Light handlers, so 99 remain pure `501`
-/// stubs. This doubles as a drift alarm for the probe table.
+/// contract. 5 had real First-Light handlers, Batch 6 ported 19 more (7 Startup +
+/// 12 User admin/quick-connect), and Batch 12 ported `/ClientLog/Document`,
+/// leaving 79 pure `501` stubs. This doubles as a drift alarm for the probe
+/// table.
 #[test]
-fn unit7_covers_all_99_stub_ops() {
+fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        99,
-        "Unit-7 has 104 tagged ops minus 5 real handlers = 99 stubs; probe table drifted"
+        45,
+        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 = 45 stubs; probe table drifted"
     );
 }

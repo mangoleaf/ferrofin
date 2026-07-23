@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use hermit_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
+use hermit_model::branding::BrandingOptions;
 use hermit_model::configuration::ServerConfiguration;
 use uuid::Uuid;
 
@@ -53,6 +54,17 @@ pub trait ServerConfigurationManager: Send + Sync {
         &self,
         configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError>;
+
+    /// The current branding options (C# `GetConfiguration<BrandingOptions>("branding")`).
+    ///
+    /// Jellyfin stores this as a named configuration in a pluggable store;
+    /// Hermit persists it alongside the main configuration. A never-configured
+    /// server returns [`BrandingOptions::default`].
+    async fn get_branding(&self) -> Result<BrandingOptions, ServiceError>;
+
+    /// Persists a replacement branding configuration
+    /// (C# `SaveConfiguration("branding", …)`).
+    async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_server_configuration_manager(_: &dyn ServerConfigurationManager) {}

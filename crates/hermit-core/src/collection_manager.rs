@@ -294,6 +294,27 @@ impl PlaylistManager for HermitPlaylistManager {
         Ok(rows)
     }
 
+    async fn get_playlist_items(
+        &self,
+        playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // The playlist must exist; per-user visibility filtering is a deferred
+        // parental-control concern, so all members are returned in link order.
+        self.require_playlist(playlist_id).await?;
+        let child_ids = self
+            .linked_children
+            .get_linked_children_ids(playlist_id, Some(LINKED_CHILD_MANUAL))
+            .await?;
+        let mut out = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            if let Some(row) = self.library_manager.get_item_by_id(child_id).await? {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     async fn add_user_to_shares(
         &self,
         _request: &PlaylistUserUpdateRequest,
@@ -482,6 +503,59 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_returns_members() {
+        let db = test_db().await;
+        let track_a = Uuid::new_v4();
+        let track_b = Uuid::new_v4();
+        seed_item(&db, track_a, BaseItemKind::Audio).await;
+        seed_item(&db, track_b, BaseItemKind::Audio).await;
+
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track_a, track_b],
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        let items = mgr
+            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .await
+            .expect("items");
+        assert_eq!(items.len(), 2);
+        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+        assert!(ids.contains(&track_a.to_string()));
+        assert!(ids.contains(&track_b.to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_missing_is_not_found() {
+        let db = test_db().await;
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let err = mgr
+            .get_playlist_items(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .expect_err("missing");
+        assert!(matches!(
+            err,
+            hermit_traits::error::ServiceError::NotFound(_)
+        ));
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use hermit_model::branding::BrandingOptions;
 use hermit_model::configuration::ServerConfiguration;
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
@@ -126,6 +127,7 @@ pub fn default_server_configuration() -> ServerConfiguration {
 pub struct HermitServerConfigurationManager {
     paths: Arc<HermitServerApplicationPaths>,
     config_file: PathBuf,
+    branding_file: PathBuf,
     configuration: RwLock<ServerConfiguration>,
 }
 
@@ -140,6 +142,10 @@ impl std::fmt::Debug for HermitServerConfigurationManager {
 impl HermitServerConfigurationManager {
     /// The on-disk configuration file name (JSON counterpart of C# `system.xml`).
     const CONFIG_FILE_NAME: &'static str = "system.json";
+
+    /// The on-disk branding configuration file name (Jellyfin's named
+    /// `branding` configuration, stored as a sibling JSON document).
+    const BRANDING_FILE_NAME: &'static str = "branding.json";
 
     /// Loads (or initializes) the configuration for the given paths.
     ///
@@ -160,6 +166,7 @@ impl HermitServerConfigurationManager {
                 std::path::Path::to_path_buf,
             );
         let config_file = config_dir.join(Self::CONFIG_FILE_NAME);
+        let branding_file = config_dir.join(Self::BRANDING_FILE_NAME);
 
         let configuration = if config_file.exists() {
             let bytes = tokio::fs::read(&config_file)
@@ -178,6 +185,7 @@ impl HermitServerConfigurationManager {
         Ok(Self {
             paths,
             config_file,
+            branding_file,
             configuration: RwLock::new(configuration),
         })
     }
@@ -257,6 +265,30 @@ impl ServerConfigurationManager for HermitServerConfigurationManager {
             .set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
         Ok(())
     }
+
+    async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
+        if !self.branding_file.exists() {
+            return Ok(BrandingOptions::default());
+        }
+        let bytes = tokio::fs::read(&self.branding_file)
+            .await
+            .map_err(|e| io_err("read branding", &self.branding_file, &e))?;
+        serde_json::from_slice::<BrandingOptions>(&bytes)
+            .map_err(|e| ServiceError::Backend(format!("invalid branding JSON: {e}")))
+    }
+
+    async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
+        if let Some(parent) = self.branding_file.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| io_err("create configuration directory", parent, &e))?;
+        }
+        let json = serde_json::to_vec_pretty(branding)
+            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?;
+        tokio::fs::write(&self.branding_file, json)
+            .await
+            .map_err(|e| io_err("write branding", &self.branding_file, &e))
+    }
 }
 
 /// Serializes and writes a configuration to `path` (creating the parent dir).
@@ -333,6 +365,40 @@ mod tests {
             .await
             .expect("reload");
         assert_eq!(reloaded.snapshot().server_name, "Hermit Test");
+    }
+
+    #[tokio::test]
+    async fn branding_defaults_then_persists_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = HermitServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+
+        // No branding file yet → defaults.
+        let initial = mgr.get_branding().await.expect("get branding");
+        assert_eq!(initial, BrandingOptions::default());
+
+        // Persist a customized branding and observe it reload.
+        let branding = BrandingOptions {
+            login_disclaimer: Some("Be excellent.".to_owned()),
+            custom_css: Some("body{}".to_owned()),
+            splashscreen_enabled: true,
+            splashscreen_location: Some("/tmp/splash.png".to_owned()),
+        };
+        mgr.update_branding(&branding)
+            .await
+            .expect("update branding");
+        assert_eq!(mgr.get_branding().await.expect("reget"), branding);
+
+        // A fresh manager over the same paths reads the persisted branding.
+        let reloaded = HermitServerConfigurationManager::load(paths)
+            .await
+            .expect("reload");
+        assert_eq!(
+            reloaded.get_branding().await.expect("reload branding"),
+            branding
+        );
     }
 
     #[tokio::test]

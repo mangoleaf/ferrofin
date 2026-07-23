@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use hermit_model::data::CollectionType;
 use hermit_model::dto::ItemCounts;
+use hermit_model::entities::MediaStreamType;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -83,6 +84,16 @@ impl LibraryManager for HermitLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    async fn get_item_images(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<hermit_traits::options::ItemImageInfo>, ServiceError> {
+        if item_id.is_nil() {
+            return Ok(Vec::new());
+        }
+        self.items.get_image_infos(item_id).await
     }
 
     async fn query_items(
@@ -160,6 +171,92 @@ impl LibraryManager for HermitLibraryManager {
         self.persistence.delete_items(&ids).await
     }
 
+    async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+        // Resolve each supplied id to a persisted row, dropping any that are
+        // missing, then de-duplicate and order by id (C# `.OrderBy(i => i.Id)`).
+        let mut items = Vec::new();
+        for &id in ids {
+            if let Some(row) = self.items.retrieve_item(id).await? {
+                items.push(row);
+            }
+        }
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+        items.dedup_by(|a, b| a.id == b.id);
+
+        if items.len() < 2 {
+            return Err(ServiceError::invalid_input(
+                "please supply at least two videos to merge",
+            ));
+        }
+
+        // Pick the primary. C# prefers an item that already owns multiple sources
+        // and is itself not an alternate; Hermit does not model `MediaSourceCount`,
+        // so it falls back to C#'s secondary ordering: a plain video file outranks
+        // a special type, then the widest default video stream wins. The item's own
+        // `Width` column stands in for the default video stream width.
+        let primary_index = items
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.width.unwrap_or(0).cmp(&b.width.unwrap_or(0)))
+            .map_or(0, |(i, _)| i);
+        let primary_id = items[primary_index].id.clone();
+
+        // Link every non-primary item to the primary by pointer, and ensure the
+        // primary itself is a standalone (its own pointer cleared).
+        let mut updated = Vec::new();
+        for item in &items {
+            if item.id == primary_id {
+                if item.primary_version_id.is_some() {
+                    let mut primary = item.clone();
+                    primary.primary_version_id = None;
+                    updated.push(primary);
+                }
+            } else if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
+                let mut alt = item.clone();
+                alt.primary_version_id = Some(primary_id.clone());
+                updated.push(alt);
+            }
+        }
+
+        if !updated.is_empty() {
+            self.persistence.save_items(&updated).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let Some(item) = self.items.retrieve_item(item_id).await? else {
+            return Err(ServiceError::not_found(format!("item {item_id}")));
+        };
+
+        // Resolve the group's primary: either this item (no pointer) or the item it
+        // points at (C# hops to `PrimaryVersionId` when the item has no alternates).
+        let primary_id = match item.primary_version_id.as_deref() {
+            Some(pid) => Uuid::parse_str(pid)
+                .map_err(|_| ServiceError::invalid_input("malformed PrimaryVersionId"))?,
+            None => item_id,
+        };
+
+        // Clear the pointer on every alternate that references the primary, then on
+        // the primary itself, so each becomes a standalone version again.
+        let mut updated = Vec::new();
+        for mut alt in self.items.get_items_by_primary_version(primary_id).await? {
+            alt.primary_version_id = None;
+            updated.push(alt);
+        }
+        if let Some(mut primary) = self.items.retrieve_item(primary_id).await?
+            && primary.primary_version_id.is_some()
+        {
+            primary.primary_version_id = None;
+            updated.push(primary);
+        }
+
+        if !updated.is_empty() {
+            self.persistence.save_items(&updated).await?;
+        }
+        Ok(())
+    }
+
     async fn get_people(
         &self,
         query: &InternalPeopleQuery,
@@ -206,11 +303,35 @@ impl LibraryManager for HermitLibraryManager {
         self.items.get_artists(query).await
     }
 
+    async fn get_music_genres(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.items.get_music_genres(query).await
+    }
+
+    async fn get_album_artists(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.items.get_album_artists(query).await
+    }
+
     async fn get_query_filters_legacy(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
         self.items.get_query_filters_legacy(query).await
+    }
+
+    async fn get_media_stream_languages(
+        &self,
+        stream_type: MediaStreamType,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        self.items
+            .get_media_stream_languages(query, stream_type)
+            .await
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
@@ -229,7 +350,9 @@ mod tests {
     use crate::item_repository::HermitItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::people_repository::HermitPeopleRepository;
-    use crate::test_support::{seed_item, seed_named_item, set_clean_name, test_db};
+    use crate::test_support::{
+        seed_item, seed_item_genre, seed_named_item, set_clean_name, test_db,
+    };
     use hermit_db::Database;
     use hermit_model::data::BaseItemKind;
 
@@ -303,5 +426,280 @@ mod tests {
         let db = test_db().await;
         let mgr = manager(&db);
         mgr.queue_library_scan().await.expect("queue");
+    }
+
+    #[tokio::test]
+    async fn get_named_item_resolves_by_clean_name() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x201);
+        seed_named_item(&db, id, BaseItemKind::Genre, "Science Fiction").await;
+        set_clean_name(&db, id, "Science Fiction").await;
+        // A different-kind row with the same name must not be returned.
+        let other = Uuid::from_u128(0x202);
+        seed_named_item(&db, other, BaseItemKind::Studio, "Science Fiction").await;
+        set_clean_name(&db, other, "Science Fiction").await;
+        let mgr = manager(&db);
+
+        let found = mgr
+            .get_named_item(BaseItemKind::Genre, "Science Fiction")
+            .await
+            .expect("lookup")
+            .expect("some");
+        assert_eq!(found.id, id.to_string());
+        assert_eq!(found.name.as_deref(), Some("Science Fiction"));
+    }
+
+    #[tokio::test]
+    async fn get_ancestors_walks_parent_chain_nearest_first() {
+        let db = test_db().await;
+        // grandparent <- parent <- child
+        let grandparent = Uuid::from_u128(0x301);
+        let parent = Uuid::from_u128(0x302);
+        let child = Uuid::from_u128(0x303);
+        seed_named_item(&db, grandparent, BaseItemKind::Folder, "Library").await;
+        seed_named_item(&db, parent, BaseItemKind::Series, "Show").await;
+        seed_named_item(&db, child, BaseItemKind::Episode, "Pilot").await;
+        for (id, parent_id) in [(child, parent), (parent, grandparent)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+                .bind(id.to_string())
+                .bind(parent_id.to_string())
+                .execute(db.pool())
+                .await
+                .expect("set parent");
+        }
+        let mgr = manager(&db);
+
+        let ancestors = mgr
+            .get_ancestors(child)
+            .await
+            .expect("ancestors")
+            .expect("item exists");
+        // Nearest parent first, then its parent — the seed item is excluded.
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0].id, parent.to_string());
+        assert_eq!(ancestors[1].id, grandparent.to_string());
+
+        // A root item (no parent) yields an empty list, not None.
+        let roots = mgr
+            .get_ancestors(grandparent)
+            .await
+            .expect("ancestors")
+            .expect("item exists");
+        assert!(roots.is_empty());
+
+        // A missing item yields None so the API maps it to 404.
+        assert!(
+            mgr.get_ancestors(Uuid::from_u128(0x3ff))
+                .await
+                .expect("missing")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_named_item_missing_is_none() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        assert!(
+            mgr.get_named_item(BaseItemKind::Genre, "Nope")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        // A blank name short-circuits to None.
+        assert!(
+            mgr.get_named_item(BaseItemKind::Genre, "   ")
+                .await
+                .expect("blank")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_music_genres_counts_referencing_items() {
+        let db = test_db().await;
+        // A MusicGenre by-name row plus a song that references it.
+        let genre_id = Uuid::from_u128(0x301);
+        seed_named_item(&db, genre_id, BaseItemKind::MusicGenre, "Jazz").await;
+        set_clean_name(&db, genre_id, "Jazz").await;
+        let song = Uuid::from_u128(0x302);
+        seed_named_item(&db, song, BaseItemKind::Audio, "Blue in Green").await;
+        seed_item_genre(&db, song, "Jazz").await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_music_genres(&InternalItemsQuery::default())
+            .await
+            .expect("music genres");
+        let jazz = result
+            .items
+            .iter()
+            .find(|iwc| iwc.item.name.as_deref() == Some("Jazz"))
+            .expect("jazz present");
+        assert_eq!(jazz.counts.item_count, 1);
+    }
+
+    #[tokio::test]
+    async fn get_media_stream_languages_reads_distinct_codes() {
+        use hermit_model::entities::MediaStreamType;
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x501);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        // One English audio stream plus one with no language (→ 'und').
+        for (idx, lang) in [(0_i64, Some("eng")), (1, None)] {
+            sqlx::query(
+                r#"INSERT INTO "MediaStreamInfos"
+                   ("ItemId", "StreamIndex", "IsDefault", "IsExternal", "IsForced",
+                    "IsOriginal", "StreamType", "Language")
+                   VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)"#,
+            )
+            .bind(item.to_string())
+            .bind(idx)
+            .bind(lang)
+            .execute(db.pool())
+            .await
+            .expect("insert stream");
+        }
+        let mgr = manager(&db);
+
+        let mut langs = mgr
+            .get_media_stream_languages(MediaStreamType::Audio, &InternalItemsQuery::default())
+            .await
+            .expect("languages");
+        langs.sort();
+        assert_eq!(langs, vec!["eng".to_owned(), "und".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn get_album_artists_returns_artist_rows() {
+        let db = test_db().await;
+        let artist = Uuid::from_u128(0x401);
+        seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Miles Davis").await;
+        set_clean_name(&db, artist, "Miles Davis").await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_album_artists(&InternalItemsQuery::default())
+            .await
+            .expect("album artists");
+        assert!(
+            result
+                .items
+                .iter()
+                .any(|iwc| iwc.item.name.as_deref() == Some("Miles Davis"))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_user_root_folder_resolves_the_root_row() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+
+        // With no root row materialized, the default resolves to None.
+        assert!(mgr.get_user_root_folder().await.expect("none").is_none());
+
+        // Once a UserRootFolder row exists, it is returned.
+        let root = Uuid::from_u128(0x5001);
+        seed_named_item(&db, root, BaseItemKind::UserRootFolder, "Media Folders").await;
+        let resolved = mgr
+            .get_user_root_folder()
+            .await
+            .expect("root")
+            .expect("some");
+        assert_eq!(resolved.id, root.to_string());
+    }
+
+    /// Sets a row's `Width` column so the merge primary-selection heuristic has a
+    /// deterministic winner.
+    async fn set_width(db: &Database, id: Uuid, width: i64) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Width" = ?1 WHERE "Id" = ?2"#)
+            .bind(width)
+            .bind(id.to_string())
+            .execute(db.pool())
+            .await
+            .expect("set width");
+    }
+
+    #[tokio::test]
+    async fn merge_versions_links_alternates_to_widest_primary() {
+        let db = test_db().await;
+        let wide = Uuid::from_u128(0x301);
+        let narrow = Uuid::from_u128(0x302);
+        seed_item(&db, wide, BaseItemKind::Movie).await;
+        seed_item(&db, narrow, BaseItemKind::Movie).await;
+        set_width(&db, wide, 1920).await;
+        set_width(&db, narrow, 640).await;
+        let mgr = manager(&db);
+
+        mgr.merge_versions(&[narrow, wide]).await.expect("merge");
+
+        // The widest becomes the primary (its own pointer stays null); the narrow
+        // one points at it.
+        let primary = mgr.get_item_by_id(wide).await.expect("read").expect("some");
+        assert_eq!(primary.primary_version_id, None);
+        let alt = mgr
+            .get_item_by_id(narrow)
+            .await
+            .expect("read")
+            .expect("some");
+        assert_eq!(
+            alt.primary_version_id.as_deref(),
+            Some(wide.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_versions_rejects_single_id() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x303);
+        seed_item(&db, id, BaseItemKind::Movie).await;
+        let mgr = manager(&db);
+
+        let err = mgr.merge_versions(&[id]).await.expect_err("too few");
+        assert!(matches!(err, ServiceError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_alternate_sources_clears_the_group() {
+        let db = test_db().await;
+        let primary = Uuid::from_u128(0x311);
+        let alt = Uuid::from_u128(0x312);
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, alt, BaseItemKind::Movie).await;
+        set_width(&db, primary, 1920).await;
+        set_width(&db, alt, 640).await;
+        let mgr = manager(&db);
+        mgr.merge_versions(&[primary, alt]).await.expect("merge");
+
+        // Splitting from the *alternate* still clears the whole group.
+        mgr.remove_alternate_sources(alt).await.expect("remove");
+
+        assert_eq!(
+            mgr.get_item_by_id(primary)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
+        assert_eq!(
+            mgr.get_item_by_id(alt)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_alternate_sources_missing_item_is_not_found() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let err = mgr
+            .remove_alternate_sources(Uuid::from_u128(0x3FF))
+            .await
+            .expect_err("missing");
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 }

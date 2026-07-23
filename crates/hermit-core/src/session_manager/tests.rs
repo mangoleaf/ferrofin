@@ -55,6 +55,15 @@ impl ServerConfigurationManager for FixedConfig {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn get_branding(&self) -> Result<hermit_model::branding::BrandingOptions, ServiceError> {
+        Ok(hermit_model::branding::BrandingOptions::default())
+    }
+    async fn update_branding(
+        &self,
+        _branding: &hermit_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// A DTO service that is never invoked by the tested paths (the manager holds it

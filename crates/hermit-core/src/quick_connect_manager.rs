@@ -324,6 +324,17 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
+        async fn get_branding(
+            &self,
+        ) -> Result<hermit_model::branding::BrandingOptions, ServiceError> {
+            Ok(hermit_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &hermit_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
     }
 
     /// A session manager whose `authenticate_direct` returns a DTO tagged with
