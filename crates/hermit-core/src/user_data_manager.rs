@@ -1,0 +1,527 @@
+//! [`HermitUserDataManager`] — the concrete [`UserDataManager`] over `hermit-db`.
+//!
+//! Port of `Emby.Server.Implementations.Library.UserDataManager`. Per-user,
+//! per-item playback state lives in the `UserData` table, keyed by the
+//! `(ItemId, UserId, CustomDataKey)` triple.
+//!
+//! Port simplifications, all faithful to the trait's `Uuid`-identity surface:
+//! - The C# path derives multiple `CustomDataKey`s from an item's metadata
+//!   (`GetUserDataKeys`); the trait works purely with item ids, so this port
+//!   uses the item id as the single `CustomDataKey` (matching how the landed
+//!   `test_support::seed_user_data` and the next-up service already key rows).
+//! - The C# in-memory `FastConcurrentLru` cache and the `UserDataSaved` event
+//!   are dropped; every read hits the table.
+//! - `UpdatePlayState` needs the item's runtime + kind (for the resume-point
+//!   heuristics); those are read from the `BaseItems` row rather than a
+//!   pre-loaded domain object.
+//!
+//! Resume-point thresholds (`MinResumePct`, `MaxResumePct`,
+//! `MinResumeDurationSeconds`, `MinAudiobookResume`, `MaxAudiobookResume`) are
+//! read live from the injected [`ServerConfigurationManager`].
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use hermit_db::Database;
+use hermit_db::entities::playback::UserDataEntity;
+use hermit_model::data::BaseItemKind;
+use hermit_model::dto::{UpdateUserItemDataDto, UserItemDataDto};
+use uuid::Uuid;
+
+use hermit_traits::configuration::ServerConfigurationManager;
+use hermit_traits::error::ServiceError;
+use hermit_traits::library::UserDataManager;
+
+use crate::db_error::db_err;
+use crate::item_type_lookup::kind_from_type_name;
+use crate::kinds::{supports_played_status, supports_position_ticks_resume};
+
+/// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
+/// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
+const TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// The concrete user-data manager.
+#[derive(Clone)]
+pub struct HermitUserDataManager {
+    db: Database,
+    config: Arc<dyn ServerConfigurationManager>,
+}
+
+impl std::fmt::Debug for HermitUserDataManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HermitUserDataManager")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HermitUserDataManager {
+    /// Creates a user-data manager over the given database and configuration.
+    #[must_use]
+    pub fn new(db: Database, config: Arc<dyn ServerConfigurationManager>) -> Self {
+        Self { db, config }
+    }
+
+    /// Reads the single user-data row for an item/user pair, keyed by the item
+    /// id (this port's `CustomDataKey`), or `None`.
+    async fn read_row(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<UserDataEntity>, ServiceError> {
+        sqlx::query_as::<_, UserDataEntity>(
+            r#"SELECT * FROM "UserData"
+               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?1 LIMIT 1"#,
+        )
+        .bind(item_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)
+    }
+
+    /// Reads the item's runtime ticks and [`BaseItemKind`], for the play-state
+    /// heuristics. A missing item yields `None`.
+    async fn item_runtime_and_kind(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, BaseItemKind)>, ServiceError> {
+        let row: Option<(Option<i64>, String)> = sqlx::query_as(
+            r#"SELECT "RunTimeTicks", "Type" FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
+        )
+        .bind(item_id.to_string())
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        Ok(row.map(|(ticks, type_name)| {
+            (
+                ticks.unwrap_or(0),
+                // Unknown stored types default to Folder (a conservative choice that
+                // disables the position-resume heuristics).
+                kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder),
+            )
+        }))
+    }
+
+    /// Inserts or updates the row for an item/user pair from the supplied
+    /// [`UserDataEntity`] (keyed by the item id).
+    async fn upsert_row(&self, row: &UserDataEntity) -> Result<(), ServiceError> {
+        let exists: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM "UserData"
+               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3)"#,
+        )
+        .bind(&row.item_id)
+        .bind(&row.user_id)
+        .bind(&row.custom_data_key)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        if exists {
+            sqlx::query(
+                r#"UPDATE "UserData" SET
+                    "AudioStreamIndex" = ?4, "IsFavorite" = ?5, "LastPlayedDate" = ?6,
+                    "Likes" = ?7, "PlayCount" = ?8, "PlaybackPositionTicks" = ?9,
+                    "Played" = ?10, "Rating" = ?11, "SubtitleStreamIndex" = ?12
+                   WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3"#,
+            )
+        } else {
+            sqlx::query(
+                r#"INSERT INTO "UserData"
+                    ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex",
+                     "IsFavorite", "LastPlayedDate", "Likes", "PlayCount",
+                     "PlaybackPositionTicks", "Played", "Rating", "SubtitleStreamIndex")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+            )
+        }
+        .bind(&row.item_id)
+        .bind(&row.user_id)
+        .bind(&row.custom_data_key)
+        .bind(row.audio_stream_index)
+        .bind(row.is_favorite)
+        .bind(row.last_played_date)
+        .bind(row.likes)
+        .bind(row.play_count)
+        .bind(row.playback_position_ticks)
+        .bind(row.played)
+        .bind(row.rating)
+        .bind(row.subtitle_stream_index)
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// A default (empty) user-data row for an item/user, used when none exists.
+    fn empty_row(item_id: Uuid, user_id: Uuid) -> UserDataEntity {
+        UserDataEntity {
+            item_id: item_id.to_string(),
+            user_id: user_id.to_string(),
+            custom_data_key: item_id.to_string(),
+            audio_stream_index: None,
+            is_favorite: false,
+            last_played_date: None,
+            likes: None,
+            play_count: 0,
+            playback_position_ticks: 0,
+            played: false,
+            rating: None,
+            retention_date: None,
+            subtitle_stream_index: None,
+        }
+    }
+}
+
+/// Maps a [`UserDataEntity`] row to the presentation DTO (C#
+/// `GetUserItemDataDto`). Playback fields carry over verbatim; the
+/// item-dependent `PlayedPercentage`/`UnplayedItemCount` are left unset here
+/// (they are filled by the DTO service against the resolved item).
+fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
+    UserItemDataDto {
+        rating: row.rating,
+        played_percentage: None,
+        unplayed_item_count: None,
+        playback_position_ticks: row.playback_position_ticks,
+        play_count: row.play_count,
+        is_favorite: row.is_favorite,
+        likes: row.likes,
+        last_played_date: row.last_played_date,
+        played: row.played,
+        key: row.custom_data_key.clone(),
+        item_id,
+    }
+}
+
+#[async_trait]
+impl UserDataManager for HermitUserDataManager {
+    async fn save_user_data(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &UpdateUserItemDataDto,
+    ) -> Result<(), ServiceError> {
+        // C# loads the existing row, applies only the set fields, then saves.
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        if let Some(v) = user_data.playback_position_ticks {
+            row.playback_position_ticks = v;
+        }
+        if let Some(v) = user_data.play_count {
+            row.play_count = v;
+        }
+        if let Some(v) = user_data.is_favorite {
+            row.is_favorite = v;
+        }
+        if user_data.likes.is_some() {
+            row.likes = user_data.likes;
+        }
+        if let Some(v) = user_data.played {
+            row.played = v;
+        }
+        if user_data.last_played_date.is_some() {
+            row.last_played_date = user_data.last_played_date;
+        }
+        if user_data.rating.is_some() {
+            row.rating = user_data.rating;
+        }
+
+        self.upsert_row(&row).await
+    }
+
+    async fn get_user_data_dto(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<UserItemDataDto>, ServiceError> {
+        let row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        Ok(Some(to_dto(&row, item_id)))
+    }
+
+    async fn get_user_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let mut result = HashMap::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            let row = self
+                .read_row(item_id, user_id)
+                .await?
+                .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+            result.insert(item_id, to_dto(&row, item_id));
+        }
+        Ok(result)
+    }
+
+    async fn update_play_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+    ) -> Result<bool, ServiceError> {
+        let config = self.config.configuration().await?;
+        let (runtime_ticks, kind) = self
+            .item_runtime_and_kind(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+
+        let mut position_ticks = reported_position_ticks.unwrap_or(runtime_ticks);
+        let has_runtime = runtime_ticks > 0;
+        let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
+        let is_book = matches!(kind, BaseItemKind::Book);
+        let mut played_to_completion = false;
+
+        if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
+            #[allow(clippy::cast_precision_loss)]
+            let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
+
+            if pct_in < f64::from(config.min_resume_pct) {
+                position_ticks = 0;
+            } else if pct_in > f64::from(config.max_resume_pct)
+                || position_ticks >= runtime_ticks - TICKS_PER_SECOND
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let duration_seconds = runtime_ticks as f64 / TICKS_PER_SECOND as f64;
+                if duration_seconds < f64::from(config.min_resume_duration_seconds) {
+                    position_ticks = 0;
+                    row.played = true;
+                    played_to_completion = true;
+                }
+            }
+        } else if position_ticks > 0 && has_runtime && is_audiobook {
+            #[allow(clippy::cast_precision_loss)]
+            let position_minutes = position_ticks as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            #[allow(clippy::cast_precision_loss)]
+            let remaining_minutes =
+                (runtime_ticks - position_ticks) as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            if position_minutes < f64::from(config.min_audiobook_resume) {
+                position_ticks = 0;
+            } else if remaining_minutes < f64::from(config.max_audiobook_resume)
+                || position_ticks >= runtime_ticks
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            }
+        } else if !has_runtime {
+            row.played = true;
+            played_to_completion = true;
+            position_ticks = 0;
+        }
+
+        if !supports_played_status(kind) {
+            position_ticks = 0;
+            row.played = false;
+        }
+        if !supports_position_ticks_resume(kind) {
+            position_ticks = 0;
+        }
+
+        row.playback_position_ticks = position_ticks;
+        self.upsert_row(&row).await?;
+
+        Ok(played_to_completion)
+    }
+
+    async fn reset_playback_stream_selections(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"UPDATE "UserData"
+               SET "AudioStreamIndex" = NULL, "SubtitleStreamIndex" = NULL
+               WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
+        )
+        .bind(item_id.to_string())
+        .bind(user_id.to_string())
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configuration_manager::default_server_configuration;
+    use crate::test_support::{seed_item, seed_user, test_db};
+    use hermit_model::configuration::ServerConfiguration;
+
+    /// A config manager whose configuration is the factory default.
+    struct FixedConfig {
+        config: ServerConfiguration,
+    }
+
+    #[async_trait]
+    impl ServerConfigurationManager for FixedConfig {
+        fn application_paths(&self) -> Arc<dyn hermit_traits::system::ServerApplicationPaths> {
+            unreachable!("not used in these tests")
+        }
+
+        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+            Ok(self.config.clone())
+        }
+
+        async fn update_configuration(
+            &self,
+            _configuration: &ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn config() -> Arc<dyn ServerConfigurationManager> {
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        })
+    }
+
+    /// Seeds a movie with a runtime, for the play-state heuristics.
+    async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
+        seed_item(db, id, BaseItemKind::Movie).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2 WHERE "Id" = ?1"#)
+            .bind(id.to_string())
+            .bind(runtime_ticks)
+            .execute(db.pool())
+            .await
+            .expect("set runtime");
+    }
+
+    #[tokio::test]
+    async fn save_then_read_round_trips() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        mgr.save_user_data(
+            user,
+            item,
+            &UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                play_count: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save");
+
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("some");
+        assert!(dto.is_favorite);
+        assert_eq!(dto.play_count, 3);
+    }
+
+    #[tokio::test]
+    async fn missing_row_reads_as_empty_dto() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        let mgr = HermitUserDataManager::new(db, config());
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("some");
+        assert!(!dto.is_favorite);
+        assert_eq!(dto.play_count, 0);
+    }
+
+    #[tokio::test]
+    async fn update_play_state_near_end_marks_played() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        // 1 hour runtime.
+        let runtime = 3600 * TICKS_PER_SECOND;
+        seed_movie_with_runtime(&db, item, runtime).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        // Reporting a position past MaxResumePct (default 90%) marks completion.
+        let played = mgr
+            .update_play_state(user, item, Some(runtime * 95 / 100))
+            .await
+            .expect("update");
+        assert!(played);
+
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("some");
+        assert!(dto.played);
+        assert_eq!(dto.playback_position_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn update_play_state_midway_keeps_resume_point() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        let runtime = 3600 * TICKS_PER_SECOND;
+        seed_movie_with_runtime(&db, item, runtime).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        let position = runtime / 2;
+        let played = mgr
+            .update_play_state(user, item, Some(position))
+            .await
+            .expect("update");
+        assert!(!played);
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("some");
+        assert_eq!(dto.playback_position_ticks, position);
+    }
+
+    #[tokio::test]
+    async fn reset_stream_selections_clears_indices() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db.clone(), config());
+
+        // Seed a row with stream indices set.
+        let mut row = HermitUserDataManager::empty_row(item, user);
+        row.audio_stream_index = Some(2);
+        row.subtitle_stream_index = Some(1);
+        mgr.upsert_row(&row).await.expect("seed row");
+
+        mgr.reset_playback_stream_selections(user, item)
+            .await
+            .expect("reset");
+
+        let cleared = mgr.read_row(item, user).await.expect("read").expect("some");
+        assert_eq!(cleared.audio_stream_index, None);
+        assert_eq!(cleared.subtitle_stream_index, None);
+    }
+}

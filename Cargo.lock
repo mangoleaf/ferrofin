@@ -713,6 +713,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hermit-common",
+ "hermit-db",
+ "hermit-model",
+ "hermit-naming",
+ "hermit-traits",
+ "rstest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hermit-db"
 version = "0.1.0"
 dependencies = [

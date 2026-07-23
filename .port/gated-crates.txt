@@ -14,3 +14,4 @@ hermit-drawing
 hermit-providers
 hermit-livetv
 hermit-hls
+hermit-core
