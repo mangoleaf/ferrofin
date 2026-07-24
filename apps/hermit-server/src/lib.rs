@@ -33,6 +33,7 @@ use anyhow::Context as _;
 use axum::Router;
 use axum::response::Redirect;
 use axum::routing::get;
+use tower::Layer as _;
 use tower_http::services::ServeDir;
 
 use crate::bootstrap::{FfmpegPaths, discover_ffmpeg, init_tracing, open_database};
@@ -149,22 +150,57 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // marking itself ready once services are registered).
     wired.app_host.mark_core_startup_complete();
 
+    // Case-insensitive routing: Jellyfin's API is case-insensitive but axum's
+    // router is not, and clients (jellyfin-web included) call some paths in
+    // non-canonical case. Rewrite each request's path to its registered case
+    // BEFORE routing. This must wrap the whole router as an outer layer (not
+    // `Router::layer`, which runs per-matched-route, too late to re-route).
+    let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
+
     let addr = SocketAddr::new(config.bind_addr, config.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
     tracing::info!(%addr, "hermit-server listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown_rx.await.ok();
-            tracing::info!("graceful shutdown requested");
-        })
-        .await
-        .context("server error")?;
+    axum::serve(
+        listener,
+        axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_rx.await.ok();
+        tracing::info!("graceful shutdown requested");
+    })
+    .await
+    .context("server error")?;
 
     tracing::info!("hermit-server stopped");
     Ok(())
+}
+
+/// Rewrites a request's path to its canonical Jellyfin case before routing.
+///
+/// Jellyfin's API is case-insensitive (ASP.NET); axum's router is case-sensitive,
+/// and clients call some paths in non-canonical case (e.g. `/Localization/countries`).
+/// [`hermit_api::routes::canonicalize_path`] re-cases route literals to the
+/// registered form while preserving parameter values, returning `None` for paths
+/// that match no API route (`/web/*` assets, health) so their case stays significant.
+/// Applied as an OUTER layer so `next.run` re-enters routing with the rewritten path.
+async fn canonicalize_path_case(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(canonical) = hermit_api::routes::canonicalize_path(request.uri().path()) {
+        let query = request
+            .uri()
+            .query()
+            .map(|q| format!("?{q}"))
+            .unwrap_or_default();
+        if let Ok(uri) = format!("{canonical}{query}").parse() {
+            *request.uri_mut() = uri;
+        }
+    }
+    next.run(request).await
 }
 
 /// Mounts a static web client at `/web` (with an SPA `index.html` fallback) and

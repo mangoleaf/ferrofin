@@ -8,6 +8,7 @@
 
 use axum::response::IntoResponse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use crate::contract_routes::VENDORED_ROUTES;
 use crate::error::ApiError;
@@ -121,13 +122,140 @@ pub fn axum_routes() -> Vec<(&'static str, String)> {
         .collect()
 }
 
+/// One segment of a registered route: a literal path component (in its canonical
+/// case) or a captured parameter.
+enum Seg {
+    /// A literal segment, e.g. `Localization` — matched case-insensitively.
+    Literal(String),
+    /// A single-segment parameter, e.g. `{itemId}` — matches any one segment.
+    Param,
+    /// A catch-all parameter, e.g. `{*path}` — matches the remaining segments.
+    Wildcard,
+}
+
+/// The registered routes, parsed into segments once, for case-insensitive matching.
+fn canonical_routes() -> &'static Vec<Vec<Seg>> {
+    static ROUTES: OnceLock<Vec<Vec<Seg>>> = OnceLock::new();
+    ROUTES.get_or_init(|| {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for (_method, path) in axum_routes() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let segs = path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.starts_with("{*") {
+                        Seg::Wildcard
+                    } else if s.starts_with('{') {
+                        Seg::Param
+                    } else {
+                        Seg::Literal(s.to_owned())
+                    }
+                })
+                .collect();
+            out.push(segs);
+        }
+        out
+    })
+}
+
+/// Rewrites a request path so its route **literals** match the registered routes
+/// case-insensitively — Jellyfin/ASP.NET routing is case-insensitive, axum is not,
+/// and clients (including jellyfin-web) call some paths in non-canonical case.
+///
+/// Only literal segments are re-cased; parameter values (item ids, names, …) are
+/// preserved verbatim. Returns `Some(canonical)` when a differently-cased match is
+/// found, or `None` when the path is already canonical or matches no API route
+/// (so `/web/*` assets, health, and unknown paths pass through untouched — their
+/// case is significant).
+#[must_use]
+pub fn canonicalize_path(path: &str) -> Option<String> {
+    let incoming: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for pattern in canonical_routes() {
+        let has_wildcard = matches!(pattern.last(), Some(Seg::Wildcard));
+        if has_wildcard {
+            if incoming.len() < pattern.len() - 1 {
+                continue;
+            }
+        } else if incoming.len() != pattern.len() {
+            continue;
+        }
+
+        let literals_match = pattern.iter().enumerate().all(|(i, seg)| match seg {
+            Seg::Literal(lit) => incoming[i].eq_ignore_ascii_case(lit),
+            Seg::Param | Seg::Wildcard => true,
+        });
+        if !literals_match {
+            continue;
+        }
+
+        let mut rebuilt = String::with_capacity(path.len());
+        for (i, seg) in pattern.iter().enumerate() {
+            match seg {
+                Seg::Literal(lit) => {
+                    rebuilt.push('/');
+                    rebuilt.push_str(lit);
+                }
+                Seg::Param => {
+                    rebuilt.push('/');
+                    rebuilt.push_str(incoming[i]);
+                }
+                Seg::Wildcard => {
+                    for rest in &incoming[i..] {
+                        rebuilt.push('/');
+                        rebuilt.push_str(rest);
+                    }
+                    break;
+                }
+            }
+        }
+        return (rebuilt != path).then_some(rebuilt);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{axum_routes, to_axum_path};
+    use super::{axum_routes, canonicalize_path, to_axum_path};
     use std::collections::BTreeMap;
 
     fn one(path: &str) -> String {
         to_axum_path(path, &mut BTreeMap::new())
+    }
+
+    #[test]
+    fn canonicalize_recases_route_literals() {
+        assert_eq!(
+            canonicalize_path("/Localization/cultures").as_deref(),
+            Some("/Localization/Cultures")
+        );
+        assert_eq!(
+            canonicalize_path("/localization/options").as_deref(),
+            Some("/Localization/Options")
+        );
+        assert_eq!(
+            canonicalize_path("/SYSTEM/INFO/PUBLIC").as_deref(),
+            Some("/System/Info/Public")
+        );
+    }
+
+    #[test]
+    fn canonicalize_preserves_parameter_values() {
+        // The `{itemId}` value keeps its exact case; only the `Images` literal is recased.
+        assert_eq!(
+            canonicalize_path("/items/AbC-123/images").as_deref(),
+            Some("/Items/AbC-123/Images")
+        );
+    }
+
+    #[test]
+    fn canonicalize_returns_none_for_canonical_or_non_api() {
+        assert_eq!(canonicalize_path("/Localization/Cultures"), None); // already canonical
+        assert_eq!(canonicalize_path("/web/index.html"), None); // static asset, not an API route
+        assert_eq!(canonicalize_path("/definitely/not/a/route"), None);
     }
 
     #[test]

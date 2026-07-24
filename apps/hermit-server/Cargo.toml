@@ -37,6 +37,7 @@ hermit-providers.workspace = true
 hermit-livetv.workspace = true
 
 axum = { workspace = true, features = ["ws", "macros"] }
+tower.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
 tokio = { workspace = true }
 async-trait.workspace = true
