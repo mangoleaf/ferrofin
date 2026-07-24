@@ -154,6 +154,28 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         Ok(())
     }
 
+    async fn set_ancestors(
+        &self,
+        item_id: Uuid,
+        ancestor_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        let id = item_id.to_string();
+        sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+            .bind(&id)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        for ancestor in ancestor_ids {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(&id)
+                .bind(ancestor.to_string())
+                .execute(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
         // The image rows live in BaseItemImageInfos and are owned by their own
         // repository; without the domain item's ImageInfos list on the entity

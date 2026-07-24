@@ -51,6 +51,9 @@ pub struct HermitLibraryManager {
     counts: Arc<dyn ItemCountService>,
     persistence: Arc<dyn ItemPersistenceService>,
     people: Arc<dyn PeopleRepository>,
+    /// The filesystem scanner, set by the composition root. When present,
+    /// `queue_library_scan` runs it; `None` (unit tests) keeps it a no-op.
+    scanner: Option<Arc<crate::library_scan::LibraryScanner>>,
 }
 
 impl std::fmt::Debug for HermitLibraryManager {
@@ -74,7 +77,16 @@ impl HermitLibraryManager {
             counts,
             persistence,
             people,
+            scanner: None,
         }
+    }
+
+    /// Attaches the filesystem scanner so `queue_library_scan` actually walks the
+    /// libraries. Called once by the composition root.
+    #[must_use]
+    pub fn with_scanner(mut self, scanner: Arc<crate::library_scan::LibraryScanner>) -> Self {
+        self.scanner = Some(scanner);
+        self
     }
 
     /// Lists every non-virtual item of `kind` (the `MergeVersions` plugin's
@@ -452,9 +464,15 @@ impl LibraryManager for HermitLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        // The real scheduler/scan pipeline is a later wave; queuing is a no-op that
-        // succeeds so callers (API endpoints) get the expected 204 semantics.
-        tracing::debug!("library scan queued (no-op: scan pipeline deferred)");
+        // ponytail: runs inline (fine for typical libraries; a dozen movies is
+        // instant). Move to a spawned, progress-reporting task if large-library
+        // refresh latency becomes an issue.
+        let Some(scanner) = &self.scanner else {
+            tracing::debug!("library scan queued (no scanner attached — no-op)");
+            return Ok(());
+        };
+        let created = scanner.scan_all().await?;
+        tracing::info!(created, "library scan complete");
         Ok(())
     }
 }

@@ -288,13 +288,26 @@ pub async fn build_app_state(
     );
 
     // ---- library + media-sources (consume repositories/services) ----------
-    let library: Arc<dyn hermit_traits::library::LibraryManager> =
-        Arc::new(HermitLibraryManager::new(
+    // The virtual-folder manager (shared with `with_virtual_folders` below) and
+    // the filesystem scanner the library manager runs on `queue_library_scan`.
+    let virtual_folders: Arc<dyn hermit_traits::library::VirtualFolderManager> = Arc::new(
+        hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
+            .with_item_store(Arc::clone(&item_persistence_service)),
+    );
+    let library_scanner = Arc::new(hermit_core::LibraryScanner::new(
+        Arc::clone(&virtual_folders),
+        Arc::clone(&file_system),
+        Arc::clone(&item_persistence_service),
+    ));
+    let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
+        HermitLibraryManager::new(
             Arc::clone(&item_repository),
             Arc::clone(&item_count_service),
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
-        ));
+        )
+        .with_scanner(Arc::clone(&library_scanner)),
+    );
     let media_sources: Arc<dyn hermit_traits::library::MediaSourceManager> =
         Arc::new(HermitMediaSourceManager::new(
             Arc::clone(&item_repository),
@@ -493,10 +506,7 @@ pub async fn build_app_state(
     // (`.mblink` shortcuts + `options.json`). Replace the disabled stub
     // `AppState::new` installed with the real filesystem-backed manager rooted
     // there (mirrors the C# `ILibraryManager` virtual-folder methods).
-    let state = state.with_virtual_folders(Arc::new(
-        hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
-            .with_item_store(Arc::clone(&item_persistence_service)),
-    ));
+    let state = state.with_virtual_folders(Arc::clone(&virtual_folders));
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time

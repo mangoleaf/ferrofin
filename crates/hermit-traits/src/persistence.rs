@@ -281,6 +281,16 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Persists (inserts or updates) the given item rows.
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
+    /// Replaces an item's ancestor-closure rows (`AncestorIds`) — the recursive
+    /// `ParentId` chain up to and including the library's `CollectionFolder`.
+    ///
+    /// `save_items` writes only the item row (its `ParentId`/`TopParentId`); the
+    /// recursive item query (`?ParentId=<library>&Recursive=true`) joins the
+    /// `AncestorIds` closure table, so a scanned item appears in the library
+    /// listing only once its ancestors are registered here.
+    async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
+    -> Result<(), ServiceError>;
+
     /// Persists the image info attached to an item.
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
