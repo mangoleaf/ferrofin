@@ -182,6 +182,24 @@ pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+/// Derives a scanned item's stable `Guid` from its kind + filesystem path — the
+/// port of Jellyfin's `LibraryManager.GetNewItemIdInternal`
+/// (`key = TypeFullName + path`, MD5 over the UTF-16LE bytes → `Guid`).
+///
+/// The path is lowercased, matching Jellyfin's default
+/// `EnableCaseSensitiveItemIds = false`. Returns [`None`] for a kind with no
+/// stored type name.
+///
+/// ponytail: no `ProgramDataPath`-relative rewrite / backslash normalization
+/// (those matter only for cross-install id parity on Windows); add if we ever
+/// import a foreign Jellyfin database.
+#[must_use]
+pub fn derive_item_id(kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
+    let type_name = stored_type_name(kind)?;
+    let key = format!("{type_name}{}", path.to_lowercase());
+    Some(hermit_common::extensions::get_md5(&key))
+}
+
 /// The inverse of [`stored_type_name`]: maps a stored `BaseItems.Type` name back
 /// to its [`BaseItemKind`], or [`None`] for an unrecognized name.
 ///

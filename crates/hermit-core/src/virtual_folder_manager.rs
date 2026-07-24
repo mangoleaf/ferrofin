@@ -27,10 +27,12 @@
 //!   refresh is a no-op (the same stance `queue_library_scan` takes today).
 //! - The `ExpandVirtualPath`/`ReverseVirtualPath` network-share remapping is the
 //!   identity here (no virtual-path substitution is configured at this seam).
-//! - `ItemId`/`PrimaryImageItemId`/refresh-state on [`VirtualFolderInfo`] need the
-//!   DB-backed collection-folder rows + refresh queue, which are not modeled here,
-//!   so they are left unset (Jellyfin leaves them null for a not-yet-materialized
-//!   folder).
+//! - When an item store is attached ([`with_item_store`](HermitVirtualFolderManager::with_item_store)),
+//!   add/remove also creates/deletes the library's `CollectionFolder` `BaseItem`,
+//!   and `GetVirtualFolders` projects its deterministic id onto
+//!   [`VirtualFolderInfo::item_id`] (so the library appears in `/UserViews` and is
+//!   editable). `PrimaryImageItemId`/refresh-state still need the image + refresh
+//!   queues and are left unset for now.
 
 use std::path::{Path, PathBuf};
 
@@ -39,8 +41,16 @@ use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
 use hermit_model::entities::CollectionTypeOptions;
 use hermit_model::entities_media::VirtualFolderInfo;
 
+use std::sync::Arc;
+
+use chrono::Utc;
+use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_model::data::BaseItemKind;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::VirtualFolderManager;
+use hermit_traits::persistence::ItemPersistenceService;
+
+use crate::item_type_lookup;
 
 /// The shortcut-file extension Jellyfin uses (`MbLinkShortcutHandler.Extension`).
 const SHORTCUT_EXTENSION: &str = "mblink";
@@ -56,10 +66,25 @@ const COLLECTION_EXTENSION: &str = "collection";
 /// Owns only the user-views root path; every operation is a directory read/write
 /// beneath it, so the manager is composition-root agnostic and fully testable
 /// over a temp directory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HermitVirtualFolderManager {
     /// The `DefaultUserViewsPath` root under which each virtual folder lives.
     root: PathBuf,
+    /// The item store, set by the composition root. When present, adding/removing
+    /// a library also creates/deletes its `CollectionFolder` [`BaseItemEntity`] —
+    /// the row whose id is `VirtualFolderInfo.ItemId` (jellyfin-web rejects a
+    /// library with a null `ItemId`) and that `/UserViews` returns. `None` in unit
+    /// tests keeps the manager filesystem-only.
+    persistence: Option<Arc<dyn ItemPersistenceService>>,
+}
+
+impl std::fmt::Debug for HermitVirtualFolderManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HermitVirtualFolderManager")
+            .field("root", &self.root)
+            .field("has_item_store", &self.persistence.is_some())
+            .finish()
+    }
 }
 
 impl HermitVirtualFolderManager {
@@ -71,7 +96,26 @@ impl HermitVirtualFolderManager {
     pub fn new(default_user_views_path: impl Into<PathBuf>) -> Self {
         Self {
             root: default_user_views_path.into(),
+            persistence: None,
         }
+    }
+
+    /// Attaches the item store so add/remove also creates/deletes the library's
+    /// `CollectionFolder` row. Called once by the composition root.
+    #[must_use]
+    pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+
+    /// The deterministic `CollectionFolder` item id for a virtual-folder directory
+    /// (`GetNewItemIdInternal` over the folder path) — both the created row's id
+    /// and the value projected onto [`VirtualFolderInfo::item_id`].
+    fn collection_folder_id(folder_path: &Path) -> Option<uuid::Uuid> {
+        item_type_lookup::derive_item_id(
+            BaseItemKind::CollectionFolder,
+            &folder_path.to_string_lossy(),
+        )
     }
 
     /// The on-disk directory of the named virtual folder.
@@ -290,6 +334,7 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
                 locations: Self::resolve_locations(&path).await?,
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
+                item_id: Self::collection_folder_id(&path).map(|g| g.to_string()),
                 ..VirtualFolderInfo::default()
             });
         }
@@ -354,11 +399,40 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
             Self::create_shortcut(&folder_path, path_info).await?;
         }
 
+        // Create the library's CollectionFolder item so it appears in /UserViews
+        // and its ItemId resolves (jellyfin-web's library editor rejects a null
+        // ItemId). Its children are populated by the library scan.
+        if let (Some(persistence), Some(id)) =
+            (&self.persistence, Self::collection_folder_id(&folder_path))
+        {
+            let entity = BaseItemEntity {
+                id: id.to_string(),
+                type_: item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: Some(dedup_name.clone()),
+                path: Some(folder_path.to_string_lossy().into_owned()),
+                is_folder: true,
+                date_created: Some(Utc::now()),
+                ..BaseItemEntity::default()
+            };
+            persistence
+                .save_items(std::slice::from_ref(&entity))
+                .await?;
+        }
+
         Ok(())
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
         let folder_path = self.require_folder(name).await?;
+        // Delete the CollectionFolder row before the directory (its id derives from
+        // the path). Child items are pruned by a later scan.
+        if let (Some(persistence), Some(id)) =
+            (&self.persistence, Self::collection_folder_id(&folder_path))
+        {
+            persistence.delete_items(std::slice::from_ref(&id)).await?;
+        }
         tokio::fs::remove_dir_all(&folder_path)
             .await
             .map_err(|e| Self::io_err("remove virtual folder", &e))
@@ -495,9 +569,12 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
 #[cfg(test)]
 mod tests {
     use super::HermitVirtualFolderManager;
+    use crate::item_persistence_service::HermitItemPersistenceService;
+    use hermit_db::Database;
     use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
     use hermit_model::entities::CollectionTypeOptions;
     use hermit_traits::library::VirtualFolderManager;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     /// Builds a manager rooted at a fresh temp user-views dir; returns both so the
@@ -506,6 +583,54 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = HermitVirtualFolderManager::new(tmp.path().join("default"));
         (tmp, mgr)
+    }
+
+    /// A manager backed by a real in-memory item store, so add/remove exercises
+    /// the `CollectionFolder` row create/delete.
+    async fn manager_with_store() -> (TempDir, Database, HermitVirtualFolderManager) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let mgr = HermitVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(persistence);
+        (tmp, db, mgr)
+    }
+
+    #[tokio::test]
+    async fn add_creates_collection_folder_row_and_projects_matching_item_id() {
+        let (tmp, db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+
+        let folders = mgr.get_virtual_folders().await.expect("get");
+        let item_id = folders[0].item_id.clone().expect("ItemId projected");
+
+        // The persisted CollectionFolder row exists with the projected id.
+        let (type_, is_folder): (String, bool) =
+            sqlx::query_as(r#"SELECT "Type", "IsFolder" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&item_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("collection folder row exists");
+        assert_eq!(type_, "MediaBrowser.Controller.Entities.CollectionFolder");
+        assert!(is_folder);
+
+        // Removing the library deletes the row.
+        mgr.remove_virtual_folder("Movies").await.expect("remove");
+        let remaining: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&item_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(remaining, 0);
     }
 
     /// Creates a real on-disk media directory under `tmp` and returns its path.

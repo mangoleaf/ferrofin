@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 // A 1:1 mirror of the ~60-column `BaseItems` table; its many boolean flags are
 // intrinsic to the schema, not a refactorable design.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Default, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct BaseItemEntity {
     /// The item's `Guid` primary key, hyphenated (`Id`).

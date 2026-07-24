@@ -493,9 +493,10 @@ pub async fn build_app_state(
     // (`.mblink` shortcuts + `options.json`). Replace the disabled stub
     // `AppState::new` installed with the real filesystem-backed manager rooted
     // there (mirrors the C# `ILibraryManager` virtual-folder methods).
-    let state = state.with_virtual_folders(Arc::new(hermit_core::HermitVirtualFolderManager::new(
-        paths.default_user_views_path(),
-    )));
+    let state = state.with_virtual_folders(Arc::new(
+        hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
+            .with_item_store(Arc::clone(&item_persistence_service)),
+    ));
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time
