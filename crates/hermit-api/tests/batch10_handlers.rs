@@ -279,6 +279,8 @@ impl MediaSourceManager for StreamSources {
 struct StreamLibrary {
     merged: Arc<Mutex<Vec<Vec<Uuid>>>>,
     removed: Arc<Mutex<Vec<Uuid>>>,
+    /// Names of the bulk `MergeVersions`-plugin ops invoked, in order.
+    bulk: Arc<Mutex<Vec<&'static str>>>,
 }
 
 #[async_trait]
@@ -292,6 +294,22 @@ impl LibraryManager for StreamLibrary {
     }
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.removed.lock().unwrap().push(item_id);
+        Ok(())
+    }
+    async fn merge_all_movie_versions(&self) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("merge_movies");
+        Ok(())
+    }
+    async fn split_all_movie_versions(&self) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("split_movies");
+        Ok(())
+    }
+    async fn merge_all_episode_versions(&self) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("merge_episodes");
+        Ok(())
+    }
+    async fn split_all_episode_versions(&self) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("split_episodes");
         Ok(())
     }
     async fn query_items(
@@ -414,6 +432,8 @@ struct Harness {
     merged: Arc<Mutex<Vec<Vec<Uuid>>>>,
     /// Ids passed to `remove_alternate_sources`.
     removed: Arc<Mutex<Vec<Uuid>>>,
+    /// Bulk `MergeVersions`-plugin ops invoked, in order.
+    bulk: Arc<Mutex<Vec<&'static str>>>,
 }
 
 /// Builds a [`Harness`] with the batch-10 stubs, serving `path` for streams.
@@ -422,6 +442,7 @@ fn state(path: &str) -> Harness {
     let closed = Arc::new(Mutex::new(Vec::new()));
     let merged = Arc::new(Mutex::new(Vec::new()));
     let removed = Arc::new(Mutex::new(Vec::new()));
+    let bulk = Arc::new(Mutex::new(Vec::new()));
     let sources = StreamSources {
         path: path.to_owned(),
         opened: opened.clone(),
@@ -430,6 +451,7 @@ fn state(path: &str) -> Harness {
     let library = StreamLibrary {
         merged: merged.clone(),
         removed: removed.clone(),
+        bulk: bulk.clone(),
     };
     let app = AppState::new(
         Arc::new(library),
@@ -471,6 +493,7 @@ fn state(path: &str) -> Harness {
         closed,
         merged,
         removed,
+        bulk,
     }
 }
 
@@ -680,6 +703,30 @@ async fn delete_alternate_sources_ok() {
         .expect("response");
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(removed.lock().unwrap().as_slice(), [ITEM_ID]);
+}
+
+/// The four parameterless `MergeVersions`-plugin routes each drive their bulk
+/// manager op and return `204`.
+#[tokio::test]
+async fn merge_versions_plugin_routes_drive_bulk_ops() {
+    let cases = [
+        ("/MergeVersions/MergeMovies", "merge_movies"),
+        ("/MergeVersions/SplitMovies", "split_movies"),
+        ("/MergeVersions/MergeEpisodes", "merge_episodes"),
+        ("/MergeVersions/SplitEpisodes", "split_episodes"),
+    ];
+    for (route, expected) in cases {
+        let (_dir, path) = temp_media();
+        let h = state(&path);
+        let bulk = h.bulk.clone();
+        let router = create_router(h.app);
+        let resp = router
+            .oneshot(authed("POST", route))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{route}");
+        assert_eq!(bulk.lock().unwrap().as_slice(), [expected], "{route}");
+    }
 }
 
 #[tokio::test]

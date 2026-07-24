@@ -105,13 +105,13 @@ mod tests {
     #[tokio::test]
     async fn stubbed_route_returns_501_not_404() {
         // A contract route with no ported handler still returns `501` (not
-        // `404`). `/Channels` is a deferred (Live-TV/channels subsystem) route
+        // `404`). `/SyncPlay/List` is a deferred (SyncPlay subsystem) route
         // registered on the shared stub.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/Channels")
+                    .uri("/SyncPlay/List")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -76,6 +76,7 @@ pub mod music_genres;
 pub mod persons;
 pub mod playlists;
 pub mod playstate;
+pub mod plugins;
 pub(crate) mod query_parse;
 pub mod quick_connect;
 pub mod remote_images;
@@ -558,6 +559,26 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Branding/Splashscreen"),
     ("post", "/Branding/Splashscreen"),
     ("delete", "/Branding/Splashscreen"),
+    // Plugins Tier 1 — the plugin-manager surface (`PluginsController` +
+    // `PackageController`) over the compile-time plugin registry. Reads,
+    // enable/disable, config, and the repository list are real; install and
+    // uninstall are honest rejections (they need the Tier-2 dynamic host, not a
+    // faked success). See `handlers::plugins` / `brain/PLAN_HERMIT_PLUGINS.md`.
+    ("get", "/Plugins"),
+    ("get", "/Plugins/{pluginId}/Configuration"),
+    ("post", "/Plugins/{pluginId}/Configuration"),
+    ("post", "/Plugins/{pluginId}/{version}/Enable"),
+    ("post", "/Plugins/{pluginId}/{version}/Disable"),
+    ("delete", "/Plugins/{pluginId}"),
+    ("delete", "/Plugins/{pluginId}/{version}"),
+    ("get", "/Plugins/{pluginId}/{version}/Image"),
+    ("post", "/Plugins/{pluginId}/Manifest"),
+    ("get", "/Repositories"),
+    ("post", "/Repositories"),
+    ("get", "/Packages"),
+    ("get", "/Packages/{name}"),
+    ("post", "/Packages/Installed/{name}"),
+    ("delete", "/Packages/Installing/{packageId}"),
 ];
 
 /// Mounts every real First-Light handler onto `router`, overriding the matching
@@ -627,6 +648,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = similar::register(router);
     // MergeVersions plugin — bulk merge/split of duplicate versions.
     let router = merge_versions::register(router);
+    // Plugins Tier 1 — plugin-manager surface over the compile-time registry.
+    let router = plugins::register(router);
     // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
     // needs it to establish a connection or it reports "Connection Failure".
     websocket::register(router)

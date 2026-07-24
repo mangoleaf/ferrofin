@@ -132,8 +132,9 @@
 //! - [`sync_play_manager`] — [`HermitSyncPlayManager`]
 //!   ([`hermit_traits::stubs::SyncPlayManager`]), a no-op group coordinator;
 //! - [`plugin_manager`] — [`HermitPluginManager`]
-//!   ([`hermit_traits::stubs::PluginManager`]), the `NullPluginManager` shape
-//!   (no plugins installed);
+//!   ([`hermit_traits::plugins::PluginManager`]), the Tier-1 registry-backed
+//!   manager over compiled-in plugins (empty until the composition root registers
+//!   any);
 //! - [`lyric_manager`] — [`HermitLyricManager`]
 //!   ([`hermit_traits::stubs::LyricManager`]), empty lyrics;
 //! - [`subtitle_manager`] — [`HermitSubtitleManager`]
@@ -252,7 +253,7 @@ pub use music_manager::HermitMusicManager;
 pub use next_up_service::HermitNextUpService;
 pub use path_manager::HermitPathManager;
 pub use people_repository::HermitPeopleRepository;
-pub use plugin_manager::HermitPluginManager;
+pub use plugin_manager::{HermitPluginManager, RegisteredPlugin};
 pub use quick_connect_manager::HermitQuickConnect;
 pub use scheduled_tasks::{HermitTaskManager, ScheduledTask};
 pub use search_manager::HermitSearchManager;

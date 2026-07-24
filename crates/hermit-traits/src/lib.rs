@@ -34,6 +34,7 @@ pub mod media_segments;
 pub mod net;
 pub mod options;
 pub mod persistence;
+pub mod plugins;
 pub mod providers;
 pub mod security;
 pub mod session;

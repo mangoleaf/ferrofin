@@ -481,6 +481,16 @@ pub async fn build_app_state(
         paths.default_user_views_path(),
     )));
 
+    // ---- plugin manager (Tier 1: compile-time plugins) --------------------
+    // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time
+    // plugin registry. No plugins are registered yet, so the plugin list is empty;
+    // the manager still persists the repository list and per-plugin configuration
+    // under `{config}/plugins/`. Runtime install/load is Tier 2 (a WASM/libloading
+    // host). See brain/PLAN_HERMIT_PLUGINS.md.
+    let state = state.with_plugins(Arc::new(hermit_core::HermitPluginManager::empty(
+        config.config_dir.join("plugins"),
+    )));
+
     Ok(WiredApp { state, app_host })
 }
 

@@ -52,23 +52,12 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     // tokenless probe), covered by batch15_handlers.rs: `GET /ScheduledTasks`,
     // `GET /ScheduledTasks/{taskId}`, `POST /ScheduledTasks/Running/{taskId}`,
     // `DELETE /ScheduledTasks/Running/{taskId}`, `POST /ScheduledTasks/{taskId}/Triggers`.
-    // Plugins
-    (Method::GET, "/Plugins"),
-    (Method::DELETE, "/Plugins/plugin-1"),
-    (Method::GET, "/Plugins/plugin-1/Configuration"),
-    (Method::POST, "/Plugins/plugin-1/Configuration"),
-    (Method::POST, "/Plugins/plugin-1/Manifest"),
-    (Method::DELETE, "/Plugins/plugin-1/1.0.0"),
-    (Method::POST, "/Plugins/plugin-1/1.0.0/Disable"),
-    (Method::POST, "/Plugins/plugin-1/1.0.0/Enable"),
-    (Method::GET, "/Plugins/plugin-1/1.0.0/Image"),
-    // Package
-    (Method::GET, "/Packages"),
-    (Method::POST, "/Packages/Installed/pkg-1"),
-    (Method::DELETE, "/Packages/Installing/install-1"),
-    (Method::GET, "/Packages/pkg-1"),
-    (Method::GET, "/Repositories"),
-    (Method::POST, "/Repositories"),
+    // Plugins / Package / Repositories — ported as the Tier-1 plugin-manager
+    // surface (`handlers::plugins`), so those routes are now real (`RequireAuth`-
+    // guarded → `401`/`400`/`404` for a probe, never `501`) and exercised in
+    // `plugins_handlers.rs` instead of being 501 stubs here. Runtime install
+    // (`POST /Packages/Installed/{name}`) is an honest `400`, not a stub. See
+    // `brain/PLAN_HERMIT_PLUGINS.md`.
     // Branding / Localization / Environment / ActivityLog / TimeSync — ported in
     // Batch 13, now real; covered by batch13_handlers.rs.
     // ClientLogController was ported in Batch 12, so `/ClientLog/Document` is now
@@ -152,7 +141,7 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        41,
-        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) = 41 stubs; probe table drifted"
+        26,
+        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) minus 15 Plugins/Packages/Repositories (Tier-1 plugin manager) = 26 stubs; probe table drifted"
     );
 }

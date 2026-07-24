@@ -1940,6 +1940,53 @@ pub fn authed_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> A
     .with_virtual_folders(vf)
 }
 
+/// Builds an authenticating [`AppState`] with the given plugin manager injected,
+/// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
+///
+/// Every other manager is the [`fake_state`] double; authentication always
+/// succeeds ([`AuthedAuthService`]) so the `RequireAuth`-guarded plugin routes
+/// reach their handler.
+#[must_use]
+pub fn authed_state_with_plugins(
+    plugins: Arc<dyn hermit_traits::plugins::PluginManager>,
+) -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+    .with_plugins(plugins)
+}
+
 /// Builds an authenticating [`AppState`] for the subtitle-conversion +
 /// FallbackFont routes, injecting the four managers those handlers touch
 /// (`library`, `config`, `file_system`, `media_sources`) and the subtitle

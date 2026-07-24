@@ -25,6 +25,7 @@ use hermit_traits::localization::LocalizationManager;
 use hermit_traits::media_encoding::{AttachmentExtractor, HlsStreamManager, SubtitleEncoder};
 use hermit_traits::media_segments::MediaSegmentManager;
 use hermit_traits::net::{AuthService, AuthorizationContext};
+use hermit_traits::plugins::{DisabledPluginManager, PluginManager};
 use hermit_traits::providers::ProviderManager;
 use hermit_traits::security::{ApiKeyManager, QuickConnect};
 use hermit_traits::session::SessionManager;
@@ -136,6 +137,12 @@ pub struct Inner {
     /// composition root injects the watcher-backed `HermitLibraryMonitor` via
     /// [`AppState::with_library_monitor`].
     pub library_monitor: Arc<dyn LibraryMonitor>,
+
+    /// The Tier-1 (compile-time) plugin manager backing `/Plugins/*`,
+    /// `/Packages/*` and `/Repositories`. Defaults to the disabled stub (no
+    /// plugins, no repositories, mutators rejected); the composition root injects
+    /// the registry-backed `HermitPluginManager` via [`AppState::with_plugins`].
+    pub plugins: Arc<dyn PluginManager>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -243,6 +250,9 @@ impl AppState {
             // Default to the no-op library monitor; the composition root overrides
             // it via `with_library_monitor` once the filesystem watcher is wired.
             library_monitor: Arc::new(NoopLibraryMonitor),
+            // Default to the disabled plugin manager; the composition root injects
+            // the registry-backed `HermitPluginManager` via `with_plugins`.
+            plugins: Arc::new(DisabledPluginManager),
         })
     }
 
@@ -327,6 +337,25 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_library_monitor must be called before the state is shared");
         inner.library_monitor = library_monitor;
+        self
+    }
+
+    /// Replaces the plugin manager with a concrete implementation.
+    ///
+    /// [`new`](Self::new) installs the disabled stub (no plugins, no repositories,
+    /// mutators rejected) so the many test constructors keep compiling; the
+    /// composition root calls this to wire the registry-backed
+    /// `HermitPluginManager` before the state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: Arc<dyn PluginManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_plugins must be called before the state is shared");
+        inner.plugins = plugins;
         self
     }
 
