@@ -99,6 +99,7 @@ pub mod user_library;
 pub mod user_views;
 pub mod users;
 pub mod videos;
+pub mod websocket;
 pub mod years;
 
 /// The `(method, axum_path)` pairs served by a real handler in this unit.
@@ -625,5 +626,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // Batch 16 — the last portable stubs.
     let router = similar::register(router);
     // MergeVersions plugin — bulk merge/split of duplicate versions.
-    merge_versions::register(router)
+    let router = merge_versions::register(router);
+    // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
+    // needs it to establish a connection or it reports "Connection Failure".
+    websocket::register(router)
 }
