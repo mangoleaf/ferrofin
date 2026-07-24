@@ -33,7 +33,7 @@ use anyhow::Context as _;
 use axum::Router;
 use axum::response::Redirect;
 use axum::routing::get;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use crate::bootstrap::{FfmpegPaths, discover_ffmpeg, init_tracing, open_database};
 use crate::config::Config;
@@ -186,11 +186,18 @@ fn mount_web(router: Router, web_dir: &Path) -> Router {
         return router;
     }
     tracing::info!(web_dir = %web_dir.display(), "serving static web client at /web");
+    // NOTE: no SPA/history fallback. jellyfin-web uses hash routing (`/web/#!/…`)
+    // and lazy webpack chunks, so a missing file MUST return 404 — falling back to
+    // `index.html` (text/html) would feed HTML to a chunk load and crash the app
+    // (black screen). `ServeDir` serves `index.html` for the `/web/` directory
+    // request on its own (append-index-on-directories is on by default).
+    // `nest_service("/web", …)` serves `/web` and `/web/*` (stripping the prefix);
+    // a bare `/web` request serves `index.html`. We cannot also register a
+    // `route("/web", …)` redirect — axum rejects the duplicate `/web` and panics.
+    // The `/` → `/web/` redirect is enough for the normal entry point (the client's
+    // relative asset URLs only resolve correctly from the trailing-slash `/web/`).
     router
-        .nest_service(
-            "/web",
-            ServeDir::new(web_dir).fallback(ServeFile::new(&index)),
-        )
+        .nest_service("/web", ServeDir::new(web_dir))
         .route("/", get(|| async { Redirect::permanent("/web/") }))
 }
 
