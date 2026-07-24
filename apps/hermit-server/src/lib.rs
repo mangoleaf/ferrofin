@@ -190,17 +190,54 @@ async fn canonicalize_path_case(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Some(canonical) = hermit_api::routes::canonicalize_path(request.uri().path()) {
-        let query = request
-            .uri()
-            .query()
-            .map(|q| format!("?{q}"))
-            .unwrap_or_default();
-        if let Ok(uri) = format!("{canonical}{query}").parse() {
-            *request.uri_mut() = uri;
-        }
+    // Path: re-case to the registered route where recognized (asset/unknown paths
+    // return `None` and keep their significant case).
+    let path = request.uri().path().to_owned();
+    let new_path = hermit_api::routes::canonicalize_path(&path).unwrap_or_else(|| path.clone());
+    // Query keys: case-fold unconditionally. Jellyfin's API is case-insensitive,
+    // but our `Query<T>` structs are `rename_all = "camelCase"`. Clients send a mix —
+    // the SDK emits PascalCase (`ParentId`, `IncludeItemTypes`), legacy jQuery paths
+    // camelCase. PascalCase and camelCase differ only in the first character, so
+    // lowercasing each key's first char maps both onto the camelCase field names
+    // (values untouched). Without this, SDK-cased filters bind to `None` and silently
+    // drop — e.g. a library's own CollectionFolder leaking into an
+    // `IncludeItemTypes=Movie` grid query. Applied to every request (harmless for
+    // asset routes, which ignore the query) so it also covers extra, non-contract
+    // routes like `/Users/{userId}/Items` that `canonicalize_path` doesn't know.
+    let target = match request.uri().query() {
+        Some(q) => format!("{new_path}?{}", normalize_query_keys(q)),
+        None => new_path,
+    };
+    // Origin-form request URI (path + query, no scheme/authority) → rebuilding from
+    // the parts is lossless; the rewrite is idempotent when nothing changed.
+    if let Ok(uri) = target.parse() {
+        *request.uri_mut() = uri;
     }
     next.run(request).await
+}
+
+/// Lowercases the first character of each `&`-separated query param's key,
+/// preserving values verbatim. Idempotent for already-camelCase keys.
+fn normalize_query_keys(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            let (key, value) = match pair.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (pair, None),
+            };
+            let mut chars = key.chars();
+            let key = match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_lowercase(), chars.as_str()),
+                None => String::new(),
+            };
+            match value {
+                Some(v) => format!("{key}={v}"),
+                None => key,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Mounts a static web client at `/web` (with an SPA `index.html` fallback) and
@@ -279,5 +316,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn normalizes_pascal_query_keys_to_camel() {
+        use super::normalize_query_keys;
+        // PascalCase (SDK) keys fold to camelCase; values (incl. their case) survive.
+        assert_eq!(
+            normalize_query_keys("ParentId=AbC-123&IncludeItemTypes=Movie&Recursive=true"),
+            "parentId=AbC-123&includeItemTypes=Movie&recursive=true"
+        );
+        // Already-camelCase keys are untouched (idempotent).
+        assert_eq!(
+            normalize_query_keys("parentId=x&sortBy=y"),
+            "parentId=x&sortBy=y"
+        );
+        // Valueless flags and empty segments don't panic.
+        assert_eq!(normalize_query_keys("Foo&bar"), "foo&bar");
     }
 }
