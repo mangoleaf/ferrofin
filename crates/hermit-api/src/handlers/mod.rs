@@ -48,6 +48,7 @@ pub mod artists;
 pub mod audio;
 pub mod branding;
 pub mod by_name;
+pub mod channels;
 pub mod client_log;
 pub mod collection;
 pub mod config;
@@ -353,6 +354,12 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/LiveStreams/Open"),
     ("post", "/LiveStreams/Close"),
     ("get", "/Playback/BitrateTest"),
+    // Channels (empty — no channel providers exist without plugins).
+    ("get", "/Channels"),
+    ("get", "/Channels/Features"),
+    ("get", "/Channels/{channelId}/Features"),
+    ("get", "/Channels/{channelId}/Items"),
+    ("get", "/Channels/Items/Latest"),
     // Batch 11 — Subtitles + Lyrics + MediaSegments + Trickplay.
     // Media segments (read); the plugin `SegmentEditor` `/MediaSegmentsApi/*`
     // routes stay on the 501 stub (dynamic plugin host is deferred).
@@ -624,6 +631,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = api_key::register(router);
     let router = client_log::register(router);
     let router = search::register(router);
+    let router = channels::register(router);
     // Batch 13 — system admin / configuration / branding / localization /
     // display preferences / activity log / dashboard / environment / time sync.
     let router = config::register(router);

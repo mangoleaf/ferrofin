@@ -113,7 +113,6 @@ fn fake_users_methods_panic() {
     assert_panics(f.get_users());
     assert_panics(f.get_user_ids());
     assert_panics(f.initialize());
-    assert_panics(f.get_user_by_id(Uuid::nil()));
     assert_panics(f.get_first_user());
     assert_panics(f.get_user_by_name("x"));
     assert_panics(f.rename_user(Uuid::nil(), "a", "b"));

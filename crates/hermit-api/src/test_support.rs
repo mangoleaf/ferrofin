@@ -412,7 +412,9 @@ impl UserManager for FakeUsers {
         unimplemented!("fake")
     }
     async fn get_user_by_id(&self, _id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
-        unimplemented!("fake")
+        // Benign default: no user. Callers that reload a user for enrichment
+        // (e.g. the auth-result User DTO) fall back gracefully on `None`.
+        Ok(None)
     }
     async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!("fake")

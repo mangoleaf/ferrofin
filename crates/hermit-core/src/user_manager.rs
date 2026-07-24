@@ -77,6 +77,12 @@ pub struct HermitUserManager {
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
+    /// This server's stable id, stamped onto every [`UserDto.ServerId`] when the
+    /// caller does not supply one. The web client keys its per-server api-client
+    /// on it and throws (`getApiClient(null)`) if it is missing. Set by the
+    /// composition root via [`with_server_id`](HermitUserManager::with_server_id);
+    /// `None` in tests (which then omit `ServerId`, the prior behaviour).
+    server_id: Option<String>,
 }
 
 impl std::fmt::Debug for HermitUserManager {
@@ -107,7 +113,16 @@ impl HermitUserManager {
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
+            server_id: None,
         }
+    }
+
+    /// Sets this server's stable id, stamped onto every produced [`UserDto`] whose
+    /// caller passes no explicit `server_id`. Called once by the composition root.
+    #[must_use]
+    pub fn with_server_id(mut self, server_id: impl Into<String>) -> Self {
+        self.server_id = Some(server_id.into());
+        self
     }
 
     /// Fetches a user row by id, or `None`.
@@ -713,7 +728,9 @@ impl UserManager for HermitUserManager {
         Ok(UserDto {
             name: Some(user.username.clone()),
             id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil()),
-            server_id,
+            // Caller-supplied id wins; otherwise fall back to the manager's own
+            // (set by the composition root) so `UserDto.ServerId` is never null.
+            server_id: server_id.or_else(|| self.server_id.clone()),
             enable_auto_login: Some(user.enable_auto_login),
             last_login_date: user.last_login_date,
             last_activity_date: user.last_activity_date,

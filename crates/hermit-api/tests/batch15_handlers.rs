@@ -326,11 +326,12 @@ async fn get_tasks_requires_auth() {
 }
 
 #[tokio::test]
-async fn channels_route_stays_501() {
-    // A deferred `ChannelsController` route must still route — as a `501` stub.
+async fn channels_route_returns_empty_not_501() {
+    // `ChannelsController` is implemented: with no channel providers it resolves
+    // to an empty result (a stock Jellyfin with none registered behaves the same).
     let tasks = Arc::new(StubTasks::new(Vec::new()));
     let (status, _body) = send(tasks, true, "GET", "/Channels").await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::OK);
 }
 
 /// Drives one request with a JSON `body` through a router built from

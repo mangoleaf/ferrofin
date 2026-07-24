@@ -174,10 +174,26 @@ pub async fn build_app_state(
     );
     let server_config = config_mgr.snapshot();
 
-    // A stable per-process server/system id. Jellyfin persists a GUID in
-    // system.json; until that field is threaded through, a fresh v4 UUID gives
-    // the DTO/auth/system layers the stable-within-a-run identifier they need.
-    let server_id = uuid::Uuid::new_v4().simple().to_string();
+    // A stable server/system id, persisted across restarts. Jellyfin persists its
+    // SystemId and the web client keys stored sessions by it, so regenerating it on
+    // every boot breaks reconnect: `ServerConnections.getApiClient` throws on the
+    // now-unknown id and the UI dies with a black screen. Persist to a dedicated
+    // `{config}/system_id` file.
+    // ponytail: a plain id file, not a new field threaded through the config manager.
+    let server_id = {
+        let id_path = config.config_dir.join("system_id");
+        match tokio::fs::read_to_string(&id_path).await {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_owned(),
+            _ => {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                tokio::fs::create_dir_all(&config.config_dir).await.ok();
+                tokio::fs::write(&id_path, &id)
+                    .await
+                    .context("failed to persist system_id")?;
+                id
+            }
+        }
+    };
 
     // ---- leaf: lookup + repositories (Database-only) ----------------------
     let item_type_lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
@@ -247,7 +263,7 @@ pub async fn build_app_state(
 
     // ---- managers over repositories/services ------------------------------
     let users: Arc<dyn hermit_traits::library::UserManager> =
-        Arc::new(HermitUserManager::new(db.clone()));
+        Arc::new(HermitUserManager::new(db.clone()).with_server_id(server_id.clone()));
     let user_data: Arc<dyn hermit_traits::library::UserDataManager> = Arc::new(
         HermitUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );

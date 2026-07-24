@@ -230,7 +230,7 @@ async fn authenticate_by_name(
         remote_endpoint: None,
     };
     let result = state.sessions.authenticate_new_session(&request).await?;
-    Ok(Json(authentication_result(result)))
+    Ok(Json(authentication_result(&state, result).await))
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -253,10 +253,16 @@ async fn authenticate_with_quick_connect(
         .await?;
     // The Quick Connect trait surfaces only the session DTO (its token is not
     // carried through this seam), so `access_token` resolves to `None`.
-    Ok(Json(authentication_result(AuthenticationResultData {
-        session,
-        access_token: String::new(),
-    })))
+    Ok(Json(
+        authentication_result(
+            &state,
+            AuthenticationResultData {
+                session,
+                access_token: String::new(),
+            },
+        )
+        .await,
+    ))
 }
 
 /// Assembles the [`AuthenticationResult`] wire body from an authenticated
@@ -265,16 +271,29 @@ async fn authenticate_with_quick_connect(
 /// The token is echoed back to the client as `AccessToken` so subsequent
 /// requests can authenticate; a genuinely empty token (e.g. the Quick Connect
 /// seam that does not carry one) collapses to `None`.
-fn authentication_result(result: AuthenticationResultData) -> AuthenticationResult {
+async fn authentication_result(
+    state: &AppState,
+    result: AuthenticationResultData,
+) -> AuthenticationResult {
     let AuthenticationResultData {
         session,
         access_token,
     } = result;
-    let user = UserDto {
+    // Build the full User DTO exactly as `GET /Users/Me` does — real policy,
+    // configuration, and `ServerId`. jellyfin-web caches `result.User` from login
+    // and drives the whole UI off it, so a bare id/name DTO with a default
+    // (all-false) policy and null `ServerId` locks the client out of its own
+    // libraries/dashboard and throws `getApiClient(null)`. Fall back to the bare
+    // DTO only if the row somehow can't be reloaded post-auth.
+    let user = match load_user(state, session.user_id).await {
+        Ok(entity) => state.users.get_user_dto(&entity, None).await.ok(),
+        Err(_) => None,
+    }
+    .unwrap_or_else(|| UserDto {
         id: session.user_id,
         name: session.user_name.clone(),
         ..UserDto::default()
-    };
+    });
     let server_id = session.server_id.clone();
     AuthenticationResult {
         user: Some(user),
