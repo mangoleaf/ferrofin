@@ -4,12 +4,13 @@
 //! the web client would be stuck at the setup wizard. Jellyfin covers this in two
 //! places: `UserManager.InitializeAsync` creates one administrator on first run,
 //! and the startup wizard's `StartupController.UpdateStartupUser` later renames
-//! that user and sets its password. A headless Hermit install has no interactive
-//! wizard, so this module folds both into a single non-interactive seed: when the
-//! database has no users, create the configured administrator, set its password
-//! (the configured one, or a freshly generated random one when none is
-//! configured — Jellyfin forbids an empty admin password), and grant it the
-//! administrator policy.
+//! that user and sets its password. This module ports `InitializeAsync`: when the
+//! database has no users, create the configured administrator and grant it the
+//! administrator policy. It sets a password only when `admin_password` is
+//! configured (a headless install); otherwise it leaves the admin **passwordless**
+//! — exactly like Jellyfin — so the web setup wizard can set it. A generated
+//! password would trip the wizard's "first user already has a password" guard and
+//! lock setup out.
 //!
 //! Seeding is idempotent and a no-op once any user exists, so it is safe to call
 //! unconditionally on every boot: an existing install is never disturbed.
@@ -20,11 +21,6 @@ use hermit_traits::library::UserManager;
 use uuid::Uuid;
 
 use crate::config::Config;
-
-/// The number of random bytes used to generate an initial admin password when
-/// none is configured. 24 bytes → a 48-character hex secret, comfortably beyond
-/// brute-force reach while staying copy-pasteable from the startup log.
-const GENERATED_PASSWORD_BYTES: usize = 24;
 
 /// The outcome of a [`seed_default_admin`] call, so the composition root can log
 /// exactly what happened (and surface a generated password once).
@@ -37,30 +33,30 @@ pub enum SeedOutcome {
         /// The seeded administrator's username.
         username: String,
     },
-    /// A default administrator was created with a freshly generated password,
-    /// carried here so the caller can print it once for the operator.
-    SeededWithGeneratedPassword {
+    /// A default administrator was created **without a password** (no
+    /// `admin_password` was configured), matching Jellyfin's `InitializeAsync`
+    /// default so the web setup wizard can set the password via
+    /// `POST /Startup/User`. The account cannot authenticate until a password is
+    /// set (through the wizard, or by configuring `admin_password`).
+    SeededPasswordless {
         /// The seeded administrator's username.
         username: String,
-        /// The generated plaintext password — log it exactly once; it cannot be
-        /// recovered afterwards (only its hash is persisted).
-        password: String,
     },
 }
 
 /// Seeds a default administrator when the install is fresh (no users exist).
 ///
-/// Port of the combined `UserManager.InitializeAsync` + startup-wizard
-/// `UpdateStartupUser` path, collapsed for a headless first run:
+/// Port of `UserManager.InitializeAsync`:
 ///
 /// 1. If any user already exists, return [`SeedOutcome::AlreadyInitialized`]
 ///    without touching the database (idempotent — safe on every boot).
 /// 2. Otherwise create the [`Config::admin_user`] account.
-/// 3. Set its password: the configured [`Config::admin_password`] when non-empty,
-///    else a freshly generated random secret (Jellyfin refuses to leave an admin
-///    password empty). The password is set *before* the administrator flag so the
-///    manager's "admin passwords must not be empty" guard does not reject it.
-/// 4. Grant it the administrator [`UserPolicy`].
+/// 3. If [`Config::admin_password`] is configured (non-empty), set it — a headless,
+///    ready-to-use admin. Otherwise leave the admin **passwordless** (Jellyfin's
+///    default) so the web setup wizard sets it; `change_password` rejects an empty
+///    admin password, so the passwordless path simply skips it.
+/// 4. Grant it the administrator [`UserPolicy`] (`update_policy` does not require a
+///    password, so a passwordless admin is valid until the wizard sets one).
 ///
 /// Returns the [`SeedOutcome`] so the caller can log the result and, for a
 /// generated password, surface it to the operator exactly once.
@@ -90,18 +86,27 @@ pub async fn seed_default_admin(
     let user_id = Uuid::parse_str(&user.id)
         .with_context(|| format!("created admin user has a non-UUID id `{}`", user.id))?;
 
-    // Resolve the password before granting admin: the manager forbids an empty
-    // password on an administrator, so an unconfigured password becomes a random
-    // secret rather than a boot failure.
-    let (password, generated) = match config.admin_password.trim() {
-        "" => (generate_password(), true),
-        configured => (configured.to_owned(), false),
+    // Set the password only when one is configured. With no `admin_password`, seed
+    // a PASSWORDLESS admin (Jellyfin's `InitializeAsync` default) so the web setup
+    // wizard can set it via `POST /Startup/User` — the wizard's `UpdateStartupUser`
+    // (like Jellyfin) forbids updating a first user that already has a password, so
+    // a generated password would lock the wizard out. `change_password` rejects an
+    // empty admin password, so for the passwordless case we simply skip it;
+    // `update_policy` grants admin without touching the password.
+    let configured = config.admin_password.trim();
+    let outcome = if configured.is_empty() {
+        SeedOutcome::SeededPasswordless {
+            username: username.clone(),
+        }
+    } else {
+        users
+            .change_password(user_id, configured)
+            .await
+            .context("failed to set the default admin password")?;
+        SeedOutcome::SeededWithConfiguredPassword {
+            username: username.clone(),
+        }
     };
-
-    users
-        .change_password(user_id, &password)
-        .await
-        .context("failed to set the default admin password")?;
 
     users
         .update_policy(
@@ -114,27 +119,7 @@ pub async fn seed_default_admin(
         .await
         .context("failed to grant the default admin administrator policy")?;
 
-    Ok(if generated {
-        SeedOutcome::SeededWithGeneratedPassword { username, password }
-    } else {
-        SeedOutcome::SeededWithConfiguredPassword { username }
-    })
-}
-
-/// Generates a random, URL-safe hex password.
-///
-/// Uses [`Uuid::new_v4`] as the entropy source (the workspace's only random
-/// dependency here), rendering each v4 UUID as its 32-character lower-hex
-/// `simple` form and concatenating until [`GENERATED_PASSWORD_BYTES`] bytes' worth
-/// of hex (two hex chars per byte) is reached, then truncating to that length.
-fn generate_password() -> String {
-    let target_len = GENERATED_PASSWORD_BYTES * 2;
-    let mut hex = String::with_capacity(target_len);
-    while hex.len() < target_len {
-        hex.push_str(&Uuid::new_v4().simple().to_string());
-    }
-    hex.truncate(target_len);
-    hex
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -206,26 +191,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seeds_admin_with_generated_password_when_unconfigured() {
+    async fn seeds_passwordless_admin_when_unconfigured() {
         let db = fresh_db().await;
         let users = HermitUserManager::new(db.clone());
         let config = seed_config("admin", "");
 
         let outcome = seed_default_admin(&users, &config).await.unwrap();
-        let SeedOutcome::SeededWithGeneratedPassword { username, password } = outcome else {
-            panic!("expected a generated-password outcome, got {outcome:?}");
-        };
-        assert_eq!(username, "admin");
-        // Two hex chars per byte.
-        assert_eq!(password.len(), GENERATED_PASSWORD_BYTES * 2);
-        assert!(password.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            outcome,
+            SeedOutcome::SeededPasswordless {
+                username: "admin".to_owned()
+            }
+        );
 
-        // The generated password authenticates the seeded admin.
-        let authed = users
-            .authenticate_user("admin", &password, "", true)
+        // The seeded admin exists and holds the administrator policy, but has NO
+        // password yet, so the setup wizard's UpdateStartupUser can set one (its
+        // "first user already has a password" guard must not trip).
+        let user = users
+            .get_user_by_name("admin")
             .await
-            .unwrap();
-        assert!(authed.is_some(), "generated password authenticates");
+            .unwrap()
+            .expect("seeded admin exists");
+        let dto = users.get_user_dto(&user, None).await.unwrap();
+        assert!(dto.policy.is_some_and(|p| p.is_administrator));
+        assert!(
+            user.password.is_none(),
+            "unconfigured seed leaves the admin passwordless for the wizard"
+        );
     }
 
     #[tokio::test]
@@ -242,13 +234,5 @@ mod tests {
 
         // Still exactly one user.
         assert_eq!(users.get_users().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn generated_passwords_differ_between_calls() {
-        let a = generate_password();
-        let b = generate_password();
-        assert_ne!(a, b, "each generated password is unique");
-        assert_eq!(a.len(), GENERATED_PASSWORD_BYTES * 2);
     }
 }

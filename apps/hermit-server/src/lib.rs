@@ -128,14 +128,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 "seeded default administrator with the configured password"
             );
         }
-        SeedOutcome::SeededWithGeneratedPassword { username, password } => {
-            // The generated secret only exists here (the DB stores its hash); log
-            // it once, prominently, so the operator can capture it.
+        SeedOutcome::SeededPasswordless { username } => {
+            // Matches Jellyfin's fresh-install default: the admin has no password
+            // yet. Complete setup in the browser (the web wizard sets it) or set
+            // HERMIT_ADMIN_PASSWORD for a headless, ready-to-use admin.
             tracing::warn!(
                 %username,
-                %password,
-                "seeded default administrator with a GENERATED password — record it now, \
-                 it cannot be recovered later"
+                "seeded a PASSWORDLESS default administrator — complete setup via the web \
+                 wizard at /web, or set HERMIT_ADMIN_PASSWORD for a headless install"
             );
         }
     }
