@@ -112,6 +112,42 @@ impl FromRequestParts<AppState> for RequireAuth {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `FirstTimeSetupOrDefault` policy.
+///
+/// Port of `FirstTimeSetupHandler`: while the startup wizard is **not** complete
+/// (`!IsStartupWizardCompleted`), the endpoint is reachable anonymously — the
+/// first-run web wizard hits e.g. `/Localization/Options` before any user exists.
+/// Once setup is complete it behaves like [`RequireAuth`] (a valid token is
+/// required, else `401`). The inner `Option` is `Some` when a token was validated,
+/// `None` for an anonymous first-time-setup request.
+#[derive(Debug, Clone)]
+pub struct FirstTimeSetupOrAuth(pub Option<AuthorizationInfo>);
+
+impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let ctx = request_context(&parts.headers, parts.uri.query(), None);
+        // Wizard incomplete → allow anonymous (still surface a token if one is
+        // present, but never reject). Treat a config read error as "not complete"
+        // so a fresh install can never lock itself out of its own setup wizard.
+        let wizard_complete = state
+            .config
+            .configuration()
+            .await
+            .is_ok_and(|c| c.is_startup_wizard_completed);
+        if !wizard_complete {
+            return Ok(Self(state.auth_service().authenticate(&ctx).await.ok()));
+        }
+        // Setup complete → require a valid token.
+        let info = state.auth_service().authenticate(&ctx).await?;
+        Ok(Self(Some(info)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::request_context;

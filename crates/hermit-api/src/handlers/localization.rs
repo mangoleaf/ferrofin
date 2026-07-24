@@ -17,7 +17,7 @@ use axum::{Json, Router};
 use hermit_model::entities_media::ParentalRating;
 use hermit_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
 
-use crate::auth::RequireAuth;
+use crate::auth::FirstTimeSetupOrAuth;
 use crate::state::AppState;
 
 /// `GET /Localization/Cultures` — the known cultures, distinct + ordered.
@@ -30,7 +30,10 @@ use crate::state::AppState;
     responses((status = 200, description = "Known cultures returned", body = [CultureDto])),
     tag = "hermit"
 )]
-async fn get_cultures(State(state): State<AppState>, _auth: RequireAuth) -> Json<Vec<CultureDto>> {
+async fn get_cultures(
+    State(state): State<AppState>,
+    _auth: FirstTimeSetupOrAuth,
+) -> Json<Vec<CultureDto>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut cultures: Vec<CultureDto> = state
         .localization
@@ -53,7 +56,7 @@ async fn get_cultures(State(state): State<AppState>, _auth: RequireAuth) -> Json
 )]
 async fn get_countries(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
 ) -> Json<Vec<CountryInfo>> {
     Json(state.localization.get_countries())
 }
@@ -69,7 +72,7 @@ async fn get_countries(
 )]
 async fn get_parental_ratings(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
 ) -> Json<Vec<ParentalRating>> {
     Json(state.localization.get_parental_ratings())
 }
@@ -85,7 +88,7 @@ async fn get_parental_ratings(
 )]
 async fn get_localization_options(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
 ) -> Json<Vec<LocalizationOption>> {
     Json(state.localization.get_localization_options())
 }
