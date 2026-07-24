@@ -54,7 +54,7 @@ use hermit_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult}
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{FirstTimeSetupOrAuth, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
 use crate::handlers::query_parse::parse_csv_enums;
@@ -428,7 +428,9 @@ fn representative_item_types(
 )]
 async fn get_available_options(
     State(_state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    // `[Authorize(FirstTimeSetupOrElevated)]` (method-level): the setup wizard's
+    // add-library step reads this before login.
+    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
     Query(query): Query<AvailableOptionsQuery>,
 ) -> Result<Json<LibraryOptionsResultDto>, ApiError> {
     use hermit_model::configuration::LibraryTypeOptionsDto;
