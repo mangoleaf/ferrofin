@@ -63,8 +63,7 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     // ClientLogController was ported in Batch 12, so `/ClientLog/Document` is now
     // real (`RequireAuth`-guarded → `401` for a tokenless probe) and exercised in
     // `batch12_handlers.rs` instead of being a 501 stub here.
-    // Backup
-    (Method::GET, "/Backup"),
+    // Backup (GET list is implemented — empty; Create/Manifest/Restore deferred)
     (Method::POST, "/Backup/Create"),
     (Method::GET, "/Backup/Manifest"),
     (Method::POST, "/Backup/Restore"),
@@ -135,7 +134,7 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        21,
-        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) minus 15 Plugins/Packages/Repositories (Tier-1 plugin manager) minus 5 Channels (now implemented — empty results) = 21 stubs; probe table drifted"
+        20,
+        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) minus 15 Plugins/Packages/Repositories (Tier-1 plugin manager) minus 5 Channels (now implemented — empty results) minus 1 Backup (GET list implemented) = 20 stubs; probe table drifted"
     );
 }

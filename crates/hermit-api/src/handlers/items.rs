@@ -620,9 +620,27 @@ fn parse_order_by(
 /// The bare `/Items/{itemId}` slot carries `GET`/`DELETE` (this controller) and
 /// `POST` (the item-update controller) on one shared `MethodRouter`, since axum
 /// rejects a duplicate method+path registered across two `route` calls.
+/// `GET /Users/{userId}/Items` — the legacy, path-scoped form of `GET /Items`.
+///
+/// Removed from the 10.11 OpenAPI contract (superseded by `/Items?userId=`), so
+/// it is registered as an *extra* route, not a contract entry. jellyfin-web still
+/// calls it for some home rows (returning `404` broke those); this injects the
+/// path `userId` into the query and forwards to [`get_items`].
+async fn get_items_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    Query(mut query): Query<ItemsQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    query.user_id = Some(user_id);
+    get_items(state, auth, Query(query)).await
+}
+
+/// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Items", get(get_items).delete(delete_items))
+        .route("/Users/{userId}/Items", get(get_items_for_user))
         .route("/Items/Counts", get(get_item_counts))
         .route("/UserItems/Resume", get(get_resume_items))
         .route(

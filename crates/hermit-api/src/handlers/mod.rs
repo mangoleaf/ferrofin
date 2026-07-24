@@ -46,6 +46,7 @@ pub mod activity_log;
 pub mod api_key;
 pub mod artists;
 pub mod audio;
+pub mod backup;
 pub mod branding;
 pub mod by_name;
 pub mod channels;
@@ -354,6 +355,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/LiveStreams/Open"),
     ("post", "/LiveStreams/Close"),
     ("get", "/Playback/BitrateTest"),
+    // Backup: list available archives (empty; no backup subsystem yet).
+    ("get", "/Backup"),
     // Channels (empty — no channel providers exist without plugins).
     ("get", "/Channels"),
     ("get", "/Channels/Features"),
@@ -632,6 +635,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = client_log::register(router);
     let router = search::register(router);
     let router = channels::register(router);
+    let router = backup::register(router);
     // Batch 13 — system admin / configuration / branding / localization /
     // display preferences / activity log / dashboard / environment / time sync.
     let router = config::register(router);

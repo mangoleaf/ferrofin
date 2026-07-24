@@ -22,6 +22,8 @@ test-util = []
 hermit-traits.workspace = true
 hermit-model.workspace = true
 hermit-health.workspace = true
+# The `NetworkConfiguration` DTO returned by `GET /System/Configuration/network`.
+hermit-networking.workspace = true
 # The MD5 id-derivation helper (`GetMD5`) the display-preferences controller
 # uses to hash a non-Guid `displayPreferencesId` into a stable item id.
 hermit-common.workspace = true

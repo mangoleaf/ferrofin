@@ -7,9 +7,10 @@
 //! - `GET`/`POST /System/Configuration/{key}` — a *named* configuration.
 //!
 //! Named configurations are Jellyfin's pluggable per-key config store. Hermit
-//! surfaces the one named config it persists — `branding` — for real; other keys
-//! belong to the (deferred) plugin-config framework and return `501`. The write
-//! side accepts an arbitrary JSON body per the contract.
+//! serves the core keys the dashboard reads — `branding` + `encoding` from
+//! storage, `network`/`metadata`/`xbmcmetadata` as default objects; plugin-owned
+//! keys stay on the `501` stub. The write side currently persists only
+//! `branding` (other keys `501`).
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -102,9 +103,14 @@ async fn update_branding_configuration(
 
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
-/// Port of `ConfigurationController.GetNamedConfiguration`. Only the `branding`
-/// key is backed by real storage; other keys belong to the deferred plugin
-/// configuration framework and return `501`.
+/// Port of `ConfigurationController.GetNamedConfiguration`. The dashboard reads
+/// these core sections on load, so each returns its stored value (`branding`,
+/// `encoding`) or Jellyfin's default object (`network`, `metadata`,
+/// `xbmcmetadata`). Plugin-owned keys stay on the `501` stub.
+///
+/// ponytail: `network`/`metadata`/`xbmcmetadata` return defaults — enough to
+/// render + populate the config pages; wire persisted round-trips when the
+/// matching `POST` is ported.
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -117,16 +123,27 @@ async fn get_named_configuration(
     _auth: RequireAuth,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if key.eq_ignore_ascii_case("branding") {
-        let branding = state.config.get_branding().await?;
-        let value = serde_json::to_value(branding).map_err(|e| {
+    use hermit_model::configuration::{MetadataConfiguration, XbmcMetadataOptions};
+    let to_value = |r: Result<Value, serde_json::Error>| {
+        r.map_err(|e| {
             ApiError::from(hermit_traits::error::ServiceError::backend(format!(
-                "serialize branding: {e}"
+                "serialize configuration `{key}`: {e}"
             )))
-        })?;
-        return Ok(Json(value));
-    }
-    Err(ApiError::NotImplemented)
+        })
+    };
+    let value = match key.to_ascii_lowercase().as_str() {
+        "branding" => to_value(serde_json::to_value(state.config.get_branding().await?))?,
+        "encoding" => to_value(serde_json::to_value(
+            state.config.get_encoding_options().await?,
+        ))?,
+        "network" => to_value(serde_json::to_value(
+            hermit_networking::NetworkConfiguration::default(),
+        ))?,
+        "metadata" => to_value(serde_json::to_value(MetadataConfiguration::default()))?,
+        "xbmcmetadata" => to_value(serde_json::to_value(XbmcMetadataOptions::default()))?,
+        _ => return Err(ApiError::NotImplemented),
+    };
+    Ok(Json(value))
 }
 
 /// `POST /System/Configuration/{key}` — update a named configuration.
