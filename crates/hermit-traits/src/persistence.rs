@@ -152,6 +152,17 @@ pub trait ItemRepository: Send + Sync {
         primary_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Returns every `(item_id, value)` pair stored under `provider_key` in
+    /// `BaseItemProviders`.
+    ///
+    /// Used to group items by an external id (e.g. `Tmdb`) when merging duplicate
+    /// versions. The provider key is matched case-insensitively (Jellyfin stores a
+    /// canonical casing like `Tmdb`, but callers pass it as a literal).
+    async fn get_items_with_provider_id(
+        &self,
+        provider_key: &str,
+    ) -> Result<Vec<(Uuid, String)>, ServiceError>;
+
     /// Gets the image rows attached to an item, ordered by image type then by
     /// their stored order within a type.
     ///

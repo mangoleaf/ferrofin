@@ -27,8 +27,13 @@ pub mod seed;
 pub mod state;
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use anyhow::Context as _;
+use axum::Router;
+use axum::response::Redirect;
+use axum::routing::get;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::bootstrap::{FfmpegPaths, discover_ffmpeg, init_tracing, open_database};
 use crate::config::Config;
@@ -135,7 +140,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    let router = hermit_api::create_router(wired.state.clone());
+    let router = mount_web(
+        hermit_api::create_router(wired.state.clone()),
+        &config.web_dir,
+    );
 
     // Post-startup: flip the host's core-startup flag (mirrors `CoreAppHost`
     // marking itself ready once services are registered).
@@ -157,4 +165,76 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("hermit-server stopped");
     Ok(())
+}
+
+/// Mounts a static web client at `/web` (with an SPA `index.html` fallback) and
+/// redirects `/` → `/web/`, when `web_dir` contains an `index.html`.
+///
+/// Hermit serves whatever static bundle the operator places in `web_dir` — e.g.
+/// a built [`jellyfin-web`](https://github.com/jellyfin/jellyfin-web) `dist/`.
+/// The web client talks to Hermit over the same-origin HTTP API, exactly as it
+/// would against upstream Jellyfin. If the directory has no `index.html` the
+/// server runs API-only and `/` returns `404` (the API is unaffected either way,
+/// since no contract route lives under `/web` or at `/`).
+fn mount_web(router: Router, web_dir: &Path) -> Router {
+    let index = web_dir.join("index.html");
+    if !index.is_file() {
+        tracing::info!(
+            web_dir = %web_dir.display(),
+            "no web client bundle (index.html) found — serving API only"
+        );
+        return router;
+    }
+    tracing::info!(web_dir = %web_dir.display(), "serving static web client at /web");
+    router
+        .nest_service(
+            "/web",
+            ServeDir::new(web_dir).fallback(ServeFile::new(&index)),
+        )
+        .route("/", get(|| async { Redirect::permanent("/web/") }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mount_web;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn serves_web_bundle_and_redirects_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>hermit").unwrap();
+
+        let app = mount_web(Router::new(), dir.path());
+
+        // `/` redirects to the web client.
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(root.headers()["location"], "/web/");
+
+        // `/web/` serves the bundle's index.html.
+        let web = app
+            .oneshot(Request::builder().uri("/web/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(web.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_only_when_no_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        // No index.html written → router is returned unchanged (no `/` route).
+        let app = mount_web(Router::new(), dir.path());
+        let root = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::NOT_FOUND);
+    }
 }

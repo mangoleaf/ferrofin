@@ -372,6 +372,24 @@ impl ItemRepository for HermitItemRepository {
         Ok(rows)
     }
 
+    async fn get_items_with_provider_id(
+        &self,
+        provider_key: &str,
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ProviderId" = ?1 COLLATE NOCASE"#,
+        )
+        .bind(provider_key)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, value)| Uuid::parse_str(&id).ok().map(|id| (id, value)))
+            .collect())
+    }
+
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
         // Order by image type then id so a multi-image type (e.g. Backdrop) is
         // returned in a stable order the index-based routes can address, matching

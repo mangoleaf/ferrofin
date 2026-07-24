@@ -1244,6 +1244,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

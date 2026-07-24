@@ -70,6 +70,7 @@ pub mod localization;
 pub mod lyrics;
 pub mod media_info;
 pub mod media_segments;
+pub mod merge_versions;
 pub mod movies;
 pub mod music_genres;
 pub mod persons;
@@ -520,13 +521,20 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     // Batch 6 — portable extras: TMDb client image configuration
     // (`TmdbController`); served static while the live TMDb provider is deferred.
     ("get", "/Tmdb/ClientConfiguration"),
+    // MergeVersions plugin — bulk merge/split of duplicate versions across the
+    // whole library, ported onto the core `PrimaryVersionId` version-group seam
+    // (the same `LibraryManager` merge/split logic that backs the in-tree
+    // `POST /Videos/MergeVersions`); no dynamic plugin host required. The
+    // parameterless routes each scan the library. See `handlers::merge_versions`.
+    ("post", "/MergeVersions/MergeMovies"),
+    ("post", "/MergeVersions/SplitMovies"),
+    ("post", "/MergeVersions/MergeEpisodes"),
+    ("post", "/MergeVersions/SplitEpisodes"),
     // Deferred — third-party PLUGIN routes with no core-Jellyfin controller to
     // port from (they need the un-ported dynamic plugin host); they stay on the
-    // `501` stub: `/MergeVersions/{Merge,Split}{Episodes,Movies}` (the
-    // `MergeVersions` plugin), `GET|POST /Episode/{Id}/Timestamps` (the
-    // `IntroSkipper`/`SkipIntro` plugin), and `/MediaSegmentsApi/*` (the
-    // `SegmentEditor` plugin). The core in-tree merge surface is already real at
-    // `POST /Videos/MergeVersions` (Batch 10).
+    // `501` stub: `GET|POST /Episode/{Id}/Timestamps` (the
+    // `IntroSkipper`/`SkipIntro` plugin) and `/MediaSegmentsApi/*` (the
+    // `SegmentEditor` plugin).
     // Library structure — the media-folder listing (`LibraryController`).
     ("get", "/Library/MediaFolders"),
     // Batch 1 (this unit) — Library admin / virtual folders. The
@@ -615,5 +623,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // Batch 6 — portable extras: TMDb client config (TmdbController).
     let router = tmdb::register(router);
     // Batch 16 — the last portable stubs.
-    similar::register(router)
+    let router = similar::register(router);
+    // MergeVersions plugin — bulk merge/split of duplicate versions.
+    merge_versions::register(router)
 }

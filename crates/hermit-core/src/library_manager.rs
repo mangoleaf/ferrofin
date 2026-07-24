@@ -22,11 +22,12 @@
 //! - The `IProgress`/`CancellationToken` scan plumbing is dropped;
 //!   `queue_library_scan` records intent through the injected monitor/no-op.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
-use hermit_model::data::CollectionType;
+use hermit_model::data::{BaseItemKind, CollectionType};
 use hermit_model::dto::ItemCounts;
 use hermit_model::entities::{ImageType, MediaStreamType};
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -74,6 +75,33 @@ impl HermitLibraryManager {
             persistence,
             people,
         }
+    }
+
+    /// Lists every non-virtual item of `kind` (the `MergeVersions` plugin's
+    /// `GetItemList(IncludeItemTypes=[kind], IsVirtualItem=false, Recursive=true)`).
+    async fn list_non_virtual(
+        &self,
+        kind: BaseItemKind,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![kind],
+                is_virtual_item: Some(false),
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+    }
+
+    /// Splits every version group among the non-virtual items of `kind` by clearing
+    /// each item's link (idempotent for items not in a group).
+    async fn split_all(&self, kind: BaseItemKind) -> Result<(), ServiceError> {
+        for item in self.list_non_virtual(kind).await? {
+            if let Ok(id) = Uuid::parse_str(&item.id) {
+                self.remove_alternate_sources(id).await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -275,6 +303,75 @@ impl LibraryManager for HermitLibraryManager {
             self.persistence.save_items(&updated).await?;
         }
         Ok(())
+    }
+
+    async fn merge_all_movie_versions(&self) -> Result<(), ServiceError> {
+        let movies = self.list_non_virtual(BaseItemKind::Movie).await?;
+        let tmdb: HashMap<Uuid, String> = self
+            .items
+            .get_items_with_provider_id("Tmdb")
+            .await?
+            .into_iter()
+            .collect();
+
+        // Group movies by their Tmdb id, tracking whether each group has a member
+        // that is not already an alternate (C# `PrimaryVersionId == null`).
+        let mut groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+        let mut eligible: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for movie in &movies {
+            let Ok(id) = Uuid::parse_str(&movie.id) else {
+                continue;
+            };
+            let Some(value) = tmdb.get(&id) else {
+                continue; // no Tmdb id → skipped, matching the plugin's filter
+            };
+            if movie.primary_version_id.is_none() {
+                eligible.insert(value.clone());
+            }
+            groups.entry(value.clone()).or_default().push(id);
+        }
+
+        for (value, ids) in groups {
+            if ids.len() > 1 && eligible.contains(&value) {
+                self.merge_versions(&ids).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn split_all_movie_versions(&self) -> Result<(), ServiceError> {
+        self.split_all(BaseItemKind::Movie).await
+    }
+
+    async fn merge_all_episode_versions(&self) -> Result<(), ServiceError> {
+        let episodes = self.list_non_virtual(BaseItemKind::Episode).await?;
+
+        // Group by (series, season, name, index, year) — the plugin's episode key.
+        let mut groups: HashMap<(String, String, String, i64, i64), Vec<Uuid>> = HashMap::new();
+        for ep in &episodes {
+            let Ok(id) = Uuid::parse_str(&ep.id) else {
+                continue;
+            };
+            let key = (
+                ep.series_name.clone().unwrap_or_default(),
+                ep.season_name.clone().unwrap_or_default(),
+                ep.name.clone().unwrap_or_default(),
+                ep.index_number.unwrap_or_default(),
+                ep.production_year.unwrap_or_default(),
+            );
+            groups.entry(key).or_default().push(id);
+        }
+
+        for ids in groups.into_values() {
+            if ids.len() > 1 {
+                self.merge_versions(&ids).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn split_all_episode_versions(&self) -> Result<(), ServiceError> {
+        self.split_all(BaseItemKind::Episode).await
     }
 
     async fn get_people(
@@ -758,5 +855,170 @@ mod tests {
             .await
             .expect_err("missing");
         assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    /// Attaches a `(ProviderId, ProviderValue)` external id to an item.
+    async fn set_provider_id(db: &Database, id: Uuid, key: &str, value: &str) {
+        sqlx::query(
+            r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
+               VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(id.to_string())
+        .bind(key)
+        .bind(value)
+        .execute(db.pool())
+        .await
+        .expect("set provider id");
+    }
+
+    /// Sets the episode-grouping columns the bulk merge keys on.
+    async fn set_episode_fields(
+        db: &Database,
+        id: Uuid,
+        series: &str,
+        season: &str,
+        name: &str,
+        index: i64,
+        year: i64,
+    ) {
+        sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "SeriesName" = ?2, "SeasonName" = ?3, "Name" = ?4,
+                   "IndexNumber" = ?5, "ProductionYear" = ?6
+               WHERE "Id" = ?1"#,
+        )
+        .bind(id.to_string())
+        .bind(series)
+        .bind(season)
+        .bind(name)
+        .bind(index)
+        .bind(year)
+        .execute(db.pool())
+        .await
+        .expect("set episode fields");
+    }
+
+    #[tokio::test]
+    async fn merge_all_movie_versions_groups_by_tmdb() {
+        let db = test_db().await;
+        let a = Uuid::from_u128(0x401);
+        let b = Uuid::from_u128(0x402);
+        let lonely = Uuid::from_u128(0x403);
+        let no_id = Uuid::from_u128(0x404);
+        for id in [a, b, lonely, no_id] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        // Two files of the same movie (same Tmdb id), one of a different movie, and
+        // one with no Tmdb id at all (must be skipped).
+        set_provider_id(&db, a, "Tmdb", "603").await;
+        set_provider_id(&db, b, "Tmdb", "603").await;
+        set_provider_id(&db, lonely, "Tmdb", "604").await;
+        set_width(&db, a, 1920).await;
+        set_width(&db, b, 640).await;
+        let mgr = manager(&db);
+
+        mgr.merge_all_movie_versions().await.expect("merge movies");
+
+        // a (widest) is the primary; b links to it.
+        assert_eq!(
+            mgr.get_item_by_id(a)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
+        assert_eq!(
+            mgr.get_item_by_id(b)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id
+                .as_deref(),
+            Some(a.to_string().as_str())
+        );
+        // The single-file movie and the id-less movie are untouched.
+        assert_eq!(
+            mgr.get_item_by_id(lonely)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
+        assert_eq!(
+            mgr.get_item_by_id(no_id)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn split_all_movie_versions_clears_every_group() {
+        let db = test_db().await;
+        let primary = Uuid::from_u128(0x411);
+        let alt = Uuid::from_u128(0x412);
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, alt, BaseItemKind::Movie).await;
+        set_width(&db, primary, 1920).await;
+        set_width(&db, alt, 640).await;
+        let mgr = manager(&db);
+        mgr.merge_versions(&[primary, alt]).await.expect("merge");
+
+        mgr.split_all_movie_versions().await.expect("split movies");
+
+        for id in [primary, alt] {
+            assert_eq!(
+                mgr.get_item_by_id(id)
+                    .await
+                    .expect("read")
+                    .expect("some")
+                    .primary_version_id,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_all_episode_versions_groups_by_key() {
+        let db = test_db().await;
+        let a = Uuid::from_u128(0x421);
+        let b = Uuid::from_u128(0x422);
+        let other = Uuid::from_u128(0x423);
+        for id in [a, b, other] {
+            seed_item(&db, id, BaseItemKind::Episode).await;
+        }
+        // a and b are two files of the same episode; `other` differs by index.
+        set_episode_fields(&db, a, "Show", "Season 1", "Pilot", 1, 2020).await;
+        set_episode_fields(&db, b, "Show", "Season 1", "Pilot", 1, 2020).await;
+        set_episode_fields(&db, other, "Show", "Season 1", "Pilot", 2, 2020).await;
+        set_width(&db, a, 1920).await;
+        set_width(&db, b, 640).await;
+        let mgr = manager(&db);
+
+        mgr.merge_all_episode_versions()
+            .await
+            .expect("merge episodes");
+
+        assert_eq!(
+            mgr.get_item_by_id(b)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id
+                .as_deref(),
+            Some(a.to_string().as_str())
+        );
+        assert_eq!(
+            mgr.get_item_by_id(other)
+                .await
+                .expect("read")
+                .expect("some")
+                .primary_version_id,
+            None
+        );
     }
 }

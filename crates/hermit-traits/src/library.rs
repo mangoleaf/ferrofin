@@ -298,6 +298,56 @@ pub trait LibraryManager: Send + Sync {
         ))
     }
 
+    /// Scans every movie and merges duplicate versions into one group.
+    ///
+    /// Port of the `MergeVersions` plugin's `MergeMovies`: lists all non-virtual
+    /// movies that carry a `Tmdb` provider id, groups them by that id, and merges
+    /// (via [`merge_versions`](Self::merge_versions)) each group of two or more in
+    /// which at least one member is not already an alternate. Movies without a
+    /// `Tmdb` id are skipped (the plugin's `ProviderIds.ContainsKey("Tmdb")`
+    /// filter). Library-exclusion config is not modeled, so nothing is excluded.
+    async fn merge_all_movie_versions(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "merge_all_movie_versions not supported",
+        ))
+    }
+
+    /// Scans every movie and splits any merged version groups apart.
+    ///
+    /// Port of the `MergeVersions` plugin's `SplitMovies`: clears the version-group
+    /// link (via [`remove_alternate_sources`](Self::remove_alternate_sources)) for
+    /// every non-virtual movie, so each becomes a standalone version again. The
+    /// per-item call is idempotent for movies that are not part of a group.
+    async fn split_all_movie_versions(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "split_all_movie_versions not supported",
+        ))
+    }
+
+    /// Scans every episode and merges duplicate versions into one group.
+    ///
+    /// Port of the `MergeVersions` plugin's `MergeEpisodes`: groups all non-virtual
+    /// episodes by `(SeriesName, SeasonName, Name, IndexNumber, ProductionYear)`
+    /// and merges (via [`merge_versions`](Self::merge_versions)) each group of two
+    /// or more.
+    async fn merge_all_episode_versions(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "merge_all_episode_versions not supported",
+        ))
+    }
+
+    /// Scans every episode and splits any merged version groups apart.
+    ///
+    /// Port of the `MergeVersions` plugin's `SplitEpisodes`: clears the
+    /// version-group link (via
+    /// [`remove_alternate_sources`](Self::remove_alternate_sources)) for every
+    /// non-virtual episode. Idempotent for episodes not part of a group.
+    async fn split_all_episode_versions(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "split_all_episode_versions not supported",
+        ))
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,
