@@ -938,7 +938,10 @@ impl ServerConfigurationManager for FakeConfig {
         Arc::new(FakePaths)
     }
     async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        unimplemented!("fake")
+        // Default config has `is_startup_wizard_completed = false`, so the
+        // `FirstTimeSetupOrAuth` extractor takes its anonymous first-time-setup
+        // path in tests (matching a fresh install).
+        Ok(ServerConfiguration::default())
     }
     async fn update_configuration(
         &self,

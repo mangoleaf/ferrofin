@@ -73,8 +73,10 @@ async fn get_virtual_folders_returns_the_list() {
 }
 
 #[tokio::test]
-async fn get_virtual_folders_requires_auth() {
-    // fake_state's auth service always rejects → 401 before the handler.
+async fn get_virtual_folders_accessible_during_first_time_setup() {
+    // LibraryStructureController is `[Authorize(FirstTimeSetupOrElevated)]`: while
+    // the startup wizard is incomplete (the fake config's default), the endpoint is
+    // reachable WITHOUT a token so the setup wizard can list/add libraries.
     let state = fake_state().with_virtual_folders(Arc::new(FakeVirtualFolders::working()));
     let response = create_router(state)
         .oneshot(
@@ -85,7 +87,7 @@ async fn get_virtual_folders_requires_auth() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -321,14 +321,17 @@ fn fake_paths_all_return_empty() {
 }
 
 #[test]
-fn fake_config_methods_run_and_panic() {
+fn fake_config_methods_run() {
     let f = FakeConfig;
-    // `application_paths` returns the fake paths; the read/write config methods
-    // stay `unimplemented!`.
+    // `application_paths` returns the fake paths.
     let _paths: Arc<dyn ServerApplicationPaths> = f.application_paths();
-    assert_panics(f.configuration());
-    // `update_configuration` is omitted: `ServerConfiguration` has no `Default`;
-    // `configuration()` + `application_paths()` already cover the impl.
+    // `configuration()` now returns a real default (the `FirstTimeSetupOrAuth`
+    // extractor reads it, so the fake must answer rather than panic).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert!(rt.block_on(f.configuration()).is_ok());
+    // `update_configuration` stays `unimplemented!` and is left uncalled.
 }
 
 #[test]

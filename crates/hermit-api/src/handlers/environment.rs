@@ -22,7 +22,7 @@ use axum::{Json, Router};
 use hermit_model::environment_dtos::{DefaultDirectoryBrowserInfoDto, ValidatePathDto};
 use hermit_model::io::FileSystemEntryInfo;
 
-use crate::auth::RequireAuth;
+use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -64,7 +64,7 @@ struct DirectoryContentsQuery {
 )]
 async fn get_directory_contents(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
     Query(query): Query<DirectoryContentsQuery>,
 ) -> Result<Json<Vec<FileSystemEntryInfo>>, ApiError> {
     let path = query
@@ -111,7 +111,7 @@ async fn get_directory_contents(
 )]
 async fn validate_path(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
     Json(dto): Json<ValidatePathDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = dto.path.unwrap_or_default();
@@ -149,7 +149,7 @@ async fn validate_path(
 )]
 async fn get_drives(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
 ) -> Json<Vec<FileSystemEntryInfo>> {
     Json(state.file_system.get_drives())
 }
@@ -164,7 +164,7 @@ async fn get_drives(
     responses((status = 200, description = "Empty array returned", body = [FileSystemEntryInfo])),
     tag = "hermit"
 )]
-async fn get_network_shares(_auth: RequireAuth) -> Json<Vec<FileSystemEntryInfo>> {
+async fn get_network_shares(_auth: FirstTimeSetupOrAuth) -> Json<Vec<FileSystemEntryInfo>> {
     Json(Vec::new())
 }
 
@@ -189,7 +189,7 @@ struct ParentPathQuery {
     tag = "hermit"
 )]
 async fn get_parent_path(
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
     Query(query): Query<ParentPathQuery>,
 ) -> Result<Json<Option<String>>, ApiError> {
     let path = query
@@ -231,7 +231,9 @@ async fn get_parent_path(
     responses((status = 200, description = "Default directory browser returned", body = DefaultDirectoryBrowserInfoDto)),
     tag = "hermit"
 )]
-async fn get_default_directory_browser(_auth: RequireAuth) -> Json<DefaultDirectoryBrowserInfoDto> {
+async fn get_default_directory_browser(
+    _auth: FirstTimeSetupOrAuth,
+) -> Json<DefaultDirectoryBrowserInfoDto> {
     Json(DefaultDirectoryBrowserInfoDto::default())
 }
 
