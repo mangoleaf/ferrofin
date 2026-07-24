@@ -300,6 +300,46 @@ impl HermitTaskManager {
     }
 }
 
+/// The "Scan all libraries" task — port of `RefreshMediaLibraryTask`.
+///
+/// Its [`execute`](ScheduledTask::execute) runs the same library scan as
+/// `POST /Library/Refresh` (`LibraryManager::queue_library_scan`). The `Key` is
+/// Jellyfin's well-known `"RefreshLibrary"`, so jellyfin-web's dashboard "Scan
+/// all libraries" button (which starts the task by that key) drives it. Triggers
+/// are advisory here (no scheduler), so it only runs when started manually.
+pub struct RefreshLibraryTask {
+    library: Arc<dyn hermit_traits::library::LibraryManager>,
+}
+
+impl RefreshLibraryTask {
+    /// Builds the task over the library-manager seam it scans through.
+    #[must_use]
+    pub fn new(library: Arc<dyn hermit_traits::library::LibraryManager>) -> Self {
+        Self { library }
+    }
+}
+
+// Metadata accessors return `&'self str` backed by string literals — fine here.
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for RefreshLibraryTask {
+    fn key(&self) -> &str {
+        "RefreshLibrary"
+    }
+    fn name(&self) -> &str {
+        "Scan all libraries"
+    }
+    fn description(&self) -> &str {
+        "Scans your media library for new files and refreshes metadata."
+    }
+    fn category(&self) -> &str {
+        "Library"
+    }
+    async fn execute(&self) -> Result<(), ServiceError> {
+        self.library.queue_library_scan().await
+    }
+}
+
 /// Bridges the concrete registry onto the `hermit-traits` [`TaskManager`] seam
 /// the API layer depends on.
 ///

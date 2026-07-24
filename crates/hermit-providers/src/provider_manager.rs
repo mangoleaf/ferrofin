@@ -168,7 +168,11 @@ impl ProviderManager for LocalProviderManager {
         _options: &MetadataRefreshOptions,
         _priority: RefreshPriority,
     ) -> Result<(), ServiceError> {
-        Err(Self::deferred("queue_refresh"))
+        // No remote-metadata queue yet (Part B). Accept the enqueue as a no-op so
+        // callers (the item/library refresh buttons) succeed instead of 500-ing on
+        // a deferred error; the actual fetch lands once TMDB/MusicBrainz are wired.
+        // ponytail: replace with the real priority queue when providers exist.
+        Ok(())
     }
 
     async fn refresh_full_item(
@@ -556,12 +560,11 @@ mod tests {
         let id = Uuid::nil();
         let opts = MetadataRefreshOptions::default();
 
-        let queue = mgr
-            .queue_refresh(id, &opts, RefreshPriority::Normal)
+        // `queue_refresh` intentionally no-ops (Ok) rather than deferring, so the
+        // item/library refresh buttons succeed before Part B providers exist.
+        mgr.queue_refresh(id, &opts, RefreshPriority::Normal)
             .await
-            .expect_err("queue_refresh deferred");
-        assert!(queue.to_string().contains("queue_refresh"));
-        assert!(queue.to_string().contains("deferred"));
+            .expect("queue_refresh is an accepted no-op until providers land");
 
         let full = mgr
             .refresh_full_item(id, &opts)

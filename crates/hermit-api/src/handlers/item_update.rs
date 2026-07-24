@@ -323,7 +323,7 @@ async fn refresh_item(
     Path(item_id): Path<Uuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
-    state
+    let item = state
         .library
         .get_item_by_id(item_id)
         .await?
@@ -333,6 +333,18 @@ async fn refresh_item(
     // contract parity but does not affect the queued refresh yet.
     let _ = query.regenerate_trickplay;
 
+    // Refreshing a folder (a library's CollectionFolder, or any container) means
+    // "scan its media" — the C# `ValidateChildren` path — so drive the filesystem
+    // scan. This is what jellyfin-web's per-library "Scan library" button calls.
+    if item.is_folder {
+        state.library.queue_library_scan().await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Leaf-item metadata/image refresh goes to the provider queue. The remote
+    // fetchers are Part B, so the concrete manager currently no-ops the enqueue
+    // (returns Ok) rather than erroring — the button works, the refresh lands once
+    // TMDB/MusicBrainz are wired.
     let metadata_refresh_mode = query
         .metadata_refresh_mode
         .map_or(MetadataRefreshMode::None, MetadataRefreshMode::from);

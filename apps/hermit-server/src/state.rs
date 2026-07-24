@@ -236,7 +236,6 @@ pub async fn build_app_state(
     );
     let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> = Arc::new(HermitLyricManager::new());
     let _live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager> = Arc::new(DisabledLiveTvManager);
-    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(HermitTaskManager::new());
     let path_manager: Arc<dyn hermit_traits::system::PathManager> =
         Arc::new(HermitPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn hermit_traits::events::ClientEventLogger> =
@@ -308,6 +307,13 @@ pub async fn build_app_state(
         )
         .with_scanner(Arc::clone(&library_scanner)),
     );
+    // Scheduled tasks: register the "Scan all libraries" task (drives the same
+    // scan as `POST /Library/Refresh`) so the dashboard button + tasks page work.
+    let task_manager = HermitTaskManager::new();
+    task_manager.register(Arc::new(hermit_core::RefreshLibraryTask::new(Arc::clone(
+        &library,
+    ))));
+    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager);
     let media_sources: Arc<dyn hermit_traits::library::MediaSourceManager> =
         Arc::new(HermitMediaSourceManager::new(
             Arc::clone(&item_repository),

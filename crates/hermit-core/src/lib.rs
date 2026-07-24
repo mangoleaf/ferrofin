@@ -257,7 +257,7 @@ pub use path_manager::HermitPathManager;
 pub use people_repository::HermitPeopleRepository;
 pub use plugin_manager::{HermitPluginManager, RegisteredPlugin};
 pub use quick_connect_manager::HermitQuickConnect;
-pub use scheduled_tasks::{HermitTaskManager, ScheduledTask};
+pub use scheduled_tasks::{HermitTaskManager, RefreshLibraryTask, ScheduledTask};
 pub use search_manager::HermitSearchManager;
 pub use session_manager::HermitSessionManager;
 pub use session_websocket_listener::{HermitSessionWebSocketListener, HermitWebSocketManager};
