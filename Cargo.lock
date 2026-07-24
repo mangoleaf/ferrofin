@@ -1004,6 +1004,7 @@ dependencies = [
  "hermit-db",
  "hermit-health",
  "hermit-model",
+ "hermit-networking",
  "hermit-traits",
  "serde",
  "serde_json",
