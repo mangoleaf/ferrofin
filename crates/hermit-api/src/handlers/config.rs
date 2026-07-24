@@ -6,11 +6,11 @@
 //! - `POST /System/Configuration/Branding` — update the branding config.
 //! - `GET`/`POST /System/Configuration/{key}` — a *named* configuration.
 //!
-//! Named configurations are Jellyfin's pluggable per-key config store. Hermit
-//! serves the core keys the dashboard reads — `branding` + `encoding` from
-//! storage, `network`/`metadata`/`xbmcmetadata` as default objects; plugin-owned
-//! keys stay on the `501` stub. The write side currently persists only
-//! `branding` (other keys `501`).
+//! Named configurations are Jellyfin's pluggable per-key config store. `branding`
+//! has a dedicated typed store; every other key (`encoding`/`network`/`metadata`/
+//! `xbmcmetadata` and any plugin key) round-trips through a generic per-key store
+//! at `{config}/named/{key}.json` — `POST` persists the JSON verbatim, `GET`
+//! returns it (or a typed default object for the known core keys until saved).
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -26,6 +26,31 @@ use serde_json::Value;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// The on-disk file backing a persisted named configuration, or `None` when
+/// `key` is not a safe single filename segment.
+///
+/// `key` comes straight from the URL, so this is the path-traversal guard: only
+/// `[A-Za-z0-9_-]` is allowed (rejecting `..`, `/`, `.`), and the file lives in a
+/// dedicated `named/` subdir of the configuration directory.
+fn named_config_file(state: &AppState, key: &str) -> Option<std::path::PathBuf> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let dir = state
+        .config
+        .application_paths()
+        .user_configuration_directory_path();
+    Some(
+        std::path::Path::new(&dir)
+            .join("named")
+            .join(format!("{}.json", key.to_ascii_lowercase())),
+    )
+}
 
 /// `GET /System/Configuration` — the current server configuration.
 ///
@@ -103,14 +128,12 @@ async fn update_branding_configuration(
 
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
-/// Port of `ConfigurationController.GetNamedConfiguration`. The dashboard reads
-/// these core sections on load, so each returns its stored value (`branding`,
-/// `encoding`) or Jellyfin's default object (`network`, `metadata`,
-/// `xbmcmetadata`). Plugin-owned keys stay on the `501` stub.
-///
-/// ponytail: `network`/`metadata`/`xbmcmetadata` return defaults — enough to
-/// render + populate the config pages; wire persisted round-trips when the
-/// matching `POST` is ported.
+/// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
+/// dedicated typed store; every other key round-trips through the generic
+/// per-key store (`{config}/named/{key}.json`), falling back to a typed default
+/// object for the known core sections (`encoding`/`network`/`metadata`/
+/// `xbmcmetadata`) when nothing has been saved. An unknown, never-saved key is
+/// still `501`.
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -131,8 +154,19 @@ async fn get_named_configuration(
             )))
         })
     };
+    if key.eq_ignore_ascii_case("branding") {
+        return Ok(Json(to_value(serde_json::to_value(
+            state.config.get_branding().await?,
+        ))?));
+    }
+    // A previously-saved value wins over the default object.
+    if let Some(path) = named_config_file(&state, &key)
+        && let Ok(bytes) = tokio::fs::read(&path).await
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+    {
+        return Ok(Json(value));
+    }
     let value = match key.to_ascii_lowercase().as_str() {
-        "branding" => to_value(serde_json::to_value(state.config.get_branding().await?))?,
         "encoding" => to_value(serde_json::to_value(
             state.config.get_encoding_options().await?,
         ))?,
@@ -149,7 +183,9 @@ async fn get_named_configuration(
 /// `POST /System/Configuration/{key}` — update a named configuration.
 ///
 /// Port of `ConfigurationController.UpdateNamedConfiguration` (elevation-gated).
-/// Only `branding` is backed by real storage; other keys return `501`.
+/// `branding` updates its dedicated typed store; every other key is persisted
+/// verbatim to the generic per-key store (`{config}/named/{key}.json`), so the
+/// dashboard's config pages round-trip.
 #[utoipa::path(
     post,
     path = "/System/Configuration/{key}",
@@ -171,7 +207,27 @@ async fn update_named_configuration(
         state.config.update_branding(&branding).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    Err(ApiError::NotImplemented)
+    let path = named_config_file(&state, &key)
+        .ok_or_else(|| ApiError::BadRequest("invalid configuration key".to_owned()))?;
+    let io_err = |e: &std::io::Error| {
+        ApiError::from(hermit_traits::error::ServiceError::backend(format!(
+            "persist configuration `{key}`: {e}"
+        )))
+    };
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| io_err(&e))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&body).map_err(|e| {
+        ApiError::from(hermit_traits::error::ServiceError::backend(format!(
+            "serialize configuration `{key}`: {e}"
+        )))
+    })?;
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| io_err(&e))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Registers this controller's real routes onto `router`.
