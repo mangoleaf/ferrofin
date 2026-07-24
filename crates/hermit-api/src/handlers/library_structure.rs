@@ -424,11 +424,12 @@ struct UpdateLibraryOptionsBody {
 /// for any newly-referenced media path, then persists the new options.
 ///
 /// **Id vs name.** C# looks the library up by its `CollectionFolder` item id
-/// (`GetItemById<CollectionFolder>(request.Id)`). Hermit's virtual-folder seam is
-/// the on-disk directory tree and does not model that DB item id, so the folder
-/// is resolved by its `Name` (its directory name). Clients that only have the id
-/// must supply the name; a request with neither (or an unknown library) is a
-/// `404`, mirroring the C# `NotFound`.
+/// (`GetItemById<CollectionFolder>(request.Id)`), and jellyfin-web sends only that
+/// `Id` (no `Name`). Hermit's virtual-folder seam is keyed by the library `Name`
+/// (its directory name), but the `CollectionFolder` row now carries the same
+/// deterministic id it projects into `VirtualFolderInfo.ItemId`, so we resolve the
+/// posted `Id` back to its name via `get_virtual_folders`. `Name` is still honored
+/// when supplied; a request matching no library (by either) is a `404`.
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/LibraryOptions",
@@ -445,12 +446,24 @@ async fn update_library_options(
     Json(body): Json<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
     let options = body.library_options.unwrap_or_default();
-    let name = body.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "library {} (a library name is required at this seam)",
-            body.id.map(|i| i.to_string()).unwrap_or_default()
-        ))
-    })?;
+    // No name: resolve the library by its CollectionFolder id (what jellyfin-web
+    // posts). Match the projected `ItemId` against the persisted virtual folders.
+    let name = if let Some(name) = body.name.filter(|n| !n.trim().is_empty()) {
+        name
+    } else {
+        let id = body
+            .id
+            .ok_or_else(|| ApiError::NotFound("library (no Id or Name supplied)".to_owned()))?;
+        let wanted = id.to_string();
+        state
+            .virtual_folders
+            .get_virtual_folders()
+            .await?
+            .into_iter()
+            .find(|f| f.item_id.as_deref() == Some(wanted.as_str()))
+            .and_then(|f| f.name)
+            .ok_or_else(|| ApiError::NotFound(format!("library {id}")))?
+    };
     state
         .virtual_folders
         .update_library_options(&name, &options)
