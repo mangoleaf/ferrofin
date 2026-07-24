@@ -13,6 +13,12 @@ use utoipa::ToSchema;
 pub struct ValidatePathDto {
     /// Gets or sets a value indicating whether to validate if the path is
     /// writable.
+    ///
+    /// Defaulted: jellyfin-web sends the field misspelled (`ValidateWriteable`),
+    /// so the correctly-spelled key is absent. C# Jellyfin binds it to `false`
+    /// and ignores the stray key; without `#[serde(default)]` the missing
+    /// required field makes axum reject the body with `422`.
+    #[serde(default)]
     pub validate_writable: bool,
 
     /// Gets or sets the path.
