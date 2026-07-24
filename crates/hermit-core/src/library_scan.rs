@@ -6,12 +6,11 @@
 //! (`GET /Items?ParentId=<library>&Recursive=true`) is populated and items
 //! direct-play.
 //!
-//! **v1 scope: movies.** Every video file under a `movies`/`homevideos`/mixed
-//! library becomes a `Movie` parented to the collection folder (flattening any
-//! nested folders, which is how a movie library presents anyway). The
-//! `tvshows` (Series→Season→Episode) and `music` (MusicAlbum→Audio) resolver
-//! chains, pruning of deleted files, and remote-metadata refresh are follow-ups
-//! (see `brain/plans/PLAN_HERMIT_LIBRARY_SCAN.md`).
+//! Dispatches by collection type: `movies`/`homevideos`/`musicvideos`/`mixed`
+//! (and untyped) libraries flatten every video file to a `Movie`; `tvshows` build
+//! the Series→Season→Episode hierarchy; `music` builds MusicAlbum→Audio. Pruning
+//! of deleted files and remote-metadata refresh are follow-ups (see
+//! `brain/plans/PLAN_HERMIT_LIBRARY_SCAN.md`).
 //!
 //! Two passes: a **synchronous plan** (walk + filename resolution — this is where
 //! the `!Sync` [`NamingOptions`] lazy-regex cells live, so they never cross an
@@ -26,7 +25,9 @@ use hermit_model::data::BaseItemKind;
 use hermit_model::entities::CollectionTypeOptions;
 use hermit_model::entities_media::VirtualFolderInfo;
 use hermit_model::io::FileSystemEntryType;
+use hermit_naming::audio::is_audio_file;
 use hermit_naming::common::NamingOptions;
+use hermit_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use hermit_naming::video::video_resolver;
 use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
@@ -98,13 +99,19 @@ impl LibraryScanner {
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
     /// items. Owns the `NamingOptions` so its `!Sync` cells stay off the async path.
+    ///
+    /// Dispatches by the library's collection type: `tvshows` builds the
+    /// Series→Season→Episode hierarchy, `music` builds MusicAlbum→Audio, and the
+    /// video types (`movies`/`homevideos`/`musicvideos`/`mixed`) plus an untyped
+    /// library flatten every video file to a `Movie`. Other types (books, photos,
+    /// …) are not scanned yet.
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
         let naming = NamingOptions::new();
         let mut out = Vec::new();
         for folder in folders {
             // `item_id` is the library's CollectionFolder id (projected by the
             // virtual-folder manager); items hang beneath it.
-            let Some(cf_id) = folder
+            let Some(cf) = folder
                 .item_id
                 .as_deref()
                 .and_then(|s| Uuid::parse_str(s).ok())
@@ -112,78 +119,282 @@ impl LibraryScanner {
                 continue;
             };
             for location in &folder.locations {
-                self.plan_dir(
-                    location,
-                    cf_id,
-                    &[cf_id],
-                    folder.collection_type,
-                    &naming,
-                    &mut out,
-                );
+                match folder.collection_type {
+                    Some(CollectionTypeOptions::tvshows) => {
+                        self.plan_tv(location, cf, &naming, &mut out);
+                    }
+                    Some(CollectionTypeOptions::music) => {
+                        self.plan_music(location, cf, &naming, &mut out);
+                    }
+                    None
+                    | Some(
+                        CollectionTypeOptions::movies
+                        | CollectionTypeOptions::homevideos
+                        | CollectionTypeOptions::musicvideos
+                        | CollectionTypeOptions::mixed,
+                    ) => self.plan_movies(location, cf, &naming, &mut out),
+                    // books / photos / boxsets / … aren't scanned in v1.
+                    Some(_) => {}
+                }
             }
         }
         out
     }
 
-    /// Recursively plans one directory, emitting items parented to the library
-    /// `cf` (the first — and, for a flat movie library, only — ancestor).
-    fn plan_dir(
+    /// Builds a typed item row under collection folder `cf` with direct parent
+    /// `parent`, returning its deterministic id and the row (the caller sets any
+    /// type-specific fields and pushes it with its ancestor closure). `None` when
+    /// the id cannot be derived.
+    fn base_item(
+        kind: BaseItemKind,
+        cf: Uuid,
+        parent: Uuid,
+        name: String,
+        path: &str,
+        is_folder: bool,
+    ) -> Option<(Uuid, BaseItemEntity)> {
+        let id = item_type_lookup::derive_item_id(kind, path)?;
+        let entity = BaseItemEntity {
+            id: id.to_string(),
+            type_: item_type_lookup::stored_type_name(kind)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(name),
+            path: Some(path.to_owned()),
+            parent_id: Some(parent.to_string()),
+            top_parent_id: Some(cf.to_string()),
+            is_folder,
+            date_created: Some(Utc::now()),
+            ..BaseItemEntity::default()
+        };
+        Some((id, entity))
+    }
+
+    /// Flat video library: every video file (recursing per-title folders) becomes a
+    /// `Movie` directly under the collection folder.
+    fn plan_movies(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_movies(&entry.path, cf, naming, out);
+                continue;
+            }
+            if !video_resolver::is_video_file(&entry.path, naming) {
+                continue;
+            }
+            let (name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
+                .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
+            let Some((id, mut entity)) =
+                Self::base_item(BaseItemKind::Movie, cf, cf, name, &entry.path, false)
+            else {
+                continue;
+            };
+            entity.is_movie = true;
+            entity.media_type = Some("Video".to_owned());
+            entity.production_year = year.map(i64::from);
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            });
+        }
+    }
+
+    /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
+    /// are `Season`s and the videos beneath them `Episode`s.
+    fn plan_tv(&self, location: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+        for entry in self.file_system.get_file_system_entries(location) {
+            if entry.type_ != FileSystemEntryType::Directory {
+                continue; // loose files directly under a tvshows root are skipped in v1
+            }
+            let info = series_resolver::resolve(naming, &entry.path);
+            let name = info.name.unwrap_or_else(|| entry.name.clone());
+            let Some((series_id, mut series)) =
+                Self::base_item(BaseItemKind::Series, cf, cf, name, &entry.path, true)
+            else {
+                continue;
+            };
+            series.production_year = info.year.map(i64::from);
+            out.push(Planned {
+                id: series_id,
+                entity: series,
+                ancestors: vec![cf],
+            });
+            self.plan_series(&entry.path, cf, series_id, naming, out);
+        }
+    }
+
+    /// Plans one series folder: `Season NN` subfolders → a `Season` plus its
+    /// episodes; a video directly in the series folder → an `Episode` with no
+    /// season parent.
+    fn plan_series(
+        &self,
+        series_dir: &str,
+        cf: Uuid,
+        series_id: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        for entry in self.file_system.get_file_system_entries(series_dir) {
+            if entry.type_ == FileSystemEntryType::Directory {
+                let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
+                if season.season_number.is_some() || season.is_season_folder {
+                    let num = season.season_number;
+                    let name = num.map_or_else(|| entry.name.clone(), |n| format!("Season {n}"));
+                    let Some((season_id, mut e)) = Self::base_item(
+                        BaseItemKind::Season,
+                        cf,
+                        series_id,
+                        name,
+                        &entry.path,
+                        true,
+                    ) else {
+                        continue;
+                    };
+                    e.index_number = num.map(i64::from);
+                    out.push(Planned {
+                        id: season_id,
+                        entity: e,
+                        ancestors: vec![cf, series_id],
+                    });
+                    self.plan_episodes(
+                        &entry.path,
+                        cf,
+                        series_id,
+                        Some((season_id, num)),
+                        naming,
+                        out,
+                    );
+                } else {
+                    // A non-season subfolder (extras, etc.): its videos hang off the
+                    // series directly.
+                    self.plan_episodes(&entry.path, cf, series_id, None, naming, out);
+                }
+            } else if video_resolver::is_video_file(&entry.path, naming) {
+                Self::emit_episode(&entry.path, cf, series_id, None, naming, out);
+            }
+        }
+    }
+
+    /// Plans every video under `dir` (recursively) as an `Episode`. `season` is the
+    /// `(season_id, season_number)` when the files live in a season folder.
+    fn plan_episodes(
         &self,
         dir: &str,
         cf: Uuid,
-        ancestors: &[Uuid],
-        collection_type: Option<CollectionTypeOptions>,
+        series_id: Uuid,
+        season: Option<(Uuid, Option<i32>)>,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                // Recurse; movies nested in per-title folders still land directly
-                // under the collection folder (a flat movie library view).
-                self.plan_dir(&entry.path, cf, ancestors, collection_type, naming, out);
-                continue;
+                self.plan_episodes(&entry.path, cf, series_id, season, naming, out);
+            } else if video_resolver::is_video_file(&entry.path, naming) {
+                Self::emit_episode(&entry.path, cf, series_id, season, naming, out);
             }
-            let is_video_library = matches!(
-                collection_type,
-                None | Some(
-                    CollectionTypeOptions::movies
-                        | CollectionTypeOptions::homevideos
-                        | CollectionTypeOptions::musicvideos
-                        | CollectionTypeOptions::mixed
-                )
-            );
-            if !(is_video_library && video_resolver::is_video_file(&entry.path, naming)) {
-                continue;
-            }
-            let Some(id) = item_type_lookup::derive_item_id(BaseItemKind::Movie, &entry.path)
-            else {
-                continue;
-            };
-            let (name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
-                .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
-            let entity = BaseItemEntity {
-                id: id.to_string(),
-                type_: item_type_lookup::stored_type_name(BaseItemKind::Movie)
-                    .unwrap_or_default()
-                    .to_owned(),
-                name: Some(name),
-                path: Some(entry.path.clone()),
-                parent_id: Some(cf.to_string()),
-                top_parent_id: Some(cf.to_string()),
-                is_folder: false,
-                is_movie: true,
-                media_type: Some("Video".to_owned()),
-                production_year: year.map(i64::from),
-                date_created: Some(Utc::now()),
-                ..BaseItemEntity::default()
-            };
-            out.push(Planned {
-                id,
-                entity,
-                ancestors: ancestors.to_vec(),
-            });
         }
     }
+
+    /// Emits one `Episode` row, parented to its season (or the series when there is
+    /// no season folder), carrying `IndexNumber`/`ParentIndexNumber` from the
+    /// filename's episode/season numbers.
+    fn emit_episode(
+        path: &str,
+        cf: Uuid,
+        series_id: Uuid,
+        season: Option<(Uuid, Option<i32>)>,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        let info = EpisodeResolver::new(naming).resolve_simple(path, false);
+        let (parent, ancestors) = match season {
+            Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
+            None => (series_id, vec![cf, series_id]),
+        };
+        let Some((id, mut entity)) = Self::base_item(
+            BaseItemKind::Episode,
+            cf,
+            parent,
+            file_stem(path),
+            path,
+            false,
+        ) else {
+            return;
+        };
+        entity.media_type = Some("Video".to_owned());
+        entity.index_number = info.as_ref().and_then(|i| i.episode_number).map(i64::from);
+        entity.parent_index_number = season
+            .and_then(|(_, n)| n)
+            .or_else(|| info.as_ref().and_then(|i| i.season_number))
+            .map(i64::from);
+        entity.series_name = info.and_then(|i| i.series_name);
+        out.push(Planned {
+            id,
+            entity,
+            ancestors,
+        });
+    }
+
+    /// Music library: any folder that directly contains audio files is a
+    /// `MusicAlbum` (its audio files become `Audio` tracks); subfolders are walked
+    /// so an `Artist/Album/` layout still yields the albums.
+    fn plan_music(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+        let entries = self.file_system.get_file_system_entries(dir);
+        let audio: Vec<_> = entries
+            .iter()
+            .filter(|e| e.type_ != FileSystemEntryType::Directory && is_audio_file(&e.path, naming))
+            .collect();
+        if !audio.is_empty() {
+            let album_name = file_stem(dir);
+            if let Some((album_id, album)) = Self::base_item(
+                BaseItemKind::MusicAlbum,
+                cf,
+                cf,
+                album_name.clone(),
+                dir,
+                true,
+            ) {
+                out.push(Planned {
+                    id: album_id,
+                    entity: album,
+                    ancestors: vec![cf],
+                });
+                for track in &audio {
+                    let Some((id, mut entity)) = Self::base_item(
+                        BaseItemKind::Audio,
+                        cf,
+                        album_id,
+                        file_stem(&track.name),
+                        &track.path,
+                        false,
+                    ) else {
+                        continue;
+                    };
+                    entity.media_type = Some("Audio".to_owned());
+                    entity.album = Some(album_name.clone());
+                    out.push(Planned {
+                        id,
+                        entity,
+                        ancestors: vec![cf, album_id],
+                    });
+                }
+            }
+        }
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_music(&entry.path, cf, naming, out);
+            }
+        }
+    }
+}
+
+/// The file name without its extension — a lightweight display name until real
+/// metadata (titles, track names) lands in Part B.
+fn file_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| path.to_owned(), ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -269,5 +480,190 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(total, 2, "re-scan did not duplicate");
+    }
+
+    /// Creates a library of `ct` over `media`, scans it, and returns the DB handle
+    /// plus the library's projected CollectionFolder id.
+    async fn scan_one(
+        ct: CollectionTypeOptions,
+        name: &str,
+        media: &std::path::Path,
+    ) -> (Database, String) {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(media.parent().unwrap().join(".views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            name,
+            Some(ct),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+            .scan_all()
+            .await
+            .unwrap();
+        let cf = vf.get_virtual_folders().await.unwrap()[0]
+            .item_id
+            .clone()
+            .unwrap();
+        (db, cf)
+    }
+
+    #[tokio::test]
+    async fn scan_builds_tv_series_season_episode_hierarchy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let season = media.join("Breaking Bad (2008)").join("Season 1");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("Breaking Bad S01E01.mkv"), b"").unwrap();
+        std::fs::write(season.join("Breaking Bad S01E02.mkv"), b"").unwrap();
+
+        let (db, cf) = scan_one(CollectionTypeOptions::tvshows, "Shows", &media).await;
+
+        // Series → parented to the collection folder.
+        let series: (String, String) = sqlx::query_as(
+            r#"SELECT "Id","ParentId" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Series'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(series.1, cf, "series parents to the collection folder");
+
+        // Season → parented to the series, IndexNumber = 1.
+        let season_row: (String, String, Option<i64>) = sqlx::query_as(
+            r#"SELECT "Id","ParentId","IndexNumber" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Season'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(season_row.1, series.0, "season parents to the series");
+        assert_eq!(season_row.2, Some(1));
+
+        // Two episodes → parented to the season, with Index/ParentIndex numbers.
+        let eps: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "ParentId","IndexNumber","ParentIndexNumber" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Episode' ORDER BY "IndexNumber""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(eps.len(), 2);
+        assert!(
+            eps.iter().all(|e| e.0 == season_row.0),
+            "episodes parent to the season"
+        );
+        assert_eq!(eps[0].1, Some(1));
+        assert_eq!(eps[1].1, Some(2));
+        assert!(
+            eps.iter().all(|e| e.2 == Some(1)),
+            "ParentIndexNumber = season 1"
+        );
+
+        // Each episode's ancestor closure is depth 3 (cf, series, season).
+        let anc: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "AncestorIds" a JOIN "BaseItems" b ON b."Id"=a."ItemId"
+               WHERE b."Type"='MediaBrowser.Controller.Entities.TV.Episode'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(anc, 6, "2 episodes × 3 ancestors each");
+    }
+
+    #[tokio::test]
+    async fn tv_episode_without_a_season_folder_parents_to_the_series() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        // No "Season N" folder — the episode sits directly in the series folder.
+        let series = media.join("The Office (US)");
+        std::fs::create_dir_all(&series).unwrap();
+        std::fs::write(series.join("The Office S02E05.mkv"), b"").unwrap();
+
+        let (db, cf) = scan_one(CollectionTypeOptions::tvshows, "Shows", &media).await;
+
+        let series_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Series'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        // No season rows were created; every episode parents to the series directly.
+        let seasons: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Season'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(seasons, 0);
+        let eps: Vec<(String, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "ParentId","ParentIndexNumber" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Episode'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].0, series_id, "episode parents to the series");
+        // The `S02E05` file still carries its parsed season number.
+        assert_eq!(eps[0].1, Some(2));
+        // Ancestor closure is depth 2 (cf, series) with no season.
+        let anc: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "AncestorIds" WHERE "ParentItemId" = ?1"#)
+                .bind(&cf)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(anc, 2, "series + 1 episode each have cf as an ancestor");
+    }
+
+    #[tokio::test]
+    async fn scan_builds_music_album_with_tracks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        // Artist/Album layout — the album folder (with audio) is the MusicAlbum.
+        let album = media.join("Pink Floyd").join("The Wall");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 In the Flesh.flac"), b"").unwrap();
+        std::fs::write(album.join("02 The Thin Ice.flac"), b"").unwrap();
+
+        let (db, cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+
+        let album_row: (String, String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id","ParentId","Name" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.Audio.MusicAlbum'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(album_row.1, cf, "album parents to the collection folder");
+        assert_eq!(album_row.2.as_deref(), Some("The Wall"));
+
+        let tracks: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "ParentId","Album" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.Audio.Audio'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert!(
+            tracks.iter().all(|t| t.0 == album_row.0),
+            "tracks parent to the album"
+        );
+        assert!(tracks.iter().all(|t| t.1.as_deref() == Some("The Wall")));
     }
 }
