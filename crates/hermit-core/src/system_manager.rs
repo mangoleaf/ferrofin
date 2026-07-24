@@ -202,6 +202,22 @@ impl HermitSystemManager {
     }
 }
 
+/// The host OS name in Jellyfin's `SystemInfo.OperatingSystem` vocabulary
+/// (`Windows` / `OSX` / `BSD` / `Linux`).
+///
+/// jellyfin-web's directory browser calls `.toLowerCase()` on this field
+/// unconditionally when opening the folder picker, so it must never be null —
+/// a `None` here throws `undefined.toLowerCase()` and the picker never opens.
+fn host_operating_system() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "OSX",
+        "windows" => "Windows",
+        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "BSD",
+        other => other,
+    }
+}
+
 #[async_trait]
 impl hermit_traits::system::SystemManager for HermitSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
@@ -232,6 +248,7 @@ impl hermit_traits::system::SystemManager for HermitSystemManager {
             log_path: Some(self.paths.log_directory_path()),
             transcoding_temp_path: Some(transcode),
             cast_receiver_applications: Some(cfg.cast_receiver_applications),
+            operating_system: Some(host_operating_system().to_owned()),
             ..Default::default()
         })
     }
@@ -250,7 +267,7 @@ impl hermit_traits::system::SystemManager for HermitSystemManager {
             server_name: Some(self.application_host.friendly_name()),
             local_address,
             startup_wizard_completed: Some(cfg.is_startup_wizard_completed),
-            ..Default::default()
+            operating_system: Some(host_operating_system().to_owned()),
         })
     }
 
