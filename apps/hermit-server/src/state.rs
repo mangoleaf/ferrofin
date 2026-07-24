@@ -53,6 +53,15 @@ const PRODUCT_NAME: &str = "Hermit Server";
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "hermit-server";
 
+/// The **Jellyfin server version Hermit reports** in `SystemInfo`/`PublicSystemInfo`
+/// (`Version`). This is the version the vendored OpenAPI contract targets — i.e.
+/// "Hermit speaks Jellyfin 10.11.8's API" — NOT Hermit's own crate version
+/// (`CARGO_PKG_VERSION`, used only for build/log lines). Clients gate on it:
+/// jellyfin-web's SDK refuses any server below `MINIMUM_VERSION = 10.10.0` with an
+/// "Update Required" screen, so reporting Hermit's `0.1.0` locks the web client out.
+/// Keep this in sync with `contracts/jellyfin-openapi-*.json`.
+const JELLYFIN_API_VERSION: &str = "10.11.8";
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -373,7 +382,9 @@ pub async fn build_app_state(
         Arc::clone(&paths),
         Arc::clone(&lifecycle),
         SystemHostFacts {
-            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            // Report the emulated Jellyfin API version (clients gate on this), not
+            // Hermit's own crate version — see JELLYFIN_API_VERSION.
+            version: Some(JELLYFIN_API_VERSION.to_owned()),
             product_name: Some(PRODUCT_NAME.to_owned()),
             system_id: Some(server_id.clone()),
             package_name: Some(PACKAGE_NAME.to_owned()),
