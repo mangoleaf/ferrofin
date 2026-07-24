@@ -118,6 +118,42 @@ impl HermitVirtualFolderManager {
         )
     }
 
+    /// Upserts the library's `CollectionFolder` row for `folder_path` when it is
+    /// missing (idempotent). No-op without an item store wired. This is the single
+    /// place the row is created — on add and, self-healingly, on every
+    /// [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders) read — so
+    /// the projected `ItemId` always backs a real row and children can parent to it
+    /// without a foreign-key failure.
+    async fn ensure_collection_folder(
+        &self,
+        folder_path: &Path,
+        name: &str,
+    ) -> Result<(), ServiceError> {
+        let (Some(persistence), Some(id)) =
+            (&self.persistence, Self::collection_folder_id(folder_path))
+        else {
+            return Ok(());
+        };
+        if persistence.item_exists(id).await? {
+            return Ok(());
+        }
+        let entity = BaseItemEntity {
+            id: id.to_string(),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(name.to_owned()),
+            path: Some(folder_path.to_string_lossy().into_owned()),
+            is_folder: true,
+            date_created: Some(Utc::now()),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await?;
+        Ok(())
+    }
+
     /// The on-disk directory of the named virtual folder.
     fn folder_path(&self, name: &str) -> PathBuf {
         self.root.join(name)
@@ -329,6 +365,13 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
                 continue;
             }
             let name = path.file_name().and_then(|s| s.to_str()).map(str::to_owned);
+            // Self-heal: the projected ItemId is deterministic and returned even
+            // when no row backs it (e.g. a library created before CollectionFolder
+            // rows existed). Ensure the row now, so parenting scanned children to it
+            // doesn't hit a FOREIGN KEY failure and its ItemId always resolves.
+            if let Some(name) = name.as_deref() {
+                self.ensure_collection_folder(&path, name).await?;
+            }
             folders.push(VirtualFolderInfo {
                 name,
                 locations: Self::resolve_locations(&path).await?,
@@ -402,24 +445,8 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
         // Create the library's CollectionFolder item so it appears in /UserViews
         // and its ItemId resolves (jellyfin-web's library editor rejects a null
         // ItemId). Its children are populated by the library scan.
-        if let (Some(persistence), Some(id)) =
-            (&self.persistence, Self::collection_folder_id(&folder_path))
-        {
-            let entity = BaseItemEntity {
-                id: id.to_string(),
-                type_: item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
-                    .unwrap_or_default()
-                    .to_owned(),
-                name: Some(dedup_name.clone()),
-                path: Some(folder_path.to_string_lossy().into_owned()),
-                is_folder: true,
-                date_created: Some(Utc::now()),
-                ..BaseItemEntity::default()
-            };
-            persistence
-                .save_items(std::slice::from_ref(&entity))
-                .await?;
-        }
+        self.ensure_collection_folder(&folder_path, &dedup_name)
+            .await?;
 
         Ok(())
     }
@@ -631,6 +658,42 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn get_virtual_folders_reheals_a_missing_collection_folder_row() {
+        let (tmp, db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .expect("add");
+        let item_id = mgr.get_virtual_folders().await.expect("get")[0]
+            .item_id
+            .clone()
+            .expect("ItemId");
+
+        // Simulate a library created before CollectionFolder rows existed: the
+        // on-disk folder remains but its BaseItems row is gone.
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&item_id)
+            .execute(db.pool())
+            .await
+            .expect("delete row");
+
+        // Reading the folders re-heals the row (so scanned children can parent to it
+        // without a foreign-key failure).
+        let folders = mgr.get_virtual_folders().await.expect("get");
+        assert_eq!(folders[0].item_id.as_deref(), Some(item_id.as_str()));
+        let exists: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&item_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(exists, 1, "the CollectionFolder row was re-created");
     }
 
     /// Creates a real on-disk media directory under `tmp` and returns its path.

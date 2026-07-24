@@ -281,6 +281,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Persists (inserts or updates) the given item rows.
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
+    /// Whether an item row with this id exists (used to self-heal a library's
+    /// `CollectionFolder` row before parenting scanned children to it).
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;
+
     /// Replaces an item's ancestor-closure rows (`AncestorIds`) — the recursive
     /// `ParentId` chain up to and including the library's `CollectionFolder`.
     ///

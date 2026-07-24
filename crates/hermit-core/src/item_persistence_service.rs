@@ -154,6 +154,16 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         Ok(())
     }
 
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+        let exists: Option<i64> =
+            sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(id.to_string())
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(exists.is_some())
+    }
+
     async fn set_ancestors(
         &self,
         item_id: Uuid,
