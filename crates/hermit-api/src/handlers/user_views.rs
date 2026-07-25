@@ -18,10 +18,14 @@
 //! C# filter narrows. The projection, id format (`guid.simple`), name-ordering,
 //! and `404`-on-missing-user outcomes are already the final ones.
 
+use std::collections::HashMap;
+
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use hermit_model::data::CollectionType;
 use hermit_model::dto::{BaseItemDto, SpecialViewOptionDto};
+use hermit_model::entities::CollectionTypeOptions;
 use hermit_model::querying::QueryResult;
 use hermit_traits::options::DtoOptions;
 use uuid::Uuid;
@@ -30,6 +34,22 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
+
+/// Maps a library's [`CollectionTypeOptions`] to the DTO [`CollectionType`] the
+/// web client keys presentation off. `mixed` has no single type → `None` (a
+/// generic view), matching Jellyfin.
+fn map_collection_type(options: CollectionTypeOptions) -> Option<CollectionType> {
+    Some(match options {
+        CollectionTypeOptions::movies => CollectionType::movies,
+        CollectionTypeOptions::tvshows => CollectionType::tvshows,
+        CollectionTypeOptions::music => CollectionType::music,
+        CollectionTypeOptions::musicvideos => CollectionType::musicvideos,
+        CollectionTypeOptions::homevideos => CollectionType::homevideos,
+        CollectionTypeOptions::boxsets => CollectionType::boxsets,
+        CollectionTypeOptions::books => CollectionType::books,
+        CollectionTypeOptions::mixed => return None,
+    })
+}
 
 /// Query parameters for `GET /UserViews`.
 ///
@@ -64,10 +84,38 @@ async fn get_user_views(
     let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
     let folders = state.user_views.get_user_views(user_id).await?;
     let options = DtoOptions::with_all_fields(false);
-    let dtos = state
+    let mut dtos = state
         .dto
         .get_base_item_dtos(&folders, &options, Some(&user), None, true)
         .await?;
+
+    // The per-library collection type is not stored on the `CollectionFolder`
+    // rows, so the DTO projection leaves `CollectionType` unset. jellyfin-web
+    // keys a library's presentation off this field — a `tvshows` library with no
+    // type renders as a plain folder and its series never surface as shows.
+    // Backfill it from the virtual-folder options (matched by item id), which
+    // already carry the collection type (as `/Library/VirtualFolders` returns).
+    if let Ok(folders_info) = state.virtual_folders.get_virtual_folders().await {
+        let by_id: HashMap<Uuid, CollectionType> = folders_info
+            .into_iter()
+            .filter_map(|vf| {
+                let id = vf
+                    .item_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())?;
+                let ct = vf.collection_type.and_then(map_collection_type)?;
+                Some((id, ct))
+            })
+            .collect();
+        for dto in &mut dtos {
+            if dto.collection_type.is_none()
+                && let Some(ct) = by_id.get(&dto.id)
+            {
+                dto.collection_type = Some(*ct);
+            }
+        }
+    }
+
     Ok(Json(QueryResult::from_items(dtos)))
 }
 
@@ -116,4 +164,25 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/UserViews", get(get_user_views))
         .route("/UserViews/GroupingOptions", get(get_grouping_options))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_type_maps_library_options_to_dto_type() {
+        // A tvshows library must surface as CollectionType::tvshows so the web
+        // client renders it as a Shows view (the bug: it was unset → generic).
+        assert_eq!(
+            map_collection_type(CollectionTypeOptions::tvshows),
+            Some(CollectionType::tvshows)
+        );
+        assert_eq!(
+            map_collection_type(CollectionTypeOptions::movies),
+            Some(CollectionType::movies)
+        );
+        // A mixed library has no single type → None (a generic view).
+        assert_eq!(map_collection_type(CollectionTypeOptions::mixed), None);
+    }
 }
