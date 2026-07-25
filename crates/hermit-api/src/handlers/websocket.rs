@@ -6,17 +6,23 @@
 //! calls all succeeded. These routes are NOT part of the OpenAPI contract (Swagger
 //! doesn't describe WebSocket endpoints), so they are registered as extras.
 //!
-//! This is a minimal, always-open socket: it accepts the upgrade, answers pings,
-//! sends periodic keep-alives, and stays open until the peer closes. Real
-//! server→client event pushing (session/now-playing/remote-control messages) is a
-//! follow-up; *establishing and holding* the connection is what unblocks the UI.
+//! The socket accepts the upgrade, answers pings, sends periodic keep-alives,
+//! and — when the caller authenticates via the `api_key` query parameter —
+//! **registers a message sink** on the [`SessionMessageBus`] keyed by the
+//! caller's session id, so server→client pushes (currently SyncPlay commands and
+//! group updates) reach this client. The sink is unregistered when the socket
+//! closes. An anonymous socket still holds open (keep-alive only), so a client
+//! that opens the socket before authenticating is never dropped.
 
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{RawQuery, State};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
+use tokio::sync::mpsc;
 
 use crate::state::AppState;
 
@@ -32,11 +38,71 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 /// `GET /socket` — upgrade the connection to a WebSocket.
 ///
-/// jellyfin-web passes the access token as the `api_key` query parameter; the
-/// upgrade is accepted so the client can open its session channel. (Token
-/// validation on the socket is a follow-up — see the module docs.)
-async fn websocket_upgrade(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_socket)
+/// jellyfin-web passes the access token as the `api_key` query parameter. We
+/// resolve it to the caller's session id (best-effort; an anonymous socket still
+/// upgrades) so the socket can register a delivery sink for server→client pushes.
+async fn websocket_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let session_id = resolve_session_id(&state, &headers, query.as_deref()).await;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+}
+
+/// Resolves the caller's session id from the socket's access token, or `None`
+/// when anonymous.
+///
+/// The WebSocket carries its token as the `api_key`/`ApiKey` query parameter (the
+/// Jellyfin convention) or, failing that, an `X-Emby-Token`/`X-MediaBrowser-Token`
+/// header. We resolve it straight through the session manager
+/// ([`get_session_by_authentication_token`]) rather than the general
+/// [`AuthService`], because the latter gates the lowercase `api_key` query
+/// parameter behind legacy-authorization config — which would silently drop the
+/// socket's session and its SyncPlay delivery. Passing an empty `device_id` lets
+/// the manager key the session off the token's own device, so the derived id
+/// matches the one the `/SyncPlay/*` handlers compute for the same client.
+///
+/// [`get_session_by_authentication_token`]: hermit_traits::session::SessionManager::get_session_by_authentication_token
+/// [`AuthService`]: hermit_traits::net::AuthService
+async fn resolve_session_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<String> {
+    let token = query_param(query, "api_key")
+        .or_else(|| query_param(query, "ApiKey"))
+        .or_else(|| header_token(headers))?;
+    state
+        .sessions
+        .get_session_by_authentication_token(&token, "", "")
+        .await
+        .ok()?
+        .id
+}
+
+/// Reads a bare-token header (`X-Emby-Token` / `X-MediaBrowser-Token`).
+fn header_token(headers: &HeaderMap) -> Option<String> {
+    for name in ["x-emby-token", "x-mediabrowser-token"] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// Extracts a query-string parameter value by exact key (no percent-decoding —
+/// access tokens are URL-safe hex).
+fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_owned())
+    })
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -59,9 +125,31 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
     }
 }
 
-/// Holds a WebSocket open: answer pings, send a periodic keep-alive, and close
-/// cleanly when the peer goes away.
-async fn handle_socket(mut socket: WebSocket) {
+/// Holds a WebSocket open: register the caller's push sink (if authenticated),
+/// answer pings, forward server→client pushes, send a periodic keep-alive, and
+/// close cleanly — unregistering the sink — when the peer goes away.
+async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Option<String>) {
+    // `tx` feeds this socket; the bus holds a clone as the session's delivery
+    // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
+    // (no sink registered) so the forward branch stays pending rather than
+    // closing the loop.
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let registration = match (session_id.as_ref(), state.session_bus.as_ref()) {
+        (Some(sid), Some(bus)) => {
+            let sink_tx = tx.clone();
+            bus.register(
+                sid.clone(),
+                Box::new(move |msg| {
+                    // Failure means the socket's receiver is gone; the socket
+                    // unregisters on close, so dropping the message is correct.
+                    let _ = sink_tx.send(msg);
+                }),
+            );
+            Some((sid.clone(), std::sync::Arc::clone(bus)))
+        }
+        _ => None,
+    };
+
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
     keepalive.tick().await; // consume the immediate first tick
 
@@ -76,6 +164,12 @@ async fn handle_socket(mut socket: WebSocket) {
                 Action::Stop => break,
                 Action::Ignore => {}
             },
+            Some(push) = rx.recv() => {
+                // A server→client message (SyncPlay command/update, …).
+                if socket.send(Message::Text(push.into())).await.is_err() {
+                    break;
+                }
+            },
             _ = keepalive.tick() => {
                 // Jellyfin's `ForceKeepAlive`: tells the client the keep-alive interval.
                 let msg = Message::Text(force_keep_alive_message().into());
@@ -85,6 +179,11 @@ async fn handle_socket(mut socket: WebSocket) {
             }
         }
     }
+
+    if let Some((sid, bus)) = registration {
+        bus.unregister(&sid);
+    }
+    drop(tx);
 }
 
 /// The `ForceKeepAlive` message body Jellyfin's protocol uses.
@@ -94,8 +193,29 @@ fn force_keep_alive_message() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, KEEPALIVE_SECS, action_for, force_keep_alive_message};
+    use super::{
+        Action, KEEPALIVE_SECS, action_for, force_keep_alive_message, header_token, query_param,
+    };
     use axum::extract::ws::Message;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn query_param_extracts_by_exact_key() {
+        let q = Some("deviceId=dev1&api_key=abc123&x=1");
+        assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
+        assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
+        assert_eq!(query_param(q, "ApiKey"), None); // case-sensitive
+        assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
+        assert_eq!(query_param(None, "api_key"), None);
+    }
+
+    #[test]
+    fn header_token_reads_bare_token_headers() {
+        let mut h = HeaderMap::new();
+        assert_eq!(header_token(&h), None);
+        h.insert("X-Emby-Token", "tok-1".parse().unwrap());
+        assert_eq!(header_token(&h).as_deref(), Some("tok-1"));
+    }
 
     #[test]
     fn ping_is_ponged_with_same_payload() {

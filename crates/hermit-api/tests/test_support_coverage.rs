@@ -295,7 +295,7 @@ fn fake_app_host_methods_run() {
 }
 
 #[test]
-fn fake_paths_all_return_empty() {
+fn fake_paths_are_empty_except_the_writable_data_root() {
     let p = FakePaths;
     for s in [
         p.root_folder_path(),
@@ -308,15 +308,17 @@ fn fake_paths_all_return_empty() {
         p.artists_path(),
         p.user_configuration_directory_path(),
         p.internal_metadata_path(),
-        p.program_data_path(),
         p.web_path(),
-        p.data_path(),
         p.image_cache_path(),
         p.cache_path(),
         p.log_directory_path(),
     ] {
         assert!(s.is_empty());
     }
+    // `program_data_path`/`data_path` return a real temp dir so path-backed
+    // handlers (Backup) have somewhere writable to work in tests.
+    assert!(!p.program_data_path().is_empty());
+    assert_eq!(p.data_path(), p.program_data_path());
 }
 
 #[test]

@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
 /// string so the authorization logic can read the `api_key`/`ApiKey` parameter.
-fn request_context(
+pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
     remote: Option<String>,

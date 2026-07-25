@@ -539,6 +539,20 @@ pub async fn build_app_state(
         config.config_dir.join("plugins"),
     )));
 
+    // ---- SyncPlay + the session message bus -------------------------------
+    // The bus is the server→client push registry the session WebSocket registers
+    // its sink on; the SyncPlay manager shares it to deliver group commands to
+    // member sockets. Both are handed to `AppState` so the socket handler and the
+    // `/SyncPlay/*` routes see the same instances.
+    let session_bus: Arc<dyn hermit_traits::session_bus::SessionMessageBus> =
+        Arc::new(hermit_core::HermitSessionMessageBus::new());
+    let sync_play: Arc<dyn hermit_traits::stubs::SyncPlayManager> = Arc::new(
+        hermit_core::HermitSyncPlayManager::new(Arc::clone(&session_bus)),
+    );
+    let state = state
+        .with_session_bus(Arc::clone(&session_bus))
+        .with_sync_play(sync_play);
+
     Ok(WiredApp { state, app_host })
 }
 

@@ -31,7 +31,9 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use axum::Router;
-use axum::response::Redirect;
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
@@ -268,14 +270,30 @@ fn mount_web(router: Router, web_dir: &Path) -> Router {
     // `index.html` (text/html) would feed HTML to a chunk load and crash the app
     // (black screen). `ServeDir` serves `index.html` for the `/web/` directory
     // request on its own (append-index-on-directories is on by default).
-    // `nest_service("/web", …)` serves `/web` and `/web/*` (stripping the prefix);
-    // a bare `/web` request serves `index.html`. We cannot also register a
-    // `route("/web", …)` redirect — axum rejects the duplicate `/web` and panics.
-    // The `/` → `/web/` redirect is enough for the normal entry point (the client's
-    // relative asset URLs only resolve correctly from the trailing-slash `/web/`).
+    //
+    // `index.html` references its assets **relatively** (`src="runtime.bundle.js"`),
+    // so they only resolve when the document is loaded from the trailing-slash
+    // `/web/` (base `…/web/`); loaded from a bare `/web`, the browser resolves them
+    // against the server root and every asset 404s. `nest_service("/web", …)` serves
+    // both `/web` and `/web/*`, so a bare `/web` would wrongly serve `index.html`
+    // in-place. We can't add a `route("/web", …)` redirect (axum rejects the
+    // duplicate `/web` and panics), so a thin middleware layer redirects the exact
+    // `/web` path to `/web/` **before** it reaches the nested `ServeDir`.
     router
         .nest_service("/web", ServeDir::new(web_dir))
         .route("/", get(|| async { Redirect::permanent("/web/") }))
+        .layer(axum::middleware::from_fn(redirect_bare_web))
+}
+
+/// Redirects the exact path `/web` (no trailing slash) to `/web/`, so
+/// jellyfin-web's relative asset URLs resolve under `/web/` rather than the
+/// server root. All other requests (including `/web/` and `/web/*`) pass through
+/// untouched.
+async fn redirect_bare_web(req: Request, next: Next) -> Response {
+    if req.uri().path() == "/web" {
+        return Redirect::permanent("/web/").into_response();
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -304,10 +322,34 @@ mod tests {
 
         // `/web/` serves the bundle's index.html.
         let web = app
+            .clone()
             .oneshot(Request::builder().uri("/web/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(web.status(), StatusCode::OK);
+
+        // A bare `/web` (no trailing slash) redirects to `/web/` so the bundle's
+        // relative asset URLs resolve under `/web/` rather than the server root.
+        let bare = app
+            .clone()
+            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(bare.headers()["location"], "/web/");
+
+        // A relative asset resolves under `/web/` and is served from the bundle.
+        std::fs::write(dir.path().join("runtime.bundle.js"), "//js").unwrap();
+        let asset = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/runtime.bundle.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
     }
 
     #[tokio::test]

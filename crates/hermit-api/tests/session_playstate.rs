@@ -35,8 +35,11 @@ use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use hermit_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+use hermit_model::sync_play::GroupInfoDto;
 
 const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 const GUEST_ID: Uuid = Uuid::from_u128(0x9999);
@@ -786,6 +789,137 @@ fn recording() -> (Arc<RecordingSessions>, Arc<RecordingUserData>) {
         }),
         Arc::new(RecordingUserData::default()),
     )
+}
+
+/// A canned [`SyncPlayManager`]: group ops return a fixed group, playback
+/// requests succeed. Enough to drive the `/SyncPlay/*` handler wiring.
+const GROUP_ID: Uuid = Uuid::from_u128(0xABCD);
+
+struct FakeSyncPlay;
+
+#[async_trait]
+impl SyncPlayManager for FakeSyncPlay {
+    async fn new_group(
+        &self,
+        session: &SyncPlaySession,
+        group_name: &str,
+    ) -> Result<GroupInfoDto, ServiceError> {
+        Ok(GroupInfoDto {
+            group_id: GROUP_ID,
+            group_name: group_name.to_owned(),
+            participants: vec![session.user_name.clone()],
+            ..Default::default()
+        })
+    }
+    async fn join_group(&self, _s: &SyncPlaySession, _g: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn leave_group(&self, _s: &SyncPlaySession) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn list_groups(&self, _s: &SyncPlaySession) -> Result<Vec<GroupInfoDto>, ServiceError> {
+        Ok(vec![GroupInfoDto {
+            group_id: GROUP_ID,
+            group_name: "g".to_owned(),
+            ..Default::default()
+        }])
+    }
+    async fn get_group(
+        &self,
+        _s: &SyncPlaySession,
+        group_id: Uuid,
+    ) -> Result<GroupInfoDto, ServiceError> {
+        Ok(GroupInfoDto {
+            group_id,
+            ..Default::default()
+        })
+    }
+    async fn handle_request(
+        &self,
+        _s: &SyncPlaySession,
+        _r: PlaybackRequest,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn is_user_active(&self, _u: Uuid) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
+}
+
+/// An authenticated state with the fake SyncPlay manager wired in.
+fn sync_state() -> AppState {
+    let (sessions, user_data) = recording();
+    state(sessions, user_data).with_sync_play(Arc::new(FakeSyncPlay))
+}
+
+#[tokio::test]
+async fn sync_play_new_returns_group_with_participant() {
+    let (status, body) = send(
+        sync_state(),
+        "POST",
+        "/SyncPlay/New",
+        Body::from(r#"{"GroupName":"movie night"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["GroupName"], "movie night");
+    // One participant — the handler resolved the caller's session and passed it
+    // through to the manager (the fake session's user name is empty).
+    assert_eq!(v["Participants"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sync_play_list_get_and_playback_ops() {
+    let (status, body) = send(sync_state(), "GET", "/SyncPlay/List", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+
+    let (status, _) = send(
+        sync_state(),
+        "GET",
+        &format!("/SyncPlay/{GROUP_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The body-carrying and bodyless playback ops all resolve to 204.
+    let cases: &[(&str, &str)] = &[
+        (
+            "/SyncPlay/SetNewQueue",
+            r#"{"PlayingQueue":[],"PlayingItemPosition":0,"StartPositionTicks":0}"#,
+        ),
+        ("/SyncPlay/Seek", r#"{"PositionTicks":100}"#),
+        ("/SyncPlay/Queue", r#"{"ItemIds":[],"Mode":"Queue"}"#),
+        ("/SyncPlay/Pause", "{}"),
+        ("/SyncPlay/Unpause", "{}"),
+        ("/SyncPlay/Ping", r#"{"Ping":5}"#),
+        ("/SyncPlay/SetRepeatMode", r#"{"Mode":"RepeatAll"}"#),
+    ];
+    for (uri, body) in cases {
+        let (status, _) = send(sync_state(), "POST", uri, Body::from(*body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+    }
+
+    let (status, _) = send(sync_state(), "POST", "/SyncPlay/Leave", Body::empty()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn sync_play_returns_501_when_manager_unwired() {
+    // The route is registered, but with no SyncPlay manager composed in the
+    // handler yields `501` rather than `404`.
+    let (sessions, user_data) = recording();
+    let (status, _) = send(
+        state(sessions, user_data),
+        "GET",
+        "/SyncPlay/List",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]

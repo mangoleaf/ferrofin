@@ -319,6 +319,184 @@ pub struct UtcTimeResponse {
     pub response_transmission_time: DateTime<Utc>,
 }
 
+/// Request body for `POST /SyncPlay/New` — create a group.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct NewGroupRequestDto {
+    /// The name for the new group.
+    pub group_name: String,
+}
+
+/// Request body for `POST /SyncPlay/Join` — join an existing group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct JoinGroupRequestDto {
+    /// The identifier of the group to join.
+    #[schema(value_type = String, format = "uuid")]
+    pub group_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/SetNewQueue` — set the group play queue.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PlayRequestDto {
+    /// The ordered item ids that make up the queue.
+    #[schema(value_type = Vec<String>, format = "uuid")]
+    pub playing_queue: Vec<Uuid>,
+
+    /// The index (in `playing_queue`) of the item to play first.
+    pub playing_item_position: i32,
+
+    /// The start position for the first item, in ticks.
+    pub start_position_ticks: i64,
+}
+
+/// Request body for `POST /SyncPlay/SetPlaylistItem` — change the playing item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SetPlaylistItemRequestDto {
+    /// The playlist identifier of the item to make current.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/RemoveFromPlaylist` — remove queue entries.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct RemoveFromPlaylistRequestDto {
+    /// The playlist identifiers to remove (ignored when clearing the playlist).
+    #[schema(value_type = Vec<String>, format = "uuid")]
+    pub playlist_item_ids: Vec<Uuid>,
+
+    /// Whether the entire playlist should be cleared.
+    pub clear_playlist: bool,
+
+    /// Whether the playing item should also be removed (only when clearing).
+    pub clear_playing_item: bool,
+}
+
+/// Request body for `POST /SyncPlay/MovePlaylistItem` — reorder a queue entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct MovePlaylistItemRequestDto {
+    /// The playlist identifier of the item to move.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+
+    /// The new position for the item.
+    pub new_index: i32,
+}
+
+/// Request body for `POST /SyncPlay/Queue` — enqueue items.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct QueueRequestDto {
+    /// The items to enqueue.
+    #[schema(value_type = Vec<String>, format = "uuid")]
+    pub item_ids: Vec<Uuid>,
+
+    /// Where to insert the items.
+    pub mode: GroupQueueMode,
+}
+
+/// Request body for `POST /SyncPlay/Seek` — seek the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SeekRequestDto {
+    /// The position to seek to, in ticks.
+    pub position_ticks: i64,
+}
+
+/// Request body for `POST /SyncPlay/Buffering` — signal a client is buffering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct BufferRequestDto {
+    /// When the client made the request (client UTC).
+    #[schema(value_type = String, format = "date-time")]
+    pub when: DateTime<Utc>,
+
+    /// The client's playback position, in ticks.
+    pub position_ticks: i64,
+
+    /// Whether the client's playback is unpaused.
+    pub is_playing: bool,
+
+    /// The playlist item the client is playing.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/Ready` — signal a client is ready.
+///
+/// Same shape as [`BufferRequestDto`]; kept distinct to match the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ReadyRequestDto {
+    /// When the client made the request (client UTC).
+    #[schema(value_type = String, format = "date-time")]
+    pub when: DateTime<Utc>,
+
+    /// The client's playback position, in ticks.
+    pub position_ticks: i64,
+
+    /// Whether the client's playback is unpaused.
+    pub is_playing: bool,
+
+    /// The playlist item the client is playing.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/SetIgnoreWait` — toggle wait-ignoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct IgnoreWaitRequestDto {
+    /// Whether this client should be ignored when the group waits.
+    pub ignore_wait: bool,
+}
+
+/// Request body for `POST /SyncPlay/NextItem` — advance the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct NextItemRequestDto {
+    /// The playlist item the client is currently playing.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/PreviousItem` — go back in the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PreviousItemRequestDto {
+    /// The playlist item the client is currently playing.
+    #[schema(value_type = String, format = "uuid")]
+    pub playlist_item_id: Uuid,
+}
+
+/// Request body for `POST /SyncPlay/SetRepeatMode` — set repeat mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SetRepeatModeRequestDto {
+    /// The repeat mode to apply.
+    pub mode: GroupRepeatMode,
+}
+
+/// Request body for `POST /SyncPlay/SetShuffleMode` — set shuffle mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SetShuffleModeRequestDto {
+    /// The shuffle mode to apply.
+    pub mode: GroupShuffleMode,
+}
+
+/// Request body for `POST /SyncPlay/Ping` — report a client's measured ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PingRequestDto {
+    /// The measured ping time, in milliseconds.
+    pub ping: i64,
+}
+
 /// A polymorphic group update, internally tagged by the `Type` discriminator.
 ///
 /// This unifies the C# `GroupUpdate<T>` subclasses; each variant carries the

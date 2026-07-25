@@ -29,5 +29,5 @@ pub use hls_stream::{
 pub use library_monitor::NoopLibraryMonitor;
 pub use live_tv::LiveTvManager;
 pub use lyrics::LyricManager;
-pub use sync_play::SyncPlayManager;
+pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 pub use virtual_folders::DisabledVirtualFolderManager;
