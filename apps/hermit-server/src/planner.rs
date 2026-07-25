@@ -441,6 +441,10 @@ impl HermitStreamStatePlanner {
     /// encoder with its bitrate/quality/framerate params, the thread count, the
     /// audio encoder with its bitrate/channels, an optional subtitle burn-in, and
     /// the HLS muxer.
+    // A flat, linear ffmpeg arg-builder — one push per option, in ffmpeg's
+    // command order. Splitting it would only scatter the sequence across helpers
+    // that re-thread the same state/paths (same rationale as `plan`).
+    #[allow(clippy::too_many_lines)]
     fn build_arguments(
         &self,
         state: &EncodingJobInfo,
@@ -567,6 +571,19 @@ impl HermitStreamStatePlanner {
         if let Some(id) = segment_id {
             push_split(&mut args, "-start_number");
             args.push(id.to_string());
+        }
+        // Align a seek-restarted transcode's timestamps to this segment's place
+        // in the playlist. The `-ss` input seek makes ffmpeg reset output PTS to
+        // ~0, so segment N would carry PTS ~0 instead of N*segment_len — the
+        // player then sees a discontinuity across the seek boundary and stalls.
+        // Shift the (zero-based) output timestamps forward by the seek time so
+        // segment N's PTS is ≈ N*segment_len and hls.js can splice it in. (Not
+        // `-copyts`, which preserves the source's arbitrary start offset and
+        // desyncs the muxer's segment numbering.)
+        if let Some(id) = segment_id.filter(|&id| id > 0) {
+            let offset_secs = i64::from(id) * i64::from(state.segment_length_secs);
+            push_split(&mut args, "-output_ts_offset");
+            args.push(offset_secs.to_string());
         }
         push_split(&mut args, "-hls_segment_filename");
         args.push(format!("{dir}/{stem}%d.{ext}"));
@@ -976,8 +993,20 @@ mod tests {
         // (a seek-restart re-numbering from 0 would clobber the original job and
         // never produce the requested segment — scrubbing would hang).
         assert!(
-            plan.arguments.windows(2).any(|w| w == ["-start_number", "2"]),
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-start_number", "2"]),
             "seek segment must set -start_number: {:?}",
+            plan.arguments
+        );
+        // ...and shift output timestamps to the segment's playlist time (2 * 6s =
+        // 12s) so the player can splice the seek-restarted segment (else PTS ~0
+        // → discontinuity → stall).
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-output_ts_offset", "12"]),
+            "seek segment must set -output_ts_offset to N*segment_len: {:?}",
             plan.arguments
         );
     }
@@ -991,6 +1020,12 @@ mod tests {
         let plan = p.plan(&request("abc"), false, None).await.unwrap();
         assert!(
             !plan.arguments.iter().any(|a| a == "-start_number"),
+            "{:?}",
+            plan.arguments
+        );
+        // Segment 0 (initial play) also needs no timestamp shift — it starts at 0.
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-output_ts_offset"),
             "{:?}",
             plan.arguments
         );
