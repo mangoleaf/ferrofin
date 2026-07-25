@@ -20,8 +20,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use hermit_model::data::BaseItemKind;
+use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::CollectionTypeOptions;
 use hermit_model::entities_media::VirtualFolderInfo;
 use hermit_model::io::FileSystemEntryType;
@@ -32,10 +33,12 @@ use hermit_naming::video::video_resolver;
 use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
 use hermit_traits::library::VirtualFolderManager;
-use hermit_traits::persistence::ItemPersistenceService;
+use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+use hermit_traits::persistence::{ItemPersistenceService, MediaStreamRepository};
 use uuid::Uuid;
 
 use crate::item_type_lookup;
+use crate::media_source_manager::stream_dto_to_entity;
 
 /// One item the plan pass resolved, ready to persist.
 struct Planned {
@@ -51,6 +54,13 @@ pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
     file_system: Arc<dyn FileSystem>,
     persistence: Arc<dyn ItemPersistenceService>,
+    /// Optional ffprobe seam. When present, each leaf media file is probed during
+    /// the scan so its duration/size and per-stream codec info are persisted —
+    /// which is what lets the web client choose direct play (and the transcoder
+    /// build its arguments). Absent in unit tests, which don't need ffmpeg.
+    media_encoder: Option<Arc<dyn MediaEncoder>>,
+    /// Where probed streams are stored (paired with `media_encoder`).
+    media_streams: Option<Arc<dyn MediaStreamRepository>>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -71,7 +81,23 @@ impl LibraryScanner {
             virtual_folders,
             file_system,
             persistence,
+            media_encoder: None,
+            media_streams: None,
         }
+    }
+
+    /// Attaches the ffprobe seam so leaf media files are probed during the scan
+    /// (persisting duration/size + per-stream codec info). Wired by the composition
+    /// root; omitted in unit tests that don't exercise playback metadata.
+    #[must_use]
+    pub fn with_probe(
+        mut self,
+        media_encoder: Arc<dyn MediaEncoder>,
+        media_streams: Arc<dyn MediaStreamRepository>,
+    ) -> Self {
+        self.media_encoder = Some(media_encoder);
+        self.media_streams = Some(media_streams);
+        self
     }
 
     /// Scans every configured library; returns the number of items created.
@@ -87,14 +113,64 @@ impl LibraryScanner {
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
         for item in &planned {
+            // Probe first so the item row is saved already carrying its duration and
+            // size (the streams themselves are saved after, since they FK the row).
+            let mut entity = item.entity.clone();
+            let streams = self.probe(&mut entity).await;
             self.persistence
-                .save_items(std::slice::from_ref(&item.entity))
+                .save_items(std::slice::from_ref(&entity))
                 .await?;
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
+            if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
+                repo.save_media_streams(item.id, &streams).await?;
+            }
         }
         Ok(planned.len())
+    }
+
+    /// Best-effort ffprobe of a leaf media item: enriches `entity` with the probed
+    /// `run_time_ticks`/`size` and returns its media streams (ready to persist).
+    ///
+    /// Returns an empty vec — leaving the item unprobed but still browsable — when
+    /// no encoder is wired, the item is a folder or non-media, it has no path, or
+    /// the probe fails (missing ffmpeg, unreadable file). Probe failures are
+    /// swallowed so one bad file never aborts a whole library scan.
+    async fn probe(&self, entity: &mut BaseItemEntity) -> Vec<MediaStreamInfoEntity> {
+        let Some(encoder) = &self.media_encoder else {
+            return Vec::new();
+        };
+        let is_audio = entity.media_type.as_deref() == Some("Audio");
+        let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
+        if entity.is_folder || !is_media {
+            return Vec::new();
+        }
+        let Some(path) = entity.path.clone() else {
+            return Vec::new();
+        };
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(path),
+                ..Default::default()
+            },
+            extract_chapters: false,
+            media_is_audio: is_audio,
+        };
+        let probed = match encoder.get_media_info(&request).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                tracing::warn!(error = %e, path = ?entity.path, "media probe failed; item left unprobed");
+                return Vec::new();
+            }
+        };
+        entity.run_time_ticks = probed.run_time_ticks.or(entity.run_time_ticks);
+        entity.size = probed.size.or(entity.size);
+        probed
+            .media_streams
+            .iter()
+            .map(|s| stream_dto_to_entity(&entity.id, s))
+            .collect()
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -402,12 +478,148 @@ mod tests {
     use super::LibraryScanner;
     use crate::file_system::HermitFileSystem;
     use crate::item_persistence_service::HermitItemPersistenceService;
+    use crate::media_stream_repository::HermitMediaStreamRepository;
     use crate::virtual_folder_manager::HermitVirtualFolderManager;
+    use async_trait::async_trait;
     use hermit_db::Database;
     use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
-    use hermit_model::entities::CollectionTypeOptions;
+    use hermit_model::dto::MediaSourceInfo;
+    use hermit_model::entities::{CollectionTypeOptions, MediaStreamType};
+    use hermit_model::entities_media::MediaStream;
+    use hermit_traits::error::ServiceError;
     use hermit_traits::library::VirtualFolderManager;
+    use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
     use std::sync::Arc;
+
+    /// A fake encoder whose probe returns a fixed 3s h264+aac source — exercises
+    /// the scan's probe→persist path without a real ffmpeg.
+    struct FakeProbe;
+
+    #[async_trait]
+    impl MediaEncoder for FakeProbe {
+        fn encoder_path(&self) -> String {
+            "ffmpeg".to_owned()
+        }
+        fn probe_path(&self) -> String {
+            "ffprobe".to_owned()
+        }
+        async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn get_media_info(
+            &self,
+            _request: &MediaInfoRequest,
+        ) -> Result<MediaSourceInfo, ServiceError> {
+            Ok(MediaSourceInfo {
+                run_time_ticks: Some(30_000_000),
+                size: Some(51753),
+                media_streams: vec![
+                    MediaStream {
+                        index: 0,
+                        stream_type: MediaStreamType::Video,
+                        codec: Some("h264".to_owned()),
+                        width: Some(640),
+                        height: Some(480),
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        index: 1,
+                        stream_type: MediaStreamType::Audio,
+                        codec: Some("aac".to_owned()),
+                        channels: Some(2),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+        }
+        async fn extract_audio_image(
+            &self,
+            _path: &str,
+            _image_stream_index: Option<i32>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        async fn extract_video_image(
+            &self,
+            _input_file: &str,
+            _container: &str,
+            _media_source: &MediaSourceInfo,
+            _video_stream: &MediaStream,
+            _threed_format: Option<hermit_model::entities::Video3DFormat>,
+            _offset_ticks: Option<i64>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
+            input_file.to_owned()
+        }
+        fn get_time_parameter(&self, _ticks: i64) -> String {
+            String::new()
+        }
+        async fn convert_image(&self, _i: &str, _o: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_probes_media_and_persists_streams_and_duration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+                .with_probe(
+                    Arc::new(FakeProbe),
+                    Arc::new(HermitMediaStreamRepository::new(db.clone())),
+                );
+        scanner.scan_all().await.unwrap();
+
+        // The probed duration + size land on the item row.
+        let (ticks, size): (Option<i64>, Option<i64>) = sqlx::query_as(
+            r#"SELECT "RunTimeTicks","Size" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(ticks, Some(30_000_000));
+        assert_eq!(size, Some(51753));
+
+        // Both probed streams are persisted (a video + an audio row).
+        let streams: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos""#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(streams, 2);
+        let video_codec: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Codec" FROM "MediaStreamInfos" WHERE "StreamType" = 1"#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(video_codec.as_deref(), Some("h264"));
+    }
 
     #[tokio::test]
     async fn scan_creates_movie_rows_with_parent_and_ancestors() {

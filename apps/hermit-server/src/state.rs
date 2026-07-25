@@ -293,11 +293,19 @@ pub async fn build_app_state(
         hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service)),
     );
-    let library_scanner = Arc::new(hermit_core::LibraryScanner::new(
-        Arc::clone(&virtual_folders),
-        Arc::clone(&file_system),
-        Arc::clone(&item_persistence_service),
-    ));
+    let library_scanner = Arc::new(
+        hermit_core::LibraryScanner::new(
+            Arc::clone(&virtual_folders),
+            Arc::clone(&file_system),
+            Arc::clone(&item_persistence_service),
+        )
+        // Probe each media file during the scan (duration/size + per-stream codecs)
+        // so the web client can pick direct play and the transcoder has stream info.
+        .with_probe(
+            Arc::clone(&media_encoder),
+            Arc::clone(&media_stream_repository),
+        ),
+    );
     let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
         HermitLibraryManager::new(
             Arc::clone(&item_repository),

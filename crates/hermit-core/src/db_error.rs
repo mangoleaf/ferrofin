@@ -50,3 +50,17 @@ pub fn media_stream_type_from_disc(disc: i32) -> MediaStreamType {
         _ => MediaStreamType::Data,
     }
 }
+
+/// The stored `StreamType` discriminant for a [`MediaStreamType`] — the inverse of
+/// [`media_stream_type_from_disc`], used when persisting a probed stream.
+#[must_use]
+pub fn media_stream_type_to_disc(stream_type: MediaStreamType) -> i32 {
+    match stream_type {
+        MediaStreamType::Audio => 0,
+        MediaStreamType::Video => 1,
+        MediaStreamType::Subtitle => 2,
+        MediaStreamType::EmbeddedImage => 3,
+        MediaStreamType::Data => 4,
+        MediaStreamType::Lyric => 5,
+    }
+}

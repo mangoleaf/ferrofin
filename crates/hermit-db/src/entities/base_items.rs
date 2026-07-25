@@ -384,7 +384,7 @@ pub struct AttachmentStreamInfoEntity {
 // A 1:1 mirror of the ~55-column `MediaStreamInfos` table; its many optional
 // codec/HDR flags are intrinsic to the schema, not a refactorable design.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct MediaStreamInfoEntity {
     /// The owning item's `Guid`, hyphenated (`ItemId`, FK → `BaseItems`).

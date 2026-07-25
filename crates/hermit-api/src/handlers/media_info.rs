@@ -47,7 +47,9 @@ async fn playback_info(
         .await?;
     Ok(PlaybackInfoResponse {
         media_sources,
-        play_session_id: None,
+        // The client threads this id through every playback-progress report; C#
+        // mints a fresh GUID per PlaybackInfo call, so a null here breaks reporting.
+        play_session_id: Some(Uuid::new_v4().to_string()),
         error_code: None,
     })
 }

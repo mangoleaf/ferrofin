@@ -175,6 +175,55 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
     }
 }
 
+/// Maps a probed wire [`MediaStream`] back to a persistable
+/// [`MediaStreamInfoEntity`] — the inverse of [`stream_to_dto`], used to store the
+/// streams a scan probe returned. The essential codec/geometry fields playback
+/// negotiation relies on are mapped; the optional HDR/Dolby-Vision metadata the
+/// wire DTO carries in a different shape defaults off.
+pub(crate) fn stream_dto_to_entity(item_id: &str, s: &MediaStream) -> MediaStreamInfoEntity {
+    MediaStreamInfoEntity {
+        item_id: item_id.to_owned(),
+        stream_index: i64::from(s.index),
+        stream_type: crate::db_error::media_stream_type_to_disc(s.stream_type),
+        codec: s.codec.clone(),
+        codec_tag: s.codec_tag.clone(),
+        language: s.language.clone(),
+        title: s.title.clone(),
+        comment: s.comment.clone(),
+        time_base: s.time_base.clone(),
+        codec_time_base: s.codec_time_base.clone(),
+        profile: s.profile.clone(),
+        aspect_ratio: s.aspect_ratio.clone(),
+        path: s.path.clone(),
+        channel_layout: s.channel_layout.clone(),
+        pixel_format: s.pixel_format.clone(),
+        color_space: s.color_space.clone(),
+        color_transfer: s.color_transfer.clone(),
+        color_primaries: s.color_primaries.clone(),
+        nal_length_size: s.nal_length_size.clone(),
+        is_interlaced: Some(s.is_interlaced),
+        is_avc: s.is_avc,
+        is_default: s.is_default,
+        is_forced: s.is_forced,
+        is_external: s.is_external,
+        is_hearing_impaired: Some(s.is_hearing_impaired),
+        is_original: s.is_original,
+        is_anamorphic: s.is_anamorphic,
+        bit_rate: s.bit_rate.map(i64::from),
+        bit_depth: s.bit_depth.map(i64::from),
+        channels: s.channels.map(i64::from),
+        sample_rate: s.sample_rate.map(i64::from),
+        ref_frames: s.ref_frames.map(i64::from),
+        height: s.height.map(i64::from),
+        width: s.width.map(i64::from),
+        level: s.level,
+        rotation: s.rotation.map(i64::from),
+        average_frame_rate: s.average_frame_rate.map(f64::from),
+        real_frame_rate: s.real_frame_rate.map(f64::from),
+        ..Default::default()
+    }
+}
+
 /// Maps a persisted media-attachment row to the wire [`MediaAttachment`] DTO.
 fn attachment_to_dto(row: &AttachmentStreamInfoEntity) -> MediaAttachment {
     MediaAttachment {
