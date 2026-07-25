@@ -709,6 +709,13 @@ impl HermitStreamStatePlanner {
         args.push(state.segment_length_secs.to_string());
         push_split(&mut args, "-hls_playlist_type");
         args.push("vod".to_owned());
+        // Write each segment to a `.tmp` and rename it into place only once fully
+        // written, so a segment file appears **atomically complete**. This lets the
+        // serve path wait for just segment N (not N+1) to prove completeness — it
+        // roughly halves time-to-first-segment on start and on every seek, which is
+        // the dominant scrub latency.
+        push_split(&mut args, "-hls_flags");
+        args.push("temp_file".to_owned());
         push_split(&mut args, "-hls_segment_type");
         args.push(hls_segment_type(segment_container).to_owned());
         // fMP4 (mp4) HLS writes a separate init segment carrying the codec config
