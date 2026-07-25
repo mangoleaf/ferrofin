@@ -57,15 +57,23 @@ fn build_dto_options(
     enable_image_types: Option<&str>,
     enable_user_data: Option<bool>,
 ) -> Result<DtoOptions, ApiError> {
-    let image_types: Vec<ImageType> = parse_csv_enums(enable_image_types)?;
-    Ok(DtoOptions {
+    let requested_types: Vec<ImageType> = parse_csv_enums(enable_image_types)?;
+    let mut options = DtoOptions {
         fields: parse_csv_enums(fields)?,
         enable_images: enable_images.unwrap_or(true),
         image_type_limit: image_type_limit.unwrap_or(i32::MAX),
-        image_types,
         enable_user_data: enable_user_data.unwrap_or(true),
+        // `..default()` seeds `image_types` with *every* type — Jellyfin's
+        // `DtoOptions` constructor default. `GetImageLimit` only returns a
+        // non-zero limit for types in that list, so leaving it empty (the old
+        // behaviour) suppressed all `ImageTags` on the Seasons/Episodes lists.
         ..DtoOptions::default()
-    })
+    };
+    // Narrow to the client's requested types only when it actually asked.
+    if !requested_types.is_empty() {
+        options.image_types = requested_types;
+    }
+    Ok(options)
 }
 
 /// The presentation unique key of a series row: its explicit
