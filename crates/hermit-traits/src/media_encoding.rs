@@ -357,6 +357,12 @@ pub struct HlsStreamRequest {
     pub audio_codec: Option<String>,
     /// The desired output video codec (`videoCodec`).
     pub video_codec: Option<String>,
+    /// The transcoding profile's audio-channel cap (`transcodingMaxAudioChannels`).
+    ///
+    /// Forwarded from the PlaybackInfo-negotiated transcode URL; drives the
+    /// ffmpeg `-ac` downmix so a >2ch source doesn't produce AAC the browser's
+    /// MSE pipeline can't decode.
+    pub transcoding_max_audio_channels: Option<i32>,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
     /// The raw request query string (including the leading `?`), forwarded into

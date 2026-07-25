@@ -78,6 +78,9 @@ struct HlsQuery {
     /// The desired output video codec.
     #[serde(default)]
     video_codec: Option<String>,
+    /// The transcoding profile's max audio channels (drives the `-ac` downmix).
+    #[serde(default)]
+    transcoding_max_audio_channels: Option<i32>,
     /// Whether the client asked for a static (direct) stream.
     #[serde(default, rename = "static")]
     is_static: Option<bool>,
@@ -101,6 +104,7 @@ fn build_request(item_id: Uuid, query: HlsQuery, raw_query: Option<String>) -> H
         segment_length: query.segment_length,
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
+        transcoding_max_audio_channels: query.transcoding_max_audio_channels,
         is_static: query.is_static.unwrap_or(false),
         query_string,
     }

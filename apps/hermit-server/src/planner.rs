@@ -328,6 +328,7 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         // builder read the client's declared targets/limits.
         let base_request = BaseEncodingJobOptions {
             audio_codec: Some(requested_audio_codec.clone()),
+            transcoding_max_audio_channels: request.transcoding_max_audio_channels,
             is_static: request.is_static,
             ..BaseEncodingJobOptions::default()
         };
@@ -413,6 +414,14 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         probe_state
             .output_audio_codec
             .clone_from(&output_audio_codec);
+        // Resolve the output channel count now that the copy decision is known.
+        // A focused port of `EncodingHelper.GetAudioChannels`: the requested
+        // channels (which already fold in `TranscodingMaxAudioChannels`), clamped
+        // to the source's channel count and, when re-encoding, to the transcoding
+        // profile's hard cap. `None` → no `-ac`, so the source channels pass
+        // through (unchanged from before this resolution existed).
+        probe_state.output_audio_channels =
+            resolve_output_audio_channels(&probe_state, output_audio_codec.as_deref());
         probe_state.output_file_path = playlist_path.to_string_lossy().into_owned();
         probe_state.wait_for_path = Some(wait_for_path);
         let state = probe_state;
@@ -628,6 +637,42 @@ impl HermitStreamStatePlanner {
 
         args
     }
+}
+
+/// The output audio channel count for `-ac`, a focused port of
+/// `EncodingHelper.GetAudioChannels`.
+///
+/// Resolves the client-requested channels (`GetRequestedAudioChannels`, which
+/// already prefers an explicit request over `TranscodingMaxAudioChannels`),
+/// clamps to the source stream's channel count, and — when the audio is being
+/// re-encoded — clamps again to `TranscodingMaxAudioChannels` as a hard ceiling.
+/// Returns `None` when no cap applies, leaving the source channels untouched.
+///
+/// The full C# method additionally imposes the encoder's 8-channel ceiling and a
+/// 3/5/7-channel HLS layout fix (adding an LFE channel); those are omitted —
+/// web/TV profiles cap at 2 or 6 channels, where neither branch fires.
+// ponytail: transcoder-8 ceiling + 3/5/7ch LFE HLS-layout normalization not
+// ported; add if a >8ch source or an odd explicit channel request surfaces.
+fn resolve_output_audio_channels(
+    state: &EncodingJobInfo,
+    output_audio_codec: Option<&str>,
+) -> Option<i32> {
+    let codec = output_audio_codec.unwrap_or_default();
+    let mut result = state.requested_audio_channels(codec);
+    if let Some(input) = state
+        .audio_stream
+        .as_ref()
+        .and_then(|s| s.channels)
+        .filter(|&c| c > 0)
+    {
+        result = Some(result.map_or(input, |r| r.min(input)));
+    }
+    if !EncodingJobInfo::is_copy_codec(Some(codec))
+        && let Some(cap) = state.base_request.transcoding_max_audio_channels
+    {
+        result = Some(result.map_or(cap, |r| r.min(cap)));
+    }
+    result
 }
 
 /// Pushes each whitespace-separated token of `fragment` as its own arg.
@@ -878,6 +923,50 @@ mod tests {
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 6000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    #[tokio::test]
+    async fn plan_downmixes_audio_to_transcoding_max_channels() {
+        // A 7.1 (8ch) source transcoded for a web profile that caps HLS audio at
+        // 2ch must emit `-ac 2` — otherwise the browser's MSE pipeline can't
+        // decode the AAC (the "HDR HEVC video plays, no sound" case).
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.transcoding_max_audio_channels = Some(2);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let pos = plan.arguments.iter().position(|a| a == "-ac");
+        assert_eq!(
+            pos.map(|i| plan.arguments[i + 1].as_str()),
+            Some("2"),
+            "expected `-ac 2`, got: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_without_cap_clamps_to_source_channel_count() {
+        // No cap sent → `-ac` equals the source channel count (a passthrough,
+        // never an upmix): a port of `GetAudioChannels`' `?? inputChannels`
+        // clamp, which also prevents a 2ch source being upmixed when a higher
+        // profile cap is present.
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let pos = plan.arguments.iter().position(|a| a == "-ac");
+        assert_eq!(
+            pos.map(|i| plan.arguments[i + 1].as_str()),
+            Some("8"),
+            "expected `-ac 8` (source channels), got: {:?}",
+            plan.arguments
+        );
     }
 
     #[tokio::test]

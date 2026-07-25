@@ -13,7 +13,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermit_model::data::MediaStreamProtocol;
-use hermit_model::dlna::{DeviceProfile, MediaOptions, StreamBuilder, TranscoderSupport};
+use hermit_model::dlna::{
+    DeviceProfile, DlnaProfileType, MediaOptions, StreamBuilder, TranscoderSupport,
+};
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::media_info::{LiveStreamRequest, LiveStreamResponse, PlaybackInfoResponse};
 use hermit_model::session::PlayMethod;
@@ -154,6 +156,37 @@ fn hls_segment_container(negotiated: Option<&str>, source: &MediaSourceInfo) -> 
     }
 }
 
+/// The HLS video transcoding profile's `MaxAudioChannels` for `container`, if
+/// the client's profile declares one.
+///
+/// Prefers the HLS video transcoding profile whose container matches the chosen
+/// segment container, falling back to any HLS video profile. Returns `None` when
+/// the profile sets no channel cap (then the source's channel count streams
+/// through unchanged, matching the pre-existing behaviour).
+fn hls_transcoding_max_audio_channels(profile: &DeviceProfile, container: &str) -> Option<i32> {
+    let mut fallback = None;
+    for p in &profile.transcoding_profiles {
+        if p.profile_type != DlnaProfileType::Video || p.protocol != MediaStreamProtocol::hls {
+            continue;
+        }
+        let Some(max) = p
+            .max_audio_channels
+            .as_deref()
+            .and_then(|c| c.trim().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if p.container
+            .split(',')
+            .any(|c| c.eq_ignore_ascii_case(container))
+        {
+            return Some(max);
+        }
+        fallback.get_or_insert(max);
+    }
+    fallback
+}
+
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
@@ -200,6 +233,20 @@ fn apply_stream_decision(
     // (the old behaviour) is what made HDR HEVC fail to start.
     let container = hls_segment_container(stream.container.as_deref(), source);
     stream.container = Some(container.clone());
+
+    // Adopt the HLS transcoding profile's audio-channel cap. The builder can
+    // label this a raw-copy DirectStream (video copied, incompatible audio left
+    // to a container remux); Jellyfin would deliver that progressively over HTTP,
+    // where the browser's native pipeline decodes 7.1 AAC. We instead force an
+    // HLS *transcode* of the audio (above), which the browser decodes via MSE —
+    // and MSE can't handle >2ch AAC under a web profile. So downmix to the HLS
+    // profile's `MaxAudioChannels`, carried on the URL as
+    // `TranscodingMaxAudioChannels` → the transcoder's `-ac`. Without it the
+    // HDR HEVC video plays but the audio track is silent/undecodable.
+    if stream.transcoding_max_audio_channels.is_none() {
+        stream.transcoding_max_audio_channels =
+            hls_transcoding_max_audio_channels(profile, &container);
+    }
 
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
@@ -442,11 +489,56 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HermitTranscoderSupport, hls_segment_container};
-    use hermit_model::dlna::TranscoderSupport;
+    use super::{
+        HermitTranscoderSupport, hls_segment_container, hls_transcoding_max_audio_channels,
+    };
+    use hermit_model::data::MediaStreamProtocol;
+    use hermit_model::dlna::{DeviceProfile, DlnaProfileType, TranscoderSupport, TranscodingProfile};
     use hermit_model::dto::MediaSourceInfo;
     use hermit_model::entities::MediaStreamType;
     use hermit_model::entities_media::MediaStream;
+
+    fn hls_video_profile(container: &str, max_channels: Option<&str>) -> TranscodingProfile {
+        TranscodingProfile {
+            container: container.to_owned(),
+            profile_type: DlnaProfileType::Video,
+            protocol: MediaStreamProtocol::hls,
+            max_audio_channels: max_channels.map(str::to_owned),
+            ..TranscodingProfile::default()
+        }
+    }
+
+    #[test]
+    fn hls_channel_cap_prefers_matching_container_then_falls_back() {
+        let profile = DeviceProfile {
+            transcoding_profiles: vec![
+                // A non-HLS profile is ignored even though it matches the container.
+                TranscodingProfile {
+                    container: "mp4".to_owned(),
+                    profile_type: DlnaProfileType::Video,
+                    protocol: MediaStreamProtocol::http,
+                    max_audio_channels: Some("6".to_owned()),
+                    ..TranscodingProfile::default()
+                },
+                hls_video_profile("ts", Some("2")),
+                hls_video_profile("mp4", Some("2")),
+            ],
+            ..DeviceProfile::default()
+        };
+        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mp4"), Some(2));
+        assert_eq!(hls_transcoding_max_audio_channels(&profile, "ts"), Some(2));
+        // No container match → falls back to the first HLS video profile's cap.
+        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mkv"), Some(2));
+    }
+
+    #[test]
+    fn hls_channel_cap_absent_when_profile_sets_none() {
+        let profile = DeviceProfile {
+            transcoding_profiles: vec![hls_video_profile("mp4", None)],
+            ..DeviceProfile::default()
+        };
+        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mp4"), None);
+    }
 
     fn source_with_video(codec: &str) -> MediaSourceInfo {
         MediaSourceInfo {
