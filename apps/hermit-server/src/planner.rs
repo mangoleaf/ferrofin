@@ -182,6 +182,29 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// The transcode **target** video codec: the first client preference Hermit can
+/// encode in realtime, else h264.
+///
+/// Clients send preferred codecs most-preferred-first (e.g. `av1,h264,vp9`).
+/// Hermit's hardware encoders are deferred, so only h264 (libx264) transcodes
+/// fast enough for live HLS — software av1/vp9/hevc (libaom-av1 etc.) run far
+/// below realtime and stall the player. So skip codecs Hermit can't encode
+/// efficiently and fall back to the broadly-compatible h264. A bare `copy`
+/// request is honoured verbatim.
+// ponytail: ENCODABLE is h264-only while the hw-accel matrix is deferred; add
+// the hardware targets (av1_nvenc/qsv/vaapi, hevc_*, …) here when they land.
+fn preferred_transcode_video_codec(codecs: &[String]) -> String {
+    const ENCODABLE: &[&str] = &["h264"];
+    codecs
+        .iter()
+        .find(|c| {
+            EncodingJobInfo::is_copy_codec(Some(c))
+                || ENCODABLE.iter().any(|e| c.eq_ignore_ascii_case(e))
+        })
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned())
+}
+
 /// The client-supported codec set that drives the stream-copy decision.
 ///
 /// A bare `copy` request instead declares the *source* codec supported (so the
@@ -314,11 +337,13 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         let audio_codecs = split_codecs(request.audio_codec.as_deref());
 
         // The requested/target codecs (defaulting to the broadly-compatible
-        // h264/aac). A `copy` request is honoured verbatim.
-        let requested_video_codec = video_codecs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned());
+        // h264/aac). A `copy` request is honoured verbatim. The video target is
+        // NOT simply the client's first preference: browsers list av1/vp9 ahead
+        // of h264 for efficiency, but Hermit's hardware-encoder matrix is
+        // deferred, so encoding to av1/vp9 in software (libaom-av1 etc.) runs far
+        // slower than realtime and stalls HLS (fragLoadTimeOut). Pick the first
+        // preference Hermit can actually encode in realtime instead.
+        let requested_video_codec = preferred_transcode_video_codec(&video_codecs);
         let requested_audio_codec = audio_codecs
             .first()
             .cloned()
@@ -923,6 +948,43 @@ mod tests {
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 6000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    #[test]
+    fn transcode_target_skips_codecs_hermit_cannot_encode() {
+        // Browsers list av1/vp9 first for efficiency, but Hermit can only encode
+        // h264 in realtime — picking av1 would launch libaom-av1 and stall HLS.
+        let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
+        assert_eq!(preferred_transcode_video_codec(&av1_first), "h264");
+        // A bare `copy` request is honoured verbatim.
+        assert_eq!(
+            preferred_transcode_video_codec(&["copy".to_owned()]),
+            "copy"
+        );
+        // No encodable preference (or none at all) → the h264 default.
+        assert_eq!(
+            preferred_transcode_video_codec(&["av1".to_owned(), "vp9".to_owned()]),
+            "h264"
+        );
+        assert_eq!(preferred_transcode_video_codec(&[]), "h264");
+    }
+
+    #[tokio::test]
+    async fn plan_transcodes_hevc_source_to_libx264_not_av1() {
+        // A HEVC source a browser can't decode (av1-preferred profile) must
+        // transcode to libx264 (realtime), NOT `-c:v av1` (libaom-av1, far below
+        // realtime -> fragLoadTimeOut).
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("av1,h264,vp9".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("-c:v libx264"),
+            "expected libx264, got: {args}"
+        );
+        assert!(!args.contains("-c:v av1"), "must not encode av1: {args}");
     }
 
     #[tokio::test]

@@ -493,7 +493,9 @@ mod tests {
         HermitTranscoderSupport, hls_segment_container, hls_transcoding_max_audio_channels,
     };
     use hermit_model::data::MediaStreamProtocol;
-    use hermit_model::dlna::{DeviceProfile, DlnaProfileType, TranscoderSupport, TranscodingProfile};
+    use hermit_model::dlna::{
+        DeviceProfile, DlnaProfileType, TranscoderSupport, TranscodingProfile,
+    };
     use hermit_model::dto::MediaSourceInfo;
     use hermit_model::entities::MediaStreamType;
     use hermit_model::entities_media::MediaStream;
