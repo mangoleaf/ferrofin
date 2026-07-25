@@ -14,6 +14,11 @@ pub struct NameGuidPair {
     pub name: Option<String>,
 
     /// Gets or sets the identifier.
+    ///
+    /// `#[serde(default)]`: the metadata editor posts studios/genres as bare
+    /// `{ "Name": … }` with no id, which strict serde would reject — default it to
+    /// nil so those bodies deserialize (serialization still always emits it).
+    #[serde(default)]
     #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
 }

@@ -24,9 +24,11 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use hermit_db::entities::base_items::BaseItemEntity;
-use hermit_model::dto::{BaseItemDto, MetadataEditorInfo, NameValuePair};
+use hermit_model::dto::{MetadataEditorInfo, NameGuidPair, NameValuePair};
 use hermit_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -74,7 +76,7 @@ pub(crate) async fn update_item(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(item_id): Path<Uuid>,
-    Json(request): Json<Box<BaseItemDto>>,
+    Json(request): Json<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
         .library
@@ -86,10 +88,129 @@ pub(crate) async fn update_item(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The editable subset of a `BaseItemDto` the metadata editor `POST`s.
+///
+/// jellyfin-web's editor sends the whole item, but only these fields are applied;
+/// modelling just them (unknown fields are ignored) keeps the write path focused.
+/// Crucially, its number inputs serialize as **strings** (`"ProductionYear": "2010"`)
+/// and cleared dates as `""`, which Jellyfin's C# binder coerces but strict serde
+/// rejects (a `422`). The numeric/date fields therefore use tolerant deserializers
+/// that accept a string, a number, or an empty value.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct UpdateItemRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    forced_sort_name: Option<String>,
+    #[serde(default)]
+    original_title: Option<String>,
+    #[serde(default)]
+    original_language: Option<String>,
+    #[serde(default, deserialize_with = "opt_f32")]
+    critic_rating: Option<f32>,
+    #[serde(default, deserialize_with = "opt_f32")]
+    community_rating: Option<f32>,
+    #[serde(default, deserialize_with = "opt_i32")]
+    index_number: Option<i32>,
+    #[serde(default, deserialize_with = "opt_i32")]
+    parent_index_number: Option<i32>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    genres: Option<Vec<String>>,
+    #[serde(default)]
+    taglines: Option<Vec<String>>,
+    #[serde(default)]
+    studios: Option<Vec<NameGuidPair>>,
+    #[serde(default, deserialize_with = "opt_date")]
+    date_created: Option<DateTime<Utc>>,
+    #[serde(default)]
+    series_name: Option<String>,
+    #[serde(default, deserialize_with = "opt_date")]
+    end_date: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "opt_date")]
+    premiere_date: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "opt_i32")]
+    production_year: Option<i32>,
+    #[serde(default)]
+    official_rating: Option<String>,
+    #[serde(default)]
+    custom_rating: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    production_locations: Option<Vec<String>>,
+    #[serde(default)]
+    preferred_metadata_country_code: Option<String>,
+    #[serde(default)]
+    preferred_metadata_language: Option<String>,
+    #[serde(default)]
+    lock_data: Option<bool>,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    artist_items: Option<Vec<NameGuidPair>>,
+    #[serde(default)]
+    album_artists: Option<Vec<NameGuidPair>>,
+}
+
+/// A JSON value that is either a number or a (possibly numeric) string — the shape
+/// the metadata editor emits for its number inputs.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NumOrStr {
+    Num(f64),
+    Str(String),
+}
+
+impl NumOrStr {
+    /// The numeric value, or `None` for an empty/unparseable string.
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Num(n) => Some(*n),
+            Self::Str(s) => {
+                let s = s.trim();
+                (!s.is_empty()).then(|| s.parse().ok()).flatten()
+            }
+        }
+    }
+}
+
+/// Deserializes an optional `i32` that may arrive as a number, a numeric string,
+/// or an empty string (`""` → `None`).
+#[allow(clippy::cast_possible_truncation)]
+fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+    Ok(Option::<NumOrStr>::deserialize(d)?
+        .as_ref()
+        .and_then(NumOrStr::as_f64)
+        .map(|n| n as i32))
+}
+
+/// Deserializes an optional `f32` that may arrive as a number or a numeric string.
+#[allow(clippy::cast_possible_truncation)]
+fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(Option::<NumOrStr>::deserialize(d)?
+        .as_ref()
+        .and_then(NumOrStr::as_f64)
+        .map(|n| n as f32))
+}
+
+/// Deserializes an optional timestamp, treating a cleared field (`null` or `""`)
+/// as `None` rather than a parse error.
+fn opt_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+    match Option::<String>::deserialize(d)? {
+        Some(s) if !s.trim().is_empty() => DateTime::parse_from_rfc3339(s.trim())
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and
 /// collection assignments of C# `ItemUpdateController.UpdateItem`; the
 /// series/season/album child cascades are deferred (see the module docs).
-fn apply_update(item: &mut BaseItemEntity, request: &BaseItemDto) {
+fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
     item.original_title = non_empty(request.original_title.as_deref());
@@ -437,7 +558,35 @@ async fn get_metadata_editor(
 
 #[cfg(test)]
 mod tests {
-    use super::{containing_folder_path, join_distinct, non_empty};
+    use super::{UpdateItemRequest, containing_folder_path, join_distinct, non_empty};
+
+    #[test]
+    fn update_request_accepts_editor_string_numbers_and_empty_dates() {
+        // The metadata editor sends number inputs as strings and cleared dates as
+        // "" — strict serde would 422; these must parse (was the save bug).
+        let json = r#"{
+            "Id": "ignored", "Type": "Movie", "Name": "Inception",
+            "ProductionYear": "2010", "CommunityRating": "8.5", "IndexNumber": "1",
+            "PremiereDate": "2010-07-16T00:00:00.0000000Z", "EndDate": "",
+            "Genres": ["Action"], "Studios": [{"Name": "WB"}], "LockData": false
+        }"#;
+        let req: UpdateItemRequest = serde_json::from_str(json).expect("lenient parse");
+        assert_eq!(req.production_year, Some(2010));
+        assert_eq!(req.community_rating, Some(8.5));
+        assert_eq!(req.index_number, Some(1));
+        assert!(req.premiere_date.is_some());
+        assert!(req.end_date.is_none(), "empty date string → None, not an error");
+        assert_eq!(req.name.as_deref(), Some("Inception"));
+    }
+
+    #[test]
+    fn update_request_accepts_native_number_types_too() {
+        let req: UpdateItemRequest =
+            serde_json::from_str(r#"{"ProductionYear": 1999, "CommunityRating": 7}"#)
+                .expect("numbers parse");
+        assert_eq!(req.production_year, Some(1999));
+        assert_eq!(req.community_rating, Some(7.0));
+    }
 
     #[test]
     fn join_distinct_dedups_case_insensitively() {
