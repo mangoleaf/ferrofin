@@ -21,9 +21,9 @@ use super::transcoder::Transcoder;
 
 /// The production [`Transcoder`]: spawns ffmpeg/ffprobe with `tokio::process`.
 ///
-/// Splits the caller-supplied `arguments` string on ASCII whitespace, matching
-/// the C# `EncoderValidator` invocation shape where the arguments are a single
-/// space-joined command line with no embedded-space tokens.
+/// Splits the caller-supplied `arguments` string into argv with [`split_args`],
+/// which respects the shell quoting the argument builders emit (`file:"…"`) so
+/// paths containing spaces survive as a single token.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokioTranscoder;
 
@@ -33,6 +33,16 @@ impl TokioTranscoder {
     pub fn new() -> Self {
         Self
     }
+}
+
+/// Splits a command-line argument string into argv, honoring the shell quoting
+/// the encoder's argument builders emit — `-i file:"/path/with spaces/f.mkv"`
+/// must reach ffmpeg as one `-i` value, not four. A plain `split_whitespace`
+/// shatters any spaced path (most real media) and hands ffmpeg/ffprobe a broken
+/// input, so it is used only as the fallback when the quoting is malformed.
+fn split_args(arguments: &str) -> Vec<String> {
+    shlex::split(arguments)
+        .unwrap_or_else(|| arguments.split_whitespace().map(str::to_owned).collect())
 }
 
 #[async_trait]
@@ -46,7 +56,7 @@ impl Transcoder for TokioTranscoder {
     ) -> Result<String, String> {
         let mut command = tokio::process::Command::new(path);
         command
-            .args(arguments.split_whitespace())
+            .args(split_args(arguments))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -79,12 +89,43 @@ impl Transcoder for TokioTranscoder {
 
     async fn get_process_exit_code(&self, path: &str, arguments: &str) -> bool {
         tokio::process::Command::new(path)
-            .args(arguments.split_whitespace())
+            .args(split_args(arguments))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .await
             .is_ok_and(|status| status.success())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_args;
+
+    #[test]
+    fn quoted_path_with_spaces_stays_one_arg() {
+        // The exact shape the probe/encoding argument builders emit.
+        let args =
+            r#"-i file:"/tmp/movies/Big Buck Bunny (2008).mp4" -threads 0 -print_format json"#;
+        assert_eq!(
+            split_args(args),
+            vec![
+                "-i",
+                "file:/tmp/movies/Big Buck Bunny (2008).mp4",
+                "-threads",
+                "0",
+                "-print_format",
+                "json",
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_args_split_on_whitespace() {
+        assert_eq!(
+            split_args("-v warning -show_streams"),
+            vec!["-v", "warning", "-show_streams"]
+        );
     }
 }
