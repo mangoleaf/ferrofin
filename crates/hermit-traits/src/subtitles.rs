@@ -26,11 +26,22 @@ use uuid::Uuid;
 
 use crate::error::ServiceError;
 
+/// The kind of media a subtitle search targets (C# `VideoContentType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtitleMediaType {
+    /// A movie (or any non-episodic video).
+    #[default]
+    Movie,
+    /// A TV episode (uses `series_name` + season/episode numbers).
+    Episode,
+}
+
 /// A request to search remote providers for subtitles matching an item.
 ///
-/// Port of the fields Jellyfin's `SubtitleSearchRequest` actually drives (the
-/// C# `SearchSubtitles(Video, language, isPerfectMatch, isAutomated, …)`
-/// overload folds into these). The domain `Video` becomes an `item_id`.
+/// Port of Jellyfin's `SubtitleSearchRequest`. The [`SubtitleManager`] enriches
+/// it from the resolved item (name/year/imdb/season/episode/media path) before
+/// fanning it out to the providers, which need that metadata to query — the thin
+/// `(item_id, language)` form the API layer builds is filled in by the manager.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SubtitleSearchRequest {
     /// The item the subtitles are being searched for.
@@ -41,6 +52,24 @@ pub struct SubtitleSearchRequest {
     pub is_perfect_match: Option<bool>,
     /// Whether the request was triggered automatically (vs. user-initiated).
     pub is_automated: bool,
+    /// The kind of media (movie vs. episode).
+    pub content_type: SubtitleMediaType,
+    /// The item's display name / title.
+    pub name: Option<String>,
+    /// The series name, for episodes.
+    pub series_name: Option<String>,
+    /// The production year.
+    pub production_year: Option<i32>,
+    /// The season number, for episodes.
+    pub parent_index_number: Option<i32>,
+    /// The episode number, for episodes.
+    pub index_number: Option<i32>,
+    /// The item's runtime, in ticks (helps rank matches).
+    pub runtime_ticks: Option<i64>,
+    /// The on-disk media path (enables hash-based matching).
+    pub media_path: Option<String>,
+    /// The IMDb id (e.g. `tt1234567`), when known.
+    pub imdb_id: Option<String>,
 }
 
 /// The raw content of a downloaded subtitle.

@@ -284,6 +284,7 @@ mod tests {
                 language: "eng".to_owned(),
                 is_perfect_match: None,
                 is_automated: false,
+                ..Default::default()
             })
             .await
             .expect("search")

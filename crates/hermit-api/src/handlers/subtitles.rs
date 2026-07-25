@@ -188,11 +188,14 @@ async fn search_remote_subtitles(
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
     require_item(&state, item_id).await?;
+    // The manager enriches this from the resolved item (name/year/imdb/…) before
+    // querying providers; the handler supplies the caller-visible fields.
     let request = SubtitleSearchRequest {
         item_id,
         language,
         is_perfect_match: query.is_perfect_match,
         is_automated: false,
+        ..Default::default()
     };
     let results = state.subtitles.search_subtitles(&request).await?;
     Ok(Json(results))

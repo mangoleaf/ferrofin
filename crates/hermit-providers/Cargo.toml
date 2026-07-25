@@ -11,10 +11,14 @@ workspace = true
 
 [features]
 # Remote API providers (need keys, network) — deferred/off by default for First-Light.
-default = []
+# `opensubtitles` is on by default: the provider is compiled in (like a stock
+# Jellyfin with the plugin installed) but inert until credentials are configured
+# via the dashboard plugin page.
+default = ["opensubtitles"]
 tmdb = []
 musicbrainz = []
 omdb = []
+opensubtitles = []
 
 [dependencies]
 hermit-traits.workspace = true
