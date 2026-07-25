@@ -19,12 +19,11 @@
 //! path is faithful (it flows from
 //! [`PlaylistManager::get_playlist_for_user`](hermit_traits::collections::PlaylistManager)).
 //!
-//! **Deferred (documented in the manager port):** the minimal
-//! [`BaseItemEntity`](hermit_db::entities::base_items::BaseItemEntity) playlist
-//! row carries no `OwnerUserId` or `Shares`, so the C# owner/share `403 Forbid`
-//! branches cannot yet be evaluated; an authenticated caller is treated as
-//! permitted and the share reads return an empty list. These become real when
-//! playlist-share persistence lands (see the `PlaylistManager` module docs).
+//! Per-user **shares** are persisted (the `PlaylistShares` table): the
+//! `GET/POST/DELETE /Playlists/{id}/Users` routes read and write real permissions,
+//! and `GET /Playlists/{id}` reports them. Still deferred: the playlist row has no
+//! `OwnerUserId`, so the C# owner/share `403 Forbid` access branches aren't
+//! evaluated — an authenticated caller is treated as permitted.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -142,7 +141,7 @@ async fn get_playlist(
         .collect();
     Ok(Json(PlaylistDto {
         open_access: false,
-        shares: Vec::new(),
+        shares: state.playlists.get_playlist_shares(playlist_id).await?,
         item_ids,
     }))
 }
@@ -438,7 +437,9 @@ async fn get_playlist_users(
         .playlists
         .get_playlist_for_user(playlist_id, auth.user_id())
         .await?;
-    Ok(Json(Vec::new()))
+    Ok(Json(
+        state.playlists.get_playlist_shares(playlist_id).await?,
+    ))
 }
 
 /// `GET /Playlists/{playlistId}/Users/{userId}` — one user's permission.
@@ -469,10 +470,19 @@ async fn get_playlist_user(
         .playlists
         .get_playlist_for_user(playlist_id, calling_user_id)
         .await?;
+    // The caller always has full access to a playlist they can open; any other user
+    // is looked up in the playlist's stored shares (`Shares.FirstOrDefault`).
     if user_id == calling_user_id {
         return Ok(Json(PlaylistUserPermissions::new(calling_user_id, true)));
     }
-    Err(ApiError::NotFound("User permissions not found".to_owned()))
+    state
+        .playlists
+        .get_playlist_shares(playlist_id)
+        .await?
+        .into_iter()
+        .find(|s| s.user_id == user_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("User permissions not found".to_owned()))
 }
 
 /// `POST /Playlists/{playlistId}/Users/{userId}` — sets a user's permission.
@@ -546,7 +556,7 @@ async fn remove_user_from_playlist(
     let share = PlaylistUserPermissions::new(user_id, false);
     state
         .playlists
-        .remove_user_from_shares(playlist_id, calling_user_id, &share)
+        .remove_user_from_shares(playlist_id, user_id, &share)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

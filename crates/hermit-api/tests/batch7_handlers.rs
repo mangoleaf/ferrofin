@@ -390,6 +390,12 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn get_playlist_shares(
+        &self,
+        _playlist_id: Uuid,
+    ) -> Result<Vec<hermit_model::entities_media::PlaylistUserPermissions>, ServiceError> {
+        Ok(Vec::new())
+    }
     async fn add_item_to_playlist(
         &self,
         playlist_id: Uuid,

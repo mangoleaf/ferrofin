@@ -150,6 +150,13 @@ pub trait PlaylistManager: Send + Sync {
         share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError>;
 
+    /// Lists the per-user share permissions configured for a playlist. Port of
+    /// the read side of `PlaylistsController.GetPlaylistUsers` (`Playlist.Shares`).
+    async fn get_playlist_shares(
+        &self,
+        playlist_id: Uuid,
+    ) -> Result<Vec<PlaylistUserPermissions>, ServiceError>;
+
     /// Adds items to a playlist, optionally at a zero-based position.
     async fn add_item_to_playlist(
         &self,

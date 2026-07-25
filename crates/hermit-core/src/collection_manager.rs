@@ -317,19 +317,60 @@ impl PlaylistManager for HermitPlaylistManager {
 
     async fn add_user_to_shares(
         &self,
-        _request: &PlaylistUserUpdateRequest,
+        request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
-        // Playlist share persistence is deferred (see module docs).
+        // Upsert the share row (POST is idempotent — re-sharing updates CanEdit).
+        sqlx::query(
+            r#"INSERT INTO "PlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
+               ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
+        )
+        .bind(request.id.to_string())
+        .bind(request.user_id.to_string())
+        .bind(i64::from(request.can_edit.unwrap_or(false)))
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
     async fn remove_user_from_shares(
         &self,
-        _playlist_id: Uuid,
-        _user_id: Uuid,
+        playlist_id: Uuid,
+        user_id: Uuid,
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
+        sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#)
+            .bind(playlist_id.to_string())
+            .bind(user_id.to_string())
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn get_playlist_shares(
+        &self,
+        playlist_id: Uuid,
+    ) -> Result<Vec<PlaylistUserPermissions>, ServiceError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT "UserId", "CanEdit" FROM "PlaylistShares"
+               WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
+        )
+        .bind(playlist_id.to_string())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(uid, can_edit)| {
+                Uuid::parse_str(&uid)
+                    .ok()
+                    .map(|user_id| PlaylistUserPermissions {
+                        user_id,
+                        can_edit: can_edit != 0,
+                    })
+            })
+            .collect())
     }
 
     async fn add_item_to_playlist(
@@ -574,5 +615,70 @@ mod tests {
             err,
             hermit_traits::error::ServiceError::NotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn playlist_shares_add_update_get_remove() {
+        use hermit_model::entities_media::PlaylistUserPermissions;
+        use hermit_model::playlists::PlaylistUserUpdateRequest;
+
+        let db = test_db().await;
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let bob = Uuid::new_v4();
+
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Add a share.
+        mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+            id: playlist_id,
+            user_id: bob,
+            can_edit: Some(true),
+        })
+        .await
+        .unwrap();
+        let shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert_eq!(shares, vec![PlaylistUserPermissions::new(bob, true)]);
+
+        // POST is idempotent and updates CanEdit.
+        mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+            id: playlist_id,
+            user_id: bob,
+            can_edit: Some(false),
+        })
+        .await
+        .unwrap();
+        let shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert_eq!(shares, vec![PlaylistUserPermissions::new(bob, false)]);
+
+        // Remove it.
+        mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, false))
+            .await
+            .unwrap();
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

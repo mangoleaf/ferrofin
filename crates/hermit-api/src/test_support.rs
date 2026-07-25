@@ -1236,6 +1236,12 @@ impl PlaylistManager for FakePlaylists {
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_playlist_shares(
+        &self,
+        _playlist_id: Uuid,
+    ) -> Result<Vec<PlaylistUserPermissions>, ServiceError> {
+        Ok(Vec::new())
+    }
     async fn add_item_to_playlist(
         &self,
         _playlist_id: Uuid,
