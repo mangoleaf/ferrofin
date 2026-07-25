@@ -102,6 +102,41 @@ pub trait SubtitleManager: Send + Sync {
 
 fn _assert_object_safe_subtitle_manager(_: &dyn SubtitleManager) {}
 
+/// A single subtitle provider — the `ISubtitleProvider` strategy (OpenSubtitles,
+/// et al.).
+///
+/// The [`SubtitleManager`] owns a registry of these: it fans
+/// [`search_subtitles`](SubtitleManager::search_subtitles) out across every
+/// provider, and routes [`download_subtitles`](SubtitleManager::download_subtitles)
+/// / [`get_remote_subtitles`](SubtitleManager::get_remote_subtitles) back to the
+/// owning provider. Following Jellyfin, a [`RemoteSubtitleInfo::id`] is namespaced
+/// as `"{provider_name}_{provider_local_id}"`, so the manager selects the provider
+/// by the id's prefix and hands it the remainder via [`get_subtitles`](SubtitleProvider::get_subtitles).
+///
+/// [`RemoteSubtitleInfo::id`]: hermit_model::providers::RemoteSubtitleInfo
+#[async_trait]
+pub trait SubtitleProvider: Send + Sync {
+    /// The provider's stable display name; also the id namespace prefix.
+    fn name(&self) -> &str;
+
+    /// Searches this provider for subtitles matching `request`. Each returned
+    /// [`RemoteSubtitleInfo::id`](hermit_model::providers::RemoteSubtitleInfo) must
+    /// be namespaced with `name()`.
+    async fn search(
+        &self,
+        request: &SubtitleSearchRequest,
+    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError>;
+
+    /// Fetches the raw subtitle content for `provider_local_id` (the id with the
+    /// `"{name}_"` prefix already stripped by the manager).
+    async fn get_subtitles(
+        &self,
+        provider_local_id: &str,
+    ) -> Result<SubtitleResponse, ServiceError>;
+}
+
+fn _assert_object_safe_subtitle_provider(_: &dyn SubtitleProvider) {}
+
 #[cfg(test)]
 mod tests {
     use super::{SubtitleResponse, SubtitleSearchRequest};
