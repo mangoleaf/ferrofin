@@ -248,8 +248,39 @@ impl PluginManager for HermitPluginManager {
     }
 
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError> {
-        // Tier-1: no repository manifest fetch yet — an empty (faithful) catalog.
-        Ok(Vec::new())
+        // Fetch and aggregate the enabled repositories' plugin manifests (each a
+        // JSON `PackageInfo[]`), mirroring `InstallationManager.GetAvailablePackages`.
+        // A repository that is unreachable or serves malformed JSON is skipped with
+        // a warning rather than failing the whole catalog. (Runtime installation of
+        // what this lists is still unsupported — Hermit has no dynamic plugin host —
+        // so this populates the browse catalog only.)
+        let repos: Vec<RepositoryInfo> = {
+            let state = self.state.lock().expect("plugin state lock poisoned");
+            state
+                .repositories
+                .iter()
+                .filter(|r| r.enabled)
+                .cloned()
+                .collect()
+        };
+        let mut packages: Vec<PackageInfo> = Vec::new();
+        for repo in repos {
+            let Some(url) = repo.url.as_deref().filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            match reqwest::get(url).await {
+                Ok(resp) => match resp.json::<Vec<PackageInfo>>().await {
+                    Ok(list) => packages.extend(list),
+                    Err(e) => {
+                        tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(url, error = %e, "failed to fetch plugin repository manifest");
+                }
+            }
+        }
+        Ok(packages)
     }
 }
 

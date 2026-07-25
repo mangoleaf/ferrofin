@@ -21,7 +21,7 @@
 //! - `DELETE /Packages/Installing/{packageId}` — cancel an install (none active)
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -325,7 +325,9 @@ async fn get_packages(
 
 /// `GET /Packages/{name}` — a package by name or assembly GUID.
 ///
-/// The catalog is empty, so this is always `404`.
+/// Port of `PackageController.GetPackageInfo`: looks the package up in the
+/// aggregated repository catalog by (case-insensitive) name, or by `?assemblyGuid=`
+/// when supplied. `404` when the catalog has no match.
 #[utoipa::path(
     get,
     path = "/Packages/{name}",
@@ -337,11 +339,32 @@ async fn get_packages(
     tag = "hermit"
 )]
 async fn get_package_info(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(name): Path<String>,
+    Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
-    Err(ApiError::NotFound(format!("package {name}")))
+    let guid = query.assembly_guid.as_deref().filter(|g| !g.is_empty());
+    let package = state
+        .plugins
+        .list_packages()
+        .await?
+        .into_iter()
+        .find(|p| {
+            p.name.eq_ignore_ascii_case(&name)
+                && guid.is_none_or(|g| p.id.to_string().eq_ignore_ascii_case(g))
+        })
+        .ok_or_else(|| ApiError::NotFound(format!("package {name}")))?;
+    Ok(Json(package))
+}
+
+/// Query parameters for `GET /Packages/{name}`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageInfoQuery {
+    /// Optional assembly GUID to disambiguate same-named packages.
+    #[serde(default)]
+    assembly_guid: Option<String>,
 }
 
 /// `POST /Packages/Installed/{name}` — install a package.

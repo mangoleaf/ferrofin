@@ -1042,6 +1042,7 @@ dependencies = [
  "hermit-model",
  "hermit-naming",
  "hermit-traits",
+ "reqwest",
  "rstest",
  "serde",
  "serde_json",
