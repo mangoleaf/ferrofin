@@ -12,13 +12,62 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use hermit_model::data::MediaStreamProtocol;
+use hermit_model::dlna::{DeviceProfile, MediaOptions, StreamBuilder, TranscoderSupport};
+use hermit_model::dto::MediaSourceInfo;
 use hermit_model::media_info::{LiveStreamRequest, LiveStreamResponse, PlaybackInfoResponse};
+use hermit_model::session::PlayMethod;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
+
+/// The server's transcode capabilities, fed to the [`StreamBuilder`] so it knows
+/// which codecs a non-direct-play source can be transcoded to. Reflects the codecs
+/// the ffmpeg build ships with (matching Jellyfin's default encoder set).
+struct HermitTranscoderSupport;
+
+impl TranscoderSupport for HermitTranscoderSupport {
+    fn can_encode_to_audio_codec(&self, codec: &str) -> bool {
+        matches!(
+            codec.to_ascii_lowercase().as_str(),
+            "aac"
+                | "mp3"
+                | "libmp3lame"
+                | "ac3"
+                | "eac3"
+                | "opus"
+                | "libopus"
+                | "flac"
+                | "vorbis"
+                | "libvorbis"
+                | "alac"
+                | "wav"
+                | "pcm_s16le"
+        )
+    }
+    fn can_encode_to_subtitle_codec(&self, codec: &str) -> bool {
+        matches!(
+            codec.to_ascii_lowercase().as_str(),
+            "srt" | "subrip" | "ass" | "ssa" | "vtt" | "webvtt" | "ttml" | "mov_text"
+        )
+    }
+    fn can_extract_subtitles(&self, codec: &str) -> bool {
+        // Text-based subtitle streams extract to text; image-based ones cannot.
+        !matches!(
+            codec.to_ascii_lowercase().as_str(),
+            "hdmv_pgs_subtitle"
+                | "pgssub"
+                | "dvd_subtitle"
+                | "dvdsub"
+                | "dvb_subtitle"
+                | "dvbsub"
+                | "xsub"
+        )
+    }
+}
 
 /// Query parameters for the playback-info endpoints.
 #[derive(Debug, serde::Deserialize)]
@@ -38,13 +87,33 @@ async fn playback_info(
     auth: &hermit_traits::options::AuthorizationInfo,
     item_id: Uuid,
     user_id: Option<Uuid>,
+    profile: Option<&DeviceProfile>,
+    max_streaming_bitrate: Option<i32>,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
     let resolved_user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
-    let media_sources = state
+    let mut media_sources = state
         .media_sources
         .get_playback_media_sources(item_id, resolved_user_id, true, true)
         .await?;
+
+    // When the client posts its device profile, decide per source whether it can
+    // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't
+    // decode). Without this every source claimed direct-play, so incompatible-audio
+    // files played video-only. No profile (the GET form) keeps the static sources.
+    if let Some(profile) = profile {
+        for source in &mut media_sources {
+            apply_stream_decision(
+                source,
+                profile,
+                item_id,
+                max_streaming_bitrate,
+                auth.token.as_deref(),
+                auth.device_id.as_deref(),
+            );
+        }
+    }
+
     Ok(PlaybackInfoResponse {
         media_sources,
         // The client threads this id through every playback-progress report; C#
@@ -52,6 +121,52 @@ async fn playback_info(
         play_session_id: Some(Uuid::new_v4().to_string()),
         error_code: None,
     })
+}
+
+/// Runs the DLNA [`StreamBuilder`] for one media source against the client's
+/// profile and stamps the resulting play decision onto it: direct-play stays as-is,
+/// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
+/// / remux stream, with the negotiated codecs) is set so the client transcodes.
+fn apply_stream_decision(
+    source: &mut MediaSourceInfo,
+    profile: &DeviceProfile,
+    item_id: Uuid,
+    max_streaming_bitrate: Option<i32>,
+    token: Option<&str>,
+    device_id: Option<&str>,
+) {
+    let mut options = MediaOptions::new(profile.clone());
+    options.item_id = item_id;
+    options.media_source_id.clone_from(&source.id);
+    options.device_id = device_id.map(str::to_owned);
+    options.max_bitrate = max_streaming_bitrate;
+    options.media_sources = vec![source.clone()];
+
+    let support = HermitTranscoderSupport;
+    let Some(stream) = StreamBuilder::new(&support).get_optimal_video_stream(&options) else {
+        return;
+    };
+
+    if stream.play_method == PlayMethod::DirectPlay {
+        source.supports_direct_play = true;
+        return;
+    }
+    // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
+    // copy the compatible video, re-encode only the incompatible audio) are carried
+    // on the StreamInfo; we pin the delivery to HLS because the builder can mislabel
+    // an audio-only re-encode as a raw-copy DirectStream, which would hand the client
+    // the untouched incompatible audio (the "video plays, no audio" case).
+    let mut stream = stream;
+    stream.play_method = PlayMethod::Transcode;
+    stream.sub_protocol = MediaStreamProtocol::hls;
+    stream.container = Some("ts".to_owned());
+
+    source.supports_direct_play = false;
+    source.supports_direct_stream = false;
+    source.supports_transcoding = true;
+    source.transcoding_url = Some(stream.to_url(None, token, None));
+    source.transcoding_sub_protocol = MediaStreamProtocol::hls;
+    source.transcoding_container = Some("ts".to_owned());
 }
 
 /// `GET /Items/{itemId}/PlaybackInfo` — playback info for the item.
@@ -70,9 +185,23 @@ async fn get_playback_info(
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
+    // The GET form carries no device profile, so every source keeps its static
+    // (direct-play) shape.
     Ok(Json(
-        playback_info(&state, &auth, item_id, query.user_id).await?,
+        playback_info(&state, &auth, item_id, query.user_id, None, None).await?,
     ))
+}
+
+/// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile plus
+/// the streaming limits used to negotiate the play method. Other posted fields
+/// (stream-index selections, etc.) are ignored for the basic path.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PlaybackInfoBody {
+    #[serde(default)]
+    device_profile: Option<DeviceProfile>,
+    #[serde(default)]
+    max_streaming_bitrate: Option<i32>,
 }
 
 /// `POST /Items/{itemId}/PlaybackInfo` — playback info with a posted profile.
@@ -92,12 +221,19 @@ async fn post_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
-    body: Option<Json<serde_json::Value>>,
+    body: Option<Json<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
-    // The posted profile is not yet honoured; drop it explicitly.
-    let _ = body;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
     Ok(Json(
-        playback_info(&state, &auth, item_id, query.user_id).await?,
+        playback_info(
+            &state,
+            &auth,
+            item_id,
+            query.user_id,
+            body.device_profile.as_ref(),
+            body.max_streaming_bitrate,
+        )
+        .await?,
     ))
 }
 
@@ -262,4 +398,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/LiveStreams/Open", post(open_live_stream))
         .route("/LiveStreams/Close", post(close_live_stream))
         .route("/Playback/BitrateTest", get(get_bitrate_test))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HermitTranscoderSupport;
+    use hermit_model::dlna::TranscoderSupport;
+
+    #[test]
+    fn transcoder_support_reports_the_ffmpeg_audio_codecs() {
+        let s = HermitTranscoderSupport;
+        // Browser-transcode targets the decision relies on.
+        assert!(s.can_encode_to_audio_codec("aac"));
+        assert!(s.can_encode_to_audio_codec("AAC"), "case-insensitive");
+        assert!(s.can_encode_to_audio_codec("opus"));
+        assert!(s.can_encode_to_audio_codec("ac3"));
+        // Codecs ffmpeg only decodes (so a source can't be transcoded *to* them).
+        assert!(!s.can_encode_to_audio_codec("dts"));
+        assert!(!s.can_encode_to_audio_codec("truehd"));
+        // Image subtitles can't be extracted to text; text subs can.
+        assert!(s.can_extract_subtitles("subrip"));
+        assert!(!s.can_extract_subtitles("hdmv_pgs_subtitle"));
+    }
 }

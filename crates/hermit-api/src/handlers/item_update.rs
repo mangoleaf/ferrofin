@@ -575,7 +575,10 @@ mod tests {
         assert_eq!(req.community_rating, Some(8.5));
         assert_eq!(req.index_number, Some(1));
         assert!(req.premiere_date.is_some());
-        assert!(req.end_date.is_none(), "empty date string → None, not an error");
+        assert!(
+            req.end_date.is_none(),
+            "empty date string → None, not an error"
+        );
         assert_eq!(req.name.as_deref(), Some("Inception"));
     }
 

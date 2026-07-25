@@ -433,7 +433,12 @@ impl HermitStreamStatePlanner {
         let input = self
             .encoder
             .get_input_argument(media_path, &state.media_source);
-        args.push(input);
+        // `get_input_argument` shell-quotes the path (`file:"…"`, inner quotes
+        // `\"`-escaped) for the string-command probe path. The segment transcoder
+        // spawns ffmpeg via argv (no shell), so those quotes would become part of
+        // the filename and ffmpeg would fail to open it (exit 254) for any path
+        // containing a space. Unquote it back into a single argv token with shlex.
+        args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
 
         // ---- map -------------------------------------------------------------
         push_split(&mut args, &self.encoding_helper.map_args(state));
@@ -660,7 +665,8 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            format!("file:{input_file}")
+            // Mirror the real encoder, which shell-quotes the path.
+            format!("file:\"{input_file}\"")
         }
         fn get_time_parameter(&self, ticks: i64) -> String {
             format!("-ss {ticks}")
@@ -773,6 +779,36 @@ mod tests {
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 6000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    #[tokio::test]
+    async fn input_path_with_spaces_is_one_unquoted_argv_token() {
+        // The encoder shell-quotes the input path (`file:"…"`); the segment
+        // transcoder spawns via argv, so it must reach ffmpeg as a single token
+        // with the quotes stripped — otherwise ffmpeg can't open the file (exit 254)
+        // and every transcode of a spaced path fails.
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("ac3")]);
+        src.path = Some("/media/My Movie (2010).mkv".to_owned());
+        let p = planner(vec![src]);
+        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+
+        let i = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-i")
+            .expect("-i present");
+        assert_eq!(
+            plan.arguments[i + 1],
+            "file:/media/My Movie (2010).mkv",
+            "input must be one token, unquoted: {:?}",
+            plan.arguments
+        );
+        // No stray token still carries a literal quote.
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains('"')),
+            "no argv token should contain a literal quote: {:?}",
+            plan.arguments
+        );
     }
 
     #[tokio::test]
