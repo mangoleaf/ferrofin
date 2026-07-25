@@ -620,12 +620,13 @@ fn parse_order_by(
 /// The bare `/Items/{itemId}` slot carries `GET`/`DELETE` (this controller) and
 /// `POST` (the item-update controller) on one shared `MethodRouter`, since axum
 /// rejects a duplicate method+path registered across two `route` calls.
-/// `GET /Users/{userId}/Items` — the legacy, path-scoped form of `GET /Items`.
+/// `GET /Users/{userId}/Items` — the path-scoped form of `GET /Items`.
 ///
-/// Removed from the 10.11 OpenAPI contract (superseded by `/Items?userId=`), so
-/// it is registered as an *extra* route, not a contract entry. jellyfin-web still
-/// calls it for some home rows (returning `404` broke those); this injects the
-/// path `userId` into the query and forwards to [`get_items`].
+/// These `/Users/{userId}/Items…` forms aren't in the 10.11 OpenAPI contract
+/// (which prefers `/Items?userId=`), but jellyfin-web's bundled `jellyfin-apiclient`
+/// still calls them for core screens (home rows, the item/metadata views), so they
+/// are required — a `404` here breaks those screens. Each injects the path
+/// `userId` into the query and forwards to the query-scoped handler.
 async fn get_items_for_user(
     state: State<AppState>,
     auth: RequireAuth,
@@ -636,11 +637,40 @@ async fn get_items_for_user(
     get_items(state, auth, Query(query)).await
 }
 
+/// `GET /Users/{userId}/Items/Resume` — path-scoped form of `GET /UserItems/Resume`
+/// (the home screen's "Continue watching" row).
+async fn get_resume_items_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    Query(mut query): Query<ResumeQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    query.user_id = Some(user_id);
+    get_resume_items(state, auth, Query(query)).await
+}
+
+/// `GET /Users/{userId}/Items/{itemId}` — path-scoped form of `GET /Items/{itemId}`
+/// (item detail + the library metadata editor).
+async fn get_item_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Query(mut query): Query<ItemQuery>,
+) -> Result<Json<BaseItemDto>, ApiError> {
+    query.user_id = Some(user_id);
+    get_item(state, auth, Path(item_id), Query(query)).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Items", get(get_items).delete(delete_items))
         .route("/Users/{userId}/Items", get(get_items_for_user))
+        .route(
+            "/Users/{userId}/Items/Resume",
+            get(get_resume_items_for_user),
+        )
+        .route("/Users/{userId}/Items/{itemId}", get(get_item_for_user))
         .route("/Items/Counts", get(get_item_counts))
         .route("/UserItems/Resume", get(get_resume_items))
         .route(

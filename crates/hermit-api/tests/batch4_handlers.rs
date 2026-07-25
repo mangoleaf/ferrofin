@@ -798,6 +798,48 @@ async fn resume_returns_in_progress_items() {
     assert_eq!(result.items[0].id, ITEM_ID);
 }
 
+// The path-scoped `/Users/{userId}/Items/…` forms jellyfin-web's apiclient calls
+// forward to the query-scoped handlers (home rows + the metadata editor).
+#[tokio::test]
+async fn user_scoped_latest_forwards_to_latest() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/Latest"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, ITEM_ID);
+}
+
+#[tokio::test]
+async fn user_scoped_resume_forwards_to_resume() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/Resume"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+    assert_eq!(result.items.len(), 1);
+}
+
+#[tokio::test]
+async fn user_scoped_item_forwards_to_get_item() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dto: BaseItemDto = serde_json::from_slice(&body).expect("dto");
+    assert_eq!(dto.id, ITEM_ID);
+}
+
 #[tokio::test]
 async fn routes_require_auth() {
     // The default `fake_state` uses the rejecting `FakeAuthService`, so a

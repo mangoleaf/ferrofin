@@ -592,12 +592,29 @@ async fn get_critic_reviews(
     Ok(Json(QueryResult::from_items(Vec::new())))
 }
 
+/// `GET /Users/{userId}/Items/Latest` — path-scoped form of `GET /Items/Latest`
+/// (the home screen's "Latest …" rows). jellyfin-web's bundled apiclient calls
+/// this form; it injects the path `userId` and forwards to [`get_latest_media`].
+async fn get_latest_media_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    Query(mut query): Query<LatestQuery>,
+) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
+    query.user_id = Some(user_id);
+    get_latest_media(state, auth, Query(query)).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/UserFavoriteItems/{itemId}",
             post(mark_favorite).delete(unmark_favorite),
+        )
+        .route(
+            "/Users/{userId}/Items/Latest",
+            get(get_latest_media_for_user),
         )
         .route(
             "/UserItems/{itemId}/Rating",
