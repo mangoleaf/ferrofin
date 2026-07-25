@@ -66,6 +66,10 @@ pub struct Inner {
     pub config: Arc<dyn ServerConfigurationManager>,
     /// Metadata/image refresh orchestration (queueing item refreshes).
     pub providers: Arc<dyn ProviderManager>,
+    /// On-the-fly image resize/format conversion for image serving. `None` until
+    /// the composition root wires a concrete processor (image routes then serve the
+    /// stored original untransformed).
+    pub image_processor: Option<Arc<dyn hermit_traits::drawing::ImageProcessor>>,
     /// Builds "instant mix" playlists from a seed song/album/artist/genre.
     pub music: Arc<dyn MusicManager>,
     /// Finds items similar to a seed and builds recommendation categories.
@@ -217,6 +221,7 @@ impl AppState {
             app_host,
             config,
             providers,
+            image_processor: None,
             music,
             similar_items,
             search,
@@ -356,6 +361,26 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_plugins must be called before the state is shared");
         inner.plugins = plugins;
+        self
+    }
+
+    /// Wires the on-the-fly image processor used by the image-serving routes.
+    ///
+    /// [`new`](Self::new) leaves it `None` (image routes serve the stored original
+    /// untransformed); the composition root calls this with the real
+    /// `image`-crate-backed processor so `maxWidth`/`format`/… requests resize.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_image_processor(
+        mut self,
+        image_processor: Arc<dyn hermit_traits::drawing::ImageProcessor>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_image_processor must be called before the state is shared");
+        inner.image_processor = Some(image_processor);
         self
     }
 

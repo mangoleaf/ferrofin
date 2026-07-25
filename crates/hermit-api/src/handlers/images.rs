@@ -6,15 +6,17 @@
 //! rows come from [`LibraryManager::get_item_images`] /
 //! [`UserManager::get_profile_image`], both backed by real `hermit-db` reads.
 //!
-//! ## Port scope — original-file serving
+//! ## Port scope — processed serving
 //!
-//! Jellyfin runs every image through its `IImageProcessor` (resize, format
-//! conversion, blur/overlay). No concrete image processor is ported yet, so this
-//! layer serves the **stored original file**: the `maxWidth`/`fillHeight`/`format`
-//! /`blur`/… query parameters are accepted for contract compatibility but do not
-//! transform the bytes — the original image is returned. Parametrized resize and
-//! blurhash generation arrive with the image-processor port; the request shape,
-//! resolution logic, and `404`/`400` outcomes here are already the final ones.
+//! Every image request runs through the wired
+//! [`ImageProcessor`](hermit_traits::drawing::ImageProcessor) (the real
+//! `image`-crate encoder at the composition root): the `maxWidth`/`maxHeight`/
+//! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`blur` parameters resize and
+//! format-convert the bytes, and the positional-parameter URL lifts its
+//! `format`/`maxWidth`/`maxHeight` path segments into the same transform. A plain
+//! request (or an unwired processor) serves the **stored original** untouched. The
+//! overlay effects (`percentPlayed`/`unplayedCount`) select the file but are not
+//! drawn.
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
@@ -42,9 +44,10 @@ use axum::response::Response;
 use axum::routing::get;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::BaseItemKind;
+use hermit_model::drawing::ImageFormat;
 use hermit_model::dto::ImageInfo;
 use hermit_model::entities::ImageType;
-use hermit_traits::options::ItemImageInfo;
+use hermit_traits::options::{ImageProcessingOptions, ItemImageInfo};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
@@ -83,10 +86,9 @@ fn parse_image_type(raw: &str) -> Result<ImageType, ApiError> {
 
 /// The query parameters accepted by every image-serving route.
 ///
-/// Every field is optional and mirrors Jellyfin's `GetImage*` signature. Under
-/// original-file serving none of them transform the bytes (see the module docs),
-/// but they are parsed so a client sending them still gets a `200`; only
-/// `user_id` (for the user-image route) changes which file is served.
+/// Every field is optional and mirrors Jellyfin's `GetImage*` signature; the
+/// size/format/blur fields drive the [`ImageProcessor`](hermit_traits::drawing::ImageProcessor)
+/// transform, and `user_id` (for the user-image route) selects which file is served.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImageQuery {
@@ -96,6 +98,65 @@ pub(crate) struct ImageQuery {
     /// Optional explicit image index (query-string form of the route segment).
     #[serde(default)]
     image_index: Option<i32>,
+    /// The requested output format (`jpg`/`png`/`webp`/…); the original's format
+    /// is kept when omitted.
+    #[serde(default)]
+    format: Option<String>,
+    /// Scale so neither dimension exceeds these (aspect-preserving).
+    #[serde(default)]
+    max_width: Option<i32>,
+    #[serde(default)]
+    max_height: Option<i32>,
+    /// Scale to an exact width/height (aspect-preserving on the given axis).
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    /// Scale to fill an exact box (may crop).
+    #[serde(default)]
+    fill_width: Option<i32>,
+    #[serde(default)]
+    fill_height: Option<i32>,
+    /// JPEG/WebP quality (1–100); the encoder default is used when omitted.
+    #[serde(default)]
+    quality: Option<i32>,
+    /// Gaussian blur radius.
+    #[serde(default)]
+    blur: Option<i32>,
+}
+
+impl ImageQuery {
+    /// Whether the request asks for any transform (resize/format/blur); a plain
+    /// request serves the stored original untouched.
+    fn wants_transform(&self) -> bool {
+        self.format.is_some()
+            || self.max_width.is_some()
+            || self.max_height.is_some()
+            || self.width.is_some()
+            || self.height.is_some()
+            || self.fill_width.is_some()
+            || self.fill_height.is_some()
+            || self.blur.is_some()
+    }
+}
+
+/// The output formats the encoder can produce, used as the default accepted set
+/// when the request names no explicit `format` (lets the processor keep a
+/// compatible original or convert as needed).
+fn default_output_formats() -> Vec<ImageFormat> {
+    vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+}
+
+/// Parses a Jellyfin image-format string into an [`ImageFormat`].
+fn parse_image_format(format: &str) -> Option<ImageFormat> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some(ImageFormat::Jpg),
+        "png" => Some(ImageFormat::Png),
+        "webp" => Some(ImageFormat::Webp),
+        "gif" => Some(ImageFormat::Gif),
+        "bmp" => Some(ImageFormat::Bmp),
+        _ => None,
+    }
 }
 
 /// Selects the image of `image_type` at `index` (default `0`) from an item's
@@ -120,18 +181,66 @@ fn select_image(
 /// This is the shared tail of every image route once an image row is resolved.
 /// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
 /// image processor, so it is a `404` (the contract's not-found outcome).
-async fn serve_image_file(image: &ItemImageInfo, request: Request) -> Result<Response, ApiError> {
+async fn serve_image_file(
+    state: &AppState,
+    item_id: Uuid,
+    image: &ItemImageInfo,
+    index: i32,
+    query: &ImageQuery,
+    request: Request,
+) -> Result<Response, ApiError> {
     if !image.is_local_file() || image.path.is_empty() {
         return Err(ApiError::NotFound(format!(
             "no local file for image {:?}",
             image.image_type
         )));
     }
-    let response = ServeFile::new(&image.path)
+
+    // Run the image through the processor for the requested resize/format. It
+    // short-circuits to the original file when nothing is asked for (or the source
+    // already matches), so a plain request still serves the untouched original.
+    let mut serve_path = image.path.clone();
+    let mut content_type: Option<String> = None;
+    if let (true, Some(processor)) = (query.wants_transform(), state.image_processor.as_ref()) {
+        let options = ImageProcessingOptions {
+            item_id,
+            image: image.clone(),
+            image_index: index,
+            width: query.width,
+            height: query.height,
+            max_width: query.max_width,
+            max_height: query.max_height,
+            fill_width: query.fill_width,
+            fill_height: query.fill_height,
+            blur: query.blur,
+            quality: query.quality.unwrap_or(90),
+            supported_output_formats: query
+                .format
+                .as_deref()
+                .and_then(parse_image_format)
+                .map_or_else(default_output_formats, |f| vec![f]),
+            ..Default::default()
+        };
+        let processed = processor.process_image(&options).await?;
+        serve_path = processed.path;
+        content_type = processed.mime_type;
+    }
+
+    let mut response = ServeFile::new(&serve_path)
         .oneshot(request)
         .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
-    Ok(response.map(Body::new))
+        .map_err(|e| ApiError::NotFound(e.to_string()))?
+        .map(Body::new);
+    // The processor may have converted the format, so trust its MIME over the
+    // extension `ServeFile` guessed.
+    if let Some(mime) = content_type
+        && let Ok(value) = axum::http::HeaderValue::from_str(&mime)
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    Ok(response)
 }
 
 /// Resolves an item's images, selects the requested one, and serves it.
@@ -144,6 +253,7 @@ async fn serve_item_image(
     item_id: Uuid,
     image_type: ImageType,
     index: i32,
+    query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let images = state.library.get_item_images(item_id).await?;
@@ -152,7 +262,7 @@ async fn serve_item_image(
             "item {item_id} has no {image_type:?} image at {index}"
         ))
     })?;
-    serve_image_file(image, request).await
+    serve_image_file(state, item_id, image, index, query, request).await
 }
 
 /// `GET`/`HEAD /Items/{itemId}/Images/{imageType}` — serve an item's image.
@@ -185,7 +295,7 @@ async fn get_item_image(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let index = query.image_index.unwrap_or(0);
-    serve_item_image(&state, item_id, image_type, index, request).await
+    serve_item_image(&state, item_id, image_type, index, &query, request).await
 }
 
 /// `GET`/`HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed variant.
@@ -209,6 +319,7 @@ async fn get_item_image(
 async fn get_item_image_by_index(
     State(state): State<AppState>,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -217,16 +328,17 @@ async fn get_item_image_by_index(
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    serve_item_image(&state, item_id, image_type, image_index, request).await
+    serve_item_image(&state, item_id, image_type, image_index, &query, request).await
 }
 
 /// `GET`/`HEAD` for the fully-parametrized item-image alias
 /// `/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}`.
 ///
 /// Port of Jellyfin's positional-parameter image URL (used by some clients that
-/// bake the transform into the path). Under original-file serving the trailing
-/// `tag`/`format`/size/overlay segments are decorative — only the item, type, and
-/// index select the file, so this delegates to the same [`serve_item_image`].
+/// bake the transform into the path). The `format`/`maxWidth`/`maxHeight` path
+/// segments are lifted into an [`ImageQuery`] so the transform is applied just as
+/// the query-string form would; `tag`/`percentPlayed`/`unplayedCount` are honored
+/// for the file selection but their overlay effects are not drawn.
 #[allow(clippy::type_complexity)]
 async fn get_item_image_parametrized(
     State(state): State<AppState>,
@@ -235,9 +347,9 @@ async fn get_item_image_parametrized(
         image_type,
         image_index,
         _tag,
-        _format,
-        _max_width,
-        _max_height,
+        format,
+        max_width,
+        max_height,
         _percent,
         _unplayed,
     )): Path<(
@@ -259,7 +371,15 @@ async fn get_item_image_parametrized(
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    serve_item_image(&state, item_id, image_type, image_index, request).await
+    // Lift the positional transform segments into a query (empty/`0` segments mean
+    // "unset", matching how clients bake a partial transform into the path).
+    let query = ImageQuery {
+        format: Some(format).filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("0")),
+        max_width: max_width.parse().ok().filter(|w| *w > 0),
+        max_height: max_height.parse().ok().filter(|h| *h > 0),
+        ..ImageQuery::default()
+    };
+    serve_item_image(&state, item_id, image_type, image_index, &query, request).await
 }
 
 /// `GET /Items/{itemId}/Images` — the item's image infos.
@@ -359,6 +479,7 @@ async fn serve_named_image(
     name: &str,
     image_type: ImageType,
     index: i32,
+    query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let item = state
@@ -368,7 +489,7 @@ async fn serve_named_image(
         .ok_or_else(|| ApiError::NotFound(format!("{kind:?} {name}")))?;
     let item_id = Uuid::parse_str(&item.id)
         .map_err(|e| ApiError::NotFound(format!("bad by-name id: {e}")))?;
-    serve_item_image(state, item_id, image_type, index, request).await
+    serve_item_image(state, item_id, image_type, index, query, request).await
 }
 
 /// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`.
@@ -392,16 +513,26 @@ macro_rules! by_name_image_handlers {
         ) -> Result<Response, ApiError> {
             let image_type = parse_image_type(&image_type)?;
             let index = query.image_index.unwrap_or(0);
-            serve_named_image(&state, $kind, &name, image_type, index, request).await
+            serve_named_image(&state, $kind, &name, image_type, index, &query, request).await
         }
 
         async fn $indexed(
             State(state): State<AppState>,
             Path((name, image_type, image_index)): Path<(String, String, i32)>,
+            Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
             let image_type = parse_image_type(&image_type)?;
-            serve_named_image(&state, $kind, &name, image_type, image_index, request).await
+            serve_named_image(
+                &state,
+                $kind,
+                &name,
+                image_type,
+                image_index,
+                &query,
+                request,
+            )
+            .await
         }
     };
 }
@@ -463,7 +594,7 @@ async fn get_user_image(
         .get_profile_image(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {user_id} has no profile image")))?;
-    serve_image_file(&image, request).await
+    serve_image_file(&state, user_id, &image, 0, &query, request).await
 }
 
 /// `POST /UserImage` — upload a user's profile image.

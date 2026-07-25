@@ -36,7 +36,7 @@ use hermit_core::{
     HermitUserManager, HermitUserViewManager, ItemTypeLookup, LocalizationManager,
 };
 use hermit_db::Database;
-use hermit_drawing::{ImageProcessor, NullImageEncoder};
+use hermit_drawing::{ImageCrateEncoder, ImageProcessor};
 use hermit_livetv::DisabledLiveTvManager;
 use hermit_mediaencoding::{MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder};
 use hermit_providers::LocalProviderManager;
@@ -222,8 +222,11 @@ pub async fn build_app_state(
         Arc::new(HermitNextUpService::new(db.clone()));
 
     // ---- standalone leaves (no manager deps) ------------------------------
+    // The real `image`-crate encoder (resize + format-convert), not the no-op
+    // `NullImageEncoder` — so `maxWidth`/`fillHeight`/`format` image requests are
+    // honoured instead of serving the full-size original.
     let image_processor: Arc<dyn hermit_traits::drawing::ImageProcessor> = Arc::new(
-        ImageProcessor::new(Arc::new(NullImageEncoder::new()), paths.image_cache_path()),
+        ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), paths.image_cache_path()),
     );
     let providers: Arc<dyn hermit_traits::providers::ProviderManager> =
         Arc::new(LocalProviderManager::new(Vec::new()));
@@ -521,6 +524,10 @@ pub async fn build_app_state(
     // `AppState::new` installed with the real filesystem-backed manager rooted
     // there (mirrors the C# `ILibraryManager` virtual-folder methods).
     let state = state.with_virtual_folders(Arc::clone(&virtual_folders));
+
+    // Image serving runs through the real `image`-crate processor so
+    // `maxWidth`/`format`/… requests resize/convert instead of serving the original.
+    let state = state.with_image_processor(Arc::clone(&image_processor));
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time
