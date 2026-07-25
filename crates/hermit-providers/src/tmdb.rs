@@ -39,9 +39,11 @@ pub struct RemoteImage {
     pub url: String,
 }
 
-/// A TMDB search result carrying the image paths (movie: `title`, tv: `name`).
+/// A TMDB search result carrying the id + image paths (movie: `title`, tv: `name`).
 #[derive(Debug, Deserialize)]
 struct SearchHit {
+    #[serde(default)]
+    id: i64,
     #[serde(default)]
     poster_path: Option<String>,
     #[serde(default)]
@@ -52,6 +54,42 @@ struct SearchHit {
 struct SearchResponse {
     #[serde(default)]
     results: Vec<SearchHit>,
+}
+
+/// A matched TV series: its TMDB id (for season/episode follow-up) + poster and
+/// backdrop images.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesMatch {
+    /// The TMDB series id, used to fetch season/episode artwork.
+    pub tmdb_id: i64,
+    /// The series' poster/backdrop images.
+    pub images: Vec<RemoteImage>,
+}
+
+/// One season's artwork from `/tv/{id}/season/{n}`: the season poster plus every
+/// episode's still, keyed by episode number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeasonImages {
+    /// The season poster URL, if any.
+    pub poster: Option<String>,
+    /// `episode_number` → still image URL.
+    pub episode_stills: std::collections::HashMap<i32, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeasonResponse {
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    episodes: Vec<SeasonEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeasonEpisode {
+    #[serde(default)]
+    episode_number: i32,
+    #[serde(default)]
+    still_path: Option<String>,
 }
 
 /// A TMDB artwork client. Cheap to clone (wraps a [`reqwest::Client`]).
@@ -143,6 +181,86 @@ impl TmdbClient {
                 image_type: ImageType::Backdrop,
                 url: format!("{IMAGE_BASE}{backdrop}"),
             });
+        }
+        images
+    }
+
+    /// Matches a TV series by name/year and returns its TMDB id + poster/backdrop.
+    ///
+    /// Unlike [`images_for`](Self::images_for) this keeps the id so seasons and
+    /// episodes of the same series can be fetched with [`season_images`]. `None`
+    /// on no match or any network/parse error.
+    pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
+        let mut req = self
+            .http
+            .get(format!("{API_BASE}/search/tv"))
+            .query(&[("api_key", self.api_key.as_str()), ("query", name)]);
+        if let Some(y) = year {
+            req = req.query(&[("first_air_date_year", y.to_string())]);
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let hit = resp
+            .json::<SearchResponse>()
+            .await
+            .ok()?
+            .results
+            .into_iter()
+            .next()?;
+
+        let mut images = Vec::new();
+        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Primary,
+                url: format!("{IMAGE_BASE}{poster}"),
+            });
+        }
+        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Backdrop,
+                url: format!("{IMAGE_BASE}{backdrop}"),
+            });
+        }
+        Some(SeriesMatch {
+            tmdb_id: hit.id,
+            images,
+        })
+    }
+
+    /// Fetches one season's artwork (`/tv/{id}/season/{n}`): the season poster and
+    /// every episode's still, in a single request. Empty on any failure.
+    pub async fn season_images(&self, tmdb_id: i64, season_number: i32) -> SeasonImages {
+        let url = format!("{API_BASE}/tv/{tmdb_id}/season/{season_number}");
+        let Ok(resp) = self
+            .http
+            .get(url)
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+        else {
+            return SeasonImages::default();
+        };
+        if !resp.status().is_success() {
+            return SeasonImages::default();
+        }
+        let Ok(parsed) = resp.json::<SeasonResponse>().await else {
+            return SeasonImages::default();
+        };
+        let mut images = SeasonImages {
+            poster: parsed
+                .poster_path
+                .filter(|p| !p.is_empty())
+                .map(|p| format!("{IMAGE_BASE}{p}")),
+            episode_stills: std::collections::HashMap::new(),
+        };
+        for ep in parsed.episodes {
+            if let Some(still) = ep.still_path.filter(|p| !p.is_empty()) {
+                images
+                    .episode_stills
+                    .insert(ep.episode_number, format!("{IMAGE_BASE}{still}"));
+            }
         }
         images
     }

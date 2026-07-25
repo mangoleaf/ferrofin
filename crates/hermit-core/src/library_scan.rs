@@ -33,7 +33,7 @@ use hermit_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use hermit_naming::video::video_resolver;
 use hermit_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
-    TmdbClient, TmdbKind,
+    RemoteImage, TmdbClient, TmdbKind,
 };
 use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
@@ -45,6 +45,54 @@ use uuid::Uuid;
 
 use crate::item_type_lookup;
 use crate::media_source_manager::stream_dto_to_entity;
+
+/// Per-scan artwork lookup state, so a series is matched against TMDB once and
+/// its seasons/episodes reuse that match (and its per-season episode stills).
+#[derive(Default)]
+struct ArtworkCache {
+    /// Series item id → matched TMDB series id.
+    series_tmdb: std::collections::HashMap<String, i64>,
+    /// (series item id, season number) → {episode number → still image URL}.
+    season_stills: std::collections::HashMap<(String, i32), std::collections::HashMap<i32, String>>,
+}
+
+/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
+/// the persisted-image rows.
+///
+/// Idempotent per file: an image already on disk is referenced without a
+/// re-download. Individual download/write failures are skipped (best-effort); a
+/// wholly-failed set yields an empty vec.
+async fn download_images(
+    tmdb: &TmdbClient,
+    item_dir: &Path,
+    item_id: &str,
+    images: Vec<RemoteImage>,
+) -> Vec<ItemImageInfo> {
+    let mut infos = Vec::new();
+    for image in images {
+        let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(image.image_type)));
+        if !dest.exists() {
+            let Some(bytes) = tmdb.download(&image.url).await else {
+                continue;
+            };
+            if let Err(err) =
+                std::fs::create_dir_all(item_dir).and_then(|()| std::fs::write(&dest, &bytes))
+            {
+                tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
+                continue;
+            }
+        }
+        infos.push(ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type: image.image_type,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        });
+    }
+    infos
+}
 
 /// One item the plan pass resolved, ready to persist.
 struct Planned {
@@ -136,6 +184,9 @@ impl LibraryScanner {
     pub async fn scan_all(&self) -> Result<usize, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
+        // Carries matched series' TMDB ids + their episode-still URLs across the
+        // scan so seasons/episodes resolve against the same series lookup.
+        let mut art_cache = ArtworkCache::default();
         for item in &planned {
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
@@ -156,7 +207,7 @@ impl LibraryScanner {
             // failure here must not abort the rest of the scan.
             let mut images = discover_local_images(&entity);
             if images.is_empty() {
-                images = self.fetch_remote_images(&entity).await;
+                images = self.fetch_remote_images(&entity, &mut art_cache).await;
             }
             if !images.is_empty()
                 && let Err(err) = self.persistence.save_item_images(item.id, &images).await
@@ -210,57 +261,105 @@ impl LibraryScanner {
             .collect()
     }
 
-    /// Fetches remote artwork (TMDB poster/backdrop) for a movie or series that
-    /// has no local images, downloading each into `{metadata}/library/{id}` and
-    /// returning the rows to persist.
+    /// Fetches remote artwork (TMDB) for an item that has no local images,
+    /// downloading each image into `{metadata}/library/{id}` and returning the
+    /// rows to persist.
     ///
-    /// Idempotent: if the item's artwork was already downloaded (its folder holds
-    /// a `primary.*`), it is reused from disk with no network call. Returns an
-    /// empty vec when metadata is not configured, the item is not a movie/series,
-    /// or nothing matched — best-effort, never fatal.
-    async fn fetch_remote_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+    /// Covers movies + the whole TV tree: a movie/series poster+backdrop, a
+    /// season poster, and an episode still. `cache` carries the matched series'
+    /// TMDB id and its seasons' episode-still URLs across the scan so a season is
+    /// looked up once (`/tv/{id}/season/{n}`) rather than per episode.
+    ///
+    /// Idempotent: an item whose artwork was already downloaded (its folder holds
+    /// `primary.*`) is reused from disk with no network call. Returns empty when
+    /// metadata is not configured or nothing matched — best-effort, never fatal.
+    async fn fetch_remote_images(
+        &self,
+        entity: &BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Vec<ItemImageInfo> {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return Vec::new();
         };
-        let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
-            "Movie" => TmdbKind::Movie,
-            "Series" => TmdbKind::Series,
-            _ => return Vec::new(),
-        };
-        let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-            return Vec::new();
-        };
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         let item_dir = meta_root.join(&entity.id);
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
 
-        // Already downloaded on a prior scan → reuse from disk, skip the network.
-        if let Some(existing) = existing_downloaded_images(&item_dir) {
-            return existing;
-        }
-
-        let remote = tmdb.images_for(kind, name, year).await;
-        let mut infos = Vec::new();
-        for image in remote {
-            let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(image.image_type)));
-            let Some(bytes) = tmdb.download(&image.url).await else {
-                continue;
-            };
-            if let Err(err) =
-                std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
-            {
-                tracing::warn!(%err, item = %entity.id, "failed to write downloaded artwork");
-                continue;
+        // Each branch resolves its TMDB match/fetch (cheap search) and downloads
+        // via `download_images`, which skips any image already on disk — so a
+        // re-scan re-uses files without re-downloading, while still populating the
+        // per-series id/still cache the seasons and episodes depend on.
+        match short {
+            "Movie" => {
+                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                    return Vec::new();
+                };
+                let images = tmdb.images_for(TmdbKind::Movie, name, year).await;
+                download_images(tmdb, &item_dir, &entity.id, images).await
             }
-            infos.push(ItemImageInfo {
-                path: dest.to_string_lossy().into_owned(),
-                image_type: image.image_type,
-                date_modified: Utc::now(),
-                width: 0,
-                height: 0,
-                blur_hash: None,
-            });
+            "Series" => {
+                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                    return Vec::new();
+                };
+                let Some(matched) = tmdb.series_match(name, year).await else {
+                    return Vec::new();
+                };
+                // Remember the TMDB id so this series' seasons/episodes resolve.
+                cache.series_tmdb.insert(entity.id.clone(), matched.tmdb_id);
+                download_images(tmdb, &item_dir, &entity.id, matched.images).await
+            }
+            "Season" => {
+                let (Some(series_id), Some(season_num)) = (
+                    entity.series_id.as_deref(),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) else {
+                    return Vec::new();
+                };
+                let Some(&tmdb_id) = cache.series_tmdb.get(series_id) else {
+                    return Vec::new(); // series didn't match TMDB
+                };
+                // One request yields the season poster + every episode still.
+                let season = tmdb.season_images(tmdb_id, season_num).await;
+                cache
+                    .season_stills
+                    .insert((series_id.to_owned(), season_num), season.episode_stills);
+                let images = season
+                    .poster
+                    .map(|url| {
+                        vec![RemoteImage {
+                            image_type: ImageType::Primary,
+                            url,
+                        }]
+                    })
+                    .unwrap_or_default();
+                download_images(tmdb, &item_dir, &entity.id, images).await
+            }
+            "Episode" => {
+                let (Some(series_id), Some(season_num), Some(ep_num)) = (
+                    entity.series_id.as_deref(),
+                    entity
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) else {
+                    return Vec::new();
+                };
+                let Some(url) = cache
+                    .season_stills
+                    .get(&(series_id.to_owned(), season_num))
+                    .and_then(|stills| stills.get(&ep_num))
+                    .cloned()
+                else {
+                    return Vec::new();
+                };
+                let images = vec![RemoteImage {
+                    image_type: ImageType::Primary,
+                    url,
+                }];
+                download_images(tmdb, &item_dir, &entity.id, images).await
+            }
+            _ => Vec::new(),
         }
-        infos
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -662,35 +761,6 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
         // Primary + anything else lands on the primary poster name.
         _ => "primary",
     }
-}
-
-/// Rebuilds the persisted-image rows for an item whose artwork was already
-/// downloaded (its `{metadata}/library/{id}` folder holds a `primary.*`), so a
-/// re-scan reuses them without a network round-trip. `None` when nothing is
-/// downloaded yet.
-fn existing_downloaded_images(item_dir: &Path) -> Option<Vec<ItemImageInfo>> {
-    let primary = item_dir.join("primary.jpg");
-    if !primary.exists() {
-        return None;
-    }
-    let mut infos = Vec::new();
-    for (image_type, stem) in [
-        (ImageType::Primary, "primary"),
-        (ImageType::Backdrop, "backdrop"),
-    ] {
-        let path = item_dir.join(format!("{stem}.jpg"));
-        if path.exists() {
-            infos.push(ItemImageInfo {
-                path: path.to_string_lossy().into_owned(),
-                image_type,
-                date_modified: Utc::now(),
-                width: 0,
-                height: 0,
-                blur_hash: None,
-            });
-        }
-    }
-    Some(infos)
 }
 
 fn image_item_kind(type_: &str) -> ImageItemKind {
