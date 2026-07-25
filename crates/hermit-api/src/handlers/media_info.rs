@@ -123,6 +123,37 @@ async fn playback_info(
     })
 }
 
+/// The HLS segment container to transcode into, constrained to Jellyfin's
+/// `supportedHlsContainers` ({`ts`, `mp4`}).
+///
+/// A `negotiated` value of `ts`/`mp4` is honoured; anything else (e.g. the source
+/// `mkv` from a DirectStream-remux path) falls back to a codec-appropriate
+/// choice: fMP4 (`mp4`) for HEVC/AV1 — which browsers can only decode as an
+/// `hvc1`/`av01`-tagged fragment — and MPEG-TS (`ts`) otherwise.
+fn hls_segment_container(negotiated: Option<&str>, source: &MediaSourceInfo) -> String {
+    // HEVC/AV1 must be fMP4 regardless of what the builder negotiated: browsers
+    // decode them via MSE only as an `hvc1`/`av01`-tagged mp4 fragment, never in
+    // MPEG-TS (HDR HEVC in TS is exactly what failed to start). This is also what
+    // jellyfin-web's `mp4` HLS transcoding profile selects for these codecs.
+    let needs_fmp4 = source
+        .video_stream()
+        .and_then(|v| v.codec.as_deref())
+        .is_some_and(|codec| {
+            codec.eq_ignore_ascii_case("hevc")
+                || codec.eq_ignore_ascii_case("h265")
+                || codec.eq_ignore_ascii_case("av1")
+        });
+    if needs_fmp4 {
+        return "mp4".to_owned();
+    }
+    // Otherwise honour a valid HLS container ({ts, mp4}); a remux path may hand
+    // back the source container (e.g. `mkv`), which is not one — fall back to `ts`.
+    match negotiated {
+        Some(c) if c.eq_ignore_ascii_case("mp4") => "mp4".to_owned(),
+        _ => "ts".to_owned(),
+    }
+}
+
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
@@ -159,16 +190,15 @@ fn apply_stream_decision(
     let mut stream = stream;
     stream.play_method = PlayMethod::Transcode;
     stream.sub_protocol = MediaStreamProtocol::hls;
-    // Keep the HLS segment container the profile negotiated — jellyfin-web
-    // declares an fMP4 (`mp4`) transcoding profile for HEVC/AV1 and a `ts` one
-    // for h264. Browsers can only decode HEVC (esp. HDR) in fMP4 tagged `hvc1`,
-    // not MPEG-TS, so forcing `ts` here (the old behaviour) made HDR HEVC fail to
-    // start. Fall back to `ts` only when the profile named no container.
-    let container = stream
-        .container
-        .clone()
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| "ts".to_owned());
+    // Choose a valid HLS segment container. Jellyfin's `supportedHlsContainers`
+    // is {ts, mp4}: honour the profile's choice when it is one of those, but the
+    // builder can hand back the *source* container (e.g. `mkv`) from a
+    // DirectStream-remux path — not a valid HLS segment container — so otherwise
+    // pick by the copied video codec. HEVC/AV1 must be fMP4 (browsers only decode
+    // them in an `hvc1`/`av01`-tagged mp4 fragment, never MPEG-TS); everything
+    // else stays on the broadly-compatible `ts`. Forcing `ts` unconditionally
+    // (the old behaviour) is what made HDR HEVC fail to start.
+    let container = hls_segment_container(stream.container.as_deref(), source);
     stream.container = Some(container.clone());
 
     source.supports_direct_play = false;
@@ -412,8 +442,41 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::HermitTranscoderSupport;
+    use super::{HermitTranscoderSupport, hls_segment_container};
     use hermit_model::dlna::TranscoderSupport;
+    use hermit_model::dto::MediaSourceInfo;
+    use hermit_model::entities::MediaStreamType;
+    use hermit_model::entities_media::MediaStream;
+
+    fn source_with_video(codec: &str) -> MediaSourceInfo {
+        MediaSourceInfo {
+            media_streams: vec![MediaStream {
+                codec: Some(codec.to_owned()),
+                stream_type: MediaStreamType::Video,
+                ..MediaStream::default()
+            }],
+            ..MediaSourceInfo::default()
+        }
+    }
+
+    #[test]
+    fn hls_container_constrains_to_ts_or_mp4() {
+        let hevc = source_with_video("hevc");
+        let h264 = source_with_video("h264");
+        // HEVC/AV1 are ALWAYS fMP4 — even if the builder negotiated `ts` or the
+        // source `mkv` — because browsers can't decode them in MPEG-TS.
+        assert_eq!(hls_segment_container(Some("ts"), &hevc), "mp4");
+        assert_eq!(hls_segment_container(Some("mkv"), &hevc), "mp4");
+        assert_eq!(
+            hls_segment_container(None, &source_with_video("av1")),
+            "mp4"
+        );
+        // h264 honours a valid HLS container, else falls back to ts (never mkv).
+        assert_eq!(hls_segment_container(Some("MP4"), &h264), "mp4");
+        assert_eq!(hls_segment_container(Some("ts"), &h264), "ts");
+        assert_eq!(hls_segment_container(Some("mkv"), &h264), "ts");
+        assert_eq!(hls_segment_container(None, &h264), "ts");
+    }
 
     #[test]
     fn transcoder_support_reports_the_ffmpeg_audio_codecs() {
