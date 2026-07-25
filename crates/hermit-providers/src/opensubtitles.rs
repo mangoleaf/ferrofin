@@ -27,8 +27,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The stable id of the compiled-in OpenSubtitles plugin (dashboard config key).
-pub const PLUGIN_ID: Uuid =
-    Uuid::from_u128(0x4a3f_8e21_6c94_4d17_a2b8_0f5e_9c3d_7a10);
+pub const PLUGIN_ID: Uuid = Uuid::from_u128(0x4a3f_8e21_6c94_4d17_a2b8_0f5e_9c3d_7a10);
 
 /// The provider's name — also the id namespace prefix in [`RemoteSubtitleInfo`].
 pub const PLUGIN_NAME: &str = "opensubtitles";
@@ -146,10 +145,7 @@ fn map_search(response: &SearchResponse) -> Vec<RemoteSubtitleInfo> {
                     .as_deref()
                     .map(two_to_three_letter)
                     .map(str::to_owned),
-                name: file
-                    .file_name
-                    .clone()
-                    .or_else(|| attrs.release.clone()),
+                name: file.file_name.clone().or_else(|| attrs.release.clone()),
                 format: Some("srt".to_owned()),
                 author: attrs.uploader.as_ref().and_then(|u| u.name.clone()),
                 comment: attrs.release.clone(),
@@ -225,7 +221,8 @@ pub struct OpenSubtitlesProvider {
 
 impl std::fmt::Debug for OpenSubtitlesProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenSubtitlesProvider").finish_non_exhaustive()
+        f.debug_struct("OpenSubtitlesProvider")
+            .finish_non_exhaustive()
     }
 }
 
@@ -270,13 +267,13 @@ impl OpenSubtitlesProvider {
         Ok(body.token)
     }
 
-    /// Validates the supplied credentials by attempting a login (used by the
-    /// `ValidateLoginInfo` route). Returns `Ok(())` on success.
+    /// Validates the supplied credentials by attempting a login. Returns `Ok(())`
+    /// on success.
     ///
     /// # Errors
     /// Returns [`ServiceError::Unauthorized`] if the credentials are rejected or
     /// [`ServiceError::Backend`] on a transport error.
-    pub async fn validate_login(&self, cfg: &OpenSubtitlesConfig) -> Result<(), ServiceError> {
+    pub async fn validate_config(&self, cfg: &OpenSubtitlesConfig) -> Result<(), ServiceError> {
         if !cfg.is_configured() {
             return Err(ServiceError::invalid_input(
                 "OpenSubtitles API key is not configured",
@@ -293,7 +290,7 @@ fn net_err(e: &reqwest::Error) -> ServiceError {
 
 #[async_trait]
 impl SubtitleProvider for OpenSubtitlesProvider {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         PLUGIN_NAME
     }
 
@@ -363,6 +360,12 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         }
         let body: SearchResponse = resp.json().await.map_err(|e| net_err(&e))?;
         Ok(map_search(&body))
+    }
+
+    async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
+        let cfg: OpenSubtitlesConfig = serde_json::from_slice(config_json)
+            .map_err(|_| ServiceError::invalid_input("invalid OpenSubtitles configuration"))?;
+        self.validate_config(&cfg).await
     }
 
     async fn get_subtitles(

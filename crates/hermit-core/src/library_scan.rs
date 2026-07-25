@@ -17,23 +17,29 @@
 //! `.await`), then an **async persist**. The filesystem seam is synchronous, so
 //! the whole walk fits the sync pass.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
 use hermit_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::MediaSourceInfo;
-use hermit_model::entities::CollectionTypeOptions;
+use hermit_model::entities::{CollectionTypeOptions, ImageType};
 use hermit_model::entities_media::VirtualFolderInfo;
 use hermit_model::io::FileSystemEntryType;
 use hermit_naming::audio::is_audio_file;
 use hermit_naming::common::NamingOptions;
 use hermit_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use hermit_naming::video::video_resolver;
+use hermit_providers::{
+    EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
+    TmdbClient, TmdbKind,
+};
 use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
 use hermit_traits::library::VirtualFolderManager;
 use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+use hermit_traits::options::ItemImageInfo;
 use hermit_traits::persistence::{ItemPersistenceService, MediaStreamRepository};
 use uuid::Uuid;
 
@@ -61,6 +67,11 @@ pub struct LibraryScanner {
     media_encoder: Option<Arc<dyn MediaEncoder>>,
     /// Where probed streams are stored (paired with `media_encoder`).
     media_streams: Option<Arc<dyn MediaStreamRepository>>,
+    /// Optional TMDB client for fetching remote artwork (posters/backdrops) for
+    /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
+    tmdb: Option<Arc<TmdbClient>>,
+    /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
+    metadata_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -83,7 +94,20 @@ impl LibraryScanner {
             persistence,
             media_encoder: None,
             media_streams: None,
+            tmdb: None,
+            metadata_dir: None,
         }
+    }
+
+    /// Attaches the TMDB artwork client + the directory downloaded images are
+    /// stored under, so items with no local artwork get remote posters/backdrops
+    /// during the scan (Jellyfin's automatic-artwork behaviour). Omitted in unit
+    /// tests, which don't hit the network.
+    #[must_use]
+    pub fn with_metadata(mut self, tmdb: Arc<TmdbClient>, metadata_dir: PathBuf) -> Self {
+        self.tmdb = Some(tmdb);
+        self.metadata_dir = Some(metadata_dir);
+        self
     }
 
     /// Attaches the ffprobe seam so leaf media files are probed during the scan
@@ -125,6 +149,19 @@ impl LibraryScanner {
                 .await?;
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
+            }
+            // Artwork: local files first (poster/backdrop/logo/… next to the
+            // media), then a TMDB fallback for movies/series with none — matching
+            // Jellyfin, which fetches remote artwork automatically. Best-effort: a
+            // failure here must not abort the rest of the scan.
+            let mut images = discover_local_images(&entity);
+            if images.is_empty() {
+                images = self.fetch_remote_images(&entity).await;
+            }
+            if !images.is_empty()
+                && let Err(err) = self.persistence.save_item_images(item.id, &images).await
+            {
+                tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
             }
         }
         Ok(planned.len())
@@ -171,6 +208,59 @@ impl LibraryScanner {
             .iter()
             .map(|s| stream_dto_to_entity(&entity.id, s))
             .collect()
+    }
+
+    /// Fetches remote artwork (TMDB poster/backdrop) for a movie or series that
+    /// has no local images, downloading each into `{metadata}/library/{id}` and
+    /// returning the rows to persist.
+    ///
+    /// Idempotent: if the item's artwork was already downloaded (its folder holds
+    /// a `primary.*`), it is reused from disk with no network call. Returns an
+    /// empty vec when metadata is not configured, the item is not a movie/series,
+    /// or nothing matched — best-effort, never fatal.
+    async fn fetch_remote_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+        let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
+            return Vec::new();
+        };
+        let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
+            "Movie" => TmdbKind::Movie,
+            "Series" => TmdbKind::Series,
+            _ => return Vec::new(),
+        };
+        let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Vec::new();
+        };
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        let item_dir = meta_root.join(&entity.id);
+
+        // Already downloaded on a prior scan → reuse from disk, skip the network.
+        if let Some(existing) = existing_downloaded_images(&item_dir) {
+            return existing;
+        }
+
+        let remote = tmdb.images_for(kind, name, year).await;
+        let mut infos = Vec::new();
+        for image in remote {
+            let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(image.image_type)));
+            let Some(bytes) = tmdb.download(&image.url).await else {
+                continue;
+            };
+            if let Err(err) =
+                std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
+            {
+                tracing::warn!(%err, item = %entity.id, "failed to write downloaded artwork");
+                continue;
+            }
+            infos.push(ItemImageInfo {
+                path: dest.to_string_lossy().into_owned(),
+                image_type: image.image_type,
+                date_modified: Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            });
+        }
+        infos
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -290,6 +380,11 @@ impl LibraryScanner {
                 continue;
             };
             series.production_year = info.year.map(i64::from);
+            // The series' presentation key groups its seasons/episodes: the
+            // `/Shows/{id}/{Seasons,Episodes}` queries filter on
+            // `SeriesPresentationUniqueKey`, and `series_presentation_key` falls
+            // back to this. Use the series id so children can match it.
+            series.presentation_unique_key = Some(series_id.to_string());
             out.push(Planned {
                 id: series_id,
                 entity: series,
@@ -310,6 +405,13 @@ impl LibraryScanner {
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
+        // Episodes not under a `Season NN` folder (a flat series folder, or loose
+        // videos in a non-season subfolder). Grouped into *virtual* seasons below
+        // by their filename-detected season number, so a show without season
+        // folders still gets the Series→Season→Episode hierarchy the clients
+        // navigate (Series→Seasons→Episodes) — without seasons, a show renders
+        // with no episodes.
+        let mut loose: Vec<String> = Vec::new();
         for entry in self.file_system.get_file_system_entries(series_dir) {
             if entry.type_ == FileSystemEntryType::Directory {
                 let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
@@ -327,6 +429,8 @@ impl LibraryScanner {
                         continue;
                     };
                     e.index_number = num.map(i64::from);
+                    e.series_id = Some(series_id.to_string());
+                    e.series_presentation_unique_key = Some(series_id.to_string());
                     out.push(Planned {
                         id: season_id,
                         entity: e,
@@ -341,13 +445,82 @@ impl LibraryScanner {
                         out,
                     );
                 } else {
-                    // A non-season subfolder (extras, etc.): its videos hang off the
-                    // series directly.
-                    self.plan_episodes(&entry.path, cf, series_id, None, naming, out);
+                    // A non-season subfolder (extras, etc.): collect its videos as
+                    // loose episodes (grouped into virtual seasons below).
+                    self.collect_videos(&entry.path, naming, &mut loose);
                 }
             } else if video_resolver::is_video_file(&entry.path, naming) {
-                Self::emit_episode(&entry.path, cf, series_id, None, naming, out);
+                loose.push(entry.path);
             }
+        }
+        Self::plan_loose_episodes(&loose, cf, series_id, series_dir, naming, out);
+    }
+
+    /// Collects every video file under `dir` (recursively) into `out_paths`.
+    fn collect_videos(&self, dir: &str, naming: &NamingOptions, out_paths: &mut Vec<String>) {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.collect_videos(&entry.path, naming, out_paths);
+            } else if video_resolver::is_video_file(&entry.path, naming) {
+                out_paths.push(entry.path);
+            }
+        }
+    }
+
+    /// Groups season-folder-less episodes into **virtual** `Season`s by their
+    /// filename-detected season number, emitting one `Season` per distinct number
+    /// and each episode parented to it. A file with no detectable season number
+    /// falls into a single "Season Unknown" grouping.
+    fn plan_loose_episodes(
+        paths: &[String],
+        cf: Uuid,
+        series_id: Uuid,
+        series_dir: &str,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        use std::collections::BTreeMap;
+        let resolved: Vec<(&String, Option<i32>)> = paths
+            .iter()
+            .map(|p| {
+                let num = EpisodeResolver::new(naming)
+                    .resolve_simple(p, false)
+                    .and_then(|i| i.season_number);
+                (p, num)
+            })
+            .collect();
+
+        // One virtual season per distinct number (BTreeMap → deterministic order).
+        let mut season_ids: BTreeMap<Option<i32>, Uuid> = BTreeMap::new();
+        for &(_, num) in &resolved {
+            if season_ids.contains_key(&num) {
+                continue;
+            }
+            let name = num.map_or_else(|| "Season Unknown".to_owned(), |n| format!("Season {n}"));
+            // A flat series has no season folder, so derive a stable id from a
+            // synthetic path (unique per series+season) and leave the season's own
+            // path unset (it is a virtual grouping, not an on-disk folder).
+            let synthetic = format!("{series_dir}/#virtual-season-{}", num.unwrap_or(-1));
+            let Some((season_id, mut e)) =
+                Self::base_item(BaseItemKind::Season, cf, series_id, name, &synthetic, true)
+            else {
+                continue;
+            };
+            e.path = None;
+            e.index_number = num.map(i64::from);
+            e.series_id = Some(series_id.to_string());
+            e.series_presentation_unique_key = Some(series_id.to_string());
+            out.push(Planned {
+                id: season_id,
+                entity: e,
+                ancestors: vec![cf, series_id],
+            });
+            season_ids.insert(num, season_id);
+        }
+
+        for (path, num) in resolved {
+            let season = season_ids.get(&num).map(|&sid| (sid, num));
+            Self::emit_episode(path, cf, series_id, season, naming, out);
         }
     }
 
@@ -404,6 +577,11 @@ impl LibraryScanner {
             .or_else(|| info.as_ref().and_then(|i| i.season_number))
             .map(i64::from);
         entity.series_name = info.and_then(|i| i.series_name);
+        // Link the episode to its series/season so the `/Shows/{id}/Episodes`
+        // query (which filters on `SeriesPresentationUniqueKey`) returns it.
+        entity.series_id = Some(series_id.to_string());
+        entity.series_presentation_unique_key = Some(series_id.to_string());
+        entity.season_id = season.map(|(sid, _)| sid.to_string());
         out.push(Planned {
             id,
             entity,
@@ -471,6 +649,109 @@ fn file_stem(path: &str) -> String {
         .file_stem()
         .and_then(|s| s.to_str())
         .map_or_else(|| path.to_owned(), ToOwned::to_owned)
+}
+
+/// Maps a stored `BaseItems.Type` string to the local-image-provider item kind.
+/// The on-disk filename stem a downloaded image of `image_type` is stored under.
+fn image_type_file_stem(image_type: ImageType) -> &'static str {
+    match image_type {
+        ImageType::Backdrop => "backdrop",
+        ImageType::Logo => "logo",
+        ImageType::Thumb => "thumb",
+        ImageType::Banner => "banner",
+        // Primary + anything else lands on the primary poster name.
+        _ => "primary",
+    }
+}
+
+/// Rebuilds the persisted-image rows for an item whose artwork was already
+/// downloaded (its `{metadata}/library/{id}` folder holds a `primary.*`), so a
+/// re-scan reuses them without a network round-trip. `None` when nothing is
+/// downloaded yet.
+fn existing_downloaded_images(item_dir: &Path) -> Option<Vec<ItemImageInfo>> {
+    let primary = item_dir.join("primary.jpg");
+    if !primary.exists() {
+        return None;
+    }
+    let mut infos = Vec::new();
+    for (image_type, stem) in [
+        (ImageType::Primary, "primary"),
+        (ImageType::Backdrop, "backdrop"),
+    ] {
+        let path = item_dir.join(format!("{stem}.jpg"));
+        if path.exists() {
+            infos.push(ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            });
+        }
+    }
+    Some(infos)
+}
+
+fn image_item_kind(type_: &str) -> ImageItemKind {
+    match type_.rsplit('.').next().unwrap_or(type_) {
+        "Movie" => ImageItemKind::Movie,
+        "Series" => ImageItemKind::Series,
+        "Season" => ImageItemKind::Season,
+        "Episode" => ImageItemKind::Episode,
+        "MusicVideo" => ImageItemKind::MusicVideo,
+        "Video" => ImageItemKind::Video,
+        _ => ImageItemKind::Generic,
+    }
+}
+
+/// Discovers an item's local artwork (poster/backdrop/logo/…) by scanning its
+/// folder with the local-image providers, returning rows ready to persist.
+///
+/// Dimensions are left `0` (unknown) here — the image files are decoded lazily on
+/// serve, not during the scan. Episodes use the episode provider; everything the
+/// generic provider supports uses it; unsupported kinds yield nothing.
+fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+    let Some(path) = entity.path.as_deref() else {
+        return Vec::new();
+    };
+    let kind = image_item_kind(&entity.type_);
+
+    let containing = if entity.is_folder {
+        Some(path.to_owned())
+    } else {
+        std::path::Path::new(path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .map(ToOwned::to_owned)
+    };
+
+    let mut item = ImageItem::new(kind);
+    item.name = entity.name.clone().unwrap_or_default();
+    item.path = Some(path.to_owned());
+    item.file_name_without_extension = Some(file_stem(path));
+    item.containing_folder_path = containing;
+
+    let dir = FsDirectoryService::new();
+    let found = if kind == ImageItemKind::Episode {
+        EpisodeLocalImageProvider::get_images(&item, &dir)
+    } else if LocalImageProvider::supports(&item) {
+        LocalImageProvider::get_images(&item, &dir)
+    } else {
+        Vec::new()
+    };
+
+    found
+        .into_iter()
+        .map(|local| ItemImageInfo {
+            path: local.file_info.full_name,
+            image_type: local.type_,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -619,6 +900,53 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(video_codec.as_deref(), Some("h264"));
+    }
+
+    #[tokio::test]
+    async fn scan_discovers_and_persists_local_artwork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap();
+        // A filename-matched poster next to the movie → its Primary image.
+        std::fs::write(media.join("The Matrix (1999)-poster.jpg"), b"jpg").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
+        scanner.scan_all().await.unwrap();
+
+        // A Primary image row (ImageType = 0) pointing at the poster was persisted.
+        let (count, path): (i64, Option<String>) = sqlx::query_as(
+            r#"SELECT COUNT(*), MAX("Path") FROM "BaseItemImageInfos" WHERE "ImageType" = 0"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "one primary image should be persisted");
+        assert!(
+            path.as_deref().unwrap_or_default().ends_with("poster.jpg"),
+            "primary image path points at the poster: {path:?}"
+        );
     }
 
     #[tokio::test]
@@ -795,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tv_episode_without_a_season_folder_parents_to_the_series() {
+    async fn tv_episode_without_a_season_folder_gets_a_virtual_season() {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("tv");
         // No "Season N" folder — the episode sits directly in the series folder.
@@ -812,34 +1140,63 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        // No season rows were created; every episode parents to the series directly.
-        let seasons: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems"
+        // A flat series folder still gets a Season: a *virtual* one derived from
+        // the episode's filename season number, so the show renders its episodes.
+        let season: (String, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id","IndexNumber","Path","SeriesPresentationUniqueKey" FROM "BaseItems"
                WHERE "Type"='MediaBrowser.Controller.Entities.TV.Season'"#,
         )
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(seasons, 0);
-        let eps: Vec<(String, Option<i64>)> = sqlx::query_as(
-            r#"SELECT "ParentId","ParentIndexNumber" FROM "BaseItems"
-               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Episode'"#,
+        assert_eq!(
+            season.1,
+            Some(2),
+            "virtual season carries the season number"
+        );
+        assert_eq!(season.2, None, "a virtual season has no on-disk path");
+        assert_eq!(
+            season.3.as_deref(),
+            Some(series_id.as_str()),
+            "season links to the series by presentation key"
+        );
+
+        // The episode parents to the virtual season and carries the linking keys.
+        let ep: (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"SELECT "ParentId","ParentIndexNumber","SeasonId","SeriesId",
+                          "SeriesPresentationUniqueKey"
+                   FROM "BaseItems"
+                   WHERE "Type"='MediaBrowser.Controller.Entities.TV.Episode'"#,
         )
-        .fetch_all(db.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(eps.len(), 1);
-        assert_eq!(eps[0].0, series_id, "episode parents to the series");
-        // The `S02E05` file still carries its parsed season number.
-        assert_eq!(eps[0].1, Some(2));
-        // Ancestor closure is depth 2 (cf, series) with no season.
+        assert_eq!(ep.0, season.0, "episode parents to the virtual season");
+        assert_eq!(ep.1, Some(2));
+        assert_eq!(ep.2.as_deref(), Some(season.0.as_str()), "SeasonId set");
+        assert_eq!(ep.3.as_deref(), Some(series_id.as_str()), "SeriesId set");
+        assert_eq!(
+            ep.4.as_deref(),
+            Some(series_id.as_str()),
+            "episode links to the series by presentation key (drives the Episodes query)"
+        );
+        // Ancestor closure is depth 3 (cf, series, season).
         let anc: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*) FROM "AncestorIds" WHERE "ParentItemId" = ?1"#)
                 .bind(&cf)
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(anc, 2, "series + 1 episode each have cf as an ancestor");
+        assert_eq!(
+            anc, 3,
+            "series + season + episode each have cf as an ancestor"
+        );
     }
 
     #[tokio::test]

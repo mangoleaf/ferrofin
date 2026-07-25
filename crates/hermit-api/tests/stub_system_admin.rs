@@ -91,11 +91,9 @@ const SYSTEM_ADMIN_PROBES: &[(Method, &str)] = &[
     (Method::POST, "/SkipButtonCss/UpdateSkipDuration"),
     // Intro-skipper plugin: FileTransformation
     (Method::POST, "/FileTransformation/RegisterTransformation"),
-    // OpenSubtitles plugin
-    (
-        Method::POST,
-        "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
-    ),
+    // OpenSubtitles' /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo is now a
+    // real route (validates credentials via the OpenSubtitles provider), so it is
+    // no longer a 501 stub — covered by the subtitle handler tests instead.
 ];
 
 #[tokio::test]
@@ -132,7 +130,8 @@ async fn unit7_system_admin_stub_routes_return_501_not_404() {
 fn unit7_covers_all_remaining_stub_ops() {
     assert_eq!(
         SYSTEM_ADMIN_PROBES.len(),
-        17,
-        "Unit-7 has 104 tagged ops minus 5 First-Light minus 19 Batch-6 minus 1 Batch-12 minus 31 Batch-13 minus 3 Batch-15 minus 3 Batch-16 (ScheduledTasks cancel + Triggers, UserViews/GroupingOptions) minus 1 portable-extras (Tmdb/ClientConfiguration) minus 15 Plugins/Packages/Repositories (Tier-1 plugin manager) minus 5 Channels (now implemented — empty results) minus 4 Backup (list/manifest/create/restore all implemented) = 17 stubs; probe table drifted"
+        16,
+        "17 prior stubs minus 1 OpenSubtitles/ValidateLoginInfo (now a real \
+         credential-validation route) = 16 stubs; probe table drifted"
     );
 }

@@ -298,6 +298,25 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Persists the image info attached to an item.
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
+    /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
+    /// `images` — the write path the library scan uses to persist discovered
+    /// artwork (posters/backdrops/…) so the image routes can serve it.
+    ///
+    /// The default is a no-op (for stub/fake services); the real service deletes
+    /// the item's existing rows and inserts the given set.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn save_item_images(
+        &self,
+        item_id: Uuid,
+        images: &[ItemImageInfo],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, images);
+        Ok(())
+    }
+
     /// Reattaches user-data rows to the correct item after an id change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 

@@ -391,6 +391,7 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/RemoteSearch/Subtitles/{language}"),
     ("post", "/Items/{itemId}/RemoteSearch/Subtitles/{language}"),
     ("get", "/Providers/Subtitles/Subtitles/{subtitleId}"),
+    ("post", "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo"),
     // On-the-fly subtitle conversion (SubtitleEncoder seam) + FallbackFont
     // (encoding-options config seam + FileSystem). The `Stream.{format}` routes
     // normalize to a `{routeFormat}` capture; the ticks route adds a second one.

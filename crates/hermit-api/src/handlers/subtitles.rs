@@ -677,6 +677,29 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/FallbackFont/Fonts", get(get_fallback_font_list))
         .route("/FallbackFont/Fonts/{name}", get(get_fallback_font))
+        .route(
+            "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
+            post(validate_open_subtitles_login),
+        )
+}
+
+/// `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` — validate the
+/// OpenSubtitles credentials the dashboard is about to save.
+///
+/// Ports the OpenSubtitles plugin's login-check action: the posted
+/// `{ApiKey,Username,Password}` body is validated by attempting a real login via
+/// the provider. `200` means the credentials work; a rejected login is `401`, a
+/// missing key `400`.
+async fn validate_open_subtitles_login(
+    RequireAuth(_auth): RequireAuth,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    state
+        .subtitles
+        .validate_provider_login("opensubtitles", &body)
+        .await?;
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]

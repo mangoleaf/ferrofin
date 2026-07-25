@@ -1,69 +1,191 @@
-//! [`HermitSubtitleManager`] — a **minimal** [`SubtitleManager`] over the
-//! `MediaStreamInfos` table.
+//! [`HermitSubtitleManager`] — subtitle search/download/upload/delete over the
+//! `MediaStreamInfos` table and a registry of [`SubtitleProvider`]s.
 //!
-//! Port of `MediaBrowser.Providers.Subtitles.SubtitleManager`. Hermit ports the
-//! **portable** slice — the stored external-subtitle rows on an item — and
-//! documents the plugin-provider fan-out as a deferral:
+//! Port of `MediaBrowser.Providers.Subtitles.SubtitleManager`:
 //!
-//! - [`Self::delete_subtitles`] deletes the *external* subtitle
-//!   [`MediaStream`](hermit_model::entities_media::MediaStream) row at a given
-//!   stream index (C# `DeleteSubtitles(item, index)` removes the sidecar file and
-//!   drops the stream). The on-disk sidecar file is removed too when its `Path`
-//!   is known; a missing file is not an error (delete is idempotent).
-//! - [`Self::search_subtitles`], [`Self::download_subtitles`],
-//!   [`Self::get_remote_subtitles`], [`Self::upload_subtitle`] and
-//!   [`Self::get_supported_providers`] all drive the un-ported `ISubtitleProvider`
-//!   plugin registry (OpenSubtitles et al.) and the naming/library-options-aware
-//!   sidecar writer. No providers are ported for v1, so search/providers return
-//!   empty, and download/get/upload reject with [`ServiceError::InvalidInput`] —
-//!   the same honest "not enabled" posture as the deferred lyrics manager. These
-//!   become real when a subtitle-provider host lands.
-//!
-//! On-the-fly subtitle *conversion* (the `SubtitleEncoder`, driving the
-//! `Stream.{format}` / `.m3u8` routes) is a separate deferred subsystem handled
-//! in the API layer (those routes stay on the `501` stub).
+//! - [`Self::search_subtitles`] enriches the request from the resolved item
+//!   (name/year/series/season/episode/path) and fans it out across the
+//!   registered providers (OpenSubtitles, …), aggregating the candidates. A
+//!   provider that errors is skipped (logged) rather than failing the whole
+//!   search, matching Jellyfin's per-provider aggregation.
+//! - [`Self::download_subtitles`] routes the namespaced id back to its provider,
+//!   fetches the content, and **attaches** it to the item (sidecar file next to
+//!   the media + an external [`MediaStream`](hermit_model::entities_media::MediaStream)
+//!   row). [`Self::upload_subtitle`] attaches caller-supplied content the same way.
+//! - [`Self::get_remote_subtitles`] routes an id to its provider and returns the
+//!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
+//! - [`Self::delete_subtitles`] removes the external stream row + sidecar file.
+//! - [`Self::get_supported_providers`] lists the registered providers for an item.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use hermit_db::Database;
+use hermit_db::entities::base_items::MediaStreamInfoEntity;
 use hermit_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryManager;
-use hermit_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
+use hermit_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+use hermit_traits::subtitles::{
+    SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
+};
 
 use crate::db_error::{db_err, media_stream_type_disc};
 
-/// The concrete (minimal) subtitle manager.
+/// The concrete subtitle manager.
 #[derive(Clone)]
 pub struct HermitSubtitleManager {
     db: Database,
     library_manager: Arc<dyn LibraryManager>,
+    media_streams: Arc<dyn MediaStreamRepository>,
+    providers: Vec<Arc<dyn SubtitleProvider>>,
 }
 
 impl std::fmt::Debug for HermitSubtitleManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HermitSubtitleManager")
+            .field("providers", &self.providers.len())
             .finish_non_exhaustive()
     }
 }
 
 impl HermitSubtitleManager {
-    /// Creates a subtitle manager over the database and library seam.
+    /// Creates a subtitle manager over the database, library seam, media-stream
+    /// repository, and the registered subtitle providers.
     #[must_use]
-    pub fn new(db: Database, library_manager: Arc<dyn LibraryManager>) -> Self {
+    pub fn new(
+        db: Database,
+        library_manager: Arc<dyn LibraryManager>,
+        media_streams: Arc<dyn MediaStreamRepository>,
+        providers: Vec<Arc<dyn SubtitleProvider>>,
+    ) -> Self {
         Self {
             db,
             library_manager,
+            media_streams,
+            providers,
         }
     }
 
-    /// The shared rejection for the provider-driven operations while no subtitle
-    /// provider host is wired.
-    fn no_providers() -> ServiceError {
-        ServiceError::invalid_input("subtitle providers are not enabled on this server")
+    /// Fills the request's item-derived fields (name/year/series/season/episode/
+    /// path/content-type) from the resolved item, so providers can build a query.
+    async fn enrich(&self, request: &mut SubtitleSearchRequest) {
+        if let Ok(Some(item)) = self.library_manager.get_item_by_id(request.item_id).await {
+            request.content_type = if item.type_.ends_with("Episode") {
+                SubtitleMediaType::Episode
+            } else {
+                SubtitleMediaType::Movie
+            };
+            request.name = item.name;
+            request.series_name = item.series_name;
+            request.production_year = item.production_year.and_then(|y| i32::try_from(y).ok());
+            request.parent_index_number =
+                item.parent_index_number.and_then(|n| i32::try_from(n).ok());
+            request.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
+            request.media_path = item.path;
+        }
+    }
+
+    /// Selects the provider that owns a namespaced id (`"{name}_{local}"`),
+    /// returning it plus the provider-local id (prefix stripped).
+    fn route(&self, id: &str) -> Option<(&Arc<dyn SubtitleProvider>, String)> {
+        self.providers.iter().find_map(|p| {
+            let prefix = format!("{}_", p.name());
+            id.strip_prefix(&prefix).map(|local| (p, local.to_owned()))
+        })
+    }
+
+    /// Attaches subtitle content to an item: writes a sidecar file next to the
+    /// media and records an external subtitle stream row.
+    async fn attach(&self, item_id: Uuid, response: &SubtitleResponse) -> Result<(), ServiceError> {
+        let item = self
+            .library_manager
+            .get_item_by_id(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+        let media_path = item
+            .path
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ServiceError::invalid_input("item has no media path for a sidecar"))?;
+
+        let sidecar = sidecar_path(&media_path, response);
+        let sidecar_str = sidecar.to_string_lossy().into_owned();
+        if let Some(parent) = sidecar.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ServiceError::backend(e.to_string()))?;
+        }
+        tokio::fs::write(&sidecar, &response.content)
+            .await
+            .map_err(|e| ServiceError::backend(e.to_string()))?;
+
+        // Append the new external subtitle to the item's stream set (the repo
+        // save is a full replace, so re-save the existing streams alongside it).
+        let mut streams = self
+            .media_streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                stream_type: None,
+                index: None,
+            })
+            .await?;
+        let next_index = streams
+            .iter()
+            .map(|s| s.stream_index)
+            .max()
+            .map_or(0, |m| m + 1);
+        streams.push(MediaStreamInfoEntity {
+            stream_index: next_index,
+            stream_type: media_stream_type_disc(hermit_model::entities::MediaStreamType::Subtitle),
+            is_external: true,
+            path: Some(sidecar_str),
+            language: (!response.language.is_empty()).then(|| response.language.clone()),
+            codec: Some(codec_for(&response.format).to_owned()),
+            is_forced: response.is_forced,
+            is_hearing_impaired: Some(response.is_hearing_impaired),
+            ..Default::default()
+        });
+        self.media_streams
+            .save_media_streams(item_id, &streams)
+            .await
+    }
+}
+
+/// The sidecar path for attached subtitle content: sibling of the media file,
+/// `"{stem}.{lang}[.forced].{format}"` (Jellyfin's external-subtitle naming).
+fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> std::path::PathBuf {
+    let path = Path::new(media_path);
+    let stem = path.file_stem().map_or_else(
+        || "subtitle".to_owned(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let lang = if response.language.is_empty() {
+        "und"
+    } else {
+        &response.language
+    };
+    let forced = if response.is_forced { ".forced" } else { "" };
+    let name = format!("{stem}.{lang}{forced}.{}", response.format);
+    match path.parent() {
+        Some(dir) => dir.join(name),
+        None => std::path::PathBuf::from(name),
+    }
+}
+
+/// The stored codec for a subtitle format (`srt` → `subrip`, etc.).
+fn codec_for(format: &str) -> &str {
+    match format.to_ascii_lowercase().as_str() {
+        "srt" | "sub" => "subrip",
+        "vtt" => "webvtt",
+        "ssa" => "ssa",
+        "ass" => "ass",
+        other => match other {
+            "" => "subrip",
+            _ => format,
+        },
     }
 }
 
@@ -71,31 +193,49 @@ impl HermitSubtitleManager {
 impl SubtitleManager for HermitSubtitleManager {
     async fn search_subtitles(
         &self,
-        _request: &SubtitleSearchRequest,
+        request: &SubtitleSearchRequest,
     ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
-        // No `ISubtitleProvider` registry is ported (documented deferral).
-        Ok(Vec::new())
+        let mut request = request.clone();
+        self.enrich(&mut request).await;
+        let mut results = Vec::new();
+        for provider in &self.providers {
+            match provider.search(&request).await {
+                Ok(mut found) => results.append(&mut found),
+                Err(err) => {
+                    // Aggregate best-effort: one provider failing must not sink
+                    // the whole search (Jellyfin skips the failed provider).
+                    tracing::warn!(provider = provider.name(), %err, "subtitle search failed");
+                }
+            }
+        }
+        Ok(results)
     }
 
     async fn download_subtitles(
         &self,
-        _item_id: Uuid,
-        _subtitle_id: &str,
+        item_id: Uuid,
+        subtitle_id: &str,
     ) -> Result<(), ServiceError> {
-        Err(Self::no_providers())
+        let (provider, local) = self
+            .route(subtitle_id)
+            .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
+        let response = provider.get_subtitles(&local).await?;
+        self.attach(item_id, &response).await
     }
 
     async fn upload_subtitle(
         &self,
-        _item_id: Uuid,
-        _response: &SubtitleResponse,
+        item_id: Uuid,
+        response: &SubtitleResponse,
     ) -> Result<(), ServiceError> {
-        // Writing a sidecar needs the library-options + naming layer (deferred).
-        Err(Self::no_providers())
+        self.attach(item_id, response).await
     }
 
-    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
-        Err(Self::no_providers())
+    async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError> {
+        let (provider, local) = self
+            .route(id)
+            .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
+        provider.get_subtitles(&local).await
     }
 
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
@@ -147,10 +287,29 @@ impl SubtitleManager for HermitSubtitleManager {
         &self,
         item_id: Uuid,
     ) -> Result<Vec<SubtitleProviderInfo>, ServiceError> {
-        // Resolving the item mirrors C# (a missing item yields no providers);
-        // the provider registry itself is a documented deferral.
+        // A missing item yields no providers (mirrors C#).
         let _ = self.library_manager.get_item_by_id(item_id).await?;
-        Ok(Vec::new())
+        Ok(self
+            .providers
+            .iter()
+            .map(|p| SubtitleProviderInfo {
+                name: Some(p.name().to_owned()),
+                id: Some(p.name().to_owned()),
+            })
+            .collect())
+    }
+
+    async fn validate_provider_login(
+        &self,
+        provider_name: &str,
+        config_json: &[u8],
+    ) -> Result<(), ServiceError> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.name() == provider_name)
+            .ok_or_else(|| ServiceError::not_found(format!("subtitle provider {provider_name}")))?;
+        provider.validate_login(config_json).await
     }
 }
 
@@ -159,68 +318,162 @@ mod tests {
     use hermit_db::entities::base_items::MediaStreamInfoEntity;
     use hermit_model::data::BaseItemKind;
     use hermit_model::entities::MediaStreamType;
-    use hermit_traits::error::ServiceError;
     use hermit_traits::persistence::MediaStreamRepository;
-    use hermit_traits::subtitles::{SubtitleManager, SubtitleSearchRequest};
+    use hermit_traits::subtitles::{SubtitleProvider, SubtitleResponse, SubtitleSearchRequest};
     use uuid::Uuid;
 
     use crate::db_error::media_stream_type_disc;
     use crate::media_stream_repository::HermitMediaStreamRepository;
     use crate::test_support::{library_manager_over, seed_item, test_db};
 
-    use super::HermitSubtitleManager;
+    use super::*;
+
+    /// A canned provider: search returns one namespaced candidate; get_subtitles
+    /// returns fixed bytes.
+    struct FakeProvider;
+
+    #[async_trait]
+    impl SubtitleProvider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        async fn search(
+            &self,
+            request: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            Ok(vec![RemoteSubtitleInfo {
+                id: Some("fake_42".to_owned()),
+                provider_name: Some("fake".to_owned()),
+                name: request.name.clone(),
+                ..Default::default()
+            }])
+        }
+        async fn get_subtitles(&self, local: &str) -> Result<SubtitleResponse, ServiceError> {
+            assert_eq!(local, "42");
+            Ok(SubtitleResponse {
+                language: "eng".to_owned(),
+                format: "srt".to_owned(),
+                is_forced: false,
+                is_hearing_impaired: false,
+                content: b"1\n00:00:00,000 --> 00:00:01,000\nhi\n".to_vec(),
+            })
+        }
+    }
+
+    fn manager(db: Database, providers: Vec<Arc<dyn SubtitleProvider>>) -> HermitSubtitleManager {
+        HermitSubtitleManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitMediaStreamRepository::new(db)),
+            providers,
+        )
+    }
 
     fn subtitle_stream(index: i64, external: bool, path: Option<&str>) -> MediaStreamInfoEntity {
         MediaStreamInfoEntity {
-            item_id: String::new(),
             stream_index: index,
-            aspect_ratio: None,
-            average_frame_rate: None,
-            bit_depth: None,
-            bit_rate: None,
-            bl_present_flag: None,
-            channel_layout: None,
-            channels: None,
             codec: Some("subrip".to_owned()),
-            codec_tag: None,
-            codec_time_base: None,
-            color_primaries: None,
-            color_space: None,
-            color_transfer: None,
-            comment: None,
-            dv_bl_signal_compatibility_id: None,
-            dv_level: None,
-            dv_profile: None,
-            dv_version_major: None,
-            dv_version_minor: None,
-            el_present_flag: None,
-            hdr10_plus_present_flag: None,
-            height: None,
-            is_anamorphic: None,
-            is_avc: None,
-            is_default: false,
             is_external: external,
-            is_forced: false,
-            is_hearing_impaired: None,
-            is_interlaced: None,
-            is_original: false,
-            key_frames: None,
             language: Some("eng".to_owned()),
-            level: None,
-            nal_length_size: None,
             path: path.map(str::to_owned),
-            pixel_format: None,
-            profile: None,
-            real_frame_rate: None,
-            ref_frames: None,
-            rotation: None,
-            rpu_present_flag: None,
-            sample_rate: None,
             stream_type: media_stream_type_disc(MediaStreamType::Subtitle),
-            time_base: None,
-            title: None,
-            width: None,
+            ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn search_fans_out_and_enriches() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = manager(db, vec![Arc::new(FakeProvider)]);
+        let results = mgr
+            .search_subtitles(&SubtitleSearchRequest {
+                item_id: item,
+                language: "eng".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id.as_deref(), Some("fake_42"));
+    }
+
+    #[tokio::test]
+    async fn download_routes_to_provider_and_attaches() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        // Give the item a media path so the sidecar has a home.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("Movie.mkv");
+        std::fs::write(&media, b"x").expect("media");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
+            .bind(media.to_str().unwrap())
+            .bind(item.to_string())
+            .execute(db.pool())
+            .await
+            .expect("set path");
+
+        let mgr = manager(db.clone(), vec![Arc::new(FakeProvider)]);
+        mgr.download_subtitles(item, "fake_42")
+            .await
+            .expect("download");
+
+        // The sidecar was written and an external subtitle row recorded.
+        let sidecar = tmp.path().join("Movie.eng.srt");
+        assert!(sidecar.exists(), "sidecar written");
+        let repo = HermitMediaStreamRepository::new(db);
+        let streams = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: Some(MediaStreamType::Subtitle),
+                index: None,
+            })
+            .await
+            .expect("streams");
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].is_external);
+    }
+
+    #[tokio::test]
+    async fn get_remote_routes_by_prefix() {
+        let db = test_db().await;
+        let mgr = manager(db, vec![Arc::new(FakeProvider)]);
+        let resp = mgr.get_remote_subtitles("fake_42").await.expect("remote");
+        assert_eq!(resp.format, "srt");
+        assert!(matches!(
+            mgr.get_remote_subtitles("unknown_1").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn supported_providers_lists_registry() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = manager(db, vec![Arc::new(FakeProvider)]);
+        let providers = mgr.get_supported_providers(item).await.expect("providers");
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name.as_deref(), Some("fake"));
+    }
+
+    #[tokio::test]
+    async fn search_with_no_providers_is_empty() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = manager(db, Vec::new());
+        assert!(
+            mgr.search_subtitles(&SubtitleSearchRequest {
+                item_id: item,
+                ..Default::default()
+            })
+            .await
+            .expect("search")
+            .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -230,10 +483,9 @@ mod tests {
         seed_item(&db, item, BaseItemKind::Movie).await;
         let repo = HermitMediaStreamRepository::new(db.clone());
 
-        // Write the sidecar file so the manager can remove it.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sidecar = tmp.path().join("movie.eng.srt");
-        std::fs::write(&sidecar, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n").expect("write sidecar");
+        std::fs::write(&sidecar, b"1\n").expect("write sidecar");
 
         repo.save_media_streams(
             item,
@@ -245,12 +497,12 @@ mod tests {
         .await
         .expect("save streams");
 
-        let mgr = HermitSubtitleManager::new(db.clone(), library_manager_over(db.clone()));
+        let mgr = manager(db.clone(), Vec::new());
         mgr.delete_subtitles(item, 2).await.expect("delete idx 2");
 
         assert!(!sidecar.exists(), "sidecar file should be removed");
         let remaining = repo
-            .get_media_streams(&hermit_traits::persistence::MediaStreamQuery {
+            .get_media_streams(&MediaStreamQuery {
                 item_id: item,
                 stream_type: Some(MediaStreamType::Subtitle),
                 index: None,
@@ -266,43 +518,7 @@ mod tests {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
-        let mgr = HermitSubtitleManager::new(db.clone(), library_manager_over(db.clone()));
-        // Nothing stored → still succeeds.
+        let mgr = manager(db, Vec::new());
         mgr.delete_subtitles(item, 9).await.expect("no-op delete");
-    }
-
-    #[tokio::test]
-    async fn provider_paths_are_empty_or_rejected() {
-        let db = test_db().await;
-        let item = Uuid::new_v4();
-        seed_item(&db, item, BaseItemKind::Movie).await;
-        let mgr = HermitSubtitleManager::new(db.clone(), library_manager_over(db.clone()));
-
-        assert!(
-            mgr.search_subtitles(&SubtitleSearchRequest {
-                item_id: item,
-                language: "eng".to_owned(),
-                is_perfect_match: None,
-                is_automated: false,
-                ..Default::default()
-            })
-            .await
-            .expect("search")
-            .is_empty()
-        );
-        assert!(
-            mgr.get_supported_providers(item)
-                .await
-                .expect("providers")
-                .is_empty()
-        );
-        assert!(matches!(
-            mgr.download_subtitles(item, "x").await,
-            Err(ServiceError::InvalidInput(_))
-        ));
-        assert!(matches!(
-            mgr.get_remote_subtitles("x").await,
-            Err(ServiceError::InvalidInput(_))
-        ));
     }
 }

@@ -234,7 +234,7 @@ fn image_type_from_disc(disc: i32) -> ImageType {
 /// discriminant — the inverse of [`image_type_from_disc`].
 ///
 /// The discriminants line up 1:1 with the C# `ImageType` declaration order.
-fn image_type_to_disc(image_type: ImageType) -> i32 {
+pub(crate) fn image_type_to_disc(image_type: ImageType) -> i32 {
     match image_type {
         ImageType::Primary => 0,
         ImageType::Art => 1,

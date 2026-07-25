@@ -13,10 +13,13 @@ pub mod mediainfo;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod provider_manager;
+pub mod tmdb;
 pub mod xbmc;
 
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
+
+pub use tmdb::{RemoteImage, TmdbClient, TmdbKind};
 
 pub use container_types::{
     FileSystemMetadata, ItemInfo, LocalImageInfo, MetadataResult, NfoItem, PersonInfo,

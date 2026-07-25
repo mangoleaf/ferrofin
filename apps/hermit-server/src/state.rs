@@ -307,6 +307,12 @@ pub async fn build_app_state(
         .with_probe(
             Arc::clone(&media_encoder),
             Arc::clone(&media_stream_repository),
+        )
+        // Fetch remote artwork (TMDB) for movies/series with no local images,
+        // using Jellyfin's built-in key so posters/backdrops appear with no setup.
+        .with_metadata(
+            Arc::new(hermit_providers::TmdbClient::new()),
+            std::path::PathBuf::from(paths.internal_metadata_path()).join("library"),
         ),
     );
     let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
@@ -338,8 +344,41 @@ pub async fn build_app_state(
     let chapters: Arc<dyn hermit_traits::chapters::ChapterManager> = Arc::new(
         HermitChapterManager::new(Arc::clone(&chapter_repository), Arc::clone(&library)),
     );
+    // The Tier-1 plugin manager is built here (ahead of its `with_plugins`
+    // injection) so the OpenSubtitles subtitle provider can read its
+    // dashboard-managed credentials through it. The OpenSubtitles plugin is
+    // registered so it appears in the dashboard and its `{ApiKey,Username,
+    // Password}` config is settable via `POST /Plugins/{id}/Configuration`.
+    let plugins: Arc<dyn hermit_traits::plugins::PluginManager> =
+        Arc::new(hermit_core::HermitPluginManager::new(
+            vec![
+                hermit_core::RegisteredPlugin::new(
+                    hermit_traits::plugins::PluginDescriptor {
+                        id: hermit_providers::opensubtitles::PLUGIN_ID,
+                        name: "OpenSubtitles".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        description: "Download subtitles from opensubtitles.com".to_owned(),
+                        enabled: true,
+                        has_image: false,
+                        can_uninstall: false,
+                    },
+                    None,
+                )
+                .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
+            ],
+            config.config_dir.join("plugins"),
+        ));
+    let subtitle_providers: Vec<Arc<dyn hermit_traits::subtitles::SubtitleProvider>> =
+        vec![Arc::new(hermit_providers::OpenSubtitlesProvider::new(
+            Arc::clone(&plugins),
+        ))];
     let subtitles: Arc<dyn hermit_traits::subtitles::SubtitleManager> =
-        Arc::new(HermitSubtitleManager::new(db.clone(), Arc::clone(&library)));
+        Arc::new(HermitSubtitleManager::new(
+            db.clone(),
+            Arc::clone(&library),
+            Arc::clone(&media_stream_repository),
+            subtitle_providers,
+        ));
     let media_segments: Arc<dyn hermit_traits::media_segments::MediaSegmentManager> = Arc::new(
         HermitMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
     );
@@ -531,13 +570,11 @@ pub async fn build_app_state(
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time
-    // plugin registry. No plugins are registered yet, so the plugin list is empty;
-    // the manager still persists the repository list and per-plugin configuration
-    // under `{config}/plugins/`. Runtime install/load is Tier 2 (a WASM/libloading
+    // plugin registry (built above with the OpenSubtitles plugin registered). The
+    // manager persists the repository list and per-plugin configuration under
+    // `{config}/plugins/`. Runtime install/load is Tier 2 (a WASM/libloading
     // host). See brain/PLAN_HERMIT_PLUGINS.md.
-    let state = state.with_plugins(Arc::new(hermit_core::HermitPluginManager::empty(
-        config.config_dir.join("plugins"),
-    )));
+    let state = state.with_plugins(Arc::clone(&plugins));
 
     // ---- SyncPlay + the session message bus -------------------------------
     // The bus is the server→client push registry the session WebSocket registers

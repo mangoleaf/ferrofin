@@ -19,9 +19,11 @@ use hermit_db::entities::base_items::BaseItemEntity;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
+use hermit_traits::options::ItemImageInfo;
 use hermit_traits::persistence::ItemPersistenceService;
 
 use crate::db_error::db_err;
+use crate::item_repository::image_type_to_disc;
 use crate::translate_query::PLACEHOLDER_ID;
 
 /// The concrete item-persistence service.
@@ -200,6 +202,40 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         if exists.is_none() {
             return Err(ServiceError::not_found(format!("item {}", item.id)));
         }
+        Ok(())
+    }
+
+    async fn save_item_images(
+        &self,
+        item_id: Uuid,
+        images: &[ItemImageInfo],
+    ) -> Result<(), ServiceError> {
+        let item = item_id.to_string();
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        // Replace the item's image set (idempotent re-scan).
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
+            .bind(&item)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for image in images {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "DateModified")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            )
+            .bind(uuid::Uuid::new_v4().hyphenated().to_string())
+            .bind(&item)
+            .bind(image_type_to_disc(image.image_type))
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.date_modified)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 

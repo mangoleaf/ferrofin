@@ -127,6 +127,22 @@ pub trait SubtitleManager: Send + Sync {
         &self,
         item_id: Uuid,
     ) -> Result<Vec<SubtitleProviderInfo>, ServiceError>;
+
+    /// Validates a candidate configuration for the named provider — the plugin
+    /// "validate login" action (e.g. OpenSubtitles' `ValidateLoginInfo`). Routes
+    /// `config_json` (opaque provider config bytes) to the provider's
+    /// [`SubtitleProvider::validate_login`]. The default rejects, so a manager
+    /// with no matching provider surfaces an error.
+    async fn validate_provider_login(
+        &self,
+        provider_name: &str,
+        config_json: &[u8],
+    ) -> Result<(), ServiceError> {
+        let _ = (provider_name, config_json);
+        Err(ServiceError::invalid_input(
+            "login validation is not supported",
+        ))
+    }
 }
 
 fn _assert_object_safe_subtitle_manager(_: &dyn SubtitleManager) {}
@@ -146,7 +162,7 @@ fn _assert_object_safe_subtitle_manager(_: &dyn SubtitleManager) {}
 #[async_trait]
 pub trait SubtitleProvider: Send + Sync {
     /// The provider's stable display name; also the id namespace prefix.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Searches this provider for subtitles matching `request`. Each returned
     /// [`RemoteSubtitleInfo::id`](hermit_model::providers::RemoteSubtitleInfo) must
@@ -162,6 +178,14 @@ pub trait SubtitleProvider: Send + Sync {
         &self,
         provider_local_id: &str,
     ) -> Result<SubtitleResponse, ServiceError>;
+
+    /// Validates a candidate configuration (e.g. account login) — backs the
+    /// plugin "validate login" action. Providers that need no auth accept any
+    /// config (the default). `config_json` is the provider's opaque config bytes.
+    async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
+        let _ = config_json;
+        Ok(())
+    }
 }
 
 fn _assert_object_safe_subtitle_provider(_: &dyn SubtitleProvider) {}

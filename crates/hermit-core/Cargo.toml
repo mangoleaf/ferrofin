@@ -15,6 +15,7 @@ hermit-model.workspace = true
 hermit-db.workspace = true
 hermit-common.workspace = true
 hermit-naming.workspace = true
+hermit-providers.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 sqlx.workspace = true

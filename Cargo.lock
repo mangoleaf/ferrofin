@@ -1069,6 +1069,7 @@ dependencies = [
  "hermit-db",
  "hermit-model",
  "hermit-naming",
+ "hermit-providers",
  "hermit-traits",
  "reqwest",
  "rstest",
