@@ -21,11 +21,13 @@
 //! The planner honours the request-declared target codecs and **copies when it
 //! can** (the cheapest correct path): [`EncodingHelper::can_stream_copy_video`] /
 //! [`EncodingHelper::can_stream_copy_audio`] decide per stream, and a copyable
-//! stream becomes a `-c:v copy` / `-c:a copy` remux. What it does *not* do is the
-//! full device-profile negotiation, the hardware-acceleration matrix
-//! (`NoOptionalEncoders` selects software encoders only), HDR/tonemap/3D filters,
-//! or subtitle provider fan-out (only stored/embedded burn-in). Those are
-//! deferred (see `brain/DEFERRED.md`).
+//! stream becomes a `-c:v copy` / `-c:a copy` remux. When it must re-encode, it
+//! uses **NVENC** hardware encoding (h264/hevc/av1 + NVDEC decode) if the
+//! persisted encoding options select it, else software `libx264`. What it does
+//! *not* do is the full device-profile negotiation, the rest of the
+//! hardware-acceleration matrix (QSV/VAAPI/AMF), HDR→SDR tonemapping, or subtitle
+//! provider fan-out (only stored/embedded burn-in). Those are deferred (see
+//! `brain/DEFERRED.md`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ use hermit_mediaencoding::{
 use hermit_model::configuration::EncodingOptions;
 use hermit_model::dlna::SubtitleDeliveryMethod;
 use hermit_model::dto::MediaSourceInfo;
-use hermit_model::entities::{EncoderPreset, MediaStreamType};
+use hermit_model::entities::{EncoderPreset, HardwareAccelerationType, MediaStreamType};
 use hermit_model::entities_media::MediaStream;
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
@@ -50,10 +52,7 @@ use hermit_traits::system::ServerApplicationPaths as _;
 /// The default HLS segment length, in seconds.
 ///
 /// Port of the `EncodingOptions`/`DynamicHlsController` default segment length
-/// (`6`), used when no `EncodingOptions` override is configured. First-Light
-/// reads `EncodingOptions::default()` (the persisted named-config accessor is not
-/// yet threaded through [`ServerConfigurationManager`]), so this is the effective
-/// value.
+/// (`6`), used when no `EncodingOptions` override is configured.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 6;
 
 /// The default HLS segment container when the request declares none.
@@ -91,16 +90,14 @@ const MS_PER_SECOND: i32 = 1000;
 /// [`MediaSourceManager`] (item → [`MediaSourceInfo`]), the [`MediaEncoder`]
 /// (input-argument + seek-time formatting), the [`EncodingHelper`] (encoder
 /// selection, mapping, bitrate/quality/thread params, copy decision), the
-/// [`ServerConfigurationManager`] (encoding options — reserved), and the
+/// [`ServerConfigurationManager`] (persisted encoding options), and the
 /// application [`paths`](HermitServerApplicationPaths) (transcode cache root).
 pub struct HermitStreamStatePlanner {
     media_sources: Arc<dyn MediaSourceManager>,
     encoder: Arc<dyn MediaEncoder>,
     encoding_helper: EncodingHelper<NoOptionalEncoders>,
-    #[allow(dead_code)] // Reserved: the persisted EncodingOptions named-config
-    // accessor is not yet on `ServerConfigurationManager`; First-Light uses
-    // `EncodingOptions::default()`. Kept so the read path lands without a
-    // constructor change when the accessor is threaded through.
+    /// The server config manager — read for the persisted `encoding` options
+    /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
     paths: Arc<HermitServerApplicationPaths>,
 }
@@ -112,7 +109,7 @@ impl HermitStreamStatePlanner {
     /// * `encoder` — formats the ffmpeg input argument and the `-ss` seek time.
     /// * `encoding_helper` — builds the encoder/map/bitrate/quality/thread args
     ///   and the stream-copy decision (`NoOptionalEncoders` → software only).
-    /// * `config` — the server configuration (encoding options); reserved.
+    /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
     #[must_use]
     pub fn new(
@@ -131,15 +128,12 @@ impl HermitStreamStatePlanner {
         }
     }
 
-    /// The effective [`EncodingOptions`] for this planner.
-    ///
-    /// First-Light returns [`EncodingOptions::default`] — the persisted
-    /// named-config accessor is not yet exposed by [`ServerConfigurationManager`]
-    /// (see the field docs). Kept as a method (taking `&self`) so the read moves
-    /// to `self.config` in one place when the accessor lands.
-    #[allow(clippy::unused_self)] // `self.config` read lands here (see field docs).
-    fn encoding_options(&self) -> EncodingOptions {
-        EncodingOptions::default()
+    /// The effective [`EncodingOptions`] for this planner, read from the persisted
+    /// named `encoding` config (falling back to [`EncodingOptions::default`] when
+    /// unset or unreadable). This is what carries the user's hardware-acceleration
+    /// choice (e.g. NVENC) into the transcode arg builder.
+    async fn encoding_options(&self) -> EncodingOptions {
+        self.config.get_encoding_options().await.unwrap_or_default()
     }
 
     /// Resolves the [`MediaSourceInfo`] for `request`.
@@ -182,24 +176,83 @@ fn split_codecs(param: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Whether NVENC hardware transcoding is enabled by the encoding options.
+fn nvenc_enabled(options: &EncodingOptions) -> bool {
+    options.enable_hardware_encoding
+        && options.hardware_acceleration_type == HardwareAccelerationType::nvenc
+}
+
+/// The NVENC encoder for an output codec, or `None` when NVENC can't encode it.
+///
+/// NVENC (RTX-class GPUs) encodes H.264, HEVC and AV1; VP9 has no NVENC encoder.
+fn nvenc_encoder(codec: &str) -> Option<&'static str> {
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" => Some("h264_nvenc"),
+        "hevc" | "h265" => Some("hevc_nvenc"),
+        "av1" => Some("av1_nvenc"),
+        _ => None,
+    }
+}
+
+/// The NVENC constant-quality target (`-cq`). Lower = higher quality/bitrate;
+/// 24 is visually near-transparent for 4K while keeping segments reasonable.
+// TODO(config): expose as an encoding setting (Jellyfin's quality/CRF knob).
+const NVENC_CQ: i32 = 24;
+
+/// Maps an x264-style [`EncoderPreset`] to the nearest NVENC preset (`p1` fastest
+/// … `p7` best quality). `auto` and unmapped presets use the balanced `p5`.
+fn nvenc_preset(preset: EncoderPreset) -> &'static str {
+    match preset {
+        EncoderPreset::ultrafast => "p1",
+        EncoderPreset::superfast => "p2",
+        EncoderPreset::veryfast => "p3",
+        EncoderPreset::faster | EncoderPreset::fast => "p4",
+        EncoderPreset::slow => "p6",
+        EncoderPreset::slower | EncoderPreset::veryslow | EncoderPreset::placebo => "p7",
+        EncoderPreset::medium | EncoderPreset::auto => "p5",
+    }
+}
+
+/// The NVENC video-encode tokens (quality + rate control) for `encoder`.
+///
+/// Constant-quality VBR (`-cq`) so 4K keeps its detail without a guessed bitrate
+/// cap. A 10-bit HDR source targeting H.264 (browsers decode only 8-bit H.264)
+/// is down-converted to `nv12` on the GPU via `scale_cuda`; AV1/HEVC keep the
+/// source's 10-bit HDR untouched.
+fn nvenc_video_args(encoder: &str, options: &EncodingOptions) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if encoder == "h264_nvenc" {
+        a.push("-vf".to_owned());
+        a.push("scale_cuda=format=nv12".to_owned());
+    }
+    a.push("-preset".to_owned());
+    a.push(nvenc_preset(options.encoder_preset).to_owned());
+    a.push("-rc".to_owned());
+    a.push("vbr".to_owned());
+    a.push("-cq".to_owned());
+    a.push(NVENC_CQ.to_string());
+    a.push("-b:v".to_owned());
+    a.push("0".to_owned());
+    a
+}
+
 /// The transcode **target** video codec: the first client preference Hermit can
 /// encode in realtime, else h264.
 ///
 /// Clients send preferred codecs most-preferred-first (e.g. `av1,h264,vp9`).
-/// Hermit's hardware encoders are deferred, so only h264 (libx264) transcodes
-/// fast enough for live HLS — software av1/vp9/hevc (libaom-av1 etc.) run far
-/// below realtime and stall the player. So skip codecs Hermit can't encode
-/// efficiently and fall back to the broadly-compatible h264. A bare `copy`
-/// request is honoured verbatim.
-// ponytail: ENCODABLE is h264-only while the hw-accel matrix is deferred; add
-// the hardware targets (av1_nvenc/qsv/vaapi, hevc_*, …) here when they land.
-fn preferred_transcode_video_codec(codecs: &[String]) -> String {
-    const ENCODABLE: &[&str] = &["h264"];
+/// With NVENC the hardware encodes h264/hevc/av1, so the client's top pick
+/// (av1 for browsers — which keeps 10-bit HDR) is honoured. Without hardware,
+/// only software libx264 (h264) is realtime-viable — software av1/vp9/hevc
+/// (libaom-av1 etc.) run far below realtime and stall the player — so we fall
+/// back to the broadly-compatible h264. A bare `copy` request is honoured.
+fn preferred_transcode_video_codec(codecs: &[String], options: &EncodingOptions) -> String {
+    let hw = nvenc_enabled(options);
     codecs
         .iter()
         .find(|c| {
             EncodingJobInfo::is_copy_codec(Some(c))
-                || ENCODABLE.iter().any(|e| c.eq_ignore_ascii_case(e))
+                || c.eq_ignore_ascii_case("h264")
+                || (hw && nvenc_encoder(c).is_some())
         })
         .cloned()
         .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned())
@@ -311,7 +364,7 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         let audio_stream = default_stream(&media_source.media_streams, MediaStreamType::Audio);
         let subtitle_stream = subtitle_stream(&media_source.media_streams, None);
 
-        let options = self.encoding_options();
+        let options = self.encoding_options().await;
         let segment_length_secs = if options.encoding_thread_count >= 0 {
             request
                 .segment_length
@@ -343,7 +396,7 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         // deferred, so encoding to av1/vp9 in software (libaom-av1 etc.) runs far
         // slower than realtime and stalls HLS (fragLoadTimeOut). Pick the first
         // preference Hermit can actually encode in realtime instead.
-        let requested_video_codec = preferred_transcode_video_codec(&video_codecs);
+        let requested_video_codec = preferred_transcode_video_codec(&video_codecs, &options);
         let requested_audio_codec = audio_codecs
             .first()
             .cloned()
@@ -476,6 +529,22 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
 }
 
 impl HermitStreamStatePlanner {
+    /// The ffmpeg video encoder for `state`: the NVENC hardware encoder when
+    /// hardware acceleration is enabled and the target codec has one, else the
+    /// software [`EncodingHelper`] choice (`copy` / `libx264`).
+    fn resolve_video_encoder(&self, state: &EncodingJobInfo, options: &EncodingOptions) -> String {
+        let codec = state.output_video_codec.as_deref().unwrap_or("copy");
+        if EncodingJobInfo::is_copy_codec(Some(codec)) {
+            return "copy".to_owned();
+        }
+        if nvenc_enabled(options)
+            && let Some(nv) = nvenc_encoder(codec)
+        {
+            return nv.to_owned();
+        }
+        self.encoding_helper.video_encoder(state)
+    }
+
     /// Builds the full ffmpeg HLS command line (`GetCommandLineArguments`).
     ///
     /// The NEW top-level orchestrator composing the ported piecewise
@@ -499,6 +568,13 @@ impl HermitStreamStatePlanner {
     ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
 
+        // Resolve the video encoder up front (it decides input hwaccel too). NVENC
+        // maps the target codec to its hardware encoder; otherwise the software
+        // `EncodingHelper` path (libx264 / copy) is used.
+        let video_encoder = self.resolve_video_encoder(state, options);
+        let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
+        let nvenc_video = video_encoder.ends_with("_nvenc");
+
         // ---- input ------------------------------------------------------------
         // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
         if let Some(id) = segment_id.filter(|&id| id > 0) {
@@ -507,6 +583,15 @@ impl HermitStreamStatePlanner {
             let ss = self.encoder.get_time_parameter(seek_ticks);
             push_split(&mut args, "-ss");
             push_split(&mut args, ss.trim_start_matches("-ss").trim());
+        }
+        // Decode the source on the GPU too (NVDEC) when we're NVENC-encoding, so
+        // the whole pipeline stays on the card — this is what makes 4K transcode
+        // run several× realtime instead of stalling on CPU HEVC decode.
+        if nvenc_video {
+            push_split(&mut args, "-hwaccel");
+            args.push("cuda".to_owned());
+            push_split(&mut args, "-hwaccel_output_format");
+            args.push("cuda".to_owned());
         }
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
@@ -528,42 +613,46 @@ impl HermitStreamStatePlanner {
         push_split(&mut args, &self.encoding_helper.map_args(state));
 
         // ---- video -----------------------------------------------------------
-        let video_encoder = self.encoding_helper.video_encoder(state);
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
-        // The actual output video codec: the source codec when copying, else the
-        // encoder. HEVC output needs the `hvc1` codec tag to decode in browser
-        // MSE (only meaningful in fMP4). Port of `DynamicHlsController`'s
-        // `-tag:v:0 hvc1` for HEVC output.
-        let output_is_hevc = if EncodingJobInfo::is_copy_codec(Some(&video_encoder)) {
-            state
-                .video_stream
-                .as_ref()
-                .and_then(|s| s.codec.as_deref())
-                .is_some_and(is_hevc)
+        // HEVC output needs the `hvc1` codec tag to decode in browser MSE (only
+        // meaningful in fMP4). Keyed on the *output* codec: the source codec when
+        // copying, else the negotiated target (so `hevc_nvenc` tags too). Port of
+        // `DynamicHlsController`'s `-tag:v:0 hvc1`.
+        let output_codec = if copying_video {
+            state.video_stream.as_ref().and_then(|s| s.codec.as_deref())
         } else {
-            is_hevc(&video_encoder) || video_encoder.eq_ignore_ascii_case("libx265")
+            state.output_video_codec.as_deref()
         };
+        let output_is_hevc = output_codec.is_some_and(is_hevc);
         if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
             push_split(&mut args, "-tag:v:0");
             args.push("hvc1".to_owned());
         }
-        if !EncodingJobInfo::is_copy_codec(Some(&video_encoder)) {
-            push_split(
-                &mut args,
-                &self.encoding_helper.video_quality_param(
-                    state,
-                    &video_encoder,
-                    options,
-                    DEFAULT_ENCODER_PRESET,
-                ),
-            );
-            push_split(
-                &mut args,
-                &self
-                    .encoding_helper
-                    .video_bitrate_param(state, &video_encoder),
-            );
+        if !copying_video {
+            if nvenc_video {
+                // NVENC has its own rate-control/quality flags (no `-crf`); the
+                // software `video_quality_param` would emit libx264-only args.
+                for tok in nvenc_video_args(&video_encoder, options) {
+                    args.push(tok);
+                }
+            } else {
+                push_split(
+                    &mut args,
+                    &self.encoding_helper.video_quality_param(
+                        state,
+                        &video_encoder,
+                        options,
+                        DEFAULT_ENCODER_PRESET,
+                    ),
+                );
+                push_split(
+                    &mut args,
+                    &self
+                        .encoding_helper
+                        .video_bitrate_param(state, &video_encoder),
+                );
+            }
             if let Some(framerate) = self.encoding_helper.framerate_param(state) {
                 push_split(&mut args, "-r");
                 args.push(framerate.to_string());
@@ -952,21 +1041,40 @@ mod tests {
 
     #[test]
     fn transcode_target_skips_codecs_hermit_cannot_encode() {
-        // Browsers list av1/vp9 first for efficiency, but Hermit can only encode
-        // h264 in realtime — picking av1 would launch libaom-av1 and stall HLS.
+        // Software-only: browsers list av1/vp9 first, but only libx264 (h264) is
+        // realtime-viable — picking av1 would launch libaom-av1 and stall HLS.
+        let sw = EncodingOptions::default();
         let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
-        assert_eq!(preferred_transcode_video_codec(&av1_first), "h264");
+        assert_eq!(preferred_transcode_video_codec(&av1_first, &sw), "h264");
         // A bare `copy` request is honoured verbatim.
         assert_eq!(
-            preferred_transcode_video_codec(&["copy".to_owned()]),
+            preferred_transcode_video_codec(&["copy".to_owned()], &sw),
             "copy"
         );
         // No encodable preference (or none at all) → the h264 default.
         assert_eq!(
-            preferred_transcode_video_codec(&["av1".to_owned(), "vp9".to_owned()]),
+            preferred_transcode_video_codec(&["av1".to_owned(), "vp9".to_owned()], &sw),
             "h264"
         );
-        assert_eq!(preferred_transcode_video_codec(&[]), "h264");
+        assert_eq!(preferred_transcode_video_codec(&[], &sw), "h264");
+    }
+
+    #[test]
+    fn transcode_target_prefers_client_order_with_nvenc() {
+        // With NVENC the hardware encodes av1/hevc/h264, so the client's top pick
+        // (av1 — keeping 10-bit HDR) is honoured instead of forcing h264.
+        let nv = EncodingOptions {
+            enable_hardware_encoding: true,
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            ..EncodingOptions::default()
+        };
+        let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
+        assert_eq!(preferred_transcode_video_codec(&av1_first, &nv), "av1");
+        // vp9 has no NVENC encoder → skipped in favour of the next encodable.
+        assert_eq!(
+            preferred_transcode_video_codec(&["vp9".to_owned(), "hevc".to_owned()], &nv),
+            "hevc"
+        );
     }
 
     #[tokio::test]

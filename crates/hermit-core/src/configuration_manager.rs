@@ -144,6 +144,10 @@ impl HermitServerConfigurationManager {
     /// The on-disk configuration file name (JSON counterpart of C# `system.xml`).
     const CONFIG_FILE_NAME: &'static str = "system.json";
 
+    /// The subdirectory of the user config dir holding named configs
+    /// (`branding`/`encoding`), matching the `/System/Configuration/{key}` API.
+    const NAMED_SUBDIR: &'static str = "named";
+
     /// The on-disk branding configuration file name (Jellyfin's named
     /// `branding` configuration, stored as a sibling JSON document).
     const BRANDING_FILE_NAME: &'static str = "branding.json";
@@ -164,15 +168,19 @@ impl HermitServerConfigurationManager {
     /// Returns [`ServiceError`] if the configuration file cannot be read, parsed,
     /// or (when absent) written.
     pub async fn load(paths: Arc<HermitServerApplicationPaths>) -> Result<Self, ServiceError> {
-        let config_dir = PathBuf::from(paths.user_configuration_directory_path())
-            .parent()
-            .map_or_else(
-                || PathBuf::from(paths.program_data_path()),
-                std::path::Path::to_path_buf,
-            );
+        let user_config_dir = PathBuf::from(paths.user_configuration_directory_path());
+        let config_dir = user_config_dir.parent().map_or_else(
+            || PathBuf::from(paths.program_data_path()),
+            std::path::Path::to_path_buf,
+        );
         let config_file = config_dir.join(Self::CONFIG_FILE_NAME);
-        let branding_file = config_dir.join(Self::BRANDING_FILE_NAME);
-        let encoding_file = config_dir.join(Self::ENCODING_FILE_NAME);
+        // Named configs (`branding`/`encoding`) are persisted by the
+        // `/System/Configuration/{key}` API under `{user-config-dir}/named/`, so
+        // the typed readers must look there too — reading `{config-dir}/*.json`
+        // silently missed a client-saved config (e.g. NVENC never took effect).
+        let named_dir = user_config_dir.join(Self::NAMED_SUBDIR);
+        let branding_file = named_dir.join(Self::BRANDING_FILE_NAME);
+        let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
 
         let configuration = if config_file.exists() {
             let bytes = tokio::fs::read(&config_file)
@@ -439,6 +447,9 @@ mod tests {
             ..EncodingOptions::default()
         };
         let json = serde_json::to_vec_pretty(&encoding).expect("serialize encoding");
+        tokio::fs::create_dir_all(mgr.encoding_file.parent().expect("named dir"))
+            .await
+            .expect("create named dir");
         tokio::fs::write(&mgr.encoding_file, json)
             .await
             .expect("write encoding");
@@ -468,6 +479,9 @@ mod tests {
             .await
             .expect("load");
 
+        tokio::fs::create_dir_all(mgr.encoding_file.parent().expect("named dir"))
+            .await
+            .expect("create named dir");
         tokio::fs::write(&mgr.encoding_file, b"not json")
             .await
             .expect("write bad encoding");
