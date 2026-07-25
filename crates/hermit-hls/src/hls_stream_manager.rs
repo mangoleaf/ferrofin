@@ -227,6 +227,13 @@ where
     ) -> Result<ServedFile, ServiceError> {
         use hermit_traits::media_encoding::TranscodeManager as _;
 
+        // The fMP4 init segment (`#EXT-X-MAP` URI `.../-1.mp4`, negative index) is
+        // written by the transcode itself via `-hls_fmp4_init_filename`, not a
+        // normal segment. Serve it once a transcode has produced it.
+        if segment_id < 0 {
+            return self.resolve_init_segment(request, is_audio).await;
+        }
+
         let plan = self
             .planner
             .plan(request, is_audio, Some(segment_id))
@@ -317,6 +324,37 @@ where
             Err(ServiceError::NotFound(format!(
                 "segment {segment_id} did not materialise"
             )))
+        }
+    }
+
+    /// Serves the fMP4 init segment (`{stem}-1.mp4`) for `request`.
+    ///
+    /// The init header is written by ffmpeg (via `-hls_fmp4_init_filename`) when
+    /// the transcode starts, before segment 0. So if it is not yet on disk,
+    /// producing segment 0 starts the transcode — which writes the init — and we
+    /// then serve it.
+    async fn resolve_init_segment(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<ServedFile, ServiceError> {
+        let plan = self.planner.plan(request, is_audio, Some(0)).await?;
+        let ext = segment_extension(&plan.segment_container);
+        let init_path = init_segment_file(&plan.playlist_path, &ext);
+
+        if !init_path.exists() {
+            // Starting segment 0 writes the init header first; ignore the segment
+            // itself, we only need the header it produces alongside. Boxed to break
+            // the (never-taken beyond depth 1) init→segment-0 async recursion cycle.
+            Box::pin(self.resolve_dynamic_segment(request, 0, is_audio)).await?;
+        }
+
+        if init_path.exists() {
+            Ok(served(&init_path, &ext))
+        } else {
+            Err(ServiceError::NotFound(
+                "fmp4 init segment did not materialise".to_owned(),
+            ))
         }
     }
 
@@ -481,6 +519,13 @@ fn segment_file(playlist: &Path, index: i32, extension: &str) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     folder.join(format!("{stem}{index}{extension}"))
+}
+
+/// The on-disk path of the fMP4 init segment (`{stem}-1{ext}`) for `playlist` —
+/// the header ffmpeg writes via `-hls_fmp4_init_filename` and the `#EXT-X-MAP`
+/// URI references.
+fn init_segment_file(playlist: &Path, extension: &str) -> PathBuf {
+    segment_file(playlist, -1, extension)
 }
 
 /// The highest segment index a transcode has written for `playlist` on disk.

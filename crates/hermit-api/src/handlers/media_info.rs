@@ -159,14 +159,24 @@ fn apply_stream_decision(
     let mut stream = stream;
     stream.play_method = PlayMethod::Transcode;
     stream.sub_protocol = MediaStreamProtocol::hls;
-    stream.container = Some("ts".to_owned());
+    // Keep the HLS segment container the profile negotiated — jellyfin-web
+    // declares an fMP4 (`mp4`) transcoding profile for HEVC/AV1 and a `ts` one
+    // for h264. Browsers can only decode HEVC (esp. HDR) in fMP4 tagged `hvc1`,
+    // not MPEG-TS, so forcing `ts` here (the old behaviour) made HDR HEVC fail to
+    // start. Fall back to `ts` only when the profile named no container.
+    let container = stream
+        .container
+        .clone()
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "ts".to_owned());
+    stream.container = Some(container.clone());
 
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
     source.supports_transcoding = true;
     source.transcoding_url = Some(stream.to_url(None, token, None));
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
-    source.transcoding_container = Some("ts".to_owned());
+    source.transcoding_container = Some(container);
 }
 
 /// `GET /Items/{itemId}/PlaybackInfo` — playback info for the item.

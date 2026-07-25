@@ -228,15 +228,24 @@ fn subtitle_stream(streams: &[MediaStream], index: Option<i32>) -> Option<MediaS
         .cloned()
 }
 
-/// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `m4s`).
+/// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `mp4`).
 ///
-/// Port of `GetSegmentFileExtension`: fMP4 segments carry the `.m4s` extension.
+/// Port of `GetSegmentFileExtension`: the extension is the container name
+/// (`"." + container`), so fMP4 segments are `.mp4` — matching the playlist
+/// generator's `#EXT-X-MAP`/segment URIs and the served-file resolver. (An
+/// earlier `.m4s` here disagreed with both, so fMP4 segments 404'd.)
 fn segment_file_extension(segment_container: &str) -> &'static str {
     if segment_container.eq_ignore_ascii_case("mp4") {
-        "m4s"
+        "mp4"
     } else {
         "ts"
     }
+}
+
+/// Whether `codec` is HEVC (H.265), which needs the `hvc1` codec tag + fMP4 to
+/// decode in browser MSE. Port of `EncodingHelper.IsH265`.
+fn is_hevc(codec: &str) -> bool {
+    codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")
 }
 
 /// The HLS `-hls_segment_type` token for `segment_container`.
@@ -488,6 +497,23 @@ impl HermitStreamStatePlanner {
         let video_encoder = self.encoding_helper.video_encoder(state);
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
+        // The actual output video codec: the source codec when copying, else the
+        // encoder. HEVC output needs the `hvc1` codec tag to decode in browser
+        // MSE (only meaningful in fMP4). Port of `DynamicHlsController`'s
+        // `-tag:v:0 hvc1` for HEVC output.
+        let output_is_hevc = if EncodingJobInfo::is_copy_codec(Some(&video_encoder)) {
+            state
+                .video_stream
+                .as_ref()
+                .and_then(|s| s.codec.as_deref())
+                .is_some_and(is_hevc)
+        } else {
+            is_hevc(&video_encoder) || video_encoder.eq_ignore_ascii_case("libx265")
+        };
+        if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
+            push_split(&mut args, "-tag:v:0");
+            args.push("hvc1".to_owned());
+        }
         if !EncodingJobInfo::is_copy_codec(Some(&video_encoder)) {
             push_split(
                 &mut args,
@@ -562,6 +588,15 @@ impl HermitStreamStatePlanner {
         args.push("vod".to_owned());
         push_split(&mut args, "-hls_segment_type");
         args.push(hls_segment_type(segment_container).to_owned());
+        // fMP4 (mp4) HLS writes a separate init segment carrying the codec config
+        // (`#EXT-X-MAP` in the playlist). ffmpeg resolves this name relative to
+        // the .m3u8 output dir, so a bare `{stem}-1.mp4` lands beside the media
+        // segments where the init-segment route serves it. Port of
+        // `DynamicHlsController`'s `-hls_fmp4_init_filename`.
+        if segment_container.eq_ignore_ascii_case("mp4") {
+            push_split(&mut args, "-hls_fmp4_init_filename");
+            args.push(format!("{stem}-1.{ext}"));
+        }
         // Number the output segments from the requested index (GetStartNumber).
         // A seek asks for segment N: we seek the input (`-ss`) to N and restart
         // ffmpeg, so its HLS muxer must write `stem{N}.ts` onward — without this
@@ -884,6 +919,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_fmp4_hevc_gets_hvc1_tag_and_init_segment() {
+        // A hevc source delivered as fMP4 (mp4) must carry `-tag:v:0 hvc1` (so
+        // browser MSE can decode HEVC) and a `-hls_fmp4_init_filename` (the
+        // `#EXT-X-MAP` init segment). Its segments are `.mp4`, matching the
+        // playlist — an earlier `.m4s` here made every fMP4 segment 404.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-tag:v:0", "hvc1"]),
+            "hevc fMP4 needs the hvc1 tag: {:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-hls_segment_type", "fmp4"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|a| a == "-hls_fmp4_init_filename"),
+            "fMP4 needs an init segment: {:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.iter().any(|a| a.ends_with("%d.mp4")),
+            "fMP4 segments are .mp4: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_ts_hevc_gets_no_hvc1_tag() {
+        // The `hvc1` tag is an fMP4 concept; the TS path must not emit it (it
+        // would break the mpegts mux) — h264/SDR content stays on TS unchanged.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc"); // segment_container defaults to "ts"
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-tag:v:0"),
+            "TS must not carry the hvc1 tag: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|a| a == "-hls_fmp4_init_filename")
+        );
+    }
+
+    #[tokio::test]
     async fn plan_transcodes_h264_to_libx264_when_no_supported_codecs() {
         // Default request: video codec defaults to h264, supported list is the
         // requested target, so an h264 source can copy... unless we force a
@@ -1044,7 +1145,7 @@ mod tests {
     #[test]
     fn segment_helpers_map_containers() {
         assert_eq!(segment_file_extension("ts"), "ts");
-        assert_eq!(segment_file_extension("mp4"), "m4s");
+        assert_eq!(segment_file_extension("mp4"), "mp4");
         assert_eq!(hls_segment_type("ts"), "mpegts");
         assert_eq!(hls_segment_type("mp4"), "fmp4");
     }
