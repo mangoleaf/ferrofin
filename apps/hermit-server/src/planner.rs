@@ -167,6 +167,41 @@ impl HermitStreamStatePlanner {
     }
 }
 
+/// Splits a comma-delimited codec parameter into ordered, non-empty tokens.
+///
+/// Jellyfin sends the client's supported codecs as a comma-separated,
+/// preference-ordered list (e.g. `h264,hevc,vp9,av1`). The first token is the
+/// preferred transcode target; the whole set is what the client can play.
+fn split_codecs(param: Option<&str>) -> Vec<String> {
+    param
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The client-supported codec set that drives the stream-copy decision.
+///
+/// A bare `copy` request instead declares the *source* codec supported (so the
+/// stream copies through); otherwise the parsed preference list is the supported
+/// set, falling back to the resolved `target` when the client named none.
+fn supported_codecs(codecs: &[String], source: Option<&MediaStream>, target: &str) -> Vec<String> {
+    if codecs
+        .iter()
+        .any(|c| EncodingJobInfo::is_copy_codec(Some(c)))
+    {
+        source
+            .and_then(|s| s.codec.clone())
+            .map_or_else(|| codecs.to_vec(), |c| vec![c])
+    } else if codecs.is_empty() {
+        vec![target.to_owned()]
+    } else {
+        codecs.to_vec()
+    }
+}
+
 /// The default stream of `stream_type` from `streams`: the first flagged
 /// `is_default`, else the first of that type.
 ///
@@ -259,39 +294,41 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             .unwrap_or_else(|| DEFAULT_SEGMENT_CONTAINER.to_owned());
 
         // ---- (2) COPY-vs-TRANSCODE per stream -------------------------------
+        // The client sends the video/audio codecs as a comma-delimited,
+        // preference-ordered list (e.g. `h264,hevc,vp9,av1`): the whole set is
+        // what it can play (drives the copy decision), and the first entry is the
+        // preferred transcode target. The raw list is NOT a valid ffmpeg `-c:v`/
+        // `-c:a` encoder name, so it must be resolved to a single codec here — a
+        // passed-through list makes ffmpeg exit immediately and the whole
+        // transcode (hence playback) fails.
+        let video_codecs = split_codecs(request.video_codec.as_deref());
+        let audio_codecs = split_codecs(request.audio_codec.as_deref());
+
+        // The requested/target codecs (defaulting to the broadly-compatible
+        // h264/aac). A `copy` request is honoured verbatim.
+        let requested_video_codec = video_codecs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned());
+        let requested_audio_codec = audio_codecs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
+
         // Build the base options from the request so the copy decision + arg
         // builder read the client's declared targets/limits.
         let base_request = BaseEncodingJobOptions {
-            audio_codec: request.audio_codec.clone(),
+            audio_codec: Some(requested_audio_codec.clone()),
             is_static: request.is_static,
             ..BaseEncodingJobOptions::default()
         };
 
-        // The requested/target codecs (defaulting to the broadly-compatible
-        // h264/aac). A `copy` request is honoured verbatim.
-        let requested_video_codec = request
-            .video_codec
-            .clone()
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned());
-        let requested_audio_codec = request
-            .audio_codec
-            .clone()
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
-
-        // The declared supported codecs (the client's target set) drive the
-        // copy decision; a `copy` request declares the source codec supported.
-        let supported_video_codecs = video_stream
-            .as_ref()
-            .filter(|_| EncodingJobInfo::is_copy_codec(Some(&requested_video_codec)))
-            .and_then(|s| s.codec.clone())
-            .map_or_else(|| vec![requested_video_codec.clone()], |c| vec![c]);
-        let supported_audio_codecs = audio_stream
-            .as_ref()
-            .filter(|_| EncodingJobInfo::is_copy_codec(Some(&requested_audio_codec)))
-            .and_then(|s| s.codec.clone())
-            .map_or_else(|| vec![requested_audio_codec.clone()], |c| vec![c]);
+        // The declared supported codecs (the client's full set) drive the copy
+        // decision; a `copy` request declares the source codec supported.
+        let supported_video_codecs =
+            supported_codecs(&video_codecs, video_stream.as_ref(), &requested_video_codec);
+        let supported_audio_codecs =
+            supported_codecs(&audio_codecs, audio_stream.as_ref(), &requested_audio_codec);
 
         // A probe state used only for the copy decision (the final state is
         // populated below with the resolved output codecs).
@@ -521,6 +558,16 @@ impl HermitStreamStatePlanner {
         args.push("vod".to_owned());
         push_split(&mut args, "-hls_segment_type");
         args.push(hls_segment_type(segment_container).to_owned());
+        // Number the output segments from the requested index (GetStartNumber).
+        // A seek asks for segment N: we seek the input (`-ss`) to N and restart
+        // ffmpeg, so its HLS muxer must write `stem{N}.ts` onward — without this
+        // the restarted job re-numbers from 0, clobbering the original job's
+        // `stem0.ts…` and never producing the segment the client is waiting for,
+        // so scrubbing hangs/corrupts the stream.
+        if let Some(id) = segment_id {
+            push_split(&mut args, "-start_number");
+            args.push(id.to_string());
+        }
         push_split(&mut args, "-hls_segment_filename");
         args.push(format!("{dir}/{stem}%d.{ext}"));
         push_split(&mut args, "-hls_list_size");
@@ -839,6 +886,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_resolves_codec_preference_list_to_single_codec() {
+        // The client sends comma-delimited preference lists. The source is hevc
+        // (in the video list → copy) with eac3 audio (NOT in the audio list →
+        // transcode to the first listed codec, aac). The raw list must never
+        // reach ffmpeg's `-c:v`/`-c:a` (an invalid encoder name fails the job).
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264,hevc,vp9,av1".to_owned());
+        req.audio_codec = Some("aac,mp3,mp2,opus,flac,vorbis".to_owned());
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+
+        // hevc is supported → copy video; eac3 unsupported → transcode to aac.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "hevc source the client supports must copy: {:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", "aac"]),
+            "eac3 the client can't play must transcode to aac: {:?}",
+            plan.arguments
+        );
+        // No argv token is a comma-joined codec list.
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains(',')),
+            "no codec-list token may reach ffmpeg: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
     async fn plan_copies_matching_codec() {
         // Request video_codec=copy → declares the source codec supported → copy.
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
@@ -890,6 +969,28 @@ mod tests {
         // Audio-only plan: segment 2 seeks to 2 * 6s = 12s worth of ticks.
         assert!(
             plan.arguments.iter().any(|a| a == "-ss"),
+            "{:?}",
+            plan.arguments
+        );
+        // ...and the HLS muxer must number segments from 2 so it writes stem2.ts
+        // (a seek-restart re-numbering from 0 would clobber the original job and
+        // never produce the requested segment — scrubbing would hang).
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-start_number", "2"]),
+            "seek segment must set -start_number: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_omits_start_number_for_the_playlist_build() {
+        // The variant-playlist build passes segment_id=None; there is no seek, so
+        // no -start_number (segments number from 0 as usual).
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let plan = p.plan(&request("abc"), false, None).await.unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-start_number"),
             "{:?}",
             plan.arguments
         );
