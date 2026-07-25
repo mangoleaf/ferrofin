@@ -14,10 +14,9 @@
 //! - `[Authorize(Policy = FirstTimeSetupOrElevated)]` is not enforced by a policy
 //!   middleware here; these routes are reachable during first-run exactly as the
 //!   wizard needs.
-//! - `RemoteAccess` writes the separate `NetworkConfiguration` store in C#. Only
-//!   the main [`ServerConfiguration`] is ported at this layer, so the toggle is
-//!   accepted and acknowledged (`204`) but the network-config persistence is a
-//!   flagged follow-up rather than silently pretending to store elsewhere.
+//! - `RemoteAccess` writes the separate `NetworkConfiguration` store in C#; here
+//!   that config lives in the named-config store (`named/network.json`), so the
+//!   toggle persists `EnableRemoteAccess` there.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -48,17 +47,15 @@ struct StartupConfigurationDto {
 }
 
 /// The remote-access toggle DTO (`StartupRemoteAccessDto`).
-///
-/// The field is accepted for wire compatibility but unused: the separate
-/// `NetworkConfiguration` store the C# writes is not ported at this layer, so the
-/// toggle is acknowledged without persisting (see the module note).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct StartupRemoteAccessDto {
     /// Whether remote access is enabled.
     #[serde(default)]
-    #[allow(dead_code)]
     enable_remote_access: bool,
+    /// Whether UPnP automatic port mapping is enabled.
+    #[serde(default)]
+    enable_automatic_port_mapping: bool,
 }
 
 /// The first-user DTO (`StartupUserDto`): name plus optional password.
@@ -135,9 +132,11 @@ async fn update_initial_configuration(
 
 /// `POST /Startup/RemoteAccess` — toggle remote access.
 ///
-/// Port of `StartupController.SetRemoteAccess`. See the module note: the
-/// `NetworkConfiguration` store is not ported, so the toggle is acknowledged
-/// without persisting to that separate store.
+/// Port of `StartupController.SetRemoteAccess`: persists `EnableRemoteAccess` /
+/// `EnableUPnP` onto the `NetworkConfiguration`. Hermit keeps that config in the
+/// named-config store (`{config}/named/network.json`, the same file
+/// `GET/POST /System/Configuration/network` reads), so the wizard toggle now
+/// actually takes effect rather than being dropped.
 #[utoipa::path(
     post,
     path = "/Startup/RemoteAccess",
@@ -145,9 +144,35 @@ async fn update_initial_configuration(
     tag = "hermit"
 )]
 async fn set_remote_access(
-    State(_state): State<AppState>,
-    Json(_body): Json<StartupRemoteAccessDto>,
+    State(state): State<AppState>,
+    Json(body): Json<StartupRemoteAccessDto>,
 ) -> Result<StatusCode, ApiError> {
+    let path = crate::handlers::config::named_config_file(&state, "network").ok_or_else(|| {
+        ApiError::from(hermit_traits::error::ServiceError::backend(
+            "network config path unavailable",
+        ))
+    })?;
+    // Load the persisted network config (or its defaults), flip the flags, save.
+    let mut config: hermit_networking::NetworkConfiguration = tokio::fs::read(&path)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    config.enable_remote_access = body.enable_remote_access;
+    // `EnableUPnP` is deprecated and not modelled on the config, so the
+    // automatic-port-mapping flag is accepted but not persisted.
+    let _ = body.enable_automatic_port_mapping;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            ApiError::from(hermit_traits::error::ServiceError::backend(e.to_string()))
+        })?;
+    }
+    let json = serde_json::to_vec_pretty(&config)
+        .map_err(|e| ApiError::from(hermit_traits::error::ServiceError::backend(e.to_string())))?;
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|e| ApiError::from(hermit_traits::error::ServiceError::backend(e.to_string())))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

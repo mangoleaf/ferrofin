@@ -245,24 +245,29 @@ async fn authenticate_by_name(
 )]
 async fn authenticate_with_quick_connect(
     State(state): State<AppState>,
+    parts: Parts,
     Json(body): Json<QuickConnectDto>,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
+    // Validate the secret (it has already been authorized on another device),
+    // then open a session for that user *directly* — no password — so the client
+    // receives a real `AccessToken` instead of thinking it logged in with none.
     let session = state
         .quick_connect
         .get_authorized_request(&body.secret)
         .await?;
-    // The Quick Connect trait surfaces only the session DTO (its token is not
-    // carried through this seam), so `access_token` resolves to `None`.
-    Ok(Json(
-        authentication_result(
-            &state,
-            AuthenticationResultData {
-                session,
-                access_token: String::new(),
-            },
-        )
-        .await,
-    ))
+    let auth = auth_info(&parts);
+    let request = AuthenticationRequest {
+        username: None,
+        user_id: Some(session.user_id),
+        password: None,
+        app: auth.client,
+        app_version: auth.version,
+        device_id: auth.device_id,
+        device_name: auth.device,
+        remote_endpoint: None,
+    };
+    let result = state.sessions.authenticate_direct(&request).await?;
+    Ok(Json(authentication_result(&state, result).await))
 }
 
 /// Assembles the [`AuthenticationResult`] wire body from an authenticated

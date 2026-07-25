@@ -165,7 +165,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     axum::serve(
         listener,
-        axum::ServiceExt::<axum::extract::Request>::into_make_service(app),
+        // `with_connect_info` so handlers can read the client's socket address
+        // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
+        axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<SocketAddr>(
+            app,
+        ),
     )
     .with_graceful_shutdown(async move {
         shutdown_rx.await.ok();

@@ -232,21 +232,50 @@ async fn get_log_file(
 
 /// `GET /System/Endpoint` — information about the request's network endpoint.
 ///
-/// Port of `SystemController.GetEndpointInfo`. The `IsLocal`/`IsInNetwork`
-/// determination needs the live remote IP and network config; those are not
-/// surfaced at this layer, so both default to `false` (the conservative,
-/// non-local answer) rather than being faked.
+/// Port of `SystemController.GetEndpointInfo`. `IsLocal` is true for a loopback
+/// peer (the same-machine web client); `IsInNetwork` additionally covers the
+/// RFC1918 / unique-local private ranges — a faithful approximation of Jellyfin's
+/// `NetworkManager.IsInLocalNetwork` without the configured-subnet list. The peer
+/// address comes from the connection ([`ConnectInfo`]); a proxied request that
+/// hides it (no `ConnectInfo`) falls back to the non-local answer.
 #[utoipa::path(
     get,
     path = "/System/Endpoint",
     responses((status = 200, description = "Endpoint info returned", body = EndPointInfo)),
     tag = "hermit"
 )]
-async fn get_endpoint_info(_auth: RequireAuth) -> Json<EndPointInfo> {
+async fn get_endpoint_info(
+    _auth: RequireAuth,
+    parts: axum::http::request::Parts,
+) -> Json<EndPointInfo> {
+    // The peer socket address is inserted as a request extension by the server's
+    // `with_connect_info`; it survives the outer routing middleware. Absent (a
+    // proxied request or a test) → the conservative non-local answer.
+    let ip = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let is_local = ip.is_some_and(|ip| ip.is_loopback());
+    let is_in_network = ip.is_some_and(is_in_local_network);
     Json(EndPointInfo {
-        is_local: false,
-        is_in_network: false,
+        is_local,
+        is_in_network,
     })
+}
+
+/// Whether `ip` is on the local network: loopback, link-local, or a private
+/// (RFC1918 IPv4 / `fc00::/7` unique-local IPv6) address.
+fn is_in_local_network(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        // `is_unique_local`/`is_unicast_link_local` are unstable, so match the
+        // fc00::/7 and fe80::/10 prefixes directly.
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// Registers this controller's real routes onto `router`.
@@ -261,4 +290,37 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/System/Logs", get(get_server_logs))
         .route("/System/Logs/Log", get(get_log_file))
         .route("/System/Endpoint", get(get_endpoint_info))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_in_local_network;
+    use std::net::IpAddr;
+
+    #[test]
+    fn classifies_local_vs_public_addresses() {
+        let local = [
+            "127.0.0.1",
+            "::1",
+            "192.168.1.5",
+            "10.0.0.2",
+            "172.16.9.9",
+            "169.254.1.1",
+            "fd00::1",
+            "fe80::1",
+        ];
+        for a in local {
+            assert!(
+                is_in_local_network(a.parse::<IpAddr>().unwrap()),
+                "{a} should be local"
+            );
+        }
+        let public = ["8.8.8.8", "1.1.1.1", "203.0.113.5", "2606:4700:4700::1111"];
+        for a in public {
+            assert!(
+                !is_in_local_network(a.parse::<IpAddr>().unwrap()),
+                "{a} should be public"
+            );
+        }
+    }
 }

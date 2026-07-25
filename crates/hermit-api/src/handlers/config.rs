@@ -33,7 +33,7 @@ use crate::state::AppState;
 /// `key` comes straight from the URL, so this is the path-traversal guard: only
 /// `[A-Za-z0-9_-]` is allowed (rejecting `..`, `/`, `.`), and the file lives in a
 /// dedicated `named/` subdir of the configuration directory.
-fn named_config_file(state: &AppState, key: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn named_config_file(state: &AppState, key: &str) -> Option<std::path::PathBuf> {
     if key.is_empty()
         || !key
             .chars()
