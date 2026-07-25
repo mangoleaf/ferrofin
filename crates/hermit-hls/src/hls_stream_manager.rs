@@ -111,6 +111,16 @@ const HLS_PLAYLIST_MIME: &str = "application/x-mpegURL";
 /// non-default binary is configured.
 const FFMPEG_PROGRAM: &str = "ffmpeg";
 
+/// How many segments ahead of a running transcode's on-disk progress a request
+/// may be before it is treated as a *seek* (evict the job and restart from the
+/// requested segment) rather than a *read-ahead* (wait for the running job to
+/// reach it). Small so a real timeline jump restarts promptly; non-zero so
+/// normal read-ahead does not thrash the encoder with kill/restart churn.
+///
+/// ponytail: tuning knob — a candidate server setting if scrub/read-ahead
+/// behaviour needs tuning per deployment.
+const SEGMENT_WAIT_GAP: i32 = 2;
+
 /// The concrete [`HlsStreamManager`]: playlist generation + segment transcode
 /// orchestration + legacy file resolution, over the injected runtime.
 ///
@@ -129,6 +139,13 @@ where
     manager: Arc<TranscodeManagerImpl<S, FsFileCleaner>>,
     generator: Arc<DynamicHlsPlaylistGenerator<C>>,
     paths: Arc<dyn ServerApplicationPaths>,
+    /// Per-playlist async locks serialising the "find/evict/start job" critical
+    /// section of [`Self::resolve_dynamic_segment`]. Without it two concurrent
+    /// seek requests for the same output could each spawn an ffmpeg writing the
+    /// same `{stem}{n}.ts` files — a torn, corrupt segment. Port of Jellyfin's
+    /// per-playlist `TranscodingLock`.
+    segment_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
@@ -158,7 +175,16 @@ where
             manager,
             generator,
             paths,
+            segment_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// The per-playlist lock for `key`, creating it on first use. Held across the
+    /// find/evict/start critical section so concurrent seeks serialise instead of
+    /// racing two ffmpegs onto the same segment files.
+    fn playlist_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.segment_locks.lock().expect("segment locks poisoned");
+        Arc::clone(locks.entry(key.to_owned()).or_default())
     }
 
     /// Builds a variant/main playlist string for `request` from a plan.
@@ -199,29 +225,72 @@ where
         segment_id: i32,
         is_audio: bool,
     ) -> Result<ServedFile, ServiceError> {
+        use hermit_traits::media_encoding::TranscodeManager as _;
+
         let plan = self
             .planner
             .plan(request, is_audio, Some(segment_id))
             .await?;
         let playlist_path = plan.playlist_path.clone();
+        let playlist_key = playlist_path.to_string_lossy().into_owned();
         let ext = segment_extension(&plan.segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, &ext);
 
         // Fast path: the segment already exists (a live job produced it) → begin
         // the request (keep-alive) and serve it. Port of the `File.Exists` try-1.
         if segment_path.exists() {
-            use hermit_traits::media_encoding::TranscodeManager as _;
             let _ = self
                 .manager
-                .on_transcode_begin_request(
-                    &playlist_path.to_string_lossy(),
-                    TranscodingJobType::Hls,
-                )
+                .on_transcode_begin_request(&playlist_key, TranscodingJobType::Hls)
                 .await;
             return Ok(served(&segment_path, &ext));
         }
 
-        // Otherwise (re)start the transcode from this segment and wait for it.
+        // Serialise the find/evict/start decision per playlist so two concurrent
+        // requests can't each spawn an ffmpeg onto the same segment files.
+        let lock = self.playlist_lock(&playlist_key);
+        let _guard = lock.lock().await;
+
+        // Another request may have produced the segment while we waited for the
+        // lock — re-check before doing any work.
+        if segment_path.exists() {
+            return Ok(served(&segment_path, &ext));
+        }
+
+        // A transcode may already be running for this playlist. Only ONE ffmpeg
+        // may own a given `{stem}{n}.ts` set: a second one started for a seek
+        // re-numbers into the same files and tears the stream. So if the request
+        // is only just ahead of the running job's on-disk progress, wait for it;
+        // otherwise (a real seek, or the job is gone) evict the stale job and
+        // (re)start from this segment. Port of `GetDynamicSegment`'s current-index
+        // restart decision.
+        if let Some(handle) = self
+            .manager
+            .get_transcoding_job_by_path(&playlist_key, TranscodingJobType::Hls)
+            .await
+            .ok()
+            .flatten()
+        {
+            let current = current_transcoding_index(&playlist_path, &ext);
+            let read_ahead =
+                current.is_some_and(|c| segment_id > c && segment_id - c <= SEGMENT_WAIT_GAP);
+            if read_ahead
+                && self
+                    .manager
+                    .wait_for_segment(&handle, &playlist_path, segment_id)
+                    .await
+                && segment_path.exists()
+            {
+                return Ok(served(&segment_path, &ext));
+            }
+            // A seek (or the running job died mid-wait): drop the stale job before
+            // restarting so the two don't write the same files. Keep its produced
+            // segments (delete_files = false) — a later backward seek serves them
+            // straight from disk via the fast path.
+            self.manager.kill_and_remove(&handle, false).await;
+        }
+
+        // (Re)start the transcode from this segment and wait for it.
         let log_path = playlist_path.with_extension("log");
         let start = StartFfMpegRequest {
             program: FFMPEG_PROGRAM,
@@ -412,6 +481,34 @@ fn segment_file(playlist: &Path, index: i32, extension: &str) -> PathBuf {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     folder.join(format!("{stem}{index}{extension}"))
+}
+
+/// The highest segment index a transcode has written for `playlist` on disk.
+///
+/// Scans the output directory for `{stem}{n}{ext}` files and returns the max
+/// `n` — the running job's progress front. `None` when nothing has been
+/// produced yet. Port of `GetCurrentTranscodingIndex`; used to decide whether a
+/// segment request is a read-ahead (wait) or a seek (evict + restart).
+fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
+    let folder = playlist.parent()?;
+    let stem = playlist.file_stem()?.to_string_lossy().into_owned();
+    let suffix = if ext.starts_with('.') {
+        ext.to_owned()
+    } else {
+        format!(".{ext}")
+    };
+    std::fs::read_dir(folder)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            name.strip_prefix(&stem)?
+                .strip_suffix(&suffix)?
+                .parse::<i32>()
+                .ok()
+        })
+        .max()
 }
 
 /// Builds a [`ServedFile`] for `path`, choosing the MIME type from `ext`.
@@ -739,5 +836,24 @@ mod tests {
     fn segment_file_mirrors_get_segment_path() {
         let p = segment_file(Path::new("/c/out.m3u8"), 4, ".ts");
         assert_eq!(p, Path::new("/c/out4.ts"));
+    }
+
+    #[test]
+    fn current_transcoding_index_is_the_max_produced_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let playlist = dir.path().join("abc123.m3u8");
+        // Nothing produced yet.
+        assert_eq!(current_transcoding_index(&playlist, ".ts"), None);
+        // A running job wrote segments 0,1,2 plus its playlist + a foreign file.
+        for n in [0, 1, 2] {
+            std::fs::write(dir.path().join(format!("abc123{n}.ts")), b"x").unwrap();
+        }
+        std::fs::write(&playlist, b"#EXTM3U").unwrap();
+        std::fs::write(dir.path().join("other9.ts"), b"x").unwrap(); // different stem
+        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(2));
+        // After a seek restart wrote 20,21, the front is the highest index.
+        std::fs::write(dir.path().join("abc12320.ts"), b"x").unwrap();
+        std::fs::write(dir.path().join("abc12321.ts"), b"x").unwrap();
+        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(21));
     }
 }

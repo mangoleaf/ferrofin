@@ -105,13 +105,13 @@ mod tests {
     #[tokio::test]
     async fn stubbed_route_returns_501_not_404() {
         // A contract route with no ported handler still returns `501` (not
-        // `404`). `/SyncPlay/List` is a deferred (SyncPlay subsystem) route
-        // registered on the shared stub.
+        // `404`). `/IntroSkipper` is a third-party-plugin route (not core
+        // Jellyfin) registered on the shared stub.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/SyncPlay/List")
+                    .uri("/IntroSkipper")
                     .body(Body::empty())
                     .unwrap(),
             )

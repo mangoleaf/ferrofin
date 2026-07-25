@@ -139,6 +139,46 @@ pub fn fake_state() -> AppState {
     )
 }
 
+/// Like [`fake_state`] but with an [`AuthedAuthService`] that always
+/// authenticates, so `RequireAuth`-guarded routes reach their handler.
+#[must_use]
+pub fn authed_fake_state() -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+}
+
 /// Builds a minimal [`BaseItemEntity`] with the given id, name, and type key.
 ///
 /// Every other column is a neutral zero/`None`, so integration tests that only
@@ -911,13 +951,18 @@ impl ServerApplicationPaths for FakePaths {
         String::new()
     }
     fn program_data_path(&self) -> String {
-        String::new()
+        // A process-unique temp root so path-backed handlers (e.g. Backup) have a
+        // real, writable directory to operate in during tests.
+        std::env::temp_dir()
+            .join("hermit-api-test-data")
+            .to_string_lossy()
+            .into_owned()
     }
     fn web_path(&self) -> String {
         String::new()
     }
     fn data_path(&self) -> String {
-        String::new()
+        self.program_data_path()
     }
     fn image_cache_path(&self) -> String {
         String::new()

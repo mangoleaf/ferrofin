@@ -44,6 +44,7 @@ thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 
 [dev-dependencies]
 # Self dev-dependency so unit + integration tests build with the `test-util`
@@ -54,3 +55,4 @@ serde_json.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower.workspace = true
+tempfile.workspace = true

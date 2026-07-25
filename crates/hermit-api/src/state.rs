@@ -147,6 +147,17 @@ pub struct Inner {
     /// plugins, no repositories, mutators rejected); the composition root injects
     /// the registry-backed `HermitPluginManager` via [`AppState::with_plugins`].
     pub plugins: Arc<dyn PluginManager>,
+
+    /// Synchronized group playback (`/SyncPlay/*`). `None` until the composition
+    /// root wires a manager via [`AppState::with_sync_play`]; the SyncPlay routes
+    /// return `501` while unset.
+    pub sync_play: Option<Arc<dyn hermit_traits::stubs::SyncPlayManager>>,
+
+    /// The server→client WebSocket message bus (session-socket registry). `None`
+    /// until the composition root wires it via [`AppState::with_session_bus`]; the
+    /// session socket then registers/unregisters its sink here so SyncPlay (and
+    /// future now-playing/remote-control pushes) can reach the client.
+    pub session_bus: Option<Arc<dyn hermit_traits::session_bus::SessionMessageBus>>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -222,6 +233,8 @@ impl AppState {
             config,
             providers,
             image_processor: None,
+            sync_play: None,
+            session_bus: None,
             music,
             similar_items,
             search,
@@ -381,6 +394,45 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_image_processor must be called before the state is shared");
         inner.image_processor = Some(image_processor);
+        self
+    }
+
+    /// Wires the SyncPlay manager backing the `/SyncPlay/*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (those routes return `501`); the
+    /// composition root calls this with the real group-coordinating manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_sync_play(
+        mut self,
+        sync_play: Arc<dyn hermit_traits::stubs::SyncPlayManager>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_sync_play must be called before the state is shared");
+        inner.sync_play = Some(sync_play);
+        self
+    }
+
+    /// Wires the session message bus the WebSocket handler registers sinks on.
+    ///
+    /// [`new`](Self::new) leaves it unset (server→client pushes are dropped); the
+    /// composition root calls this with the concrete bus, shared with the SyncPlay
+    /// manager so its commands reach connected sockets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_session_bus(
+        mut self,
+        session_bus: Arc<dyn hermit_traits::session_bus::SessionMessageBus>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_session_bus must be called before the state is shared");
+        inner.session_bus = Some(session_bus);
         self
     }
 

@@ -38,6 +38,7 @@ pub mod plugins;
 pub mod providers;
 pub mod security;
 pub mod session;
+pub mod session_bus;
 pub mod stubs;
 pub mod subtitles;
 pub mod system;

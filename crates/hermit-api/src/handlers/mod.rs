@@ -68,6 +68,7 @@ pub mod item_update;
 pub mod items;
 pub mod library;
 pub mod library_structure;
+pub mod live_tv;
 pub mod localization;
 pub mod lyrics;
 pub mod media_info;
@@ -92,6 +93,7 @@ pub(crate) mod streaming;
 pub mod studios;
 pub mod subtitles;
 pub mod suggestions;
+pub mod sync_play;
 pub mod system;
 pub mod time_sync;
 pub mod tmdb;
@@ -355,8 +357,11 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/LiveStreams/Open"),
     ("post", "/LiveStreams/Close"),
     ("get", "/Playback/BitrateTest"),
-    // Backup: list available archives (empty; no backup subsystem yet).
+    // Backup: list/inspect/create/restore DB + config archives.
     ("get", "/Backup"),
+    ("get", "/Backup/Manifest"),
+    ("post", "/Backup/Create"),
+    ("post", "/Backup/Restore"),
     // Channels (empty — no channel providers exist without plugins).
     ("get", "/Channels"),
     ("get", "/Channels/Features"),
@@ -589,6 +594,49 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Packages/{name}"),
     ("post", "/Packages/Installed/{name}"),
     ("delete", "/Packages/Installing/{packageId}"),
+    // Live TV read surface (empty/disabled state; mutations stay on the 501 stub).
+    ("get", "/LiveTv/Info"),
+    ("get", "/LiveTv/GuideInfo"),
+    ("get", "/LiveTv/Channels"),
+    ("get", "/LiveTv/Programs"),
+    ("post", "/LiveTv/Programs"),
+    ("get", "/LiveTv/Programs/Recommended"),
+    ("get", "/LiveTv/Recordings"),
+    ("get", "/LiveTv/Recordings/Folders"),
+    ("get", "/LiveTv/Recordings/Groups"),
+    ("get", "/LiveTv/Recordings/Series"),
+    ("get", "/LiveTv/Timers"),
+    ("get", "/LiveTv/Timers/Defaults"),
+    ("get", "/LiveTv/SeriesTimers"),
+    ("get", "/LiveTv/ChannelMappingOptions"),
+    ("get", "/LiveTv/ListingProviders/Default"),
+    ("get", "/LiveTv/ListingProviders/Lineups"),
+    ("get", "/LiveTv/TunerHosts/Types"),
+    ("get", "/LiveTv/Tuners/Discover"),
+    ("get", "/LiveTv/Tuners/Discvover"),
+    // SyncPlay — synchronized group playback.
+    ("post", "/SyncPlay/New"),
+    ("post", "/SyncPlay/Join"),
+    ("post", "/SyncPlay/Leave"),
+    ("get", "/SyncPlay/List"),
+    ("get", "/SyncPlay/{id}"),
+    ("post", "/SyncPlay/SetNewQueue"),
+    ("post", "/SyncPlay/SetPlaylistItem"),
+    ("post", "/SyncPlay/RemoveFromPlaylist"),
+    ("post", "/SyncPlay/MovePlaylistItem"),
+    ("post", "/SyncPlay/Queue"),
+    ("post", "/SyncPlay/Unpause"),
+    ("post", "/SyncPlay/Pause"),
+    ("post", "/SyncPlay/Stop"),
+    ("post", "/SyncPlay/Seek"),
+    ("post", "/SyncPlay/Buffering"),
+    ("post", "/SyncPlay/Ready"),
+    ("post", "/SyncPlay/SetIgnoreWait"),
+    ("post", "/SyncPlay/NextItem"),
+    ("post", "/SyncPlay/PreviousItem"),
+    ("post", "/SyncPlay/SetRepeatMode"),
+    ("post", "/SyncPlay/SetShuffleMode"),
+    ("post", "/SyncPlay/Ping"),
 ];
 
 /// Mounts every real First-Light handler onto `router`, overriding the matching
@@ -662,6 +710,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = merge_versions::register(router);
     // Plugins Tier 1 — plugin-manager surface over the compile-time registry.
     let router = plugins::register(router);
+    // Live TV read surface — empty/disabled state so the web UI treats Live TV
+    // as "not configured" instead of erroring on 501 (mutations stay stubbed).
+    let router = live_tv::register(router);
+    // SyncPlay — synchronized group playback over the session WebSocket.
+    let router = sync_play::register(router);
     // The session WebSocket (`/socket`) — not in the OpenAPI contract; jellyfin-web
     // needs it to establish a connection or it reports "Connection Failure".
     websocket::register(router)
