@@ -5,6 +5,9 @@
 //! disabled/empty. The real tuner/EPG port is future work. Filled by the Wave 5
 //! PortJob. See `brain/PLAN_HERMIT_PORT.md`.
 
+pub mod m3u;
+pub mod xmltv;
+
 use async_trait::async_trait;
 use hermit_model::dto::BaseItemDto;
 use hermit_model::live_tv::LiveTvInfo;
