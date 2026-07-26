@@ -229,7 +229,10 @@ pub async fn build_app_state(
         ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), paths.image_cache_path()),
     );
     let providers: Arc<dyn hermit_traits::providers::ProviderManager> =
-        Arc::new(LocalProviderManager::new(Vec::new()));
+        Arc::new(LocalProviderManager::new(Vec::new()).with_image_store(
+            Arc::clone(&item_persistence_service),
+            std::path::PathBuf::from(paths.internal_metadata_path()).join("library"),
+        ));
     let file_system: Arc<dyn hermit_traits::filesystem::FileSystem> =
         Arc::new(HermitFileSystem::new());
     let event_manager: Arc<dyn hermit_traits::events::EventManager> =
@@ -264,8 +267,13 @@ pub async fn build_app_state(
         Arc::clone(&config_mgr) as Arc<_>;
 
     // ---- managers over repositories/services ------------------------------
-    let users: Arc<dyn hermit_traits::library::UserManager> =
-        Arc::new(HermitUserManager::new(db.clone()).with_server_id(server_id.clone()));
+    let users: Arc<dyn hermit_traits::library::UserManager> = Arc::new(
+        HermitUserManager::new(db.clone())
+            .with_server_id(server_id.clone())
+            .with_profile_image_dir(
+                std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
+            ),
+    );
     let user_data: Arc<dyn hermit_traits::library::UserDataManager> = Arc::new(
         HermitUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );

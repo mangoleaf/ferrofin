@@ -83,6 +83,11 @@ pub struct HermitUserManager {
     /// composition root via [`with_server_id`](HermitUserManager::with_server_id);
     /// `None` in tests (which then omit `ServerId`, the prior behaviour).
     server_id: Option<String>,
+    /// The directory user profile images are written under
+    /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
+    /// leaves [`save_profile_image`](hermit_traits::library::UserManager::save_profile_image)
+    /// deferred (tests).
+    profile_image_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for HermitUserManager {
@@ -114,7 +119,16 @@ impl HermitUserManager {
             invalid_provider: InvalidAuthProvider::new(),
             providers,
             server_id: None,
+            profile_image_dir: None,
         }
+    }
+
+    /// Sets the directory user profile images are stored under, enabling
+    /// [`save_profile_image`](hermit_traits::library::UserManager::save_profile_image).
+    #[must_use]
+    pub fn with_profile_image_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.profile_image_dir = Some(dir);
+        self
     }
 
     /// Sets this server's stable id, stamped onto every produced [`UserDto`] whose
@@ -860,6 +874,46 @@ impl UserManager for HermitUserManager {
             policy.is_disabled,
         )
         .await?;
+        Ok(())
+    }
+
+    async fn save_profile_image(
+        &self,
+        user: &UserEntity,
+        content: &[u8],
+        _mime_type: &str,
+        extension: &str,
+    ) -> Result<(), ServiceError> {
+        let Some(base) = &self.profile_image_dir else {
+            return Err(ServiceError::backend(
+                "save_profile_image requires a profile-image directory",
+            ));
+        };
+        // Write `{base}/{userId}/profile{ext}` (extension carries its dot).
+        let dir = base.join(&user.id);
+        let ext = extension.trim_start_matches('.');
+        let dest = dir.join(format!("profile.{ext}"));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ServiceError::backend(format!("create profile-image dir: {e}")))?;
+        std::fs::write(&dest, content)
+            .map_err(|e| ServiceError::backend(format!("write profile image: {e}")))?;
+        // One image per user: replace any existing row (unique index on UserId).
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
+            .bind(&user.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(chrono::Utc::now())
+        .bind(dest.to_string_lossy().as_ref())
+        .bind(&user.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 

@@ -317,6 +317,45 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Sets a single image (`image`) on an item, replacing any existing rows of
+    /// the same [`ImageType`](hermit_model::entities::ImageType) — the write path
+    /// for an uploaded poster/backdrop/logo (`ImageController.SetItemImage`).
+    ///
+    /// The default is a no-op; the real service deletes the item's rows of that
+    /// type and inserts the given one.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn set_item_image(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, image);
+        Ok(())
+    }
+
+    /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
+    /// the removed rows so the caller can delete the files
+    /// (`ImageController.DeleteItemImage`). `index` is reserved for per-index
+    /// deletes; the current store deletes every row of the type.
+    ///
+    /// The default removes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn delete_item_image(
+        &self,
+        item_id: Uuid,
+        image_type: hermit_model::entities::ImageType,
+        index: Option<i32>,
+    ) -> Result<Vec<String>, ServiceError> {
+        let _ = (item_id, image_type, index);
+        Ok(Vec::new())
+    }
+
     /// Reattaches user-data rows to the correct item after an id change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 

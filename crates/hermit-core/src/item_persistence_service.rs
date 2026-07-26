@@ -239,6 +239,67 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         Ok(())
     }
 
+    async fn set_item_image(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<(), ServiceError> {
+        let item = item_id.to_string();
+        let disc = image_type_to_disc(image.image_type);
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        // Replace any existing rows of this type (an uploaded image supersedes the
+        // prior one of the same type).
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
+            .bind(&item)
+            .bind(disc)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+               ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "DateModified")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        )
+        .bind(uuid::Uuid::new_v4().hyphenated().to_string())
+        .bind(&item)
+        .bind(disc)
+        .bind(&image.path)
+        .bind(i64::from(image.width))
+        .bind(i64::from(image.height))
+        .bind(image.date_modified)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn delete_item_image(
+        &self,
+        item_id: Uuid,
+        image_type: hermit_model::entities::ImageType,
+        _index: Option<i32>,
+    ) -> Result<Vec<String>, ServiceError> {
+        let item = item_id.to_string();
+        let disc = image_type_to_disc(image_type);
+        // Collect the on-disk paths before deleting so the caller can remove files.
+        let paths: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#,
+        )
+        .bind(&item)
+        .bind(disc)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
+            .bind(&item)
+            .bind(disc)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(paths)
+    }
+
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
         // Reattach user-data rows detached onto the placeholder item back to this
         // item when their CustomDataKey matches the item's presentation key

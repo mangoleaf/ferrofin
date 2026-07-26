@@ -14,17 +14,22 @@
 //! deferral rather than silently succeeding. The external-id descriptor set —
 //! which the NFO parsers consume — is fully wired.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use hermit_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use hermit_model::data::BaseItemKind;
 use hermit_model::entities::ImageType;
+use hermit_model::net::mime_types;
 use hermit_model::providers::{
     ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
     RemoteImageQuery, RemoteSearchResult,
 };
 use hermit_traits::error::ServiceError;
+use hermit_traits::options::ItemImageInfo;
+use hermit_traits::persistence::ItemPersistenceService;
 use hermit_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority, RemoteSearchRequest,
 };
@@ -68,6 +73,10 @@ pub trait RemoteSearchProvider: Send + Sync {
 pub struct LocalProviderManager {
     external_id_infos: Vec<ExternalIdInfo>,
     remote_search_providers: Vec<Arc<dyn RemoteSearchProvider>>,
+    /// The item-image store (rows) + the directory uploaded images are written
+    /// to. Present enables the `save_image`/`delete_image` write paths.
+    image_store: Option<Arc<dyn ItemPersistenceService>>,
+    metadata_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -78,6 +87,8 @@ impl std::fmt::Debug for LocalProviderManager {
                 "remote_search_providers",
                 &self.remote_search_providers.len(),
             )
+            .field("has_image_store", &self.image_store.is_some())
+            .field("metadata_dir", &self.metadata_dir)
             .finish()
     }
 }
@@ -94,6 +105,8 @@ impl LocalProviderManager {
         Self {
             external_id_infos,
             remote_search_providers: Vec::new(),
+            image_store: None,
+            metadata_dir: None,
         }
     }
 
@@ -107,6 +120,21 @@ impl LocalProviderManager {
         providers: Vec<Arc<dyn RemoteSearchProvider>>,
     ) -> Self {
         self.remote_search_providers = providers;
+        self
+    }
+
+    /// Attaches the item-image store + the directory uploaded images are written
+    /// to, enabling [`save_image`](ProviderManager::save_image) /
+    /// [`delete_image`](ProviderManager::delete_image). Absent, both stay
+    /// deferred (unit tests / hosts without an image store).
+    #[must_use]
+    pub fn with_image_store(
+        mut self,
+        image_store: Arc<dyn ItemPersistenceService>,
+        metadata_dir: PathBuf,
+    ) -> Self {
+        self.image_store = Some(image_store);
+        self.metadata_dir = Some(metadata_dir);
         self
     }
 
@@ -160,6 +188,16 @@ impl LocalProviderManager {
     }
 }
 
+/// The on-disk filename stem for an uploaded image of `image_type`/`index`,
+/// e.g. `Primary` → `primary`, `Backdrop` index 2 → `backdrop2`.
+fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
+    let base = format!("{image_type:?}").to_ascii_lowercase();
+    match index.filter(|&i| i > 0) {
+        Some(i) => format!("{base}{i}"),
+        None => base,
+    }
+}
+
 #[async_trait]
 impl ProviderManager for LocalProviderManager {
     async fn queue_refresh(
@@ -203,13 +241,58 @@ impl ProviderManager for LocalProviderManager {
 
     async fn save_image(
         &self,
-        _item_id: Uuid,
-        _content: &[u8],
-        _mime_type: &str,
-        _image_type: ImageType,
-        _image_index: Option<i32>,
+        item_id: Uuid,
+        content: &[u8],
+        mime_type: &str,
+        image_type: ImageType,
+        image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        Err(Self::deferred("save_image"))
+        let (Some(store), Some(meta_root)) = (&self.image_store, &self.metadata_dir) else {
+            return Err(Self::deferred("save_image"));
+        };
+        let ext = mime_types::to_extension(&mime_type.to_ascii_lowercase())
+            .unwrap_or(".jpg")
+            .trim_start_matches('.');
+        let item_dir = meta_root.join(item_id.to_string());
+        let stem = image_file_stem(image_type, image_index);
+        let dest = item_dir.join(format!("{stem}.{ext}"));
+        std::fs::create_dir_all(&item_dir)
+            .map_err(|e| ServiceError::backend(format!("create image dir: {e}")))?;
+        std::fs::write(&dest, content)
+            .map_err(|e| ServiceError::backend(format!("write image: {e}")))?;
+        store
+            .set_item_image(
+                item_id,
+                &ItemImageInfo {
+                    path: dest.to_string_lossy().into_owned(),
+                    image_type,
+                    date_modified: Utc::now(),
+                    width: 0,
+                    height: 0,
+                    blur_hash: None,
+                },
+            )
+            .await
+    }
+
+    async fn delete_image(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        let Some(store) = &self.image_store else {
+            return Err(Self::deferred("delete_image"));
+        };
+        // Remove the DB rows, then the files they pointed at (best-effort — a
+        // missing file must not fail the delete).
+        let paths = store
+            .delete_item_image(item_id, image_type, image_index)
+            .await?;
+        for path in paths {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
     }
 
     async fn get_available_remote_images(
