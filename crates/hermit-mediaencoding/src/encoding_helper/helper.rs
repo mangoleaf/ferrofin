@@ -1058,7 +1058,6 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
 
     let has = |name: &str| requested.iter().any(|r| r.eq_ignore_ascii_case(name));
     let request_hdr10 = has("HDR10");
-    let request_hlg = has("HLG");
     let request_sdr = has("SDR");
     let request_dovi = has("DOVI");
 
@@ -1074,16 +1073,17 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
 
     let range_name = video_range_type_name(range);
     let directly_supported = requested.iter().any(|r| r.eq_ignore_ascii_case(range_name));
-    let dovi_fallback_ok = (request_hdr10 && range == VideoRangeType::DoviWithHdr10)
-        || (request_hlg && range == VideoRangeType::DoviWithHlg)
-        || (request_sdr && range == VideoRangeType::DoviWithSdr)
-        || (request_hdr10 && range == VideoRangeType::Hdr10Plus);
 
-    // Not directly supported and no DOVI fallback: the C# path would consult a
-    // deferred hardware capability probe to decide whether dynamic HDR metadata
-    // can be removed; without it, refuse conservatively (this also covers the
-    // static-HDR HDR10/HDR10Plus/HLG refusal).
-    directly_supported || dovi_fallback_ok
+    // Copying a Dolby Vision stream to a client that only supports the fallback
+    // range (e.g. a browser that lists HDR10 but not DOVI) requires stripping the
+    // DV RPU so the base layer plays clean — a capability Hermit does not have.
+    // So we do NOT treat DoviWith{HDR10,HLG,SDR} as copyable via the base-range
+    // fallback; those transcode instead (matches the C# "remove metadata or
+    // refuse" intent, minus the removal path). HDR10+ is safe to copy as HDR10 —
+    // its dynamic metadata is SEI the decoder ignores, with a valid HDR10 base.
+    let hdr10plus_fallback_ok = request_hdr10 && range == VideoRangeType::Hdr10Plus;
+
+    directly_supported || hdr10plus_fallback_ok
 }
 
 /// The PascalCase wire name of a video range type. Port of
@@ -1551,6 +1551,30 @@ mod tests {
         state.supported_video_codecs = vec!["h264".to_owned()];
         state.base_request.max_width = Some(1920);
         assert!(!helper(vec![]).can_stream_copy_video(&state, &stream));
+    }
+
+    #[test]
+    fn range_type_copy_refuses_dovi_fallback_allows_direct() {
+        // Dolby Vision Profile 8.1 (bl_compat 1) over an HDR10 base layer, e.g.
+        // Mickey 17: video_range_type resolves to DoviWithHdr10.
+        let dovi = MediaStream {
+            codec: Some("av1".to_owned()),
+            index: 0,
+            stream_type: MediaStreamType::Video,
+            color_transfer: Some("smpte2084".to_owned()),
+            dv_profile: Some(8),
+            dv_bl_signal_compatibility_id: Some(1),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            ..MediaStream::default()
+        };
+        assert_eq!(dovi.video_range_type(), VideoRangeType::DoviWithHdr10);
+        // A client that supports HDR10 but not DOVI must NOT copy — the DV RPU
+        // can't be stripped, so the base-range fallback would ship a broken
+        // stream. It transcodes instead.
+        assert!(!range_type_copy_ok(&dovi, &["HDR10".to_owned()]));
+        // A DOVI-capable client (lists the DOVI range directly) may copy.
+        assert!(range_type_copy_ok(&dovi, &["DOVIWithHDR10".to_owned()]));
     }
 
     // ----- can_stream_copy_audio ---------------------------------------------

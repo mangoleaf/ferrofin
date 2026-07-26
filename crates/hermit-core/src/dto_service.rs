@@ -1566,6 +1566,9 @@ mod tests {
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }
+        async fn refresh_media_streams(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
     }
 
     /// A [`ChapterManager`] fake — no chapters.

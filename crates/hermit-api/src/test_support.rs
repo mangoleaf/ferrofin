@@ -649,6 +649,9 @@ impl MediaSourceManager for FakeMediaSources {
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// The deterministic access token [`FakeSessions`] mints on authentication, so

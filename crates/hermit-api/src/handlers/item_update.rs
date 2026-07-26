@@ -482,6 +482,15 @@ async fn refresh_item(
         .providers
         .queue_refresh(item_id, &options, RefreshPriority::High)
         .await?;
+    // Re-probe the file so a metadata refresh also corrects stale media info
+    // (duration, codecs, HDR/Dolby-Vision fields added since the first scan).
+    // This is the media-info half of the C# refresh; best-effort, so a probe
+    // failure doesn't fail the request.
+    if !matches!(metadata_refresh_mode, MetadataRefreshMode::None)
+        && let Err(e) = state.media_sources.refresh_media_streams(item_id).await
+    {
+        tracing::warn!(%item_id, error = %e, "media re-probe during refresh failed");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

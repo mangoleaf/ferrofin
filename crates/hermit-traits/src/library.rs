@@ -808,6 +808,13 @@ pub trait MediaSourceManager: Send + Sync {
 
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
+
+    /// Re-probes a leaf item's file (ffprobe) and rewrites its media streams and
+    /// duration/size — the media-info half of a metadata refresh. Used to correct
+    /// stale probe data (e.g. Dolby Vision fields added after the item was first
+    /// scanned) without a full library rescan. A folder/non-media/missing-path
+    /// item, or one with no encoder wired, is a successful no-op.
+    async fn refresh_media_streams(&self, item_id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_media_source_manager(_: &dyn MediaSourceManager) {}

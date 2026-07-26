@@ -886,6 +886,9 @@ mod tests {
         async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
             Err(ServiceError::backend("no live streams in test"))
         }
+        async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }

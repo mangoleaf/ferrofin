@@ -171,15 +171,30 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
         average_frame_rate: row.average_frame_rate.map(|v| v as f32),
         #[allow(clippy::cast_possible_truncation)]
         real_frame_rate: row.real_frame_rate.map(|v| v as f32),
+        // Dolby Vision / HDR10+ metadata — the wire DTO carries the present flags
+        // as 0/1 ints; the entity stores booleans. Required so playback's
+        // `video_range_type` sees DOVI/HDR10+ and negotiates copy-vs-transcode
+        // correctly.
+        dv_version_major: row.dv_version_major.and_then(|v| i32::try_from(v).ok()),
+        dv_version_minor: row.dv_version_minor.and_then(|v| i32::try_from(v).ok()),
+        dv_profile: row.dv_profile.and_then(|v| i32::try_from(v).ok()),
+        dv_level: row.dv_level.and_then(|v| i32::try_from(v).ok()),
+        dv_bl_signal_compatibility_id: row
+            .dv_bl_signal_compatibility_id
+            .and_then(|v| i32::try_from(v).ok()),
+        rpu_present_flag: row.rpu_present_flag.map(i32::from),
+        bl_present_flag: row.bl_present_flag.map(i32::from),
+        el_present_flag: row.el_present_flag.map(i32::from),
+        hdr10_plus_present_flag: row.hdr10_plus_present_flag,
         ..Default::default()
     }
 }
 
 /// Maps a probed wire [`MediaStream`] back to a persistable
 /// [`MediaStreamInfoEntity`] — the inverse of [`stream_to_dto`], used to store the
-/// streams a scan probe returned. The essential codec/geometry fields playback
-/// negotiation relies on are mapped; the optional HDR/Dolby-Vision metadata the
-/// wire DTO carries in a different shape defaults off.
+/// streams a scan probe returned. Codec/geometry plus the HDR/Dolby-Vision
+/// metadata (present flags stored as booleans) are mapped so the persisted row
+/// round-trips the video-range information playback negotiation relies on.
 pub(crate) fn stream_dto_to_entity(item_id: &str, s: &MediaStream) -> MediaStreamInfoEntity {
     MediaStreamInfoEntity {
         item_id: item_id.to_owned(),
@@ -220,6 +235,19 @@ pub(crate) fn stream_dto_to_entity(item_id: &str, s: &MediaStream) -> MediaStrea
         rotation: s.rotation.map(i64::from),
         average_frame_rate: s.average_frame_rate.map(f64::from),
         real_frame_rate: s.real_frame_rate.map(f64::from),
+        // Dolby Vision / HDR10+ metadata — load-bearing for the HDR video-range
+        // derivation (`MediaStream::video_range_type`) that drives the transcode
+        // copy-vs-encode decision. The DTO carries the present flags as 0/1 ints;
+        // the entity stores them as booleans.
+        dv_version_major: s.dv_version_major.map(i64::from),
+        dv_version_minor: s.dv_version_minor.map(i64::from),
+        dv_profile: s.dv_profile.map(i64::from),
+        dv_level: s.dv_level.map(i64::from),
+        dv_bl_signal_compatibility_id: s.dv_bl_signal_compatibility_id.map(i64::from),
+        rpu_present_flag: s.rpu_present_flag.map(|v| v != 0),
+        bl_present_flag: s.bl_present_flag.map(|v| v != 0),
+        el_present_flag: s.el_present_flag.map(|v| v != 0),
+        hdr10_plus_present_flag: s.hdr10_plus_present_flag,
         ..Default::default()
     }
 }
@@ -326,6 +354,36 @@ impl MediaSourceManager for HermitMediaSourceManager {
             .remove(id);
         Ok(())
     }
+
+    async fn refresh_media_streams(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let Some(item) = self.items.retrieve_item(item_id).await? else {
+            return Ok(());
+        };
+        let is_audio = item.media_type.as_deref() == Some("Audio");
+        let is_media = is_audio || item.media_type.as_deref() == Some("Video");
+        if item.is_folder || !is_media || item.path.is_none() {
+            return Ok(());
+        }
+        let request = hermit_traits::media_encoding::MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: item.path.clone(),
+                ..Default::default()
+            },
+            extract_chapters: false,
+            media_is_audio: is_audio,
+        };
+        // Re-probe and rewrite the item's stream rows (which carry the codec/HDR/
+        // Dolby-Vision fields). Duration/size persistence lives with the item
+        // repository's scan path, not this manager, so they are left as scanned.
+        let probed = self.encoder.get_media_info(&request).await?;
+        let streams: Vec<_> = probed
+            .media_streams
+            .iter()
+            .map(|s| stream_dto_to_entity(&item.id, s))
+            .collect();
+        self.streams.save_media_streams(item_id, &streams).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +397,42 @@ mod tests {
     use hermit_db::Database;
     use hermit_model::data::BaseItemKind;
     use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+
+    #[test]
+    fn dv_metadata_round_trips_through_entity() {
+        use hermit_model::data::VideoRangeType;
+        // A Dolby Vision Profile 8.1 (HDR10-compatible) video stream, as ffprobe
+        // reports it: present flags as 0/1 ints, HDR10 base transfer.
+        let dto = MediaStream {
+            index: 0,
+            stream_type: hermit_model::entities::MediaStreamType::Video,
+            codec: Some("av1".to_owned()),
+            color_transfer: Some("smpte2084".to_owned()),
+            dv_profile: Some(8),
+            dv_level: Some(10),
+            dv_version_major: Some(1),
+            dv_bl_signal_compatibility_id: Some(1),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            el_present_flag: Some(0),
+            ..MediaStream::default()
+        };
+        let entity = stream_dto_to_entity("item-1", &dto);
+        assert_eq!(entity.dv_profile, Some(8));
+        assert_eq!(entity.dv_bl_signal_compatibility_id, Some(1));
+        assert_eq!(entity.rpu_present_flag, Some(true));
+        assert_eq!(entity.bl_present_flag, Some(true));
+        assert_eq!(entity.el_present_flag, Some(false));
+
+        let back = stream_to_dto(&entity);
+        assert_eq!(back.dv_profile, Some(8));
+        assert_eq!(back.dv_bl_signal_compatibility_id, Some(1));
+        assert_eq!(back.rpu_present_flag, Some(1));
+        assert_eq!(back.bl_present_flag, Some(1));
+        assert_eq!(back.el_present_flag, Some(0));
+        // The point of persisting DV: the derived range is DOVI, not plain HDR10.
+        assert_eq!(back.video_range_type(), VideoRangeType::DoviWithHdr10);
+    }
 
     /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
     struct StubEncoder;
