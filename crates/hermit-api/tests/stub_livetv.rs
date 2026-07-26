@@ -29,22 +29,16 @@ use tower::ServiceExt;
 /// The still-stubbed `(method, path)` ops of the `LiveTvController`, with
 /// concrete segment values where the vendored route has a `{param}`. 22 ops.
 const LIVETV_PROBES: &[(Method, &str)] = &[
-    // Channels — single-channel lookup (no channels exist to fetch)
-    (Method::GET, "/LiveTv/Channels/channel-1"),
     // Channel mapping (mutation)
     (Method::POST, "/LiveTv/ChannelMappings"),
-    // Listing providers (mutation + SchedulesDirect proxy)
-    (Method::POST, "/LiveTv/ListingProviders"),
-    (Method::DELETE, "/LiveTv/ListingProviders"),
+    // Listing providers — SchedulesDirect proxy (not the XMLTV backend)
     (
         Method::GET,
         "/LiveTv/ListingProviders/SchedulesDirect/Countries",
     ),
-    // Live streams (need real media)
+    // Live streams (need the DVR/live-stream backend)
     (Method::GET, "/LiveTv/LiveRecordings/recording-1/stream"),
     (Method::GET, "/LiveTv/LiveStreamFiles/stream-1/stream.mp4"),
-    // Programs — single-program lookup
-    (Method::GET, "/LiveTv/Programs/program-1"),
     // Recordings — by-id lookup, delete, deprecated group lookup
     (Method::GET, "/LiveTv/Recordings/Groups/group-1"),
     (Method::GET, "/LiveTv/Recordings/recording-1"),
@@ -59,11 +53,6 @@ const LIVETV_PROBES: &[(Method, &str)] = &[
     (Method::GET, "/LiveTv/Timers/timer-1"),
     (Method::POST, "/LiveTv/Timers/timer-1"),
     (Method::DELETE, "/LiveTv/Timers/timer-1"),
-    // Tuner hosts (mutation)
-    (Method::POST, "/LiveTv/TunerHosts"),
-    (Method::DELETE, "/LiveTv/TunerHosts"),
-    // Tuners — reset (mutation)
-    (Method::POST, "/LiveTv/Tuners/tuner-1/Reset"),
 ];
 
 #[tokio::test]
@@ -91,14 +80,16 @@ async fn unit6_livetv_stub_routes_return_501_not_404() {
     }
 }
 
-/// Guards the op count: of the `LiveTvController`'s 41 contract routes, 19 are
-/// now real (empty/disabled read surface) and 22 remain stubbed. This doubles as
-/// a drift alarm — promoting another op to real must decrement this count.
+/// Guards the op count: of the `LiveTvController`'s 41 contract routes, 26 are
+/// now real (the read/disabled surface plus tuner-host/listing-provider config,
+/// channel/program by-id, and tuner reset) and 15 remain stubbed (ChannelMappings,
+/// SchedulesDirect, live streams, and the DVR recording/timer surface). This
+/// doubles as a drift alarm — promoting another op to real must decrement this.
 #[test]
 fn unit6_covers_remaining_stubbed_livetv_ops() {
     assert_eq!(
         LIVETV_PROBES.len(),
-        22,
-        "22 LiveTv ops remain 501-stubbed (41 total − 19 real); probe table drifted"
+        15,
+        "15 LiveTv ops remain 501-stubbed (41 total − 26 real); probe table drifted"
     );
 }
