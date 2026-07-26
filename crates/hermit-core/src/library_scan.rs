@@ -516,7 +516,7 @@ impl LibraryScanner {
                 let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
                 if season.season_number.is_some() || season.is_season_folder {
                     let num = season.season_number;
-                    let name = num.map_or_else(|| entry.name.clone(), |n| format!("Season {n}"));
+                    let name = num.map_or_else(|| entry.name.clone(), season_display_name);
                     let Some((season_id, mut e)) = Self::base_item(
                         BaseItemKind::Season,
                         cf,
@@ -595,7 +595,7 @@ impl LibraryScanner {
             if season_ids.contains_key(&num) {
                 continue;
             }
-            let name = num.map_or_else(|| "Season Unknown".to_owned(), |n| format!("Season {n}"));
+            let name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
             // A flat series has no season folder, so derive a stable id from a
             // synthetic path (unique per series+season) and leave the season's own
             // path unset (it is a virtual grouping, not an on-disk folder).
@@ -760,6 +760,16 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
         ImageType::Banner => "banner",
         // Primary + anything else lands on the primary poster name.
         _ => "primary",
+    }
+}
+
+/// The display name for a season number — `0` is "Specials" (Jellyfin's
+/// convention for extras/specials), every other number is "Season N".
+fn season_display_name(number: i32) -> String {
+    if number == 0 {
+        "Specials".to_owned()
+    } else {
+        format!("Season {number}")
     }
 }
 

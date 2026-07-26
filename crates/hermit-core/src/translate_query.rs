@@ -824,6 +824,16 @@ fn order_column(by: ItemSortBy) -> &'static str {
         ItemSortBy::VideoBitRate => r#"bi."TotalBitrate""#,
         ItemSortBy::ParentIndexNumber => r#"bi."ParentIndexNumber""#,
         ItemSortBy::IndexNumber => r#"bi."IndexNumber""#,
+        // Aired order: (season, episode). Specials (`ParentIndexNumber = 0`) have
+        // no air-date positioning here, so they sort *after* the regular seasons
+        // (rather than at the very front, where `SortName`/filename order put
+        // them and made "Play"/"Play All" start on a special). Port of
+        // `AiredEpisodeOrderComparer` with the metadata-less special placed last.
+        ItemSortBy::AiredEpisodeOrder => {
+            r#"(CASE WHEN bi."ParentIndexNumber" = 0 THEN 1000000
+                     ELSE COALESCE(bi."ParentIndexNumber", 0) END) * 100000
+               + COALESCE(bi."IndexNumber", 0)"#
+        }
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,

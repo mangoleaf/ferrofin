@@ -133,6 +133,46 @@ async fn mark_unplayed_item(
     Ok(Json(dto))
 }
 
+/// `POST /Users/{userId}/PlayedItems/{itemId}` — the legacy per-user played
+/// route jellyfin-web still calls (the contract form is `/UserPlayedItems/...`).
+async fn mark_played_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<MarkPlayedQuery>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user = resolve_user(&state, &auth, Some(user_id)).await?;
+    let uid = parse_id(&user.id);
+    assert_item_exists(&state, item_id).await?;
+    let dto = state
+        .user_data
+        .mark_played(uid, item_id, query.date_played)
+        .await?;
+    for guest in additional_user_ids(&state, &auth).await? {
+        state
+            .user_data
+            .mark_played(guest, item_id, query.date_played)
+            .await?;
+    }
+    Ok(Json(dto))
+}
+
+/// `DELETE /Users/{userId}/PlayedItems/{itemId}` — legacy per-user mark-unplayed.
+async fn unmark_played_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let user = resolve_user(&state, &auth, Some(user_id)).await?;
+    let uid = parse_id(&user.id);
+    assert_item_exists(&state, item_id).await?;
+    let dto = state.user_data.mark_unplayed(uid, item_id).await?;
+    for guest in additional_user_ids(&state, &auth).await? {
+        state.user_data.mark_unplayed(guest, item_id).await?;
+    }
+    Ok(Json(dto))
+}
+
 /// `POST /Sessions/Playing` — reports playback has started.
 ///
 /// Port of `PlaystateController.ReportPlaybackStart`.
@@ -449,6 +489,10 @@ async fn additional_user_ids(
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
+        .route(
+            "/Users/{userId}/PlayedItems/{itemId}",
+            post(mark_played_for_user).delete(unmark_played_for_user),
+        )
         .route(
             "/UserPlayedItems/{itemId}",
             post(mark_played_item).delete(mark_unplayed_item),

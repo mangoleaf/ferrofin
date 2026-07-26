@@ -173,6 +173,59 @@ async fn unmark_favorite(
     set_favorite(&state, &auth, query.user_id, item_id, false).await
 }
 
+/// `POST /Users/{userId}/FavoriteItems/{itemId}` — the legacy per-user favourite
+/// route. jellyfin-web (apiclient) still calls this form; the current contract
+/// route is `/UserFavoriteItems/{itemId}`. Same handler, `userId` from the path.
+async fn mark_favorite_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    set_favorite(&state, &auth, Some(user_id), item_id, true).await
+}
+
+/// `DELETE /Users/{userId}/FavoriteItems/{itemId}` — legacy per-user unfavourite.
+async fn unmark_favorite_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    set_favorite(&state, &auth, Some(user_id), item_id, false).await
+}
+
+/// `POST /Users/{userId}/Items/{itemId}/Rating` — legacy per-user like route.
+async fn update_rating_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<RatingQuery>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let (user_uuid, resolved_item) =
+        resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
+    let update = UpdateUserItemDataDto {
+        likes: query.likes,
+        ..UpdateUserItemDataDto::default()
+    };
+    save_and_return(&state, user_uuid, resolved_item, &update).await
+}
+
+/// `DELETE /Users/{userId}/Items/{itemId}/Rating` — legacy per-user clear-like.
+/// Mirrors `delete_rating` (a `likes = null` clear reads back current data).
+async fn delete_rating_for_user(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let (user_uuid, resolved_item) =
+        resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
+    let dto = state
+        .user_data
+        .get_user_data_dto(resolved_item, user_uuid)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("user data for item {resolved_item}")))?;
+    Ok(Json(dto))
+}
+
 /// Shared favourite toggle for the mark/unmark handlers.
 async fn set_favorite(
     state: &AppState,
@@ -611,6 +664,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/UserFavoriteItems/{itemId}",
             post(mark_favorite).delete(unmark_favorite),
+        )
+        // Legacy per-user routes still used by jellyfin-web's apiclient.
+        .route(
+            "/Users/{userId}/FavoriteItems/{itemId}",
+            post(mark_favorite_for_user).delete(unmark_favorite_for_user),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/Rating",
+            post(update_rating_for_user).delete(delete_rating_for_user),
         )
         .route(
             "/Users/{userId}/Items/Latest",
