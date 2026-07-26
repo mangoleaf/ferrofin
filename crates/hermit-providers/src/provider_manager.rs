@@ -29,11 +29,75 @@ use hermit_model::providers::{
 };
 use hermit_traits::error::ServiceError;
 use hermit_traits::options::ItemImageInfo;
-use hermit_traits::persistence::ItemPersistenceService;
+use hermit_traits::persistence::{ItemPersistenceService, ItemRepository};
 use hermit_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority, RemoteSearchRequest,
 };
 use uuid::Uuid;
+
+use crate::tmdb::{TmdbClient, TmdbKind};
+
+/// A [`RemoteSearchProvider`] backed by TMDB (the "Identify" flow). One instance
+/// searches a single kind (movie or series), so it is registered once per kind.
+pub struct TmdbSearchProvider {
+    tmdb: Arc<TmdbClient>,
+    kind: TmdbKind,
+    supported: BaseItemKind,
+}
+
+impl TmdbSearchProvider {
+    /// A TMDB search provider for `kind` (`Movie` or `Series`).
+    #[must_use]
+    pub fn new(tmdb: Arc<TmdbClient>, kind: TmdbKind) -> Self {
+        let supported = match kind {
+            TmdbKind::Movie => BaseItemKind::Movie,
+            TmdbKind::Series => BaseItemKind::Series,
+        };
+        Self {
+            tmdb,
+            kind,
+            supported,
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for TmdbSearchProvider {
+    // The trait fixes the return as `&str`; the literal is unavoidably behind it.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "TheMovieDb"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == self.supported
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        let hits = self.tmdb.search(self.kind, name, search_info.year).await;
+        Ok(hits
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                name: hit.name,
+                production_year: hit.year,
+                image_url: hit.poster_url,
+                overview: hit.overview,
+                provider_ids: Some(std::collections::HashMap::from([(
+                    "Tmdb".to_owned(),
+                    hit.tmdb_id.to_string(),
+                )])),
+                search_provider_name: Some("TheMovieDb".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
 
 /// A single remote metadata-search fetcher (e.g. a TMDb or MusicBrainz plugin).
 ///
@@ -77,6 +141,10 @@ pub struct LocalProviderManager {
     /// to. Present enables the `save_image`/`delete_image` write paths.
     image_store: Option<Arc<dyn ItemPersistenceService>>,
     metadata_dir: Option<PathBuf>,
+    /// The TMDB client + item store used by the remote-image ("Choose Image")
+    /// methods to resolve an item and list/download its TMDB artwork.
+    tmdb: Option<Arc<TmdbClient>>,
+    items: Option<Arc<dyn ItemRepository>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -89,6 +157,8 @@ impl std::fmt::Debug for LocalProviderManager {
             )
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
+            .field("has_tmdb", &self.tmdb.is_some())
+            .field("has_items", &self.items.is_some())
             .finish()
     }
 }
@@ -107,7 +177,23 @@ impl LocalProviderManager {
             remote_search_providers: Vec::new(),
             image_store: None,
             metadata_dir: None,
+            tmdb: None,
+            items: None,
         }
+    }
+
+    /// Attaches the TMDB client + item store used by the remote-image methods
+    /// (`get_available_remote_images` / `save_image_from_url`). Absent, those
+    /// stay empty/deferred.
+    #[must_use]
+    pub fn with_remote_images(
+        mut self,
+        tmdb: Arc<TmdbClient>,
+        items: Arc<dyn ItemRepository>,
+    ) -> Self {
+        self.tmdb = Some(tmdb);
+        self.items = Some(items);
+        self
     }
 
     /// Registers the remote-search fetchers this manager queries.
@@ -136,6 +222,29 @@ impl LocalProviderManager {
         self.image_store = Some(image_store);
         self.metadata_dir = Some(metadata_dir);
         self
+    }
+
+    /// Resolves an item to `(TmdbKind, name, year)` for a TMDB lookup, or `None`
+    /// when the item is missing, pathless, or a kind TMDB does not serve here
+    /// (only movies/series).
+    async fn tmdb_lookup(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        item_id: Uuid,
+    ) -> Result<Option<(TmdbKind, String, Option<i32>)>, ServiceError> {
+        let Some(entity) = items.retrieve_item(item_id).await? else {
+            return Ok(None);
+        };
+        let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
+            "Movie" => TmdbKind::Movie,
+            "Series" => TmdbKind::Series,
+            _ => return Ok(None),
+        };
+        let Some(name) = entity.name.filter(|n| !n.is_empty()) else {
+            return Ok(None);
+        };
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        Ok(Some((kind, name, year)))
     }
 
     /// Builds the "operation deferred" error for the orchestration methods that
@@ -231,12 +340,25 @@ impl ProviderManager for LocalProviderManager {
 
     async fn save_image_from_url(
         &self,
-        _item_id: Uuid,
-        _url: &str,
-        _image_type: ImageType,
-        _image_index: Option<i32>,
+        item_id: Uuid,
+        url: &str,
+        image_type: ImageType,
+        image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        Err(Self::deferred("save_image_from_url"))
+        let Some(tmdb) = &self.tmdb else {
+            return Err(Self::deferred("save_image_from_url"));
+        };
+        let bytes = tmdb.download(url).await.ok_or_else(|| {
+            ServiceError::backend(format!("could not download remote image {url}"))
+        })?;
+        // Reuse the local write+persist path.
+        let mime = if url.to_ascii_lowercase().ends_with(".png") {
+            "image/png"
+        } else {
+            "image/jpeg"
+        };
+        self.save_image(item_id, &bytes, mime, image_type, image_index)
+            .await
     }
 
     async fn save_image(
@@ -297,18 +419,52 @@ impl ProviderManager for LocalProviderManager {
 
     async fn get_available_remote_images(
         &self,
-        _item_id: Uuid,
-        _query: &RemoteImageQuery,
+        item_id: Uuid,
+        query: &RemoteImageQuery,
     ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
-        // No remote image providers are wired in First-Light.
-        Ok(Vec::new())
+        let (Some(tmdb), Some(items)) = (&self.tmdb, &self.items) else {
+            return Ok(Vec::new());
+        };
+        let Some((kind, name, year)) = self.tmdb_lookup(items, item_id).await? else {
+            return Ok(Vec::new());
+        };
+        // Best-match the title, then list all of TMDB's images for it.
+        let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let images = tmdb.all_images(kind, hit.tmdb_id).await;
+        Ok(images
+            .into_iter()
+            .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
+            .map(|img| RemoteImageInfo {
+                provider_name: Some("TheMovieDb".to_owned()),
+                url: Some(img.url),
+                width: img.width,
+                height: img.height,
+                community_rating: img.community_rating,
+                vote_count: img.vote_count,
+                language: img.language,
+                type_: img.image_type,
+                ..RemoteImageInfo::default()
+            })
+            .collect())
     }
 
     async fn get_remote_image_provider_info(
         &self,
-        _item_id: Uuid,
+        item_id: Uuid,
     ) -> Result<Vec<ImageProviderInfo>, ServiceError> {
-        Ok(Vec::new())
+        let Some(items) = &self.items else {
+            return Ok(Vec::new());
+        };
+        // Advertise TMDB only for the kinds it serves.
+        if self.tmdb_lookup(items, item_id).await?.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![ImageProviderInfo {
+            name: Some("TheMovieDb".to_owned()),
+            supported_images: vec![ImageType::Primary, ImageType::Backdrop],
+        }])
     }
 
     async fn save_metadata(
@@ -316,7 +472,12 @@ impl ProviderManager for LocalProviderManager {
         _item_id: Uuid,
         _update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
-        Err(Self::deferred("save_metadata"))
+        // The DB-side persistence already happened in the caller (e.g.
+        // `save_image_from_url` → `set_item_image`). The remaining C# work is
+        // writing metadata savers (NFO/images to the media folder), which Hermit
+        // defers — so this is a successful no-op rather than a hard failure, and
+        // the image-download / metadata-edit flows complete.
+        Ok(())
     }
 
     async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
@@ -667,11 +828,12 @@ mod tests {
             .expect_err("save_image deferred");
         assert!(save_bytes.to_string().contains("save_image"));
 
-        let save_meta = mgr
-            .save_metadata(id, ItemUpdateType::MetadataDownload)
+        // `save_metadata` is an accepted no-op (the DB write happens in the
+        // caller; NFO-saver writing is deferred), so the image-download /
+        // metadata-edit flows complete rather than 500.
+        mgr.save_metadata(id, ItemUpdateType::MetadataDownload)
             .await
-            .expect_err("save_metadata deferred");
-        assert!(save_meta.to_string().contains("save_metadata"));
+            .expect("save_metadata is an accepted no-op");
     }
 
     /// The read-only descriptor queries return empty/default results (no store,

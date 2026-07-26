@@ -228,11 +228,30 @@ pub async fn build_app_state(
     let image_processor: Arc<dyn hermit_traits::drawing::ImageProcessor> = Arc::new(
         ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), paths.image_cache_path()),
     );
-    let providers: Arc<dyn hermit_traits::providers::ProviderManager> =
-        Arc::new(LocalProviderManager::new(Vec::new()).with_image_store(
-            Arc::clone(&item_persistence_service),
-            std::path::PathBuf::from(paths.internal_metadata_path()).join("library"),
-        ));
+    // The shared TMDB client — the scan's automatic artwork, the remote-search
+    // ("Identify") providers, and the remote-image ("Choose Image") methods all
+    // use Jellyfin's built-in key.
+    let tmdb_client = Arc::new(hermit_providers::TmdbClient::new());
+    let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
+    let tmdb_search: Vec<Arc<dyn hermit_providers::RemoteSearchProvider>> = vec![
+        Arc::new(hermit_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            hermit_providers::TmdbKind::Movie,
+        )),
+        Arc::new(hermit_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            hermit_providers::TmdbKind::Series,
+        )),
+    ];
+    let providers: Arc<dyn hermit_traits::providers::ProviderManager> = Arc::new(
+        LocalProviderManager::new(Vec::new())
+            .with_image_store(
+                Arc::clone(&item_persistence_service),
+                metadata_library.clone(),
+            )
+            .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
+            .with_remote_search_providers(tmdb_search),
+    );
     let file_system: Arc<dyn hermit_traits::filesystem::FileSystem> =
         Arc::new(HermitFileSystem::new());
     let event_manager: Arc<dyn hermit_traits::events::EventManager> =
@@ -319,10 +338,7 @@ pub async fn build_app_state(
         )
         // Fetch remote artwork (TMDB) for movies/series with no local images,
         // using Jellyfin's built-in key so posters/backdrops appear with no setup.
-        .with_metadata(
-            Arc::new(hermit_providers::TmdbClient::new()),
-            std::path::PathBuf::from(paths.internal_metadata_path()).join("library"),
-        ),
+        .with_metadata(Arc::clone(&tmdb_client), metadata_library),
     );
     let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
         HermitLibraryManager::new(

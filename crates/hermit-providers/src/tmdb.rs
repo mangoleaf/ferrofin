@@ -48,12 +48,80 @@ struct SearchHit {
     poster_path: Option<String>,
     #[serde(default)]
     backdrop_path: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
     #[serde(default)]
     results: Vec<SearchHit>,
+}
+
+/// One candidate from a TMDB name search (the "Identify" flow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbSearchHit {
+    /// The TMDB id.
+    pub tmdb_id: i64,
+    /// The candidate's title/name.
+    pub name: Option<String>,
+    /// The release / first-air year.
+    pub year: Option<i32>,
+    /// The poster image URL (for the result thumbnail).
+    pub poster_url: Option<String>,
+    /// The plot overview.
+    pub overview: Option<String>,
+}
+
+/// One image offered by TMDB for an item (the "Choose Image" flow).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmdbImage {
+    /// Whether this is a poster (Primary) or backdrop.
+    pub image_type: ImageType,
+    /// The full-resolution image URL.
+    pub url: String,
+    /// The image width in pixels.
+    pub width: Option<i32>,
+    /// The image height in pixels.
+    pub height: Option<i32>,
+    /// The community rating (TMDB `vote_average`).
+    pub community_rating: Option<f64>,
+    /// The vote count backing the rating.
+    pub vote_count: Option<i32>,
+    /// The ISO-639-1 language of the image, if tagged.
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImagesResponse {
+    #[serde(default)]
+    posters: Vec<ImageEntry>,
+    #[serde(default)]
+    backdrops: Vec<ImageEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageEntry {
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    vote_count: Option<i32>,
+    #[serde(default)]
+    iso_639_1: Option<String>,
 }
 
 /// A matched TV series: its TMDB id (for season/episode follow-up) + poster and
@@ -265,6 +333,91 @@ impl TmdbClient {
         images
     }
 
+    /// Searches TMDB by name/year and returns the candidate list (the "Identify"
+    /// flow). Empty on no match or any error.
+    pub async fn search(
+        &self,
+        kind: TmdbKind,
+        name: &str,
+        year: Option<i32>,
+    ) -> Vec<TmdbSearchHit> {
+        let (path, year_param) = match kind {
+            TmdbKind::Movie => ("search/movie", "year"),
+            TmdbKind::Series => ("search/tv", "first_air_date_year"),
+        };
+        let mut req = self
+            .http
+            .get(format!("{API_BASE}/{path}"))
+            .query(&[("api_key", self.api_key.as_str()), ("query", name)]);
+        if let Some(y) = year {
+            req = req.query(&[(year_param, y.to_string())]);
+        }
+        let Ok(resp) = req.send().await else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<SearchResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .results
+            .into_iter()
+            .map(|hit| TmdbSearchHit {
+                tmdb_id: hit.id,
+                name: hit.title.or(hit.name),
+                year: year_from(hit.release_date.or(hit.first_air_date).as_deref()),
+                poster_url: hit
+                    .poster_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!("{IMAGE_BASE}{p}")),
+                overview: hit.overview.filter(|o| !o.is_empty()),
+            })
+            .collect()
+    }
+
+    /// Lists **all** poster (Primary) + backdrop images TMDB has for a title (the
+    /// "Choose Image" flow), via `/movie|tv/{id}/images`. Empty on any error.
+    pub async fn all_images(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<TmdbImage> {
+        let path = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Series => "tv",
+        };
+        let Ok(resp) = self
+            .http
+            .get(format!("{API_BASE}/{path}/{tmdb_id}/images"))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+            return Vec::new();
+        };
+        let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
+            entries.into_iter().filter_map(move |e| {
+                let path = e.file_path.filter(|p| !p.is_empty())?;
+                Some(TmdbImage {
+                    image_type,
+                    url: format!("{IMAGE_BASE}{path}"),
+                    width: e.width,
+                    height: e.height,
+                    community_rating: e.vote_average,
+                    vote_count: e.vote_count,
+                    language: e.iso_639_1.filter(|l| !l.is_empty()),
+                })
+            })
+        };
+        map(parsed.posters, ImageType::Primary)
+            .chain(map(parsed.backdrops, ImageType::Backdrop))
+            .collect()
+    }
+
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
         let resp = self.http.get(url).send().await.ok()?;
@@ -275,9 +428,21 @@ impl TmdbClient {
     }
 }
 
+/// The four-digit year from a TMDB `YYYY-MM-DD` date string.
+fn year_from(date: Option<&str>) -> Option<i32> {
+    date?.get(0..4)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn year_parsed_from_date_prefix() {
+        assert_eq!(year_from(Some("2014-10-10")), Some(2014));
+        assert_eq!(year_from(Some("")), None);
+        assert_eq!(year_from(None), None);
+    }
 
     #[test]
     fn empty_user_key_falls_back_to_builtin() {

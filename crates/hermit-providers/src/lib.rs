@@ -19,7 +19,9 @@ pub mod xbmc;
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
-pub use tmdb::{RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbKind};
+pub use tmdb::{
+    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbImage, TmdbKind, TmdbSearchHit,
+};
 
 pub use container_types::{
     FileSystemMetadata, ItemInfo, LocalImageInfo, MetadataResult, NfoItem, PersonInfo,
@@ -31,5 +33,5 @@ pub use local_images::{
     LocalImageProvider,
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
-pub use provider_manager::{LocalProviderManager, RemoteSearchProvider};
+pub use provider_manager::{LocalProviderManager, RemoteSearchProvider, TmdbSearchProvider};
 pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};
