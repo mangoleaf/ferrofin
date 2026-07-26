@@ -412,12 +412,49 @@ impl PlaylistManager for HermitPlaylistManager {
 
     async fn move_item(
         &self,
-        _playlist_id: &str,
-        _entry_id: &str,
-        _new_index: i32,
+        playlist_id: &str,
+        entry_id: &str,
+        new_index: i32,
         _calling_user_id: Uuid,
     ) -> Result<(), ServiceError> {
-        // Reordering needs an ordinal column the leaf schema lacks (deferred).
+        // Port of `Playlist.MoveItem`: pull the current order, relocate the entry,
+        // then rewrite the `SortOrder` ordinals. `entry_id` is the `ChildId` (as
+        // `remove_item_from_playlist` treats it).
+        // Same ordering the read path uses (`get_linked_children_ids`), so the
+        // relocation matches what the client sees.
+        let mut order: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "ChildId" FROM "LinkedChildren"
+               WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+        )
+        .bind(playlist_id)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        let Some(pos) = order.iter().position(|c| c == entry_id) else {
+            return Ok(()); // entry not in the playlist — nothing to move
+        };
+        let child = order.remove(pos);
+        // Clamp to the valid range of the now-shorter list (C# `Math.Clamp`).
+        let target = usize::try_from(new_index.max(0))
+            .unwrap_or(usize::MAX)
+            .min(order.len());
+        order.insert(target, child);
+
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        for (ordinal, child) in order.iter().enumerate() {
+            sqlx::query(
+                r#"UPDATE "LinkedChildren" SET "SortOrder" = ?1
+                   WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
+            )
+            .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+            .bind(playlist_id)
+            .bind(child)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 

@@ -223,9 +223,14 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
     ) -> Result<(), ServiceError> {
         // Insert a new edge, or update its ChildType if the (parent, child) pair
         // already exists (C# find-or-add on the composite key).
+        // Append: `SortOrder` = one past the parent's current max, so the stored
+        // order is insertion order and reordering (`move_item`) has stable
+        // ordinals to rewrite. An existing edge keeps its position.
         sqlx::query(
             r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
-               VALUES (?1, ?2, ?3, NULL)
+               VALUES (?1, ?2, ?3,
+                   (SELECT COALESCE(MAX("SortOrder"), -1) + 1
+                    FROM "LinkedChildren" WHERE "ParentId" = ?1))
                ON CONFLICT("ParentId", "ChildId") DO UPDATE SET "ChildType" = excluded."ChildType""#,
         )
         .bind(parent_id.to_string())
