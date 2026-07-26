@@ -377,17 +377,40 @@ impl PlaylistManager for HermitPlaylistManager {
         &self,
         playlist_id: Uuid,
         item_ids: &[Uuid],
-        _position: Option<i32>,
+        position: Option<i32>,
         _user_id: Uuid,
     ) -> Result<(), ServiceError> {
-        // Explicit-position insertion is deferred (linked-children carry no
-        // ordinal in this leaf schema); items are appended.
+        // Append each item (upsert assigns `SortOrder = max + 1`).
         for item_id in item_ids {
             self.linked_children
                 .upsert_linked_child(playlist_id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
-        Ok(())
+        // If a position was requested, relocate the just-appended items there.
+        let Some(pos) = position else {
+            return Ok(());
+        };
+        let pid = playlist_id.to_string();
+        let added: Vec<String> = item_ids.iter().map(Uuid::to_string).collect();
+        let mut order: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "ChildId" FROM "LinkedChildren"
+               WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+        )
+        .bind(&pid)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        // Pull the added items out (they were appended), then re-insert as a block
+        // at the clamped target index, preserving their given order.
+        order.retain(|c| !added.contains(c));
+        let target = usize::try_from(pos.max(0))
+            .unwrap_or(usize::MAX)
+            .min(order.len());
+        for (offset, child) in added.iter().enumerate() {
+            let at = (target + offset).min(order.len());
+            order.insert(at, child.clone());
+        }
+        write_sort_order(self.db.pool(), &pid, &order).await
     }
 
     async fn remove_item_from_playlist(
@@ -440,28 +463,36 @@ impl PlaylistManager for HermitPlaylistManager {
             .unwrap_or(usize::MAX)
             .min(order.len());
         order.insert(target, child);
-
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
-        for (ordinal, child) in order.iter().enumerate() {
-            sqlx::query(
-                r#"UPDATE "LinkedChildren" SET "SortOrder" = ?1
-                   WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
-            )
-            .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-            .bind(playlist_id)
-            .bind(child)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
-        tx.commit().await.map_err(db_err)?;
-        Ok(())
+        write_sort_order(self.db.pool(), playlist_id, &order).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
         // Owner tracking (and share transfer) is deferred; nothing is removed.
         Ok(())
     }
+}
+
+/// Rewrites the `SortOrder` ordinals (`0,1,2,…`) for a playlist's children in the
+/// given order, in one transaction. Shared by add-at-position and move.
+async fn write_sort_order(
+    pool: &sqlx::SqlitePool,
+    playlist_id: &str,
+    order: &[String],
+) -> Result<(), ServiceError> {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    for (ordinal, child) in order.iter().enumerate() {
+        sqlx::query(
+            r#"UPDATE "LinkedChildren" SET "SortOrder" = ?1
+               WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
+        )
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(playlist_id)
+        .bind(child)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)
 }
 
 #[cfg(test)]
@@ -616,6 +647,63 @@ mod tests {
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         assert!(ids.contains(&track_a.to_string()));
         assert!(ids.contains(&track_b.to_string()));
+    }
+
+    #[tokio::test]
+    async fn add_item_at_position_relocates_appended_block() {
+        let db = test_db().await;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, c] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Ordered".to_owned()),
+                item_id_list: vec![a, b],
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        // Insert C at the front: expect [C, A, B].
+        mgr.add_item_to_playlist(playlist_id, &[c], Some(0), Uuid::new_v4())
+            .await
+            .expect("add at 0");
+        let order: Vec<String> = mgr
+            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .await
+            .expect("items")
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![c.to_string(), a.to_string(), b.to_string()],
+            "position 0 should move the appended item to the front"
+        );
+
+        // No position → plain append at the end.
+        let d = Uuid::new_v4();
+        seed_item(&db, d, BaseItemKind::Audio).await;
+        mgr.add_item_to_playlist(playlist_id, &[d], None, Uuid::new_v4())
+            .await
+            .expect("append");
+        let last = mgr
+            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .await
+            .expect("items2")
+            .last()
+            .expect("non-empty")
+            .id
+            .clone();
+        assert_eq!(last, d.to_string(), "no position should append at the end");
     }
 
     #[tokio::test]
