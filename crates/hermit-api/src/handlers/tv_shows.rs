@@ -417,9 +417,19 @@ async fn get_episodes(
         internal.is_missing = Some(is_missing);
     }
 
-    // `startItemId`/`adjacentTo` remain documented deferrals — they need the
-    // reconstructed alternate-version/sibling tree.
-    let episodes = state.library.get_item_list(&internal).await?;
+    let mut episodes = state.library.get_item_list(&internal).await?;
+
+    // `startItemId`: return the run of episodes from that item onward, so a client
+    // playing "from this episode" queues the right slice. Port of C#
+    // `episodes.SkipWhile(i => i.Id != startItemId)` — drop everything before the
+    // match; if the item isn't in this list, the skip consumes all (empty).
+    if let Some(start_item_id) = query.start_item_id {
+        let start = start_item_id.to_string();
+        match episodes.iter().position(|e| e.id == start) {
+            Some(pos) => drop(episodes.drain(..pos)),
+            None => episodes.clear(),
+        }
+    }
 
     let total = i32::try_from(episodes.len()).unwrap_or(i32::MAX);
     let page = paginate(episodes, query.start_index, query.limit);
