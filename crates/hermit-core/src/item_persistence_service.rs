@@ -140,6 +140,15 @@ impl ItemPersistenceService for HermitItemPersistenceService {
                 // Never delete the UserData placeholder row.
                 continue;
             }
+            // `LinkedChildren` is the one BaseItems FK without `ON DELETE CASCADE`
+            // (it references the item as both parent and child), so clear those
+            // links first — otherwise deleting a playlist/collection, or an item
+            // that belongs to one, trips a FOREIGN KEY constraint (787).
+            sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
+                .bind(id.to_string())
+                .execute(self.db.pool())
+                .await
+                .map_err(db_err)?;
             sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(id.to_string())
                 .execute(self.db.pool())
@@ -392,3 +401,62 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "TopParentId" = excluded."TopParentId", "TotalBitrate" = excluded."TotalBitrate",
     "Type" = excluded."Type", "UnratedType" = excluded."UnratedType", "Width" = excluded."Width"
 "#;
+
+#[cfg(test)]
+mod tests {
+    use hermit_model::data::BaseItemKind;
+    use hermit_traits::persistence::{ItemPersistenceService, LinkedChildrenService};
+    use uuid::Uuid;
+
+    use crate::linked_children_service::HermitLinkedChildrenService;
+    use crate::test_support::{seed_item, test_db};
+
+    use super::HermitItemPersistenceService;
+
+    // A playlist (parent) and one of its members (child) both live in
+    // `LinkedChildren`, whose BaseItems FK lacks `ON DELETE CASCADE`. Deleting
+    // either must clear those links first instead of tripping constraint 787.
+    #[tokio::test]
+    async fn delete_clears_linked_children_both_directions() {
+        let db = test_db().await;
+        let playlist = Uuid::new_v4();
+        let (member_a, member_b) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, playlist, BaseItemKind::Playlist).await;
+        seed_item(&db, member_a, BaseItemKind::Movie).await;
+        seed_item(&db, member_b, BaseItemKind::Movie).await;
+
+        let links = HermitLinkedChildrenService::new(db.clone());
+        links
+            .upsert_linked_child(playlist, member_a, 0)
+            .await
+            .expect("link a");
+        links
+            .upsert_linked_child(playlist, member_b, 0)
+            .await
+            .expect("link b");
+
+        let svc = HermitItemPersistenceService::new(db.clone());
+
+        // Delete a member (the ChildId FK direction): its link clears, the
+        // playlist and other member survive — no FK 787.
+        svc.delete_items(&[member_a])
+            .await
+            .expect("delete member_a");
+        assert!(!svc.item_exists(member_a).await.expect("exists a"));
+        assert!(svc.item_exists(playlist).await.expect("playlist survives"));
+
+        // Delete the playlist (the ParentId FK direction) while member_b's link
+        // still exists — must clear it instead of tripping FK 787.
+        svc.delete_items(&[playlist])
+            .await
+            .expect("delete playlist");
+        assert!(!svc.item_exists(playlist).await.expect("exists p"));
+        assert!(svc.item_exists(member_b).await.expect("member_b survives"));
+
+        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "LinkedChildren""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(remaining, 0, "all links should be cleared");
+    }
+}
