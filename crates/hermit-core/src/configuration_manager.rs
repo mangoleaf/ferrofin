@@ -38,15 +38,47 @@ use hermit_traits::system::ServerApplicationPaths;
 
 use crate::app_paths::HermitServerApplicationPaths;
 
+/// The per-item-type [`MetadataOptions`] `ServerConfiguration` ships with — the
+/// set the library metadata-options editor lists. Verbatim port of the C#
+/// `ServerConfiguration.MetadataOptions` default array (an empty array here left
+/// the editor with no per-type rows).
+fn default_metadata_options() -> Vec<hermit_model::configuration::MetadataOptions> {
+    use hermit_model::configuration::MetadataOptions;
+    let plain = |item_type: &str| MetadataOptions {
+        item_type: Some(item_type.to_owned()),
+        ..MetadataOptions::default()
+    };
+    let with_disabled = |item_type: &str, fetchers: &[&str], images: &[&str]| MetadataOptions {
+        item_type: Some(item_type.to_owned()),
+        disabled_metadata_fetchers: fetchers.iter().map(|s| (*s).to_owned()).collect(),
+        disabled_image_fetchers: images.iter().map(|s| (*s).to_owned()).collect(),
+        ..MetadataOptions::default()
+    };
+    vec![
+        plain("Book"),
+        plain("Movie"),
+        with_disabled(
+            "MusicVideo",
+            &["The Open Movie Database"],
+            &["The Open Movie Database"],
+        ),
+        plain("Series"),
+        with_disabled("MusicAlbum", &["TheAudioDB"], &[]),
+        with_disabled("MusicArtist", &["TheAudioDB"], &[]),
+        plain("BoxSet"),
+        plain("Season"),
+        plain("Episode"),
+    ]
+}
+
 /// Builds a fresh [`ServerConfiguration`] with Jellyfin's factory defaults.
 ///
 /// The `hermit-model` [`ServerConfiguration`] intentionally derives no
 /// `Default` (it is a pure wire DTO), so this reproduces the C#
 /// `ServerConfiguration()` constructor defaults (and its `BaseApplicationConfiguration`
 /// base) here — the one place a "blank" configuration is minted before the first
-/// `system.json` is written. One departure: the C# constructor seeds a table of
-/// per-item-type `MetadataOptions`; those are metadata-provider tuning, not part
-/// of the config the server logic in this unit reads, so the list starts empty.
+/// `system.json` is written, including the per-item-type `MetadataOptions` table
+/// the C# constructor seeds (see [`default_metadata_options`]).
 #[must_use]
 pub fn default_server_configuration() -> ServerConfiguration {
     ServerConfiguration {
@@ -87,7 +119,7 @@ pub fn default_server_configuration() -> ServerConfiguration {
         // C# uses ProcessorCount * 100; a fixed sensible default here.
         cache_size: 6 * 100,
         image_saving_convention: hermit_model::configuration::ImageSavingConvention::default(),
-        metadata_options: Vec::new(),
+        metadata_options: default_metadata_options(),
         skip_deserialization_for_basic_types: true,
         server_name: String::new(),
         ui_culture: "en-US".to_owned(),
@@ -186,8 +218,14 @@ impl HermitServerConfigurationManager {
             let bytes = tokio::fs::read(&config_file)
                 .await
                 .map_err(|e| io_err("read configuration", &config_file, &e))?;
-            serde_json::from_slice::<ServerConfiguration>(&bytes)
-                .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?
+            let mut config = serde_json::from_slice::<ServerConfiguration>(&bytes)
+                .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?;
+            // Backfill the per-type MetadataOptions on an older config that
+            // predates them (was written empty), so the library editor lists them.
+            if config.metadata_options.is_empty() {
+                config.metadata_options = default_metadata_options();
+            }
+            config
         } else {
             let default = default_server_configuration();
             write_config(&config_file, &default).await?;
