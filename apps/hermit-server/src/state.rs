@@ -240,7 +240,8 @@ pub async fn build_app_state(
     let localization: Arc<dyn hermit_traits::localization::LocalizationManager> = Arc::new(
         LocalizationManager::new(&server_config.metadata_country_code),
     );
-    let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> = Arc::new(HermitLyricManager::new());
+    let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> =
+        Arc::new(HermitLyricManager::new().with_items(Arc::clone(&item_repository)));
     let _live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager> = Arc::new(DisabledLiveTvManager);
     let path_manager: Arc<dyn hermit_traits::system::PathManager> =
         Arc::new(HermitPathManager::new(Arc::clone(&paths)));
