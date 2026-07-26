@@ -12,8 +12,15 @@ workspace = true
 [dependencies]
 hermit-traits.workspace = true
 hermit-model.workspace = true
+hermit-db.workspace = true
 async-trait.workspace = true
 quick-xml.workspace = true
 chrono.workspace = true
+sqlx.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]

@@ -141,10 +141,6 @@
 //!   ([`hermit_traits::subtitles::SubtitleManager`]), the portable
 //!   stored-external-subtitle slice (delete a stream + its sidecar); the
 //!   provider fan-out (search/download/upload) is a documented deferral;
-//! - [`live_tv_manager`] — [`HermitLiveTvManager`]
-//!   ([`hermit_traits::stubs::LiveTvManager`]), a **placeholder** for the real
-//!   `hermit-livetv` impl injected at Wave 8 (this crate must not depend on
-//!   `hermit-livetv`);
 //! - [`scheduled_tasks`] — [`HermitTaskManager`] + the local [`ScheduledTask`]
 //!   trait, a minimal register/list/run-now registry over the `hermit-model`
 //!   task DTOs. **No cron loop**: a task only runs on an explicit
@@ -182,7 +178,6 @@ pub mod library_manager;
 pub mod library_monitor;
 pub mod library_scan;
 pub mod linked_children_service;
-pub mod live_tv_manager;
 pub mod localization_manager;
 pub mod lyric_manager;
 pub mod media_attachment_repository;
@@ -245,7 +240,6 @@ pub use library_manager::HermitLibraryManager;
 pub use library_monitor::HermitLibraryMonitor;
 pub use library_scan::LibraryScanner;
 pub use linked_children_service::HermitLinkedChildrenService;
-pub use live_tv_manager::HermitLiveTvManager;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::HermitLyricManager;
 pub use media_attachment_repository::HermitMediaAttachmentRepository;

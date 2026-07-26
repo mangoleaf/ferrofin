@@ -158,6 +158,11 @@ pub struct Inner {
     /// session socket then registers/unregisters its sink here so SyncPlay (and
     /// future now-playing/remote-control pushes) can reach the client.
     pub session_bus: Option<Arc<dyn hermit_traits::session_bus::SessionMessageBus>>,
+
+    /// Live TV (`/LiveTv/*`). `None` until the composition root wires the real
+    /// manager via [`AppState::with_live_tv`]; while unset the Live TV routes
+    /// report the disabled/empty state.
+    pub live_tv: Option<Arc<dyn hermit_traits::stubs::LiveTvManager>>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -235,6 +240,7 @@ impl AppState {
             image_processor: None,
             sync_play: None,
             session_bus: None,
+            live_tv: None,
             music,
             similar_items,
             search,
@@ -413,6 +419,22 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_sync_play must be called before the state is shared");
         inner.sync_play = Some(sync_play);
+        self
+    }
+
+    /// Wires the real Live TV manager.
+    ///
+    /// [`new`](Self::new) leaves it unset (Live TV reports disabled/empty); the
+    /// composition root calls this with the `hermit-livetv` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_live_tv(mut self, live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_live_tv must be called before the state is shared");
+        inner.live_tv = Some(live_tv);
         self
     }
 

@@ -37,7 +37,7 @@ use hermit_core::{
 };
 use hermit_db::Database;
 use hermit_drawing::{ImageCrateEncoder, ImageProcessor};
-use hermit_livetv::DisabledLiveTvManager;
+use hermit_livetv::HermitLiveTvManager;
 use hermit_mediaencoding::{MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder};
 use hermit_providers::LocalProviderManager;
 use hermit_traits::system::ServerApplicationPaths as _;
@@ -261,7 +261,11 @@ pub async fn build_app_state(
     );
     let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> =
         Arc::new(HermitLyricManager::new().with_items(Arc::clone(&item_repository)));
-    let _live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager> = Arc::new(DisabledLiveTvManager);
+    let live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager> = Arc::new(HermitLiveTvManager::new(
+        db.clone(),
+        Arc::new(hermit_livetv::ReqwestFetcher::new()),
+        server_id.clone(),
+    ));
     let path_manager: Arc<dyn hermit_traits::system::PathManager> =
         Arc::new(HermitPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn hermit_traits::events::ClientEventLogger> =
@@ -613,7 +617,8 @@ pub async fn build_app_state(
     );
     let state = state
         .with_session_bus(Arc::clone(&session_bus))
-        .with_sync_play(sync_play);
+        .with_sync_play(sync_play)
+        .with_live_tv(live_tv);
 
     Ok(WiredApp { state, app_host })
 }
