@@ -738,6 +738,75 @@ mod tests {
         async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
             Ok(Some("http://tuner/live.ts".to_owned()))
         }
+        async fn get_timers(
+            &self,
+        ) -> Result<Vec<hermit_model::live_tv::TimerInfoDto>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_timer(
+            &self,
+            _id: &str,
+        ) -> Result<Option<hermit_model::live_tv::TimerInfoDto>, ServiceError> {
+            Ok(None)
+        }
+        async fn create_timer(
+            &self,
+            _timer: hermit_model::live_tv::TimerInfoDto,
+        ) -> Result<String, ServiceError> {
+            Ok(String::new())
+        }
+        async fn update_timer(
+            &self,
+            _id: &str,
+            _timer: hermit_model::live_tv::TimerInfoDto,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn cancel_timer(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_series_timers(
+            &self,
+        ) -> Result<Vec<hermit_model::live_tv::SeriesTimerInfoDto>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_series_timer(
+            &self,
+            _id: &str,
+        ) -> Result<Option<hermit_model::live_tv::SeriesTimerInfoDto>, ServiceError> {
+            Ok(None)
+        }
+        async fn create_series_timer(
+            &self,
+            _timer: hermit_model::live_tv::SeriesTimerInfoDto,
+        ) -> Result<String, ServiceError> {
+            Ok(String::new())
+        }
+        async fn update_series_timer(
+            &self,
+            _id: &str,
+            _timer: hermit_model::live_tv::SeriesTimerInfoDto,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_recordings(
+            &self,
+        ) -> Result<hermit_model::querying::QueryResult<hermit_model::dto::BaseItemDto>, ServiceError>
+        {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
+        async fn get_recording(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<hermit_model::dto::BaseItemDto>, ServiceError> {
+            Ok(None)
+        }
+        async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

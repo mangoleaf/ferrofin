@@ -2,8 +2,8 @@
 //!
 //! Port of the read/config slice of
 //! `MediaBrowser.Controller.LiveTv.ILiveTvManager` plus the tuner-host and
-//! listing-provider configuration surface. The DVR surface (timers, series
-//! timers, recordings) is a later phase and is not part of this trait yet.
+//! listing-provider configuration surface and the DVR timer/series-timer/
+//! recording CRUD.
 //!
 //! Port rules applied: DTO-shaped results reuse `hermit-model` DTOs
 //! ([`LiveTvInfo`], [`TunerHostInfo`], [`ListingsProviderInfo`],
@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use hermit_model::dto::BaseItemDto;
-use hermit_model::live_tv::{ListingsProviderInfo, LiveTvInfo, TunerHostInfo};
+use hermit_model::live_tv::{
+    ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
+};
 use hermit_model::querying::QueryResult;
 
 use crate::error::ServiceError;
@@ -89,6 +91,55 @@ pub trait LiveTvManager: Send + Sync {
     /// Resolves a channel id to the tuner stream URL that plays it, or `None`
     /// when the channel is unknown.
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError>;
+
+    // ---- DVR: recording timers -------------------------------------------
+
+    /// Lists the scheduled recording timers.
+    async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError>;
+
+    /// Gets a single timer by id, or `None` when unknown.
+    async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError>;
+
+    /// Creates (or replaces) a recording timer, returning its id.
+    async fn create_timer(&self, timer: TimerInfoDto) -> Result<String, ServiceError>;
+
+    /// Updates the timer with the given id.
+    async fn update_timer(&self, id: &str, timer: TimerInfoDto) -> Result<(), ServiceError>;
+
+    /// Cancels (deletes) the timer with the given id.
+    async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError>;
+
+    // ---- DVR: series timers ----------------------------------------------
+
+    /// Lists the recurring (series) recording timers.
+    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError>;
+
+    /// Gets a single series timer by id, or `None` when unknown.
+    async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError>;
+
+    /// Creates (or replaces) a series timer, returning its id.
+    async fn create_series_timer(&self, timer: SeriesTimerInfoDto) -> Result<String, ServiceError>;
+
+    /// Updates the series timer with the given id.
+    async fn update_series_timer(
+        &self,
+        id: &str,
+        timer: SeriesTimerInfoDto,
+    ) -> Result<(), ServiceError>;
+
+    /// Cancels (deletes) the series timer and its pending timers.
+    async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError>;
+
+    // ---- DVR: recordings -------------------------------------------------
+
+    /// Lists recordings as `BaseItemDto`s (`Type = "Recording"`).
+    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError>;
+
+    /// Gets a single recording by id, or `None` when unknown.
+    async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError>;
+
+    /// Deletes a recording (its DB row and, when present, its file).
+    async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_live_tv_manager(_: &dyn LiveTvManager) {}

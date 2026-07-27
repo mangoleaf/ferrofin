@@ -8,8 +8,10 @@
 //! manager too; adding a source triggers a guide refresh so channels/programmes
 //! populate immediately.
 //!
-//! The DVR surface (recordings, timers, series timers) has no backend yet and
-//! returns empty listings; its mutations stay on the shared `501` stub.
+//! The DVR surface (recordings, timers, series timers) is backed by the manager
+//! too: timers and series timers persist and list/get/update/cancel, and
+//! recordings list/get/delete. The recording *capture* engine (a scheduler that
+//! records a channel to disk when a timer fires) is a further increment.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -221,12 +223,41 @@ struct IdQuery {
     id: String,
 }
 
-/// `GET /LiveTv/Recordings` — DVR recordings (no DVR backend → empty).
-async fn get_recordings(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
-    Json(QueryResult::default())
+/// `GET /LiveTv/Recordings` — DVR recordings.
+async fn get_recordings(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    match state.live_tv.as_ref() {
+        Some(m) => Ok(Json(m.get_recordings().await?)),
+        None => Ok(Json(QueryResult::default())),
+    }
 }
 
-/// `GET /LiveTv/Recordings/Folders` — recording folders (no DVR → empty).
+/// `GET /LiveTv/Recordings/{recordingId}` — a single recording (`404` if absent).
+async fn get_recording(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(recording_id): Path<Uuid>,
+) -> Result<Json<BaseItemDto>, ApiError> {
+    live_tv(&state)?
+        .get_recording(recording_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("recording".into()))
+}
+
+/// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
+async fn delete_recording(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(recording_id): Path<Uuid>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.delete_recording(recording_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
 async fn get_recording_folders(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
 }
@@ -241,9 +272,59 @@ async fn get_recordings_series(RequireAuth(_auth): RequireAuth) -> Json<QueryRes
     Json(QueryResult::default())
 }
 
-/// `GET /LiveTv/Timers` — pending recording timers (no DVR → empty).
-async fn get_timers(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<TimerInfoDto>> {
-    Json(QueryResult::default())
+/// `GET /LiveTv/Timers` — pending recording timers.
+async fn get_timers(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+) -> Result<Json<QueryResult<TimerInfoDto>>, ApiError> {
+    match state.live_tv.as_ref() {
+        Some(m) => Ok(Json(QueryResult::from_items(m.get_timers().await?))),
+        None => Ok(Json(QueryResult::default())),
+    }
+}
+
+/// `GET /LiveTv/Timers/{timerId}` — a single timer (`404` if absent).
+async fn get_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+) -> Result<Json<TimerInfoDto>, ApiError> {
+    live_tv(&state)?
+        .get_timer(&timer_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("timer".into()))
+}
+
+/// `POST /LiveTv/Timers` — create a recording timer.
+async fn create_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(timer): Json<TimerInfoDto>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.create_timer(timer).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `POST /LiveTv/Timers/{timerId}` — update a recording timer.
+async fn update_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+    Json(timer): Json<TimerInfoDto>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.update_timer(&timer_id, timer).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /LiveTv/Timers/{timerId}` — cancel a recording timer.
+async fn cancel_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.cancel_timer(&timer_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /LiveTv/Timers/Defaults` — default values for a new timer.
@@ -251,11 +332,61 @@ async fn get_default_timer(RequireAuth(_auth): RequireAuth) -> Json<SeriesTimerI
     Json(SeriesTimerInfoDto::default())
 }
 
-/// `GET /LiveTv/SeriesTimers` — recurring (series) timers (no DVR → empty).
+/// `GET /LiveTv/SeriesTimers` — recurring (series) timers.
 async fn get_series_timers(
+    State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-) -> Json<QueryResult<SeriesTimerInfoDto>> {
-    Json(QueryResult::default())
+) -> Result<Json<QueryResult<SeriesTimerInfoDto>>, ApiError> {
+    match state.live_tv.as_ref() {
+        Some(m) => Ok(Json(QueryResult::from_items(m.get_series_timers().await?))),
+        None => Ok(Json(QueryResult::default())),
+    }
+}
+
+/// `GET /LiveTv/SeriesTimers/{timerId}` — a single series timer (`404` if absent).
+async fn get_series_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+) -> Result<Json<SeriesTimerInfoDto>, ApiError> {
+    live_tv(&state)?
+        .get_series_timer(&timer_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound("series timer".into()))
+}
+
+/// `POST /LiveTv/SeriesTimers` — create a series timer.
+async fn create_series_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(timer): Json<SeriesTimerInfoDto>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.create_series_timer(timer).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `POST /LiveTv/SeriesTimers/{timerId}` — update a series timer.
+async fn update_series_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+    Json(timer): Json<SeriesTimerInfoDto>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?
+        .update_series_timer(&timer_id, timer)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /LiveTv/SeriesTimers/{timerId}` — cancel a series timer.
+async fn cancel_series_timer(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(timer_id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    live_tv(&state)?.cancel_series_timer(&timer_id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `GET /LiveTv/ChannelMappingOptions` — channel-mapping options.
@@ -306,12 +437,29 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_recommended_programs),
         )
         .route("/LiveTv/Recordings", get(get_recordings))
+        .route(
+            "/LiveTv/Recordings/{recordingId}",
+            get(get_recording).delete(delete_recording),
+        )
         .route("/LiveTv/Recordings/Folders", get(get_recording_folders))
         .route("/LiveTv/Recordings/Groups", get(get_recording_groups))
         .route("/LiveTv/Recordings/Series", get(get_recordings_series))
-        .route("/LiveTv/Timers", get(get_timers))
+        .route("/LiveTv/Timers", get(get_timers).post(create_timer))
+        .route(
+            "/LiveTv/Timers/{timerId}",
+            get(get_timer).post(update_timer).delete(cancel_timer),
+        )
         .route("/LiveTv/Timers/Defaults", get(get_default_timer))
-        .route("/LiveTv/SeriesTimers", get(get_series_timers))
+        .route(
+            "/LiveTv/SeriesTimers",
+            get(get_series_timers).post(create_series_timer),
+        )
+        .route(
+            "/LiveTv/SeriesTimers/{timerId}",
+            get(get_series_timer)
+                .post(update_series_timer)
+                .delete(cancel_series_timer),
+        )
         .route(
             "/LiveTv/ChannelMappingOptions",
             get(get_channel_mapping_options),
@@ -416,11 +564,33 @@ mod tests {
         assert!(get_lineups(auth()).await.0.is_empty());
         assert_eq!(get_tuner_host_types(auth()).await.0.len(), 1);
         assert!(discover_tuners(auth()).await.0.is_empty());
-        assert!(get_recordings(auth()).await.0.items.is_empty());
+        let state = fake_state();
+        assert!(
+            get_recordings(State(state.clone()), auth())
+                .await
+                .unwrap()
+                .0
+                .items
+                .is_empty()
+        );
         assert!(get_recording_folders(auth()).await.0.items.is_empty());
         assert!(get_recording_groups(auth()).await.0.items.is_empty());
         assert!(get_recordings_series(auth()).await.0.items.is_empty());
-        assert_eq!(get_timers(auth()).await.0.total_record_count, 0);
-        assert_eq!(get_series_timers(auth()).await.0.total_record_count, 0);
+        assert_eq!(
+            get_timers(State(state.clone()), auth())
+                .await
+                .unwrap()
+                .0
+                .total_record_count,
+            0
+        );
+        assert_eq!(
+            get_series_timers(State(state), auth())
+                .await
+                .unwrap()
+                .0
+                .total_record_count,
+            0
+        );
     }
 }

@@ -36,23 +36,11 @@ const LIVETV_PROBES: &[(Method, &str)] = &[
         Method::GET,
         "/LiveTv/ListingProviders/SchedulesDirect/Countries",
     ),
-    // Live streams (need the DVR/live-stream backend)
+    // Live streams (need the live-stream proxy backend)
     (Method::GET, "/LiveTv/LiveRecordings/recording-1/stream"),
     (Method::GET, "/LiveTv/LiveStreamFiles/stream-1/stream.mp4"),
-    // Recordings — by-id lookup, delete, deprecated group lookup
+    // Recordings — deprecated group-by-id lookup
     (Method::GET, "/LiveTv/Recordings/Groups/group-1"),
-    (Method::GET, "/LiveTv/Recordings/recording-1"),
-    (Method::DELETE, "/LiveTv/Recordings/recording-1"),
-    // Series timers (mutation + by-id)
-    (Method::POST, "/LiveTv/SeriesTimers"),
-    (Method::GET, "/LiveTv/SeriesTimers/timer-1"),
-    (Method::POST, "/LiveTv/SeriesTimers/timer-1"),
-    (Method::DELETE, "/LiveTv/SeriesTimers/timer-1"),
-    // Timers (mutation + by-id)
-    (Method::POST, "/LiveTv/Timers"),
-    (Method::GET, "/LiveTv/Timers/timer-1"),
-    (Method::POST, "/LiveTv/Timers/timer-1"),
-    (Method::DELETE, "/LiveTv/Timers/timer-1"),
 ];
 
 #[tokio::test]
@@ -80,16 +68,17 @@ async fn unit6_livetv_stub_routes_return_501_not_404() {
     }
 }
 
-/// Guards the op count: of the `LiveTvController`'s 41 contract routes, 26 are
-/// now real (the read/disabled surface plus tuner-host/listing-provider config,
-/// channel/program by-id, and tuner reset) and 15 remain stubbed (ChannelMappings,
-/// SchedulesDirect, live streams, and the DVR recording/timer surface). This
-/// doubles as a drift alarm — promoting another op to real must decrement this.
+/// Guards the op count: of the `LiveTvController`'s 41 contract routes, 36 are
+/// now real (the read/disabled surface, tuner/provider config, channel/program
+/// by-id, tuner reset, and the full DVR timer/series-timer/recording CRUD). Five
+/// remain stubbed: ChannelMappings, the SchedulesDirect proxy, the two live-stream
+/// proxy endpoints, and the deprecated recording-group-by-id lookup. This doubles
+/// as a drift alarm — promoting another op to real must decrement this.
 #[test]
 fn unit6_covers_remaining_stubbed_livetv_ops() {
     assert_eq!(
         LIVETV_PROBES.len(),
-        15,
-        "15 LiveTv ops remain 501-stubbed (41 total − 26 real); probe table drifted"
+        5,
+        "5 LiveTv ops remain 501-stubbed (41 total − 36 real); probe table drifted"
     );
 }

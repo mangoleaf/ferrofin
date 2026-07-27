@@ -19,12 +19,14 @@ use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::BaseItemDto;
 use hermit_model::live_tv::{
     ChannelType, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo, LiveTvServiceStatus,
-    TunerHostInfo,
+    RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
 use hermit_model::querying::QueryResult;
 use hermit_traits::error::ServiceError;
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
 use hermit_traits::stubs::LiveTvManager;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
@@ -411,6 +413,157 @@ impl LiveTvManager for HermitLiveTvManager {
                 .map_err(db_err)?;
         Ok(url)
     }
+
+    async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        self.json_list(r#"SELECT "Data" FROM "LiveTvTimers" ORDER BY "StartDate""#)
+            .await
+    }
+
+    async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
+        self.json_get(r#"SELECT "Data" FROM "LiveTvTimers" WHERE "Id" = ?1"#, id)
+            .await
+    }
+
+    async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
+        let id = ensure_id(&mut timer.base.id);
+        let data = to_json(&timer)?;
+        sqlx::query(
+            r#"INSERT INTO "LiveTvTimers"
+               ("Id","ChannelId","ProgramId","SeriesTimerId","Name","StartDate","EndDate","Status",
+                "PrePaddingSeconds","PostPaddingSeconds","Data")
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+               ON CONFLICT("Id") DO UPDATE SET
+                 "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
+                 "SeriesTimerId"=excluded."SeriesTimerId","Name"=excluded."Name",
+                 "StartDate"=excluded."StartDate","EndDate"=excluded."EndDate",
+                 "Status"=excluded."Status","Data"=excluded."Data""#,
+        )
+        .bind(&id)
+        .bind(timer.base.channel_id.to_string())
+        .bind(&timer.base.program_id)
+        .bind(&timer.series_timer_id)
+        .bind(timer.base.name.clone().unwrap_or_default())
+        .bind(timer.base.start_date.to_rfc3339())
+        .bind(timer.base.end_date.to_rfc3339())
+        .bind(recording_status_name(timer.status))
+        .bind(timer.base.pre_padding_seconds)
+        .bind(timer.base.post_padding_seconds)
+        .bind(&data)
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(id)
+    }
+
+    async fn update_timer(&self, id: &str, mut timer: TimerInfoDto) -> Result<(), ServiceError> {
+        timer.base.id = Some(id.to_owned());
+        self.create_timer(timer).await.map(|_| ())
+    }
+
+    async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError> {
+        self.delete_by_id(r#"DELETE FROM "LiveTvTimers" WHERE "Id" = ?1"#, id)
+            .await
+    }
+
+    async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
+        self.json_list(r#"SELECT "Data" FROM "LiveTvSeriesTimers" ORDER BY "Name""#)
+            .await
+    }
+
+    async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
+        self.json_get(
+            r#"SELECT "Data" FROM "LiveTvSeriesTimers" WHERE "Id" = ?1"#,
+            id,
+        )
+        .await
+    }
+
+    async fn create_series_timer(
+        &self,
+        mut timer: SeriesTimerInfoDto,
+    ) -> Result<String, ServiceError> {
+        let id = ensure_id(&mut timer.base.id);
+        let data = to_json(&timer)?;
+        sqlx::query(
+            r#"INSERT INTO "LiveTvSeriesTimers" ("Id","ChannelId","ProgramId","Name","Data")
+               VALUES (?1,?2,?3,?4,?5)
+               ON CONFLICT("Id") DO UPDATE SET
+                 "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
+                 "Name"=excluded."Name","Data"=excluded."Data""#,
+        )
+        .bind(&id)
+        .bind(timer.base.channel_id.to_string())
+        .bind(&timer.base.program_id)
+        .bind(timer.base.name.clone().unwrap_or_default())
+        .bind(&data)
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(id)
+    }
+
+    async fn update_series_timer(
+        &self,
+        id: &str,
+        mut timer: SeriesTimerInfoDto,
+    ) -> Result<(), ServiceError> {
+        timer.base.id = Some(id.to_owned());
+        self.create_series_timer(timer).await.map(|_| ())
+    }
+
+    async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError> {
+        // Drop the series timer and any timers it scheduled.
+        sqlx::query(r#"DELETE FROM "LiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
+            .bind(id)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        self.delete_by_id(r#"DELETE FROM "LiveTvSeriesTimers" WHERE "Id" = ?1"#, id)
+            .await
+    }
+
+    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        let rows = sqlx::query(
+            r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
+               FROM "LiveTvRecordings" ORDER BY "StartDate" DESC"#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let items: Vec<BaseItemDto> = rows.iter().map(|r| self.recording_dto(r)).collect();
+        Ok(QueryResult::from_items(items))
+    }
+
+    async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
+        let row = sqlx::query(
+            r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
+               FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| self.recording_dto(&r)))
+    }
+
+    async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
+        // Remove the file first (best-effort), then the row.
+        let path: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
+                .bind(id.to_string())
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?
+                .flatten();
+        if let Some(path) = path {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        self.delete_by_id(
+            r#"DELETE FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
+            &id.to_string(),
+        )
+        .await
+    }
 }
 
 impl HermitLiveTvManager {
@@ -470,6 +623,93 @@ impl HermitLiveTvManager {
             ..BaseItemDto::default()
         }
     }
+
+    /// Maps a recording row to a `BaseItemDto` (`Type = "Recording"`).
+    fn recording_dto(&self, r: &sqlx::sqlite::SqliteRow) -> BaseItemDto {
+        let id = Uuid::parse_str(&r.get::<String, _>("Id")).unwrap_or_default();
+        BaseItemDto {
+            id,
+            server_id: Some(self.server_id.clone()),
+            name: Some(r.get::<String, _>("Name")),
+            type_: BaseItemKind::Recording,
+            channel_id: Uuid::parse_str(&r.get::<String, _>("ChannelId")).ok(),
+            media_type: MediaType::Video,
+            overview: r.get::<Option<String>, _>("Overview"),
+            start_date: parse_dt(r.get::<String, _>("StartDate").as_str()),
+            end_date: r
+                .get::<Option<String>, _>("EndDate")
+                .as_deref()
+                .and_then(parse_dt),
+            status: r.get::<Option<String>, _>("Status"),
+            is_folder: Some(false),
+            ..BaseItemDto::default()
+        }
+    }
+
+    /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
+    async fn json_list<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, ServiceError> {
+        let rows = sqlx::query(sql)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
+            .collect())
+    }
+
+    /// Reads and deserializes a single JSON `Data` column by id.
+    async fn json_get<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        id: &str,
+    ) -> Result<Option<T>, ServiceError> {
+        let data: Option<String> = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+    }
+
+    /// Runs a `DELETE … WHERE "Id" = ?1` statement.
+    async fn delete_by_id(&self, sql: &str, id: &str) -> Result<(), ServiceError> {
+        sqlx::query(sql)
+            .bind(id)
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+/// Ensures a DTO id field is set, generating a fresh UUID when absent, and
+/// returns it.
+fn ensure_id(id: &mut Option<String>) -> String {
+    let value = id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    *id = Some(value.clone());
+    value
+}
+
+/// Serializes a DVR DTO to its stored JSON.
+fn to_json<T: Serialize>(value: &T) -> Result<String, ServiceError> {
+    serde_json::to_string(value).map_err(|e| ServiceError::Backend(format!("serialize timer: {e}")))
+}
+
+/// The stored `Status` string for a [`RecordingStatus`].
+fn recording_status_name(status: RecordingStatus) -> &'static str {
+    match status {
+        RecordingStatus::New => "New",
+        RecordingStatus::InProgress => "InProgress",
+        RecordingStatus::Completed => "Completed",
+        RecordingStatus::Cancelled => "Cancelled",
+        RecordingStatus::ConflictedOk => "ConflictedOk",
+        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
+        RecordingStatus::Error => "Error",
+    }
 }
 
 /// Parses an RFC-3339 timestamp stored in the guide cache.
@@ -494,7 +734,7 @@ mod tests {
     use hermit_traits::options::{DtoOptions, InternalItemsQuery};
     use hermit_traits::stubs::LiveTvManager;
 
-    use super::{HermitLiveTvManager, SourceFetcher};
+    use super::{HermitLiveTvManager, SourceFetcher, parse_dt};
 
     /// An in-memory [`SourceFetcher`] mapping URL → body for offline tests.
     struct FakeFetcher(HashMap<String, String>);
@@ -658,6 +898,73 @@ mod tests {
                 .expect("c3")
                 .total_record_count,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn timer_crud_roundtrips() {
+        use hermit_model::live_tv::{BaseTimerInfoDto, TimerInfoDto};
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let ch = uuid::Uuid::new_v4();
+        let timer = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                channel_id: ch,
+                name: Some("Record the news".to_owned()),
+                start_date: parse_dt("2026-07-25T06:00:00Z").unwrap(),
+                end_date: parse_dt("2026-07-25T07:00:00Z").unwrap(),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        };
+
+        let id = mgr.create_timer(timer).await.expect("create");
+        assert!(!id.is_empty());
+        let timers = mgr.get_timers().await.expect("list");
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].base.channel_id, ch);
+        assert_eq!(timers[0].base.name.as_deref(), Some("Record the news"));
+
+        let got = mgr.get_timer(&id).await.expect("get").expect("some");
+        assert_eq!(got.base.id.as_deref(), Some(id.as_str()));
+
+        mgr.cancel_timer(&id).await.expect("cancel");
+        assert!(mgr.get_timers().await.expect("list2").is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_timer_crud_and_cascade() {
+        use hermit_model::live_tv::{BaseTimerInfoDto, SeriesTimerInfoDto, TimerInfoDto};
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let st = SeriesTimerInfoDto {
+            base: BaseTimerInfoDto {
+                channel_id: uuid::Uuid::new_v4(),
+                name: Some("Every episode".to_owned()),
+                ..BaseTimerInfoDto::default()
+            },
+            ..SeriesTimerInfoDto::default()
+        };
+        let st_id = mgr.create_series_timer(st).await.expect("create st");
+        assert_eq!(mgr.get_series_timers().await.expect("list").len(), 1);
+
+        // A timer that belongs to the series timer is removed when it's cancelled.
+        let timer = TimerInfoDto {
+            series_timer_id: Some(st_id.clone()),
+            base: BaseTimerInfoDto {
+                channel_id: uuid::Uuid::new_v4(),
+                start_date: parse_dt("2026-07-25T06:00:00Z").unwrap(),
+                end_date: parse_dt("2026-07-25T07:00:00Z").unwrap(),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        };
+        mgr.create_timer(timer).await.expect("create timer");
+        assert_eq!(mgr.get_timers().await.expect("t").len(), 1);
+
+        mgr.cancel_series_timer(&st_id).await.expect("cancel st");
+        assert!(mgr.get_series_timers().await.expect("l2").is_empty());
+        assert!(
+            mgr.get_timers().await.expect("t2").is_empty(),
+            "cancelling a series timer drops its timers"
         );
     }
 }

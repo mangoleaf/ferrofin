@@ -17,6 +17,7 @@ async-trait.workspace = true
 quick-xml.workspace = true
 chrono.workspace = true
 sqlx.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
