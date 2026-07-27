@@ -165,6 +165,57 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         Ok(())
     }
 
+    async fn save_item_values(
+        &self,
+        item_id: Uuid,
+        values: &[(i32, String)],
+    ) -> Result<(), ServiceError> {
+        let id = item_id.to_string();
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        // Rewrite this item's links; the shared ItemValues rows are kept.
+        sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for (type_, value) in values {
+            if value.is_empty() {
+                continue;
+            }
+            let clean = crate::text_util::get_clean_value(value);
+            // Get-or-create the (Type, Value) row (unique index on Type+Value).
+            let new_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+                   VALUES (?1,?2,?3,?4)"#,
+            )
+            .bind(&new_id)
+            .bind(&clean)
+            .bind(type_)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let value_id: String = sqlx::query_scalar(
+                r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1 AND "Value" = ?2"#,
+            )
+            .bind(type_)
+            .bind(value)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "ItemValuesMap" ("ItemValueId","ItemId") VALUES (?1,?2)"#,
+            )
+            .bind(&value_id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         let exists: Option<i64> =
             sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)

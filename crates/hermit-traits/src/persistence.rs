@@ -281,6 +281,16 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Persists (inserts or updates) the given item rows.
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
+    /// Replaces an item's `ItemValues` links (genres/studios/tags) with `values`,
+    /// each a `(type discriminant, display value)` pair. Get-or-creates the shared
+    /// `ItemValues` row per (type, value) and rewrites this item's `ItemValuesMap`
+    /// — which is what the genre/studio/tag *filters* (e.g. "More Like This") query.
+    async fn save_item_values(
+        &self,
+        item_id: Uuid,
+        values: &[(i32, String)],
+    ) -> Result<(), ServiceError>;
+
     /// Whether an item row with this id exists (used to self-heal a library's
     /// `CollectionFolder` row before parenting scanned children to it).
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError>;

@@ -221,6 +221,14 @@ impl LibraryScanner {
             self.persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
+            // Mirror the item's genres/studios/tags into ItemValues so the
+            // genre/studio/tag *filters* (More Like This, genre browse) match.
+            let item_values = item_values_of(&entity);
+            if !item_values.is_empty() {
+                self.persistence
+                    .save_item_values(item.id, &item_values)
+                    .await?;
+            }
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
@@ -888,6 +896,25 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.premiere_date.is_none() {
         entity.premiere_date = d.premiere_date.as_deref().and_then(parse_ymd);
     }
+}
+
+/// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
+/// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
+fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
+    let split = |field: Option<&str>| -> Vec<String> {
+        field
+            .unwrap_or_default()
+            .split('|')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut out = Vec::new();
+    out.extend(split(entity.genres.as_deref()).into_iter().map(|g| (2, g)));
+    out.extend(split(entity.studios.as_deref()).into_iter().map(|s| (3, s)));
+    out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
+    out
 }
 
 /// Maps a probed [`ChapterInfo`](hermit_model::entities_media::ChapterInfo) to a
