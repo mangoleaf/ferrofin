@@ -21,7 +21,7 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use tmdb::{
     RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
-    TmdbPerson, TmdbSearchHit,
+    TmdbPerson, TmdbSearchHit, TmdbTrailer,
 };
 
 pub use container_types::{

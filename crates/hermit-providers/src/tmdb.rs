@@ -167,6 +167,8 @@ pub struct TmdbDetails {
     pub runtime_minutes: Option<i32>,
     /// Cast (billing order) followed by key crew (director/writer/producer).
     pub people: Vec<TmdbPerson>,
+    /// YouTube trailers/teasers for the title.
+    pub trailers: Vec<TmdbTrailer>,
 }
 
 /// One credited person from a title's `credits`.
@@ -180,6 +182,17 @@ pub struct TmdbPerson {
     pub role: Option<String>,
     /// Display order (cast billing order; crew sort last).
     pub sort_order: i32,
+    /// The person's profile-photo URL (headshot), when TMDB has one.
+    pub profile_url: Option<String>,
+}
+
+/// A trailer/video link for a title (name + URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbTrailer {
+    /// The video's display name.
+    pub name: String,
+    /// The absolute (YouTube) URL.
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +219,26 @@ struct DetailsResponse {
     release_dates: Option<ReleaseDatesResults>,
     #[serde(default)]
     content_ratings: Option<ContentRatingResults>,
+    #[serde(default)]
+    videos: Option<VideosResults>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VideosResults {
+    #[serde(default)]
+    results: Vec<VideoEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(rename = "type", default)]
+    type_: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +261,8 @@ struct CastEntry {
     name: String,
     #[serde(default)]
     character: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +271,8 @@ struct CrewEntry {
     name: String,
     #[serde(default)]
     job: Option<String>,
+    #[serde(default)]
+    profile_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -588,8 +625,8 @@ impl TmdbClient {
     /// `None` on any network/parse error.
     pub async fn details(&self, kind: TmdbKind, tmdb_id: i64) -> Option<TmdbDetails> {
         let (path, append) = match kind {
-            TmdbKind::Movie => ("movie", "credits,release_dates"),
-            TmdbKind::Series => ("tv", "credits,content_ratings"),
+            TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
+            TmdbKind::Series => ("tv", "credits,content_ratings,videos"),
         };
         let resp = self
             .http
@@ -622,6 +659,10 @@ impl TmdbClient {
                     person_type: "Actor".to_owned(),
                     role: c.character.filter(|r| !r.is_empty()),
                     sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                    profile_url: c
+                        .profile_path
+                        .filter(|p| !p.is_empty())
+                        .map(|p| format!("{IMAGE_BASE}{p}")),
                 });
             }
             // Crew: only the roles Jellyfin surfaces on the detail page.
@@ -637,9 +678,35 @@ impl TmdbClient {
                     person_type: person_type.to_owned(),
                     role: c.job.filter(|r| !r.is_empty()),
                     sort_order: i32::MAX,
+                    profile_url: c
+                        .profile_path
+                        .filter(|p| !p.is_empty())
+                        .map(|p| format!("{IMAGE_BASE}{p}")),
                 });
             }
         }
+
+        // Trailers: YouTube "Trailer"/"Teaser" videos become RemoteTrailers.
+        let trailers = d
+            .videos
+            .map(|v| v.results)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| {
+                v.site.as_deref() == Some("YouTube")
+                    && matches!(v.type_.as_deref(), Some("Trailer" | "Teaser"))
+            })
+            .filter_map(|v| {
+                let key = v.key.filter(|k| !k.is_empty())?;
+                Some(TmdbTrailer {
+                    name: v
+                        .name
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "Trailer".to_owned()),
+                    url: format!("https://www.youtube.com/watch?v={key}"),
+                })
+            })
+            .collect();
 
         Some(TmdbDetails {
             overview: d.overview.filter(|s| !s.is_empty()),
@@ -656,6 +723,7 @@ impl TmdbClient {
             premiere_date: premiere,
             runtime_minutes: d.runtime.filter(|m| *m > 0),
             people,
+            trailers,
         })
     }
 
