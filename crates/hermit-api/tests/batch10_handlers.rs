@@ -269,6 +269,9 @@ impl MediaSourceManager for StreamSources {
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
     }
+    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
         self.closed.lock().unwrap().push(id.to_owned());
         Ok(())
