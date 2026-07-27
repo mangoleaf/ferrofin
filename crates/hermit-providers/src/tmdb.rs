@@ -6,9 +6,9 @@
 //! upstream]) so artwork is fetched with zero configuration; a user-supplied key
 //! overrides it.
 //!
-//! Only movies and TV series are matched here (the primary library artwork);
-//! season/episode stills are a later extension. Metadata fields (overview,
-//! genres, cast) are likewise deferred — this delivers the missing *artwork*.
+//! Movies and TV series are matched by name/year; [`details`](TmdbClient::details)
+//! then fetches full metadata (overview, tagline, genres, studios, rating,
+//! certification, premiere date, and cast + key crew) alongside the artwork.
 
 use hermit_model::entities::ImageType;
 use serde::Deserialize;
