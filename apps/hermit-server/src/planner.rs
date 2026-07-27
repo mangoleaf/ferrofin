@@ -219,9 +219,12 @@ fn nvenc_preset(preset: EncoderPreset) -> &'static str {
 /// cap. A 10-bit HDR source targeting H.264 (browsers decode only 8-bit H.264)
 /// is down-converted to `nv12` on the GPU via `scale_cuda`; AV1/HEVC keep the
 /// source's 10-bit HDR untouched.
-fn nvenc_video_args(encoder: &str, options: &EncodingOptions) -> Vec<String> {
+fn nvenc_video_args(encoder: &str, options: &EncodingOptions, burn_sub: bool) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
-    if encoder == "h264_nvenc" {
+    // The h264 8-bit down-convert is a simple `-vf`, but that can't coexist with
+    // the subtitle-burn `-filter_complex`; when burning, the overlay filter does
+    // the `format=nv12` conversion itself (see the burn-in block), so skip it here.
+    if encoder == "h264_nvenc" && !burn_sub {
         a.push("-vf".to_owned());
         a.push("scale_cuda=format=nv12".to_owned());
     }
@@ -304,6 +307,18 @@ fn subtitle_stream(streams: &[MediaStream], index: Option<i32>) -> Option<MediaS
         .cloned()
 }
 
+/// Reads an integer query param (case-insensitive key) from a `?a=b&c=d` string.
+/// The subtitle index rides in the transcode URL's query rather than a typed
+/// field on the request, so the planner parses it here.
+fn query_param_i32(query_string: &str, key: &str) -> Option<i32> {
+    query_string
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .and_then(|(_, v)| v.parse().ok())
+}
+
 /// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `mp4`).
 ///
 /// Port of `GetSegmentFileExtension`: the extension is the container name
@@ -362,7 +377,16 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             default_stream(&media_source.media_streams, MediaStreamType::Video)
         };
         let audio_stream = default_stream(&media_source.media_streams, MediaStreamType::Audio);
-        let subtitle_stream = subtitle_stream(&media_source.media_streams, None);
+        // A subtitle named in the transcode URL is one the client wants delivered
+        // *by* the transcode (burned in) — text tracks it can fetch externally are
+        // not put here — so selecting one means Encode/burn-in.
+        let subtitle_index = query_param_i32(&request.query_string, "SubtitleStreamIndex");
+        let subtitle_stream = subtitle_stream(&media_source.media_streams, subtitle_index);
+        let subtitle_delivery_method = if subtitle_stream.is_some() {
+            SubtitleDeliveryMethod::Encode
+        } else {
+            SubtitleDeliveryMethod::Hls
+        };
 
         let options = self.encoding_options().await;
         let segment_length_secs = if options.encoding_thread_count >= 0 {
@@ -436,7 +460,7 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             output_file_path: String::new(),
             input_container: media_source.container.clone(),
             is_input_video: !is_audio,
-            subtitle_delivery_method: SubtitleDeliveryMethod::Hls,
+            subtitle_delivery_method,
             run_time_ticks: media_source.run_time_ticks,
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: supported_video_codecs.clone(),
@@ -574,6 +598,11 @@ impl HermitStreamStatePlanner {
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
         let nvenc_video = video_encoder.ends_with("_nvenc");
+        // Burning a graphical subtitle needs the decoded frames in system memory
+        // for the `overlay` filter, so we can't keep them on the GPU
+        // (`-hwaccel_output_format cuda`); NVENC still uploads the filtered frames.
+        let burn_sub =
+            hermit_mediaencoding::encoding_helper::helper::burns_graphical_subtitle(state);
 
         // ---- input ------------------------------------------------------------
         // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
@@ -590,8 +619,13 @@ impl HermitStreamStatePlanner {
         if nvenc_video {
             push_split(&mut args, "-hwaccel");
             args.push("cuda".to_owned());
-            push_split(&mut args, "-hwaccel_output_format");
-            args.push("cuda".to_owned());
+            // Keep frames on the GPU for the pure transcode path; but when burning
+            // a graphical subtitle, let them land in system memory so `overlay` can
+            // composite the bitmap subtitle onto the video.
+            if !burn_sub {
+                push_split(&mut args, "-hwaccel_output_format");
+                args.push("cuda".to_owned());
+            }
         }
         // GetInputArgument yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
@@ -633,7 +667,7 @@ impl HermitStreamStatePlanner {
             if nvenc_video {
                 // NVENC has its own rate-control/quality flags (no `-crf`); the
                 // software `video_quality_param` would emit libx264-only args.
-                for tok in nvenc_video_args(&video_encoder, options) {
+                for tok in nvenc_video_args(&video_encoder, options, burn_sub) {
                     args.push(tok);
                 }
             } else {
@@ -686,13 +720,23 @@ impl HermitStreamStatePlanner {
             }
         }
 
-        // ---- subtitle burn-in (only when the delivery method is Encode) ------
-        if state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
-            && let Some(sub) = state.subtitle_stream.as_ref()
-        {
-            let idx = sub.index.max(0);
+        // ---- graphical subtitle burn-in --------------------------------------
+        // Composite the (bitmap) subtitle stream onto the video: `overlay` takes
+        // the base video and the decoded subtitle as its two inputs and emits the
+        // labelled `[v]` that `map_args` maps in place of the raw video.
+        if burn_sub && let Some(sub) = state.subtitle_stream.as_ref() {
+            let sub_idx = sub.index.max(0);
+            let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
+            // h264 (8-bit only) needs the overlaid frames down-converted to nv12 —
+            // done inside the graph here since the separate `-vf scale_cuda` is
+            // suppressed while burning (they can't coexist).
+            let fmt = if video_encoder == "h264_nvenc" {
+                ",format=nv12"
+            } else {
+                ""
+            };
             push_split(&mut args, "-filter_complex");
-            args.push(format!("[0:{idx}]overlay"));
+            args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay{fmt}[v]"));
         }
 
         // ---- HLS muxer -------------------------------------------------------
@@ -820,6 +864,9 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.device_id.hash(&mut hasher);
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
+    // A burned-in subtitle changes the video, so it must key the cache — else a
+    // subtitled and non-subtitled transcode of the same item would collide.
+    query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
     segment_container.hash(&mut hasher);
     is_audio.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

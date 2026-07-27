@@ -213,6 +213,7 @@ fn apply_stream_decision(
 
     if stream.play_method == PlayMethod::DirectPlay {
         source.supports_direct_play = true;
+        apply_subtitle_delivery(source, &stream, &support, token);
         return;
     }
     // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
@@ -254,6 +255,33 @@ fn apply_stream_decision(
     source.transcoding_url = Some(stream.to_url(None, token, None));
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
     source.transcoding_container = Some(container);
+    apply_subtitle_delivery(source, &stream, &support, token);
+}
+
+/// Populates each subtitle stream's `DeliveryMethod`/`DeliveryUrl` on the source
+/// (Jellyfin's `StreamInfo.GetSubtitleProfiles`). Without it every subtitle has
+/// no delivery method, so the client can't fetch (text → external VTT) or
+/// request burn-in (image subs like DVDSUB/PGS → `Encode`), and a selected
+/// subtitle simply never renders.
+fn apply_subtitle_delivery(
+    source: &mut MediaSourceInfo,
+    stream: &hermit_model::dlna::StreamInfo,
+    support: &HermitTranscoderSupport,
+    token: Option<&str>,
+) {
+    // Relative URLs (empty base), matching the transcoding URL; all subtitles
+    // (not just a selected one) so the client knows how to handle each.
+    let infos = stream.get_subtitle_profiles(support, false, true, "", token);
+    for info in &infos {
+        if let Some(sub) = source.media_streams.iter_mut().find(|s| {
+            s.stream_type == hermit_model::entities::MediaStreamType::Subtitle
+                && s.index == info.index
+        }) {
+            sub.delivery_method = Some(info.delivery_method);
+            sub.delivery_url.clone_from(&info.url);
+            sub.is_external_url = Some(info.is_external_url);
+        }
+    }
 }
 
 /// `GET /Items/{itemId}/PlaybackInfo` — playback info for the item.

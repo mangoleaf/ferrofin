@@ -202,8 +202,14 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
         let mut args = String::new();
 
         if let Some(video) = state.video_stream.as_ref() {
-            let idx = find_index(&state.media_source.media_streams, video);
-            let _ = write!(args, "-map 0:{idx}");
+            if burns_graphical_subtitle(state) {
+                // The overlay filter produces a `[v]` label; map that, not the raw
+                // input video, so the burned-in subtitle reaches the output.
+                args.push_str("-map [v]");
+            } else {
+                let idx = find_index(&state.media_source.media_streams, video);
+                let _ = write!(args, "-map 0:{idx}");
+            }
         } else {
             args.push_str("-vn");
         }
@@ -953,6 +959,21 @@ fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
     state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
         || (state.base_request.always_burn_in_subtitle_when_transcoding
             && !EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()))
+}
+
+/// Whether the transcode burns a **graphical** (image-based, e.g. DVDSUB/PGS)
+/// subtitle into the video. Those must be composited with an `overlay` filter
+/// (producing a `[v]` label the muxer maps), unlike text subtitles which are
+/// delivered externally. Shared by [`map_args`](EncodingHelper::map_args) and the
+/// segment planner so the filter, the `-map [v]`, and the decode path agree.
+#[must_use]
+pub fn burns_graphical_subtitle(state: &EncodingJobInfo) -> bool {
+    should_encode_subtitle(state)
+        && state.video_stream.is_some()
+        && state
+            .subtitle_stream
+            .as_ref()
+            .is_some_and(|s| !is_text_subtitle_stream(s))
 }
 
 /// Whether an external subtitle must be muxed as a second FFmpeg input. Port of
