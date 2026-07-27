@@ -20,7 +20,8 @@ pub mod xbmc;
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use tmdb::{
-    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbImage, TmdbKind, TmdbSearchHit,
+    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
+    TmdbPerson, TmdbSearchHit,
 };
 
 pub use container_types::{

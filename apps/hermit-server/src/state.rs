@@ -342,7 +342,9 @@ pub async fn build_app_state(
         )
         // Fetch remote artwork (TMDB) for movies/series with no local images,
         // using Jellyfin's built-in key so posters/backdrops appear with no setup.
-        .with_metadata(Arc::clone(&tmdb_client), metadata_library),
+        .with_metadata(Arc::clone(&tmdb_client), metadata_library)
+        // Persist TMDB cast/crew credits fetched alongside the metadata.
+        .with_people(Arc::clone(&people_repository)),
     );
     let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
         HermitLibraryManager::new(

@@ -144,6 +144,170 @@ pub struct SeasonImages {
     pub episode_stills: std::collections::HashMap<i32, String>,
 }
 
+/// Full title metadata from `/movie|tv/{id}` (the detail-page fields).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TmdbDetails {
+    /// Plot synopsis.
+    pub overview: Option<String>,
+    /// Marketing tagline.
+    pub tagline: Option<String>,
+    /// Genre names.
+    pub genres: Vec<String>,
+    /// Production-company (studio) names.
+    pub studios: Vec<String>,
+    /// Community rating (`vote_average`, 0–10), when non-zero.
+    pub community_rating: Option<f64>,
+    /// US content certification (e.g. `R`, `TV-MA`), when available.
+    pub official_rating: Option<String>,
+    /// Release/first-air year.
+    pub production_year: Option<i32>,
+    /// Release/first-air date (`YYYY-MM-DD`).
+    pub premiere_date: Option<String>,
+    /// Runtime in minutes, when known.
+    pub runtime_minutes: Option<i32>,
+    /// Cast (billing order) followed by key crew (director/writer/producer).
+    pub people: Vec<TmdbPerson>,
+}
+
+/// One credited person from a title's `credits`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmdbPerson {
+    /// The person's name.
+    pub name: String,
+    /// Jellyfin person type: `Actor`, `Director`, `Writer`, `Producer`, …
+    pub person_type: String,
+    /// The credited role (character for cast, job for crew), when present.
+    pub role: Option<String>,
+    /// Display order (cast billing order; crew sort last).
+    pub sort_order: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailsResponse {
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    tagline: Option<String>,
+    #[serde(default)]
+    genres: Vec<NamedEntry>,
+    #[serde(default)]
+    production_companies: Vec<NamedEntry>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    runtime: Option<i32>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    first_air_date: Option<String>,
+    #[serde(default)]
+    credits: Option<CreditsResponse>,
+    #[serde(default)]
+    release_dates: Option<ReleaseDatesResults>,
+    #[serde(default)]
+    content_ratings: Option<ContentRatingResults>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedEntry {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreditsResponse {
+    #[serde(default)]
+    cast: Vec<CastEntry>,
+    #[serde(default)]
+    crew: Vec<CrewEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CastEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    character: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CrewEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    job: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReleaseDatesResults {
+    #[serde(default)]
+    results: Vec<ReleaseDatesCountry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDatesCountry {
+    #[serde(default)]
+    iso_3166_1: Option<String>,
+    #[serde(default)]
+    release_dates: Vec<ReleaseDatesEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDatesEntry {
+    #[serde(default)]
+    certification: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ContentRatingResults {
+    #[serde(default)]
+    results: Vec<ContentRatingCountry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentRatingCountry {
+    #[serde(default)]
+    iso_3166_1: Option<String>,
+    #[serde(default)]
+    rating: Option<String>,
+}
+
+/// Maps a TMDB crew `job` to the Jellyfin person type Hermit surfaces, or `None`
+/// to skip the credit.
+fn crew_person_type(job: Option<&str>) -> Option<&'static str> {
+    match job? {
+        "Director" => Some("Director"),
+        "Writer" | "Screenplay" | "Author" | "Novel" => Some("Writer"),
+        "Producer" | "Executive Producer" => Some("Producer"),
+        _ => None,
+    }
+}
+
+/// Extracts the US content certification from a movie's `release_dates` or a
+/// series' `content_ratings`, preferring the US entry.
+fn us_certification(
+    kind: TmdbKind,
+    release_dates: Option<ReleaseDatesResults>,
+    content_ratings: Option<ContentRatingResults>,
+) -> Option<String> {
+    match kind {
+        TmdbKind::Movie => {
+            let results = release_dates?.results;
+            let us = results
+                .iter()
+                .find(|c| c.iso_3166_1.as_deref() == Some("US"))?;
+            us.release_dates
+                .iter()
+                .find_map(|r| r.certification.clone().filter(|c| !c.is_empty()))
+        }
+        TmdbKind::Series => content_ratings?
+            .results
+            .into_iter()
+            .find(|c| c.iso_3166_1.as_deref() == Some("US"))
+            .and_then(|c| c.rating.filter(|r| !r.is_empty())),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SeasonResponse {
     #[serde(default)]
@@ -418,6 +582,83 @@ impl TmdbClient {
             .collect()
     }
 
+    /// Fetches full metadata for a title (overview, tagline, genres, studios,
+    /// rating, certification, premiere date, runtime, and cast + key crew) via
+    /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
+    /// `None` on any network/parse error.
+    pub async fn details(&self, kind: TmdbKind, tmdb_id: i64) -> Option<TmdbDetails> {
+        let (path, append) = match kind {
+            TmdbKind::Movie => ("movie", "credits,release_dates"),
+            TmdbKind::Series => ("tv", "credits,content_ratings"),
+        };
+        let resp = self
+            .http
+            .get(format!("{API_BASE}/{path}/{tmdb_id}"))
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("append_to_response", append),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let d = resp.json::<DetailsResponse>().await.ok()?;
+
+        let premiere = d
+            .release_date
+            .or(d.first_air_date)
+            .filter(|s| !s.is_empty());
+        let mut people = Vec::new();
+        if let Some(credits) = d.credits {
+            // Cast: keep TMDB's billing order.
+            for (order, c) in credits.cast.into_iter().enumerate() {
+                if c.name.is_empty() {
+                    continue;
+                }
+                people.push(TmdbPerson {
+                    name: c.name,
+                    person_type: "Actor".to_owned(),
+                    role: c.character.filter(|r| !r.is_empty()),
+                    sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                });
+            }
+            // Crew: only the roles Jellyfin surfaces on the detail page.
+            for c in credits.crew {
+                let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+                    continue;
+                };
+                if c.name.is_empty() {
+                    continue;
+                }
+                people.push(TmdbPerson {
+                    name: c.name,
+                    person_type: person_type.to_owned(),
+                    role: c.job.filter(|r| !r.is_empty()),
+                    sort_order: i32::MAX,
+                });
+            }
+        }
+
+        Some(TmdbDetails {
+            overview: d.overview.filter(|s| !s.is_empty()),
+            tagline: d.tagline.filter(|s| !s.is_empty()),
+            genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
+            studios: d
+                .production_companies
+                .into_iter()
+                .filter_map(|c| c.name)
+                .collect(),
+            community_rating: d.vote_average.filter(|v| *v > 0.0),
+            official_rating: us_certification(kind, d.release_dates, d.content_ratings),
+            production_year: year_from(premiere.as_deref()),
+            premiere_date: premiere,
+            runtime_minutes: d.runtime.filter(|m| *m > 0),
+            people,
+        })
+    }
+
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
         let resp = self.http.get(url).send().await.ok()?;
@@ -442,6 +683,53 @@ mod tests {
         assert_eq!(year_from(Some("2014-10-10")), Some(2014));
         assert_eq!(year_from(Some("")), None);
         assert_eq!(year_from(None), None);
+    }
+
+    #[test]
+    fn crew_jobs_map_to_person_types() {
+        assert_eq!(crew_person_type(Some("Director")), Some("Director"));
+        assert_eq!(crew_person_type(Some("Screenplay")), Some("Writer"));
+        assert_eq!(
+            crew_person_type(Some("Executive Producer")),
+            Some("Producer")
+        );
+        assert_eq!(crew_person_type(Some("Gaffer")), None);
+        assert_eq!(crew_person_type(None), None);
+    }
+
+    #[test]
+    fn us_certification_prefers_us_entry() {
+        let rd = ReleaseDatesResults {
+            results: vec![
+                ReleaseDatesCountry {
+                    iso_3166_1: Some("GB".to_owned()),
+                    release_dates: vec![ReleaseDatesEntry {
+                        certification: Some("15".to_owned()),
+                    }],
+                },
+                ReleaseDatesCountry {
+                    iso_3166_1: Some("US".to_owned()),
+                    release_dates: vec![ReleaseDatesEntry {
+                        certification: Some("R".to_owned()),
+                    }],
+                },
+            ],
+        };
+        assert_eq!(
+            us_certification(TmdbKind::Movie, Some(rd), None).as_deref(),
+            Some("R")
+        );
+        let cr = ContentRatingResults {
+            results: vec![ContentRatingCountry {
+                iso_3166_1: Some("US".to_owned()),
+                rating: Some("TV-MA".to_owned()),
+            }],
+        };
+        assert_eq!(
+            us_certification(TmdbKind::Series, None, Some(cr)).as_deref(),
+            Some("TV-MA")
+        );
+        assert_eq!(us_certification(TmdbKind::Movie, None, None), None);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use hermit_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
+use hermit_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity, PeopleEntity};
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{CollectionTypeOptions, ImageType};
@@ -33,7 +33,7 @@ use hermit_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use hermit_naming::video::video_resolver;
 use hermit_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
-    RemoteImage, TmdbClient, TmdbKind,
+    RemoteImage, TmdbClient, TmdbDetails, TmdbKind,
 };
 use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
@@ -120,6 +120,9 @@ pub struct LibraryScanner {
     tmdb: Option<Arc<TmdbClient>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
     metadata_dir: Option<PathBuf>,
+    /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
+    /// movie/series with no overview gets its TMDB cast during the scan).
+    people: Option<Arc<dyn hermit_traits::persistence::PeopleRepository>>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -144,7 +147,19 @@ impl LibraryScanner {
             media_streams: None,
             tmdb: None,
             metadata_dir: None,
+            people: None,
         }
+    }
+
+    /// Attaches the people repository so TMDB cast/crew credits are persisted
+    /// during the scan. Paired with [`with_metadata`](Self::with_metadata).
+    #[must_use]
+    pub fn with_people(
+        mut self,
+        people: Arc<dyn hermit_traits::persistence::PeopleRepository>,
+    ) -> Self {
+        self.people = Some(people);
+        self
     }
 
     /// Attaches the TMDB artwork client + the directory downloaded images are
@@ -192,12 +207,22 @@ impl LibraryScanner {
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
             let streams = self.probe(&mut entity).await;
+            // Enrich the row from TMDB (overview/tagline/genres/studios/ratings +
+            // cast/crew) before it's saved, so a bare file with no NFO shows the
+            // same detail page Jellyfin does. Best-effort: failures don't abort.
+            let people = self.fetch_remote_metadata(&mut entity).await;
             self.persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
+            if !people.is_empty()
+                && let Some(repo) = &self.people
+                && let Err(err) = repo.update_people(item.id, &people).await
+            {
+                tracing::warn!(%err, item = %item.id, "failed to persist cast/crew");
+            }
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
             }
@@ -272,6 +297,52 @@ impl LibraryScanner {
     ///
     /// Idempotent: an item whose artwork was already downloaded (its folder holds
     /// `primary.*`) is reused from disk with no network call. Returns empty when
+    /// Enriches a movie/series row from TMDB (overview, tagline, genres, studios,
+    /// community rating, US certification, premiere date) and returns its cast +
+    /// key crew to persist. No-op when TMDB is unconfigured, the item already has
+    /// an overview (a local NFO or a prior scan), or the item isn't a movie/series.
+    /// Best-effort — a network/parse failure returns no people and leaves the row.
+    async fn fetch_remote_metadata(&self, entity: &mut BaseItemEntity) -> Vec<PeopleEntity> {
+        let Some(tmdb) = &self.tmdb else {
+            return Vec::new();
+        };
+        if entity.overview.as_deref().is_some_and(|o| !o.is_empty()) {
+            return Vec::new();
+        }
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        let kind = match short {
+            "Movie" => TmdbKind::Movie,
+            "Series" => TmdbKind::Series,
+            _ => return Vec::new(),
+        };
+        let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Vec::new();
+        };
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        let Some(tmdb_id) = tmdb
+            .search(kind, name, year)
+            .await
+            .into_iter()
+            .next()
+            .map(|h| h.tmdb_id)
+        else {
+            return Vec::new();
+        };
+        let Some(details) = tmdb.details(kind, tmdb_id).await else {
+            return Vec::new();
+        };
+        apply_details(entity, &details);
+        details
+            .people
+            .iter()
+            .map(|p| PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: p.name.clone(),
+                person_type: Some(p.person_type.clone()),
+            })
+            .collect()
+    }
+
     /// metadata is not configured or nothing matched — best-effort, never fatal.
     async fn fetch_remote_images(
         &self,
@@ -765,6 +836,46 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
 
 /// The display name for a season number — `0` is "Specials" (Jellyfin's
 /// convention for extras/specials), every other number is "Season N".
+/// Applies fetched TMDB [`TmdbDetails`] onto a row, filling only fields the scan
+/// hasn't already set (so a probed runtime, a local NFO, or a prior scan wins).
+/// Genres/studios are stored pipe-delimited, matching the `BaseItems` columns the
+/// DTO service reads.
+fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&d.overview);
+    }
+    if entity.tagline.is_none() {
+        entity.tagline.clone_from(&d.tagline);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = d.community_rating;
+    }
+    if entity.official_rating.is_none() {
+        entity.official_rating.clone_from(&d.official_rating);
+    }
+    if entity.genres.as_deref().unwrap_or_default().is_empty() && !d.genres.is_empty() {
+        entity.genres = Some(d.genres.join("|"));
+    }
+    if entity.studios.as_deref().unwrap_or_default().is_empty() && !d.studios.is_empty() {
+        entity.studios = Some(d.studios.join("|"));
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = d.production_year.map(i64::from);
+    }
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = d.premiere_date.as_deref().and_then(parse_ymd);
+    }
+}
+
+/// Parses a TMDB `YYYY-MM-DD` date to a UTC timestamp at midnight.
+fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0)?,
+        Utc,
+    ))
+}
+
 fn season_display_name(number: i32) -> String {
     if number == 0 {
         "Specials".to_owned()

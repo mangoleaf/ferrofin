@@ -314,7 +314,11 @@ async fn get_item(
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    let options = DtoOptions::with_all_fields(false);
+    // A single-item fetch backs a detail page, so return the full DTO (overview,
+    // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
+    // detail view needs. Port of `UserLibraryController.GetItem`, which builds a
+    // `DtoOptions` with all fields.
+    let options = DtoOptions::with_all_fields(true);
     let dto = state
         .dto
         .get_base_item_dto(&item, &options, Some(&user), None)
