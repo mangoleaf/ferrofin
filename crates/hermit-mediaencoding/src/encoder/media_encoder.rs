@@ -303,7 +303,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             input_file,
             source.protocol,
         );
-        Ok(info.media_source)
+        // Carry the probed chapters on the source (internal-only field) so the
+        // scan can persist them; they were requested via `extract_chapters`.
+        let mut media_source = info.media_source;
+        media_source.chapters = info.chapters;
+        Ok(media_source)
     }
 
     async fn extract_audio_image(

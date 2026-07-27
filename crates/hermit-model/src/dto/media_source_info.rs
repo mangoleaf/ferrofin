@@ -139,6 +139,13 @@ pub struct MediaSourceInfo {
     /// Gets or sets the media attachments.
     pub media_attachments: Vec<MediaAttachment>,
 
+    /// The probed chapter markers (embedded `#show_chapters`). Internal only —
+    /// never on the wire (Jellyfin's `MediaSourceInfo` has no chapters; they live
+    /// on `BaseItemDto`), it just carries them from the probe to the scan's
+    /// chapter persistence.
+    #[serde(skip)]
+    pub chapters: Vec<crate::entities_media::ChapterInfo>,
+
     /// Gets or sets the formats.
     pub formats: Vec<String>,
 
@@ -228,6 +235,7 @@ impl Default for MediaSourceInfo {
             video3d_format: None,
             media_streams: Vec::new(),
             media_attachments: Vec::new(),
+            chapters: Vec::new(),
             formats: Vec::new(),
             bitrate: None,
             fallback_max_streaming_bitrate: None,

@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use hermit_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity, PeopleEntity};
+use hermit_db::entities::base_items::{
+    BaseItemEntity, ChapterEntity, MediaStreamInfoEntity, PeopleEntity,
+};
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{CollectionTypeOptions, ImageType};
@@ -123,6 +125,8 @@ pub struct LibraryScanner {
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
     /// movie/series with no overview gets its TMDB cast during the scan).
     people: Option<Arc<dyn hermit_traits::persistence::PeopleRepository>>,
+    /// Where probed chapter markers are persisted (paired with the probe seam).
+    chapters: Option<Arc<dyn hermit_traits::persistence::ChapterRepository>>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -148,6 +152,7 @@ impl LibraryScanner {
             tmdb: None,
             metadata_dir: None,
             people: None,
+            chapters: None,
         }
     }
 
@@ -181,9 +186,11 @@ impl LibraryScanner {
         mut self,
         media_encoder: Arc<dyn MediaEncoder>,
         media_streams: Arc<dyn MediaStreamRepository>,
+        chapters: Arc<dyn hermit_traits::persistence::ChapterRepository>,
     ) -> Self {
         self.media_encoder = Some(media_encoder);
         self.media_streams = Some(media_streams);
+        self.chapters = Some(chapters);
         self
     }
 
@@ -206,7 +213,7 @@ impl LibraryScanner {
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
-            let streams = self.probe(&mut entity).await;
+            let (streams, chapters) = self.probe(&mut entity).await;
             // Enrich the row from TMDB (overview/tagline/genres/studios/ratings +
             // cast/crew) before it's saved, so a bare file with no NFO shows the
             // same detail page Jellyfin does. Best-effort: failures don't abort.
@@ -225,6 +232,9 @@ impl LibraryScanner {
             }
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
+            }
+            if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
+                repo.save_chapters(item.id, &chapters).await?;
             }
             // Artwork: local files first (poster/backdrop/logo/… next to the
             // media), then a TMDB fallback for movies/series with none — matching
@@ -250,40 +260,53 @@ impl LibraryScanner {
     /// no encoder is wired, the item is a folder or non-media, it has no path, or
     /// the probe fails (missing ffmpeg, unreadable file). Probe failures are
     /// swallowed so one bad file never aborts a whole library scan.
-    async fn probe(&self, entity: &mut BaseItemEntity) -> Vec<MediaStreamInfoEntity> {
+    async fn probe(
+        &self,
+        entity: &mut BaseItemEntity,
+    ) -> (Vec<MediaStreamInfoEntity>, Vec<ChapterEntity>) {
+        let empty = (Vec::new(), Vec::new());
         let Some(encoder) = &self.media_encoder else {
-            return Vec::new();
+            return empty;
         };
         let is_audio = entity.media_type.as_deref() == Some("Audio");
         let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
         if entity.is_folder || !is_media {
-            return Vec::new();
+            return empty;
         }
         let Some(path) = entity.path.clone() else {
-            return Vec::new();
+            return empty;
         };
         let request = MediaInfoRequest {
             media_source: MediaSourceInfo {
                 path: Some(path),
                 ..Default::default()
             },
-            extract_chapters: false,
+            // Extract embedded chapter markers so they show on the playback
+            // timeline (matching Jellyfin's `-show_chapters`).
+            extract_chapters: true,
             media_is_audio: is_audio,
         };
         let probed = match encoder.get_media_info(&request).await {
             Ok(probed) => probed,
             Err(e) => {
                 tracing::warn!(error = %e, path = ?entity.path, "media probe failed; item left unprobed");
-                return Vec::new();
+                return empty;
             }
         };
         entity.run_time_ticks = probed.run_time_ticks.or(entity.run_time_ticks);
         entity.size = probed.size.or(entity.size);
-        probed
+        let streams = probed
             .media_streams
             .iter()
             .map(|s| stream_dto_to_entity(&entity.id, s))
-            .collect()
+            .collect();
+        let chapters = probed
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(index, c)| chapter_to_entity(&entity.id, index, c))
+            .collect();
+        (streams, chapters)
     }
 
     /// Fetches remote artwork (TMDB) for an item that has no local images,
@@ -867,6 +890,26 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
 }
 
+/// Maps a probed [`ChapterInfo`](hermit_model::entities_media::ChapterInfo) to a
+/// persistable [`ChapterEntity`], numbered by its position in the file.
+fn chapter_to_entity(
+    item_id: &str,
+    index: usize,
+    chapter: &hermit_model::entities_media::ChapterInfo,
+) -> ChapterEntity {
+    ChapterEntity {
+        item_id: item_id.to_owned(),
+        chapter_index: i64::try_from(index).unwrap_or(i64::MAX),
+        start_position_ticks: chapter.start_position_ticks,
+        name: chapter.name.clone(),
+        image_path: chapter.image_path.clone(),
+        image_date_modified: chapter
+            .image_path
+            .as_ref()
+            .map(|_| chapter.image_date_modified),
+    }
+}
+
 /// Parses a TMDB `YYYY-MM-DD` date to a UTC timestamp at midnight.
 fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
@@ -1066,6 +1109,9 @@ mod tests {
                 .with_probe(
                     Arc::new(FakeProbe),
                     Arc::new(HermitMediaStreamRepository::new(db.clone())),
+                    Arc::new(crate::chapter_repository::HermitChapterRepository::new(
+                        db.clone(),
+                    )),
                 );
         scanner.scan_all().await.unwrap();
 

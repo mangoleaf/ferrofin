@@ -339,6 +339,7 @@ pub async fn build_app_state(
         .with_probe(
             Arc::clone(&media_encoder),
             Arc::clone(&media_stream_repository),
+            Arc::clone(&chapter_repository),
         )
         // Fetch remote artwork (TMDB) for movies/series with no local images,
         // using Jellyfin's built-in key so posters/backdrops appear with no setup.
