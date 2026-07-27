@@ -435,6 +435,12 @@ pub struct MediaStream {
     /// The title.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The composed display title (language + codec + channels/flags), computed
+    /// by [`display_title`](Self::display_title). Populated when the wire DTO is
+    /// built; clients show it verbatim (jellyfin-web renders "Undefined" without
+    /// it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
     /// The HDR10+ present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr10_plus_present_flag: Option<bool>,

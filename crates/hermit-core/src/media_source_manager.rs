@@ -195,7 +195,7 @@ fn container_of(item: &BaseItemEntity) -> Option<String> {
 /// Maps a persisted media-stream row to the wire [`MediaStream`] DTO. Fields the
 /// entity does not carry are left at their [`Default`].
 fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
-    MediaStream {
+    let mut stream = MediaStream {
         index: i32::try_from(row.stream_index).unwrap_or(0),
         stream_type: media_stream_type_from_disc(row.stream_type),
         codec: row.codec.clone(),
@@ -251,7 +251,11 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
         el_present_flag: row.el_present_flag.map(i32::from),
         hdr10_plus_present_flag: row.hdr10_plus_present_flag,
         ..Default::default()
-    }
+    };
+    // Compose the display title from the now-populated codec/language/channel
+    // fields so clients don't fall back to "Undefined".
+    stream.display_title = stream.display_title();
+    stream
 }
 
 /// Maps a probed wire [`MediaStream`] back to a persistable
