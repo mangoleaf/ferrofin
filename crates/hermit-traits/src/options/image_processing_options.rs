@@ -141,12 +141,17 @@ impl ImageProcessingOptions {
     ) -> bool {
         let Some(size) = size else {
             // C# private HasDefaultOptions(path): size-less form also requires
-            // that no exact/max dimension is requested.
+            // that no exact/max/fill dimension is requested. (Fill must be here
+            // too — without it a `fillWidth`/`fillHeight` request on an image of
+            // unknown stored size is wrongly treated as "no transform" and the
+            // uncropped original is served, so a poster renders clipped.)
             return self.has_default_options_without_size(original_image_path)
                 && self.width.is_none()
                 && self.height.is_none()
                 && self.max_width.is_none()
-                && self.max_height.is_none();
+                && self.max_height.is_none()
+                && self.fill_width.is_none()
+                && self.fill_height.is_none();
         };
 
         if !self.has_default_options_without_size(original_image_path) {
@@ -272,6 +277,28 @@ mod tests {
         // A source larger than fill bounds is not default.
         let big = ImageDimensions::new(200, 50);
         assert!(!opts.has_default_options("/a.jpg", Some(big)));
+    }
+
+    #[test]
+    fn fill_request_is_not_default_without_known_size() {
+        // A poster whose stored dimensions are unknown (size = None) requested
+        // with fillWidth/fillHeight must NOT be treated as "no transform" — else
+        // the uncropped original is served and the poster renders clipped.
+        let opts = ImageProcessingOptions {
+            quality: 95,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            fill_width: Some(400),
+            fill_height: Some(600),
+            ..Default::default()
+        };
+        assert!(!opts.has_default_options("/poster.jpg", None));
+        // With no dimensions of any kind requested, it is default.
+        let plain = ImageProcessingOptions {
+            quality: 95,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            ..Default::default()
+        };
+        assert!(plain.has_default_options("/poster.jpg", None));
     }
 
     #[test]
