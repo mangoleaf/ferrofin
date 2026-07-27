@@ -360,14 +360,16 @@ pub async fn build_app_state(
         &library,
     ))));
     let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager);
-    let media_sources: Arc<dyn hermit_traits::library::MediaSourceManager> =
-        Arc::new(HermitMediaSourceManager::new(
+    let media_sources: Arc<dyn hermit_traits::library::MediaSourceManager> = Arc::new(
+        HermitMediaSourceManager::new(
             Arc::clone(&item_repository),
             Arc::clone(&media_stream_repository),
             Arc::clone(&media_attachment_repository),
             Arc::clone(&media_encoder),
             Arc::clone(&providers),
-        ));
+        )
+        .with_live_tv(Arc::clone(&live_tv)),
+    );
 
     // ---- managers over library -------------------------------------------
     let chapters: Arc<dyn hermit_traits::chapters::ChapterManager> = Arc::new(

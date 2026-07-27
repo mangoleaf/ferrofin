@@ -53,6 +53,9 @@ pub struct HermitMediaSourceManager {
     encoder: Arc<dyn MediaEncoder>,
     #[allow(dead_code)]
     provider: Arc<dyn ProviderManager>,
+    /// Live TV manager, when configured — lets playback resolve a Live TV channel
+    /// id (which is not a `BaseItems` row) to its tuner stream.
+    live_tv: Option<Arc<dyn hermit_traits::stubs::LiveTvManager>>,
     /// Open live streams keyed by their live-stream id. Guarded by a
     /// `std::sync::Mutex` because the guard never spans an `.await`.
     open_streams: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
@@ -81,8 +84,56 @@ impl HermitMediaSourceManager {
             attachments,
             encoder,
             provider,
+            live_tv: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Wires the Live TV manager so playback can resolve channel ids to their
+    /// tuner streams. Without it, an unknown id yields no media sources as before.
+    #[must_use]
+    pub fn with_live_tv(mut self, live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager>) -> Self {
+        self.live_tv = Some(live_tv);
+        self
+    }
+
+    /// Builds the media source for a Live TV channel id: probe its tuner stream so
+    /// transcode negotiation knows the codecs, then mark it as an infinite stream
+    /// that must be transcoded (the raw tuner container/codec is rarely
+    /// browser-playable). Returns empty when Live TV is unconfigured or the id is
+    /// not a known channel.
+    async fn channel_media_source(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let Some(live_tv) = &self.live_tv else {
+            return Ok(Vec::new());
+        };
+        let Some(url) = live_tv.get_channel_stream_url(item_id).await? else {
+            return Ok(Vec::new());
+        };
+        // Probe the tuner stream for its real streams; if the probe fails (tuner
+        // unreachable), fall back to a bare source so the id still resolves.
+        let request = hermit_traits::media_encoding::MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(url.clone()),
+                ..Default::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let probed = self.encoder.get_media_info(&request).await.ok();
+        let mut source = probed.unwrap_or_default();
+        source.id = Some(item_id.to_string());
+        source.path = Some(url.clone());
+        source.protocol = MediaProtocol::Http;
+        source.container = Some(live_stream_container(&url));
+        source.is_infinite_stream = true;
+        source.run_time_ticks = None;
+        source.supports_direct_play = false;
+        source.supports_direct_stream = false;
+        source.supports_transcoding = true;
+        Ok(vec![source])
     }
 
     /// Reads an item's media streams as DTOs.
@@ -115,6 +166,19 @@ impl HermitMediaSourceManager {
             supports_transcoding: true,
             ..Default::default()
         }
+    }
+}
+
+/// The container reported for a Live TV tuner stream, from its URL extension: an
+/// HLS playlist (`.m3u8`) or MPEG-TS (`.ts`); otherwise `ts` (the common IPTV
+/// default). Used only for negotiation labelling — the transcode reads the URL
+/// directly regardless.
+fn live_stream_container(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    if path.to_ascii_lowercase().ends_with(".m3u8") {
+        "hls".to_owned()
+    } else {
+        "ts".to_owned()
     }
 }
 
@@ -306,7 +370,8 @@ impl MediaSourceManager for HermitMediaSourceManager {
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let Some(item) = self.items.retrieve_item(item_id).await? else {
-            return Ok(Vec::new());
+            // Not a library item — it may be a Live TV channel.
+            return self.channel_media_source(item_id).await;
         };
         let streams = self.streams_dto(item_id).await?;
         Ok(vec![Self::static_source(&item, streams)])
@@ -595,6 +660,102 @@ mod tests {
             Arc::new(StubEncoder),
             Arc::new(StubProvider),
         )
+    }
+
+    /// A Live TV manager that resolves any channel id to a fixed tuner URL.
+    struct FakeLiveTv;
+
+    #[async_trait]
+    impl hermit_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_live_tv_info(
+            &self,
+        ) -> Result<hermit_model::live_tv::LiveTvInfo, ServiceError> {
+            Ok(hermit_model::live_tv::LiveTvInfo::default())
+        }
+        async fn get_tuner_hosts(
+            &self,
+        ) -> Result<Vec<hermit_model::live_tv::TunerHostInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn save_tuner_host(
+            &self,
+            info: hermit_model::live_tv::TunerHostInfo,
+        ) -> Result<hermit_model::live_tv::TunerHostInfo, ServiceError> {
+            Ok(info)
+        }
+        async fn delete_tuner_host(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_listing_providers(
+            &self,
+        ) -> Result<Vec<hermit_model::live_tv::ListingsProviderInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn save_listing_provider(
+            &self,
+            info: hermit_model::live_tv::ListingsProviderInfo,
+        ) -> Result<hermit_model::live_tv::ListingsProviderInfo, ServiceError> {
+            Ok(info)
+        }
+        async fn delete_listing_provider(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_channels(
+            &self,
+            _options: &hermit_traits::options::DtoOptions,
+        ) -> Result<hermit_model::querying::QueryResult<hermit_model::dto::BaseItemDto>, ServiceError>
+        {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
+        async fn get_channel(
+            &self,
+            _id: Uuid,
+            _options: &hermit_traits::options::DtoOptions,
+        ) -> Result<Option<hermit_model::dto::BaseItemDto>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_programs(
+            &self,
+            _query: &hermit_traits::options::InternalItemsQuery,
+            _options: &hermit_traits::options::DtoOptions,
+        ) -> Result<hermit_model::querying::QueryResult<hermit_model::dto::BaseItemDto>, ServiceError>
+        {
+            Ok(hermit_model::querying::QueryResult::default())
+        }
+        async fn get_program(
+            &self,
+            _id: Uuid,
+            _options: &hermit_traits::options::DtoOptions,
+        ) -> Result<Option<hermit_model::dto::BaseItemDto>, ServiceError> {
+            Ok(None)
+        }
+        async fn reset_tuner(&self, _id: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn refresh_guide(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
+            Ok(Some("http://tuner/live.ts".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_id_resolves_to_infinite_transcodable_stream() {
+        let db = test_db().await;
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv));
+        // An id absent from BaseItems falls through to the Live TV channel path.
+        let sources = mgr
+            .get_static_media_sources(Uuid::from_u128(0x777), false, None)
+            .await
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        let s = &sources[0];
+        assert_eq!(s.path.as_deref(), Some("http://tuner/live.ts"));
+        assert!(s.is_infinite_stream);
+        assert!(s.supports_transcoding);
+        assert!(!s.supports_direct_play);
+        assert_eq!(s.container.as_deref(), Some("ts"));
     }
 
     #[tokio::test]
