@@ -169,6 +169,9 @@ pub struct TmdbDetails {
     pub people: Vec<TmdbPerson>,
     /// YouTube trailers/teasers for the title.
     pub trailers: Vec<TmdbTrailer>,
+    /// The IMDb id (`ttNNNNNNN`), when known — the key for an OMDb Rotten
+    /// Tomatoes lookup.
+    pub imdb_id: Option<String>,
 }
 
 /// One credited person from a title's `credits`.
@@ -241,6 +244,19 @@ struct DetailsResponse {
     content_ratings: Option<ContentRatingResults>,
     #[serde(default)]
     videos: Option<VideosResults>,
+    /// IMDb id — present directly on `/movie/{id}`.
+    #[serde(default)]
+    imdb_id: Option<String>,
+    /// IMDb id for `/tv/{id}` (via `append_to_response=external_ids`).
+    #[serde(default)]
+    external_ids: Option<ExternalIds>,
+}
+
+/// TMDB `external_ids` — only the IMDb id is used (RT lookup key for series).
+#[derive(Debug, Default, Deserialize)]
+struct ExternalIds {
+    #[serde(default)]
+    imdb_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -650,7 +666,7 @@ impl TmdbClient {
     pub async fn details(&self, kind: TmdbKind, tmdb_id: i64) -> Option<TmdbDetails> {
         let (path, append) = match kind {
             TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
-            TmdbKind::Series => ("tv", "credits,content_ratings,videos"),
+            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids"),
         };
         let resp = self
             .http
@@ -746,6 +762,10 @@ impl TmdbClient {
             runtime_minutes: d.runtime.filter(|m| *m > 0),
             people,
             trailers,
+            imdb_id: d
+                .imdb_id
+                .or_else(|| d.external_ids.and_then(|e| e.imdb_id))
+                .filter(|s| !s.is_empty()),
         })
     }
 

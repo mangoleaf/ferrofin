@@ -71,6 +71,7 @@ fn test_config(root: &std::path::Path) -> Config {
         https_port: 0,
         published_url: None,
         base_url: String::new(),
+        omdb_api_key: String::new(),
         ffmpeg_path: None,
         ffprobe_path: None,
         library_roots: Vec::new(),

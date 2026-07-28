@@ -120,6 +120,9 @@ pub struct LibraryScanner {
     /// Optional TMDB client for fetching remote artwork (posters/backdrops) for
     /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
     tmdb: Option<Arc<TmdbClient>>,
+    /// Optional OMDb client for the Rotten Tomatoes critic rating (keyed by the
+    /// title's IMDb id from TMDB). Disabled when no OMDb API key is configured.
+    omdb: Option<Arc<hermit_providers::OmdbClient>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
     metadata_dir: Option<PathBuf>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
@@ -150,10 +153,20 @@ impl LibraryScanner {
             media_encoder: None,
             media_streams: None,
             tmdb: None,
+            omdb: None,
             metadata_dir: None,
             people: None,
             chapters: None,
         }
+    }
+
+    /// Attaches the OMDb client so movies/series get their Rotten Tomatoes critic
+    /// rating during the scan (keyed by the IMDb id TMDB returns). A disabled
+    /// client (no API key) is a no-op.
+    #[must_use]
+    pub fn with_omdb(mut self, omdb: Arc<hermit_providers::OmdbClient>) -> Self {
+        self.omdb = Some(omdb);
+        self
     }
 
     /// Attaches the people repository so TMDB cast/crew credits are persisted
@@ -341,15 +354,22 @@ impl LibraryScanner {
         let Some(tmdb) = &self.tmdb else {
             return Vec::new();
         };
-        if entity.overview.as_deref().is_some_and(|o| !o.is_empty()) {
-            return Vec::new();
-        }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let kind = match short {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
             _ => return Vec::new(),
         };
+        // Fetch when the row still lacks core metadata OR still lacks a Rotten
+        // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
+        // for titles scanned before OMDb was configured. A fully-enriched title is
+        // skipped, so re-scans stay cheap.
+        let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
+        let wants_rating =
+            self.omdb.as_ref().is_some_and(|o| o.is_enabled()) && entity.critic_rating.is_none();
+        if has_overview && !wants_rating {
+            return Vec::new();
+        }
         let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
             return Vec::new();
         };
@@ -367,6 +387,13 @@ impl LibraryScanner {
             return Vec::new();
         };
         apply_details(entity, &details);
+        // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
+        if wants_rating
+            && let (Some(omdb), Some(imdb_id)) = (&self.omdb, details.imdb_id.as_deref())
+            && let Some(rating) = omdb.critic_rating(imdb_id).await
+        {
+            entity.critic_rating = Some(f64::from(rating));
+        }
         details
             .people
             .iter()

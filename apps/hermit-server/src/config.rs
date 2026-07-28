@@ -105,6 +105,7 @@ struct FileConfig {
     https_port: Option<u16>,
     published_url: Option<String>,
     base_url: Option<String>,
+    omdb_api_key: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     library_roots: Option<Vec<PathBuf>>,
@@ -159,6 +160,11 @@ pub struct Config {
     /// URL path prefix the server is mounted under
     /// (`HostNetworkInfo.base_url`). Empty string = root.
     pub base_url: String,
+
+    /// OMDb (omdbapi.com) API key, enabling the Rotten Tomatoes critic rating.
+    /// Empty = disabled (RT ratings stay unpopulated). From `HERMIT_OMDB_KEY` or
+    /// `config.toml`.
+    pub omdb_api_key: String,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -261,6 +267,11 @@ impl Config {
             .or(file.base_url)
             .unwrap_or_default();
 
+        let omdb_api_key = env
+            .var("HERMIT_OMDB_KEY")
+            .or(file.omdb_api_key)
+            .unwrap_or_default();
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("HERMIT_FFMPEG_PATH").map(PathBuf::from))
@@ -307,6 +318,7 @@ impl Config {
             https_port,
             published_url,
             base_url,
+            omdb_api_key,
             ffmpeg_path,
             ffprobe_path,
             library_roots,

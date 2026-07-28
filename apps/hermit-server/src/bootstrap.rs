@@ -452,6 +452,7 @@ mod tests {
             https_port: 8920,
             published_url: None,
             base_url: String::new(),
+            omdb_api_key: String::new(),
             ffmpeg_path: ffmpeg.map(PathBuf::from),
             ffprobe_path: None,
             library_roots: Vec::new(),

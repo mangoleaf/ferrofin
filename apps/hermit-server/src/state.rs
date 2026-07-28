@@ -368,6 +368,11 @@ pub async fn build_app_state(
         // Fetch remote artwork (TMDB) for movies/series with no local images,
         // using Jellyfin's built-in key so posters/backdrops appear with no setup.
         .with_metadata(Arc::clone(&tmdb_client), metadata_library)
+        // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
+        // key is configured (HERMIT_OMDB_KEY / config.toml `omdb_api_key`).
+        .with_omdb(Arc::new(hermit_providers::OmdbClient::new(
+            &config.omdb_api_key,
+        )))
         // Persist TMDB cast/crew credits fetched alongside the metadata.
         .with_people(Arc::clone(&people_repository)),
     );
@@ -674,6 +679,7 @@ mod tests {
             https_port: 8920,
             published_url: None,
             base_url: String::new(),
+            omdb_api_key: String::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),

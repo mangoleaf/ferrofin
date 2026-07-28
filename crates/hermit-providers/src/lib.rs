@@ -10,6 +10,7 @@
 pub mod container_types;
 pub mod local_images;
 pub mod mediainfo;
+pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod provider_manager;
@@ -19,6 +20,7 @@ pub mod xbmc;
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
+pub use omdb::OmdbClient;
 pub use tmdb::{
     RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
     TmdbPerson, TmdbSearchHit, TmdbTrailer,
