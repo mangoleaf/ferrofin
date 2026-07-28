@@ -232,20 +232,27 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         ancestor_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
         let id = item_id.to_string();
+        // One transaction so the clear+rewrite is atomic on a single connection —
+        // otherwise the DELETE and INSERTs land on different pool connections and
+        // can interleave with a concurrent rebuild, and `INSERT OR IGNORE` makes
+        // a duplicate ancestor (or a lost race) a no-op instead of a UNIQUE 500.
+        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ItemId" = ?1"#)
             .bind(&id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         for ancestor in ancestor_ids {
-            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-                .bind(&id)
-                .bind(ancestor.to_string())
-                .execute(self.db.pool())
-                .await
-                .map_err(db_err)?;
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
+            )
+            .bind(&id)
+            .bind(ancestor.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         }
-        Ok(())
+        tx.commit().await.map_err(db_err)
     }
 
     async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {

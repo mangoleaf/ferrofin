@@ -245,6 +245,17 @@ impl PeopleRepository for HermitPeopleRepository {
 
         let mut tx = self.db.pool().begin().await.map_err(db_err)?;
 
+        // Clear this item's credit rows first. Doing a write as the transaction's
+        // first statement takes SQLite's write lock upfront, so a concurrent writer
+        // (e.g. a page load's playstate update during a scan) can't invalidate a
+        // read snapshot and trip `SQLITE_BUSY_SNAPSHOT` (which busy_timeout won't
+        // retry). The map is rebuilt below.
+        sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
+            .bind(item_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+
         // Ensure a Peoples row exists for each (case-insensitive name + type),
         // reusing an existing id where present so credits share one person row.
         let mut people_ids: Vec<String> = Vec::with_capacity(deduped.len());
