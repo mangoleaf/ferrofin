@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use hermit_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episodes};
@@ -101,6 +102,7 @@ impl Extension for IntroSkipperExtension {
             plugins: Arc::clone(&cx.plugins),
             fingerprinter: cx.fingerprinter.clone(),
             cache_dir: cx.cache_dir.join("introskipper"),
+            running: Arc::new(AtomicBool::new(false)),
         })]
     }
 }
@@ -175,12 +177,16 @@ struct Episode {
 }
 
 /// The scheduled task that detects intros/credits across the library.
+#[derive(Clone)]
 struct DetectSegmentsTask {
     library: Arc<dyn LibraryManager>,
     media_segments: Arc<dyn MediaSegmentManager>,
     plugins: Arc<dyn PluginManager>,
     fingerprinter: Option<Arc<dyn Fingerprinter>>,
     cache_dir: PathBuf,
+    /// `true` while an analysis pass is running, so a second trigger is a no-op
+    /// instead of a duplicate concurrent pass.
+    running: Arc<AtomicBool>,
 }
 
 #[allow(clippy::unnecessary_literal_bound)]
@@ -213,9 +219,40 @@ impl ScheduledTask for DetectSegmentsTask {
             );
             return Ok(());
         };
+        // One pass at a time.
+        if self.running.swap(true, Ordering::SeqCst) {
+            tracing::info!("intro skipper: an analysis pass is already running");
+            return Ok(());
+        }
         let config = self.load_config().await;
+        // Run in the background so the `/ScheduledTasks/Running` trigger returns
+        // immediately: a full-library fingerprint pass runs for many minutes, and
+        // a synchronous run would be cancelled when the client connection times
+        // out. (Mirrors how the library scan already spawns.)
+        let worker = self.clone();
+        tokio::spawn(async move {
+            worker.run_analysis(&fingerprinter, &config).await;
+            worker.running.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+}
 
-        let seasons = self.episodes_by_season().await?;
+impl DetectSegmentsTask {
+    /// The background analysis pass: enumerate episodes by season, then detect +
+    /// write segments for each season with enough episodes to compare.
+    async fn run_analysis(
+        &self,
+        fingerprinter: &Arc<dyn Fingerprinter>,
+        config: &IntroSkipperConfig,
+    ) {
+        let seasons = match self.episodes_by_season().await {
+            Ok(seasons) => seasons,
+            Err(err) => {
+                tracing::warn!(%err, "intro skipper: could not enumerate episodes");
+                return;
+            }
+        };
         tracing::info!(seasons = seasons.len(), "intro skipper: analyzing");
         let mut written = 0usize;
         for episodes in seasons.values() {
@@ -223,15 +260,12 @@ impl ScheduledTask for DetectSegmentsTask {
                 continue; // need a pair to find a shared region
             }
             written += self
-                .analyze_season(episodes, &config, fingerprinter.as_ref())
+                .analyze_season(episodes, config, fingerprinter.as_ref())
                 .await;
         }
         tracing::info!(segments = written, "intro skipper: analysis complete");
-        Ok(())
     }
-}
 
-impl DetectSegmentsTask {
     /// Whether the extension's plugin is currently enabled.
     async fn enabled(&self) -> bool {
         matches!(
