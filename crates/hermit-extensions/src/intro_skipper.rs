@@ -95,6 +95,15 @@ impl Extension for IntroSkipperExtension {
         serde_json::to_vec_pretty(&IntroSkipperConfig::default()).unwrap_or_else(|_| b"{}".to_vec())
     }
 
+    fn config_page(&self) -> Option<(String, Vec<u8>)> {
+        // The dashboard settings page (name = "introskipper"). Served by
+        // `GET /web/ConfigurationPage?name=introskipper`.
+        Some((
+            "introskipper".to_owned(),
+            include_bytes!("intro_skipper_config.html").to_vec(),
+        ))
+    }
+
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
         vec![Arc::new(DetectSegmentsTask {
             library: Arc::clone(&cx.library),

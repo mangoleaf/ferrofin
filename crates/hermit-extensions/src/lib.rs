@@ -53,6 +53,12 @@ pub trait Extension: Send + Sync {
     fn descriptor(&self) -> PluginDescriptor;
     /// The seed configuration written on first run (the plugin config schema).
     fn default_config(&self) -> Vec<u8>;
+    /// The dashboard settings page as `(page name, HTML)`, if the extension has
+    /// one. Providing it makes a Settings link appear on the plugin in the
+    /// dashboard (served via `GET /web/ConfigurationPage`). Defaults to none.
+    fn config_page(&self) -> Option<(String, Vec<u8>)> {
+        None
+    }
     /// The background tasks this extension contributes.
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
@@ -70,7 +76,12 @@ pub fn registered_plugins(extensions: &[Arc<dyn Extension>]) -> Vec<RegisteredPl
     extensions
         .iter()
         .map(|ext| {
-            RegisteredPlugin::new(ext.descriptor(), None).with_default_config(ext.default_config())
+            let mut plugin =
+                RegisteredPlugin::new(ext.descriptor(), None).with_default_config(ext.default_config());
+            if let Some((name, html)) = ext.config_page() {
+                plugin = plugin.with_config_page(name, html);
+            }
+            plugin
         })
         .collect()
 }

@@ -38,6 +38,10 @@ pub struct RegisteredPlugin {
     /// The plugin's default configuration (JSON bytes), returned until the admin
     /// writes a value.
     pub default_config: Vec<u8>,
+    /// The plugin's dashboard settings page as `(page name, HTML)`, if it ships
+    /// one — projected into `GET /web/ConfigurationPages` + served by
+    /// `GET /web/ConfigurationPage?name=…` so the dashboard shows a Settings link.
+    pub config_page: Option<(String, Vec<u8>)>,
 }
 
 impl RegisteredPlugin {
@@ -52,6 +56,7 @@ impl RegisteredPlugin {
             descriptor,
             image,
             default_config: b"{}".to_vec(),
+            config_page: None,
         }
     }
 
@@ -59,6 +64,13 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
         self.default_config = config;
+        self
+    }
+
+    /// Attaches the plugin's dashboard settings page (`page name`, `HTML`).
+    #[must_use]
+    pub fn with_config_page(mut self, name: impl Into<String>, html: Vec<u8>) -> Self {
+        self.config_page = Some((name.into(), html));
         self
     }
 }
@@ -281,6 +293,37 @@ impl PluginManager for HermitPluginManager {
             }
         }
         Ok(packages)
+    }
+
+    async fn get_configuration_pages(
+        &self,
+    ) -> Result<Vec<hermit_model::plugins::ConfigurationPageInfo>, ServiceError> {
+        Ok(self
+            .plugins
+            .iter()
+            .filter_map(|plugin| {
+                plugin.config_page.as_ref().map(|(name, _)| {
+                    hermit_model::plugins::ConfigurationPageInfo {
+                        name: name.clone(),
+                        enable_in_main_menu: false,
+                        menu_section: None,
+                        menu_icon: None,
+                        display_name: Some(plugin.descriptor.name.clone()),
+                        plugin_id: Some(plugin.descriptor.id),
+                    }
+                })
+            })
+            .collect())
+    }
+
+    async fn get_configuration_page(&self, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+        Ok(self.plugins.iter().find_map(|plugin| {
+            plugin
+                .config_page
+                .as_ref()
+                .filter(|(page_name, _)| page_name == name)
+                .map(|(_, html)| html.clone())
+        }))
     }
 }
 

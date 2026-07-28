@@ -11,7 +11,8 @@
 //! `GET /web/ConfigurationPages` is elevation-gated; both collapse to the
 //! contract's routing here.
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
+use axum::response::Html;
 use axum::routing::get;
 use axum::{Json, Router};
 use hermit_model::plugins::ConfigurationPageInfo;
@@ -41,13 +42,16 @@ struct ConfigurationPagesQuery {
     tag = "hermit"
 )]
 async fn get_configuration_pages(
+    State(state): State<AppState>,
     _auth: RequireAuth,
     Query(query): Query<ConfigurationPagesQuery>,
-) -> Json<Vec<ConfigurationPageInfo>> {
-    // The `enableInMainMenu` filter is honoured against an empty page list, so
-    // the result is always empty regardless of its value.
-    let _ = query.enable_in_main_menu;
-    Json(Vec::new())
+) -> Result<Json<Vec<ConfigurationPageInfo>>, ApiError> {
+    let mut pages = state.plugins.get_configuration_pages().await?;
+    // When the caller filters on main-menu placement, keep only matching pages.
+    if let Some(want) = query.enable_in_main_menu {
+        pages.retain(|p| p.enable_in_main_menu == want);
+    }
+    Ok(Json(pages))
 }
 
 /// Query parameters for `GET /web/ConfigurationPage`.
@@ -74,12 +78,16 @@ struct ConfigurationPageQuery {
     tag = "hermit"
 )]
 async fn get_dashboard_configuration_page(
+    State(state): State<AppState>,
     Query(query): Query<ConfigurationPageQuery>,
-) -> Result<(), ApiError> {
-    Err(ApiError::NotFound(format!(
-        "configuration page {:?} not found",
-        query.name.unwrap_or_default()
-    )))
+) -> Result<Html<Vec<u8>>, ApiError> {
+    let name = query.name.unwrap_or_default();
+    match state.plugins.get_configuration_page(&name).await? {
+        Some(html) => Ok(Html(html)),
+        None => Err(ApiError::NotFound(format!(
+            "configuration page {name:?} not found"
+        ))),
+    }
 }
 
 /// Registers this controller's real routes onto `router`.

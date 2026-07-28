@@ -105,6 +105,21 @@ pub trait PluginManager: Send + Sync {
     /// until repository browsing lands (faithful — an empty catalog, never a
     /// faked package).
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError>;
+
+    /// The plugin configuration pages — the dashboard `GET /web/ConfigurationPages`
+    /// list, projected from plugins that ship a settings page. Defaults to empty
+    /// (a plugin without a page has no dashboard settings link).
+    async fn get_configuration_pages(
+        &self,
+    ) -> Result<Vec<hermit_model::plugins::ConfigurationPageInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// A configuration page's HTML by its page `name`, for
+    /// `GET /web/ConfigurationPage`. Defaults to `None` (no such page).
+    async fn get_configuration_page(&self, _name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_plugin_manager(_: &dyn PluginManager) {}

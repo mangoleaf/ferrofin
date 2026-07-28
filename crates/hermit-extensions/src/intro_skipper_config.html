@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Intro Skipper</title>
+</head>
+<body>
+<div id="IntroSkipperConfigPage" data-role="page" class="page type-interior pluginConfigurationPage"
+     data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+        <div class="content-primary">
+            <form id="IntroSkipperConfigForm">
+                <div class="verticalSection">
+                    <h2 class="sectionTitle">Intro Skipper</h2>
+                    <p>
+                        Detects TV episode intros and end credits by audio fingerprinting and exposes
+                        them as media segments, so clients show <strong>Skip Intro</strong> /
+                        <strong>Skip Credits</strong>. After changing settings, run the
+                        <em>Detect intros and credits</em> scheduled task to re-analyze.
+                    </p>
+                </div>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="DetectIntros" />
+                        <span>Detect intros</span>
+                    </label>
+                </div>
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
+                        <input is="emby-checkbox" type="checkbox" id="DetectCredits" />
+                        <span>Detect end credits</span>
+                    </label>
+                </div>
+
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MinimumIntroDuration">Minimum intro duration (seconds)</label>
+                    <input is="emby-input" type="number" id="MinimumIntroDuration" min="1" step="1" />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MaximumIntroDuration">Maximum intro duration (seconds)</label>
+                    <input is="emby-input" type="number" id="MaximumIntroDuration" min="1" step="1" />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MinimumCreditsDuration">Minimum credits duration (seconds)</label>
+                    <input is="emby-input" type="number" id="MinimumCreditsDuration" min="1" step="1" />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="MaximumCreditsDuration">Maximum credits duration (seconds)</label>
+                    <input is="emby-input" type="number" id="MaximumCreditsDuration" min="1" step="1" />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="AnalysisPercent">Intro search window (% of episode from the start)</label>
+                    <input is="emby-input" type="number" id="AnalysisPercent" min="1" max="100" step="1" />
+                </div>
+                <div class="inputContainer">
+                    <label class="inputLabel inputLabelUnfocused" for="AnalysisLengthLimit">Intro search window cap (minutes)</label>
+                    <input is="emby-input" type="number" id="AnalysisLengthLimit" min="1" step="1" />
+                </div>
+
+                <details class="verticalSection">
+                    <summary>Advanced matching</summary>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="MaximumFingerprintPointDifferences">Maximum fingerprint point differences (bits, 0–32)</label>
+                        <input is="emby-input" type="number" id="MaximumFingerprintPointDifferences" min="0" max="32" step="1" />
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="MaximumTimeSkip">Maximum time skip (seconds)</label>
+                        <input is="emby-input" type="number" id="MaximumTimeSkip" min="0" step="0.1" />
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="InvertedIndexShift">Inverted index shift</label>
+                        <input is="emby-input" type="number" id="InvertedIndexShift" min="0" step="1" />
+                    </div>
+                </details>
+
+                <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                    <span>Save</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        (function () {
+            var pluginId = "1a7b05c1-5c1b-4d0e-9f00-1247a105c1de";
+            var page = document.querySelector('#IntroSkipperConfigPage');
+            // field id -> kind
+            var fields = {
+                DetectIntros: 'bool',
+                DetectCredits: 'bool',
+                MinimumIntroDuration: 'number',
+                MaximumIntroDuration: 'number',
+                MinimumCreditsDuration: 'number',
+                MaximumCreditsDuration: 'number',
+                AnalysisPercent: 'number',
+                AnalysisLengthLimit: 'number',
+                MaximumFingerprintPointDifferences: 'number',
+                MaximumTimeSkip: 'number',
+                InvertedIndexShift: 'number'
+            };
+
+            function loadConfig() {
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    Object.keys(fields).forEach(function (key) {
+                        var el = page.querySelector('#' + key);
+                        if (!el) { return; }
+                        if (fields[key] === 'bool') {
+                            el.checked = config[key] === true;
+                        } else {
+                            el.value = config[key];
+                        }
+                    });
+                    Dashboard.hideLoadingMsg();
+                });
+            }
+
+            function saveConfig(e) {
+                e.preventDefault();
+                Dashboard.showLoadingMsg();
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    Object.keys(fields).forEach(function (key) {
+                        var el = page.querySelector('#' + key);
+                        if (!el) { return; }
+                        if (fields[key] === 'bool') {
+                            config[key] = el.checked;
+                        } else {
+                            var value = parseFloat(el.value);
+                            if (!isNaN(value)) { config[key] = value; }
+                        }
+                    });
+                    ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                    });
+                });
+                return false;
+            }
+
+            // jellyfin-web fires 'viewshow' when the config view is shown; older
+            // clients use 'pageshow'. Load on either.
+            page.addEventListener('viewshow', loadConfig);
+            page.addEventListener('pageshow', loadConfig);
+            page.querySelector('#IntroSkipperConfigForm').addEventListener('submit', saveConfig);
+            // If the script runs after the view is already visible, load now too.
+            loadConfig();
+        })();
+    </script>
+</div>
+</body>
+</html>
