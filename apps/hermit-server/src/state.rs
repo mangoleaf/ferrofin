@@ -608,14 +608,16 @@ pub async fn build_app_state(
     // Called before the state is cloned/shared (mirrors the C# Autofac
     // registration of ITranscodeManager/IDynamicHlsPlaylistGenerator +
     // IAttachmentExtractor).
-    let (hls, attachments) = build_media_encoding(
+    let (hls, attachments, subtitle_encoder) = build_media_encoding(
         me_media_sources,
         me_media_encoder,
         me_config,
         Arc::clone(&paths),
         me_path_manager,
     );
-    let state = state.with_media_encoding(hls, attachments);
+    let state = state
+        .with_media_encoding(hls, attachments)
+        .with_subtitle_encoder(subtitle_encoder);
 
     // ---- virtual-folder (library-structure) store -------------------------
     // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is

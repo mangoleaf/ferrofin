@@ -19,6 +19,9 @@ use async_trait::async_trait;
 use hermit_core::HermitServerApplicationPaths;
 use hermit_hls::{DynamicHlsPlaylistGenerator, HlsStreamManagerImpl};
 use hermit_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
+use hermit_mediaencoding::subtitles::{
+    SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
+};
 use hermit_mediaencoding::{
     AttachmentExtractorImpl, EncodingHelper, NoOptionalEncoders, NoopSessionReporter,
     TokioSegmentTranscoder, TranscodeManagerImpl,
@@ -27,9 +30,11 @@ use hermit_model::configuration::EncodingOptions;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::Video3DFormat;
 use hermit_model::entities_media::MediaStream;
+use hermit_model::media_info::MediaProtocol;
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::MediaSourceManager;
+use hermit_traits::media_encoding::SubtitleEncoder;
 use hermit_traits::media_encoding::{
     AttachmentExtractor, HlsStreamManager, MediaEncoder, MediaInfoRequest,
 };
@@ -61,7 +66,11 @@ pub fn build_media_encoding(
     config: Arc<dyn ServerConfigurationManager>,
     paths: Arc<HermitServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
-) -> (Arc<dyn HlsStreamManager>, Arc<dyn AttachmentExtractor>) {
+) -> (
+    Arc<dyn HlsStreamManager>,
+    Arc<dyn AttachmentExtractor>,
+    Arc<dyn SubtitleEncoder>,
+) {
     // ---- HLS transcode chain (below the planner seam) ---------------------
     let planner = HermitStreamStatePlanner::new(
         Arc::clone(&media_sources),
@@ -90,17 +99,122 @@ pub fn build_media_encoding(
     ));
 
     // ---- attachment extractor (real ffmpeg + filesystem) ------------------
-    let resolver = Arc::new(MediaSourceManagerResolver { media_sources });
-    let io = Arc::new(FfmpegAttachmentIo { path_manager });
+    let resolver = Arc::new(MediaSourceManagerResolver {
+        media_sources: Arc::clone(&media_sources),
+    });
+    let io = Arc::new(FfmpegAttachmentIo {
+        path_manager: Arc::clone(&path_manager),
+    });
     // `AttachmentExtractorImpl<E, …>` holds an `Arc<E>` with `E: Sized`, so the
     // trait-object encoder is wrapped in the sized [`DynMediaEncoder`] newtype.
+    // Capture the ffmpeg binary path before `encoder` is moved into the wrapper.
+    let ffmpeg_path = encoder.encoder_path();
     let attachments: Arc<dyn AttachmentExtractor> = Arc::new(AttachmentExtractorImpl::new(
         Arc::new(DynMediaEncoder(encoder)),
         resolver,
         io,
     ));
 
-    (hls, attachments)
+    // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
+    // Replaces the `DisabledSubtitleEncoder` stub so `/Videos/.../Subtitles/
+    // .../Stream.vtt` actually extracts/converts (external subtitle delivery for
+    // direct-play, where the client fetches VTT rather than the server burning in).
+    let sub_resolver = Arc::new(MediaSourceManagerResolver { media_sources });
+    let sub_io = FfmpegSubtitleIo {
+        path_manager,
+        ffmpeg_path,
+    };
+    let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
+    let subtitles: Arc<dyn SubtitleEncoder> =
+        Arc::new(SubtitleEncoderImpl::new(pure_encoder, sub_resolver));
+
+    (hls, attachments, subtitles)
+}
+
+/// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
+///
+/// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
+/// file/HTTP reads use `tokio::fs`/`reqwest`, and extraction runs the injected
+/// ffmpeg binary through `tokio::process`.
+struct FfmpegSubtitleIo {
+    path_manager: Arc<dyn PathManager>,
+    ffmpeg_path: String,
+}
+
+#[async_trait]
+impl SubtitleIo for FfmpegSubtitleIo {
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("read {path}: {e}"))
+    }
+
+    async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+        let resp = reqwest::get(url)
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("GET {url}: HTTP {}", resp.status()));
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("GET {url} body: {e}"))
+    }
+
+    fn path_protocol(&self, path: &str) -> MediaProtocol {
+        let lower = path.trim_start().to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            MediaProtocol::Http
+        } else {
+            MediaProtocol::File
+        }
+    }
+
+    fn subtitle_cache_path(
+        &self,
+        media_source_id: &str,
+        subtitle_stream_index: i32,
+        output_extension: &str,
+    ) -> Option<String> {
+        self.path_manager
+            .subtitle_path(media_source_id, subtitle_stream_index, output_extension)
+    }
+
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+        // ffmpeg won't create missing output directories; the per-source subtitle
+        // cache folder may not exist yet on first extraction, so ensure each
+        // output's parent exists (C# creates it before spawning ffmpeg).
+        for path in output_paths {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+        }
+        let parts = split_ffmpeg_args(args);
+        let status = tokio::process::Command::new(&self.ffmpeg_path)
+            .args(&parts)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map_err(|e| format!("spawn ffmpeg {}: {e}", self.ffmpeg_path))?;
+        if !status.success() {
+            return Err(format!(
+                "ffmpeg subtitle extraction exited with {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        // The extraction is only useful if every requested output was written.
+        for path in output_paths {
+            if !std::path::Path::new(path).is_file() {
+                return Err(format!("ffmpeg did not produce {path}"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A `Sized` newtype wrapping an `Arc<dyn MediaEncoder>`, delegating every
@@ -518,8 +632,8 @@ mod tests {
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
             root: "/cache/att".to_owned(),
         });
-        // The pair builds without panicking; both slots are real trait objects.
-        let (_hls, _attachments) =
+        // The trio builds without panicking; every slot is a real trait object.
+        let (_hls, _attachments, _subtitles) =
             build_media_encoding(media_sources, encoder, config, paths, path_manager);
     }
 

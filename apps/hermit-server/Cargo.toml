@@ -41,6 +41,7 @@ tower.workspace = true        # outer path-canonicalization layer (case-insensit
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
 tokio = { workspace = true }
 async-trait.workspace = true
+reqwest.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
 clap.workspace = true
