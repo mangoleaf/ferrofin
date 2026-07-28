@@ -22,6 +22,16 @@
 
                 <div class="checkboxContainer checkboxContainer-withDescription">
                     <label>
+                        <input is="emby-checkbox" type="checkbox" id="Enabled" />
+                        <span>Enable Intro Skipper</span>
+                    </label>
+                    <div class="fieldDescription">
+                        When disabled, the detection task does nothing (existing segments are kept).
+                    </div>
+                </div>
+
+                <div class="checkboxContainer checkboxContainer-withDescription">
+                    <label>
                         <input is="emby-checkbox" type="checkbox" id="DetectIntros" />
                         <span>Detect intros</span>
                     </label>
@@ -84,8 +94,10 @@
     <script type="text/javascript">
         (function () {
             var pluginId = "1a7b05c1-5c1b-4d0e-9f00-1247a105c1de";
+            var pluginVersion = "1.0.0";
             var page = document.querySelector('#IntroSkipperConfigPage');
-            // field id -> kind
+            // field id -> kind (the analysis config; the Enabled toggle is handled
+            // separately via the plugin enable/disable endpoints).
             var fields = {
                 DetectIntros: 'bool',
                 DetectCredits: 'bool',
@@ -100,18 +112,42 @@
                 InvertedIndexShift: 'number'
             };
 
+            // Reflect the plugin's enabled state (its /Plugins Status) in the toggle.
+            function loadEnabled() {
+                return ApiClient.getPlugins().then(function (plugins) {
+                    var mine = (plugins || []).filter(function (p) { return p.Id === pluginId; })[0];
+                    if (mine && mine.Version) { pluginVersion = mine.Version; }
+                    page.querySelector('#Enabled').checked = mine ? mine.Status === 'Active' : true;
+                }).catch(function () {
+                    page.querySelector('#Enabled').checked = true;
+                });
+            }
+
+            // Enable/disable the plugin to match the toggle.
+            function saveEnabled() {
+                var action = page.querySelector('#Enabled').checked ? 'Enable' : 'Disable';
+                return ApiClient.ajax({
+                    type: 'POST',
+                    url: ApiClient.getUrl('Plugins/' + pluginId + '/' + pluginVersion + '/' + action)
+                });
+            }
+
             function loadConfig() {
                 Dashboard.showLoadingMsg();
-                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
-                    Object.keys(fields).forEach(function (key) {
-                        var el = page.querySelector('#' + key);
-                        if (!el) { return; }
-                        if (fields[key] === 'bool') {
-                            el.checked = config[key] === true;
-                        } else {
-                            el.value = config[key];
-                        }
-                    });
+                Promise.all([
+                    loadEnabled(),
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        Object.keys(fields).forEach(function (key) {
+                            var el = page.querySelector('#' + key);
+                            if (!el) { return; }
+                            if (fields[key] === 'bool') {
+                                el.checked = config[key] === true;
+                            } else {
+                                el.value = config[key];
+                            }
+                        });
+                    })
+                ]).then(function () {
                     Dashboard.hideLoadingMsg();
                 });
             }
@@ -131,7 +167,9 @@
                         }
                     });
                     ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
-                        Dashboard.processPluginConfigurationUpdateResult(result);
+                        saveEnabled().then(function () {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
                     });
                 });
                 return false;
