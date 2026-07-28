@@ -24,6 +24,7 @@ opensubtitles = []
 hermit-traits.workspace = true
 hermit-model.workspace = true
 hermit-common.workspace = true
+hermit-db.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true

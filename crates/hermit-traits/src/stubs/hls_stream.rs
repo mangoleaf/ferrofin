@@ -86,6 +86,19 @@ impl HlsStreamManager for DisabledHlsStreamManager {
         // so the client's `DELETE` still returns `204`.
         Ok(())
     }
+
+    async fn ping_transcoding_job(
+        &self,
+        play_session_id: &str,
+        _is_user_paused: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        // No jobs run on a disabled host, but the empty-id contract still holds so
+        // the handler's `204` semantics match the concrete manager.
+        if play_session_id.trim().is_empty() {
+            return Err(ServiceError::invalid_input("playSessionId is empty"));
+        }
+        Ok(())
+    }
 }
 
 /// A no-op [`AttachmentExtractor`]: every request reports "no transcode runtime".

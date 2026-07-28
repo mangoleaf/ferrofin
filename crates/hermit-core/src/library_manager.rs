@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
@@ -54,6 +55,14 @@ pub struct HermitLibraryManager {
     /// The filesystem scanner, set by the composition root. When present,
     /// `queue_library_scan` runs it; `None` (unit tests) keeps it a no-op.
     scanner: Option<Arc<crate::library_scan::LibraryScanner>>,
+    /// Coalescing guard for `queue_library_scan`: `true` while a scan task runs.
+    /// A queue request during a running scan sets [`Self::scan_pending`] instead
+    /// of spawning a second scan (the library monitor fans a webhook batch into
+    /// one report per path, and `/Library/Refresh` can be double-clicked).
+    scan_in_flight: Arc<AtomicBool>,
+    /// Set when a scan is requested while one is already running, so the running
+    /// task loops once more and picks up the change it would otherwise miss.
+    scan_pending: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HermitLibraryManager {
@@ -78,6 +87,8 @@ impl HermitLibraryManager {
             persistence,
             people,
             scanner: None,
+            scan_in_flight: Arc::new(AtomicBool::new(false)),
+            scan_pending: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -114,6 +125,13 @@ impl HermitLibraryManager {
             }
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::library_monitor::LibraryScanTrigger for HermitLibraryManager {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        LibraryManager::queue_library_scan(self).await
     }
 }
 
@@ -468,21 +486,39 @@ impl LibraryManager for HermitLibraryManager {
             tracing::debug!("library scan queued (no scanner attached — no-op)");
             return Ok(());
         };
-        // Spawn so the /Library/Refresh request returns immediately (Jellyfin's
-        // refresh is fire-and-forget); a full scan now fetches remote metadata and
-        // downloads artwork for every item + credited person, which can run for
-        // minutes and must not block the HTTP handler.
-        //
-        // ponytail: no in-flight guard — a double refresh runs two scans, which is
-        // wasteful but safe (writes are idempotent and take the write lock upfront,
-        // per update_people/save_item_values). Add an AtomicBool guard if repeated
-        // refreshes during a long scan become a problem.
+        // Coalesce: a full scan fetches remote metadata + artwork for every item,
+        // so it can run for minutes. The library-monitor webhooks report one path
+        // at a time (a Radarr/Sonarr batch = many calls) and `/Library/Refresh`
+        // can be double-clicked, so overlapping requests must fold into one scan.
+        // If a scan is already running, mark a rerun and return; the running task
+        // loops once more to pick up whatever changed mid-scan.
+        if self.scan_in_flight.swap(true, Ordering::AcqRel) {
+            self.scan_pending.store(true, Ordering::Release);
+            tracing::debug!("library scan already running; coalesced (rerun queued)");
+            return Ok(());
+        }
+        // Spawn so the request returns immediately (Jellyfin's refresh is
+        // fire-and-forget) and must not block the HTTP handler.
         let scanner = Arc::clone(scanner);
+        let in_flight = Arc::clone(&self.scan_in_flight);
+        let pending = Arc::clone(&self.scan_pending);
         tokio::spawn(async move {
-            match scanner.scan_all().await {
-                Ok(created) => tracing::info!(created, "library scan complete"),
-                Err(err) => tracing::error!(%err, "library scan failed"),
+            loop {
+                pending.store(false, Ordering::Release);
+                match scanner.scan_all().await {
+                    Ok(created) => tracing::info!(created, "library scan complete"),
+                    Err(err) => tracing::error!(%err, "library scan failed"),
+                }
+                // A request that arrived during the scan queued a rerun.
+                if !pending.swap(false, Ordering::AcqRel) {
+                    break;
+                }
             }
+            in_flight.store(false, Ordering::Release);
+            // ponytail: a request landing in the gap between the pending re-check
+            // and clearing in_flight loses its rerun — harmless (the next webhook
+            // or a manual refresh re-triggers). Tighten only if webhook-driven
+            // scans start missing changes.
         });
         Ok(())
     }

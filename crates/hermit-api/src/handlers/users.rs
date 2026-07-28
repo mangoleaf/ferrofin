@@ -46,6 +46,7 @@ use hermit_model::session::AuthenticationResult;
 use hermit_model::users::{
     ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
 };
+use hermit_traits::error::ServiceError;
 use hermit_traits::options::AuthorizationInfo;
 use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
@@ -106,31 +107,145 @@ struct UpdateUserPassword {
 }
 
 /// The `POST /Users/ForgotPassword` request body.
-///
-/// The field is accepted for wire compatibility but unused: the pluggable
-/// password-reset provider is a deferred subsystem, so the handler returns the
-/// default "contact admin" action without consulting the username.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordDto {
     /// The username whose password should be reset.
     #[serde(default)]
-    #[allow(dead_code)]
     entered_username: String,
 }
 
 /// The `POST /Users/ForgotPassword/Pin` request body.
-///
-/// The field is accepted for wire compatibility but unused: with the reset
-/// subsystem deferred, no pin is ever issued, so redemption always reports
-/// failure.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordPinDto {
     /// The entered pin.
     #[serde(default)]
-    #[allow(dead_code)]
     pin: String,
+}
+
+/// Filename prefix for a pending password-reset record under the data dir
+/// (`passwordreset-<userId>.json`). Port of C#
+/// `DefaultPasswordResetProvider._passwordResetFileBase`.
+const PASSWORD_RESET_PREFIX: &str = "passwordreset-";
+
+/// How long an issued forgot-password pin stays valid. Port of C#
+/// `DefaultPasswordResetProvider` (30 minutes).
+const PIN_TTL_MINUTES: i64 = 30;
+
+/// The on-disk record of an in-progress forgot-password reset.
+///
+/// Port of C# `DefaultPasswordResetProvider.SerializablePasswordReset`, written
+/// to `{data}/passwordreset-<userId>.json` when a pin is issued and consumed by
+/// the `/Pin` redemption.
+#[derive(Debug, serde::Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SerializablePasswordReset {
+    /// When the pin expires.
+    expiration_date: chrono::DateTime<chrono::Utc>,
+    /// The issued pin (dash-grouped uppercase hex, e.g. `1A-2B-3C-4D`).
+    pin: String,
+    /// The absolute path of this record (echoed to the client as `PinFile`).
+    pin_file: String,
+    /// The username this reset belongs to.
+    user_name: String,
+}
+
+/// Generates a fresh reset pin from 4 random bytes, formatted like C#'s
+/// `BitConverter.ToString` (`1A-2B-3C-4D`).
+///
+/// ponytail: seeds from a v4 UUID's random bytes instead of pulling in a
+/// dedicated RNG crate — 32 bits of entropy over a 30-minute window is ample for
+/// a single-use, admin-visible reset pin.
+fn generate_reset_pin() -> String {
+    let b = Uuid::new_v4().into_bytes();
+    format!("{:02X}-{:02X}-{:02X}-{:02X}", b[0], b[1], b[2], b[3])
+}
+
+/// Normalizes a pin for comparison: strip the grouping dashes, uppercase.
+fn normalize_pin(pin: &str) -> String {
+    pin.replace('-', "").to_ascii_uppercase()
+}
+
+/// Issues a reset pin for a user, writing the record to
+/// `{data_dir}/passwordreset-<user_id>.json`. Returns the `PinCode` result to
+/// send the client and the plaintext pin (for the server log). Port of
+/// `DefaultPasswordResetProvider.StartForgotPassword`.
+fn issue_reset_pin(
+    data_dir: &std::path::Path,
+    user_id: &str,
+    user_name: &str,
+) -> Result<(ForgotPasswordResult, String), ServiceError> {
+    let pin = generate_reset_pin();
+    let expiration = chrono::Utc::now() + chrono::Duration::minutes(PIN_TTL_MINUTES);
+    let pin_file = data_dir.join(format!("{PASSWORD_RESET_PREFIX}{user_id}.json"));
+    let record = SerializablePasswordReset {
+        expiration_date: expiration,
+        pin: pin.clone(),
+        pin_file: pin_file.to_string_lossy().into_owned(),
+        user_name: user_name.to_owned(),
+    };
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| ServiceError::backend(format!("create data dir: {e}")))?;
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|e| ServiceError::backend(format!("serialize reset record: {e}")))?;
+    std::fs::write(&pin_file, bytes)
+        .map_err(|e| ServiceError::backend(format!("write reset record: {e}")))?;
+    Ok((
+        ForgotPasswordResult {
+            action: ForgotPasswordAction::PinCode,
+            pin_file: Some(record.pin_file),
+            pin_expiration_date: Some(expiration),
+        },
+        pin,
+    ))
+}
+
+/// Scans `data_dir` for pending reset records: deletes expired ones, and for
+/// each whose pin matches `entered_pin` (dashes/case ignored) returns its
+/// `(user_name, pin)` and deletes the record. An empty pin matches nothing. Port
+/// of `DefaultPasswordResetProvider.RedeemPasswordResetPin`.
+fn redeem_reset_pins(
+    data_dir: &std::path::Path,
+    entered_pin: &str,
+) -> Result<Vec<(String, String)>, ServiceError> {
+    let entered = normalize_pin(entered_pin);
+    let mut matches = Vec::new();
+
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        // No data dir yet ⇒ no pending resets.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(matches),
+        Err(e) => return Err(ServiceError::backend(format!("read data dir: {e}"))),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name_is_reset = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(PASSWORD_RESET_PREFIX));
+        let is_json = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        if !name_is_reset || !is_json {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<SerializablePasswordReset>(&bytes) else {
+            continue;
+        };
+
+        if record.expiration_date < chrono::Utc::now() {
+            let _ = std::fs::remove_file(&path);
+        } else if !entered.is_empty() && normalize_pin(&record.pin) == entered {
+            matches.push((record.user_name, record.pin));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(matches)
 }
 
 /// Query parameters carrying an optional `userId` (the update/password routes).
@@ -656,10 +771,14 @@ async fn update_user_password(
 
 /// `POST /Users/ForgotPassword` — begin the forgot-password flow.
 ///
-/// Port of `UserController.ForgotPassword`. The pluggable password-reset provider
-/// subsystem is deferred; the ported built-in behaviour directs the user to
-/// contact the administrator (the default provider's response for a
-/// non-in-network request), which is the safe, faithful default.
+/// Port of `UserController.ForgotPassword` → `UserManager.StartForgotPassword` →
+/// the built-in `DefaultPasswordResetProvider`: when the entered username matches
+/// a user, a random pin (valid [`PIN_TTL_MINUTES`]) is written to
+/// `{data}/passwordreset-<userId>.json` and its path returned as `PinFile` with
+/// action [`ForgotPasswordAction::PinCode`]. The pin is also logged (there is no
+/// e-mail provider — the admin reads it from the server log, matching Jellyfin).
+/// An unknown / blank username yields [`ForgotPasswordAction::ContactAdmin`] so
+/// the endpoint never discloses whether an account exists.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
@@ -667,21 +786,40 @@ async fn update_user_password(
     tag = "hermit"
 )]
 async fn forgot_password(
-    State(_state): State<AppState>,
-    Json(_body): Json<ForgotPasswordDto>,
+    State(state): State<AppState>,
+    Json(body): Json<ForgotPasswordDto>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    Ok(Json(ForgotPasswordResult {
-        action: ForgotPasswordAction::ContactAdmin,
-        pin_file: None,
-        pin_expiration_date: None,
-    }))
+    let contact_admin = || {
+        Ok(Json(ForgotPasswordResult {
+            action: ForgotPasswordAction::ContactAdmin,
+            pin_file: None,
+            pin_expiration_date: None,
+        }))
+    };
+
+    let username = body.entered_username.trim();
+    if username.is_empty() {
+        return contact_admin();
+    }
+    let Some(user) = state.users.get_user_by_name(username).await? else {
+        return contact_admin();
+    };
+
+    let dir = std::path::PathBuf::from(state.config.application_paths().data_path());
+    let (result, pin) = issue_reset_pin(&dir, &user.id, &user.username)?;
+    // No e-mail provider: surface the pin in the log so the admin can relay it.
+    tracing::info!(user = %user.username, pin = %pin, "forgot-password pin issued");
+    Ok(Json(result))
 }
 
 /// `POST /Users/ForgotPassword/Pin` — redeem a forgot-password pin.
 ///
-/// Port of `UserController.ForgotPasswordPin`. With the reset-provider subsystem
-/// deferred, no pin is ever issued, so redemption always reports failure — the
-/// faithful outcome for a server with no active reset flow.
+/// Port of `UserController.ForgotPasswordPin` →
+/// `DefaultPasswordResetProvider.RedeemPasswordResetPin`: scans the pending
+/// `passwordreset-*.json` records, deleting expired ones. When one matches the
+/// entered pin (dashes/case ignored) its user's password is set to the pin (so
+/// they can log in and change it) and the record deleted. Reports the set of
+/// usernames reset.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
@@ -689,12 +827,24 @@ async fn forgot_password(
     tag = "hermit"
 )]
 async fn forgot_password_pin(
-    State(_state): State<AppState>,
-    Json(_body): Json<ForgotPasswordPinDto>,
+    State(state): State<AppState>,
+    Json(body): Json<ForgotPasswordPinDto>,
 ) -> Result<Json<PinRedeemResult>, ApiError> {
+    let dir = std::path::PathBuf::from(state.config.application_paths().data_path());
+    let mut users_reset = Vec::new();
+    for (user_name, pin) in redeem_reset_pins(&dir, &body.pin)? {
+        // Set the matched user's password to the pin so they can log in and
+        // change it (C# `_userManager.ChangePassword(resetUser, pin)`).
+        if let Some(user) = state.users.get_user_by_name(&user_name).await?
+            && let Ok(user_id) = Uuid::parse_str(&user.id)
+        {
+            state.users.change_password(user_id, &pin).await?;
+            users_reset.push(user.username);
+        }
+    }
     Ok(Json(PinRedeemResult {
-        success: false,
-        users_reset: Vec::new(),
+        success: !users_reset.is_empty(),
+        users_reset,
     }))
 }
 
@@ -786,4 +936,95 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Users/ForgotPassword", post(forgot_password))
         .route("/Users/ForgotPassword/Pin", post(forgot_password_pin))
         .route("/Users/Me", get(get_current_user))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PASSWORD_RESET_PREFIX, SerializablePasswordReset, generate_reset_pin, issue_reset_pin,
+        normalize_pin, redeem_reset_pins,
+    };
+
+    #[test]
+    fn reset_pin_format_and_normalization() {
+        let pin = generate_reset_pin();
+        // `XX-XX-XX-XX`: 8 hex digits in four dash-separated pairs.
+        let parts: Vec<&str> = pin.split('-').collect();
+        assert_eq!(parts.len(), 4);
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+        );
+        // Normalization strips dashes and uppercases, so a lowercased/spaced-out
+        // entry still matches.
+        assert_eq!(
+            normalize_pin(&pin),
+            normalize_pin(&pin.to_ascii_lowercase())
+        );
+        assert_eq!(normalize_pin("1a-2b"), "1A2B");
+    }
+
+    #[test]
+    fn issue_then_redeem_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (result, pin) = issue_reset_pin(dir.path(), "user-1", "alice").unwrap();
+        assert_eq!(result.action, super::ForgotPasswordAction::PinCode);
+        assert!(result.pin_file.is_some());
+        assert!(result.pin_expiration_date.is_some());
+        // The record file exists.
+        let file = dir
+            .path()
+            .join(format!("{PASSWORD_RESET_PREFIX}user-1.json"));
+        assert!(file.exists());
+
+        // A wrong pin matches nothing and leaves the record in place.
+        assert!(
+            redeem_reset_pins(dir.path(), "FF-FF-FF-FF")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(file.exists());
+        // An empty pin never matches.
+        assert!(redeem_reset_pins(dir.path(), "").unwrap().is_empty());
+
+        // The right pin (dashes/case ignored) returns the user + consumes the file.
+        let matched = redeem_reset_pins(dir.path(), &pin.to_ascii_lowercase()).unwrap();
+        assert_eq!(matched, vec![("alice".to_owned(), pin)]);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn expired_record_is_deleted_and_never_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = SerializablePasswordReset {
+            expiration_date: chrono::Utc::now() - chrono::Duration::minutes(1),
+            pin: "AA-BB-CC-DD".to_owned(),
+            pin_file: String::new(),
+            user_name: "bob".to_owned(),
+        };
+        let file = dir
+            .path()
+            .join(format!("{PASSWORD_RESET_PREFIX}user-2.json"));
+        std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        // Even with the correct pin, an expired record yields no match and is purged.
+        assert!(
+            redeem_reset_pins(dir.path(), "AA-BB-CC-DD")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn redeem_on_missing_dir_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            redeem_reset_pins(&missing, "AA-BB-CC-DD")
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

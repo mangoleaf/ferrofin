@@ -24,9 +24,12 @@
 //! further change here.
 //!
 //! `Apply` resolves the item (`404` when absent) and drives the provider
-//! manager's real `refresh_full_item` seam; the refresh *pipeline* itself is the
-//! deferred piece (it needs the library-item store / image pipeline), so until it
-//! lands the seam surfaces its deferral error.
+//! manager's `refresh_full_item`, which re-fetches the item's metadata + artwork
+//! from TMDB and persists them. It re-searches by the item's title rather than
+//! binding the exact provider id on the chosen result (that needs a
+//! `BaseItemProviders` write path not yet present), so a title with multiple
+//! matches may not honor the precise pick; the metadata applied is real either
+//! way and the common case matches the user's selection.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -182,10 +185,8 @@ fn default_true() -> bool {
 ///
 /// Port of `ItemLookupController.ApplySearchCriteria`: resolves the item (`404`
 /// when absent), then drives a full metadata + image refresh through the provider
-/// manager's `refresh_full_item` seam with the chosen [`RemoteSearchResult`]'s
-/// provider ids. The refresh *pipeline* is deferred (it needs the library-item
-/// store / image pipeline), so until it lands the seam surfaces its deferral;
-/// the endpoint itself is wired to the real seam.
+/// manager's `refresh_full_item`, which re-fetches and persists the item's TMDB
+/// metadata and downloads its primary/backdrop artwork.
 #[utoipa::path(
     post,
     path = "/Items/RemoteSearch/Apply/{itemId}",

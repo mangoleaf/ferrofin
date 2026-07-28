@@ -1272,6 +1272,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "hermit-common",
+ "hermit-db",
  "hermit-model",
  "hermit-traits",
  "quick-xml",

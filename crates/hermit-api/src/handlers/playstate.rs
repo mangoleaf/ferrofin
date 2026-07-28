@@ -270,9 +270,11 @@ struct PingQuery {
 
 /// `POST /Sessions/Playing/Ping` — pings a playback session.
 ///
-/// Port of `PlaystateController.PingPlaybackSession`. The ping targets the
-/// transcode manager (deferred), so this validates the parameter and returns
-/// `204` — the transcode keep-alive is a no-op without a transcoding job.
+/// Port of `PlaystateController.PingPlaybackSession`: refreshes the keep-alive
+/// timer of the session's transcoding job(s) via the HLS/transcode runtime
+/// (`_transcodeManager.PingTranscodingJob(playSessionId, null)`) so an active
+/// transcode is not reaped while the client is between segment requests. A ping
+/// for a session with no live job is a successful `204` no-op.
 #[utoipa::path(
     post,
     path = "/Sessions/Playing/Ping",
@@ -281,14 +283,14 @@ struct PingQuery {
     tag = "hermit"
 )]
 async fn ping_playback_session(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Query(query): Query<PingQuery>,
 ) -> Result<StatusCode, ApiError> {
-    // C# `_transcodeManager.PingTranscodingJob(playSessionId, null)`; the
-    // transcode manager is deferred, so keeping the job alive is a no-op. The
-    // required `playSessionId` is still validated by the extractor.
-    tracing::debug!(play_session_id = %query.play_session_id, "ping playback session");
+    state
+        .hls
+        .ping_transcoding_job(&query.play_session_id, None)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

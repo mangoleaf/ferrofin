@@ -13,10 +13,11 @@
 //!   injected [`FileSystemWatcher`] so the real inotify wrapper is supplied at
 //!   the composition root and tests use a fake.
 //!
-//! The debounce timer and the actual refresh dispatch (`ReportFileSystemChanged`
-//! → `ProviderManager.QueueRefresh`) are deferred to the scan wave; here the
-//! change reports update suppression state and log, returning success so API
-//! callers get the expected semantics.
+//! `ReportFileSystemChanged` dispatches a real refresh: a non-suppressed change
+//! queues a (coalescing) library scan through the injected [`LibraryScanTrigger`]
+//! (the composition root passes the library manager). The C# debounce timer is
+//! not ported — the scan's own in-flight guard folds a burst of reports into one
+//! scan instead. Without a trigger attached (unit tests) a change is logged only.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -27,6 +28,22 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryMonitor;
 
 use crate::resolvers::FileSystemWatcher;
+
+/// The narrow slice of the library manager the monitor needs: queue a rescan.
+///
+/// The monitor only ever asks "something changed — refresh"; depending on the
+/// whole [`LibraryManager`](hermit_traits::library::LibraryManager) would drag in
+/// ~50 unrelated methods. [`HermitLibraryManager`](crate::HermitLibraryManager)
+/// implements this, so the composition root passes the same instance.
+#[async_trait]
+pub trait LibraryScanTrigger: Send + Sync {
+    /// Queues a (coalescing) full library scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the scan cannot be queued.
+    async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+}
 
 /// The concrete library monitor.
 ///
@@ -42,6 +59,10 @@ pub struct HermitLibraryMonitor {
     /// suppressed. Guarded by a `std::sync::Mutex` because the guard never spans
     /// an `.await` (the set is touched synchronously inside each method).
     suppressed: Arc<Mutex<HashSet<String>>>,
+    /// The scan trigger a real (non-suppressed) change dispatches — the port of
+    /// C# `ReportFileSystemChanged` → `ProviderManager.QueueRefresh`. `None`
+    /// (unit tests without a target) logs the change only.
+    refresh_target: Option<Arc<dyn LibraryScanTrigger>>,
 }
 
 impl std::fmt::Debug for HermitLibraryMonitor {
@@ -61,7 +82,16 @@ impl HermitLibraryMonitor {
             watcher,
             roots: Arc::new(roots),
             suppressed: Arc::new(Mutex::new(HashSet::new())),
+            refresh_target: None,
         }
+    }
+
+    /// Attaches the library manager a real change should refresh. Called once by
+    /// the composition root; without it a reported change is only logged.
+    #[must_use]
+    pub fn with_refresh_target(mut self, library: Arc<dyn LibraryScanTrigger>) -> Self {
+        self.refresh_target = Some(library);
+        self
     }
 
     /// Whether `path` (or an ancestor of it) is currently suppressed. Mirrors C#
@@ -132,9 +162,39 @@ impl LibraryMonitor for HermitLibraryMonitor {
             tracing::trace!(path, "change suppressed (server-initiated write)");
             return Ok(());
         }
-        // The debounced refresh dispatch is deferred to the scan wave; a real
-        // change is logged so the intent is observable end-to-end.
         tracing::debug!(path, "library filesystem change reported");
+        // Dispatch the refresh. Hermit's scanner is whole-library (not per-path),
+        // so a reported change queues a coalescing `scan_all` — the scanner picks
+        // up the new/changed file under `path`. Overlapping reports (a webhook
+        // batch) fold into one scan via the library manager's in-flight guard.
+        // ponytail: whole-library rescan, not Jellyfin's targeted per-item
+        // refresh; upgrade to a path-scoped scan if full rescans get too costly.
+        if let Some(library) = &self.refresh_target {
+            library.queue_library_scan().await?;
+        }
+        Ok(())
+    }
+}
+
+/// A [`FileSystemWatcher`] that watches nothing.
+///
+/// Live inotify watching is deferred (the OS change-event wiring is a separate
+/// piece of work), but the [`HermitLibraryMonitor`] still needs a watcher to
+/// construct. The composition root pairs this with `with_refresh_target` so the
+/// external-change **webhooks** (`POST /Library/{Series,Movies,Media}/…`) drive a
+/// real refresh; only the passive OS-watch lifecycle (`start`/`stop`) is a no-op.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopFileSystemWatcher;
+
+#[async_trait]
+impl FileSystemWatcher for NoopFileSystemWatcher {
+    async fn watch(&self, _path: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn unwatch(&self, _path: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn unwatch_all(&self) -> Result<(), ServiceError> {
         Ok(())
     }
 }
@@ -204,5 +264,49 @@ mod tests {
     async fn empty_path_is_rejected() {
         let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![]);
         assert!(monitor.report_file_system_changed("").await.is_err());
+    }
+
+    /// A [`LibraryScanTrigger`] fake that counts `queue_library_scan` calls.
+    #[derive(Default)]
+    struct CountingLibrary {
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LibraryScanTrigger for CountingLibrary {
+        async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn real_change_queues_a_scan() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        monitor
+            .report_file_system_changed("/media/movies/Solaris (1972)")
+            .await
+            .expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suppressed_change_does_not_scan() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        let dir = "/media/movies/Solaris";
+        monitor
+            .report_file_system_change_beginning(dir)
+            .await
+            .expect("begin");
+        // A change under a server-write-suppressed dir must not trigger a rescan.
+        monitor
+            .report_file_system_changed(&format!("{dir}/poster.jpg"))
+            .await
+            .expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

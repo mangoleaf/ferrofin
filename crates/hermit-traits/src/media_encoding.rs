@@ -507,6 +507,23 @@ pub trait HlsStreamManager: Send + Sync {
     ///
     /// Returns a [`ServiceError`] if the kill cannot be dispatched.
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError>;
+
+    /// Refreshes the keep-alive timer for the transcoding job(s) of a play
+    /// session so an active-but-paused transcode is not reaped.
+    ///
+    /// Port of `PlaystateController.PingPlaybackSession` →
+    /// `TranscodeManager.PingTranscodingJob`. `is_user_paused`, when set, records
+    /// whether the client paused playback. A ping for a session with no live job
+    /// is a successful no-op (the client pings on a fixed interval regardless).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::InvalidInput`] if `play_session_id` is empty.
+    async fn ping_transcoding_job(
+        &self,
+        play_session_id: &str,
+        is_user_paused: Option<bool>,
+    ) -> Result<(), ServiceError>;
 }
 
 /// Compile-time assertion that [`HlsStreamManager`] is object-safe.

@@ -813,12 +813,38 @@ async fn startup_user_get_and_set_password() {
 }
 
 #[tokio::test]
-async fn forgot_password_reports_contact_admin() {
+async fn forgot_password_unknown_user_reports_contact_admin() {
+    // An unknown username must not disclose account existence, and touches no
+    // filesystem (the user lookup returns `None` before a pin is issued).
     let router = create_router(state(
         Arc::new(MemUsers::default()),
         Arc::new(MemConfig::new(true)),
     ));
     let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/ForgotPassword")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "EnteredUsername": "nobody" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["Action"], "ContactAdmin");
+}
+
+#[tokio::test]
+async fn forgot_password_known_user_issues_and_redeems_pin() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+
+    // 1) Request a pin for a known user → PinCode + a real pin file.
+    let response = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -832,5 +858,32 @@ async fn forgot_password_reports_contact_admin() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["Action"], "ContactAdmin");
+    let body = body_json(response).await;
+    assert_eq!(body["Action"], "PinCode");
+    let pin_file = body["PinFile"].as_str().expect("pin file path").to_owned();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pin_file).unwrap()).unwrap();
+    let pin = record["Pin"].as_str().unwrap().to_owned();
+
+    // 2) Redeem the pin → success, bob reset, password set to the pin, file gone.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/ForgotPassword/Pin")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "Pin": pin }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["Success"], true);
+    assert_eq!(body["UsersReset"][0], "bob");
+
+    let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
+    assert_eq!(id, BOB_ID);
+    assert_eq!(pw, pin);
+    assert!(!std::path::Path::new(&pin_file).exists());
 }

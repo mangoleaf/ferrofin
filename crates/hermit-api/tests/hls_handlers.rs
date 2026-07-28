@@ -148,6 +148,20 @@ impl HlsStreamManager for FakeHls {
             .push((request.device_id.clone(), request.play_session_id.clone()));
         Ok(())
     }
+
+    async fn ping_transcoding_job(
+        &self,
+        play_session_id: &str,
+        _is_user_paused: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        if let Some(e) = &self.fail {
+            return Err(clone_err(e));
+        }
+        if play_session_id.trim().is_empty() {
+            return Err(ServiceError::invalid_input("playSessionId is empty"));
+        }
+        Ok(())
+    }
 }
 
 /// A fake [`AttachmentExtractor`] returning fixed bytes + MIME.

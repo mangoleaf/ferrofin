@@ -497,6 +497,17 @@ where
             .kill_transcoding_jobs(device, request.play_session_id.as_deref(), true)
             .await
     }
+
+    async fn ping_transcoding_job(
+        &self,
+        play_session_id: &str,
+        is_user_paused: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        use hermit_traits::media_encoding::TranscodeManager as _;
+        self.manager
+            .ping_transcoding_job(play_session_id, is_user_paused)
+            .await
+    }
 }
 
 /// The segment file extension for `segment_container` (`.ts` default).
@@ -863,6 +874,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         assert!(mgr.stop_encoding(&req()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ping_transcoding_job_is_ok_and_validates_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        // Pinging a session with no live job is a successful no-op.
+        assert!(mgr.ping_transcoding_job("play-1", Some(true)).await.is_ok());
+        // An empty play-session id is rejected.
+        assert!(matches!(
+            mgr.ping_transcoding_job("", None).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
     }
 
     #[test]

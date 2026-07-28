@@ -448,9 +448,11 @@ pub async fn build_app_state(
     ];
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(hermit_extensions::registered_plugins(&extensions));
-    let plugins: Arc<dyn hermit_traits::plugins::PluginManager> = Arc::new(
-        hermit_core::HermitPluginManager::new(registered_plugins, config.config_dir.join("plugins")),
-    );
+    let plugins: Arc<dyn hermit_traits::plugins::PluginManager> =
+        Arc::new(hermit_core::HermitPluginManager::new(
+            registered_plugins,
+            config.config_dir.join("plugins"),
+        ));
     let subtitle_providers: Vec<Arc<dyn hermit_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(hermit_providers::OpenSubtitlesProvider::new(
             Arc::clone(&plugins),

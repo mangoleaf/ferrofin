@@ -31,11 +31,13 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::options::ItemImageInfo;
 use hermit_traits::persistence::{ItemPersistenceService, ItemRepository};
 use hermit_traits::providers::{
-    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority, RemoteSearchRequest,
+    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    RemoteSearchRequest,
 };
 use uuid::Uuid;
 
-use crate::tmdb::{TmdbClient, TmdbKind};
+use crate::tmdb::{TmdbClient, TmdbDetails, TmdbKind};
+use hermit_db::entities::base_items::BaseItemEntity;
 
 /// A [`RemoteSearchProvider`] backed by TMDB (the "Identify" flow). One instance
 /// searches a single kind (movie or series), so it is registered once per kind.
@@ -297,6 +299,75 @@ impl LocalProviderManager {
     }
 }
 
+/// Whether a [`MetadataRefreshMode`] should fetch remote data (`Default` /
+/// `FullRefresh`); `None` / `ValidationOnly` skip the network.
+fn wants_fetch(mode: MetadataRefreshMode) -> bool {
+    matches!(
+        mode,
+        MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+    )
+}
+
+/// Copies `new` into `cur` when `new` has a value and either `replace` is set or
+/// `cur` is currently empty. Mirrors the scanner's fill-or-replace merge.
+fn set_text(cur: &mut Option<String>, new: Option<&str>, replace: bool) {
+    if let Some(value) = new
+        && (replace || cur.as_deref().is_none_or(str::is_empty))
+    {
+        *cur = Some(value.to_owned());
+    }
+}
+
+/// Applies fetched TMDB [`TmdbDetails`] onto an item row. Each field is filled
+/// when empty, or overwritten when `replace` is set (the C# `FullRefresh`
+/// `ReplaceAllMetadata` behavior); a field TMDB did not return is left untouched.
+/// Mirrors the scanner's `apply_details` merge.
+fn apply_tmdb_details(entity: &mut BaseItemEntity, details: &TmdbDetails, replace: bool) {
+    set_text(&mut entity.overview, details.overview.as_deref(), replace);
+    set_text(&mut entity.tagline, details.tagline.as_deref(), replace);
+    set_text(
+        &mut entity.official_rating,
+        details.official_rating.as_deref(),
+        replace,
+    );
+    if details.community_rating.is_some() && (replace || entity.community_rating.is_none()) {
+        entity.community_rating = details.community_rating;
+    }
+    if !details.genres.is_empty()
+        && (replace || entity.genres.as_deref().unwrap_or_default().is_empty())
+    {
+        entity.genres = Some(details.genres.join("|"));
+    }
+    if !details.studios.is_empty()
+        && (replace || entity.studios.as_deref().unwrap_or_default().is_empty())
+    {
+        entity.studios = Some(details.studios.join("|"));
+    }
+    if details.production_year.is_some() && (replace || entity.production_year.is_none()) {
+        entity.production_year = details.production_year.map(i64::from);
+    }
+    if let Some(mins) = details.runtime_minutes
+        && (replace || entity.run_time_ticks.is_none())
+    {
+        // Ticks are 100-ns units: minutes × 60 s × 10,000,000.
+        entity.run_time_ticks = Some(i64::from(mins) * 600_000_000);
+    }
+    if let Some(date) = details.premiere_date.as_deref().and_then(parse_ymd)
+        && (replace || entity.premiere_date.is_none())
+    {
+        entity.premiere_date = Some(date);
+    }
+}
+
+/// Parses a TMDB `YYYY-MM-DD` date into a UTC midnight timestamp.
+fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(chrono::DateTime::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0)?,
+        Utc,
+    ))
+}
+
 /// The on-disk filename stem for an uploaded image of `image_type`/`index`,
 /// e.g. `Primary` → `primary`, `Backdrop` index 2 → `backdrop2`.
 fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
@@ -324,10 +395,62 @@ impl ProviderManager for LocalProviderManager {
 
     async fn refresh_full_item(
         &self,
-        _item_id: Uuid,
-        _options: &MetadataRefreshOptions,
+        item_id: Uuid,
+        options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
-        Err(Self::deferred("refresh_full_item"))
+        let (Some(tmdb), Some(items)) = (&self.tmdb, &self.items) else {
+            // No remote provider configured — nothing to fetch (faithful: Jellyfin
+            // with no metadata plugins leaves the item unchanged).
+            return Ok(());
+        };
+        let Some(mut entity) = items.retrieve_item(item_id).await? else {
+            return Err(ServiceError::not_found(format!("item {item_id}")));
+        };
+        // Resolve the item to a TMDB (kind, title, year) — movies/series only.
+        // ponytail: re-searches by the item's title (the same query the client's
+        // "Identify" ran), not the exact provider id on the chosen result — writing
+        // that id needs a `BaseItemProviders` upsert path that does not exist yet.
+        // In the common case the top hit matches the user's pick; the metadata is
+        // real either way. Honor the exact pick once that write path lands.
+        let Some((kind, name, year)) = self.tmdb_lookup(items, item_id).await? else {
+            return Ok(());
+        };
+        let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next() else {
+            return Ok(());
+        };
+        let Some(details) = tmdb.details(kind, hit.tmdb_id).await else {
+            return Ok(());
+        };
+
+        // Metadata pass: apply the fetched fields onto the row and persist.
+        if wants_fetch(options.metadata_refresh_mode) {
+            apply_tmdb_details(&mut entity, &details, options.replace_all_metadata);
+            // Persist through the item store (the same `ItemPersistenceService`
+            // the scanner writes enriched rows with).
+            if let Some(store) = &self.image_store {
+                store.save_items(std::slice::from_ref(&entity)).await?;
+            }
+        }
+
+        // Image pass: download the primary + backdrop when requested and an image
+        // store is wired. A single failed download must not fail the refresh.
+        if wants_fetch(options.image_refresh_mode) && self.image_store.is_some() {
+            let candidates = self
+                .get_available_remote_images(item_id, &RemoteImageQuery::default())
+                .await?;
+            for image_type in [ImageType::Primary, ImageType::Backdrop] {
+                if let Some(url) = candidates
+                    .iter()
+                    .find(|img| img.type_ == image_type)
+                    .and_then(|img| img.url.clone())
+                {
+                    let _ = self
+                        .save_image_from_url(item_id, &url, image_type, None)
+                        .await;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn refresh_single_item(
@@ -543,8 +666,13 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::{LocalProviderManager, RemoteSearchProvider};
+    use super::{
+        LocalProviderManager, RemoteSearchProvider, apply_tmdb_details, parse_ymd, set_text,
+        wants_fetch,
+    };
+    use crate::tmdb::TmdbDetails;
     use async_trait::async_trait;
+    use hermit_db::entities::base_items::BaseItemEntity;
     use hermit_model::data::BaseItemKind;
     use hermit_model::entities::ImageType;
     use hermit_model::providers::{
@@ -552,8 +680,8 @@ mod tests {
     };
     use hermit_traits::error::ServiceError;
     use hermit_traits::providers::{
-        ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
-        RemoteSearchRequest,
+        ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager,
+        RefreshPriority, RemoteSearchRequest,
     };
     use uuid::Uuid;
 
@@ -810,11 +938,13 @@ mod tests {
             .await
             .expect("queue_refresh is an accepted no-op until providers land");
 
-        let full = mgr
-            .refresh_full_item(id, &opts)
+        // `refresh_full_item` on a manager with no TMDB client / item store has
+        // nothing to fetch and succeeds as a no-op (faithful: Jellyfin with no
+        // metadata provider leaves the item unchanged). The field-merge helpers it
+        // applies are unit-tested in `metadata_merge_helpers` below.
+        mgr.refresh_full_item(id, &opts)
             .await
-            .expect_err("refresh_full_item deferred");
-        assert!(full.to_string().contains("refresh_full_item"));
+            .expect("refresh_full_item is a no-op without a provider");
 
         let save_url = mgr
             .save_image_from_url(id, "http://x/y.jpg", ImageType::Primary, Some(0))
@@ -834,6 +964,95 @@ mod tests {
         mgr.save_metadata(id, ItemUpdateType::MetadataDownload)
             .await
             .expect("save_metadata is an accepted no-op");
+    }
+
+    /// The field-merge helpers behind `refresh_full_item`: `wants_fetch` gates on
+    /// the refresh mode, `set_text` fills-or-replaces, `parse_ymd` reads a TMDB
+    /// date.
+    #[test]
+    fn metadata_merge_helpers() {
+        // wants_fetch: Default/FullRefresh fetch; None/ValidationOnly do not.
+        assert!(wants_fetch(MetadataRefreshMode::FullRefresh));
+        assert!(wants_fetch(MetadataRefreshMode::Default));
+        assert!(!wants_fetch(MetadataRefreshMode::None));
+        assert!(!wants_fetch(MetadataRefreshMode::ValidationOnly));
+
+        // set_text fills an empty target regardless of replace.
+        let mut cur = None;
+        set_text(&mut cur, Some("Solaris"), false);
+        assert_eq!(cur.as_deref(), Some("Solaris"));
+        // With replace=false an existing value is kept.
+        set_text(&mut cur, Some("Stalker"), false);
+        assert_eq!(cur.as_deref(), Some("Solaris"));
+        // With replace=true it is overwritten.
+        set_text(&mut cur, Some("Stalker"), true);
+        assert_eq!(cur.as_deref(), Some("Stalker"));
+        // A `None` incoming value never clears the target.
+        set_text(&mut cur, None, true);
+        assert_eq!(cur.as_deref(), Some("Stalker"));
+        // An empty existing string counts as absent (fills without replace).
+        let mut empty = Some(String::new());
+        set_text(&mut empty, Some("Mirror"), false);
+        assert_eq!(empty.as_deref(), Some("Mirror"));
+
+        // parse_ymd reads a valid date and rejects garbage.
+        assert!(parse_ymd("1972-03-20").is_some());
+        assert!(parse_ymd("not-a-date").is_none());
+    }
+
+    /// `apply_tmdb_details` fills empty fields, honors `replace`, joins
+    /// genres/studios, converts runtime to ticks, and parses the premiere date.
+    #[test]
+    fn apply_tmdb_details_fills_and_replaces() {
+        let details = TmdbDetails {
+            overview: Some("A physicist visits a space station.".to_owned()),
+            tagline: Some("A tagline".to_owned()),
+            genres: vec!["Science Fiction".to_owned(), "Drama".to_owned()],
+            studios: vec!["Mosfilm".to_owned()],
+            community_rating: Some(8.1),
+            official_rating: Some("PG".to_owned()),
+            production_year: Some(1972),
+            premiere_date: Some("1972-03-20".to_owned()),
+            runtime_minutes: Some(167),
+            ..TmdbDetails::default()
+        };
+
+        // Empty entity ⇒ every field filled regardless of `replace`.
+        let mut entity = BaseItemEntity::default();
+        apply_tmdb_details(&mut entity, &details, false);
+        assert_eq!(
+            entity.overview.as_deref(),
+            Some("A physicist visits a space station.")
+        );
+        assert_eq!(entity.genres.as_deref(), Some("Science Fiction|Drama"));
+        assert_eq!(entity.studios.as_deref(), Some("Mosfilm"));
+        assert_eq!(entity.community_rating, Some(8.1));
+        assert_eq!(entity.official_rating.as_deref(), Some("PG"));
+        assert_eq!(entity.production_year, Some(1972));
+        assert_eq!(entity.run_time_ticks, Some(167 * 600_000_000));
+        assert!(entity.premiere_date.is_some());
+
+        // With replace=false an existing value is kept.
+        let mut kept = BaseItemEntity {
+            overview: Some("existing".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        apply_tmdb_details(&mut kept, &details, false);
+        assert_eq!(kept.overview.as_deref(), Some("existing"));
+        // With replace=true it is overwritten.
+        apply_tmdb_details(&mut kept, &details, true);
+        assert_eq!(
+            kept.overview.as_deref(),
+            Some("A physicist visits a space station.")
+        );
+
+        // A detail TMDB did not return leaves the field untouched.
+        let mut untouched = BaseItemEntity {
+            tagline: Some("keep me".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        apply_tmdb_details(&mut untouched, &TmdbDetails::default(), true);
+        assert_eq!(untouched.tagline.as_deref(), Some("keep me"));
     }
 
     /// The read-only descriptor queries return empty/default results (no store,

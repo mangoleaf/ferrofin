@@ -237,7 +237,7 @@ pub use item_repository::HermitItemRepository;
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::HermitKeyframeRepository;
 pub use library_manager::HermitLibraryManager;
-pub use library_monitor::HermitLibraryMonitor;
+pub use library_monitor::{HermitLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher};
 pub use library_scan::LibraryScanner;
 pub use linked_children_service::HermitLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
