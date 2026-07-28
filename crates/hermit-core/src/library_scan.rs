@@ -236,7 +236,7 @@ impl LibraryScanner {
                 && let Some(repo) = &self.people
             {
                 match repo.update_people(item.id, &people).await {
-                    Ok(image_refs) => self.download_person_images(image_refs).await,
+                    Ok(written) => self.enrich_people(repo.as_ref(), written).await,
                     Err(err) => {
                         tracing::warn!(%err, item = %item.id, "failed to persist cast/crew");
                     }
@@ -376,34 +376,63 @@ impl LibraryScanner {
                 person_type: Some(p.person_type.clone()),
                 role: p.role.clone(),
                 primary_image_url: p.profile_url.clone(),
+                provider_id: Some(p.tmdb_id),
             })
             .collect()
     }
 
-    /// metadata is not configured or nothing matched — best-effort, never fatal.
-    /// Downloads each credited person's TMDB profile image into that person's
-    /// metadata folder and saves it as their `Primary` image, so cast/crew show
-    /// artwork. Best-effort and cached (existing files are skipped on re-scan).
+    /// Enriches credited people: downloads each one's TMDB profile image as their
+    /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
+    /// for each *newly-created* person. Best-effort and cached — images skip
+    /// existing files, and bios only run for new people, so re-scans stay cheap.
     ///
-    /// ponytail: downloads every credited person serially — a large cast makes the
-    /// first scan slower, but the per-file skip makes re-scans cheap. Batch/cap if
-    /// first-scan latency on huge libraries becomes a problem.
-    async fn download_person_images(&self, refs: Vec<(Uuid, String)>) {
+    /// ponytail: runs serially — a large cast makes the first scan slower, but the
+    /// per-file / new-only guards make re-scans cheap. Batch if first-scan latency
+    /// on huge libraries becomes a problem.
+    async fn enrich_people(
+        &self,
+        repo: &dyn hermit_traits::persistence::PeopleRepository,
+        written: Vec<hermit_traits::persistence::WrittenPerson>,
+    ) {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
-        for (person_id, url) in refs {
-            let id = person_id.to_string();
-            let dir = meta_root.join(&id);
-            let images = vec![RemoteImage {
-                image_type: ImageType::Primary,
-                url,
-            }];
-            let infos = download_images(tmdb, &dir, &id, images).await;
-            if !infos.is_empty()
-                && let Err(err) = self.persistence.save_item_images(person_id, &infos).await
+        for person in written {
+            let id = person.id.to_string();
+            if let Some(url) = person.image_url {
+                let dir = meta_root.join(&id);
+                let infos = download_images(
+                    tmdb,
+                    &dir,
+                    &id,
+                    vec![RemoteImage {
+                        image_type: ImageType::Primary,
+                        url,
+                    }],
+                )
+                .await;
+                if !infos.is_empty()
+                    && let Err(err) = self.persistence.save_item_images(person.id, &infos).await
+                {
+                    tracing::warn!(%err, person = %id, "failed to persist person image");
+                }
+            }
+
+            // Biography: only for people still missing one, and only when TMDB
+            // actually has detail to store.
+            if person.needs_details
+                && let Some(tmdb_id) = person.provider_id
+                && let Some(details) = tmdb.person_details(tmdb_id).await
             {
-                tracing::warn!(%err, person = %id, "failed to persist person image");
+                let metadata = hermit_traits::persistence::PersonMetadata {
+                    overview: details.biography,
+                    premiere_date: details.birthday.as_deref().and_then(parse_ymd),
+                    end_date: details.deathday.as_deref().and_then(parse_ymd),
+                    birthplace: details.place_of_birth,
+                };
+                if let Err(err) = repo.set_person_metadata(person.id, metadata).await {
+                    tracing::warn!(%err, person = %id, "failed to persist person biography");
+                }
             }
         }
     }

@@ -174,6 +174,9 @@ pub struct TmdbDetails {
 /// One credited person from a title's `credits`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdbPerson {
+    /// The person's TMDB id — the key for a [`person_details`](TmdbClient::person_details)
+    /// biography lookup.
+    pub tmdb_id: i64,
     /// The person's name.
     pub name: String,
     /// Jellyfin person type: `Actor`, `Director`, `Writer`, `Producer`, …
@@ -184,6 +187,19 @@ pub struct TmdbPerson {
     pub sort_order: i32,
     /// The person's profile-photo URL (headshot), when TMDB has one.
     pub profile_url: Option<String>,
+}
+
+/// A person's biographical detail, from TMDB `/person/{id}`.
+#[derive(Debug, Clone, Default)]
+pub struct TmdbPersonDetails {
+    /// The biography text.
+    pub biography: Option<String>,
+    /// The birthday (`YYYY-MM-DD`).
+    pub birthday: Option<String>,
+    /// The date of death (`YYYY-MM-DD`), when applicable.
+    pub deathday: Option<String>,
+    /// The place of birth.
+    pub place_of_birth: Option<String>,
 }
 
 /// A trailer/video link for a title (name + URL).
@@ -262,6 +278,8 @@ struct CreditsResponse {
 #[derive(Debug, Deserialize)]
 struct CastEntry {
     #[serde(default)]
+    id: i64,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     character: Option<String>,
@@ -271,6 +289,8 @@ struct CastEntry {
 
 #[derive(Debug, Deserialize)]
 struct CrewEntry {
+    #[serde(default)]
+    id: i64,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -659,6 +679,7 @@ impl TmdbClient {
                     continue;
                 }
                 people.push(TmdbPerson {
+                    tmdb_id: c.id,
                     name: c.name,
                     person_type: "Actor".to_owned(),
                     role: c.character.filter(|r| !r.is_empty()),
@@ -678,6 +699,7 @@ impl TmdbClient {
                     continue;
                 }
                 people.push(TmdbPerson {
+                    tmdb_id: c.id,
                     name: c.name,
                     person_type: person_type.to_owned(),
                     role: c.job.filter(|r| !r.is_empty()),
@@ -727,6 +749,36 @@ impl TmdbClient {
         })
     }
 
+    /// Fetches a person's biography via `/person/{id}`, or `None` on any
+    /// network/parse error or when TMDB has no biographical text.
+    pub async fn person_details(&self, tmdb_id: i64) -> Option<TmdbPersonDetails> {
+        let resp = self
+            .http
+            .get(format!("{API_BASE}/person/{tmdb_id}"))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let p = resp.json::<PersonDetailsResponse>().await.ok()?;
+        let details = TmdbPersonDetails {
+            biography: p.biography.filter(|s| !s.is_empty()),
+            birthday: p.birthday.filter(|s| !s.is_empty()),
+            deathday: p.deathday.filter(|s| !s.is_empty()),
+            place_of_birth: p.place_of_birth.filter(|s| !s.is_empty()),
+        };
+        // Skip persons with nothing worth storing (keeps re-fetch cheap).
+        if details.biography.is_none()
+            && details.birthday.is_none()
+            && details.place_of_birth.is_none()
+        {
+            return None;
+        }
+        Some(details)
+    }
+
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
         let resp = self.http.get(url).send().await.ok()?;
@@ -735,6 +787,19 @@ impl TmdbClient {
         }
         resp.bytes().await.ok().map(|b| b.to_vec())
     }
+}
+
+/// The subset of TMDB `/person/{id}` Hermit surfaces on the person page.
+#[derive(Debug, Default, Deserialize)]
+struct PersonDetailsResponse {
+    #[serde(default)]
+    biography: Option<String>,
+    #[serde(default)]
+    birthday: Option<String>,
+    #[serde(default)]
+    deathday: Option<String>,
+    #[serde(default)]
+    place_of_birth: Option<String>,
 }
 
 /// Resolves an item's studios: for series, its broadcast networks (Jellyfin's

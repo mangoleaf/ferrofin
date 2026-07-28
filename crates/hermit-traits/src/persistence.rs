@@ -522,6 +522,36 @@ pub trait MediaAttachmentRepository: Send + Sync {
 
 fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentRepository) {}
 
+/// The outcome of writing one credited person via
+/// [`PeopleRepository::update_people`] — enough for the caller to fetch that
+/// person's remote artwork and biography.
+#[derive(Debug, Clone)]
+pub struct WrittenPerson {
+    /// The materialized `Person` item id.
+    pub id: Uuid,
+    /// Whether the person's item still lacks a biography — the caller fetches
+    /// details only for these, so a re-scan backfills people scanned before the
+    /// biography feature and never re-fetches an already-enriched person.
+    pub needs_details: bool,
+    /// The remote profile-image URL to download, when present.
+    pub image_url: Option<String>,
+    /// The remote provider id (TMDB person id) for a biography lookup.
+    pub provider_id: Option<i64>,
+}
+
+/// A `Person` item's biographical fields.
+#[derive(Debug, Clone, Default)]
+pub struct PersonMetadata {
+    /// The biography text.
+    pub overview: Option<String>,
+    /// The birthday.
+    pub premiere_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// The date of death.
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// The place of birth.
+    pub birthplace: Option<String>,
+}
+
 /// Reads and writes an item's people rows.
 ///
 /// Port of `IPeopleRepository`. C# `PersonInfo` becomes [`PeopleEntity`].
@@ -536,14 +566,22 @@ pub trait PeopleRepository: Send + Sync {
     /// Replaces an item's people with the given set, materializing a browsable
     /// `Person` item per credit.
     ///
-    /// Returns `(person_id, image_url)` for each credited person that carries a
-    /// remote profile-image URL, so the caller can download the artwork into that
-    /// person's image folder (the repository has no HTTP/filesystem access).
+    /// Returns a [`WrittenPerson`] per credited person so the caller (which has
+    /// the HTTP/filesystem access the repository lacks) can download artwork and
+    /// fetch biographies — the `is_new` flag lets it enrich only freshly-created
+    /// people, keeping re-scans cheap.
     async fn update_people(
         &self,
         item_id: Uuid,
         people: &[PeopleEntity],
-    ) -> Result<Vec<(Uuid, String)>, ServiceError>;
+    ) -> Result<Vec<WrittenPerson>, ServiceError>;
+
+    /// Sets a `Person` item's biographical fields (C# person-provider write).
+    async fn set_person_metadata(
+        &self,
+        person_id: Uuid,
+        metadata: PersonMetadata,
+    ) -> Result<(), ServiceError>;
 
     /// Gets the distinct people names matching a filter.
     async fn get_people_names(

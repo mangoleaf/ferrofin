@@ -329,6 +329,10 @@ pub struct PeopleEntity {
     /// path. Not a column; `#[sqlx(default)]` so reads ignore it.
     #[sqlx(default)]
     pub primary_image_url: Option<String>,
+    /// The remote provider id (TMDB person id) for a biography lookup, on the
+    /// write path. Not a column; `#[sqlx(default)]` so reads ignore it.
+    #[sqlx(default)]
+    pub provider_id: Option<i64>,
 }
 
 /// A row of the `PeopleBaseItemMap` table — a person's credited role on an item.

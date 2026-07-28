@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
 use hermit_traits::options::InternalPeopleQuery;
-use hermit_traits::persistence::PeopleRepository;
+use hermit_traits::persistence::{PeopleRepository, PersonMetadata, WrittenPerson};
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
@@ -58,6 +58,25 @@ impl HermitPeopleRepository {
     pub fn new(db: Database) -> Self {
         Self { db }
     }
+}
+
+/// Dedupes credited people case-insensitively by `(name, person_type)`, matching
+/// the C# `DistinctBy(name.ToLower + "-" + type)` and preserving first-seen order
+/// (which becomes the credit `ListOrder`).
+fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<&PeopleEntity> = Vec::new();
+    for person in people {
+        let key = format!(
+            "{}-{}",
+            person.name.trim().to_lowercase(),
+            person.person_type.clone().unwrap_or_default()
+        );
+        if seen.insert(key) {
+            deduped.push(person);
+        }
+    }
+    deduped
 }
 
 /// Whether a person-type filter value is valid (C# `IsValidPersonType` =
@@ -228,23 +247,8 @@ impl PeopleRepository for HermitPeopleRepository {
         &self,
         item_id: Uuid,
         people: &[PeopleEntity],
-    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
-        // Dedupe case-insensitively by (name, person_type), matching the C#
-        // DistinctBy(name.ToLower + "-" + type). Preserve first-seen order for
-        // ListOrder.
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped: Vec<&PeopleEntity> = Vec::new();
-        for person in people {
-            let key = format!(
-                "{}-{}",
-                person.name.trim().to_lowercase(),
-                person.person_type.clone().unwrap_or_default()
-            );
-            if seen.insert(key) {
-                deduped.push(person);
-            }
-        }
-
+    ) -> Result<Vec<WrittenPerson>, ServiceError> {
+        let deduped = dedupe_people(people);
         let mut tx = self.db.pool().begin().await.map_err(db_err)?;
 
         // Clear this item's credit rows first. Doing a write as the transaction's
@@ -267,7 +271,7 @@ impl PeopleRepository for HermitPeopleRepository {
         // download.
         let person_type_name = stored_type_name(BaseItemKind::Person);
         let mut people_ids: Vec<String> = Vec::with_capacity(deduped.len());
-        let mut image_downloads: Vec<(Uuid, String)> = Vec::new();
+        let mut written: Vec<WrittenPerson> = Vec::with_capacity(deduped.len());
         for person in &deduped {
             let name = person.name.trim();
             let existing: Option<String> = sqlx::query_scalar(
@@ -320,14 +324,28 @@ impl PeopleRepository for HermitPeopleRepository {
                 .map_err(db_err)?;
             }
 
-            if let (Ok(pid), Some(url)) = (
-                Uuid::parse_str(&id),
-                person
-                    .primary_image_url
-                    .as_deref()
-                    .filter(|u| !u.is_empty()),
-            ) {
-                image_downloads.push((pid, url.to_owned()));
+            // Enrich (fetch a biography for) any person whose item has no overview
+            // yet — new people and those scanned before biographies existed.
+            let overview: Option<String> =
+                sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .flatten();
+            let needs_details = overview.is_none_or(|o| o.is_empty());
+
+            if let Ok(pid) = Uuid::parse_str(&id) {
+                written.push(WrittenPerson {
+                    id: pid,
+                    needs_details,
+                    image_url: person
+                        .primary_image_url
+                        .as_deref()
+                        .filter(|u| !u.is_empty())
+                        .map(str::to_owned),
+                    provider_id: person.provider_id.filter(|id| *id > 0),
+                });
             }
             people_ids.push(id);
         }
@@ -350,7 +368,29 @@ impl PeopleRepository for HermitPeopleRepository {
         }
 
         tx.commit().await.map_err(db_err)?;
-        Ok(image_downloads)
+        Ok(written)
+    }
+
+    async fn set_person_metadata(
+        &self,
+        person_id: Uuid,
+        metadata: PersonMetadata,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "Overview" = ?2, "PremiereDate" = ?3, "EndDate" = ?4,
+                   "ProductionLocations" = ?5
+               WHERE "Id" = ?1"#,
+        )
+        .bind(person_id.to_string())
+        .bind(metadata.overview)
+        .bind(metadata.premiere_date.map(|d| d.to_rfc3339()))
+        .bind(metadata.end_date.map(|d| d.to_rfc3339()))
+        .bind(metadata.birthplace)
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn get_people_names(
@@ -438,7 +478,7 @@ mod tests {
     use hermit_db::entities::base_items::PeopleEntity;
     use hermit_model::data::BaseItemKind;
     use hermit_traits::options::InternalPeopleQuery;
-    use hermit_traits::persistence::PeopleRepository;
+    use hermit_traits::persistence::{PeopleRepository, PersonMetadata};
     use uuid::Uuid;
 
     fn person(name: &str, person_type: &str) -> PeopleEntity {
@@ -493,21 +533,29 @@ mod tests {
             person_type: Some("Actor".to_owned()),
             role: Some("Chani".to_owned()),
             primary_image_url: Some("https://img/zendaya.jpg".to_owned()),
+            provider_id: Some(505_710),
         };
         let refs = repo
             .update_people(item, &[with_image, person("No Photo", "Director")])
             .await
             .expect("update");
 
-        // Only the person with a profile URL is returned for download.
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].1, "https://img/zendaya.jpg");
+        // Both credits come back needing details; the one with a URL/provider id
+        // carries them.
+        assert_eq!(refs.len(), 2);
+        let zendaya = refs.iter().find(|w| w.image_url.is_some()).expect("z");
+        assert_eq!(
+            zendaya.image_url.as_deref(),
+            Some("https://img/zendaya.jpg")
+        );
+        assert_eq!(zendaya.provider_id, Some(505_710));
+        assert!(zendaya.needs_details);
 
         // A browsable Person BaseItems row exists (id = the Peoples id), so the
         // person page / image endpoint can resolve it.
         let (base_type, base_name): (String, String) =
             sqlx::query_as(r#"SELECT bi."Type", bi."Name" FROM "BaseItems" bi WHERE bi."Id" = ?1"#)
-                .bind(refs[0].0.to_string())
+                .bind(zendaya.id.to_string())
                 .fetch_one(db.pool())
                 .await
                 .expect("person base item");
@@ -523,6 +571,25 @@ mod tests {
         .await
         .expect("role");
         assert_eq!(role, "Chani");
+
+        // Once the person has a biography, re-crediting reports needs_details=false
+        // so the scan won't re-fetch it.
+        repo.set_person_metadata(
+            zendaya.id,
+            PersonMetadata {
+                overview: Some("An actor.".to_owned()),
+                ..PersonMetadata::default()
+            },
+        )
+        .await
+        .expect("set metadata");
+        let item2 = Uuid::new_v4();
+        seed_item(&db, item2, BaseItemKind::Movie).await;
+        let again = repo
+            .update_people(item2, &[person("Zendaya", "Actor")])
+            .await
+            .expect("re-update");
+        assert!(!again[0].needs_details);
     }
 
     #[tokio::test]
