@@ -19,7 +19,7 @@ use hermit_db::Database;
 use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::ItemValueType;
-use hermit_model::data::{BaseItemKind, CollectionType};
+use hermit_model::data::CollectionType;
 use hermit_model::entities::ImageType;
 use hermit_model::entities::MediaStreamType;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -141,59 +141,114 @@ impl HermitItemRepository {
     }
 
     /// Resolves the by-name items of `kind` to [`ItemWithCounts`], counting the
-    /// items that reference each by-name item's clean name via `ItemValues` of the
-    /// given types (a pragmatic port of C# `GetItemValues`).
+    /// content items that reference each via `ItemValues` of the given types
+    /// (port of C# `GetItemValues`).
+    ///
+    /// Scoped to the browse's `parent_id` (via [`InternalItemsQuery::ancestor_ids`])
+    /// and `include_item_types`: the Movies "Genres" tab lists only genres carried
+    /// by movies, the TV "Networks" tab only studios carried by items under the TV
+    /// library, each with an in-scope item count — matching Jellyfin, which scopes
+    /// its by-name aggregates to the query. Only values with an in-scope item (and
+    /// a materialized by-name row) appear.
     async fn item_values_with_counts(
         &self,
-        kind: BaseItemKind,
         value_types: &[ItemValueType],
+        filter: &InternalItemsQuery,
+        include_content_types: &[String],
+        exclude_content_types: &[String],
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        let Some(type_name) = stored_type_name(kind) else {
-            return Ok(QueryResult::default());
-        };
-        let by_name_query = InternalItemsQuery {
-            include_item_types: vec![kind],
-            ..Default::default()
-        };
-        let rows = self
-            .fetch_rows(&by_name_query, QueryShape::FullRows)
-            .await?;
-        let _ = type_name;
+        let type_ints: Vec<i64> = value_types
+            .iter()
+            .map(|t| i64::from(i32::from(*t)))
+            .collect();
+        // Content-item scoping: the browse's requested kinds plus any caller-forced
+        // types (music genres come only from music items; plain genres exclude them).
+        let mut content_type_names: Vec<String> = filter
+            .include_item_types
+            .iter()
+            .filter_map(|k| stored_type_name(*k).map(str::to_owned))
+            .collect();
+        content_type_names.extend(include_content_types.iter().cloned());
+        let ancestors: Vec<String> = filter.ancestor_ids.iter().map(Uuid::to_string).collect();
 
-        let mut items = Vec::with_capacity(rows.len());
-        for item in rows {
-            let clean = item.clean_name.clone().unwrap_or_default();
-            let count = self.count_referencing_items(value_types, &clean).await?;
-            let counts = hermit_model::dto::ItemCounts {
-                item_count: count,
-                ..Default::default()
-            };
-            items.push(ItemWithCounts { item, counts });
-        }
-        Ok(QueryResult::from_items(items))
-    }
-
-    /// Counts items that reference `clean_value` through an `ItemValues` row of any
-    /// of `types`.
-    async fn count_referencing_items(
-        &self,
-        types: &[ItemValueType],
-        clean_value: &str,
-    ) -> Result<i32, ServiceError> {
-        let type_ints: Vec<i64> = types.iter().map(|t| i64::from(i32::from(*t))).collect();
+        // The value ids referenced by in-scope content items, with in-scope counts.
         let mut sql = String::from(
-            r#"SELECT COUNT(DISTINCT ivm."ItemId") FROM "ItemValuesMap" ivm
-               JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               WHERE iv."CleanValue" = ? AND iv."Type" IN ("#,
+            r#"SELECT iv."ItemValueId", COUNT(DISTINCT ivm."ItemId")
+               FROM "ItemValues" iv
+               JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+               JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
+               WHERE iv."Type" IN ("#,
         );
         sql.push_str(&placeholders(type_ints.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(clean_value.to_owned());
+        if !content_type_names.is_empty() {
+            sql.push_str(r#" AND bi."Type" IN ("#);
+            sql.push_str(&placeholders(content_type_names.len()));
+            sql.push(')');
+        }
+        if !exclude_content_types.is_empty() {
+            sql.push_str(r#" AND bi."Type" NOT IN ("#);
+            sql.push_str(&placeholders(exclude_content_types.len()));
+            sql.push(')');
+        }
+        if !ancestors.is_empty() {
+            sql.push_str(
+                r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = bi."Id" AND a."ParentItemId" IN ("#,
+            );
+            sql.push_str(&placeholders(ancestors.len()));
+            sql.push_str("))");
+        }
+        sql.push_str(r#" GROUP BY iv."ItemValueId""#);
+
+        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
         for t in &type_ints {
             query = query.bind(*t);
         }
-        let count = query.fetch_one(self.db.pool()).await.map_err(db_err)?;
-        Ok(i32::try_from(count).unwrap_or(i32::MAX))
+        for n in &content_type_names {
+            query = query.bind(n.clone());
+        }
+        for n in exclude_content_types {
+            query = query.bind(n.clone());
+        }
+        for a in &ancestors {
+            query = query.bind(a.clone());
+        }
+        let counts: Vec<(String, i64)> = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        if counts.is_empty() {
+            return Ok(QueryResult::default());
+        }
+
+        // Load the materialized by-name rows (id = ItemValueId) for those values.
+        let ids: Vec<String> = counts.iter().map(|(id, _)| id.clone()).collect();
+        let mut esql = String::from(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
+        esql.push_str(&placeholders(ids.len()));
+        esql.push(')');
+        let mut equery = sqlx::query_as::<_, BaseItemEntity>(&esql);
+        for id in &ids {
+            equery = equery.bind(id.clone());
+        }
+        let mut by_id: std::collections::HashMap<String, BaseItemEntity> = equery
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|e| (e.id.clone(), e))
+            .collect();
+
+        let mut items: Vec<ItemWithCounts> = counts
+            .into_iter()
+            .filter_map(|(id, cnt)| {
+                by_id.remove(&id).map(|item| ItemWithCounts {
+                    item,
+                    counts: hermit_model::dto::ItemCounts {
+                        item_count: i32::try_from(cnt).unwrap_or(i32::MAX),
+                        ..Default::default()
+                    },
+                })
+            })
+            .collect();
+        items.sort_by(|a, b| a.item.name.cmp(&b.item.name));
+        Ok(QueryResult::from_items(items))
     }
 }
 
@@ -474,49 +529,53 @@ impl ItemRepository for HermitItemRepository {
 
     async fn get_genres(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::Genre, GENRE_TYPES)
+        // Plain genres exclude music items (those are the MusicGenres browse).
+        let music = self.item_type_lookup.music_genre_types();
+        self.item_values_with_counts(GENRE_TYPES, filter, &[], &music)
             .await
     }
 
     async fn get_music_genres(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::MusicGenre, GENRE_TYPES)
+        // Music genres come only from music items.
+        let music = self.item_type_lookup.music_genre_types();
+        self.item_values_with_counts(GENRE_TYPES, filter, &music, &[])
             .await
     }
 
     async fn get_studios(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::Studio, STUDIO_TYPES)
+        self.item_values_with_counts(STUDIO_TYPES, filter, &[], &[])
             .await
     }
 
     async fn get_artists(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::MusicArtist, ARTIST_TYPES)
+        self.item_values_with_counts(ARTIST_TYPES, filter, &[], &[])
             .await
     }
 
     async fn get_album_artists(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::MusicArtist, ALBUM_ARTIST_TYPES)
+        self.item_values_with_counts(ALBUM_ARTIST_TYPES, filter, &[], &[])
             .await
     }
 
     async fn get_all_artists(
         &self,
-        _filter: &InternalItemsQuery,
+        filter: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        self.item_values_with_counts(BaseItemKind::MusicArtist, ALL_ARTIST_TYPES)
+        self.item_values_with_counts(ALL_ARTIST_TYPES, filter, &[], &[])
             .await
     }
 
@@ -715,6 +774,7 @@ mod tests {
         seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, test_db,
     };
     use hermit_db::Database;
+    use hermit_model::data::BaseItemKind;
     use hermit_model::entities::ExtraType;
 
     fn repo(db: &Database) -> HermitItemRepository {
@@ -750,6 +810,68 @@ mod tests {
             .expect("get_items");
         assert_eq!(res.total_record_count, 1);
         assert_eq!(res.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recursive_parent_matches_descendants_via_ancestor_closure() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        // library ─ series ─ episode. The episode is a direct child of the series,
+        // NOT of the library, but the library is in its ancestor closure.
+        let library = Uuid::from_u128(0xB001);
+        let series = Uuid::from_u128(0xB002);
+        let episode = Uuid::from_u128(0xB003);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "TV").await;
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(series.to_string())
+            .bind(library.to_string())
+            .execute(db.pool())
+            .await
+            .expect("series parent");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(episode.to_string())
+            .bind(series.to_string())
+            .execute(db.pool())
+            .await
+            .expect("episode parent");
+        for ancestor in [series, library] {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(episode.to_string())
+                .bind(ancestor.to_string())
+                .execute(db.pool())
+                .await
+                .expect("ancestor");
+        }
+
+        // Non-recursive: the library has one direct child (the series), no episode.
+        let direct = InternalItemsQuery {
+            parent_id: library,
+            include_item_types: vec![BaseItemKind::Episode],
+            ..InternalItemsQuery::default()
+        };
+        assert!(
+            repository
+                .get_item_list(&direct)
+                .await
+                .expect("direct")
+                .is_empty()
+        );
+
+        // Recursive: the episode is reached through the ancestor closure.
+        let recursive = InternalItemsQuery {
+            parent_id: library,
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Episode],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository
+            .get_item_list(&recursive)
+            .await
+            .expect("recursive");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, episode.to_string());
     }
 
     #[tokio::test]
@@ -942,11 +1064,8 @@ mod tests {
         let db = test_db().await;
         let repository = repo(&db);
 
-        // A by-name Genre item whose clean name matches a movie's genre value.
-        let genre_id = Uuid::from_u128(0x8001);
-        seed_named_item(&db, genre_id, BaseItemKind::Genre, "Drama").await;
-        crate::test_support::set_clean_name(&db, genre_id, "Drama").await;
-
+        // Seeding a movie's genre also materializes the browsable by-name Genre
+        // row (id = ItemValueId), the way the scanner does.
         let movie = Uuid::from_u128(0x8002);
         seed_named_item(&db, movie, BaseItemKind::Movie, "A Drama Film").await;
         seed_item_genre(&db, movie, "Drama").await;

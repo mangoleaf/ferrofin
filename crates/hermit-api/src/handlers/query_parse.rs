@@ -36,6 +36,31 @@ where
         .collect()
 }
 
+/// Like [`parse_csv_enums`] but silently drops tokens that don't parse instead
+/// of erroring.
+///
+/// This mirrors Jellyfin's tolerant `ItemFields` model binding: clients still
+/// send deprecated field names (e.g. `BasicSyncInfo`) that the server no longer
+/// recognizes, and Jellyfin skips them rather than failing the whole request.
+/// Used only for the `fields` parameter, where forward/backward-compat matters;
+/// identifier-bearing params (item types, ids) stay strict.
+pub(crate) fn parse_csv_enums_lenient<T>(raw: Option<&str>) -> Vec<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|token| {
+            let de: StrDeserializer<'_, ValueError> = token.into_deserializer();
+            T::deserialize(de).ok()
+        })
+        .collect()
+}
+
 /// Splits a comma-delimited value into [`Uuid`]s, skipping empty tokens.
 ///
 /// A malformed id is a `400`.
@@ -82,6 +107,14 @@ mod tests {
     fn csv_enums_reject_unknown_token() {
         let err = parse_csv_enums::<BaseItemKind>(Some("Nope")).unwrap_err();
         assert!(matches!(err, crate::error::ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn csv_enums_lenient_skips_unknown() {
+        use super::parse_csv_enums_lenient;
+        // A deprecated/unknown token is dropped, the valid ones survive.
+        let kinds: Vec<BaseItemKind> = parse_csv_enums_lenient(Some("Movie,BasicSyncInfo,Series"));
+        assert_eq!(kinds, vec![BaseItemKind::Movie, BaseItemKind::Series]);
     }
 
     #[test]

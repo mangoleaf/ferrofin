@@ -745,9 +745,37 @@ mod tests {
     #[tokio::test]
     async fn get_album_artists_returns_artist_rows() {
         let db = test_db().await;
-        let artist = Uuid::from_u128(0x401);
-        seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Miles Davis").await;
-        set_clean_name(&db, artist, "Miles Davis").await;
+        // A song credits "Miles Davis" as album artist (ItemValues type 1), and the
+        // browsable by-name row is materialized sharing the value id — the shape the
+        // by-name aggregate now requires (a value referenced by an in-scope item).
+        let value_id = Uuid::from_u128(0x401).to_string();
+        let song = Uuid::from_u128(0x402);
+        seed_named_item(&db, song, BaseItemKind::Audio, "So What").await;
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId","Type","Value","CleanValue")
+               VALUES (?1, 1, 'Miles Davis', 'miles davis')"#,
+        )
+        .bind(&value_id)
+        .execute(db.pool())
+        .await
+        .expect("value");
+        sqlx::query(r#"INSERT INTO "ItemValuesMap" ("ItemId","ItemValueId") VALUES (?1,?2)"#)
+            .bind(song.to_string())
+            .bind(&value_id)
+            .execute(db.pool())
+            .await
+            .expect("map");
+        sqlx::query(
+            r#"INSERT INTO "BaseItems"
+               ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,'MediaBrowser.Controller.Entities.Audio.MusicArtist',
+                       'Miles Davis','miles davis',1,0,0,0,0,0,0)"#,
+        )
+        .bind(&value_id)
+        .execute(db.pool())
+        .await
+        .expect("by-name row");
         let mgr = manager(&db);
 
         let result = mgr

@@ -167,8 +167,20 @@ fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Internal
     }
 
     if filter.parent_id != Uuid::nil() {
-        qb.push(r#" AND bi."ParentId" = "#)
-            .push_bind(filter.parent_id.to_string());
+        if filter.recursive {
+            // Recursive browse (e.g. a library's "Episodes" tab): match any
+            // descendant via the `AncestorIds` closure, not just direct children.
+            // Port of Jellyfin translating a recursive `ParentId` into an ancestor
+            // query rather than a `ParentId` equality.
+            qb.push(
+                r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = bi."Id" AND a."ParentItemId" = "#,
+            )
+            .push_bind(filter.parent_id.to_string())
+            .push(")");
+        } else {
+            qb.push(r#" AND bi."ParentId" = "#)
+                .push_bind(filter.parent_id.to_string());
+        }
     }
 
     if let Some(path) = non_blank(filter.path.as_ref()) {

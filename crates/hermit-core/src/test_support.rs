@@ -163,10 +163,25 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
            VALUES (?1, ?2) ON CONFLICT DO NOTHING"#,
     )
     .bind(item_id.to_string())
-    .bind(value_id)
+    .bind(&value_id)
     .execute(db.pool())
     .await
     .expect("map item value");
+
+    // Materialize the browsable by-name Genre row (id = ItemValueId), mirroring
+    // the scanner's `save_item_values`, so `get_genres` lists it.
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO "BaseItems"
+           ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+            "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+           VALUES (?1,'MediaBrowser.Controller.Entities.Genre',?2,?3,1,0,0,0,0,0,0)"#,
+    )
+    .bind(&value_id)
+    .bind(genre)
+    .bind(&clean)
+    .execute(db.pool())
+    .await
+    .expect("materialize by-name genre");
 }
 
 /// Inserts a minimal `Users` row and returns a [`UserEntity`] carrying its id.

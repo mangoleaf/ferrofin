@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_uuids};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /{kind}/{itemId}/Similar`.
@@ -69,7 +69,8 @@ async fn similar_items(
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
     let options = DtoOptions {
-        fields: parse_csv_enums(query.fields.as_deref())?,
+        // Lenient: clients send deprecated ItemFields; Jellyfin drops unknowns.
+        fields: parse_csv_enums_lenient(query.fields.as_deref()),
         ..DtoOptions::default()
     };
 

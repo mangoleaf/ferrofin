@@ -22,9 +22,27 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::options::ItemImageInfo;
 use hermit_traits::persistence::ItemPersistenceService;
 
+use hermit_model::data::BaseItemKind;
+
 use crate::db_error::db_err;
 use crate::item_repository::image_type_to_disc;
+use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::PLACEHOLDER_ID;
+
+/// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
+/// its browsable by-name item, or [`None`] for value types with no browse tab
+/// (tags, artists — handled elsewhere).
+///
+/// ponytail: Genre (2) → `Genre` and Studios (3) → `Studio` only. Music genres
+/// share the Genre value type here, so a music-only library's MusicGenre tab
+/// would want its own mapping; add when a music library needs it.
+fn by_name_type_name(value_type: i32) -> Option<&'static str> {
+    match value_type {
+        2 => stored_type_name(BaseItemKind::Genre),
+        3 => stored_type_name(BaseItemKind::Studio),
+        _ => None,
+    }
+}
 
 /// The concrete item-persistence service.
 #[derive(Clone)]
@@ -212,6 +230,27 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+            // Materialize the browsable by-name item (genre/studio) sharing the
+            // ItemValueId as its id, so the Genres/Studios tabs list it, the
+            // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
+            // (which resolves the id → BaseItems.CleanName) matches. Faithful to
+            // Jellyfin, where genres/studios are BaseItems; here their id is the
+            // shared value id the DTO layer already emits for genre_items.
+            if let Some(type_name) = by_name_type_name(*type_) {
+                sqlx::query(
+                    r#"INSERT OR IGNORE INTO "BaseItems"
+                       ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                        "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+                       VALUES (?1,?2,?3,?4,1,0,0,0,0,0,0)"#,
+                )
+                .bind(&value_id)
+                .bind(type_name)
+                .bind(value)
+                .bind(&clean)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
         }
         tx.commit().await.map_err(db_err)
     }
@@ -516,5 +555,56 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(remaining, 0, "all links should be cleared");
+    }
+
+    // Saving a movie's genre/studio values must also materialize the browsable
+    // by-name BaseItems row (sharing the ItemValueId as its id) so the
+    // Genres/Studios tabs list it and a `GenreIds=<id>` filter resolves.
+    #[tokio::test]
+    async fn save_item_values_materializes_by_name_items() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let svc = HermitItemPersistenceService::new(db.clone());
+
+        // 2 = Genre, 3 = Studios, 4 = Tags (tags get no browse item).
+        svc.save_item_values(
+            movie,
+            &[
+                (2, "Horror".to_owned()),
+                (3, "A24".to_owned()),
+                (4, "4k".to_owned()),
+            ],
+        )
+        .await
+        .expect("save values");
+
+        // The Genre by-name row exists, and its id equals the shared ItemValueId.
+        let genre: Option<(String, String)> = sqlx::query_as(
+            r#"SELECT bi."Id", iv."ItemValueId"
+               FROM "BaseItems" bi
+               JOIN "ItemValues" iv ON iv."Value" = bi."Name" AND iv."Type" = 2
+               WHERE bi."Type" LIKE '%.Genre' AND bi."Name" = 'Horror'"#,
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("query genre");
+        let (genre_item_id, genre_value_id) = genre.expect("genre by-name row exists");
+        assert_eq!(genre_item_id, genre_value_id, "id is the shared value id");
+
+        // Studio row exists too; the tag does NOT get a by-name row.
+        let studios: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%.Studio'"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("studio count");
+        assert_eq!(studios, 1);
+        let tags: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = '4k' AND "Type" NOT LIKE '%.Movie'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("tag count");
+        assert_eq!(tags, 0, "tags are not browsable by-name items");
     }
 }

@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::{resolve_user, resolve_user_opt};
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_uuids};
+use crate::handlers::query_parse::{parse_csv_enums, parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
 
 /// Builds a [`DtoOptions`] from the request's `fields` / image parameters.
@@ -59,7 +59,9 @@ fn build_dto_options(
 ) -> Result<DtoOptions, ApiError> {
     let requested_types: Vec<ImageType> = parse_csv_enums(enable_image_types)?;
     let mut options = DtoOptions {
-        fields: parse_csv_enums(fields)?,
+        // Lenient: clients still send deprecated ItemFields (e.g. BasicSyncInfo);
+        // Jellyfin drops unknowns rather than 400-ing the request.
+        fields: parse_csv_enums_lenient(fields),
         enable_images: enable_images.unwrap_or(true),
         image_type_limit: image_type_limit.unwrap_or(i32::MAX),
         enable_user_data: enable_user_data.unwrap_or(true),
