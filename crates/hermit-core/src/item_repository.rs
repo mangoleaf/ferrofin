@@ -884,11 +884,13 @@ mod tests {
         let person = Uuid::from_u128(0xC0FF);
         seed_named_item(&db, movie_a, BaseItemKind::Movie, "Heat").await;
         seed_named_item(&db, movie_b, BaseItemKind::Movie, "Solaris").await;
-        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,'Al Pacino','Actor')"#)
-            .bind(person.to_string())
-            .execute(db.pool())
-            .await
-            .expect("person");
+        sqlx::query(
+            r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,'Al Pacino','Actor')"#,
+        )
+        .bind(person.to_string())
+        .execute(db.pool())
+        .await
+        .expect("person");
         sqlx::query(
             r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
                VALUES (?1,?2,'',0,0)"#,
@@ -914,7 +916,11 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         assert_eq!(
-            repository.get_item_list(&by_name).await.expect("by name").len(),
+            repository
+                .get_item_list(&by_name)
+                .await
+                .expect("by name")
+                .len(),
             1
         );
     }
