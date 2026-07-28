@@ -205,6 +205,10 @@ struct DetailsResponse {
     genres: Vec<NamedEntry>,
     #[serde(default)]
     production_companies: Vec<NamedEntry>,
+    /// TV broadcast networks (HBO, AMC, …); empty for movies. Jellyfin's series
+    /// "Networks" browse is populated from these, not production companies.
+    #[serde(default)]
+    networks: Vec<NamedEntry>,
     #[serde(default)]
     vote_average: Option<f64>,
     #[serde(default)]
@@ -712,11 +716,7 @@ impl TmdbClient {
             overview: d.overview.filter(|s| !s.is_empty()),
             tagline: d.tagline.filter(|s| !s.is_empty()),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
-            studios: d
-                .production_companies
-                .into_iter()
-                .filter_map(|c| c.name)
-                .collect(),
+            studios: resolve_studios(d.networks, d.production_companies),
             community_rating: d.vote_average.filter(|v| *v > 0.0),
             official_rating: us_certification(kind, d.release_dates, d.content_ratings),
             production_year: year_from(premiere.as_deref()),
@@ -734,6 +734,18 @@ impl TmdbClient {
             return None;
         }
         resp.bytes().await.ok().map(|b| b.to_vec())
+    }
+}
+
+/// Resolves an item's studios: for series, its broadcast networks (Jellyfin's
+/// "Networks" browse), falling back to production companies when TMDB lists no
+/// networks. Movies carry no networks, so they keep their production companies.
+fn resolve_studios(networks: Vec<NamedEntry>, companies: Vec<NamedEntry>) -> Vec<String> {
+    let networks: Vec<String> = networks.into_iter().filter_map(|c| c.name).collect();
+    if networks.is_empty() {
+        companies.into_iter().filter_map(|c| c.name).collect()
+    } else {
+        networks
     }
 }
 
