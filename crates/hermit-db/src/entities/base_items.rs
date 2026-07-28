@@ -309,7 +309,7 @@ pub struct ItemValueMapEntity {
 }
 
 /// A row of the `Peoples` table — a distinct person (actor, director, …).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct PeopleEntity {
     /// The person's `Guid` primary key, hyphenated (`Id`).
@@ -318,6 +318,17 @@ pub struct PeopleEntity {
     pub name: String,
     /// The person-type key (`PersonType`), if any.
     pub person_type: Option<String>,
+    /// The credited role on the item being written (e.g. a character name).
+    ///
+    /// Not a `Peoples` column — it belongs to the `PeopleBaseItemMap` join, so it
+    /// is `#[sqlx(default)]` (absent when reading a bare `Peoples` row) and carried
+    /// on the write path so `update_people` can persist it.
+    #[sqlx(default)]
+    pub role: Option<String>,
+    /// The remote profile-image URL to download for this person, on the write
+    /// path. Not a column; `#[sqlx(default)]` so reads ignore it.
+    #[sqlx(default)]
+    pub primary_image_url: Option<String>,
 }
 
 /// A row of the `PeopleBaseItemMap` table — a person's credited role on an item.

@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::PeopleEntity;
+use hermit_model::data::BaseItemKind;
 use hermit_model::querying::QueryResult;
 use sqlx::QueryBuilder;
 use sqlx::Sqlite;
@@ -32,6 +33,7 @@ use hermit_traits::options::InternalPeopleQuery;
 use hermit_traits::persistence::PeopleRepository;
 
 use crate::db_error::db_err;
+use crate::item_type_lookup::stored_type_name;
 
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
 /// user-data join (C# `itemTypeLookup.BaseItemKindNames[Person]`).
@@ -226,7 +228,7 @@ impl PeopleRepository for HermitPeopleRepository {
         &self,
         item_id: Uuid,
         people: &[PeopleEntity],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
         // Dedupe case-insensitively by (name, person_type), matching the C#
         // DistinctBy(name.ToLower + "-" + type). Preserve first-seen order for
         // ListOrder.
@@ -258,7 +260,14 @@ impl PeopleRepository for HermitPeopleRepository {
 
         // Ensure a Peoples row exists for each (case-insensitive name + type),
         // reusing an existing id where present so credits share one person row.
+        // Each person is also materialized as a browsable `Person` BaseItems row
+        // (id = the Peoples id) so `/Persons/{name}` and `/Items/{personId}`
+        // resolve (else the client's person page spins forever), and so its image
+        // rows have an FK target. Collect the profile-image URLs to hand back for
+        // download.
+        let person_type_name = stored_type_name(BaseItemKind::Person);
         let mut people_ids: Vec<String> = Vec::with_capacity(deduped.len());
+        let mut image_downloads: Vec<(Uuid, String)> = Vec::new();
         for person in &deduped {
             let name = person.name.trim();
             let existing: Option<String> = sqlx::query_scalar(
@@ -292,23 +301,47 @@ impl PeopleRepository for HermitPeopleRepository {
                 .map_err(db_err)?;
                 new_id
             };
+
+            // Materialize the browsable Person item (id = the Peoples id).
+            if let Some(type_name) = person_type_name {
+                let clean = crate::text_util::get_clean_value(name);
+                sqlx::query(
+                    r#"INSERT OR IGNORE INTO "BaseItems"
+                       ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                        "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+                       VALUES (?1,?2,?3,?4,0,0,0,0,0,0,0)"#,
+                )
+                .bind(&id)
+                .bind(type_name)
+                .bind(name)
+                .bind(&clean)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+
+            if let (Ok(pid), Some(url)) = (
+                Uuid::parse_str(&id),
+                person
+                    .primary_image_url
+                    .as_deref()
+                    .filter(|u| !u.is_empty()),
+            ) {
+                image_downloads.push((pid, url.to_owned()));
+            }
             people_ids.push(id);
         }
 
-        // Replace this item's credit rows (C# removes stale maps and re-adds).
-        sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        for (list_order, people_id) in people_ids.iter().enumerate() {
+        // Rebuild this item's credit rows, preserving each credited role.
+        for (list_order, (people_id, person)) in people_ids.iter().zip(deduped.iter()).enumerate() {
             sqlx::query(
                 r#"INSERT INTO "PeopleBaseItemMap"
                    ("ItemId", "PeopleId", "Role", "ListOrder", "SortOrder")
-                   VALUES (?1, ?2, '', ?3, ?4)"#,
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
             )
             .bind(item_id.to_string())
             .bind(people_id)
+            .bind(person.role.clone().unwrap_or_default())
             .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
             .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
             .execute(&mut *tx)
@@ -317,7 +350,7 @@ impl PeopleRepository for HermitPeopleRepository {
         }
 
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(image_downloads)
     }
 
     async fn get_people_names(
@@ -413,6 +446,7 @@ mod tests {
             id: String::new(),
             name: name.to_owned(),
             person_type: Some(person_type.to_owned()),
+            ..Default::default()
         }
     }
 
@@ -444,6 +478,51 @@ mod tests {
         assert_eq!(result.items[0].name, "Alice");
         assert_eq!(result.items[1].name, "Bob");
         assert_eq!(result.items[2].name, "Carol");
+    }
+
+    #[tokio::test]
+    async fn update_people_materializes_person_items_and_returns_image_refs() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = HermitPeopleRepository::new(db.clone());
+
+        let with_image = PeopleEntity {
+            id: String::new(),
+            name: "Zendaya".to_owned(),
+            person_type: Some("Actor".to_owned()),
+            role: Some("Chani".to_owned()),
+            primary_image_url: Some("https://img/zendaya.jpg".to_owned()),
+        };
+        let refs = repo
+            .update_people(item, &[with_image, person("No Photo", "Director")])
+            .await
+            .expect("update");
+
+        // Only the person with a profile URL is returned for download.
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].1, "https://img/zendaya.jpg");
+
+        // A browsable Person BaseItems row exists (id = the Peoples id), so the
+        // person page / image endpoint can resolve it.
+        let (base_type, base_name): (String, String) =
+            sqlx::query_as(r#"SELECT bi."Type", bi."Name" FROM "BaseItems" bi WHERE bi."Id" = ?1"#)
+                .bind(refs[0].0.to_string())
+                .fetch_one(db.pool())
+                .await
+                .expect("person base item");
+        assert!(base_type.ends_with(".Person"));
+        assert_eq!(base_name, "Zendaya");
+
+        // The credited role is persisted on the map.
+        let role: String = sqlx::query_scalar(
+            r#"SELECT "Role" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1 AND "Role" <> '' LIMIT 1"#,
+        )
+        .bind(item.to_string())
+        .fetch_one(db.pool())
+        .await
+        .expect("role");
+        assert_eq!(role, "Chani");
     }
 
     #[tokio::test]

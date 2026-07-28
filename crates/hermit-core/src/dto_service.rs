@@ -366,17 +366,31 @@ impl HermitDtoService {
         let mut list = Vec::with_capacity(people.len());
         for person in people {
             let person_id = Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil());
+            // Resolve the person's primary image tag (from the materialized Person
+            // item's image rows) so the client renders cast/crew artwork.
+            let primary_image_tag = match self.load_images(person_id).await {
+                Ok(images) => {
+                    if let Some(primary) =
+                        images.iter().find(|i| i.image_type == ImageType::Primary)
+                    {
+                        self.image_tag(person_id, primary).await
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
             list.push(BaseItemPerson {
                 name: Some(person.name),
                 id: person_id,
-                role: None,
+                role: person.role.clone(),
                 type_: person
                     .person_type
                     .as_deref()
                     .map_or(hermit_model::data::PersonKind::Unknown, |t| {
                         person_kind_from_str(t)
                     }),
-                primary_image_tag: None,
+                primary_image_tag,
                 image_blur_hashes: None,
             });
         }
@@ -2185,6 +2199,7 @@ mod tests {
                 id: Uuid::new_v4().to_string(),
                 name: "Leonardo DiCaprio".into(),
                 person_type: Some("Actor".into()),
+                ..Default::default()
             }],
         });
         let svc = service_with(db, library);

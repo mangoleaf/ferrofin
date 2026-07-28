@@ -239,6 +239,7 @@ impl LibraryManager for ByNameLibrary {
             id: PERSON_ID.to_string(),
             name: "Uma".to_owned(),
             person_type: Some("Actor".to_owned()),
+            ..Default::default()
         }])
     }
     /// Backs the `get_years` default: one distinct production year.

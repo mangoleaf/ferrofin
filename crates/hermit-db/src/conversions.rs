@@ -304,6 +304,7 @@ mod tests {
             id: id.to_string(),
             name: "Harrison Ford".to_owned(),
             person_type: Some("Actor".to_owned()),
+            ..Default::default()
         };
         let credit = PeopleBaseItemMapEntity {
             item_id: Uuid::from_u128(0x30).to_string(),
@@ -326,6 +327,7 @@ mod tests {
             id: id.to_string(),
             name: "Someone".to_owned(),
             person_type: Some("Choreographer".to_owned()),
+            ..Default::default()
         };
         let credit = PeopleBaseItemMapEntity {
             item_id: Uuid::from_u128(2).to_string(),

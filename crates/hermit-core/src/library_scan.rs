@@ -234,9 +234,13 @@ impl LibraryScanner {
                 .await?;
             if !people.is_empty()
                 && let Some(repo) = &self.people
-                && let Err(err) = repo.update_people(item.id, &people).await
             {
-                tracing::warn!(%err, item = %item.id, "failed to persist cast/crew");
+                match repo.update_people(item.id, &people).await {
+                    Ok(image_refs) => self.download_person_images(image_refs).await,
+                    Err(err) => {
+                        tracing::warn!(%err, item = %item.id, "failed to persist cast/crew");
+                    }
+                }
             }
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
@@ -370,11 +374,40 @@ impl LibraryScanner {
                 id: Uuid::new_v4().to_string(),
                 name: p.name.clone(),
                 person_type: Some(p.person_type.clone()),
+                role: p.role.clone(),
+                primary_image_url: p.profile_url.clone(),
             })
             .collect()
     }
 
     /// metadata is not configured or nothing matched — best-effort, never fatal.
+    /// Downloads each credited person's TMDB profile image into that person's
+    /// metadata folder and saves it as their `Primary` image, so cast/crew show
+    /// artwork. Best-effort and cached (existing files are skipped on re-scan).
+    ///
+    /// ponytail: downloads every credited person serially — a large cast makes the
+    /// first scan slower, but the per-file skip makes re-scans cheap. Batch/cap if
+    /// first-scan latency on huge libraries becomes a problem.
+    async fn download_person_images(&self, refs: Vec<(Uuid, String)>) {
+        let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
+            return;
+        };
+        for (person_id, url) in refs {
+            let id = person_id.to_string();
+            let dir = meta_root.join(&id);
+            let images = vec![RemoteImage {
+                image_type: ImageType::Primary,
+                url,
+            }];
+            let infos = download_images(tmdb, &dir, &id, images).await;
+            if !infos.is_empty()
+                && let Err(err) = self.persistence.save_item_images(person_id, &infos).await
+            {
+                tracing::warn!(%err, person = %id, "failed to persist person image");
+            }
+        }
+    }
+
     async fn fetch_remote_images(
         &self,
         entity: &BaseItemEntity,

@@ -464,15 +464,26 @@ impl LibraryManager for HermitLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        // ponytail: runs inline (fine for typical libraries; a dozen movies is
-        // instant). Move to a spawned, progress-reporting task if large-library
-        // refresh latency becomes an issue.
         let Some(scanner) = &self.scanner else {
             tracing::debug!("library scan queued (no scanner attached — no-op)");
             return Ok(());
         };
-        let created = scanner.scan_all().await?;
-        tracing::info!(created, "library scan complete");
+        // Spawn so the /Library/Refresh request returns immediately (Jellyfin's
+        // refresh is fire-and-forget); a full scan now fetches remote metadata and
+        // downloads artwork for every item + credited person, which can run for
+        // minutes and must not block the HTTP handler.
+        //
+        // ponytail: no in-flight guard — a double refresh runs two scans, which is
+        // wasteful but safe (writes are idempotent and take the write lock upfront,
+        // per update_people/save_item_values). Add an AtomicBool guard if repeated
+        // refreshes during a long scan become a problem.
+        let scanner = Arc::clone(scanner);
+        tokio::spawn(async move {
+            match scanner.scan_all().await {
+                Ok(created) => tracing::info!(created, "library scan complete"),
+                Err(err) => tracing::error!(%err, "library scan failed"),
+            }
+        });
         Ok(())
     }
 }

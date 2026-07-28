@@ -533,12 +533,17 @@ pub trait PeopleRepository: Send + Sync {
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError>;
 
-    /// Replaces an item's people with the given set.
+    /// Replaces an item's people with the given set, materializing a browsable
+    /// `Person` item per credit.
+    ///
+    /// Returns `(person_id, image_url)` for each credited person that carries a
+    /// remote profile-image URL, so the caller can download the artwork into that
+    /// person's image folder (the repository has no HTTP/filesystem access).
     async fn update_people(
         &self,
         item_id: Uuid,
         people: &[PeopleEntity],
-    ) -> Result<(), ServiceError>;
+    ) -> Result<Vec<(Uuid, String)>, ServiceError>;
 
     /// Gets the distinct people names matching a filter.
     async fn get_people_names(
