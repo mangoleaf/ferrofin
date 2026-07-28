@@ -1,0 +1,15 @@
+[package]
+name = "hermit-chromaprint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure Chromaprint fingerprint comparison for intro/credits detection (port of Intro Skipper's ChromaprintAnalyzer math)."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rstest.workspace = true

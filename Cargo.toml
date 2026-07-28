@@ -15,7 +15,9 @@ members = [
     "crates/hermit-drawing",
     "crates/hermit-providers",
     "crates/hermit-livetv",
+    "crates/hermit-chromaprint",
     "crates/hermit-core",
+    "crates/hermit-extensions",
     "crates/hermit-api",
     "apps/hermit-server",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
