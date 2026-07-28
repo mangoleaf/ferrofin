@@ -65,7 +65,9 @@ hermit-hls = { path = "crates/hermit-hls" }
 hermit-drawing = { path = "crates/hermit-drawing" }
 hermit-providers = { path = "crates/hermit-providers" }
 hermit-livetv = { path = "crates/hermit-livetv" }
+hermit-chromaprint = { path = "crates/hermit-chromaprint" }
 hermit-core = { path = "crates/hermit-core" }
+hermit-extensions = { path = "crates/hermit-extensions" }
 hermit-api = { path = "crates/hermit-api" }
 
 # ── http / async ───────────────────────────────────────────────────

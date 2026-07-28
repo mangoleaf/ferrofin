@@ -376,7 +376,9 @@ pub async fn build_app_state(
         // Persist TMDB cast/crew credits fetched alongside the metadata.
         .with_people(Arc::clone(&people_repository)),
     );
-    let library: Arc<dyn hermit_traits::library::LibraryManager> = Arc::new(
+    // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
+    // (the `dyn LibraryManager` object does not carry that narrow impl).
+    let library_impl = Arc::new(
         HermitLibraryManager::new(
             Arc::clone(&item_repository),
             Arc::clone(&item_count_service),
@@ -385,13 +387,30 @@ pub async fn build_app_state(
         )
         .with_scanner(Arc::clone(&library_scanner)),
     );
+    let library: Arc<dyn hermit_traits::library::LibraryManager> = library_impl.clone();
+    // The library monitor backs the external-source change webhooks
+    // (`POST /Library/{Series,Movies,Media}/{Added,Updated}`): a reported path
+    // queues a (coalescing) library scan so tools like Radarr/Sonarr can poke the
+    // server to pick up new media. Live OS inotify watching is deferred, so the
+    // watcher is a no-op — only the webhook-driven refresh path is wired.
+    let library_monitor: Arc<dyn hermit_traits::library::LibraryMonitor> = Arc::new(
+        hermit_core::HermitLibraryMonitor::new(
+            Arc::new(hermit_core::NoopFileSystemWatcher),
+            Vec::new(),
+        )
+        .with_refresh_target(library_impl.clone()),
+    );
     // Scheduled tasks: register the "Scan all libraries" task (drives the same
     // scan as `POST /Library/Refresh`) so the dashboard button + tasks page work.
     let task_manager = HermitTaskManager::new();
     task_manager.register(Arc::new(hermit_core::RefreshLibraryTask::new(Arc::clone(
         &library,
     ))));
-    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager);
+    // The curated, compiled-in extensions (Intro Skipper, …). Their descriptors
+    // feed the plugin manager below (so they appear in `/Plugins`); their tasks
+    // are registered once `media_segments` exists, and the `task_manager` is
+    // wrapped into the `tasks` seam after that.
+    let extensions = hermit_extensions::builtin_extensions();
     let media_sources: Arc<dyn hermit_traits::library::MediaSourceManager> = Arc::new(
         HermitMediaSourceManager::new(
             Arc::clone(&item_repository),
@@ -412,25 +431,26 @@ pub async fn build_app_state(
     // dashboard-managed credentials through it. The OpenSubtitles plugin is
     // registered so it appears in the dashboard and its `{ApiKey,Username,
     // Password}` config is settable via `POST /Plugins/{id}/Configuration`.
-    let plugins: Arc<dyn hermit_traits::plugins::PluginManager> =
-        Arc::new(hermit_core::HermitPluginManager::new(
-            vec![
-                hermit_core::RegisteredPlugin::new(
-                    hermit_traits::plugins::PluginDescriptor {
-                        id: hermit_providers::opensubtitles::PLUGIN_ID,
-                        name: "OpenSubtitles".to_owned(),
-                        version: "1.0.0".to_owned(),
-                        description: "Download subtitles from opensubtitles.com".to_owned(),
-                        enabled: true,
-                        has_image: false,
-                        can_uninstall: false,
-                    },
-                    None,
-                )
-                .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
-            ],
-            config.config_dir.join("plugins"),
-        ));
+    let mut registered_plugins = vec![
+        hermit_core::RegisteredPlugin::new(
+            hermit_traits::plugins::PluginDescriptor {
+                id: hermit_providers::opensubtitles::PLUGIN_ID,
+                name: "OpenSubtitles".to_owned(),
+                version: "1.0.0".to_owned(),
+                description: "Download subtitles from opensubtitles.com".to_owned(),
+                enabled: true,
+                has_image: false,
+                can_uninstall: false,
+            },
+            None,
+        )
+        .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
+    ];
+    // Every curated extension surfaces as a plugin here.
+    registered_plugins.extend(hermit_extensions::registered_plugins(&extensions));
+    let plugins: Arc<dyn hermit_traits::plugins::PluginManager> = Arc::new(
+        hermit_core::HermitPluginManager::new(registered_plugins, config.config_dir.join("plugins")),
+    );
     let subtitle_providers: Vec<Arc<dyn hermit_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(hermit_providers::OpenSubtitlesProvider::new(
             Arc::clone(&plugins),
@@ -445,6 +465,27 @@ pub async fn build_app_state(
     let media_segments: Arc<dyn hermit_traits::media_segments::MediaSegmentManager> = Arc::new(
         HermitMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
     );
+
+    // Wire the curated extensions' background tasks now that their collaborators
+    // (library, media segments, plugin config) exist. The intro skipper gets a
+    // fingerprinter only when Chromaprint's `fpcalc` is installed; otherwise it
+    // loads but reports unavailable at run time.
+    let fingerprinter: Option<Arc<dyn hermit_extensions::fingerprint::Fingerprinter>> =
+        hermit_extensions::fingerprint::discover_fpcalc().map(|fpcalc| {
+            Arc::new(hermit_extensions::fingerprint::FpcalcFingerprinter::new(
+                fpcalc,
+                ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+            )) as Arc<dyn hermit_extensions::fingerprint::Fingerprinter>
+        });
+    let extension_cx = hermit_extensions::ExtensionContext {
+        library: Arc::clone(&library),
+        media_segments: Arc::clone(&media_segments),
+        plugins: Arc::clone(&plugins),
+        fingerprinter,
+        cache_dir: config.cache_dir.join("extensions"),
+    };
+    hermit_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
+    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager);
     let collections: Arc<dyn hermit_traits::collections::CollectionManager> =
         Arc::new(HermitCollectionManager::new(
             db.clone(),
@@ -635,6 +676,10 @@ pub async fn build_app_state(
     // Image serving runs through the real `image`-crate processor so
     // `maxWidth`/`format`/… requests resize/convert instead of serving the original.
     let state = state.with_image_processor(Arc::clone(&image_processor));
+
+    // Replace the `NoopLibraryMonitor` default with the webhook-driven monitor
+    // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
+    let state = state.with_library_monitor(library_monitor);
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time

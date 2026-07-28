@@ -10,5 +10,17 @@ description = "Curated, compiled-in extensions (Jellyfin plugins) for Hermit, in
 workspace = true
 
 [dependencies]
+hermit-chromaprint.workspace = true
+hermit-traits.workspace = true
+hermit-core.workspace = true
+hermit-model.workspace = true
+hermit-db.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]

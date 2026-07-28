@@ -34,6 +34,7 @@ hermit-mediaencoding.workspace = true
 hermit-hls.workspace = true
 hermit-drawing.workspace = true
 hermit-providers.workspace = true
+hermit-extensions.workspace = true
 hermit-livetv.workspace = true
 
 axum = { workspace = true, features = ["ws", "macros"] }

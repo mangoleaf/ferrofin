@@ -1474,6 +1474,14 @@ impl MediaSegmentManager for FakeMediaSegments {
     ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn delete_provider_segments(
+        &self,
+        _item_id: Uuid,
+        _provider_id: &str,
+        _type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
 }
 
 /// A fake [`TrickplayManager`]; every method is unused by INFRA-level tests.

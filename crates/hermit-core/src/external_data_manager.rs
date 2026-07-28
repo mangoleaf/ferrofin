@@ -280,6 +280,14 @@ mod tests {
             self.segments.lock().unwrap().push(item_id);
             Ok(())
         }
+        async fn delete_provider_segments(
+            &self,
+            _item_id: Uuid,
+            _provider_id: &str,
+            _type_filter: Option<MediaSegmentType>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
         async fn get_segments(
             &self,
             _item_id: Uuid,

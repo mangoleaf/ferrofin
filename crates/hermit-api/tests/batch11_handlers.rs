@@ -302,6 +302,14 @@ impl MediaSegmentManager for OneSegment {
     ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
         Ok(Vec::new())
     }
+    async fn delete_provider_segments(
+        &self,
+        _item_id: Uuid,
+        _provider_id: &str,
+        _type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// A [`TrickplayManager`] returning a canned playlist + a caller-supplied tile

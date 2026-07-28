@@ -58,6 +58,17 @@ pub trait MediaSegmentManager: Send + Sync {
     /// Deletes all media segments belonging to an item.
     async fn delete_segments(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
+    /// Deletes an item's segments that were written by `provider_id`, optionally
+    /// limited to one type. Lets a provider (e.g. the intro skipper) replace only
+    /// its own rows on re-analysis, leaving user-authored and other providers'
+    /// segments intact.
+    async fn delete_provider_segments(
+        &self,
+        item_id: Uuid,
+        provider_id: &str,
+        type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError>;
+
     /// Lists the segments for an item, optionally filtered by type and/or to
     /// providers currently enabled on the item's library.
     async fn get_segments(
