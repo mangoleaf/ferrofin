@@ -191,7 +191,51 @@ async fn report_playback_start(
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
+    log_playback_activity(&state, &auth, info.item_id, "is playing", "VideoPlayback").await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Records a playback activity-log entry (best-effort — a logging failure must
+/// not fail the playback report). Port of `ActivityLogEntryPoint.OnPlayback*`,
+/// which writes "{user} is playing {item} on {device}" so the dashboard's
+/// Activity feed reflects what's being watched.
+async fn log_playback_activity(
+    state: &AppState,
+    auth: &hermit_traits::options::AuthorizationInfo,
+    item_id: Uuid,
+    action: &str,
+    type_: &str,
+) {
+    // No user → no entry, matching Jellyfin (it skips user-less playback events).
+    let Some(user) = auth.user.as_ref() else {
+        return;
+    };
+    let user_id = Uuid::parse_str(&user.id).ok();
+    let device = auth
+        .device
+        .clone()
+        .or_else(|| auth.client.clone())
+        .unwrap_or_default();
+    let item_name = state
+        .library
+        .get_item_by_id(item_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|i| i.name)
+        .unwrap_or_default();
+    let name = format!("{} {action} {item_name} on {device}", user.username);
+    let _ = state
+        .activity
+        .create_entry(hermit_traits::activity::ActivityLogCreate {
+            name,
+            type_: type_.to_owned(),
+            user_id,
+            item_id: Some(item_id),
+            severity: hermit_model::activity::LogLevel::Information,
+            ..Default::default()
+        })
+        .await;
 }
 
 /// `POST /Sessions/Playing/Progress` — reports playback progress.
@@ -266,7 +310,16 @@ async fn report_playback_stopped(
     // The transcode-job kill (C# `KillTranscodingJobs`) is deferred; the play-
     // state bookkeeping below is the portable slice.
     info.session_id = Some(current_session_id(&state, &auth).await?);
+    let item_id = info.item_id;
     state.sessions.on_playback_stopped(&info).await?;
+    log_playback_activity(
+        &state,
+        &auth,
+        item_id,
+        "has finished playing",
+        "VideoPlaybackStopped",
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

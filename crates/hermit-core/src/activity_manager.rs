@@ -22,11 +22,14 @@
 //!   [`int_to_severity`] map it to the [`LogLevel`] model.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use hermit_db::Database;
 use hermit_db::entities::activity::ActivityLogEntity;
 use hermit_model::activity::{ActivityLogEntry, LogLevel};
 use hermit_model::querying::QueryResult;
-use hermit_traits::activity::{ActivityLogQuery, ActivityLogSortBy, ActivityManager, SortOrder};
+use hermit_traits::activity::{
+    ActivityLogCreate, ActivityLogQuery, ActivityLogSortBy, ActivityManager, SortOrder,
+};
 use hermit_traits::error::ServiceError;
 use uuid::Uuid;
 
@@ -219,6 +222,35 @@ impl ActivityManager for HermitActivityManager {
             items,
         ))
     }
+
+    async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError> {
+        // A user-less entry stores the empty guid (the `has_user_id` filter keys
+        // off it); a real user stores the hyphenated guid so the Users join
+        // resolves the username. ItemId matches the hyphen-free "N" storage the
+        // read-side item filter binds against.
+        let user_id = entry
+            .user_id
+            .map_or_else(|| EMPTY_GUID.to_owned(), |u| u.to_string());
+        let item_id = entry.item_id.map(|i| i.simple().to_string());
+        sqlx::query(
+            r#"INSERT INTO "ActivityLogs"
+               ("Name", "Type", "UserId", "Overview", "ShortOverview",
+                "ItemId", "LogSeverity", "DateCreated", "RowVersion")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)"#,
+        )
+        .bind(entry.name)
+        .bind(entry.type_)
+        .bind(user_id)
+        .bind(entry.overview)
+        .bind(entry.short_overview)
+        .bind(item_id)
+        .bind(severity_to_int(entry.severity))
+        .bind(Utc::now().to_rfc3339())
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +327,49 @@ mod tests {
         assert_eq!(result.items[0].name, "new");
         assert_eq!(result.items[0].severity, LogLevel::Error);
         assert_eq!(result.items[1].name, "old");
+    }
+
+    #[tokio::test]
+    async fn create_entry_persists_and_reads_back() {
+        let db = memory_db().await;
+        let mgr = HermitActivityManager::new(db);
+        let user = Uuid::from_u128(0x42);
+        let item = Uuid::from_u128(0x99);
+        mgr.create_entry(ActivityLogCreate {
+            name: "Ken is playing Dune on Firefox".to_owned(),
+            type_: "VideoPlayback".to_owned(),
+            user_id: Some(user),
+            item_id: Some(item),
+            severity: LogLevel::Information,
+            ..Default::default()
+        })
+        .await
+        .expect("create");
+
+        // It comes back through the query surface, tagged with its user + item.
+        let all = mgr
+            .get_paged_result(&ActivityLogQuery::default())
+            .await
+            .expect("query");
+        assert_eq!(all.total_record_count, 1);
+        assert_eq!(all.items[0].name, "Ken is playing Dune on Firefox");
+        assert_eq!(all.items[0].type_, "VideoPlayback");
+        assert_eq!(all.items[0].user_id, user);
+
+        // The has-user filter sees it as a user entry, and the item filter (which
+        // binds the hyphen-free id) matches — proving the storage format lines up.
+        let by_item = ActivityLogQuery {
+            item_id: Some(item),
+            has_user_id: Some(true),
+            ..ActivityLogQuery::default()
+        };
+        assert_eq!(
+            mgr.get_paged_result(&by_item)
+                .await
+                .expect("by item")
+                .total_record_count,
+            1
+        );
     }
 
     #[tokio::test]

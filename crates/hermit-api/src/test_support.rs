@@ -1733,6 +1733,12 @@ impl ActivityManager for FakeActivity {
     ) -> Result<QueryResult<ActivityLogEntry>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn create_entry(
+        &self,
+        _entry: hermit_traits::activity::ActivityLogCreate,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// A fake [`TaskManager`]; every method is unused by INFRA-level tests.

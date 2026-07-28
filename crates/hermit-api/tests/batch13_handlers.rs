@@ -302,6 +302,12 @@ impl ActivityManager for StubActivity {
         };
         Ok(QueryResult::new(query.start_index, Some(1), vec![entry]))
     }
+    async fn create_entry(
+        &self,
+        _entry: hermit_traits::activity::ActivityLogCreate,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 /// A filesystem stub returning canned directory entries, drives, and log files.

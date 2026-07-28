@@ -83,9 +83,32 @@ pub struct ActivityLogQuery {
     pub order_by: Vec<(ActivityLogSortBy, SortOrder)>,
 }
 
-/// Manages retrieval of activity-log entries.
+/// A new activity-log entry to persist.
 ///
-/// Port of `IActivityManager` (query surface only).
+/// Port of the `ActivityLog` values `IActivityManager.CreateAsync` receives
+/// (name/type/severity plus the optional user + item associations). `DateCreated`
+/// is stamped by the manager at insert time.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityLogCreate {
+    /// The human-readable entry name (e.g. "Ken is playing Dune on Firefox").
+    pub name: String,
+    /// The entry type discriminator (e.g. `VideoPlayback`, `VideoPlaybackStopped`).
+    pub type_: String,
+    /// The associated user, if any (absent → a system/anonymous entry).
+    pub user_id: Option<Uuid>,
+    /// A longer description.
+    pub overview: Option<String>,
+    /// A short description.
+    pub short_overview: Option<String>,
+    /// The item this entry is about, if any.
+    pub item_id: Option<Uuid>,
+    /// The log severity.
+    pub severity: LogLevel,
+}
+
+/// Manages retrieval and creation of activity-log entries.
+///
+/// Port of `IActivityManager` (query + create surface).
 #[async_trait]
 pub trait ActivityManager: Send + Sync {
     /// Returns a page of activity-log entries matching the query
@@ -94,6 +117,10 @@ pub trait ActivityManager: Send + Sync {
         &self,
         query: &ActivityLogQuery,
     ) -> Result<QueryResult<ActivityLogEntry>, ServiceError>;
+
+    /// Persists a new activity-log entry (C# `CreateAsync`), stamping it with the
+    /// current time. Best-effort callers may ignore the result.
+    async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_activity_manager(_: &dyn ActivityManager) {}
