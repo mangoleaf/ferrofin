@@ -875,6 +875,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn person_ids_filter_returns_that_persons_filmography() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        // Two movies; a person credited on only the first.
+        let movie_a = Uuid::from_u128(0xC001);
+        let movie_b = Uuid::from_u128(0xC002);
+        let person = Uuid::from_u128(0xC0FF);
+        seed_named_item(&db, movie_a, BaseItemKind::Movie, "Heat").await;
+        seed_named_item(&db, movie_b, BaseItemKind::Movie, "Solaris").await;
+        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,'Al Pacino','Actor')"#)
+            .bind(person.to_string())
+            .execute(db.pool())
+            .await
+            .expect("person");
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+               VALUES (?1,?2,'',0,0)"#,
+        )
+        .bind(movie_a.to_string())
+        .bind(person.to_string())
+        .execute(db.pool())
+        .await
+        .expect("credit");
+
+        // By id: only the credited movie.
+        let by_id = InternalItemsQuery {
+            person_ids: vec![person],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository.get_item_list(&by_id).await.expect("by id");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, movie_a.to_string());
+
+        // By name resolves the same filmography.
+        let by_name = InternalItemsQuery {
+            person: Some("Al Pacino".to_owned()),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            repository.get_item_list(&by_name).await.expect("by name").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn any_provider_id_equals_matches_exact_value_case_insensitively() {
         let db = test_db().await;
         let repository = repo(&db);

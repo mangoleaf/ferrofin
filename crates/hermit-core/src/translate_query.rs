@@ -241,6 +241,7 @@ fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Internal
 
     append_user_data_predicates(qb, filter);
     append_item_value_predicates(qb, filter, &tags, &exclude_tags);
+    append_people_predicates(qb, filter);
 
     if let Some(has) = filter.has_overview {
         if has {
@@ -593,6 +594,29 @@ fn push_user_data_exists(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, cond:
     .push(r#"(SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
     .push_bind(user_id.to_owned())
     .push(format!(" AND {cond})"));
+}
+
+/// Appends the credited-person predicates: `person` (by name) and `person_ids`
+/// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
+/// join, so `/Items?PersonIds=<id>` returns everything that person is credited
+/// on (port of C# `WhereContainsPerson` / the `people` sub-query).
+fn append_people_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+    if let Some(name) = non_blank(filter.person.as_ref()) {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
+                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
+                WHERE pm."ItemId" = bi."Id" AND pp."Name" = "#,
+        );
+        qb.push_bind(name.to_owned());
+        qb.push(")");
+    }
+    if !filter.person_ids.is_empty() {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm WHERE pm."ItemId" = bi."Id" AND "#,
+        );
+        push_in_list(qb, r#"pm."PeopleId""#, &to_guid_strings(&filter.person_ids));
+        qb.push(")");
+    }
 }
 
 /// Appends the `ItemValues`-backed predicates: genres, genre ids, studios, studio
