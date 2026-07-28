@@ -38,15 +38,17 @@ METHODS = ("get", "post", "put", "delete", "patch", "head")
 def norm(method, path):
     """Param-name-agnostic key that matches REAL_ROUTES to spec paths.
 
-    Collapses `{anyName}` -> `{}`, and folds the trailing-suffix equivalences
-    Hermit's router relies on (`/Videos/{id}/stream.{container}` is served by a
-    registered `/Videos/{id}/{container}`; `.m3u8`/`.jpg` literals; `/stream`).
+    Replicates the router's `to_axum_path` (crates/hermit-api/src/routes.rs): any
+    segment containing a `{placeholder}` collapses to a single `{}` capture of the
+    whole segment, so a mixed literal+param segment folds to `{}` too
+    (`stream.{container}` -> `{}`, `Stream.{routeFormat}` -> `{}`,
+    `{segmentId}.{container}` -> `{}`). Literal-only segments are kept verbatim
+    (`subtitles.m3u8`, `stream`, `Countries`), and param names are irrelevant.
+    This is exactly the equivalence the router keys on, so a route registered
+    under Hermit's spelling matches the vendored spec path it serves.
     """
-    path = re.sub(r"\{[^}]+\}", "{}", path)
-    path = re.sub(r"\.\{\}$", "", path)
-    path = re.sub(r"\.[a-z0-9]+$", "", path)
-    path = re.sub(r"/stream$", "", path)
-    return (method, path)
+    segments = ["{}" if "{" in seg else seg for seg in path.split("/")]
+    return (method, "/".join(segments))
 
 
 def load_spec():
@@ -61,7 +63,9 @@ def load_real_routes():
     start = mod.index("pub const REAL_ROUTES")
     blk = mod[start:]
     blk = blk[: blk.index("\n];")]
-    pairs = re.findall(r'\(\s*"(\w+)"\s*,\s*"([^"]+)"\s*\)', blk)
+    # Tolerate a trailing comma before `)` so multi-line entries (long paths
+    # split across lines with a dangling comma) are captured, not just one-liners.
+    pairs = re.findall(r'\(\s*"(\w+)"\s*,\s*"([^"]+)"\s*,?\s*\)', blk)
     return set(norm(m, p) for m, p in pairs)
 
 

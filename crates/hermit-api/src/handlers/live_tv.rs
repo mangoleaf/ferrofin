@@ -13,21 +13,23 @@
 //! recordings list/get/delete. The recording *capture* engine (a scheduler that
 //! records a channel to disk when a timer fires) is a further increment.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use uuid::Uuid;
 
-use hermit_model::dto::{BaseItemDto, NameIdPair};
+use hermit_model::dto::{BaseItemDto, NameIdPair, NameValuePair};
 use hermit_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto,
-    TimerInfoDto, TunerHostInfo,
+    TimerInfoDto, TunerChannelMapping, TunerHostInfo,
 };
 use hermit_model::querying::QueryResult;
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
 
 /// `GET /LiveTv/Info` — top-level Live TV status.
@@ -267,6 +269,130 @@ async fn get_recording_groups(RequireAuth(_auth): RequireAuth) -> Json<QueryResu
     Json(QueryResult::default())
 }
 
+/// `GET /LiveTv/Recordings/Groups/{groupId}` — a single recording group.
+///
+/// Port of `LiveTvController.GetRecordingGroup`: recording groups are an obsolete
+/// concept (the list endpoint returns empty), so no group is ever resolvable and
+/// this always reports `404` — the faithful outcome.
+async fn get_recording_group(
+    RequireAuth(_auth): RequireAuth,
+    Path(_group_id): Path<Uuid>,
+) -> Result<Json<BaseItemDto>, ApiError> {
+    Err(ApiError::NotFound("recording group".into()))
+}
+
+/// `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` — Schedules Direct
+/// country list.
+///
+/// Port of `LiveTvController.GetSchedulesDirectCountries`: Hermit's Live TV is
+/// M3U + XMLTV, with no Schedules Direct provider, so the available-country set
+/// is empty (faithful — Jellyfin streams SD's country JSON only when SD is
+/// configured). Returned as a JSON array so the dashboard's SD setup page parses
+/// it instead of erroring.
+async fn get_schedules_direct_countries(
+    RequireAuth(_auth): RequireAuth,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!([]))
+}
+
+/// `GET /LiveTv/LiveRecordings/{recordingId}/stream` — stream a recording file.
+///
+/// Port of `LiveTvController.GetLiveRecordingFile`: resolves the recording's
+/// captured file path and serves it (HTTP Range supported). `404` when the
+/// recording is unknown or has no file on disk yet — the faithful result until
+/// the capture engine (a later Live TV increment) writes recordings.
+async fn get_live_recording_stream(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(recording_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let Ok(id) = Uuid::parse_str(&recording_id) else {
+        return Err(ApiError::NotFound("recording".into()));
+    };
+    match live_tv(&state)?.get_recording_path(id).await? {
+        Some(path) => serve_static_file(&path, request).await,
+        None => Err(ApiError::NotFound("recording".into())),
+    }
+}
+
+/// `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — serve a buffered
+/// live-stream file.
+///
+/// Port of `LiveTvController.GetLiveStreamFile`. Jellyfin serves the on-disk file
+/// a tuner buffers a live stream into; Hermit direct-plays each M3U channel from
+/// its source URL (see `LiveTvManager::get_channel_stream_url`) and buffers
+/// nothing to disk, so there is no such file to serve and this reports `404` —
+/// the faithful result for a stream id that has no buffered file.
+async fn get_live_stream_file(
+    RequireAuth(_auth): RequireAuth,
+    Path((_stream_id, _container)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    Err(ApiError::NotFound("live stream file".into()))
+}
+
+/// The `POST /LiveTv/ChannelMappings` request body.
+///
+/// Port of `SetChannelMappingDto`: a tuner channel mapped to a listings-provider
+/// channel, for the given listings provider.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(clippy::struct_field_names)] // mirrors the vendored `SetChannelMappingDto`
+struct SetChannelMappingDto {
+    /// The listings provider id the mapping belongs to.
+    #[serde(default)]
+    provider_id: String,
+    /// The tuner channel id being mapped.
+    #[serde(default)]
+    tuner_channel_id: String,
+    /// The provider channel id it maps to.
+    #[serde(default)]
+    provider_channel_id: String,
+}
+
+/// `POST /LiveTv/ChannelMappings` — map a tuner channel to a provider channel.
+///
+/// Port of `LiveTvController.SetChannelMapping` → `SetChannelMapping`: upserts the
+/// `tunerChannelId -> providerChannelId` pair into the listings provider's
+/// `ChannelMappings` and persists it (the guide match honors the mapping on the
+/// next refresh). Returns the resulting [`TunerChannelMapping`]. `404` when the
+/// provider id is unknown.
+async fn set_channel_mapping(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Json(dto): Json<SetChannelMappingDto>,
+) -> Result<Json<TunerChannelMapping>, ApiError> {
+    let manager = live_tv(&state)?;
+    let mut provider = manager
+        .get_listing_providers()
+        .await?
+        .into_iter()
+        .find(|p| p.id.as_deref() == Some(dto.provider_id.as_str()))
+        .ok_or_else(|| ApiError::NotFound("listing provider".into()))?;
+
+    // Upsert the mapping (keyed on the tuner channel id).
+    if let Some(existing) = provider
+        .channel_mappings
+        .iter_mut()
+        .find(|m| m.name.as_deref() == Some(dto.tuner_channel_id.as_str()))
+    {
+        existing.value = Some(dto.provider_channel_id.clone());
+    } else {
+        provider.channel_mappings.push(NameValuePair {
+            name: Some(dto.tuner_channel_id.clone()),
+            value: Some(dto.provider_channel_id.clone()),
+        });
+    }
+    manager.save_listing_provider(provider).await?;
+
+    Ok(Json(TunerChannelMapping {
+        name: Some(dto.tuner_channel_id.clone()),
+        id: Some(dto.tuner_channel_id),
+        provider_channel_id: Some(dto.provider_channel_id),
+        provider_channel_name: None,
+    }))
+}
+
 /// `GET /LiveTv/Recordings/Series` — series recordings (deprecated; empty).
 async fn get_recordings_series(RequireAuth(_auth): RequireAuth) -> Json<QueryResult<BaseItemDto>> {
     Json(QueryResult::default())
@@ -443,7 +569,19 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/LiveTv/Recordings/Folders", get(get_recording_folders))
         .route("/LiveTv/Recordings/Groups", get(get_recording_groups))
+        .route(
+            "/LiveTv/Recordings/Groups/{groupId}",
+            get(get_recording_group),
+        )
         .route("/LiveTv/Recordings/Series", get(get_recordings_series))
+        .route(
+            "/LiveTv/LiveRecordings/{recordingId}/stream",
+            get(get_live_recording_stream),
+        )
+        .route(
+            "/LiveTv/LiveStreamFiles/{streamId}/{container}",
+            get(get_live_stream_file),
+        )
         .route("/LiveTv/Timers", get(get_timers).post(create_timer))
         .route(
             "/LiveTv/Timers/{timerId}",
@@ -472,7 +610,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/LiveTv/ListingProviders/Default",
             get(get_default_listing_provider),
         )
+        .route(
+            "/LiveTv/ListingProviders/SchedulesDirect/Countries",
+            get(get_schedules_direct_countries),
+        )
         .route("/LiveTv/ListingProviders/Lineups", get(get_lineups))
+        .route("/LiveTv/ChannelMappings", post(set_channel_mapping))
         .route(
             "/LiveTv/TunerHosts",
             post(add_tuner_host).delete(delete_tuner_host),
@@ -592,5 +735,290 @@ mod tests {
                 .total_record_count,
             0
         );
+    }
+
+    // ---- the 5 previously-stubbed routes ---------------------------------
+
+    #[tokio::test]
+    async fn schedules_direct_countries_is_empty() {
+        assert_eq!(
+            get_schedules_direct_countries(auth()).await.0,
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_group_and_live_stream_file_are_404() {
+        let group = get_recording_group(auth(), Path(Uuid::nil()))
+            .await
+            .unwrap_err();
+        assert_eq!(group.status(), axum::http::StatusCode::NOT_FOUND);
+        let file = get_live_stream_file(auth(), Path(("s1".into(), "mp4".into())))
+            .await
+            .unwrap_err();
+        assert_eq!(file.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn manager_backed_ops_501_without_manager() {
+        let state = fake_state();
+        let req = axum::http::Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let rec = get_live_recording_stream(
+            State(state.clone()),
+            auth(),
+            Path(Uuid::nil().to_string()),
+            req,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rec.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+        let map = set_channel_mapping(
+            State(state),
+            auth(),
+            Json(SetChannelMappingDto {
+                provider_id: "p".into(),
+                tuner_channel_id: "t".into(),
+                provider_channel_id: "c".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(map.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// A minimal [`LiveTvManager`] backing only the three methods the new
+    /// handlers touch; everything else is unreachable in these tests.
+    #[derive(Default)]
+    struct FakeLiveTv {
+        providers: std::sync::Mutex<Vec<ListingsProviderInfo>>,
+        recording_path: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl hermit_traits::stubs::LiveTvManager for FakeLiveTv {
+        async fn get_listing_providers(
+            &self,
+        ) -> Result<Vec<ListingsProviderInfo>, hermit_traits::error::ServiceError> {
+            Ok(self.providers.lock().unwrap().clone())
+        }
+        async fn save_listing_provider(
+            &self,
+            info: ListingsProviderInfo,
+        ) -> Result<ListingsProviderInfo, hermit_traits::error::ServiceError> {
+            let mut g = self.providers.lock().unwrap();
+            *g = vec![info.clone()];
+            Ok(info)
+        }
+        async fn get_recording_path(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<String>, hermit_traits::error::ServiceError> {
+            Ok(self.recording_path.clone())
+        }
+        async fn get_live_tv_info(&self) -> Result<LiveTvInfo, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_tuner_hosts(
+            &self,
+        ) -> Result<Vec<TunerHostInfo>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn save_tuner_host(
+            &self,
+            _info: TunerHostInfo,
+        ) -> Result<TunerHostInfo, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn delete_tuner_host(
+            &self,
+            _id: &str,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn delete_listing_provider(
+            &self,
+            _id: &str,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_channels(
+            &self,
+            _options: &DtoOptions,
+        ) -> Result<QueryResult<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_channel(
+            &self,
+            _id: Uuid,
+            _options: &DtoOptions,
+        ) -> Result<Option<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_programs(
+            &self,
+            _query: &InternalItemsQuery,
+            _options: &DtoOptions,
+        ) -> Result<QueryResult<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_program(
+            &self,
+            _id: Uuid,
+            _options: &DtoOptions,
+        ) -> Result<Option<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn reset_tuner(&self, _id: &str) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn refresh_guide(&self) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_channel_stream_url(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<String>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_timers(
+            &self,
+        ) -> Result<Vec<TimerInfoDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_timer(
+            &self,
+            _id: &str,
+        ) -> Result<Option<TimerInfoDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn create_timer(
+            &self,
+            _timer: TimerInfoDto,
+        ) -> Result<String, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn update_timer(
+            &self,
+            _id: &str,
+            _timer: TimerInfoDto,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn cancel_timer(&self, _id: &str) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_series_timers(
+            &self,
+        ) -> Result<Vec<SeriesTimerInfoDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_series_timer(
+            &self,
+            _id: &str,
+        ) -> Result<Option<SeriesTimerInfoDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn create_series_timer(
+            &self,
+            _timer: SeriesTimerInfoDto,
+        ) -> Result<String, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn update_series_timer(
+            &self,
+            _id: &str,
+            _timer: SeriesTimerInfoDto,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn cancel_series_timer(
+            &self,
+            _id: &str,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_recordings(
+            &self,
+        ) -> Result<QueryResult<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn get_recording(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<BaseItemDto>, hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+        async fn delete_recording(
+            &self,
+            _id: Uuid,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn set_channel_mapping_upserts_and_returns() {
+        let provider = ListingsProviderInfo {
+            id: Some("prov1".into()),
+            ..ListingsProviderInfo::default()
+        };
+        let fake = std::sync::Arc::new(FakeLiveTv {
+            providers: std::sync::Mutex::new(vec![provider]),
+            recording_path: None,
+        });
+        let state = fake_state().with_live_tv(fake.clone());
+        let mapping = set_channel_mapping(
+            State(state),
+            auth(),
+            Json(SetChannelMappingDto {
+                provider_id: "prov1".into(),
+                tuner_channel_id: "10".into(),
+                provider_channel_id: "HBO".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(mapping.id.as_deref(), Some("10"));
+        assert_eq!(mapping.provider_channel_id.as_deref(), Some("HBO"));
+        // The mapping was persisted onto the provider.
+        let saved = fake.providers.lock().unwrap()[0].channel_mappings.clone();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name.as_deref(), Some("10"));
+        assert_eq!(saved[0].value.as_deref(), Some("HBO"));
+    }
+
+    #[tokio::test]
+    async fn set_channel_mapping_unknown_provider_is_404() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake);
+        let err = set_channel_mapping(
+            State(state),
+            auth(),
+            Json(SetChannelMappingDto {
+                provider_id: "missing".into(),
+                tuner_channel_id: "1".into(),
+                provider_channel_id: "2".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn live_recording_stream_404_when_no_file() {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake);
+        let req = axum::http::Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let err =
+            get_live_recording_stream(State(state), auth(), Path(Uuid::new_v4().to_string()), req)
+                .await
+                .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

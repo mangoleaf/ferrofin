@@ -546,6 +546,18 @@ impl LiveTvManager for HermitLiveTvManager {
         Ok(row.map(|r| self.recording_dto(&r)))
     }
 
+    async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
+        let path: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
+                .bind(id.to_string())
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?
+                .flatten();
+        // Only report a path that actually points at a captured file.
+        Ok(path.filter(|p| !p.is_empty()))
+    }
+
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
         // Remove the file first (best-effort), then the row.
         let path: Option<String> =

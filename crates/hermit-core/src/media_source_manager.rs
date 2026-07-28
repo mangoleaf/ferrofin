@@ -808,6 +808,9 @@ mod tests {
         ) -> Result<Option<hermit_model::dto::BaseItemDto>, ServiceError> {
             Ok(None)
         }
+        async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
         async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
