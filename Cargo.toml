@@ -94,6 +94,7 @@ utoipa = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
+libc = "0.2"
 argon2 = "0.5"
 pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)

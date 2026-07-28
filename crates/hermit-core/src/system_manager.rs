@@ -84,44 +84,91 @@ pub trait LifecycleController: Send + Sync {
 /// Probes a folder's storage usage.
 ///
 /// A seam over the OS free-/used-space query (C# `StorageHelper.GetFreeSpaceOf`)
-/// so storage-info assembly is testable. The default [`FsStorageProbe`] returns
-/// zeroed usage (portable free-space querying is a `hermit-server` concern); the
-/// resolved path is still surfaced.
+/// so storage-info assembly is testable. The default [`FsStorageProbe`] queries
+/// the real filesystem via `statvfs` on unix.
 pub trait StorageProbe: Send + Sync {
     /// Returns the storage info for `path` (resolved path, free/used bytes).
     fn probe(&self, path: &str) -> FolderStorageInfo;
 }
 
-/// The default storage probe: reports the path with zeroed usage.
+/// The default storage probe: reports the path with the free/used bytes of the
+/// filesystem it lives on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FsStorageProbe;
 
 impl StorageProbe for FsStorageProbe {
     fn probe(&self, path: &str) -> FolderStorageInfo {
+        let resolved_path = std::fs::canonicalize(path)
+            .map_or_else(|_| path.to_owned(), |p| p.to_string_lossy().into_owned());
+        let (free_space, used_space) = disk_usage(&resolved_path);
         FolderStorageInfo {
             path: path.to_owned(),
-            resolved_path: std::fs::canonicalize(path)
-                .map_or_else(|_| path.to_owned(), |p| p.to_string_lossy().into_owned()),
+            resolved_path,
+            free_space,
+            used_space,
             ..Default::default()
         }
     }
 }
 
+/// Returns `(free_space, used_space)` in bytes for the filesystem containing
+/// `path`, mirroring C# `DriveInfo` (free = space available to unprivileged
+/// callers; used = total − total-free). Both are `0` if the query fails.
+#[cfg(unix)]
+fn disk_usage(path: &str) -> (i64, i64) {
+    use std::os::unix::ffi::OsStrExt;
+    // A configured folder may not exist on disk yet (e.g. the log dir before the
+    // first write); walk up to the nearest existing ancestor so we still report
+    // the containing filesystem, as C# `DriveInfo` does.
+    let mut current = Some(std::path::Path::new(path));
+    while let Some(dir) = current {
+        let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return (0, 0);
+        };
+        // SAFETY: `stat` is written by `statvfs` before we read it; `c_path` is a
+        // valid NUL-terminated C string that outlives the call.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::from_mut(&mut stat)) } == 0 {
+            let block = i128::from(stat.f_frsize);
+            let bytes = |blocks: u64| -> i64 {
+                i64::try_from(i128::from(blocks) * block).unwrap_or(i64::MAX)
+            };
+            let free = bytes(stat.f_bavail);
+            let used = bytes(stat.f_blocks.saturating_sub(stat.f_bfree));
+            return (free, used);
+        }
+        current = dir.parent();
+    }
+    (0, 0)
+}
+
+/// Non-unix fallback: no portable `statvfs`, so usage is unknown.
+///
+// ponytail: Windows would use `GetDiskFreeSpaceExW`; add it if a Windows build
+// ships. The user's server is unix, where this is real.
+#[cfg(not(unix))]
+fn disk_usage(_path: &str) -> (i64, i64) {
+    (0, 0)
+}
+
 /// Supplies the per-library storage folders.
 ///
-/// Stands in for `ILibraryManager.GetVirtualFolders()` (the library manager is
-/// out of this unit's scope). The default [`NoLibraries`] reports none.
+/// Stands in for `ILibraryManager.GetVirtualFolders()`. Async because the real
+/// provider reads the virtual folders from disk; the default [`NoLibraries`]
+/// reports none.
+#[async_trait]
 pub trait LibraryStorageProvider: Send + Sync {
     /// The libraries and their on-disk locations, as `(id, name, paths)`.
-    fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)>;
+    async fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)>;
 }
 
 /// A [`LibraryStorageProvider`] that reports no libraries.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoLibraries;
 
+#[async_trait]
 impl LibraryStorageProvider for NoLibraries {
-    fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)> {
+    async fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)> {
         Vec::new()
     }
 }
@@ -284,6 +331,7 @@ impl hermit_traits::system::SystemManager for HermitSystemManager {
         let libraries = self
             .library_storage
             .libraries()
+            .await
             .into_iter()
             .map(|(id, name, folders)| LibraryStorageInfo {
                 id,
@@ -426,5 +474,16 @@ mod tests {
         assert_eq!(storage.cache_folder.used_space, 50);
         assert!(storage.libraries.is_empty());
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
+    }
+
+    // The real filesystem probe reports the live free/used bytes of the disk the
+    // path is on — a booted server no longer shows every folder as 0 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn fs_probe_reports_real_disk_usage() {
+        let dir = std::env::temp_dir();
+        let info = FsStorageProbe.probe(&dir.to_string_lossy());
+        assert!(info.free_space > 0, "free space should be non-zero");
+        assert!(info.used_space > 0, "used space should be non-zero");
     }
 }

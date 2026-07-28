@@ -1071,6 +1071,7 @@ dependencies = [
  "hermit-naming",
  "hermit-providers",
  "hermit-traits",
+ "libc",
  "reqwest",
  "rstest",
  "serde",

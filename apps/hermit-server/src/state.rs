@@ -125,6 +125,30 @@ impl LifecycleController for HermitLifecycleController {
     }
 }
 
+/// Adapts the [`VirtualFolderManager`](hermit_traits::library::VirtualFolderManager)
+/// to the system manager's [`LibraryStorageProvider`] seam, so the storage page
+/// reports each library folder's real disk usage.
+struct VirtualFolderStorage(Arc<dyn hermit_traits::library::VirtualFolderManager>);
+
+#[async_trait::async_trait]
+impl hermit_core::system_manager::LibraryStorageProvider for VirtualFolderStorage {
+    async fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)> {
+        self.0
+            .get_virtual_folders()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|vf| {
+                let id = vf
+                    .item_id
+                    .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                    .unwrap_or_default();
+                (id, vf.name.unwrap_or_default(), vf.locations)
+            })
+            .collect()
+    }
+}
+
 /// Assembles every concrete manager over `db` + `config` and returns the wired
 /// [`AppState`].
 ///
@@ -495,22 +519,25 @@ pub async fn build_app_state(
 
     let lifecycle: Arc<dyn LifecycleController> =
         Arc::new(HermitLifecycleController::new(shutdown));
-    let system: Arc<dyn hermit_traits::system::SystemManager> = Arc::new(HermitSystemManager::new(
-        Arc::clone(&app_host_trait),
-        Arc::clone(&config_trait),
-        Arc::clone(&paths),
-        Arc::clone(&lifecycle),
-        SystemHostFacts {
-            // Report the emulated Jellyfin API version (clients gate on this), not
-            // Hermit's own crate version — see JELLYFIN_API_VERSION.
-            version: Some(JELLYFIN_API_VERSION.to_owned()),
-            product_name: Some(PRODUCT_NAME.to_owned()),
-            system_id: Some(server_id.clone()),
-            package_name: Some(PACKAGE_NAME.to_owned()),
-            transcoding_temp_path: None,
-            completed_installations: Vec::new(),
-        },
-    ));
+    let system: Arc<dyn hermit_traits::system::SystemManager> = Arc::new(
+        HermitSystemManager::new(
+            Arc::clone(&app_host_trait),
+            Arc::clone(&config_trait),
+            Arc::clone(&paths),
+            Arc::clone(&lifecycle),
+            SystemHostFacts {
+                // Report the emulated Jellyfin API version (clients gate on this), not
+                // Hermit's own crate version — see JELLYFIN_API_VERSION.
+                version: Some(JELLYFIN_API_VERSION.to_owned()),
+                product_name: Some(PRODUCT_NAME.to_owned()),
+                system_id: Some(server_id.clone()),
+                package_name: Some(PACKAGE_NAME.to_owned()),
+                transcoding_temp_path: None,
+                completed_installations: Vec::new(),
+            },
+        )
+        .with_library_storage(Arc::new(VirtualFolderStorage(Arc::clone(&virtual_folders)))),
+    );
 
     // The auth service wraps an owned concrete authorization context, so build
     // that concrete value, clone it into the service, and box the other for the
