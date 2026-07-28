@@ -76,8 +76,8 @@ pub fn registered_plugins(extensions: &[Arc<dyn Extension>]) -> Vec<RegisteredPl
     extensions
         .iter()
         .map(|ext| {
-            let mut plugin =
-                RegisteredPlugin::new(ext.descriptor(), None).with_default_config(ext.default_config());
+            let mut plugin = RegisteredPlugin::new(ext.descriptor(), None)
+                .with_default_config(ext.default_config());
             if let Some((name, html)) = ext.config_page() {
                 plugin = plugin.with_config_page(name, html);
             }
