@@ -815,28 +815,34 @@ async fn subtitle_upload_bad_base64_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-// ---- Intentionally-deferred routes stay on the 501 stub --------------------
+// ---- The Intro Skipper plugin SegmentEditor route is now implemented --------
 
 #[tokio::test]
-async fn deferred_routes_still_return_501() {
+async fn plugin_segment_editor_route_is_implemented() {
     let app = state(
         Arc::new(FakeMediaSegments),
         Arc::new(FakeTrickplay),
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    // The plugin SegmentEditor routes remain unimplemented (they need the plugin
-    // host). On-the-fly subtitle conversion, the HLS subtitle playlist, and the
-    // FallbackFont routes are now real (see `batch5_handlers`).
-    for (method, uri) in [
-        // The plugin SegmentEditor create route (POST-only in the contract).
-        ("POST", format!("/MediaSegmentsApi/{ITEM_ID}")),
-    ] {
-        let (status, _) = call(app.clone(), method, &uri).await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_IMPLEMENTED,
-            "expected 501 for deferred route {method} {uri}"
-        );
-    }
+    // The Intro Skipper SegmentEditor create route (`POST /MediaSegmentsApi/{id}`)
+    // used to sit on the 501 stub; it is now a real handler (see
+    // `handlers::intro_skipper`). Target an unknown item so the handler resolves
+    // it to `404` up front — proving the route is implemented (not `501`) without
+    // reaching the fake segment store.
+    let unknown = Uuid::from_u128(0x00B1_DEAD);
+    let (status, _) = call_with_body(
+        app,
+        "POST",
+        &format!("/MediaSegmentsApi/{unknown}?providerId=IntroSkipper"),
+        Body::from(r#"{"Type":"Intro","StartTicks":0,"EndTicks":100}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "SegmentEditor route should be implemented, not 501"
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown item should be 404");
 }

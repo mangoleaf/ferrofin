@@ -63,6 +63,7 @@ pub mod hls;
 pub(crate) mod image_upload;
 pub mod images;
 pub mod instant_mix;
+pub mod intro_skipper;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
@@ -660,6 +661,29 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/SyncPlay/SetRepeatMode"),
     ("post", "/SyncPlay/SetShuffleMode"),
     ("post", "/SyncPlay/Ping"),
+    // Intro Skipper extension — the plugin's five controllers plus the
+    // FileTransformation registration hook it depends on. See
+    // `handlers::intro_skipper`. Paths are the contract-canonical forms
+    // (`/MediaSegmentsApi/{segmentId}` canonicalizes to `{itemId}`).
+    ("get", "/Episode/{Id}/Timestamps"),
+    ("post", "/Episode/{Id}/Timestamps"),
+    ("get", "/Episode/{Id}/IntroSkipperSegments"),
+    ("post", "/Intros/EraseTimestamps"),
+    ("post", "/Intros/RebuildDatabase"),
+    ("get", "/MediaSegmentsApi"),
+    ("post", "/MediaSegmentsApi/{itemId}"),
+    ("delete", "/MediaSegmentsApi/{itemId}"),
+    ("post", "/SkipButtonCss/InjectCss"),
+    ("post", "/SkipButtonCss/UpdateSkipDuration"),
+    ("get", "/IntroSkipper"),
+    ("get", "/IntroSkipper/SupportBundle"),
+    ("get", "/Intros/AnalyzerActions/{SeasonId}"),
+    ("post", "/Intros/AnalyzerActions/UpdateSeason"),
+    ("get", "/Intros/Show/{SeriesId}/{SeasonId}"),
+    ("delete", "/Intros/Show/{SeriesId}/{SeasonId}"),
+    ("post", "/Intros/ScanSeason/{SeriesId}/{SeasonId}"),
+    ("get", "/Intros/ScanStatus"),
+    ("post", "/FileTransformation/RegisterTransformation"),
 ];
 
 /// Mounts every real First-Light handler onto `router`, overriding the matching
@@ -686,6 +710,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = filter::register(router);
     let router = suggestions::register(router);
     let router = instant_mix::register(router);
+    let router = intro_skipper::register(router);
     let router = movies::register(router);
     let router = trailers::register(router);
     let router = user_library::register(router);

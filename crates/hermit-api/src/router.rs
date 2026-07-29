@@ -104,14 +104,17 @@ mod tests {
 
     #[tokio::test]
     async fn stubbed_route_returns_501_not_404() {
-        // A contract route with no ported handler still returns `501` (not
-        // `404`). `/IntroSkipper` is a third-party-plugin route (not core
-        // Jellyfin) registered on the shared stub.
-        let router = create_router(fake_state());
+        // Every vendored contract route now has a real handler, so the shared
+        // stub no longer fronts any live route. The stub *mechanism* still
+        // guards any future un-ported contract path — it must map to `501`
+        // (not `404`), so exercise `not_implemented` directly.
+        use crate::routes::not_implemented;
+        use axum::routing::get;
+        let router: axum::Router = axum::Router::new().route("/_unported", get(not_implemented));
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/IntroSkipper")
+                    .uri("/_unported")
                     .body(Body::empty())
                     .unwrap(),
             )
