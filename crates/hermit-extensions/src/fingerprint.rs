@@ -78,7 +78,15 @@ impl Fingerprinter for FpcalcFingerprinter {
                 ],
             )
             .await?;
-            let out = run(&self.fpcalc, &["-raw", &tmp_path]).await?;
+            // `-length` is required here too: fpcalc's default analysis length
+            // is 120 s, which silently truncated the credits window to its
+            // first two minutes — usually the final scene, not the credits —
+            // and gutted the credits detection rate.
+            let out = run(
+                &self.fpcalc,
+                &["-raw", "-length", &format!("{length:.0}"), &tmp_path],
+            )
+            .await?;
             parse_fpcalc(&out)
         }
     }

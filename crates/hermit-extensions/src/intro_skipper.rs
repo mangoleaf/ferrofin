@@ -776,11 +776,15 @@ fn to_episode(row: &BaseItemEntity) -> Option<Episode> {
     })
 }
 
-/// A short filename tag for an analysis mode.
+/// A short filename tag for an analysis mode (part of the fingerprint-cache
+/// key).
 fn mode_tag(mode: AnalysisMode) -> &'static str {
     match mode {
         AnalysisMode::Introduction => "intro",
-        AnalysisMode::Credits => "credits",
+        // "credits2": the v1 cache was fingerprinted under fpcalc's default
+        // 120 s `-length` cap (a truncated tail window); the tag bump orphans
+        // those files so a re-run re-fingerprints the full window.
+        AnalysisMode::Credits => "credits2",
         AnalysisMode::Recap => "recap",
     }
 }
