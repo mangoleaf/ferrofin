@@ -3,87 +3,281 @@
 <head>
     <meta charset="utf-8" />
     <title>Intro Skipper</title>
+    <style>
+        .introSkipperTabs { display: flex; flex-wrap: wrap; gap: .25em; margin: 1em 0; border-bottom: 1px solid rgba(128,128,128,.3); }
+        .introSkipperTabs .isTabButton { background: transparent; border: none; border-bottom: 2px solid transparent; color: inherit; padding: .6em 1em; cursor: pointer; font-size: 1em; opacity: .7; }
+        .introSkipperTabs .isTabButton.isActive { opacity: 1; border-bottom-color: currentColor; font-weight: 600; }
+        .introSkipperTab { display: none; }
+        .introSkipperTab.isActive { display: block; }
+        .isResetButton { margin-left: .5em; }
+        .isStorageRow { margin: .75em 0; }
+        .isStorageBar { height: .5em; border-radius: .25em; background: rgba(128,128,128,.3); overflow: hidden; margin: .25em 0; }
+        .isStorageBarFill { height: 100%; }
+    </style>
 </head>
 <body>
 <div id="IntroSkipperConfigPage" data-role="page" class="page type-interior pluginConfigurationPage"
-     data-require="emby-input,emby-button,emby-checkbox">
+     data-require="emby-input,emby-button,emby-checkbox,emby-select">
     <div data-role="content">
         <div class="content-primary">
+            <h1>Intro Skipper</h1>
+
+            <div class="introSkipperTabs">
+                <button type="button" class="isTabButton isActive" data-tab="general">General</button>
+                <button type="button" class="isTabButton" data-tab="analysis">Analysis</button>
+                <button type="button" class="isTabButton" data-tab="detection">Detection</button>
+                <button type="button" class="isTabButton" data-tab="blackframe">Black Frame</button>
+                <button type="button" class="isTabButton" data-tab="chapters">Chapters</button>
+                <button type="button" class="isTabButton" data-tab="ffmpeg">FFmpeg</button>
+                <button type="button" class="isTabButton" data-tab="timestamps">Timestamps</button>
+                <button type="button" class="isTabButton" data-tab="tools">Tools</button>
+                <button type="button" class="isTabButton" data-tab="information">Information</button>
+            </div>
+
             <form id="IntroSkipperConfigForm">
-                <div class="verticalSection">
-                    <h2 class="sectionTitle">Intro Skipper</h2>
-                    <p>
-                        Detects TV episode intros and end credits by audio fingerprinting and exposes
-                        them as media segments, so clients show <strong>Skip Intro</strong> /
-                        <strong>Skip Credits</strong>. After changing settings, run the
-                        <em>Detect intros and credits</em> scheduled task to re-analyze.
+
+                <!-- ============================ GENERAL ============================ -->
+                <div class="introSkipperTab isActive" data-tab="general">
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="Enabled" /><span>Enable Intro Skipper</span></label>
+                        <div class="fieldDescription">When disabled, the detection task does nothing (existing segments are kept).</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="AutoDetectIntros" /><span>Automatically analyze new media</span></label>
+                        <div class="fieldDescription">Analyze newly added media for skippable segments when it is added to the library.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="ReanalyzeSettledSeasons" /><span>Re-analyze settled seasons</span></label>
+                        <div class="fieldDescription">When a season has had no new episodes for the configured delay, re-analyze it against the full season (uses cached fingerprints).</div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="SettledSeasonDelayHours">Settled season delay (hours)</label>
+                        <input is="emby-input" type="number" id="SettledSeasonDelayHours" min="0" max="87600" step="1" />
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="UpdateMediaSegments" /><span>Update missing segments during a library scan</span></label>
+                        <div class="fieldDescription">Disable this if you use media-segment providers other than Intro Skipper.</div>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h3 class="checkboxListLabel">Analyze for</h3>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ScanIntroduction" /><span>Introduction</span></label></div>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ScanCredits" /><span>Credits</span></label></div>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ScanRecap" /><span>Recap</span></label></div>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ScanPreview" /><span>Preview</span></label></div>
+                        <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="ScanCommercial" /><span>Commercials</span></label></div>
+                    </div>
+
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="AnalyzeSeasonZero" /><span>Analyze Season 0 (specials / extras)</span></label>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="UseFileTransformationPlugin" /><span>Use the File Transformation plugin to patch the web interface</span></label>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="SkipbuttonHideDelay">Skip button hide delay (seconds, 0 = never)</label>
+                        <input is="emby-input" type="number" id="SkipbuttonHideDelay" min="0" max="1000" step="1" />
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="EnableMainMenu" /><span>Show Intro Skipper in the main menu</span></label>
+                    </div>
+
+                    <div class="verticalSection">
+                        <h3 class="checkboxListLabel">Exclusions</h3>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="SeriesExclusions">Excluded series (one per line)</label>
+                            <textarea is="emby-input" id="SeriesExclusions" rows="3"></textarea>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="MovieExclusions">Excluded movies (one per line)</label>
+                            <textarea is="emby-input" id="MovieExclusions" rows="3"></textarea>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="PathExclusions">Excluded paths (one per line)</label>
+                            <textarea is="emby-input" id="PathExclusions" rows="3"></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ============================ ANALYSIS ============================ -->
+                <div class="introSkipperTab" data-tab="analysis">
+                    <p class="fieldDescription">
+                        The amount analyzed is the minimum of (duration &times; percent) and the maximum runtime.
+                        Changing the percent or runtime requires regenerating cached fingerprints and timestamps.
                     </p>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="PreferChromaprint" /><span>Prefer Chromaprint analysis</span></label>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="FullLengthChapters" /><span>Ignore duration limits for chapters</span></label>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="CacheFingerprints" /><span>Cache fingerprints between runs</span></label>
+                    </div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="AnalysisPercent">Percent of media to analyze (1&ndash;50)</label><input is="emby-input" type="number" id="AnalysisPercent" min="1" max="50" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="AnalysisLengthLimit">Maximum runtime to analyze (minutes)</label><input is="emby-input" type="number" id="AnalysisLengthLimit" min="1" step="1" /></div>
+
+                    <h3 class="checkboxListLabel">Durations (seconds)</h3>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumIntroDuration">Minimum introduction</label><input is="emby-input" type="number" id="MinimumIntroDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumIntroDuration">Maximum introduction</label><input is="emby-input" type="number" id="MaximumIntroDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumCreditsDuration">Minimum credits</label><input is="emby-input" type="number" id="MinimumCreditsDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumCreditsDuration">Maximum credits</label><input is="emby-input" type="number" id="MaximumCreditsDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumMovieCreditsDuration">Maximum movie credits</label><input is="emby-input" type="number" id="MaximumMovieCreditsDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumRecapDuration">Minimum recap</label><input is="emby-input" type="number" id="MinimumRecapDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumRecapDuration">Maximum recap</label><input is="emby-input" type="number" id="MaximumRecapDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumRecapDetectionDuration">Minimum detected recap</label><input is="emby-input" type="number" id="MinimumRecapDetectionDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumRecapDetectionDuration">Maximum detected recap</label><input is="emby-input" type="number" id="MaximumRecapDetectionDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumPreviewDuration">Minimum preview</label><input is="emby-input" type="number" id="MinimumPreviewDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumPreviewDuration">Maximum preview</label><input is="emby-input" type="number" id="MaximumPreviewDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MinimumCommercialDuration">Minimum commercial</label><input is="emby-input" type="number" id="MinimumCommercialDuration" min="1" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumCommercialDuration">Maximum commercial</label><input is="emby-input" type="number" id="MaximumCommercialDuration" min="1" step="1" /></div>
+
+                    <details class="verticalSection">
+                        <summary>Advanced matching</summary>
+                        <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumFingerprintPointDifferences">Maximum fingerprint point differences (bits, 0&ndash;32)</label><input is="emby-input" type="number" id="MaximumFingerprintPointDifferences" min="0" max="32" step="1" /></div>
+                        <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaximumTimeSkip">Maximum time skip (seconds)</label><input is="emby-input" type="number" id="MaximumTimeSkip" min="0" step="0.1" /></div>
+                        <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="InvertedIndexShift">Inverted index shift</label><input is="emby-input" type="number" id="InvertedIndexShift" min="0" step="1" /></div>
+                    </details>
                 </div>
 
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="Enabled" />
-                        <span>Enable Intro Skipper</span>
-                    </label>
-                    <div class="fieldDescription">
-                        When disabled, the detection task does nothing (existing segments are kept).
+                <!-- ============================ DETECTION ============================ -->
+                <div class="introSkipperTab" data-tab="detection">
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="AdjustIntroBasedOnSilence" /><span>Enable silence detection</span></label>
+                        <div class="fieldDescription">Adjust segment endpoints to the nearest silence point.</div>
+                    </div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="SilenceDetectionMaximumNoise">Noise tolerance (negative dB)</label><input is="emby-input" type="number" id="SilenceDetectionMaximumNoise" min="-90" max="0" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="SilenceDetectionMinimumDuration">Minimum silence duration (seconds)</label><input is="emby-input" type="number" id="SilenceDetectionMinimumDuration" min="0" step="0.01" /></div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="SnapToKeyframe" /><span>Enable keyframe snapping</span></label>
+                        <div class="fieldDescription">Adjust segment endpoints to the nearest video keyframe for smoother skips.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="AdjustIntroBasedOnChapters" /><span>Enable chapter snapping</span></label>
+                        <div class="fieldDescription">Adjust segment start/end to the nearest chapter boundary.</div>
+                    </div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="AdjustWindowInward">Adjustment window inward (seconds)</label><input is="emby-input" type="number" id="AdjustWindowInward" min="0" step="0.5" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="AdjustWindowOutward">Adjustment window outward (seconds)</label><input is="emby-input" type="number" id="AdjustWindowOutward" min="0" step="0.5" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="EndSnapThreshold">Snap to episode start/end threshold (seconds, 0 = off)</label><input is="emby-input" type="number" id="EndSnapThreshold" min="0" step="0.5" /></div>
+                    <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="SkipFirstEpisode" /><span>Ignore intros for the first episode of a season</span></label></div>
+                    <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="SkipFirstEpisodeAnime" /><span>Only ignore the first episode of an anime season</span></label></div>
+                    <div class="checkboxContainer"><label><input is="emby-checkbox" type="checkbox" id="AnimePreviewFromCreditsEnd" /><span>Set after-credits scene as preview for anime</span></label></div>
+                    <h3 class="checkboxListLabel">Segment offsets (seconds)</h3>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="IntroStartOffset">Intro start offset (play this long before skipping)</label><input is="emby-input" type="number" id="IntroStartOffset" min="0" step="0.5" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="IntroEndOffset">Intro end offset (resume this long before the end)</label><input is="emby-input" type="number" id="IntroEndOffset" min="0" step="0.5" /></div>
+                </div>
+
+                <!-- ============================ BLACK FRAME ============================ -->
+                <div class="introSkipperTab" data-tab="blackframe">
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="DetectRecapUsingBlackFrames" /><span>Detect recap using black frames</span></label>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="UseAlternativeBlackFrameAnalyzer" /><span>Use the alternative black-frame analyzer (experimental)</span></label>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="RefineCreditsBoundary" /><span>Refine credits boundary</span></label>
+                        <div class="fieldDescription">Frame-level analysis of the exact credits boundary (alternative analyzer).</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="DetectNonBlackCredits" /><span>Detect non-black credits</span></label>
+                        <div class="fieldDescription">Also detect credits over a near-uniform card (black/white/grey/muted).</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="UseChapterMarkersBlackFrame" /><span>Use chapter markers for credits detection</span></label>
+                    </div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="BlackFrameMinimumPercentage">Minimum percentage of black pixels</label><input is="emby-input" type="number" id="BlackFrameMinimumPercentage" min="0" max="100" step="1" /></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="BlackFrameThreshold">Black frame threshold (luma)</label><input is="emby-input" type="number" id="BlackFrameThreshold" min="16" max="255" step="1" /></div>
+                </div>
+
+                <!-- ============================ CHAPTERS ============================ -->
+                <div class="introSkipperTab" data-tab="chapters">
+                    <p class="fieldDescription">Regular expressions used to identify chapter titles.</p>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ChapterAnalyzerIntroductionPattern">Introductions</label><input is="emby-input" type="text" id="ChapterAnalyzerIntroductionPattern" /><button type="button" is="emby-button" class="isResetButton raised" data-reset="ChapterAnalyzerIntroductionPattern"><span>Reset</span></button></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ChapterAnalyzerEndCreditsPattern">Credits</label><input is="emby-input" type="text" id="ChapterAnalyzerEndCreditsPattern" /><button type="button" is="emby-button" class="isResetButton raised" data-reset="ChapterAnalyzerEndCreditsPattern"><span>Reset</span></button></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ChapterAnalyzerPreviewPattern">Preview</label><input is="emby-input" type="text" id="ChapterAnalyzerPreviewPattern" /><button type="button" is="emby-button" class="isResetButton raised" data-reset="ChapterAnalyzerPreviewPattern"><span>Reset</span></button></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ChapterAnalyzerRecapPattern">Recaps</label><input is="emby-input" type="text" id="ChapterAnalyzerRecapPattern" /><button type="button" is="emby-button" class="isResetButton raised" data-reset="ChapterAnalyzerRecapPattern"><span>Reset</span></button></div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ChapterAnalyzerCommercialPattern">Commercials</label><input is="emby-input" type="text" id="ChapterAnalyzerCommercialPattern" /><button type="button" is="emby-button" class="isResetButton raised" data-reset="ChapterAnalyzerCommercialPattern"><span>Reset</span></button></div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="EnableSponsorBlockChapterDetection" /><span>Enable SponsorBlock chapter detection</span></label>
                     </div>
                 </div>
 
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="DetectIntros" />
-                        <span>Detect intros</span>
-                    </label>
-                </div>
-                <div class="checkboxContainer checkboxContainer-withDescription">
-                    <label>
-                        <input is="emby-checkbox" type="checkbox" id="DetectCredits" />
-                        <span>Detect end credits</span>
-                    </label>
+                <!-- ============================ FFMPEG ============================ -->
+                <div class="introSkipperTab" data-tab="ffmpeg">
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="MaxParallelism">Maximum degree of parallelism</label><input is="emby-input" type="number" id="MaxParallelism" min="1" step="1" /></div>
+                    <div class="selectContainer">
+                        <label class="selectLabel" for="ProcessPriority">FFmpeg priority</label>
+                        <select is="emby-select" id="ProcessPriority" class="emby-select">
+                            <option value="Idle">Idle</option>
+                            <option value="BelowNormal">Below Normal</option>
+                            <option value="Normal">Normal</option>
+                            <option value="AboveNormal">Above Normal</option>
+                            <option value="High">High</option>
+                            <option value="RealTime">Highest</option>
+                        </select>
+                    </div>
+                    <div class="inputContainer"><label class="inputLabel inputLabelUnfocused" for="ProcessThreads">FFmpeg threads (0 = auto)</label><input is="emby-input" type="number" id="ProcessThreads" min="0" max="16" step="1" /></div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label><input is="emby-checkbox" type="checkbox" id="ProbeAudioDuration" /><span>Probe audio duration for credits</span></label>
+                    </div>
+                    <div class="selectContainer">
+                        <label class="selectLabel" for="CacheCompressionLevel">Cache compression level</label>
+                        <select is="emby-select" id="CacheCompressionLevel" class="emby-select">
+                            <option value="NoCompression">No Compression</option>
+                            <option value="Fastest">Fastest</option>
+                            <option value="Optimal">Optimal</option>
+                            <option value="SmallestSize">Smallest Size</option>
+                        </select>
+                    </div>
                 </div>
 
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="MinimumIntroDuration">Minimum intro duration (seconds)</label>
-                    <input is="emby-input" type="number" id="MinimumIntroDuration" min="1" step="1" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="MaximumIntroDuration">Maximum intro duration (seconds)</label>
-                    <input is="emby-input" type="number" id="MaximumIntroDuration" min="1" step="1" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="MinimumCreditsDuration">Minimum credits duration (seconds)</label>
-                    <input is="emby-input" type="number" id="MinimumCreditsDuration" min="1" step="1" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="MaximumCreditsDuration">Maximum credits duration (seconds)</label>
-                    <input is="emby-input" type="number" id="MaximumCreditsDuration" min="1" step="1" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="AnalysisPercent">Intro search window (% of episode from the start)</label>
-                    <input is="emby-input" type="number" id="AnalysisPercent" min="1" max="100" step="1" />
-                </div>
-                <div class="inputContainer">
-                    <label class="inputLabel inputLabelUnfocused" for="AnalysisLengthLimit">Intro search window cap (minutes)</label>
-                    <input is="emby-input" type="number" id="AnalysisLengthLimit" min="1" step="1" />
+                <!-- ============================ TIMESTAMPS ============================ -->
+                <div class="introSkipperTab" data-tab="timestamps">
+                    <p class="fieldDescription">
+                        Detected timestamps are stored as media segments. Any client that reads media
+                        segments shows the Skip Intro / Skip Credits buttons automatically. To view an
+                        episode's detected segments, use the item's details or the
+                        <code>/MediaSegments/{itemId}</code> endpoint.
+                    </p>
+                    <button type="button" is="emby-button" id="RunDetectionTimestamps" class="raised block"><span>Run detection now</span></button>
+                    <div id="RunDetectionTimestampsStatus" class="fieldDescription"></div>
                 </div>
 
-                <details class="verticalSection">
-                    <summary>Advanced matching</summary>
-                    <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="MaximumFingerprintPointDifferences">Maximum fingerprint point differences (bits, 0–32)</label>
-                        <input is="emby-input" type="number" id="MaximumFingerprintPointDifferences" min="0" max="32" step="1" />
-                    </div>
-                    <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="MaximumTimeSkip">Maximum time skip (seconds)</label>
-                        <input is="emby-input" type="number" id="MaximumTimeSkip" min="0" step="0.1" />
-                    </div>
-                    <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="InvertedIndexShift">Inverted index shift</label>
-                        <input is="emby-input" type="number" id="InvertedIndexShift" min="0" step="1" />
-                    </div>
-                </details>
+                <!-- ============================ TOOLS ============================ -->
+                <div class="introSkipperTab" data-tab="tools">
+                    <h3 class="checkboxListLabel">Run analysis</h3>
+                    <p class="fieldDescription">Fingerprints every season and writes intro/credit segments in the background.</p>
+                    <button type="button" is="emby-button" id="RunDetectionTools" class="raised block"><span>Run detection now</span></button>
+                    <div id="RunDetectionToolsStatus" class="fieldDescription"></div>
 
+                    <h3 class="checkboxListLabel">Erase timestamps</h3>
+                    <p class="fieldDescription">Deletes all Intro Skipper segments of the selected type across the library. Existing media stays; re-run detection to recreate.</p>
+                    <div class="selectContainer">
+                        <label class="selectLabel" for="EraseType">Segment type</label>
+                        <select is="emby-select" id="EraseType" class="emby-select">
+                            <option value="Intro">Introduction</option>
+                            <option value="Outro">Credits</option>
+                            <option value="Recap">Recap</option>
+                            <option value="Preview">Preview</option>
+                            <option value="Commercial">Commercials</option>
+                        </select>
+                    </div>
+                    <button type="button" is="emby-button" id="EraseTimestamps" class="raised block button-cancel"><span>Erase all timestamps of this type</span></button>
+                    <div id="EraseTimestampsStatus" class="fieldDescription"></div>
+                </div>
+
+                <!-- ============================ INFORMATION ============================ -->
+                <div class="introSkipperTab" data-tab="information">
+                    <h3 class="checkboxListLabel">Support information</h3>
+                    <textarea is="emby-input" id="SupportInfo" rows="8" readonly></textarea>
+                    <button type="button" is="emby-button" id="CopySupportInfo" class="raised"><span>Copy to clipboard</span></button>
+
+                    <h3 class="checkboxListLabel">Storage usage</h3>
+                    <div id="StorageUsage"></div>
+                </div>
+
+                <br />
                 <button is="emby-button" type="submit" class="raised button-submit block emby-button">
                     <span>Save</span>
                 </button>
@@ -96,40 +290,86 @@
             var pluginId = "1a7b05c1-5c1b-4d0e-9f00-1247a105c1de";
             var pluginVersion = "1.0.0";
             var page = document.querySelector('#IntroSkipperConfigPage');
-            // field id -> kind (the analysis config; the Enabled toggle is handled
-            // separately via the plugin enable/disable endpoints).
-            var fields = {
-                DetectIntros: 'bool',
-                DetectCredits: 'bool',
-                MinimumIntroDuration: 'number',
-                MaximumIntroDuration: 'number',
-                MinimumCreditsDuration: 'number',
-                MaximumCreditsDuration: 'number',
-                AnalysisPercent: 'number',
-                AnalysisLengthLimit: 'number',
-                MaximumFingerprintPointDifferences: 'number',
-                MaximumTimeSkip: 'number',
-                InvertedIndexShift: 'number'
-            };
 
-            // Reflect the plugin's enabled state (its /Plugins Status) in the toggle.
+            // Config field id -> kind. 'list' = textarea (one value per line).
+            var fields = {
+                AutoDetectIntros: 'bool', ReanalyzeSettledSeasons: 'bool', SettledSeasonDelayHours: 'number',
+                UpdateMediaSegments: 'bool', ScanIntroduction: 'bool', ScanCredits: 'bool', ScanRecap: 'bool',
+                ScanPreview: 'bool', ScanCommercial: 'bool', AnalyzeSeasonZero: 'bool',
+                UseFileTransformationPlugin: 'bool', SkipbuttonHideDelay: 'number', EnableMainMenu: 'bool',
+                SeriesExclusions: 'list', MovieExclusions: 'list', PathExclusions: 'list',
+                PreferChromaprint: 'bool', FullLengthChapters: 'bool', CacheFingerprints: 'bool',
+                AnalysisPercent: 'number', AnalysisLengthLimit: 'number',
+                MinimumIntroDuration: 'number', MaximumIntroDuration: 'number', MinimumCreditsDuration: 'number',
+                MaximumCreditsDuration: 'number', MaximumMovieCreditsDuration: 'number',
+                MinimumRecapDuration: 'number', MaximumRecapDuration: 'number',
+                MinimumRecapDetectionDuration: 'number', MaximumRecapDetectionDuration: 'number',
+                MinimumPreviewDuration: 'number', MaximumPreviewDuration: 'number',
+                MinimumCommercialDuration: 'number', MaximumCommercialDuration: 'number',
+                MaximumFingerprintPointDifferences: 'number', MaximumTimeSkip: 'number', InvertedIndexShift: 'number',
+                AdjustIntroBasedOnSilence: 'bool', SilenceDetectionMaximumNoise: 'number',
+                SilenceDetectionMinimumDuration: 'number', SnapToKeyframe: 'bool', AdjustIntroBasedOnChapters: 'bool',
+                AdjustWindowInward: 'number', AdjustWindowOutward: 'number', EndSnapThreshold: 'number',
+                SkipFirstEpisode: 'bool', SkipFirstEpisodeAnime: 'bool', AnimePreviewFromCreditsEnd: 'bool',
+                IntroStartOffset: 'number', IntroEndOffset: 'number',
+                DetectRecapUsingBlackFrames: 'bool', UseAlternativeBlackFrameAnalyzer: 'bool',
+                RefineCreditsBoundary: 'bool', DetectNonBlackCredits: 'bool', UseChapterMarkersBlackFrame: 'bool',
+                BlackFrameMinimumPercentage: 'number', BlackFrameThreshold: 'number',
+                ChapterAnalyzerIntroductionPattern: 'text', ChapterAnalyzerEndCreditsPattern: 'text',
+                ChapterAnalyzerPreviewPattern: 'text', ChapterAnalyzerRecapPattern: 'text',
+                ChapterAnalyzerCommercialPattern: 'text', EnableSponsorBlockChapterDetection: 'bool',
+                MaxParallelism: 'number', ProcessPriority: 'text', ProcessThreads: 'number',
+                ProbeAudioDuration: 'bool', CacheCompressionLevel: 'text'
+            };
+            var defaults = {};
+
+            // ---- tabs ----
+            page.querySelectorAll('.isTabButton').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var tab = btn.getAttribute('data-tab');
+                    page.querySelectorAll('.isTabButton').forEach(function (b) { b.classList.toggle('isActive', b === btn); });
+                    page.querySelectorAll('.introSkipperTab').forEach(function (c) {
+                        c.classList.toggle('isActive', c.getAttribute('data-tab') === tab);
+                    });
+                    if (tab === 'information') { loadInformation(); }
+                });
+            });
+
+            // ---- reset-to-default buttons (regex fields) ----
+            page.querySelectorAll('.isResetButton').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var key = btn.getAttribute('data-reset');
+                    if (defaults[key] !== undefined) { page.querySelector('#' + key).value = defaults[key]; }
+                });
+            });
+
+            function setField(key, kind, value) {
+                var el = page.querySelector('#' + key);
+                if (!el) { return; }
+                if (kind === 'bool') { el.checked = value === true; }
+                else if (kind === 'list') { el.value = (value || []).join('\n'); }
+                else { el.value = value; }
+            }
+            function readField(key, kind) {
+                var el = page.querySelector('#' + key);
+                if (!el) { return undefined; }
+                if (kind === 'bool') { return el.checked; }
+                if (kind === 'list') { return el.value.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { return s.length; }); }
+                if (kind === 'number') { var n = parseFloat(el.value); return isNaN(n) ? undefined : n; }
+                return el.value;
+            }
+
+            // ---- enable/disable (plugin status, not a config field) ----
             function loadEnabled() {
                 return ApiClient.getPlugins().then(function (plugins) {
                     var mine = (plugins || []).filter(function (p) { return p.Id === pluginId; })[0];
                     if (mine && mine.Version) { pluginVersion = mine.Version; }
                     page.querySelector('#Enabled').checked = mine ? mine.Status === 'Active' : true;
-                }).catch(function () {
-                    page.querySelector('#Enabled').checked = true;
-                });
+                }).catch(function () { page.querySelector('#Enabled').checked = true; });
             }
-
-            // Enable/disable the plugin to match the toggle.
             function saveEnabled() {
                 var action = page.querySelector('#Enabled').checked ? 'Enable' : 'Disable';
-                return ApiClient.ajax({
-                    type: 'POST',
-                    url: ApiClient.getUrl('Plugins/' + pluginId + '/' + pluginVersion + '/' + action)
-                });
+                return ApiClient.ajax({ type: 'POST', url: ApiClient.getUrl('Plugins/' + pluginId + '/' + pluginVersion + '/' + action) });
             }
 
             function loadConfig() {
@@ -138,18 +378,11 @@
                     loadEnabled(),
                     ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                         Object.keys(fields).forEach(function (key) {
-                            var el = page.querySelector('#' + key);
-                            if (!el) { return; }
-                            if (fields[key] === 'bool') {
-                                el.checked = config[key] === true;
-                            } else {
-                                el.value = config[key];
-                            }
+                            if (defaults[key] === undefined) { defaults[key] = config[key]; }
+                            setField(key, fields[key], config[key]);
                         });
                     })
-                ]).then(function () {
-                    Dashboard.hideLoadingMsg();
-                });
+                ]).then(function () { Dashboard.hideLoadingMsg(); });
             }
 
             function saveConfig(e) {
@@ -157,30 +390,88 @@
                 Dashboard.showLoadingMsg();
                 ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                     Object.keys(fields).forEach(function (key) {
-                        var el = page.querySelector('#' + key);
-                        if (!el) { return; }
-                        if (fields[key] === 'bool') {
-                            config[key] = el.checked;
-                        } else {
-                            var value = parseFloat(el.value);
-                            if (!isNaN(value)) { config[key] = value; }
-                        }
+                        var v = readField(key, fields[key]);
+                        if (v !== undefined) { config[key] = v; }
                     });
                     ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
-                        saveEnabled().then(function () {
-                            Dashboard.processPluginConfigurationUpdateResult(result);
-                        });
+                        saveEnabled().then(function () { Dashboard.processPluginConfigurationUpdateResult(result); });
                     });
                 });
                 return false;
             }
 
-            // jellyfin-web fires 'viewshow' when the config view is shown; older
-            // clients use 'pageshow'. Load on either.
+            // ---- Tools / Timestamps: run the detection task ----
+            function runDetection(statusId) {
+                var status = page.querySelector('#' + statusId);
+                status.textContent = 'Starting detection...';
+                ApiClient.ajax({ type: 'POST', url: ApiClient.getUrl('ScheduledTasks/Running/IntroSkipper.Detect') })
+                    .then(function () { status.textContent = 'Detection started. Segments appear as it runs.'; })
+                    .catch(function () { status.textContent = 'Could not start detection.'; });
+            }
+            page.querySelector('#RunDetectionTools').addEventListener('click', function () { runDetection('RunDetectionToolsStatus'); });
+            page.querySelector('#RunDetectionTimestamps').addEventListener('click', function () { runDetection('RunDetectionTimestampsStatus'); });
+
+            // ---- Tools: erase all Intro Skipper segments of a type ----
+            page.querySelector('#EraseTimestamps').addEventListener('click', function () {
+                var type = page.querySelector('#EraseType').value;
+                var status = page.querySelector('#EraseTimestampsStatus');
+                var run = function () {
+                    status.textContent = 'Erasing...';
+                    ApiClient.ajax({ type: 'DELETE', url: ApiClient.getUrl('MediaSegments/Provider/IntroSkipper', { type: type }) })
+                        .then(function () { status.textContent = 'Erased all ' + type + ' segments.'; })
+                        .catch(function () { status.textContent = 'Erase failed (endpoint unavailable).'; });
+                };
+                if (window.Dashboard && Dashboard.confirm) {
+                    Dashboard.confirm('Erase all ' + type + ' segments created by Intro Skipper?', 'Erase timestamps', function (ok) { if (ok) { run(); } });
+                } else if (confirm('Erase all ' + type + ' segments created by Intro Skipper?')) { run(); }
+            });
+
+            // ---- Information ----
+            function formatBytes(n) {
+                if (!n || n < 0) { return '?'; }
+                var u = ['B', 'KB', 'MB', 'GB', 'TB']; var i = 0;
+                while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+                return n.toFixed(1) + ' ' + u[i];
+            }
+            var informationLoaded = false;
+            function loadInformation() {
+                if (informationLoaded) { return; }
+                informationLoaded = true;
+                var info = page.querySelector('#SupportInfo');
+                ApiClient.getPublicSystemInfo().then(function (sys) {
+                    info.value = 'Intro Skipper ' + pluginVersion + '\n' +
+                        'Server: ' + (sys.ServerName || '?') + ' ' + (sys.Version || '') + '\n' +
+                        'OS: ' + (sys.OperatingSystem || '?');
+                }).catch(function () { info.value = 'Intro Skipper ' + pluginVersion; });
+
+                ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('System/Info/Storage'), dataType: 'json' }).then(function (storage) {
+                    var host = page.querySelector('#StorageUsage');
+                    host.innerHTML = '';
+                    (storage.Libraries || []).forEach(function (lib) {
+                        (lib.Folders || []).forEach(function (folder) {
+                            var total = (folder.FreeSpace || 0) + (folder.UsedSpace || 0);
+                            var pct = total > 0 ? Math.round((folder.UsedSpace / total) * 100) : 0;
+                            var color = pct >= 90 ? '#c62828' : (pct >= 75 ? '#f9a825' : '#2e7d32');
+                            var row = document.createElement('div');
+                            row.className = 'isStorageRow';
+                            row.innerHTML = '<div>' + lib.Name + ' &mdash; ' + folder.Path + '</div>' +
+                                '<div class="isStorageBar"><div class="isStorageBarFill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
+                                '<div class="fieldDescription">' + formatBytes(folder.UsedSpace) + ' / ' + formatBytes(total) + '</div>';
+                            host.appendChild(row);
+                        });
+                    });
+                    if (!host.innerHTML) { host.innerHTML = '<div class="fieldDescription">No storage information available.</div>'; }
+                }).catch(function () { page.querySelector('#StorageUsage').innerHTML = '<div class="fieldDescription">Storage information unavailable.</div>'; });
+            }
+            page.querySelector('#CopySupportInfo').addEventListener('click', function () {
+                var info = page.querySelector('#SupportInfo');
+                info.select();
+                try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+            });
+
             page.addEventListener('viewshow', loadConfig);
             page.addEventListener('pageshow', loadConfig);
             page.querySelector('#IntroSkipperConfigForm').addEventListener('submit', saveConfig);
-            // If the script runs after the view is already visible, load now too.
             loadConfig();
         })();
     </script>

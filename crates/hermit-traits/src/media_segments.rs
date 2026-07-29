@@ -69,6 +69,17 @@ pub trait MediaSegmentManager: Send + Sync {
         type_filter: Option<MediaSegmentType>,
     ) -> Result<(), ServiceError>;
 
+    /// Deletes every segment written by `provider_id` across all items, optionally
+    /// limited to one type. Backs a provider's bulk "erase timestamps" action.
+    /// Defaults to a no-op so stub/test managers need not implement it.
+    async fn delete_all_provider_segments(
+        &self,
+        _provider_id: &str,
+        _type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
     /// Lists the segments for an item, optionally filtered by type and/or to
     /// providers currently enabled on the item's library.
     async fn get_segments(

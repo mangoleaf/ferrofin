@@ -116,29 +116,168 @@ impl Extension for IntroSkipperExtension {
     }
 }
 
-/// The Intro Skipper's analysis configuration (its `/Plugins/{id}/Configuration`
-/// JSON). Defaults mirror the Intro Skipper plugin's C# defaults.
+/// The Intro Skipper's configuration — the full schema of the upstream plugin
+/// (`IntroSkipper/Configuration/PluginConfiguration.cs`), so the settings page is
+/// 1:1 with it. Field names (via `PascalCase`) and defaults match the C# exactly;
+/// `#[serde(default)]` lets a partial JSON fill the rest.
+///
+/// Not every field drives Hermit's current analysis pipeline (which fingerprints
+/// intros/credits) — the black-frame, chapter, silence, and keyframe refiners are
+/// stored for parity and consumed as those analyzers land. The knobs the pipeline
+/// uses today: the `Scan*` toggles, the min/max durations, the analysis window
+/// (`AnalysisPercent`/`AnalysisLengthLimit`), the fingerprint match parameters,
+/// and the intro offsets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
+#[allow(clippy::struct_excessive_bools)] // a faithful mirror of the plugin's config
 pub struct IntroSkipperConfig {
-    /// Detect episode intros.
-    pub detect_intros: bool,
+    // ---- General ----------------------------------------------------------
+    /// Automatically analyze newly added media.
+    pub auto_detect_intros: bool,
+    /// Re-analyze a season once it has settled (no new episodes for a while).
+    pub reanalyze_settled_seasons: bool,
+    /// Hours without new episodes before a season is "settled".
+    pub settled_season_delay_hours: i32,
+    /// Update missing media segments during a library scan.
+    pub update_media_segments: bool,
+    /// Legacy comma-separated excluded series (superseded by `SeriesExclusions`).
+    pub exclude_series: String,
+    /// Series excluded from analysis (exact, case-insensitive names).
+    pub series_exclusions: Vec<String>,
+    /// Movies excluded from analysis.
+    pub movie_exclusions: Vec<String>,
+    /// Paths excluded from analysis.
+    pub path_exclusions: Vec<String>,
+    /// Detect introductions.
+    pub scan_introduction: bool,
     /// Detect end credits.
-    pub detect_credits: bool,
+    pub scan_credits: bool,
+    /// Detect recaps.
+    pub scan_recap: bool,
+    /// Detect previews.
+    pub scan_preview: bool,
+    /// Detect commercials.
+    pub scan_commercial: bool,
+    /// Analyze Season 0 (specials / extras).
+    pub analyze_season_zero: bool,
+    /// Use the File Transformation plugin to patch the web UI.
+    pub use_file_transformation_plugin: bool,
+    /// Seconds before the client's skip button auto-hides (0 = never).
+    pub skipbutton_hide_delay: i32,
+    /// Show an Intro Skipper entry in the client's main menu.
+    pub enable_main_menu: bool,
+
+    // ---- Analysis ---------------------------------------------------------
+    /// Prefer Chromaprint analysis over other analyzers.
+    pub prefer_chromaprint: bool,
+    /// Allow a chapter-derived segment to ignore the duration limits.
+    pub full_length_chapters: bool,
+    /// Percent of each item, from the start, to analyze (1–50).
+    pub analysis_percent: i32,
+    /// Hard cap (minutes) on the analysis window.
+    pub analysis_length_limit: i32,
+    /// Cache fingerprints to disk between runs.
+    pub cache_fingerprints: bool,
+    /// Minimum recap length (seconds).
+    pub minimum_recap_duration: i32,
+    /// Maximum recap length (seconds).
+    pub maximum_recap_duration: i32,
+    /// Minimum detected-recap length (seconds).
+    pub minimum_recap_detection_duration: i32,
+    /// Maximum detected-recap length (seconds).
+    pub maximum_recap_detection_duration: i32,
     /// Minimum intro length (seconds) to accept.
-    pub minimum_intro_duration: f64,
+    pub minimum_intro_duration: i32,
     /// Maximum intro length (seconds).
-    pub maximum_intro_duration: f64,
+    pub maximum_intro_duration: i32,
     /// Minimum credits length (seconds).
-    pub minimum_credits_duration: f64,
+    pub minimum_credits_duration: i32,
     /// Maximum credits length (seconds).
-    pub maximum_credits_duration: f64,
-    /// Fraction (percent) of each episode, from the start, searched for the intro.
-    pub analysis_percent: u32,
-    /// Hard cap (minutes) on the intro search window.
-    pub analysis_length_limit: u32,
+    pub maximum_credits_duration: i32,
+    /// Maximum movie-credits length (seconds).
+    pub maximum_movie_credits_duration: i32,
+    /// Minimum preview length (seconds).
+    pub minimum_preview_duration: i32,
+    /// Maximum preview length (seconds).
+    pub maximum_preview_duration: i32,
+    /// Minimum commercial length (seconds).
+    pub minimum_commercial_duration: i32,
+    /// Maximum commercial length (seconds).
+    pub maximum_commercial_duration: i32,
+
+    // ---- Detection --------------------------------------------------------
+    /// Adjust segment endpoints to the nearest silence point.
+    pub adjust_intro_based_on_silence: bool,
+    /// Silence noise tolerance (negative dB).
+    pub silence_detection_maximum_noise: i32,
+    /// Minimum silence duration (seconds) before adjusting.
+    pub silence_detection_minimum_duration: f64,
+    /// Adjust segment endpoints to the nearest video keyframe.
+    pub snap_to_keyframe: bool,
+    /// Adjust segment endpoints to the nearest chapter boundary.
+    pub adjust_intro_based_on_chapters: bool,
+    /// Seconds searched toward a segment's interior for an adjustment point.
+    pub adjust_window_inward: f64,
+    /// Seconds searched away from a segment for an adjustment point.
+    pub adjust_window_outward: f64,
+    /// Snap a segment start/end within this many seconds of the episode boundary.
+    pub end_snap_threshold: f64,
+    /// Ignore intros for the first episode of a season.
+    pub skip_first_episode: bool,
+    /// Restrict the first-episode-ignore rule to anime seasons.
+    pub skip_first_episode_anime: bool,
+    /// For anime with no detected preview, treat the after-credits scene as one.
+    pub anime_preview_from_credits_end: bool,
+    /// Seconds of the intro to play before the skip point.
+    pub intro_start_offset: i32,
+    /// Seconds before the intro end to resume playback.
+    pub intro_end_offset: i32,
+
+    // ---- Black Frame ------------------------------------------------------
+    /// Fall back to black-frame detection for recaps.
+    pub detect_recap_using_black_frames: bool,
+    /// Use the experimental alternative black-frame analyzer.
+    pub use_alternative_black_frame_analyzer: bool,
+    /// Frame-level refine of the credits boundary (alt analyzer).
+    pub refine_credits_boundary: bool,
+    /// Also detect credits on a near-uniform (non-black) card.
+    pub detect_non_black_credits: bool,
+    /// Use chapter markers to locate credits via nearby black frames.
+    pub use_chapter_markers_black_frame: bool,
+    /// Minimum percent of black pixels for a frame to count as black.
+    pub black_frame_minimum_percentage: i32,
+    /// Luma value below which a pixel is considered black.
+    pub black_frame_threshold: i32,
+
+    // ---- Chapters ---------------------------------------------------------
+    /// Regex identifying introduction chapters.
+    pub chapter_analyzer_introduction_pattern: String,
+    /// Regex identifying end-credits chapters.
+    pub chapter_analyzer_end_credits_pattern: String,
+    /// Regex identifying preview chapters.
+    pub chapter_analyzer_preview_pattern: String,
+    /// Regex identifying recap chapters.
+    pub chapter_analyzer_recap_pattern: String,
+    /// Regex identifying commercial chapters.
+    pub chapter_analyzer_commercial_pattern: String,
+    /// Also detect known SponsorBlock chapter labels.
+    pub enable_sponsor_block_chapter_detection: bool,
+
+    // ---- FFmpeg -----------------------------------------------------------
+    /// Maximum simultaneous episode-analysis operations.
+    pub max_parallelism: i32,
+    /// ffmpeg process priority (`Idle`/`BelowNormal`/`Normal`/`AboveNormal`/`High`/`RealTime`).
+    pub process_priority: String,
+    /// ffmpeg threads (0 = auto).
+    pub process_threads: i32,
+    /// Probe the audio-stream duration for credits fingerprinting.
+    pub probe_audio_duration: bool,
+    /// Detection-cache compression (`NoCompression`/`Fastest`/`Optimal`/`SmallestSize`).
+    pub cache_compression_level: String,
+
+    // ---- Advanced matching (Analysis tab, advanced) -----------------------
     /// Max Hamming distance (bits) two fingerprint points may differ.
-    pub maximum_fingerprint_point_differences: u32,
+    pub maximum_fingerprint_point_differences: i32,
     /// Max gap (seconds) between matched points before a run breaks.
     pub maximum_time_skip: f64,
     /// Fuzzy point-value tolerance when matching points across episodes.
@@ -148,14 +287,82 @@ pub struct IntroSkipperConfig {
 impl Default for IntroSkipperConfig {
     fn default() -> Self {
         Self {
-            detect_intros: true,
-            detect_credits: true,
-            minimum_intro_duration: 15.0,
-            maximum_intro_duration: 120.0,
-            minimum_credits_duration: 15.0,
-            maximum_credits_duration: 450.0,
+            // General
+            auto_detect_intros: true,
+            reanalyze_settled_seasons: false,
+            settled_season_delay_hours: 24,
+            update_media_segments: true,
+            exclude_series: String::new(),
+            series_exclusions: Vec::new(),
+            movie_exclusions: Vec::new(),
+            path_exclusions: Vec::new(),
+            scan_introduction: true,
+            scan_credits: true,
+            scan_recap: true,
+            scan_preview: true,
+            scan_commercial: true,
+            analyze_season_zero: false,
+            use_file_transformation_plugin: false,
+            skipbutton_hide_delay: 8,
+            enable_main_menu: true,
+            // Analysis
+            prefer_chromaprint: false,
+            full_length_chapters: false,
             analysis_percent: 25,
             analysis_length_limit: 10,
+            cache_fingerprints: true,
+            minimum_recap_duration: 15,
+            maximum_recap_duration: 120,
+            minimum_recap_detection_duration: 15,
+            maximum_recap_detection_duration: 120,
+            minimum_intro_duration: 15,
+            maximum_intro_duration: 120,
+            minimum_credits_duration: 15,
+            maximum_credits_duration: 450,
+            maximum_movie_credits_duration: 900,
+            minimum_preview_duration: 15,
+            maximum_preview_duration: 120,
+            minimum_commercial_duration: 15,
+            maximum_commercial_duration: 120,
+            // Detection
+            adjust_intro_based_on_silence: true,
+            silence_detection_maximum_noise: -50,
+            silence_detection_minimum_duration: 0.33,
+            snap_to_keyframe: true,
+            adjust_intro_based_on_chapters: true,
+            adjust_window_inward: 5.0,
+            adjust_window_outward: 2.0,
+            end_snap_threshold: 2.0,
+            skip_first_episode: false,
+            skip_first_episode_anime: false,
+            anime_preview_from_credits_end: false,
+            intro_start_offset: 0,
+            intro_end_offset: 0,
+            // Black Frame
+            detect_recap_using_black_frames: false,
+            use_alternative_black_frame_analyzer: false,
+            refine_credits_boundary: true,
+            detect_non_black_credits: true,
+            use_chapter_markers_black_frame: true,
+            black_frame_minimum_percentage: 85,
+            black_frame_threshold: 28,
+            // Chapters
+            chapter_analyzer_introduction_pattern:
+                r"(^|\s)(Intro|Introduction|OP|Opening)(?![\s:]+End)(\s|:|$)".to_owned(),
+            chapter_analyzer_end_credits_pattern:
+                r"(^|\s)(Credits?|ED|Ending|Outro)(?![\s:]+End)(\s|:|$)".to_owned(),
+            chapter_analyzer_preview_pattern: r"(^|\s)(Preview|PV|Sneak\s?Peek|Coming\s?(Up|Soon)|Next\s+(time|on|episode)|Extra|Teaser|Trailer)(?![\s:]+End)(\s|:|$)".to_owned(),
+            chapter_analyzer_recap_pattern: r"(^|\s)(Re?cap|Sum{1,2}ary|Prev(ious(ly)?)?|(Last|Earlier)(\s\w+)?|Catch[ -]up)(?![\s:]+End)(\s|:|$)".to_owned(),
+            chapter_analyzer_commercial_pattern:
+                r"(^|\s)(Ad(vert(isement)?)?|Commercial|Intermission)(?![\s:]+End)(\s|:|$)".to_owned(),
+            enable_sponsor_block_chapter_detection: true,
+            // FFmpeg
+            max_parallelism: 2,
+            process_priority: "BelowNormal".to_owned(),
+            process_threads: 0,
+            probe_audio_duration: false,
+            cache_compression_level: "Optimal".to_owned(),
+            // Advanced matching
             maximum_fingerprint_point_differences: 6,
             maximum_time_skip: 3.5,
             inverted_index_shift: 2,
@@ -164,16 +371,18 @@ impl Default for IntroSkipperConfig {
 }
 
 impl IntroSkipperConfig {
-    /// The [`CompareConfig`] for a given mode (recap unused for v1).
+    /// The [`CompareConfig`] for a given mode.
     fn compare_config(&self, mode: AnalysisMode) -> CompareConfig {
+        let min_seconds = match mode {
+            AnalysisMode::Credits => self.minimum_credits_duration,
+            AnalysisMode::Recap => self.minimum_recap_duration,
+            AnalysisMode::Introduction => self.minimum_intro_duration,
+        };
         CompareConfig {
             inverted_index_shift: self.inverted_index_shift,
-            max_bit_diff: self.maximum_fingerprint_point_differences,
+            max_bit_diff: u32::try_from(self.maximum_fingerprint_point_differences).unwrap_or(6),
             max_time_skip: self.maximum_time_skip,
-            min_region_duration: match mode {
-                AnalysisMode::Credits => self.minimum_credits_duration,
-                _ => self.minimum_intro_duration,
-            },
+            min_region_duration: f64::from(min_seconds),
         }
     }
 }
@@ -325,19 +534,20 @@ impl DetectSegmentsTask {
         fingerprinter: &dyn Fingerprinter,
     ) -> usize {
         let mut written = 0;
-        if config.detect_intros {
-            let best = self
+        if config.scan_introduction {
+            let mut best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Introduction)
                 .await;
+            apply_intro_offsets(&mut best, config);
             written += self
                 .write_segments(
                     &best,
                     MediaSegmentType::Intro,
-                    config.maximum_intro_duration,
+                    f64::from(config.maximum_intro_duration),
                 )
                 .await;
         }
-        if config.detect_credits {
+        if config.scan_credits {
             let best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Credits)
                 .await;
@@ -345,7 +555,7 @@ impl DetectSegmentsTask {
                 .write_segments(
                     &best,
                     MediaSegmentType::Outro,
-                    config.maximum_credits_duration,
+                    f64::from(config.maximum_credits_duration),
                 )
                 .await;
         }
@@ -370,11 +580,12 @@ impl DetectSegmentsTask {
         let mut fingerprints: Vec<Print> = Vec::new();
         for ep in episodes {
             let (start, end) = window(ep.duration_secs, config, mode);
-            if end - start
-                < config
+            let min_window = f64::from(
+                config
                     .minimum_intro_duration
-                    .min(config.minimum_credits_duration)
-            {
+                    .min(config.minimum_credits_duration),
+            );
+            if end - start < min_window {
                 continue;
             }
             match self
@@ -490,11 +701,30 @@ fn consider(
     }
 }
 
+/// Applies the configured intro offsets to each detected intro: play
+/// `IntroStartOffset` seconds before skipping, and resume `IntroEndOffset` seconds
+/// before the intro ends (Intro Skipper's `IntroStartOffset`/`IntroEndOffset`).
+fn apply_intro_offsets(regions: &mut HashMap<Uuid, TimeRange>, config: &IntroSkipperConfig) {
+    let start_offset = f64::from(config.intro_start_offset).max(0.0);
+    let end_offset = f64::from(config.intro_end_offset).max(0.0);
+    if start_offset == 0.0 && end_offset == 0.0 {
+        return;
+    }
+    for range in regions.values_mut() {
+        let new_start = range.start + start_offset;
+        let new_end = range.end - end_offset;
+        if new_end > new_start {
+            range.start = new_start;
+            range.end = new_end;
+        }
+    }
+}
+
 /// The `[start, end]` seconds window to fingerprint for an episode + mode.
 fn window(duration_secs: f64, config: &IntroSkipperConfig, mode: AnalysisMode) -> (f64, f64) {
     if mode == AnalysisMode::Credits {
         // The tail of the episode (a little longer than the max credits).
-        let win = config.maximum_credits_duration + 30.0;
+        let win = f64::from(config.maximum_credits_duration) + 30.0;
         ((duration_secs - win).max(0.0), duration_secs)
     } else {
         // The first AnalysisPercent of the episode, capped by the limit.
@@ -556,7 +786,7 @@ mod tests {
     fn default_config_round_trips_json() {
         let bytes = IntroSkipperExtension.default_config();
         let cfg: IntroSkipperConfig = serde_json::from_slice(&bytes).expect("parse");
-        assert!(cfg.detect_intros);
+        assert!(cfg.scan_introduction);
         assert_eq!(cfg.analysis_percent, 25);
         assert_eq!(cfg.maximum_fingerprint_point_differences, 6);
     }
@@ -564,9 +794,9 @@ mod tests {
     #[test]
     fn partial_config_fills_defaults() {
         let cfg: IntroSkipperConfig =
-            serde_json::from_str(r#"{"DetectCredits":false,"AnalysisPercent":40}"#).unwrap();
-        assert!(!cfg.detect_credits);
-        assert!(cfg.detect_intros); // default kept
+            serde_json::from_str(r#"{"ScanCredits":false,"AnalysisPercent":40}"#).unwrap();
+        assert!(!cfg.scan_credits);
+        assert!(cfg.scan_introduction); // default kept
         assert_eq!(cfg.analysis_percent, 40);
     }
 

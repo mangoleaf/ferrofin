@@ -159,6 +159,23 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
         Ok(())
     }
 
+    async fn delete_all_provider_segments(
+        &self,
+        provider_id: &str,
+        type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError> {
+        let mut sql = String::from(r#"DELETE FROM "MediaSegments" WHERE "SegmentProviderId" = ?1"#);
+        if type_filter.is_some() {
+            sql.push_str(r#" AND "Type" = ?2"#);
+        }
+        let mut query = sqlx::query(&sql).bind(provider_id.to_owned());
+        if let Some(kind) = type_filter {
+            query = query.bind(Self::type_discriminant(kind));
+        }
+        query.execute(self.db.pool()).await.map_err(db_err)?;
+        Ok(())
+    }
+
     async fn get_segments(
         &self,
         item_id: Uuid,

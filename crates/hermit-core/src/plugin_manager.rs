@@ -221,7 +221,11 @@ impl PluginManager for HermitPluginManager {
             return Err(ServiceError::not_found(format!("plugin {id}")));
         };
         match std::fs::read(self.config_path(id)) {
-            Ok(bytes) => Ok(bytes),
+            // Overlay the stored values onto the current defaults, so a config
+            // saved by an older plugin version (missing newly-added keys) still
+            // returns every field at its default — matching how C# deserializes a
+            // partial `PluginConfiguration`.
+            Ok(bytes) => Ok(merge_config(&plugin.default_config, &bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(plugin.default_config.clone()),
             Err(e) => Err(ServiceError::backend(format!("read plugin config: {e}"))),
         }
@@ -327,13 +331,42 @@ impl PluginManager for HermitPluginManager {
     }
 }
 
+/// Overlays a stored config's top-level keys onto the current defaults, so a
+/// config saved by an older plugin version still returns every field (missing
+/// keys keep their default). Falls back to the raw stored bytes if either side
+/// isn't a JSON object.
+fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
+    let (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) = (
+        serde_json::from_slice::<serde_json::Value>(defaults),
+        serde_json::from_slice::<serde_json::Value>(stored),
+    ) else {
+        return stored.to_vec();
+    };
+    base.extend(over);
+    serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HermitPluginManager, RegisteredPlugin};
+    use super::{HermitPluginManager, RegisteredPlugin, merge_config};
     use hermit_model::updates::RepositoryInfo;
     use hermit_traits::error::ServiceError;
     use hermit_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
     use uuid::Uuid;
+
+    #[test]
+    fn merge_config_fills_missing_keys_and_keeps_stored() {
+        let defaults = br#"{"A":1,"B":true,"C":"x"}"#;
+        let stored = br#"{"A":9,"D":"extra"}"#;
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_config(defaults, stored)).unwrap();
+        assert_eq!(merged["A"], 9); // stored overrides default
+        assert_eq!(merged["B"], true); // missing key filled from default
+        assert_eq!(merged["C"], "x");
+        assert_eq!(merged["D"], "extra"); // stale extra key preserved
+        // Non-object stored falls back to raw stored bytes.
+        assert_eq!(merge_config(defaults, b"not json"), b"not json");
+    }
 
     fn descriptor(id: Uuid, name: &str, enabled: bool) -> PluginDescriptor {
         PluginDescriptor {

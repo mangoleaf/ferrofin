@@ -9,7 +9,8 @@
 //! the `501` stub.
 
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use hermit_model::querying::QueryResult;
@@ -74,7 +75,45 @@ async fn get_item_segments(
     Ok(Json(QueryResult::new(Some(0), Some(count), segments)))
 }
 
+/// Query parameters for `DELETE /MediaSegments/Provider/{providerId}`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ProviderEraseQuery {
+    /// Optional single segment type to limit the erase to.
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+}
+
+/// `DELETE /MediaSegments/Provider/{providerId}` — erases every segment a provider
+/// wrote, optionally limited to one type. Backs a provider's bulk "erase
+/// timestamps" tool (e.g. Intro Skipper). Not a Jellyfin contract route; additive.
+async fn erase_provider_segments(
+    State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
+    Path(provider_id): Path<String>,
+    Query(query): Query<ProviderEraseQuery>,
+) -> Result<StatusCode, ApiError> {
+    let type_filter = match query.type_.as_deref() {
+        Some(raw) => Some(
+            parse_csv_enums::<MediaSegmentType>(Some(raw))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::BadRequest(format!("invalid segment type {raw:?}")))?,
+        ),
+        None => None,
+    };
+    state
+        .media_segments
+        .delete_all_provider_segments(&provider_id, type_filter)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
-    router.route("/MediaSegments/{itemId}", get(get_item_segments))
+    router
+        .route("/MediaSegments/{itemId}", get(get_item_segments))
+        .route(
+            "/MediaSegments/Provider/{providerId}",
+            delete(erase_provider_segments),
+        )
 }
