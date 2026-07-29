@@ -694,6 +694,32 @@ pub trait UserDataManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<UserItemDataDto>, ServiceError>;
 
+    /// Sets — or clears, when `likes` is `None` — a user's like flag for an item,
+    /// returning the refreshed data DTO.
+    ///
+    /// Unlike [`Self::save_user_data`]'s merge semantics (an absent field is left
+    /// unchanged), a `None` here **explicitly clears** the stored like, matching
+    /// C# `UpdateUserItemRatingInternal` with `Likes = null`. The default
+    /// implementation only persists the set case (via [`Self::save_user_data`]);
+    /// the concrete manager overrides it to also persist a clear.
+    async fn set_likes(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        likes: Option<bool>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        if let Some(v) = likes {
+            let update = UpdateUserItemDataDto {
+                likes: Some(v),
+                ..UpdateUserItemDataDto::default()
+            };
+            self.save_user_data(user_id, item_id, &update).await?;
+        }
+        self.get_user_data_dto(item_id, user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user data for item {item_id}")))
+    }
+
     /// Gets user-data DTOs for several items in one batch.
     async fn get_user_data_batch(
         &self,

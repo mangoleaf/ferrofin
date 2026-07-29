@@ -202,15 +202,16 @@ async fn update_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    let update = UpdateUserItemDataDto {
-        likes: query.likes,
-        ..UpdateUserItemDataDto::default()
-    };
-    save_and_return(&state, user_uuid, resolved_item, &update).await
+    Ok(Json(
+        state
+            .user_data
+            .set_likes(user_uuid, resolved_item, query.likes)
+            .await?,
+    ))
 }
 
 /// `DELETE /Users/{userId}/Items/{itemId}/Rating` — legacy per-user clear-like.
-/// Mirrors `delete_rating` (a `likes = null` clear reads back current data).
+/// Clears the stored like (C# `Likes = null`) and returns the refreshed data.
 async fn delete_rating_for_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
@@ -218,12 +219,12 @@ async fn delete_rating_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, Some(user_id), item_id).await?;
-    let dto = state
-        .user_data
-        .get_user_data_dto(resolved_item, user_uuid)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("user data for item {resolved_item}")))?;
-    Ok(Json(dto))
+    Ok(Json(
+        state
+            .user_data
+            .set_likes(user_uuid, resolved_item, None)
+            .await?,
+    ))
 }
 
 /// Shared favourite toggle for the mark/unmark handlers.
@@ -278,11 +279,14 @@ async fn update_rating(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
-    let update = UpdateUserItemDataDto {
-        likes: query.likes,
-        ..UpdateUserItemDataDto::default()
-    };
-    save_and_return(&state, user_uuid, resolved_item, &update).await
+    // C# assigns `userData.Likes = likes` (clearing when the query param is
+    // absent), so use the explicit like setter rather than the merge path.
+    Ok(Json(
+        state
+            .user_data
+            .set_likes(user_uuid, resolved_item, query.likes)
+            .await?,
+    ))
 }
 
 /// `DELETE /UserItems/{itemId}/Rating` — clears the like rating for an item.
@@ -306,16 +310,13 @@ async fn delete_rating(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let (user_uuid, resolved_item) =
         resolve_user_and_item(&state, &auth, query.user_id, item_id).await?;
-    // C# clears the like by saving `Likes = null`; the update DTO's absent
-    // `likes` leaves it unset, so this write is a no-op on the like field —
-    // instead assert the row and return it (C# `UpdateUserItemRatingInternal`
-    // with `likes = null` re-reads without changing other fields).
-    let dto = state
-        .user_data
-        .get_user_data_dto(resolved_item, user_uuid)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("user data for item {resolved_item}")))?;
-    Ok(Json(dto))
+    // Persist the cleared like (C# saves `Likes = null`), then return the row.
+    Ok(Json(
+        state
+            .user_data
+            .set_likes(user_uuid, resolved_item, None)
+            .await?,
+    ))
 }
 
 /// `GET /UserItems/{itemId}/UserData` — reads an item's user data.
@@ -583,7 +584,6 @@ async fn get_latest_media(
     // Flatten the per-view groups, honouring the parent/type/played filters the
     // portable seam can apply to the flat rows.
     let mut resolved: Vec<hermit_db::entities::base_items::BaseItemEntity> = Vec::new();
-    let mut child_counts: Vec<i32> = Vec::new();
     for (view, items) in groups {
         if let Some(parent) = query.parent_id
             && view.id != parent.to_string()
@@ -599,31 +599,132 @@ async fn get_latest_media(
                 continue;
             }
             resolved.push(item);
-            child_counts.push(0);
         }
     }
-    let _ = (is_played, group_items, &child_counts);
 
-    // C# caps the result at `limit` (default 20).
+    // isPlayed filter: keep only items whose played state matches the request.
+    // C# applies this inside the latest-items query; here it is a post-filter
+    // over the flat rows using each item's user data.
+    if let Some(want_played) = is_played {
+        let ids: Vec<Uuid> = resolved
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        let data = state.user_data.get_user_data_batch(&ids, user_uuid).await?;
+        resolved.retain(|i| {
+            let played = Uuid::parse_str(&i.id)
+                .ok()
+                .and_then(|id| data.get(&id))
+                .is_some_and(|d| d.played);
+            played == want_played
+        });
+    }
+
+    // C# caps the flat item list at `limit` (default 20) before grouping.
     let limit = usize::try_from(query.limit.unwrap_or(DEFAULT_LATEST_LIMIT).max(0)).unwrap_or(0);
     resolved.truncate(limit);
 
-    let dtos = state
+    // groupItems (default true): collapse each grouping parent's run of ≥2 items
+    // (episodes → their series, audio → its album) into the parent with a
+    // `ChildCount`; single items and ungrouped kinds stand alone. Port of
+    // `UserLibraryController.GetLatestMedia`'s tuple projection.
+    let (entities, child_counts) = if group_items {
+        group_latest(&state, resolved).await?
+    } else {
+        let counts = vec![0i32; resolved.len()];
+        (resolved, counts)
+    };
+
+    let mut dtos = state
         .dto
-        .get_base_item_dtos(&resolved, &options, Some(&user), None, true)
+        .get_base_item_dtos(&entities, &options, Some(&user), None, true)
         .await?;
+    for (dto, count) in dtos.iter_mut().zip(child_counts) {
+        if count > 0 {
+            dto.child_count = Some(count);
+        }
+    }
     Ok(Json(dtos))
+}
+
+/// The parent an item groups under in the "Latest" row: an episode's series or
+/// an audio/music-video's album (its parent). Other kinds do not group. Returns
+/// `None` for a nil/absent/unparseable id.
+fn grouping_parent(item: &hermit_db::entities::base_items::BaseItemEntity) -> Option<Uuid> {
+    let short = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+    let id_str = match short {
+        "Episode" => item.series_id.as_deref(),
+        "Audio" | "MusicVideo" => item.parent_id.as_deref(),
+        _ => None,
+    }?;
+    Uuid::parse_str(id_str).ok().filter(|u| !u.is_nil())
+}
+
+/// Groups the latest items by their grouping parent, preserving first-seen order.
+/// A group of ≥2 items collapses to its (resolved) parent with a child count;
+/// everything else is emitted as-is with a zero count.
+async fn group_latest(
+    state: &AppState,
+    items: Vec<hermit_db::entities::base_items::BaseItemEntity>,
+) -> Result<
+    (
+        Vec<hermit_db::entities::base_items::BaseItemEntity>,
+        Vec<i32>,
+    ),
+    ApiError,
+> {
+    use std::collections::HashMap;
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<
+        String,
+        (
+            Option<Uuid>,
+            Vec<hermit_db::entities::base_items::BaseItemEntity>,
+        ),
+    > = HashMap::new();
+    for item in items {
+        let (key, parent) = match grouping_parent(&item) {
+            Some(pid) => (pid.to_string(), Some(pid)),
+            None => (item.id.clone(), None),
+        };
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| {
+                order.push(key.clone());
+                (parent, Vec::new())
+            })
+            .1
+            .push(item);
+    }
+    let mut entities = Vec::new();
+    let mut counts = Vec::new();
+    for key in order {
+        let (parent, mut group) = groups.remove(&key).expect("group present");
+        if group.len() > 1
+            && let Some(pid) = parent
+            && let Some(parent_item) = state.library.get_item_by_id(pid).await?
+        {
+            entities.push(parent_item);
+            counts.push(i32::try_from(group.len()).unwrap_or(i32::MAX));
+        } else {
+            entities.push(group.remove(0));
+            counts.push(0);
+        }
+    }
+    Ok((entities, counts))
 }
 
 /// Whether a stored type name matches a [`BaseItemKind`](hermit_model::data::BaseItemKind).
 ///
-/// The stored `Type` column holds the short kind name (e.g. `"Movie"`); the
-/// serde name of the kind matches it (Jellyfin's `BaseItemKind` names).
+/// The stored `Type` column holds the full CLR type name (e.g.
+/// `MediaBrowser.Controller.Entities.Movies.Movie`), so compare its last dotted
+/// segment against the serde name of the kind (Jellyfin's `BaseItemKind` names).
 fn type_name_matches(stored: &str, kind: hermit_model::data::BaseItemKind) -> bool {
+    let short = stored.rsplit('.').next().unwrap_or(stored);
     serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(std::string::ToString::to_string))
-        .is_some_and(|name| name == stored)
+        .is_some_and(|name| name == short)
 }
 
 /// `GET /Items/{itemId}/CriticReviews` — critic reviews for an item.
@@ -692,4 +793,78 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/SpecialFeatures", get(get_special_features))
         .route("/Items/{itemId}/Intros", get(get_intros))
         .route("/Items/{itemId}/CriticReviews", get(get_critic_reviews))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grouping_parent, type_name_matches};
+    use hermit_db::entities::base_items::BaseItemEntity;
+    use hermit_model::data::BaseItemKind;
+    use uuid::Uuid;
+
+    fn item(type_: &str, series_id: Option<&str>, parent_id: Option<&str>) -> BaseItemEntity {
+        BaseItemEntity {
+            type_: type_.to_owned(),
+            series_id: series_id.map(str::to_owned),
+            parent_id: parent_id.map(str::to_owned),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    #[test]
+    fn type_filter_matches_full_clr_name() {
+        // Stored `Type` is the full CLR name; the short kind name must still match.
+        assert!(type_name_matches(
+            "MediaBrowser.Controller.Entities.TV.Episode",
+            BaseItemKind::Episode
+        ));
+        assert!(type_name_matches(
+            "MediaBrowser.Controller.Entities.Movies.Movie",
+            BaseItemKind::Movie
+        ));
+        assert!(!type_name_matches(
+            "MediaBrowser.Controller.Entities.TV.Episode",
+            BaseItemKind::Movie
+        ));
+    }
+
+    #[test]
+    fn grouping_parent_is_series_for_episodes_and_album_for_audio() {
+        let series = Uuid::from_u128(0xAB);
+        let album = Uuid::from_u128(0xCD);
+        assert_eq!(
+            grouping_parent(&item(
+                "MediaBrowser.Controller.Entities.TV.Episode",
+                Some(&series.to_string()),
+                None
+            )),
+            Some(series)
+        );
+        assert_eq!(
+            grouping_parent(&item(
+                "MediaBrowser.Controller.Entities.Audio.Audio",
+                None,
+                Some(&album.to_string())
+            )),
+            Some(album)
+        );
+        // Movies never group.
+        assert_eq!(
+            grouping_parent(&item(
+                "MediaBrowser.Controller.Entities.Movies.Movie",
+                None,
+                None
+            )),
+            None
+        );
+        // A nil / unparseable parent id groups to nothing.
+        assert_eq!(
+            grouping_parent(&item(
+                "MediaBrowser.Controller.Entities.TV.Episode",
+                Some(&Uuid::nil().to_string()),
+                None
+            )),
+            None
+        );
+    }
 }

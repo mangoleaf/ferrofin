@@ -244,6 +244,24 @@ impl UserDataManager for HermitUserDataManager {
         Ok(Some(to_dto(&row, item_id)))
     }
 
+    async fn set_likes(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        likes: Option<bool>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        // Assign the like directly (including `None`) so a clear persists — the
+        // merge path in `save_user_data` can only ever *set* a like. Port of C#
+        // `UpdateUserItemRatingInternal` (`userData.Likes = likes; Save(...)`).
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        row.likes = likes;
+        self.upsert_row(&row).await?;
+        Ok(to_dto(&row, item_id))
+    }
+
     async fn get_user_data_batch(
         &self,
         item_ids: &[Uuid],
@@ -497,6 +515,42 @@ mod tests {
             .expect("some");
         assert!(dto.is_favorite);
         assert_eq!(dto.play_count, 3);
+    }
+
+    #[tokio::test]
+    async fn set_likes_sets_and_clears() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        // Set a like.
+        let dto = mgr.set_likes(user, item, Some(true)).await.expect("like");
+        assert_eq!(dto.likes, Some(true));
+        assert_eq!(
+            mgr.get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .likes,
+            Some(true),
+            "like persisted"
+        );
+
+        // Clear it — must stick (the bug: a merge-save could not clear).
+        let dto = mgr.set_likes(user, item, None).await.expect("clear");
+        assert_eq!(dto.likes, None);
+        assert_eq!(
+            mgr.get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .likes,
+            None,
+            "cleared like persisted"
+        );
     }
 
     #[tokio::test]

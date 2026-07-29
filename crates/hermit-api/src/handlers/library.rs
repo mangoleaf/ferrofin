@@ -343,11 +343,9 @@ async fn refresh_library(
 /// The query parameters accepted by `GET /Library/MediaFolders`.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct MediaFoldersQuery {
-    /// Optional. Filter by folders marked hidden, or not. Accepted for contract
-    /// compatibility but unread — the per-folder hidden flag is not modelled at
-    /// this seam (see the module docs), so the folders are returned unfiltered.
+    /// Optional. Filter by folders marked hidden. Hermit models no per-folder
+    /// hidden flag, so `true` matches nothing and `false`/absent matches all.
     #[serde(default)]
     is_hidden: Option<bool>,
 }
@@ -458,10 +456,12 @@ async fn get_available_options(
 ///
 /// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
 /// name-sorted, projected to [`BaseItemDto`] as a
-/// [`QueryResult`](hermit_model::querying::QueryResult). The `isHidden` filter and
-/// the `LibraryOptions.Enabled` gate need the un-ported per-folder options and are
-/// documented deferrals (see the module docs); the folder set and projection are
-/// already the final ones.
+/// [`QueryResult`](hermit_model::querying::QueryResult).
+///
+/// Resolved against the authenticated user (not the nil user) so the folders and
+/// their user data are the caller's. Hermit does not model a per-folder hidden
+/// flag, so no folder is hidden: an `isHidden=true` filter returns nothing, and
+/// `false`/absent returns them all (a faithful projection of "nothing hidden").
 #[utoipa::path(
     get,
     path = "/Library/MediaFolders",
@@ -471,16 +471,23 @@ async fn get_available_options(
 )]
 async fn get_media_folders(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
-    Query(_query): Query<MediaFoldersQuery>,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    // The user-root collection folders are the media folders; the view seam
-    // already returns them name-sorted.
-    let folders = state.user_views.get_user_views(Uuid::nil()).await?;
+    let user = resolve_user(&state, &auth, None).await?;
+    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    // The user's collection folders are the media folders; the view seam returns
+    // them name-sorted.
+    let folders = if query.is_hidden == Some(true) {
+        // No folder carries a hidden flag, so none match `isHidden=true`.
+        Vec::new()
+    } else {
+        state.user_views.get_user_views(user_uuid).await?
+    };
     let options = DtoOptions::default();
     let dtos = state
         .dto
-        .get_base_item_dtos(&folders, &options, None, None, true)
+        .get_base_item_dtos(&folders, &options, Some(&user), None, true)
         .await?;
     Ok(Json(QueryResult::from_items(dtos)))
 }
