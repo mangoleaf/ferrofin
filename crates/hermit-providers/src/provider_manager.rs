@@ -649,7 +649,14 @@ impl ProviderManager for LocalProviderManager {
     }
 
     async fn get_all_metadata_plugins(&self) -> Result<Vec<MetadataPluginSummary>, ServiceError> {
-        Ok(Vec::new())
+        Ok(crate::library_options::all_metadata_plugins())
+    }
+
+    async fn get_library_options_info(
+        &self,
+        item_types: &[String],
+    ) -> Result<hermit_model::configuration::LibraryOptionsResultDto, ServiceError> {
+        Ok(crate::library_options::library_options_info(item_types))
     }
 
     async fn get_metadata_options(&self, _item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
@@ -1076,7 +1083,9 @@ mod tests {
                 .is_empty()
         );
         assert!(mgr.get_external_urls(id).await.unwrap().is_empty());
-        assert!(mgr.get_all_metadata_plugins().await.unwrap().is_empty());
+        // The metadata-plugin registry projects the compiled-in providers, so it
+        // is non-empty (covered in detail by `library_options` tests).
+        assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
         assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
 
         // Metadata options fall back to the type default.

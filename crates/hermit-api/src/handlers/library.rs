@@ -15,10 +15,10 @@
 //!   virtual folder, from the
 //!   [`VirtualFolderManager`](hermit_traits::library::VirtualFolderManager) seam
 //!   (`RootFolder.Children.SelectMany(c => c.PhysicalLocations)`).
-//! - `GET /Libraries/AvailableOptions` — the library options info; the
-//!   representative-item-type shell is assembled here, and the provider lists are
-//!   empty because no metadata plugins are registered at this seam (a faithful
-//!   projection — Jellyfin returns empty arrays when no plugin matches).
+//! - `GET /Libraries/AvailableOptions` — the library options info, projected
+//!   from Hermit's compiled-in provider registry (via the `ProviderManager`):
+//!   real per-type metadata/image fetchers plus the flat saver/reader/subtitle/
+//!   segment lists.
 //!
 //! The external-source **change-report webhooks** are also ported here, over the
 //! [`LibraryMonitor`](hermit_traits::library::LibraryMonitor) seam on `AppState`:
@@ -29,13 +29,8 @@
 //! - `POST /Library/Media/Updated` — reports each path in the request body.
 //!
 //! The `LibraryStructureController` virtual-folder CRUD lives in the sibling
-//! [`library_structure`](crate::handlers::library_structure) module. A few
-//! `LibraryController` routes stay on the shared `501` stub as intentional
-//! deferrals, because each depends on a subsystem Hermit does not model at this
-//! portable seam:
-//! - The `isHidden` filter on `/Library/MediaFolders` — the per-folder hidden
-//!   flag lives in the un-ported `LibraryOptions`, so the folders are returned
-//!   unfiltered (the query still succeeds and the folder set is faithful).
+//! [`library_structure`](crate::handlers::library_structure) module. One
+//! `LibraryController` branch is a faithful projection of an unmodelled field:
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
@@ -405,15 +400,13 @@ fn representative_item_types(
 
 /// `GET /Libraries/AvailableOptions` — the library options info.
 ///
-/// Port of `LibraryController.GetLibraryOptionsInfo`: assembles the available
-/// metadata/subtitle/lyric/image providers from the metadata-plugin registry,
-/// grouped by the representative item types of `libraryContentType`.
-///
-/// **No metadata plugins are registered at this seam** (the provider registry is
-/// a later-wave subsystem), so every provider list is empty — a faithful
-/// projection (Jellyfin returns empty arrays when no plugin matches the type).
-/// The per-type blocks are still emitted (one per representative item type) with
-/// empty fetcher/image lists, so the shape a client sees is correct.
+/// Port of `LibraryController.GetLibraryOptionsInfo`: projects Hermit's
+/// compiled-in provider registry (via the
+/// [`ProviderManager`](hermit_traits::providers::ProviderManager)) into the
+/// available metadata/image/subtitle/lyric/segment providers, grouped by the
+/// representative item types of `libraryContentType`. A provider is listed iff
+/// its code is in the build (e.g. Open Subtitles only with the `opensubtitles`
+/// feature).
 #[utoipa::path(
     get,
     path = "/Libraries/AvailableOptions",
@@ -425,31 +418,25 @@ fn representative_item_types(
     tag = "hermit"
 )]
 async fn get_available_options(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     // `[Authorize(FirstTimeSetupOrElevated)]` (method-level): the setup wizard's
     // add-library step reads this before login.
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
     Query(query): Query<AvailableOptionsQuery>,
 ) -> Result<Json<LibraryOptionsResultDto>, ApiError> {
-    use hermit_model::configuration::LibraryTypeOptionsDto;
-
-    // With no metadata plugins registered, the saver/reader/fetcher lists are all
-    // empty; only the per-type shell is populated (one block per representative
-    // item type), matching the C# assembly with an empty plugin set.
-    let type_options = representative_item_types(query.library_content_type)
+    let item_types: Vec<String> = representative_item_types(query.library_content_type)
         .into_iter()
-        .map(|type_name| LibraryTypeOptionsDto {
-            type_: Some(type_name.to_owned()),
-            ..LibraryTypeOptionsDto::default()
-        })
+        .map(str::to_owned)
         .collect();
-
-    let _ = query.is_new_library; // Only affects DefaultEnabled flags (none set).
-
-    Ok(Json(LibraryOptionsResultDto {
-        type_options,
-        ..LibraryOptionsResultDto::default()
-    }))
+    // `isNewLibrary` only nudges DefaultEnabled in C#; Hermit's registry defaults
+    // every provider enabled, so the flag needs no special handling.
+    let _ = query.is_new_library;
+    Ok(Json(
+        state
+            .providers
+            .get_library_options_info(&item_types)
+            .await?,
+    ))
 }
 
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.

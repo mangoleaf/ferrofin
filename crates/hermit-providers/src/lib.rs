@@ -8,6 +8,7 @@
 //! Filled by the Wave 5 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 
 pub mod container_types;
+pub mod library_options;
 pub mod local_images;
 pub mod mediainfo;
 pub mod omdb;

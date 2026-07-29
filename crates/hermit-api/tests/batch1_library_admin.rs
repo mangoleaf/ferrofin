@@ -483,7 +483,11 @@ async fn physical_paths_unions_locations() {
 }
 
 #[tokio::test]
-async fn available_options_returns_type_shell_with_empty_providers() {
+async fn available_options_delegates_to_provider_manager() {
+    // The handler resolves the representative item types and delegates the whole
+    // projection to the provider manager (the real registry is tested in
+    // `hermit-providers::library_options`). With the default fake provider this
+    // is an empty-but-valid `LibraryOptionsResultDto`.
     let (state, _vf) = working_state();
     let response = create_router(state)
         .oneshot(
@@ -497,19 +501,12 @@ async fn available_options_returns_type_shell_with_empty_providers() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
-    // No plugins registered → provider lists empty; one type block for "Movie".
-    assert!(json["MetadataSavers"].as_array().unwrap().is_empty());
-    assert_eq!(json["TypeOptions"][0]["Type"], "Movie");
-    assert!(
-        json["TypeOptions"][0]["MetadataFetchers"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(json["MetadataSavers"].is_array());
+    assert!(json["TypeOptions"].is_array());
 }
 
 #[tokio::test]
-async fn available_options_defaults_to_video_type_shell() {
+async fn available_options_without_content_type_is_ok() {
     let (state, _vf) = working_state();
     let response = create_router(state)
         .oneshot(
@@ -522,15 +519,6 @@ async fn available_options_defaults_to_video_type_shell() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let json = json_body(response).await;
-    // The default representative types are Series/Season/Episode/Movie.
-    let types: Vec<&str> = json["TypeOptions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["Type"].as_str().unwrap())
-        .collect();
-    assert_eq!(types, vec!["Series", "Season", "Episode", "Movie"]);
 }
 
 #[tokio::test]

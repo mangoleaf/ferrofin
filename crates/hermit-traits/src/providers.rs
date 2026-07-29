@@ -264,6 +264,20 @@ pub trait ProviderManager: Send + Sync {
     /// Gets a summary of every registered metadata plugin.
     async fn get_all_metadata_plugins(&self) -> Result<Vec<MetadataPluginSummary>, ServiceError>;
 
+    /// Assembles the available library options (metadata/image/subtitle/segment
+    /// providers) for a library whose representative item types are `item_types`.
+    ///
+    /// Backs `GET /Libraries/AvailableOptions`. Defaults to an empty result so
+    /// stub/test managers compile unchanged; the concrete provider manager
+    /// overrides it to project the compiled-in provider registry.
+    async fn get_library_options_info(
+        &self,
+        item_types: &[String],
+    ) -> Result<hermit_model::configuration::LibraryOptionsResultDto, ServiceError> {
+        let _ = item_types;
+        Ok(hermit_model::configuration::LibraryOptionsResultDto::default())
+    }
+
     /// Gets the configured metadata options for an item.
     async fn get_metadata_options(&self, item_id: Uuid) -> Result<MetadataOptions, ServiceError>;
 
