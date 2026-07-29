@@ -71,6 +71,21 @@ pub fn build_media_encoding(
     Arc<dyn AttachmentExtractor>,
     Arc<dyn SubtitleEncoder>,
 ) {
+    // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
+    // Built first: the planner also consumes it, resolving a burned text
+    // subtitle to its cached extracted file so the `subtitles` filter doesn't
+    // re-demux the whole source on every ffmpeg start.
+    let sub_resolver = Arc::new(MediaSourceManagerResolver {
+        media_sources: Arc::clone(&media_sources),
+    });
+    let sub_io = FfmpegSubtitleIo {
+        path_manager: Arc::clone(&path_manager),
+        ffmpeg_path: encoder.encoder_path(),
+    };
+    let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
+    let subtitles: Arc<dyn SubtitleEncoder> =
+        Arc::new(SubtitleEncoderImpl::new(pure_encoder, sub_resolver));
+
     // ---- HLS transcode chain (below the planner seam) ---------------------
     let planner = HermitStreamStatePlanner::new(
         Arc::clone(&media_sources),
@@ -78,6 +93,7 @@ pub fn build_media_encoding(
         EncodingHelper::new(NoOptionalEncoders),
         config,
         Arc::clone(&paths),
+        Arc::clone(&subtitles),
     );
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -99,34 +115,15 @@ pub fn build_media_encoding(
     ));
 
     // ---- attachment extractor (real ffmpeg + filesystem) ------------------
-    let resolver = Arc::new(MediaSourceManagerResolver {
-        media_sources: Arc::clone(&media_sources),
-    });
-    let io = Arc::new(FfmpegAttachmentIo {
-        path_manager: Arc::clone(&path_manager),
-    });
+    let resolver = Arc::new(MediaSourceManagerResolver { media_sources });
+    let io = Arc::new(FfmpegAttachmentIo { path_manager });
     // `AttachmentExtractorImpl<E, …>` holds an `Arc<E>` with `E: Sized`, so the
     // trait-object encoder is wrapped in the sized [`DynMediaEncoder`] newtype.
-    // Capture the ffmpeg binary path before `encoder` is moved into the wrapper.
-    let ffmpeg_path = encoder.encoder_path();
     let attachments: Arc<dyn AttachmentExtractor> = Arc::new(AttachmentExtractorImpl::new(
         Arc::new(DynMediaEncoder(encoder)),
         resolver,
         io,
     ));
-
-    // ---- subtitle encoder (real ffmpeg extraction + charset/format conv) ---
-    // Replaces the `DisabledSubtitleEncoder` stub so `/Videos/.../Subtitles/
-    // .../Stream.vtt` actually extracts/converts (external subtitle delivery for
-    // direct-play, where the client fetches VTT rather than the server burning in).
-    let sub_resolver = Arc::new(MediaSourceManagerResolver { media_sources });
-    let sub_io = FfmpegSubtitleIo {
-        path_manager,
-        ffmpeg_path,
-    };
-    let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
-    let subtitles: Arc<dyn SubtitleEncoder> =
-        Arc::new(SubtitleEncoderImpl::new(pure_encoder, sub_resolver));
 
     (hls, attachments, subtitles)
 }

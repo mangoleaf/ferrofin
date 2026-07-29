@@ -180,7 +180,7 @@ impl NumOrStr {
 /// Deserializes an optional `i32` that may arrive as a number, a numeric string,
 /// or an empty string (`""` → `None`).
 #[allow(clippy::cast_possible_truncation)]
-fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
+pub(crate) fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
     Ok(Option::<NumOrStr>::deserialize(d)?
         .as_ref()
         .and_then(NumOrStr::as_f64)

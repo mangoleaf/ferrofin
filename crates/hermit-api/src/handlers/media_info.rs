@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::item_update::opt_i32;
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
 
@@ -72,12 +73,22 @@ impl TranscoderSupport for HermitTranscoderSupport {
 }
 
 /// Query parameters for the playback-info endpoints.
-#[derive(Debug, serde::Deserialize)]
+///
+/// Jellyfin clients send these PascalCase (the C# model binder is
+/// case-insensitive; axum's `Query` is not), so each field carries a PascalCase
+/// alias alongside the camelCase rename.
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaybackInfoQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(default, alias = "UserId")]
     user_id: Option<Uuid>,
+    /// The requested audio stream index override.
+    #[serde(default, alias = "AudioStreamIndex")]
+    audio_stream_index: Option<i32>,
+    /// The requested subtitle stream index override (`-1` = none).
+    #[serde(default, alias = "SubtitleStreamIndex")]
+    subtitle_stream_index: Option<i32>,
 }
 
 /// Resolves the playback info for `item_id` and the effective user.
@@ -91,6 +102,7 @@ async fn playback_info(
     user_id: Option<Uuid>,
     profile: Option<&DeviceProfile>,
     max_streaming_bitrate: Option<i32>,
+    stream_selection: StreamSelection,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
     let resolved_user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
@@ -112,6 +124,7 @@ async fn playback_info(
                 max_streaming_bitrate,
                 auth.token.as_deref(),
                 auth.device_id.as_deref(),
+                stream_selection,
             );
         }
     }
@@ -187,10 +200,21 @@ fn hls_transcoding_max_audio_channels(profile: &DeviceProfile, container: &str) 
     fallback
 }
 
+/// The client's requested stream-index overrides, threaded from the
+/// PlaybackInfo query/body into the [`StreamBuilder`]'s [`MediaOptions`].
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamSelection {
+    /// The requested audio stream index.
+    audio_stream_index: Option<i32>,
+    /// The requested subtitle stream index (`-1` = none selected).
+    subtitle_stream_index: Option<i32>,
+}
+
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
 /// / remux stream, with the negotiated codecs) is set so the client transcodes.
+#[allow(clippy::too_many_arguments)]
 fn apply_stream_decision(
     source: &mut MediaSourceInfo,
     profile: &DeviceProfile,
@@ -198,12 +222,17 @@ fn apply_stream_decision(
     max_streaming_bitrate: Option<i32>,
     token: Option<&str>,
     device_id: Option<&str>,
+    stream_selection: StreamSelection,
 ) {
     let mut options = MediaOptions::new(profile.clone());
     options.item_id = item_id;
     options.media_source_id.clone_from(&source.id);
     options.device_id = device_id.map(str::to_owned);
     options.max_bitrate = max_streaming_bitrate;
+    // The client's explicit stream picks (a `-1` subtitle index means "none" —
+    // C# treats negatives as unset when resolving the stream).
+    options.audio_stream_index = stream_selection.audio_stream_index;
+    options.subtitle_stream_index = stream_selection.subtitle_stream_index.filter(|&i| i >= 0);
     options.media_sources = vec![source.clone()];
 
     let support = HermitTranscoderSupport;
@@ -270,8 +299,13 @@ fn apply_subtitle_delivery(
     token: Option<&str>,
 ) {
     // Relative URLs (empty base), matching the transcoding URL; all subtitles
-    // (not just a selected one) so the client knows how to handle each.
-    let infos = stream.get_subtitle_profiles(support, false, true, "", token);
+    // (not just a selected one) so the client knows how to handle each — but ONE
+    // resolved profile per stream (`enable_all_profiles=false`, the C#
+    // `SetDeviceSpecificData` overload). With `true` this yields an entry per
+    // device subtitle profile and the loop below overwrites the stream's
+    // delivery method with each in turn, so the last profile's Encode fallback
+    // clobbered the External+conversion match and no subtitle ever rendered.
+    let infos = stream.get_subtitle_profiles(support, false, false, "", token);
     for info in &infos {
         if let Some(sub) = source.media_streams.iter_mut().find(|s| {
             s.stream_type == hermit_model::entities::MediaStreamType::Subtitle
@@ -303,20 +337,38 @@ async fn get_playback_info(
     // The GET form carries no device profile, so every source keeps its static
     // (direct-play) shape.
     Ok(Json(
-        playback_info(&state, &auth, item_id, query.user_id, None, None).await?,
+        playback_info(
+            &state,
+            &auth,
+            item_id,
+            query.user_id,
+            None,
+            None,
+            StreamSelection::default(),
+        )
+        .await?,
     ))
 }
 
-/// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile plus
-/// the streaming limits used to negotiate the play method. Other posted fields
-/// (stream-index selections, etc.) are ignored for the basic path.
+/// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
+/// the streaming limits, and the stream-index selections used to negotiate the
+/// play method. Query parameters take precedence over body fields (the C#
+/// `?? playbackInfoDto?.Field` pattern).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct PlaybackInfoBody {
     #[serde(default)]
     device_profile: Option<DeviceProfile>,
-    #[serde(default)]
+    // The numeric fields use the lenient number-or-string deserializer: the C#
+    // binder runs with `JsonNumberHandling.AllowReadingFromString`, and clients
+    // (jellyfin-web track pickers) really do post `"AudioStreamIndex": "1"` — a
+    // strict i32 turns the whole request into a 422.
+    #[serde(default, deserialize_with = "opt_i32")]
     max_streaming_bitrate: Option<i32>,
+    #[serde(default, deserialize_with = "opt_i32")]
+    audio_stream_index: Option<i32>,
+    #[serde(default, deserialize_with = "opt_i32")]
+    subtitle_stream_index: Option<i32>,
 }
 
 /// `POST /Items/{itemId}/PlaybackInfo` — playback info with a posted profile.
@@ -339,6 +391,10 @@ async fn post_playback_info(
     body: Option<Json<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let stream_selection = StreamSelection {
+        audio_stream_index: query.audio_stream_index.or(body.audio_stream_index),
+        subtitle_stream_index: query.subtitle_stream_index.or(body.subtitle_stream_index),
+    };
     Ok(Json(
         playback_info(
             &state,
@@ -347,6 +403,7 @@ async fn post_playback_info(
             query.user_id,
             body.device_profile.as_ref(),
             body.max_streaming_bitrate,
+            stream_selection,
         )
         .await?,
     ))
@@ -527,6 +584,20 @@ mod tests {
     use hermit_model::dto::MediaSourceInfo;
     use hermit_model::entities::MediaStreamType;
     use hermit_model::entities_media::MediaStream;
+
+    #[test]
+    fn playback_info_body_accepts_stringly_numbers() {
+        // jellyfin-web posts stream indexes as strings ("1", "-1"); the C# binder
+        // accepts them (AllowReadingFromString) — a strict i32 made the whole
+        // PlaybackInfo request a 422.
+        let body: super::PlaybackInfoBody = serde_json::from_str(
+            r#"{"AudioStreamIndex":"1","SubtitleStreamIndex":"-1","MaxStreamingBitrate":"140000000"}"#,
+        )
+        .expect("lenient parse");
+        assert_eq!(body.audio_stream_index, Some(1));
+        assert_eq!(body.subtitle_stream_index, Some(-1));
+        assert_eq!(body.max_streaming_bitrate, Some(140_000_000));
+    }
 
     fn hls_video_profile(container: &str, max_channels: Option<&str>) -> TranscodingProfile {
         TranscodingProfile {

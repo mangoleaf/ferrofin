@@ -125,6 +125,14 @@ pub trait SubtitleIo: Send + Sync {
     ///
     /// Returns an error message on ffmpeg failure.
     async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String>;
+
+    /// Whether a cached subtitle file already exists at `path`. Port of the
+    /// `File.Exists` skip in `ExtractAllExtractableSubtitles` — without it every
+    /// subtitle request re-runs the full-file ffmpeg extraction (seconds per
+    /// request) instead of hitting the cache.
+    fn file_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_file()
+    }
 }
 
 /// A set of keyed async mutexes, replacing the C# `AsyncKeyedLocker<string>`.
@@ -459,7 +467,15 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
     /// serialized with the keyed lock. Errors are swallowed (logged in C#) so a
     /// single un-extractable stream cannot abort the caller.
     pub async fn extract_all_extractable_subtitles(&self, media_source: &MediaSourceInfo) {
-        let mut extractable: Vec<&MediaStream> = Vec::new();
+        let source_path = media_source.path.clone().unwrap_or_default();
+        let input_path = Self::io_input_argument(&source_path, media_source);
+        let mut args = format!("-y -i {input_path}");
+        let mut output_paths: Vec<String> = Vec::new();
+        // Guards for the paths this call extracts, held across the ffmpeg run so
+        // concurrent extractions of the same cache never race (the C# per-path
+        // `AsyncKeyedLock`).
+        let mut held = Vec::new();
+
         for stream in &media_source.media_streams {
             if !stream.is_extractable_subtitle_stream() {
                 continue;
@@ -468,20 +484,6 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             if stream.is_external && !ends_with_ignore_ascii_case(&stream_path, ".mks") {
                 continue;
             }
-            extractable.push(stream);
-        }
-
-        if extractable.is_empty() {
-            return;
-        }
-
-        let source_path = media_source.path.clone().unwrap_or_default();
-        let input_path = Self::io_input_argument(&source_path, media_source);
-        let mut args = format!("-y -i {input_path}");
-        let mut output_paths: Vec<String> = Vec::new();
-
-        for stream in extractable {
-            let stream_path = stream.path.clone().unwrap_or_default();
             if !stream_path.is_empty() && ends_with_ignore_ascii_case(&stream_path, ".mks") {
                 continue;
             }
@@ -490,6 +492,19 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             else {
                 continue;
             };
+            let Some(stream_index) = find_index(&media_source.media_streams, stream) else {
+                continue;
+            };
+            // Lock the output path, then skip a cache hit — the C# `File.Exists`
+            // skip. Without it every subtitle request re-runs the full-file
+            // ffmpeg extraction (seconds per request) instead of serving the
+            // already-extracted cache. Taking the lock first also means a
+            // concurrent extraction of the same path completes before the check.
+            let guard = self.locks.get(&output_path).lock_owned().await;
+            if self.io.file_exists(&output_path) {
+                continue;
+            }
+            held.push(guard);
             let codec = stream.codec.clone().unwrap_or_default();
             let output_codec = if is_codec_copyable(&codec) {
                 "copy"
@@ -500,9 +515,6 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                 " -f matroska"
             } else {
                 ""
-            };
-            let Some(stream_index) = find_index(&media_source.media_streams, stream) else {
-                continue;
             };
             output_paths.push(output_path.clone());
             let _ = write!(
@@ -515,18 +527,8 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             return;
         }
 
-        // Serialize per output path so concurrent extractions of the same cache
-        // never race, matching the C# per-path `AsyncKeyedLock`.
-        let mut guards = Vec::new();
-        for path in &output_paths {
-            guards.push(self.locks.get(path));
-        }
-        let mut held = Vec::new();
-        for g in &guards {
-            held.push(g.lock().await);
-        }
-
         let _ = self.io.extract(&args, &output_paths).await;
+        drop(held);
     }
 
     /// Converts an unsupported text subtitle to SRT via ffmpeg, once per path.

@@ -46,7 +46,9 @@ use hermit_model::entities_media::MediaStream;
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::MediaSourceManager;
-use hermit_traits::media_encoding::{HlsStreamRequest, MediaEncoder, TranscodingJobType};
+use hermit_traits::media_encoding::{
+    HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
+};
 use hermit_traits::system::ServerApplicationPaths as _;
 
 /// The default HLS segment length, in seconds.
@@ -100,6 +102,10 @@ pub struct HermitStreamStatePlanner {
     /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
     paths: Arc<HermitServerApplicationPaths>,
+    /// The subtitle encoder — resolves a burned **text** subtitle to its small
+    /// extracted/external file (cached across requests), so the `subtitles`
+    /// filter doesn't re-demux the whole media file on every ffmpeg (re)start.
+    subtitles: Arc<dyn SubtitleEncoder>,
 }
 
 impl HermitStreamStatePlanner {
@@ -111,6 +117,7 @@ impl HermitStreamStatePlanner {
     ///   and the stream-copy decision (`NoOptionalEncoders` → software only).
     /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
+    /// * `subtitles` — resolves a burned text subtitle to its cached file.
     #[must_use]
     pub fn new(
         media_sources: Arc<dyn MediaSourceManager>,
@@ -118,6 +125,7 @@ impl HermitStreamStatePlanner {
         encoding_helper: EncodingHelper<NoOptionalEncoders>,
         config: Arc<dyn ServerConfigurationManager>,
         paths: Arc<HermitServerApplicationPaths>,
+        subtitles: Arc<dyn SubtitleEncoder>,
     ) -> Self {
         Self {
             media_sources,
@@ -125,6 +133,7 @@ impl HermitStreamStatePlanner {
             encoding_helper,
             config,
             paths,
+            subtitles,
         }
     }
 
@@ -427,11 +436,15 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
 
         // Build the base options from the request so the copy decision + arg
-        // builder read the client's declared targets/limits.
+        // builder read the client's declared targets/limits. The subtitle index
+        // is load-bearing: `can_stream_copy_video` must refuse `-c:v copy` when a
+        // subtitle is burned in (a filter and a stream-copy can't coexist —
+        // ffmpeg exits immediately and playback never starts).
         let base_request = BaseEncodingJobOptions {
             audio_codec: Some(requested_audio_codec.clone()),
             transcoding_max_audio_channels: request.transcoding_max_audio_channels,
             is_static: request.is_static,
+            subtitle_stream_index: subtitle_index,
             ..BaseEncodingJobOptions::default()
         };
 
@@ -528,6 +541,25 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         probe_state.wait_for_path = Some(wait_for_path);
         let state = probe_state;
 
+        // Resolve a burned *text* subtitle to its standalone file (extracting to
+        // the subtitle cache once; the C# `GetSubtitleFilePath`). The `subtitles`
+        // filter otherwise re-demuxes the entire source file to load cues on
+        // every ffmpeg (re)start — tens of seconds added to every play/seek.
+        // On resolution failure fall back to `si=` on the original input.
+        let burn_subtitle_path = if state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+            && let Some(sub) = state
+                .subtitle_stream
+                .as_ref()
+                .filter(|s| s.is_text_subtitle_stream())
+        {
+            self.subtitles
+                .get_subtitle_file_path(sub, &media_source)
+                .await
+                .ok()
+        } else {
+            None
+        };
+
         // ---- (4) BUILD FFMPEG ARGS (GetCommandLineArguments) ----------------
         let arguments = self.build_arguments(
             &state,
@@ -536,6 +568,7 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             &segment_container,
             &playlist_path,
             &options,
+            burn_subtitle_path.as_deref(),
         );
 
         // ---- (5) RETURN the TranscodePlan -----------------------------------
@@ -580,7 +613,7 @@ impl HermitStreamStatePlanner {
     // A flat, linear ffmpeg arg-builder — one push per option, in ffmpeg's
     // command order. Splitting it would only scatter the sequence across helpers
     // that re-thread the same state/paths (same rationale as `plan`).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn build_arguments(
         &self,
         state: &EncodingJobInfo,
@@ -589,6 +622,7 @@ impl HermitStreamStatePlanner {
         segment_container: &str,
         playlist_path: &std::path::Path,
         options: &EncodingOptions,
+        burn_subtitle_path: Option<&str>,
     ) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
 
@@ -601,8 +635,12 @@ impl HermitStreamStatePlanner {
         // Burning a graphical subtitle needs the decoded frames in system memory
         // for the `overlay` filter, so we can't keep them on the GPU
         // (`-hwaccel_output_format cuda`); NVENC still uploads the filtered frames.
-        let burn_sub =
+        let burn_graphical =
             hermit_mediaencoding::encoding_helper::helper::burns_graphical_subtitle(state);
+        // Burning a *text* subtitle (the Encode delivery for srt/ass/…) uses the
+        // `subtitles` filter, which likewise needs frames in system memory.
+        let burn_text = burns_text_subtitle(state);
+        let burn_sub = burn_graphical || burn_text;
 
         // ---- input ------------------------------------------------------------
         // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
@@ -720,11 +758,63 @@ impl HermitStreamStatePlanner {
             }
         }
 
+        // ---- text subtitle burn-in -------------------------------------------
+        // Render the text subtitle onto the video with the `subtitles` filter
+        // (libass), preferring the small extracted/external subtitle file (the
+        // cached `GetSubtitleFilePath` result — the filter loads it instantly).
+        // The fallback reads the track straight from the media file (`si=`
+        // selects among its embedded subtitle streams), which re-demuxes the
+        // whole source to find cues — correct, but slow on every start.
+        if burn_text
+            && !copying_video
+            && let Some(sub) = state.subtitle_stream.as_ref()
+        {
+            use std::fmt::Write as _;
+            let mut chain = String::new();
+            // An input `-ss` seek resets frame PTS to ~0, but the filter picks
+            // cues by PTS — shift PTS to the absolute position for the filter,
+            // then back so the muxer's `-output_ts_offset` numbering still holds.
+            let offset_secs = segment_id
+                .filter(|&id| id > 0)
+                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
+            if let Some(off) = offset_secs {
+                let _ = write!(chain, "setpts=PTS+{off}/TB,");
+            }
+            let external_path =
+                burn_subtitle_path.or_else(|| sub.path.as_deref().filter(|_| sub.is_external));
+            if let Some(path) = external_path {
+                let _ = write!(chain, "subtitles=f='{}'", escape_subtitle_filter_path(path));
+            } else {
+                let si = state
+                    .media_source
+                    .media_streams
+                    .iter()
+                    .filter(|s| s.stream_type == MediaStreamType::Subtitle && !s.is_external)
+                    .position(|s| s.index == sub.index)
+                    .unwrap_or(0);
+                let _ = write!(
+                    chain,
+                    "subtitles=f='{}':si={si}",
+                    escape_subtitle_filter_path(media_path)
+                );
+            }
+            if let Some(off) = offset_secs {
+                let _ = write!(chain, ",setpts=PTS-{off}/TB");
+            }
+            // h264 is 8-bit only; the burn path bypassed the `-vf scale_cuda`
+            // down-convert, so do it inside this chain.
+            if video_encoder == "h264_nvenc" {
+                chain.push_str(",format=nv12");
+            }
+            args.push("-vf".to_owned());
+            args.push(chain);
+        }
+
         // ---- graphical subtitle burn-in --------------------------------------
         // Composite the (bitmap) subtitle stream onto the video: `overlay` takes
         // the base video and the decoded subtitle as its two inputs and emits the
         // labelled `[v]` that `map_args` maps in place of the raw video.
-        if burn_sub && let Some(sub) = state.subtitle_stream.as_ref() {
+        if burn_graphical && let Some(sub) = state.subtitle_stream.as_ref() {
             let sub_idx = sub.index.max(0);
             let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
             // h264 (8-bit only) needs the overlaid frames down-converted to nv12 —
@@ -838,6 +928,29 @@ fn resolve_output_audio_channels(
         result = Some(result.map_or(cap, |r| r.min(cap)));
     }
     result
+}
+
+/// Whether the transcode burns a **text** subtitle (srt/ass/…) into the video
+/// via the `subtitles` filter. The graphical (PGS/DVDSUB) counterpart is
+/// [`burns_graphical_subtitle`](hermit_mediaencoding::encoding_helper::helper::burns_graphical_subtitle);
+/// text subs are normally delivered externally, so this only fires when the
+/// client explicitly asks for Encode (e.g. the "burn all subtitles" setting).
+fn burns_text_subtitle(state: &EncodingJobInfo) -> bool {
+    state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+        && state.video_stream.is_some()
+        && state
+            .subtitle_stream
+            .as_ref()
+            .is_some_and(MediaStream::is_text_subtitle_stream)
+}
+
+/// Escapes a path for use inside a `subtitles=f='…'` filter option. Port of
+/// `MediaEncoder.EscapeSubtitleFilterPath`: the filtergraph parser and the
+/// filter's own option parser each unescape once, so quotes are double-escaped.
+fn escape_subtitle_filter_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "'\\\\\\''")
 }
 
 /// Pushes each whitespace-separated token of `fragment` as its own arg.
@@ -1015,6 +1128,15 @@ mod tests {
         }
     }
 
+    fn subtitle_stream(codec: &str, index: i32) -> MediaStream {
+        MediaStream {
+            codec: Some(codec.to_owned()),
+            index,
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        }
+    }
+
     fn source(id: &str, streams: Vec<MediaStream>) -> MediaSourceInfo {
         MediaSourceInfo {
             id: Some(id.to_owned()),
@@ -1038,7 +1160,10 @@ mod tests {
             "/web",
         ));
         let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
-        HermitStreamStatePlanner::new(media_sources, encoder, helper, config, paths)
+        // The disabled stub always errors, exercising the `si=` burn fallback.
+        let subtitles: Arc<dyn SubtitleEncoder> =
+            Arc::new(hermit_traits::stubs::DisabledSubtitleEncoder);
+        HermitStreamStatePlanner::new(media_sources, encoder, helper, config, paths, subtitles)
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
@@ -1232,6 +1357,90 @@ mod tests {
         let p = planner(vec![src]);
         let result = p.plan(&request("nope"), false, None).await;
         assert!(matches!(result, Err(ServiceError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn plan_burns_embedded_text_subtitle_and_refuses_video_copy() {
+        // An h264 source the client can play would normally stream-copy; a
+        // selected text subtitle (SubtitleStreamIndex in the transcode URL)
+        // must force a re-encode with a `subtitles` burn filter — `-c:v copy`
+        // plus a filter makes ffmpeg exit immediately.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.query_string = "?SubtitleStreamIndex=2".to_owned();
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("-vf subtitles=f='/media/movie.mkv':si=0"),
+            "expected embedded si= burn filter, got: {args}"
+        );
+        assert!(!args.contains("-c:v copy"), "must not stream-copy: {args}");
+    }
+
+    #[tokio::test]
+    async fn plan_seek_wraps_text_burn_in_setpts_shift() {
+        // A seek restart input-seeks with `-ss`, resetting frame PTS to ~0; the
+        // subtitles filter picks cues by PTS, so the chain must shift PTS to
+        // the absolute position for the filter and back for the muxer.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2".to_owned();
+        let plan = p.plan(&req, false, Some(3)).await.unwrap();
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str())
+            .expect("-vf present");
+        // 3 segments * 6 s = 18 s shift.
+        assert!(
+            vf.starts_with("setpts=PTS+18/TB,subtitles=") && vf.contains(",setpts=PTS-18/TB"),
+            "expected setpts sandwich, got: {vf}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_without_subtitle_index_has_no_burn_filter() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "no subtitle selected → no burn filter: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn escape_subtitle_filter_path_escapes_metacharacters() {
+        // Port of `MediaEncoder.EscapeSubtitleFilterPath` oracle values.
+        assert_eq!(escape_subtitle_filter_path("/a/b.mkv"), "/a/b.mkv");
+        assert_eq!(escape_subtitle_filter_path("C:\\a.mkv"), "C\\:/a.mkv");
+        assert_eq!(escape_subtitle_filter_path("/a's.mkv"), "/a'\\\\\\''s.mkv");
     }
 
     #[tokio::test]

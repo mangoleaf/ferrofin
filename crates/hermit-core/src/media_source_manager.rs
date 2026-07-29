@@ -25,6 +25,7 @@ use hermit_db::entities::base_items::{
     AttachmentStreamInfoEntity, BaseItemEntity, MediaStreamInfoEntity,
 };
 use hermit_model::dto::{MediaSourceInfo, MediaSourceType};
+use hermit_model::entities::MediaStreamType;
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
 use hermit_model::media_info::{LiveStreamRequest, MediaProtocol};
 use uuid::Uuid;
@@ -255,6 +256,17 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
     // Compose the display title from the now-populated codec/language/channel
     // fields so clients don't fall back to "Undefined".
     stream.display_title = stream.display_title();
+    // Port of `MediaSourceManager.StreamSupportsExternalStream`: stamp whether a
+    // subtitle can be delivered as a separate stream (external file, extractable
+    // text, or PGS/VobSub). Not persisted — derived on every load, like C#.
+    // Without it the StreamBuilder's External+conversion match always fails and
+    // every embedded text subtitle silently falls back to Encode with no URL.
+    if stream.stream_type == MediaStreamType::Subtitle {
+        stream.supports_external_stream = stream.is_external
+            || stream.is_text_subtitle_stream()
+            || stream.is_pgs_subtitle_stream()
+            || stream.is_vob_sub_subtitle_stream();
+    }
     stream
 }
 
