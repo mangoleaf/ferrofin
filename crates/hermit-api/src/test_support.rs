@@ -1466,7 +1466,8 @@ impl MediaSegmentManager for FakeMediaSegments {
         unimplemented!("fake")
     }
     async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
-        unimplemented!("fake")
+        // Consulted by every PlaybackInfo call (the `HasSegments` stamp).
+        Ok(false)
     }
     async fn get_supported_providers(
         &self,

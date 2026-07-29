@@ -111,6 +111,20 @@ async fn playback_info(
         .get_playback_media_sources(item_id, resolved_user_id, true, true)
         .await?;
 
+    // Stamp `HasSegments` from the media-segment store (upstream
+    // MediaSourceManager does this via IMediaSegmentManager). jellyfin-web's
+    // segment manager checks this flag at playback start and never even
+    // fetches `/MediaSegments/{id}` without it — so the skip-intro button
+    // can't appear regardless of what detection stored.
+    let has_segments = state
+        .media_segments
+        .has_segments(item_id)
+        .await
+        .unwrap_or(false);
+    for source in &mut media_sources {
+        source.has_segments = has_segments;
+    }
+
     // When the client posts its device profile, decide per source whether it can
     // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't
     // decode). Without this every source claimed direct-play, so incompatible-audio
