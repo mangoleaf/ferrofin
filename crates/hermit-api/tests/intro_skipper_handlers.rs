@@ -31,7 +31,7 @@ use hermit_traits::tasks::TaskManager;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0x1a7b_05c1_5c1b_4d0e_9f00_1247_a105_c1de);
+const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
 // --- Minimal working fakes for the four small managers the routes touch ------
 

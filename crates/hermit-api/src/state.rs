@@ -163,6 +163,13 @@ pub struct Inner {
     /// manager via [`AppState::with_live_tv`]; while unset the Live TV routes
     /// report the disabled/empty state.
     pub live_tv: Option<Arc<dyn hermit_traits::stubs::LiveTvManager>>,
+
+    /// The web-file transformation pipeline (the File Transformation
+    /// extension). `None` until the composition root wires it via
+    /// [`AppState::with_file_transformations`]; while unset a transformation
+    /// registration is accepted and dropped (nothing serves transformable
+    /// files without the composition root's web mount anyway).
+    pub file_transformations: Option<Arc<dyn hermit_traits::plugins::FileTransformationService>>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -241,6 +248,7 @@ impl AppState {
             sync_play: None,
             session_bus: None,
             live_tv: None,
+            file_transformations: None,
             music,
             similar_items,
             search,
@@ -435,6 +443,24 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_live_tv must be called before the state is shared");
         inner.live_tv = Some(live_tv);
+        self
+    }
+
+    /// Wires the web-file transformation pipeline (the File Transformation
+    /// extension), shared with the static web mount so registrations made via
+    /// `POST /FileTransformation/RegisterTransformation` apply to served files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_file_transformations(
+        mut self,
+        service: Arc<dyn hermit_traits::plugins::FileTransformationService>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_file_transformations must be called before the state is shared");
+        inner.file_transformations = Some(service);
         self
     }
 

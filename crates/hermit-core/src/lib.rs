@@ -250,7 +250,7 @@ pub use music_manager::HermitMusicManager;
 pub use next_up_service::HermitNextUpService;
 pub use path_manager::HermitPathManager;
 pub use people_repository::HermitPeopleRepository;
-pub use plugin_manager::{HermitPluginManager, RegisteredPlugin};
+pub use plugin_manager::{HermitPluginManager, PluginConfigPage, RegisteredPlugin};
 pub use quick_connect_manager::HermitQuickConnect;
 pub use scheduled_tasks::{HermitTaskManager, RefreshLibraryTask, ScheduledTask};
 pub use search_manager::HermitSearchManager;

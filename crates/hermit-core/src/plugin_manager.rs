@@ -38,10 +38,28 @@ pub struct RegisteredPlugin {
     /// The plugin's default configuration (JSON bytes), returned until the admin
     /// writes a value.
     pub default_config: Vec<u8>,
-    /// The plugin's dashboard settings page as `(page name, HTML)`, if it ships
-    /// one — projected into `GET /web/ConfigurationPages` + served by
-    /// `GET /web/ConfigurationPage?name=…` so the dashboard shows a Settings link.
-    pub config_page: Option<(String, Vec<u8>)>,
+    /// The plugin's dashboard pages/resources — projected into
+    /// `GET /web/ConfigurationPages` + served by
+    /// `GET /web/ConfigurationPage?name=…` so the dashboard shows a Settings
+    /// link. The first page is the plugin's main settings page (jellyfin-web
+    /// links the first page whose `PluginId` matches); the rest are typically
+    /// the JS/CSS resources that page loads by name.
+    pub config_pages: Vec<PluginConfigPage>,
+}
+
+/// One dashboard page (or page resource) a plugin ships. Mirrors the C#
+/// `PluginPageInfo`: a name the dashboard fetches by, the bytes, and whether the
+/// page gets a main-menu (drawer) link.
+#[derive(Debug, Clone)]
+pub struct PluginConfigPage {
+    /// The name the page is fetched by (`?name=…`); resources keep their file
+    /// extension (e.g. `introskipper.js`) so the server picks the MIME type.
+    pub name: String,
+    /// The raw page/resource bytes.
+    pub bytes: Vec<u8>,
+    /// Whether the dashboard drawer shows a direct link to this page
+    /// (`EnableInMainMenu`).
+    pub enable_in_main_menu: bool,
 }
 
 impl RegisteredPlugin {
@@ -56,7 +74,7 @@ impl RegisteredPlugin {
             descriptor,
             image,
             default_config: b"{}".to_vec(),
-            config_page: None,
+            config_pages: Vec::new(),
         }
     }
 
@@ -67,10 +85,11 @@ impl RegisteredPlugin {
         self
     }
 
-    /// Attaches the plugin's dashboard settings page (`page name`, `HTML`).
+    /// Appends a dashboard page/resource. Call once per page; the first call
+    /// registers the plugin's main settings page.
     #[must_use]
-    pub fn with_config_page(mut self, name: impl Into<String>, html: Vec<u8>) -> Self {
-        self.config_page = Some((name.into(), html));
+    pub fn with_config_page(mut self, page: PluginConfigPage) -> Self {
+        self.config_pages.push(page);
         self
     }
 }
@@ -296,37 +315,75 @@ impl PluginManager for HermitPluginManager {
                 }
             }
         }
+        // The compiled-in plugins are real installed packages even when no
+        // repository lists them — synthesize a catalog entry for each so
+        // `GET /Packages/{name}?assemblyGuid=…` (the dashboard's plugin detail
+        // page) resolves instead of 404ing. A repository entry with the same
+        // guid wins (it carries richer version/changelog data).
+        for plugin in &self.plugins {
+            if packages.iter().any(|p| p.id == plugin.descriptor.id) {
+                continue;
+            }
+            packages.push(PackageInfo {
+                name: plugin.descriptor.name.clone(),
+                description: plugin.descriptor.description.clone(),
+                overview: plugin.descriptor.description.clone(),
+                owner: "Hermit (compiled-in)".to_owned(),
+                category: "General".to_owned(),
+                id: plugin.descriptor.id,
+                versions: vec![hermit_model::updates::VersionInfo {
+                    version: plugin.descriptor.version.clone(),
+                    version_number: Some(plugin.descriptor.version.clone()),
+                    changelog: None,
+                    target_abi: None,
+                    source_url: None,
+                    checksum: None,
+                    timestamp: None,
+                    repository_name: "Hermit built-in".to_owned(),
+                    repository_url: String::new(),
+                }],
+                image_url: None,
+            });
+        }
         Ok(packages)
     }
 
     async fn get_configuration_pages(
         &self,
     ) -> Result<Vec<hermit_model::plugins::ConfigurationPageInfo>, ServiceError> {
-        Ok(self
-            .plugins
-            .iter()
-            .filter_map(|plugin| {
-                plugin.config_page.as_ref().map(|(name, _)| {
-                    hermit_model::plugins::ConfigurationPageInfo {
-                        name: name.clone(),
-                        enable_in_main_menu: false,
-                        menu_section: None,
-                        menu_icon: None,
-                        display_name: Some(plugin.descriptor.name.clone()),
-                        plugin_id: Some(plugin.descriptor.id),
-                    }
-                })
-            })
-            .collect())
+        let mut pages = Vec::new();
+        for plugin in &self.plugins {
+            // A page declared main-menu-enabled can be vetoed by the plugin's
+            // own stored configuration (the Intro Skipper convention:
+            // `EnableInMainMenu = Configuration.EnableMainMenu ?? true`).
+            let menu_allowed = self
+                .get_plugin_configuration(plugin.descriptor.id)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|v| v.get("EnableMainMenu").and_then(serde_json::Value::as_bool))
+                .unwrap_or(true);
+            for page in &plugin.config_pages {
+                pages.push(hermit_model::plugins::ConfigurationPageInfo {
+                    name: page.name.clone(),
+                    enable_in_main_menu: page.enable_in_main_menu && menu_allowed,
+                    menu_section: None,
+                    menu_icon: None,
+                    display_name: Some(plugin.descriptor.name.clone()),
+                    plugin_id: Some(plugin.descriptor.id),
+                });
+            }
+        }
+        Ok(pages)
     }
 
     async fn get_configuration_page(&self, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
         Ok(self.plugins.iter().find_map(|plugin| {
             plugin
-                .config_page
-                .as_ref()
-                .filter(|(page_name, _)| page_name == name)
-                .map(|(_, html)| html.clone())
+                .config_pages
+                .iter()
+                .find(|page| page.name.eq_ignore_ascii_case(name))
+                .map(|page| page.bytes.clone())
         }))
     }
 }

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use hermit_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episodes};
-use hermit_core::ScheduledTask;
+use hermit_core::{PluginConfigPage, ScheduledTask};
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_model::data::BaseItemKind;
 use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
@@ -35,8 +35,10 @@ use uuid::Uuid;
 use crate::fingerprint::Fingerprinter;
 use crate::{Extension, ExtensionContext};
 
-/// The Intro Skipper's stable plugin id (also its `/Plugins` id).
-const EXTENSION_ID: Uuid = Uuid::from_u128(0x1a7b_05c1_5c1b_4d0e_9f00_1247_a105_c1de);
+/// The Intro Skipper's stable plugin id (also its `/Plugins` id) — the
+/// **upstream plugin's GUID**, because the vendored dashboard app and third-party
+/// client integrations address the plugin by that id.
+const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
 /// The media-segment provider id stamped on segments this extension writes, so a
 /// re-run replaces only its own rows (never user-authored ones).
@@ -95,13 +97,32 @@ impl Extension for IntroSkipperExtension {
         serde_json::to_vec_pretty(&IntroSkipperConfig::default()).unwrap_or_else(|_| b"{}".to_vec())
     }
 
-    fn config_page(&self) -> Option<(String, Vec<u8>)> {
-        // The dashboard settings page (name = "introskipper"). Served by
-        // `GET /web/ConfigurationPage?name=introskipper`.
-        Some((
-            "introskipper".to_owned(),
-            include_bytes!("intro_skipper_config.html").to_vec(),
-        ))
+    fn config_pages(&self) -> Vec<PluginConfigPage> {
+        // The upstream plugin's own dashboard pages, vendored at build time
+        // (see `build.rs`): the "Intro Skipper" shell page (main-menu-enabled,
+        // vetoed at list time by the `EnableMainMenu` config toggle) plus the
+        // built JS/CSS app it loads by name — so the settings page renders
+        // exactly as on a Jellyfin-hosted install.
+        vec![
+            PluginConfigPage {
+                name: "Intro Skipper".to_owned(),
+                bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/configPage.html"))
+                    .to_vec(),
+                enable_in_main_menu: true,
+            },
+            PluginConfigPage {
+                name: "introskipper.js".to_owned(),
+                bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.js"))
+                    .to_vec(),
+                enable_in_main_menu: false,
+            },
+            PluginConfigPage {
+                name: "introskipper.css".to_owned(),
+                bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.css"))
+                    .to_vec(),
+                enable_in_main_menu: false,
+            },
+        ]
     }
 
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
@@ -282,6 +303,12 @@ pub struct IntroSkipperConfig {
     pub maximum_time_skip: f64,
     /// Fuzzy point-value tolerance when matching points across episodes.
     pub inverted_index_shift: i32,
+
+    /// Server-managed flag: whether the File Transformation plugin is present.
+    /// Read-only from the dashboard's perspective; the File Transformation
+    /// extension is compiled in, so this is always `true` (the settings page
+    /// uses it to enable the `UseFileTransformationPlugin` toggle).
+    pub file_transformation_plugin_enabled: bool,
 }
 
 impl Default for IntroSkipperConfig {
@@ -366,6 +393,9 @@ impl Default for IntroSkipperConfig {
             maximum_fingerprint_point_differences: 6,
             maximum_time_skip: 3.5,
             inverted_index_shift: 2,
+            // The File Transformation extension is compiled in, so it is
+            // always "installed" (the upstream flag = plugin presence).
+            file_transformation_plugin_enabled: true,
         }
     }
 }

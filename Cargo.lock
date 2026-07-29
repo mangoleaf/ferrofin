@@ -1132,6 +1132,8 @@ dependencies = [
  "hermit-db",
  "hermit-model",
  "hermit-traits",
+ "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

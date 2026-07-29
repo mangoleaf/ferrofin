@@ -51,8 +51,9 @@ use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The compiled-in Intro Skipper extension id (mirrors `EXTENSION_ID` in
-/// `hermit-extensions`).
-const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0x1a7b_05c1_5c1b_4d0e_9f00_1247_a105_c1de);
+/// `hermit-extensions` — the upstream plugin's GUID, which the plugin's own
+/// dashboard app and client integrations hardcode).
+const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 /// The media-segment provider id the extension writes its rows under.
 const PROVIDER_ID: &str = "IntroSkipper";
 /// The scheduled-task key that runs a detection pass.
@@ -740,18 +741,59 @@ async fn scan_season(
 // FileTransformation hook
 // ---------------------------------------------------------------------------
 
-/// `POST /FileTransformation/RegisterTransformation` — accept a transformation
-/// registration.
+/// The File Transformation plugin's registration body
+/// (`TransformationRegistrationPayload` upstream, camelCase on the wire).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct TransformationRegistration {
+    /// The registering plugin's id.
+    id: Uuid,
+    /// The exact web-root-relative path or regex to transform.
+    file_name_pattern: String,
+    /// The HTTP callback the pipeline POSTs `{"contents": …}` to.
+    transformation_endpoint: String,
+    /// A .NET named-pipe callback (unsupported — .NET-process-specific).
+    transformation_pipe: Option<String>,
+    /// A .NET assembly-reflection callback (unsupported — compiled-in
+    /// extensions register natively through the service instead).
+    callback_assembly: Option<String>,
+}
+
+/// `POST /FileTransformation/RegisterTransformation` — register a web-file
+/// transformation.
 ///
-/// In Jellyfin this belongs to the separate File Transformation plugin that
-/// rewrites served web-client assets so the skip button can be injected. Hermit
-/// serves no web client, so there is nothing to transform; the registration is
-/// accepted (200) and dropped.
-// ponytail: no web-asset pipeline in Hermit; accept-and-drop.
+/// Port of `FileTransformationController.RegisterTransformation`: registers an
+/// HTTP-callback transformation with the pipeline the static `/web` mount
+/// consults. The .NET-specific callback forms (assembly reflection, named
+/// pipes) cannot exist in a Rust process; a registration carrying only those is
+/// still `200` (upstream always is) but logged, since it can never fire.
 async fn register_transformation(
+    State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Json(_payload): Json<serde_json::Value>,
+    Json(payload): Json<TransformationRegistration>,
 ) -> StatusCode {
+    let Some(service) = state.file_transformations.as_ref() else {
+        tracing::warn!("file-transformation registration dropped: pipeline not wired");
+        return StatusCode::OK;
+    };
+    if payload.transformation_endpoint.is_empty() {
+        tracing::warn!(
+            id = %payload.id,
+            pattern = payload.file_name_pattern,
+            assembly = payload.callback_assembly.as_deref().unwrap_or_default(),
+            pipe = payload.transformation_pipe.as_deref().unwrap_or_default(),
+            "file-transformation registration has no HTTP endpoint; \
+             .NET assembly/pipe callbacks are unsupported in Hermit"
+        );
+        return StatusCode::OK;
+    }
+    service
+        .add_endpoint_transformation(
+            payload.id,
+            &payload.file_name_pattern,
+            &payload.transformation_endpoint,
+        )
+        .await;
     StatusCode::OK
 }
 

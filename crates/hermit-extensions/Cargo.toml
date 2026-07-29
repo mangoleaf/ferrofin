@@ -16,6 +16,8 @@ hermit-core.workspace = true
 hermit-model.workspace = true
 hermit-db.workspace = true
 async-trait.workspace = true
+regex.workspace = true
+reqwest.workspace = true
 tokio = { workspace = true }
 uuid.workspace = true
 serde.workspace = true

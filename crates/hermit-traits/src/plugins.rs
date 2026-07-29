@@ -124,6 +124,60 @@ pub trait PluginManager: Send + Sync {
 
 fn _assert_object_safe_plugin_manager(_: &dyn PluginManager) {}
 
+/// One step of a web-file transformation pipeline.
+///
+/// Port of the File Transformation plugin's `TransformFile` delegate: given the
+/// served file's (web-root-relative) path and its current textual contents,
+/// returns the transformed contents. Implementations must be pure over their
+/// inputs plus their own configuration — the pipeline may run them on every
+/// request of a matching file.
+#[async_trait]
+pub trait FileTransformer: Send + Sync {
+    /// Transforms `contents` for the file at `path`.
+    async fn transform(&self, path: &str, contents: String) -> String;
+}
+
+fn _assert_object_safe_file_transformer(_: &dyn FileTransformer) {}
+
+/// The web-file transformation pipeline — the File Transformation plugin's
+/// `IWebFileTransformation{Read,Write}Service`, as one object-safe seam.
+///
+/// Registrations map a file-name pattern (an exact web-root-relative path, or a
+/// regex) to an ordered pipeline of [`FileTransformer`]s. The static web server
+/// consults [`needs_transformation`](Self::needs_transformation) per request and
+/// routes matching files through [`run_transformation`](Self::run_transformation).
+#[async_trait]
+pub trait FileTransformationService: Send + Sync {
+    /// Whether any registered transformation matches `path` (leading `/`
+    /// ignored). Port of `NeedsTransformation`.
+    async fn needs_transformation(&self, path: &str) -> bool;
+
+    /// Runs the matching pipeline over `contents`, returning the transformed
+    /// text (unchanged when nothing matches). Port of `RunTransformation`.
+    async fn run_transformation(&self, path: &str, contents: String) -> String;
+
+    /// Registers an in-process transformer for `file_name_pattern` under `id`
+    /// (idempotent per id within a pattern). Port of `AddTransformation`.
+    async fn add_transformation(
+        &self,
+        id: Uuid,
+        file_name_pattern: &str,
+        transformer: std::sync::Arc<dyn FileTransformer>,
+    );
+
+    /// Registers an HTTP-callback transformer: the pipeline POSTs
+    /// `{"contents": …}` to `endpoint` (a relative endpoint resolves against
+    /// this server's own base URL) and uses the response body as the
+    /// transformed contents. Port of the `TransformationEndpoint` callback in
+    /// `TransformationHelper.ApplyTransformation`.
+    async fn add_endpoint_transformation(&self, id: Uuid, file_name_pattern: &str, endpoint: &str);
+
+    /// Removes every registration made under `id`. Port of `RemoveTransformation`.
+    async fn remove_transformation(&self, id: Uuid);
+}
+
+fn _assert_object_safe_file_transformation_service(_: &dyn FileTransformationService) {}
+
 /// A disabled [`PluginManager`]: no plugins installed, no repositories, mutators
 /// rejected. Used as the [`AppState`](../../hermit_api/state) default so test
 /// constructors compile; the composition root injects the real manager.

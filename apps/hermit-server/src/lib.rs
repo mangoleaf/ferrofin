@@ -28,6 +28,7 @@ pub mod state;
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::Router;
@@ -146,6 +147,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let router = mount_web(
         hermit_api::create_router(wired.state.clone()),
         &config.web_dir,
+        Arc::clone(&wired.file_transformations),
     );
 
     // Post-startup: flip the host's core-startup flag (mirrors `CoreAppHost`
@@ -255,7 +257,11 @@ fn normalize_query_keys(query: &str) -> String {
 /// would against upstream Jellyfin. If the directory has no `index.html` the
 /// server runs API-only and `/` returns `404` (the API is unaffected either way,
 /// since no contract route lives under `/web` or at `/`).
-fn mount_web(router: Router, web_dir: &Path) -> Router {
+fn mount_web(
+    router: Router,
+    web_dir: &Path,
+    transformations: Arc<dyn hermit_traits::plugins::FileTransformationService>,
+) -> Router {
     let index = web_dir.join("index.html");
     if !index.is_file() {
         tracing::info!(
@@ -279,10 +285,74 @@ fn mount_web(router: Router, web_dir: &Path) -> Router {
     // in-place. We can't add a `route("/web", …)` redirect (axum rejects the
     // duplicate `/web` and panics), so a thin middleware layer redirects the exact
     // `/web` path to `/web/` **before** it reaches the nested `ServeDir`.
+    // The File Transformation pipeline runs as a layer in front of `ServeDir`:
+    // a matching file is read, transformed, and served directly; everything
+    // else falls through to the plain static serving. The pipeline self-gates
+    // on the File Transformation plugin's enabled flag, so with it disabled
+    // every request takes the `needs_transformation → false` fast path.
+    let web_root = web_dir.to_path_buf();
+    let transform_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
+        let transformations = Arc::clone(&transformations);
+        let web_root = web_root.clone();
+        async move { transform_web_file(&transformations, &web_root, req, next).await }
+    });
     router
         .nest_service("/web", ServeDir::new(web_dir))
         .route("/", get(|| async { Redirect::permanent("/web/") }))
         .layer(axum::middleware::from_fn(redirect_bare_web))
+        .layer(transform_layer)
+}
+
+/// Serves a `/web` file through the File Transformation pipeline when a
+/// registered transformation matches it; all other requests pass through to
+/// the static `ServeDir` untouched.
+///
+/// Port of the File Transformation plugin's static-file middleware: it reads
+/// the matched file, runs the pipeline over its text, and responds with the
+/// transformed contents (binary or unreadable files fall through untouched).
+async fn transform_web_file(
+    transformations: &Arc<dyn hermit_traits::plugins::FileTransformationService>,
+    web_root: &Path,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if req.method() == axum::http::Method::GET
+        && let Some(rel) = path.strip_prefix("/web/").filter(|r| !r.is_empty())
+        // Reject any path that could escape the web root (`..`, absolute).
+        && !Path::new(rel).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        && transformations.needs_transformation(rel).await
+        && let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        let transformed = transformations.run_transformation(rel, text).await;
+        return (
+            [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+            transformed,
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// The MIME type for a transformed web file, from its extension (the plain
+/// `ServeDir` path normally derives this; a transformed response must match).
+fn web_file_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or_default() {
+        "js" | "mjs" => "application/javascript",
+        "css" => "text/css",
+        "html" => "text/html; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        _ => "text/plain; charset=utf-8",
+    }
 }
 
 /// Redirects the exact path `/web` (no trailing slash) to `/web/`, so
@@ -302,14 +372,50 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use hermit_traits::plugins::FileTransformationService;
+    use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    /// An upper-casing test transformer.
+    struct Upper;
+    #[async_trait::async_trait]
+    impl hermit_traits::plugins::FileTransformer for Upper {
+        async fn transform(&self, _path: &str, contents: String) -> String {
+            contents.to_uppercase()
+        }
+    }
+
+    /// An identity test transformer (registration presence is what matters).
+    struct Identity;
+    #[async_trait::async_trait]
+    impl hermit_traits::plugins::FileTransformer for Identity {
+        async fn transform(&self, _path: &str, contents: String) -> String {
+            contents
+        }
+    }
+
+    /// A transformation service over the extension registry with the File
+    /// Transformation plugin registered (and thus enabled by default).
+    fn transformations(plugins_dir: &std::path::Path) -> Arc<dyn FileTransformationService> {
+        let plugins: Arc<dyn hermit_traits::plugins::PluginManager> =
+            Arc::new(hermit_core::HermitPluginManager::new(
+                hermit_extensions::registered_plugins(&hermit_extensions::builtin_extensions()),
+                plugins_dir.to_path_buf(),
+            ));
+        Arc::new(
+            hermit_extensions::file_transformation::WebFileTransformationService::new(
+                plugins,
+                "http://127.0.0.1:0".to_owned(),
+            ),
+        )
+    }
 
     #[tokio::test]
     async fn serves_web_bundle_and_redirects_root() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<!doctype html>hermit").unwrap();
 
-        let app = mount_web(Router::new(), dir.path());
+        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
 
         // `/` redirects to the web client.
         let root = app
@@ -356,12 +462,84 @@ mod tests {
     async fn api_only_when_no_bundle() {
         let dir = tempfile::tempdir().unwrap();
         // No index.html written → router is returned unchanged (no `/` route).
-        let app = mount_web(Router::new(), dir.path());
+        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
         let root = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(root.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_file_is_served_through_the_transformation_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>hermit").unwrap();
+        std::fs::write(dir.path().join("a.js"), "hello world").unwrap();
+
+        let service = transformations(dir.path());
+        // Register an in-process transformer for `a.js` only.
+        service
+            .add_transformation(uuid::Uuid::from_u128(9), "a.js", Arc::new(Upper))
+            .await;
+
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+
+        // The matching file is transformed and typed by extension.
+        let hit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/a.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(hit.headers()["content-type"], "application/javascript");
+        let body = axum::body::to_bytes(hit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"HELLO WORLD");
+
+        // A non-matching file falls through to plain static serving.
+        let miss = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(miss.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<!doctype html>hermit");
+    }
+
+    #[tokio::test]
+    async fn traversal_paths_never_reach_the_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "x").unwrap();
+        let service = transformations(dir.path());
+        // A greedy pattern that would match anything, including `..` paths.
+        service
+            .add_transformation(uuid::Uuid::from_u128(9), ".*", Arc::new(Identity))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), service);
+        // `..` components must not be read+served by the transform branch.
+        let out = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/../secret.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(out.status(), StatusCode::OK);
     }
 
     #[test]

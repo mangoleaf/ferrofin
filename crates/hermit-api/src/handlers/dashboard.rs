@@ -12,7 +12,8 @@
 //! contract's routing here.
 
 use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hermit_model::plugins::ConfigurationPageInfo;
@@ -80,13 +81,28 @@ struct ConfigurationPageQuery {
 async fn get_dashboard_configuration_page(
     State(state): State<AppState>,
     Query(query): Query<ConfigurationPageQuery>,
-) -> Result<Html<Vec<u8>>, ApiError> {
+) -> Result<Response, ApiError> {
     let name = query.name.unwrap_or_default();
     match state.plugins.get_configuration_page(&name).await? {
-        Some(html) => Ok(Html(html)),
+        Some(bytes) => Ok(([(header::CONTENT_TYPE, page_mime(&name))], bytes).into_response()),
         None => Err(ApiError::NotFound(format!(
             "configuration page {name:?} not found"
         ))),
+    }
+}
+
+/// The MIME type for a configuration page resource, from its name's extension.
+///
+/// A plugin page's shell HTML loads sibling resources by name (e.g.
+/// `configurationpage?name=introskipper.js` as a `<script type="module">`) —
+/// browsers refuse module scripts served as `text/html`, so the extension must
+/// drive the content type. Nameless / extensionless pages are the HTML page.
+fn page_mime(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or_default() {
+        "js" | "mjs" => "application/javascript",
+        "css" => "text/css",
+        "json" => "application/json",
+        _ => "text/html; charset=utf-8",
     }
 }
 
@@ -96,6 +112,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/web/ConfigurationPages", get(get_configuration_pages))
         .route(
             "/web/ConfigurationPage",
+            get(get_dashboard_configuration_page),
+        )
+        // ASP.NET routing is case-insensitive; axum's is not. jellyfin-web's
+        // plugin shell pages reference sibling resources with the lowercase
+        // `configurationpage?name=…`, so serve that spelling too.
+        .route(
+            "/web/configurationpage",
             get(get_dashboard_configuration_page),
         )
 }

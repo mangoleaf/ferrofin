@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hermit_core::{HermitTaskManager, RegisteredPlugin, ScheduledTask};
+use hermit_core::{HermitTaskManager, PluginConfigPage, RegisteredPlugin, ScheduledTask};
 use hermit_traits::library::LibraryManager;
 use hermit_traits::media_segments::MediaSegmentManager;
 use hermit_traits::plugins::{PluginDescriptor, PluginManager};
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
 
+pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
 
@@ -53,11 +54,13 @@ pub trait Extension: Send + Sync {
     fn descriptor(&self) -> PluginDescriptor;
     /// The seed configuration written on first run (the plugin config schema).
     fn default_config(&self) -> Vec<u8>;
-    /// The dashboard settings page as `(page name, HTML)`, if the extension has
-    /// one. Providing it makes a Settings link appear on the plugin in the
-    /// dashboard (served via `GET /web/ConfigurationPage`). Defaults to none.
-    fn config_page(&self) -> Option<(String, Vec<u8>)> {
-        None
+    /// The dashboard pages/resources this extension ships; the first entry is
+    /// the main settings page (jellyfin-web links the first page whose
+    /// `PluginId` matches). Providing any makes a Settings link appear on the
+    /// plugin in the dashboard (served via `GET /web/ConfigurationPage`).
+    /// Defaults to none.
+    fn config_pages(&self) -> Vec<PluginConfigPage> {
+        Vec::new()
     }
     /// The background tasks this extension contributes.
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
@@ -66,7 +69,10 @@ pub trait Extension: Send + Sync {
 /// The curated set of extensions — the only place they are listed.
 #[must_use]
 pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
-    vec![Arc::new(intro_skipper::IntroSkipperExtension::new())]
+    vec![
+        Arc::new(intro_skipper::IntroSkipperExtension::new()),
+        Arc::new(file_transformation::FileTransformationExtension),
+    ]
 }
 
 /// Builds the [`RegisteredPlugin`]s the plugin manager needs, so every extension
@@ -78,8 +84,8 @@ pub fn registered_plugins(extensions: &[Arc<dyn Extension>]) -> Vec<RegisteredPl
         .map(|ext| {
             let mut plugin = RegisteredPlugin::new(ext.descriptor(), None)
                 .with_default_config(ext.default_config());
-            if let Some((name, html)) = ext.config_page() {
-                plugin = plugin.with_config_page(name, html);
+            for page in ext.config_pages() {
+                plugin = plugin.with_config_page(page);
             }
             plugin
         })

@@ -72,6 +72,9 @@ pub struct WiredApp {
     /// [`HermitServerApplicationHost::mark_core_startup_complete`] on it once
     /// the router is mounted, mirroring `CoreAppHost`'s post-startup flag.
     pub app_host: Arc<HermitServerApplicationHost>,
+    /// The web-file transformation pipeline, shared with the static `/web`
+    /// mount so registered transformations apply to the served files.
+    pub file_transformations: Arc<dyn hermit_traits::plugins::FileTransformationService>,
 }
 
 /// The concrete [`LifecycleController`] for the running server.
@@ -701,12 +704,35 @@ pub async fn build_app_state(
     let sync_play: Arc<dyn hermit_traits::stubs::SyncPlayManager> = Arc::new(
         hermit_core::HermitSyncPlayManager::new(Arc::clone(&session_bus)),
     );
+    // ---- File Transformation pipeline --------------------------------------
+    // The registry the static `/web` mount consults per request. The Intro
+    // Skipper's skip-button patch for `main.jellyfin.bundle.js` is its
+    // compiled-in registration (the upstream plugin registers it via .NET
+    // reflection); both transformers self-gate on their plugin's enabled flag
+    // and configuration, so dashboard toggles apply live.
+    let file_transformations: Arc<dyn hermit_traits::plugins::FileTransformationService> = Arc::new(
+        hermit_extensions::file_transformation::WebFileTransformationService::new(
+            Arc::clone(&plugins),
+            format!("http://127.0.0.1:{}", config.port),
+        ),
+    );
+    hermit_extensions::file_transformation::register_skip_button_transformer(
+        file_transformations.as_ref(),
+        Arc::clone(&plugins),
+    )
+    .await;
+
     let state = state
         .with_session_bus(Arc::clone(&session_bus))
         .with_sync_play(sync_play)
-        .with_live_tv(live_tv);
+        .with_live_tv(live_tv)
+        .with_file_transformations(Arc::clone(&file_transformations));
 
-    Ok(WiredApp { state, app_host })
+    Ok(WiredApp {
+        state,
+        app_host,
+        file_transformations,
+    })
 }
 
 #[cfg(test)]
