@@ -581,6 +581,29 @@ async fn media_segments_type_filter_narrows() {
 }
 
 #[tokio::test]
+async fn media_segments_accepts_repeated_type_params() {
+    let app = state(
+        Arc::new(OneSegment),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeSubtitles),
+    );
+    // The jellyfin SDK sends the filter as a REPEATED query parameter
+    // (`?includeSegmentTypes=Intro&includeSegmentTypes=Outro`); a duplicate-key
+    // 400 here breaks every playback's segment fetch (no skip button).
+    let (status, body) = call(
+        app,
+        "GET",
+        &format!("/MediaSegments/{ITEM_ID}?includeSegmentTypes=Intro&includeSegmentTypes=Outro"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(v["Items"][0]["Type"], "Intro");
+}
+
+#[tokio::test]
 async fn media_segments_missing_item_is_404() {
     let app = state(
         Arc::new(OneSegment),

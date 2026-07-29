@@ -21,13 +21,21 @@ use crate::error::ApiError;
 use crate::handlers::query_parse::parse_csv_enums;
 use crate::state::AppState;
 
-/// Query parameters for `GET /MediaSegments/{itemId}`.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ItemSegmentsQuery {
-    /// Optional. Comma-delimited filter of requested segment types.
-    #[serde(default)]
-    include_segment_types: Option<String>,
+/// Collects every `includeSegmentTypes` value from the raw query pairs.
+///
+/// ASP.NET's collection binder accepts the parameter **repeated**
+/// (`?includeSegmentTypes=Intro&includeSegmentTypes=Outro` — what the
+/// jellyfin SDK sends) as well as comma-delimited; a typed
+/// `Query<Option<String>>` rejects the repeated form as a duplicate field
+/// with `400`, which broke every playback's segment fetch (no skip button).
+fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
+    let joined = pairs
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("includeSegmentTypes"))
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// `GET /MediaSegments/{itemId}` — the item's media segments.
@@ -54,13 +62,14 @@ async fn get_item_segments(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(item_id): Path<Uuid>,
-    Query(query): Query<ItemSegmentsQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
     if state.library.get_item_by_id(item_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
 
-    let types: Vec<MediaSegmentType> = parse_csv_enums(query.include_segment_types.as_deref())?;
+    let raw_types = include_segment_types(&pairs);
+    let types: Vec<MediaSegmentType> = parse_csv_enums(raw_types.as_deref())?;
     let type_filter = if types.is_empty() {
         None
     } else {
