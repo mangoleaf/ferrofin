@@ -160,10 +160,40 @@ async fn get_named_configuration(
         ))?));
     }
     // A previously-saved value wins over the default object.
-    if let Some(path) = named_config_file(&state, &key)
+    let saved = if let Some(path) = named_config_file(&state, &key)
         && let Ok(bytes) = tokio::fs::read(&path).await
         && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
     {
+        Some(value)
+    } else {
+        None
+    };
+    // `livetv` merges the persisted scalars (recording paths, padding) with the
+    // canonical tuner/provider rows the Live TV manager keeps in SQLite — the
+    // dashboard's Live TV page renders its tuner and guide-provider lists from
+    // this config object, so they must reflect the manager's state.
+    if key.eq_ignore_ascii_case("livetv") {
+        let mut value = match saved {
+            Some(v) => v,
+            None => to_value(serde_json::to_value(
+                hermit_model::live_tv::LiveTvOptions::default(),
+            ))?,
+        };
+        if let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value) {
+            let tuners = live_tv.get_tuner_hosts().await.unwrap_or_default();
+            let providers = live_tv.get_listing_providers().await.unwrap_or_default();
+            map.insert(
+                "TunerHosts".to_owned(),
+                to_value(serde_json::to_value(tuners))?,
+            );
+            map.insert(
+                "ListingProviders".to_owned(),
+                to_value(serde_json::to_value(providers))?,
+            );
+        }
+        return Ok(Json(value));
+    }
+    if let Some(value) = saved {
         return Ok(Json(value));
     }
     let value = match key.to_ascii_lowercase().as_str() {
