@@ -1074,10 +1074,13 @@ dependencies = [
  "chrono",
  "hermit-common",
  "hermit-db",
+ "hermit-drawing",
+ "hermit-keyframes",
  "hermit-model",
  "hermit-naming",
  "hermit-providers",
  "hermit-traits",
+ "image",
  "libc",
  "reqwest",
  "rstest",
@@ -1284,6 +1287,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
