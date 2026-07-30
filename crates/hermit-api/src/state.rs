@@ -170,6 +170,12 @@ pub struct Inner {
     /// registration is accepted and dropped (nothing serves transformable
     /// files without the composition root's web mount anyway).
     pub file_transformations: Option<Arc<dyn hermit_traits::plugins::FileTransformationService>>,
+
+    /// The playback-decision metrics recorder (`brain/PLAN_PERFORMANCE.md`
+    /// Track A). `None` until the composition root wires it via
+    /// [`AppState::with_playback_metrics`]; while unset decisions are simply
+    /// not recorded (recording is observability, never load-bearing).
+    pub playback_metrics: Option<Arc<dyn hermit_traits::metrics::PlaybackMetrics>>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -249,6 +255,7 @@ impl AppState {
             session_bus: None,
             live_tv: None,
             file_transformations: None,
+            playback_metrics: None,
             music,
             similar_items,
             search,
@@ -481,6 +488,22 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_session_bus must be called before the state is shared");
         inner.session_bus = Some(session_bus);
+        self
+    }
+
+    /// Injects the playback-decision metrics recorder.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_playback_metrics(
+        mut self,
+        playback_metrics: Arc<dyn hermit_traits::metrics::PlaybackMetrics>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_playback_metrics must be called before the state is shared");
+        inner.playback_metrics = Some(playback_metrics);
         self
     }
 

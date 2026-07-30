@@ -191,8 +191,29 @@ async fn report_playback_start(
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
+    record_metrics_started(&state, info.play_session_id.as_deref()).await;
     log_playback_activity(&state, &auth, info.item_id, "is playing", "VideoPlayback").await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Best-effort Track-A metrics update: marks the `PlaybackSessions` row started
+/// (`brain/PLAN_PERFORMANCE.md`). Never fails the report.
+async fn record_metrics_started(state: &AppState, play_session_id: Option<&str>) {
+    if let (Some(metrics), Some(psid)) = (state.playback_metrics.as_ref(), play_session_id) {
+        let _ = metrics.record_started(psid).await;
+    }
+}
+
+/// Best-effort Track-A metrics update: marks the `PlaybackSessions` row stopped
+/// with the final position. Never fails the report.
+async fn record_metrics_stopped(
+    state: &AppState,
+    play_session_id: Option<&str>,
+    position_ticks: Option<i64>,
+) {
+    if let (Some(metrics), Some(psid)) = (state.playback_metrics.as_ref(), play_session_id) {
+        let _ = metrics.record_stopped(psid, position_ticks).await;
+    }
 }
 
 /// Records a playback activity-log entry (best-effort — a logging failure must
@@ -314,6 +335,7 @@ async fn report_playback_stopped(
     info.session_id = Some(current_session_id(&state, &auth).await?);
     let item_id = info.item_id;
     state.sessions.on_playback_stopped(&info).await?;
+    record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
     log_playback_activity(
         &state,
         &auth,
@@ -376,6 +398,7 @@ async fn on_playback_start(
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
+    record_metrics_started(&state, info.play_session_id.as_deref()).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -487,6 +510,7 @@ async fn on_playback_stopped(
     };
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_stopped(&info).await?;
+    record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

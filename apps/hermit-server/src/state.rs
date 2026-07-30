@@ -823,11 +823,16 @@ pub async fn build_app_state(
     )
     .await;
 
+    // ---- playback metrics (brain/PLAN_PERFORMANCE.md Track A) --------------
+    let playback_metrics: Arc<dyn hermit_traits::metrics::PlaybackMetrics> =
+        Arc::new(hermit_core::HermitPlaybackMetrics::new(db.clone()));
+
     let state = state
         .with_session_bus(Arc::clone(&session_bus))
         .with_sync_play(sync_play)
         .with_live_tv(live_tv)
-        .with_file_transformations(Arc::clone(&file_transformations));
+        .with_file_transformations(Arc::clone(&file_transformations))
+        .with_playback_metrics(playback_metrics);
 
     Ok(WiredApp {
         state,

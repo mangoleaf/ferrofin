@@ -89,12 +89,56 @@ struct PlaybackInfoQuery {
     /// The requested subtitle stream index override (`-1` = none).
     #[serde(default, alias = "SubtitleStreamIndex")]
     subtitle_stream_index: Option<i32>,
+    /// Whether direct play is permitted (default true).
+    #[serde(default, alias = "EnableDirectPlay")]
+    enable_direct_play: Option<bool>,
+    /// Whether direct stream is permitted (default true).
+    #[serde(default, alias = "EnableDirectStream")]
+    enable_direct_stream: Option<bool>,
+    /// Whether transcoding is permitted (default true).
+    #[serde(default, alias = "EnableTranscoding")]
+    enable_transcoding: Option<bool>,
+    /// Whether `-c:v copy` is permitted in a transcode (default true).
+    #[serde(default, alias = "AllowVideoStreamCopy")]
+    allow_video_stream_copy: Option<bool>,
+    /// Whether `-c:a copy` is permitted in a transcode (default true).
+    #[serde(default, alias = "AllowAudioStreamCopy")]
+    allow_audio_stream_copy: Option<bool>,
+}
+
+/// The resolved playback capability flags (query wins over the posted body,
+/// both default to permitted — the C# `?? true` pattern).
+///
+/// Port of the `EnableDirectPlay`/`EnableDirectStream`/`EnableTranscoding`/
+/// `AllowVideoStreamCopy`/`AllowAudioStreamCopy` parameters of
+/// `MediaInfoController.GetPostedPlaybackInfo`.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // a faithful mirror of the C# flag set
+struct PlaybackFlags {
+    enable_direct_play: bool,
+    enable_direct_stream: bool,
+    enable_transcoding: bool,
+    allow_video_stream_copy: bool,
+    allow_audio_stream_copy: bool,
+}
+
+impl Default for PlaybackFlags {
+    fn default() -> Self {
+        Self {
+            enable_direct_play: true,
+            enable_direct_stream: true,
+            enable_transcoding: true,
+            allow_video_stream_copy: true,
+            allow_audio_stream_copy: true,
+        }
+    }
 }
 
 /// Resolves the playback info for `item_id` and the effective user.
 ///
 /// Shared by the `GET` and `POST` handlers. `allow_media_probe` and
 /// `enable_path_substitution` mirror the C# defaults for the basic path.
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
 async fn playback_info(
     state: &AppState,
     auth: &hermit_traits::options::AuthorizationInfo,
@@ -103,6 +147,7 @@ async fn playback_info(
     profile: Option<&DeviceProfile>,
     max_streaming_bitrate: Option<i32>,
     stream_selection: StreamSelection,
+    flags: PlaybackFlags,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
     let resolved_user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
@@ -125,13 +170,19 @@ async fn playback_info(
         source.has_segments = has_segments;
     }
 
+    // The client threads this id through every playback-progress report; C#
+    // mints a fresh GUID per PlaybackInfo call, so a null here breaks reporting.
+    // Minted before the decision loop so the metrics row can be keyed by it.
+    let play_session_id = Uuid::new_v4().to_string();
+
     // When the client posts its device profile, decide per source whether it can
     // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't
     // decode). Without this every source claimed direct-play, so incompatible-audio
     // files played video-only. No profile (the GET form) keeps the static sources.
     if let Some(profile) = profile {
+        let mut first_decision = None;
         for source in &mut media_sources {
-            apply_stream_decision(
+            let decision = apply_stream_decision(
                 source,
                 profile,
                 item_id,
@@ -139,15 +190,44 @@ async fn playback_info(
                 auth.token.as_deref(),
                 auth.device_id.as_deref(),
                 stream_selection,
+                &play_session_id,
+                flags,
             );
+            if first_decision.is_none() {
+                first_decision = decision.map(|d| (d, source.clone()));
+            }
+        }
+        // Record the decision for the metrics track (Track A). Clients play the
+        // first/default source; multi-version items are the rare exception, so
+        // one row per play session (not per source) keeps the data readable.
+        if let (Some((decision, source)), Some(metrics)) =
+            (first_decision, state.playback_metrics.as_ref())
+        {
+            let record = hermit_traits::metrics::PlaybackDecision {
+                play_session_id: play_session_id.clone(),
+                item_id,
+                user_id: resolved_user_id,
+                client: auth.client.clone(),
+                device_id: auth.device_id.clone(),
+                play_method: decision.play_method.to_owned(),
+                transcode_reasons: decision.transcode_reasons,
+                container: source.container.clone(),
+                video_codec: source.video_stream().and_then(|s| s.codec.clone()),
+                audio_codec: source
+                    .get_default_audio_stream(source.default_audio_stream_index)
+                    .and_then(|s| s.codec.clone()),
+                target_container: decision.target_container,
+                target_video_codec: decision.target_video_codec,
+                target_audio_codec: decision.target_audio_codec,
+            };
+            // Observability only — never fail the request over it.
+            let _ = metrics.record_decision(&record).await;
         }
     }
 
     Ok(PlaybackInfoResponse {
         media_sources,
-        // The client threads this id through every playback-progress report; C#
-        // mints a fresh GUID per PlaybackInfo call, so a null here breaks reporting.
-        play_session_id: Some(Uuid::new_v4().to_string()),
+        play_session_id: Some(play_session_id),
         error_code: None,
     })
 }
@@ -224,11 +304,28 @@ struct StreamSelection {
     subtitle_stream_index: Option<i32>,
 }
 
+/// The play decision summary for one source, fed to the metrics recorder
+/// (`PlaybackSessions`): the final method plus the negotiated targets.
+struct StreamDecision {
+    /// `DirectPlay` | `Transcode` (what the client will actually do).
+    play_method: &'static str,
+    /// Comma-joined `TranscodeReason` names; empty for direct play.
+    transcode_reasons: String,
+    /// Negotiated target container (transcode only).
+    target_container: Option<String>,
+    /// Negotiated target video codec (transcode only).
+    target_video_codec: Option<String>,
+    /// Negotiated target audio codec (transcode only).
+    target_audio_codec: Option<String>,
+}
+
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
 /// / remux stream, with the negotiated codecs) is set so the client transcodes.
-#[allow(clippy::too_many_arguments)]
+/// Returns the decision summary for the metrics recorder ([`None`] when the
+/// builder produced no stream).
+#[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
 fn apply_stream_decision(
     source: &mut MediaSourceInfo,
     profile: &DeviceProfile,
@@ -237,12 +334,18 @@ fn apply_stream_decision(
     token: Option<&str>,
     device_id: Option<&str>,
     stream_selection: StreamSelection,
-) {
+    play_session_id: &str,
+    flags: PlaybackFlags,
+) -> Option<StreamDecision> {
     let mut options = MediaOptions::new(profile.clone());
     options.item_id = item_id;
     options.media_source_id.clone_from(&source.id);
     options.device_id = device_id.map(str::to_owned);
     options.max_bitrate = max_streaming_bitrate;
+    // The client's capability veto (EnableDirectPlay/EnableDirectStream): the
+    // builder never picks a vetoed method.
+    options.enable_direct_play = flags.enable_direct_play;
+    options.enable_direct_stream = flags.enable_direct_stream;
     // The client's explicit stream picks (a `-1` subtitle index means "none" —
     // C# treats negatives as unset when resolving the stream).
     options.audio_stream_index = stream_selection.audio_stream_index;
@@ -250,14 +353,18 @@ fn apply_stream_decision(
     options.media_sources = vec![source.clone()];
 
     let support = HermitTranscoderSupport;
-    let Some(stream) = StreamBuilder::new(&support).get_optimal_video_stream(&options) else {
-        return;
-    };
+    let stream = StreamBuilder::new(&support).get_optimal_video_stream(&options)?;
 
     if stream.play_method == PlayMethod::DirectPlay {
         source.supports_direct_play = true;
         apply_subtitle_delivery(source, &stream, &support, token);
-        return;
+        return Some(StreamDecision {
+            play_method: "DirectPlay",
+            transcode_reasons: String::new(),
+            target_container: None,
+            target_video_codec: None,
+            target_audio_codec: None,
+        });
     }
     // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
     // copy the compatible video, re-encode only the incompatible audio) are carried
@@ -294,11 +401,50 @@ fn apply_stream_decision(
 
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
+    // A transcoding veto (EnableTranscoding=false) leaves the source with no
+    // playable method — the C# behaviour: the client shows its "can't play"
+    // error rather than silently transcoding.
+    if !flags.enable_transcoding {
+        source.supports_transcoding = false;
+        apply_subtitle_delivery(source, &stream, &support, token);
+        return Some(StreamDecision {
+            play_method: "Transcode",
+            transcode_reasons: hermit_model::session::transcode_reasons_unique_names(
+                stream.transcode_reasons,
+            )
+            .join(","),
+            target_container: Some(container),
+            target_video_codec: stream.video_codecs.first().cloned(),
+            target_audio_codec: stream.audio_codecs.first().cloned(),
+        });
+    }
     source.supports_transcoding = true;
-    source.transcoding_url = Some(stream.to_url(None, token, None));
+    // The playback-session id rides the transcode URL so the spawned job is
+    // psid-addressable (`DELETE /Videos/ActiveEncodings?playSessionId=…`).
+    stream.play_session_id = Some(play_session_id.to_owned());
+    let mut transcoding_url = stream.to_url(None, token, None);
+    // The C# controller appends the copy vetoes onto the negotiated URL; the
+    // transcoder reads them back as `allowVideoStreamCopy`/`allowAudioStreamCopy`.
+    if !flags.allow_video_stream_copy {
+        transcoding_url.push_str("&AllowVideoStreamCopy=false");
+    }
+    if !flags.allow_audio_stream_copy {
+        transcoding_url.push_str("&AllowAudioStreamCopy=false");
+    }
+    source.transcoding_url = Some(transcoding_url);
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
-    source.transcoding_container = Some(container);
+    source.transcoding_container = Some(container.clone());
     apply_subtitle_delivery(source, &stream, &support, token);
+    Some(StreamDecision {
+        play_method: "Transcode",
+        transcode_reasons: hermit_model::session::transcode_reasons_unique_names(
+            stream.transcode_reasons,
+        )
+        .join(","),
+        target_container: Some(container),
+        target_video_codec: stream.video_codecs.first().cloned(),
+        target_audio_codec: stream.audio_codecs.first().cloned(),
+    })
 }
 
 /// Populates each subtitle stream's `DeliveryMethod`/`DeliveryUrl` on the source
@@ -359,6 +505,7 @@ async fn get_playback_info(
             None,
             None,
             StreamSelection::default(),
+            flags_from(&query, None),
         )
         .await?,
     ))
@@ -383,6 +530,44 @@ struct PlaybackInfoBody {
     audio_stream_index: Option<i32>,
     #[serde(default, deserialize_with = "opt_i32")]
     subtitle_stream_index: Option<i32>,
+    #[serde(default)]
+    enable_direct_play: Option<bool>,
+    #[serde(default)]
+    enable_direct_stream: Option<bool>,
+    #[serde(default)]
+    enable_transcoding: Option<bool>,
+    #[serde(default)]
+    allow_video_stream_copy: Option<bool>,
+    #[serde(default)]
+    allow_audio_stream_copy: Option<bool>,
+}
+
+/// Resolves the capability flags: query wins over body, both default to
+/// permitted (the C# `request.X ?? playbackInfoDto?.X ?? true`).
+fn flags_from(query: &PlaybackInfoQuery, body: Option<&PlaybackInfoBody>) -> PlaybackFlags {
+    let pick = |q: Option<bool>, b: Option<bool>| q.or(b).unwrap_or(true);
+    PlaybackFlags {
+        enable_direct_play: pick(
+            query.enable_direct_play,
+            body.and_then(|b| b.enable_direct_play),
+        ),
+        enable_direct_stream: pick(
+            query.enable_direct_stream,
+            body.and_then(|b| b.enable_direct_stream),
+        ),
+        enable_transcoding: pick(
+            query.enable_transcoding,
+            body.and_then(|b| b.enable_transcoding),
+        ),
+        allow_video_stream_copy: pick(
+            query.allow_video_stream_copy,
+            body.and_then(|b| b.allow_video_stream_copy),
+        ),
+        allow_audio_stream_copy: pick(
+            query.allow_audio_stream_copy,
+            body.and_then(|b| b.allow_audio_stream_copy),
+        ),
+    }
 }
 
 /// `POST /Items/{itemId}/PlaybackInfo` — playback info with a posted profile.
@@ -418,6 +603,7 @@ async fn post_playback_info(
             body.device_profile.as_ref(),
             body.max_streaming_bitrate,
             stream_selection,
+            flags_from(&query, Some(&body)),
         )
         .await?,
     ))

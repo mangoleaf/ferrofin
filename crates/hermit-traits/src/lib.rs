@@ -31,6 +31,7 @@ pub mod library;
 pub mod localization;
 pub mod media_encoding;
 pub mod media_segments;
+pub mod metrics;
 pub mod net;
 pub mod options;
 pub mod persistence;
