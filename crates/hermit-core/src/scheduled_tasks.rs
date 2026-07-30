@@ -214,30 +214,75 @@ impl HermitTaskManager {
     /// guard that only queues an `Idle` task), or whatever error the task body
     /// itself returns.
     pub async fn run_now(&self, key: &str) -> Result<(), ServiceError> {
-        // Take a task-handle clone and flip to `Running` under the lock, then drop
-        // the guard before awaiting the body.
-        let task = {
-            let guard = self
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let reg = guard
-                .get(key)
-                .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
-            if reg.state == TaskState::Running {
-                return Err(ServiceError::invalid_input(format!(
-                    "scheduled task {key} is already running"
-                )));
-            }
-            Arc::clone(&reg.task)
-        };
-        self.set_state(key, TaskState::Running);
-
+        let task = self.claim(key)?;
         let start = Utc::now();
         let outcome = task.execute().await;
-        let end = Utc::now();
+        self.finish(key, &task, start, &outcome);
+        outcome
+    }
 
-        let (status, error_message) = match &outcome {
+    /// Starts the named task in the background, returning as soon as it is
+    /// [`Running`](TaskState::Running).
+    ///
+    /// Port of `TaskManager.QueueScheduledTask` (the `StartTask` HTTP path):
+    /// the caller gets an immediate answer while the task runs to completion on
+    /// a spawned tokio task — so the dashboard sees the `Running` state for the
+    /// task's real duration, not for the microseconds of a fire-and-forget
+    /// body. Failures are recorded on the task's last result (they have no
+    /// caller to propagate to).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::NotFound`] if no task has that key, or
+    /// [`ServiceError::InvalidInput`] if it is already running.
+    pub fn queue(&self, key: &str) -> Result<(), ServiceError> {
+        let task = self.claim(key)?;
+        let this = self.clone();
+        let key = key.to_owned();
+        let start = Utc::now();
+        tokio::spawn(async move {
+            let outcome = task.execute().await;
+            if let Err(e) = &outcome {
+                tracing::warn!(task = key, error = %e, "scheduled task failed");
+            }
+            this.finish(&key, &task, start, &outcome);
+        });
+        Ok(())
+    }
+
+    /// Validates that `key` is registered and idle, flips it to
+    /// [`Running`](TaskState::Running), and returns its task handle.
+    fn claim(&self, key: &str) -> Result<Arc<dyn ScheduledTask>, ServiceError> {
+        // Take a task-handle clone and flip to `Running` under the lock, then drop
+        // the guard before the body runs.
+        let guard = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reg = guard
+            .get(key)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+        if reg.state == TaskState::Running {
+            return Err(ServiceError::invalid_input(format!(
+                "scheduled task {key} is already running"
+            )));
+        }
+        let task = Arc::clone(&reg.task);
+        drop(guard);
+        self.set_state(key, TaskState::Running);
+        Ok(task)
+    }
+
+    /// Records a finished run's outcome and returns the task to
+    /// [`Idle`](TaskState::Idle). `start` is when the run was claimed.
+    fn finish(
+        &self,
+        key: &str,
+        task: &Arc<dyn ScheduledTask>,
+        start: chrono::DateTime<Utc>,
+        outcome: &Result<(), ServiceError>,
+    ) {
+        let (status, error_message) = match outcome {
             Ok(()) => (TaskCompletionStatus::Completed, None),
             Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
         };
@@ -245,7 +290,7 @@ impl HermitTaskManager {
             key,
             TaskResult {
                 start_time_utc: start,
-                end_time_utc: end,
+                end_time_utc: Utc::now(),
                 status,
                 name: Some(task.name().to_string()),
                 key: Some(key.to_string()),
@@ -254,7 +299,6 @@ impl HermitTaskManager {
                 long_error_message: None,
             },
         );
-        outcome
     }
 
     /// Cancels a task, returning the task to [`Idle`](TaskState::Idle).
@@ -358,7 +402,9 @@ impl hermit_traits::tasks::TaskManager for HermitTaskManager {
     }
 
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
-        self.run_now(task_id).await
+        // The HTTP path queues (C# QueueScheduledTask): the request returns as
+        // soon as the task is Running; the dashboard tracks state from there.
+        self.queue(task_id)
     }
 
     async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
@@ -446,6 +492,59 @@ mod tests {
         let result = info.last_execution_result.expect("result");
         assert_eq!(result.status, TaskCompletionStatus::Completed);
         assert!(result.end_time_utc >= result.start_time_utc);
+    }
+
+    /// A task that stays running until its gate is released.
+    struct GatedTask {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for GatedTask {
+        fn key(&self) -> &str {
+            "gated"
+        }
+        fn name(&self) -> &str {
+            "Gated Task"
+        }
+        fn description(&self) -> &str {
+            "waits for its gate"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self) -> Result<(), ServiceError> {
+            self.gate.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_reports_running_for_the_tasks_real_duration() {
+        let mgr = HermitTaskManager::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        mgr.register(Arc::new(GatedTask { gate: gate.clone() }));
+
+        // Queue returns immediately with the task now Running (the dashboard's
+        // run button feedback), and a second start is rejected while it runs.
+        mgr.queue("gated").expect("queued");
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+        assert!(mgr.queue("gated").is_err());
+
+        // Release the gate; the spawned run finishes and records its result.
+        gate.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let info = mgr.get("gated").expect("info");
+            if info.state == TaskState::Idle {
+                let result = info.last_execution_result.expect("result");
+                assert_eq!(result.status, TaskCompletionStatus::Completed);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -623,19 +722,25 @@ mod tests {
                 .is_none()
         );
 
-        // `start_task` runs it and records a completed result.
+        // `start_task` queues it (returns while Running); poll for the
+        // completed result the spawned run records.
         TaskManager::start_task(&mgr, "counting")
             .await
             .expect("start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            let info = TaskManager::get_task(&mgr, "counting")
+                .await
+                .expect("get")
+                .expect("info");
+            if let Some(result) = info.last_execution_result {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "task never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        let info = TaskManager::get_task(&mgr, "counting")
-            .await
-            .expect("get")
-            .expect("info");
-        assert_eq!(
-            info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Completed
-        );
+        assert_eq!(result.status, TaskCompletionStatus::Completed);
 
         // Unknown key → NotFound.
         assert!(matches!(

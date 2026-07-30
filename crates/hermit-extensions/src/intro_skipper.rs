@@ -467,21 +467,19 @@ impl ScheduledTask for DetectSegmentsTask {
             );
             return Ok(());
         };
-        // One pass at a time.
+        // One pass at a time (belt to the task manager's Running guard, since
+        // `/Intros/ScanSeason` can also start the task).
         if self.running.swap(true, Ordering::SeqCst) {
             tracing::info!("intro skipper: an analysis pass is already running");
             return Ok(());
         }
         let config = self.load_config().await;
-        // Run in the background so the `/ScheduledTasks/Running` trigger returns
-        // immediately: a full-library fingerprint pass runs for many minutes, and
-        // a synchronous run would be cancelled when the client connection times
-        // out. (Mirrors how the library scan already spawns.)
-        let worker = self.clone();
-        tokio::spawn(async move {
-            worker.run_analysis(&fingerprinter, &config).await;
-            worker.running.store(false, Ordering::SeqCst);
-        });
+        // Run inline: the task manager queues the execution on its own spawned
+        // task, so this body's runtime IS the dashboard's Running state — a
+        // fire-and-forget here would flip the task back to Idle in
+        // milliseconds and the run button would appear to do nothing.
+        self.run_analysis(&fingerprinter, &config).await;
+        self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
