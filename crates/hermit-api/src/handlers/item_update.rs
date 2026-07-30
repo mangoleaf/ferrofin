@@ -462,10 +462,10 @@ async fn refresh_item(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    // Leaf-item metadata/image refresh goes to the provider queue. The remote
-    // fetchers are Part B, so the concrete manager currently no-ops the enqueue
-    // (returns Ok) rather than erroring — the button works, the refresh lands once
-    // TMDB/MusicBrainz are wired.
+    // Leaf-item metadata/image refresh goes to the provider queue: the enqueue
+    // spawns a background TMDB refresh (movies/series by title; seasons/episodes
+    // via their parent series) and this request 204s immediately, like the C#
+    // queued refresh. Kinds with no provider (music) no-op faithfully.
     let metadata_refresh_mode = query
         .metadata_refresh_mode
         .map_or(MetadataRefreshMode::None, MetadataRefreshMode::from);

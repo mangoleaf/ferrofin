@@ -144,6 +144,33 @@ pub struct SeasonImages {
     pub episode_stills: std::collections::HashMap<i32, String>,
 }
 
+/// One season's metadata + artwork from `/tv/{id}/season/{n}`: the season's
+/// name/overview/poster and every episode's metadata, in a single request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeasonDetails {
+    /// The season's display name (e.g. "Season 2"), if any.
+    pub name: Option<String>,
+    /// The season's synopsis, if any.
+    pub overview: Option<String>,
+    /// The season poster URL, if any.
+    pub poster: Option<String>,
+    /// The season's episodes, in TMDB order.
+    pub episodes: Vec<EpisodeDetails>,
+}
+
+/// One episode's metadata within a [`SeasonDetails`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpisodeDetails {
+    /// The episode number within the season.
+    pub episode_number: i32,
+    /// The episode title, if any.
+    pub name: Option<String>,
+    /// The episode synopsis, if any.
+    pub overview: Option<String>,
+    /// The episode still-frame URL, if any.
+    pub still_url: Option<String>,
+}
+
 /// Full title metadata from `/movie|tv/{id}` (the detail-page fields).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TmdbDetails {
@@ -388,6 +415,10 @@ fn us_certification(
 #[derive(Debug, Deserialize)]
 struct SeasonResponse {
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
     poster_path: Option<String>,
     #[serde(default)]
     episodes: Vec<SeasonEpisode>,
@@ -398,7 +429,33 @@ struct SeasonEpisode {
     #[serde(default)]
     episode_number: i32,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
     still_path: Option<String>,
+}
+
+/// Converts a raw season payload into [`SeasonDetails`], prefixing image paths
+/// with the TMDB image base and dropping empty strings. Pure — unit-testable
+/// without network.
+fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
+    let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
+    SeasonDetails {
+        name: non_empty(resp.name),
+        overview: non_empty(resp.overview),
+        poster: non_empty(resp.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+        episodes: resp
+            .episodes
+            .into_iter()
+            .map(|ep| EpisodeDetails {
+                episode_number: ep.episode_number,
+                name: non_empty(ep.name),
+                overview: non_empty(ep.overview),
+                still_url: non_empty(ep.still_path).map(|p| format!("{IMAGE_BASE}{p}")),
+            })
+            .collect(),
+    }
 }
 
 /// A TMDB artwork client. Cheap to clone (wraps a [`reqwest::Client`]).
@@ -538,40 +595,40 @@ impl TmdbClient {
         })
     }
 
-    /// Fetches one season's artwork (`/tv/{id}/season/{n}`): the season poster and
-    /// every episode's still, in a single request. Empty on any failure.
-    pub async fn season_images(&self, tmdb_id: i64, season_number: i32) -> SeasonImages {
+    /// Fetches one season's metadata + artwork (`/tv/{id}/season/{n}`): the
+    /// season name/overview/poster and every episode's name/overview/still, in a
+    /// single request. `None` on any failure.
+    pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
         let url = format!("{API_BASE}/tv/{tmdb_id}/season/{season_number}");
-        let Ok(resp) = self
+        let resp = self
             .http
             .get(url)
             .query(&[("api_key", self.api_key.as_str())])
             .send()
             .await
-        else {
-            return SeasonImages::default();
-        };
+            .ok()?;
         if !resp.status().is_success() {
-            return SeasonImages::default();
+            return None;
         }
-        let Ok(parsed) = resp.json::<SeasonResponse>().await else {
+        let parsed = resp.json::<SeasonResponse>().await.ok()?;
+        Some(season_details_from(parsed))
+    }
+
+    /// Fetches one season's artwork (`/tv/{id}/season/{n}`): the season poster and
+    /// every episode's still. A projection of [`season_details`](Self::season_details)
+    /// (same request); empty on any failure.
+    pub async fn season_images(&self, tmdb_id: i64, season_number: i32) -> SeasonImages {
+        let Some(details) = self.season_details(tmdb_id, season_number).await else {
             return SeasonImages::default();
         };
-        let mut images = SeasonImages {
-            poster: parsed
-                .poster_path
-                .filter(|p| !p.is_empty())
-                .map(|p| format!("{IMAGE_BASE}{p}")),
-            episode_stills: std::collections::HashMap::new(),
-        };
-        for ep in parsed.episodes {
-            if let Some(still) = ep.still_path.filter(|p| !p.is_empty()) {
-                images
-                    .episode_stills
-                    .insert(ep.episode_number, format!("{IMAGE_BASE}{still}"));
-            }
+        SeasonImages {
+            poster: details.poster,
+            episode_stills: details
+                .episodes
+                .into_iter()
+                .filter_map(|ep| ep.still_url.map(|url| (ep.episode_number, url)))
+                .collect(),
         }
-        images
     }
 
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"
@@ -903,5 +960,57 @@ mod tests {
         assert_eq!(c.api_key, DEFAULT_API_KEY);
         let c = TmdbClient::with_api_key("mykey".to_owned());
         assert_eq!(c.api_key, "mykey");
+    }
+
+    #[test]
+    fn season_response_converts_to_details() {
+        let parsed: SeasonResponse = serde_json::from_str(
+            r#"{
+                "name": "Season 2",
+                "overview": "The second season.",
+                "poster_path": "/s2.jpg",
+                "episodes": [
+                    { "episode_number": 1, "name": "Hello", "overview": "Ep one.",
+                      "still_path": "/e1.jpg" },
+                    { "episode_number": 2, "name": "", "overview": null,
+                      "still_path": null }
+                ]
+            }"#,
+        )
+        .expect("parse");
+        let details = season_details_from(parsed);
+        assert_eq!(details.name.as_deref(), Some("Season 2"));
+        assert_eq!(details.overview.as_deref(), Some("The second season."));
+        assert_eq!(
+            details.poster.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/s2.jpg")
+        );
+        assert_eq!(details.episodes.len(), 2);
+        let ep1 = &details.episodes[0];
+        assert_eq!(ep1.episode_number, 1);
+        assert_eq!(ep1.name.as_deref(), Some("Hello"));
+        assert_eq!(ep1.overview.as_deref(), Some("Ep one."));
+        assert_eq!(
+            ep1.still_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/e1.jpg")
+        );
+        // Empty strings and nulls collapse to None.
+        let ep2 = &details.episodes[1];
+        assert_eq!(ep2.name, None);
+        assert_eq!(ep2.overview, None);
+        assert_eq!(ep2.still_url, None);
+
+        // The `SeasonImages` projection keeps the poster + stills-by-number shape.
+        let images = SeasonImages {
+            poster: details.poster.clone(),
+            episode_stills: details
+                .episodes
+                .iter()
+                .filter_map(|ep| ep.still_url.clone().map(|url| (ep.episode_number, url)))
+                .collect(),
+        };
+        assert_eq!(images.poster, details.poster);
+        assert_eq!(images.episode_stills.len(), 1);
+        assert!(images.episode_stills.contains_key(&1));
     }
 }

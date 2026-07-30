@@ -237,16 +237,83 @@ impl LocalProviderManager {
         let Some(entity) = items.retrieve_item(item_id).await? else {
             return Ok(None);
         };
-        let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
-            "Movie" => TmdbKind::Movie,
-            "Series" => TmdbKind::Series,
-            _ => return Ok(None),
+        Ok(title_lookup(&entity))
+    }
+
+    /// Resolves what a refresh should fetch for `entity`: movies/series search
+    /// TMDB by their own title; seasons/episodes hop to their parent series (its
+    /// name/year drive the TMDB series search, the season/episode numbers select
+    /// within it). Music and every other kind has no provider — `None`, the
+    /// faithful skip.
+    async fn resolve_refresh_target(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        entity: &BaseItemEntity,
+    ) -> Result<Option<RefreshTarget>, ServiceError> {
+        // Only the season/episode arms need the parent-series row; fetch it here
+        // so the classification itself stays pure (unit-testable without a repo).
+        let series = if matches!(short_kind(entity), "Season" | "Episode") {
+            match entity
+                .series_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                Some(series_uuid) => items.retrieve_item(series_uuid).await?,
+                None => None,
+            }
+        } else {
+            None
         };
-        let Some(name) = entity.name.filter(|n| !n.is_empty()) else {
-            return Ok(None);
-        };
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-        Ok(Some((kind, name, year)))
+        Ok(refresh_target_of(entity, series.as_ref()))
+    }
+
+    /// Searches TMDB for the parent series and fetches one season's details —
+    /// the shared first half of the season/episode refresh arms. `None` when the
+    /// series has no TMDB match or the season fetch fails.
+    async fn fetch_season(
+        &self,
+        tmdb: &Arc<TmdbClient>,
+        series_name: &str,
+        series_year: Option<i32>,
+        season_number: i32,
+    ) -> Option<crate::tmdb::SeasonDetails> {
+        let hit = tmdb
+            .search(TmdbKind::Series, series_name, series_year)
+            .await
+            .into_iter()
+            .next()?;
+        tmdb.season_details(hit.tmdb_id, season_number).await
+    }
+
+    /// Applies a season's/episode's fetched name/overview (+ Primary artwork URL)
+    /// onto the row — the shared second half of the two TV refresh arms. The
+    /// metadata pass persists via the item store; the image download is
+    /// best-effort (a failed download must not fail the refresh).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_tv_slice(
+        &self,
+        entity: &mut BaseItemEntity,
+        item_id: Uuid,
+        name: Option<&str>,
+        overview: Option<&str>,
+        image_url: Option<&str>,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        if wants_fetch(options.metadata_refresh_mode) {
+            apply_name_overview(entity, name, overview, options.replace_all_metadata);
+            if let Some(store) = &self.image_store {
+                store.save_items(std::slice::from_ref(entity)).await?;
+            }
+        }
+        if wants_fetch(options.image_refresh_mode)
+            && self.image_store.is_some()
+            && let Some(url) = image_url
+        {
+            let _ = self
+                .save_image_from_url(item_id, url, ImageType::Primary, None)
+                .await;
+        }
+        Ok(())
     }
 
     /// Builds the "operation deferred" error for the orchestration methods that
@@ -297,6 +364,113 @@ impl LocalProviderManager {
             None => result_list.push(incoming),
         }
     }
+}
+
+/// What a metadata refresh should fetch for one item — resolved from the item's
+/// kind and (for seasons/episodes) its parent-series linkage.
+enum RefreshTarget {
+    /// A movie or series: TMDB-search by its own title.
+    Title {
+        /// The TMDB search kind (movie vs series).
+        kind: TmdbKind,
+        /// The title to search for.
+        name: String,
+        /// The production year narrowing the search, when known.
+        year: Option<i32>,
+    },
+    /// A season: search the parent series, then fetch `/tv/{id}/season/{n}`.
+    Season {
+        /// The parent series title driving the TMDB search.
+        series_name: String,
+        /// The parent series year, when known.
+        series_year: Option<i32>,
+        /// The season number within the series.
+        season_number: i32,
+    },
+    /// An episode: like a season, then select the episode within it.
+    Episode {
+        /// The parent series title driving the TMDB search.
+        series_name: String,
+        /// The parent series year, when known.
+        series_year: Option<i32>,
+        /// The season number within the series.
+        season_number: i32,
+        /// The episode number within the season.
+        episode_number: i32,
+    },
+}
+
+/// The short (C#-unqualified) kind name of a row, e.g. the stored
+/// `MediaBrowser.Controller.Entities.TV.Episode` → `Episode`.
+fn short_kind(entity: &BaseItemEntity) -> &str {
+    entity.type_.rsplit('.').next().unwrap_or(&entity.type_)
+}
+
+/// The pure `(kind, name, year)` extraction for a movie/series row, shared by
+/// [`LocalProviderManager::tmdb_lookup`] and the refresh-target resolver.
+fn title_lookup(entity: &BaseItemEntity) -> Option<(TmdbKind, String, Option<i32>)> {
+    let kind = match short_kind(entity) {
+        "Movie" => TmdbKind::Movie,
+        "Series" => TmdbKind::Series,
+        _ => return None,
+    };
+    let name = entity.name.clone().filter(|n| !n.is_empty())?;
+    let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+    Some((kind, name, year))
+}
+
+/// Classifies what a refresh should fetch for `entity` — the pure half of
+/// [`LocalProviderManager::resolve_refresh_target`]. `series` is the item's
+/// parent-series row when one was resolvable (seasons/episodes only). `None`
+/// for kinds with no provider (music etc.), broken series links, or missing
+/// season/episode numbers.
+fn refresh_target_of(
+    entity: &BaseItemEntity,
+    series: Option<&BaseItemEntity>,
+) -> Option<RefreshTarget> {
+    let kind = short_kind(entity);
+    if matches!(kind, "Movie" | "Series") {
+        return title_lookup(entity).map(|(kind, name, year)| RefreshTarget::Title {
+            kind,
+            name,
+            year,
+        });
+    }
+    if !matches!(kind, "Season" | "Episode") {
+        return None;
+    }
+    let series = series?;
+    let series_name = series.name.clone().filter(|n| !n.is_empty())?;
+    let series_year = series.production_year.and_then(|y| i32::try_from(y).ok());
+    let number = |v: Option<i64>| v.and_then(|n| i32::try_from(n).ok());
+    if kind == "Season" {
+        Some(RefreshTarget::Season {
+            series_name,
+            series_year,
+            season_number: number(entity.index_number)?,
+        })
+    } else {
+        // Episode: `parent_index_number` is the season, `index_number` the
+        // episode within it.
+        Some(RefreshTarget::Episode {
+            series_name,
+            series_year,
+            season_number: number(entity.parent_index_number)?,
+            episode_number: number(entity.index_number)?,
+        })
+    }
+}
+
+/// Fills or replaces an item row's name + overview (the season/episode TMDB
+/// fields), with the same fill-or-replace semantics as [`apply_tmdb_details`].
+fn apply_name_overview(
+    entity: &mut BaseItemEntity,
+    name: Option<&str>,
+    overview: Option<&str>,
+    replace: bool,
+) {
+    set_text(&mut entity.name, name, replace);
+    set_text(&mut entity.overview, overview, replace);
 }
 
 /// Whether a [`MetadataRefreshMode`] should fetch remote data (`Default` /
@@ -382,14 +556,23 @@ fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
 impl ProviderManager for LocalProviderManager {
     async fn queue_refresh(
         &self,
-        _item_id: Uuid,
-        _options: &MetadataRefreshOptions,
+        item_id: Uuid,
+        options: &MetadataRefreshOptions,
         _priority: RefreshPriority,
     ) -> Result<(), ServiceError> {
-        // No remote-metadata queue yet (Part B). Accept the enqueue as a no-op so
-        // callers (the item/library refresh buttons) succeed instead of 500-ing on
-        // a deferred error; the actual fetch lands once TMDB/MusicBrainz are wired.
-        // ponytail: replace with the real priority queue when providers exist.
+        // Run the refresh in the background and return immediately — the C#
+        // queued-refresh shape (the refresh button 204s while the fetch runs).
+        // ponytail: _priority ignored — a single-item spawn needs no ordering.
+        // Add an ordered, priority-aware worker queue when bulk/library-wide
+        // refreshes land.
+        let mgr = self.clone();
+        let options = *options;
+        let handle = tokio::spawn(async move {
+            if let Err(err) = mgr.refresh_full_item(item_id, &options).await {
+                tracing::warn!(%item_id, %err, "queued metadata refresh failed");
+            }
+        });
+        drop(handle);
         Ok(())
     }
 
@@ -406,48 +589,108 @@ impl ProviderManager for LocalProviderManager {
         let Some(mut entity) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
-        // Resolve the item to a TMDB (kind, title, year) — movies/series only.
-        // ponytail: re-searches by the item's title (the same query the client's
+        // Resolve what to fetch: movies/series by their own title, seasons/
+        // episodes via their parent series. Music/other kinds have no provider —
+        // the faithful skip.
+        // ponytail: title targets re-search by name (the same query the client's
         // "Identify" ran), not the exact provider id on the chosen result — writing
         // that id needs a `BaseItemProviders` upsert path that does not exist yet.
         // In the common case the top hit matches the user's pick; the metadata is
         // real either way. Honor the exact pick once that write path lands.
-        let Some((kind, name, year)) = self.tmdb_lookup(items, item_id).await? else {
+        let Some(target) = self.resolve_refresh_target(items, &entity).await? else {
             return Ok(());
         };
-        let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next() else {
-            return Ok(());
-        };
-        let Some(details) = tmdb.details(kind, hit.tmdb_id).await else {
-            return Ok(());
-        };
+        match target {
+            RefreshTarget::Title { kind, name, year } => {
+                let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next() else {
+                    return Ok(());
+                };
+                let Some(details) = tmdb.details(kind, hit.tmdb_id).await else {
+                    return Ok(());
+                };
 
-        // Metadata pass: apply the fetched fields onto the row and persist.
-        if wants_fetch(options.metadata_refresh_mode) {
-            apply_tmdb_details(&mut entity, &details, options.replace_all_metadata);
-            // Persist through the item store (the same `ItemPersistenceService`
-            // the scanner writes enriched rows with).
-            if let Some(store) = &self.image_store {
-                store.save_items(std::slice::from_ref(&entity)).await?;
-            }
-        }
-
-        // Image pass: download the primary + backdrop when requested and an image
-        // store is wired. A single failed download must not fail the refresh.
-        if wants_fetch(options.image_refresh_mode) && self.image_store.is_some() {
-            let candidates = self
-                .get_available_remote_images(item_id, &RemoteImageQuery::default())
-                .await?;
-            for image_type in [ImageType::Primary, ImageType::Backdrop] {
-                if let Some(url) = candidates
-                    .iter()
-                    .find(|img| img.type_ == image_type)
-                    .and_then(|img| img.url.clone())
-                {
-                    let _ = self
-                        .save_image_from_url(item_id, &url, image_type, None)
-                        .await;
+                // Metadata pass: apply the fetched fields onto the row and persist.
+                if wants_fetch(options.metadata_refresh_mode) {
+                    apply_tmdb_details(&mut entity, &details, options.replace_all_metadata);
+                    // Persist through the item store (the same `ItemPersistenceService`
+                    // the scanner writes enriched rows with).
+                    if let Some(store) = &self.image_store {
+                        store.save_items(std::slice::from_ref(&entity)).await?;
+                    }
                 }
+
+                // Image pass: download the primary + backdrop when requested and an
+                // image store is wired. A single failed download must not fail the
+                // refresh.
+                if wants_fetch(options.image_refresh_mode) && self.image_store.is_some() {
+                    let candidates = self
+                        .get_available_remote_images(item_id, &RemoteImageQuery::default())
+                        .await?;
+                    for image_type in [ImageType::Primary, ImageType::Backdrop] {
+                        if let Some(url) = candidates
+                            .iter()
+                            .find(|img| img.type_ == image_type)
+                            .and_then(|img| img.url.clone())
+                        {
+                            let _ = self
+                                .save_image_from_url(item_id, &url, image_type, None)
+                                .await;
+                        }
+                    }
+                }
+            }
+            RefreshTarget::Season {
+                series_name,
+                series_year,
+                season_number,
+            } => {
+                let Some(season) = self
+                    .fetch_season(tmdb, &series_name, series_year, season_number)
+                    .await
+                else {
+                    return Ok(());
+                };
+                // The season's artwork is its poster (Primary), like the scanner.
+                self.apply_tv_slice(
+                    &mut entity,
+                    item_id,
+                    season.name.as_deref(),
+                    season.overview.as_deref(),
+                    season.poster.as_deref(),
+                    options,
+                )
+                .await?;
+            }
+            RefreshTarget::Episode {
+                series_name,
+                series_year,
+                season_number,
+                episode_number,
+            } => {
+                let Some(season) = self
+                    .fetch_season(tmdb, &series_name, series_year, season_number)
+                    .await
+                else {
+                    return Ok(());
+                };
+                let Some(episode) = season
+                    .episodes
+                    .into_iter()
+                    .find(|ep| ep.episode_number == episode_number)
+                else {
+                    return Ok(());
+                };
+                // The episode's still is stored as Primary (the scanner's
+                // convention for episode artwork).
+                self.apply_tv_slice(
+                    &mut entity,
+                    item_id,
+                    episode.name.as_deref(),
+                    episode.overview.as_deref(),
+                    episode.still_url.as_deref(),
+                    options,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -939,11 +1182,11 @@ mod tests {
         let id = Uuid::nil();
         let opts = MetadataRefreshOptions::default();
 
-        // `queue_refresh` intentionally no-ops (Ok) rather than deferring, so the
-        // item/library refresh buttons succeed before Part B providers exist.
+        // `queue_refresh` spawns the refresh in the background and returns Ok
+        // immediately; with no TMDB client wired the spawned refresh no-ops.
         mgr.queue_refresh(id, &opts, RefreshPriority::Normal)
             .await
-            .expect("queue_refresh is an accepted no-op until providers land");
+            .expect("queue_refresh accepts the enqueue");
 
         // `refresh_full_item` on a manager with no TMDB client / item store has
         // nothing to fetch and succeeds as a no-op (faithful: Jellyfin with no
@@ -1094,5 +1337,406 @@ mod tests {
             opts,
             hermit_model::configuration::MetadataOptions::default()
         );
+    }
+
+    /// An [`ItemRepository`] over a fixed map, reporting each `retrieve_item`
+    /// call on a channel so a test can observe a background refresh running.
+    /// Every method the refresh path never touches is `unimplemented!`.
+    struct FakeItems {
+        rows: HashMap<Uuid, BaseItemEntity>,
+        seen: tokio::sync::mpsc::UnboundedSender<Uuid>,
+    }
+
+    #[async_trait]
+    impl hermit_traits::persistence::ItemRepository for FakeItems {
+        async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+            let _ = self.seen.send(id);
+            Ok(self.rows.get(&id).cloned())
+        }
+        async fn get_items(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<hermit_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_item_ids(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_item_list(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_latest_item_list(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+            _collection_type: hermit_model::data::CollectionType,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            unimplemented!()
+        }
+        async fn item_exists(&self, _id: Uuid) -> Result<bool, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_items_by_primary_version(
+            &self,
+            _primary_id: Uuid,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_items_with_provider_id(
+            &self,
+            _provider_key: &str,
+        ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_image_infos(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<hermit_traits::options::ItemImageInfo>, ServiceError> {
+            unimplemented!()
+        }
+        async fn swap_item_images(
+            &self,
+            _item_id: Uuid,
+            _image_type: ImageType,
+            _index1: i32,
+            _index2: i32,
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn get_genres(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_music_genres(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_studios(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_artists(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_album_artists(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_all_artists(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<
+            hermit_model::querying::QueryResult<hermit_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn get_music_genre_names(&self) -> Result<Vec<String>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_studio_names(&self) -> Result<Vec<String>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_genre_names(&self) -> Result<Vec<String>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_all_artist_names(&self) -> Result<Vec<String>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_media_stream_languages(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+            _stream_type: hermit_model::entities::MediaStreamType,
+        ) -> Result<Vec<String>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_query_filters_legacy(
+            &self,
+            _filter: &hermit_traits::options::InternalItemsQuery,
+        ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_is_played(
+            &self,
+            _user: &hermit_db::entities::users::UserEntity,
+            _id: Uuid,
+            _recursive: bool,
+        ) -> Result<bool, ServiceError> {
+            unimplemented!()
+        }
+    }
+
+    /// A minimal row of the given stored C# type name.
+    fn row(kind: &str, name: &str) -> BaseItemEntity {
+        BaseItemEntity {
+            id: Uuid::new_v4().to_string(),
+            name: Some(name.to_owned()),
+            type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_refresh_returns_immediately_and_runs_in_background() {
+        // A MusicAlbum short-circuits before any network, so the spawned refresh
+        // completes offline; the repo channel proves it actually ran.
+        let item_id = Uuid::new_v4();
+        let mut album = row("Audio.MusicAlbum", "OK Computer");
+        album.id = item_id.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, album)]),
+            seen: tx,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items);
+
+        mgr.queue_refresh(
+            item_id,
+            &MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                ..MetadataRefreshOptions::default()
+            },
+            RefreshPriority::High,
+        )
+        .await
+        .expect("enqueue accepted");
+
+        // The spawned task looked the item up — the refresh ran to completion.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("background refresh ran")
+            .expect("channel open");
+        assert_eq!(seen, item_id);
+    }
+
+    #[tokio::test]
+    async fn queue_refresh_swallows_refresh_errors() {
+        // The item is missing → the spawned refresh errors NotFound; the enqueue
+        // still reports Ok and the error is only logged.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::new(),
+            seen: tx,
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items);
+        mgr.queue_refresh(
+            Uuid::new_v4(),
+            &MetadataRefreshOptions::default(),
+            RefreshPriority::Low,
+        )
+        .await
+        .expect("enqueue accepted despite the failing refresh");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("background refresh attempted the lookup");
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_target_fetches_the_parent_series_row() {
+        // The async wrapper hops `series_id` → the repo for seasons; a movie
+        // resolves without touching the repo at all.
+        let series_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Severance");
+        series.id = series_id.to_string();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let items: Arc<dyn hermit_traits::persistence::ItemRepository> = Arc::new(FakeItems {
+            rows: HashMap::from([(series_id, series)]),
+            seen: tx,
+        });
+        let mgr = LocalProviderManager::default();
+
+        let mut season = row("TV.Season", "Season 1");
+        season.series_id = Some(series_id.to_string());
+        season.index_number = Some(1);
+        let target = mgr
+            .resolve_refresh_target(&items, &season)
+            .await
+            .expect("resolves");
+        assert!(matches!(target, Some(super::RefreshTarget::Season { .. })));
+        assert_eq!(rx.try_recv().ok(), Some(series_id), "series row fetched");
+
+        let movie = row("Movies.Movie", "Solaris");
+        let target = mgr
+            .resolve_refresh_target(&items, &movie)
+            .await
+            .expect("resolves");
+        assert!(matches!(target, Some(super::RefreshTarget::Title { .. })));
+        assert!(rx.try_recv().is_err(), "movies never hit the repo");
+    }
+
+    #[tokio::test]
+    async fn apply_tv_slice_applies_metadata_per_refresh_mode() {
+        let mgr = LocalProviderManager::default();
+        let opts = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::None,
+            replace_all_metadata: true,
+            replace_all_images: false,
+        };
+        let mut entity = BaseItemEntity::default();
+        mgr.apply_tv_slice(
+            &mut entity,
+            Uuid::new_v4(),
+            Some("Ep 3"),
+            Some("Plot."),
+            Some("https://example.invalid/still.jpg"),
+            &opts,
+        )
+        .await
+        .expect("slice applies");
+        assert_eq!(entity.name.as_deref(), Some("Ep 3"));
+        assert_eq!(entity.overview.as_deref(), Some("Plot."));
+
+        // ValidationOnly touches nothing.
+        let mut untouched = BaseItemEntity::default();
+        mgr.apply_tv_slice(
+            &mut untouched,
+            Uuid::new_v4(),
+            Some("X"),
+            Some("Y"),
+            None,
+            &MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::ValidationOnly,
+                ..MetadataRefreshOptions::default()
+            },
+        )
+        .await
+        .expect("slice no-ops");
+        assert_eq!(untouched.name, None);
+    }
+
+    #[test]
+    fn refresh_target_resolves_season_and_episode_via_parent_series() {
+        use super::{RefreshTarget, refresh_target_of};
+
+        let mut series = row("TV.Series", "Severance");
+        series.production_year = Some(2022);
+
+        let mut season = row("TV.Season", "Season 2");
+        season.series_id = Some(series.id.clone());
+        season.index_number = Some(2);
+        match refresh_target_of(&season, Some(&series)) {
+            Some(RefreshTarget::Season {
+                series_name,
+                series_year,
+                season_number,
+            }) => {
+                assert_eq!(series_name, "Severance");
+                assert_eq!(series_year, Some(2022));
+                assert_eq!(season_number, 2);
+            }
+            other => panic!(
+                "expected a Season target, got {}",
+                target_name(other.as_ref())
+            ),
+        }
+
+        let mut episode = row("TV.Episode", "Hello, Ms. Cobel");
+        episode.series_id = Some(series.id.clone());
+        episode.parent_index_number = Some(1);
+        episode.index_number = Some(3);
+        match refresh_target_of(&episode, Some(&series)) {
+            Some(RefreshTarget::Episode {
+                series_name,
+                season_number,
+                episode_number,
+                ..
+            }) => {
+                assert_eq!(series_name, "Severance");
+                assert_eq!(season_number, 1);
+                assert_eq!(episode_number, 3);
+            }
+            other => panic!(
+                "expected an Episode target, got {}",
+                target_name(other.as_ref())
+            ),
+        }
+    }
+
+    /// A debug label for a [`super::RefreshTarget`] in test panics.
+    fn target_name(target: Option<&super::RefreshTarget>) -> &'static str {
+        match target {
+            Some(super::RefreshTarget::Title { .. }) => "Title",
+            Some(super::RefreshTarget::Season { .. }) => "Season",
+            Some(super::RefreshTarget::Episode { .. }) => "Episode",
+            None => "None",
+        }
+    }
+
+    #[test]
+    fn refresh_target_skips_unsupported_kinds_and_broken_links() {
+        use super::refresh_target_of;
+
+        // Music has no provider — the faithful skip.
+        assert!(refresh_target_of(&row("Audio.MusicAlbum", "OK Computer"), None).is_none());
+        // A season with no resolvable parent series row.
+        let mut orphan = row("TV.Season", "Season 1");
+        orphan.index_number = Some(1);
+        assert!(refresh_target_of(&orphan, None).is_none());
+        // An episode missing its season/episode numbers.
+        let series = row("TV.Series", "Severance");
+        let mut unnumbered = row("TV.Episode", "Mystery");
+        unnumbered.series_id = Some(series.id.clone());
+        assert!(refresh_target_of(&unnumbered, Some(&series)).is_none());
+        // A movie resolves to a Title target (control case).
+        assert!(matches!(
+            refresh_target_of(&row("Movies.Movie", "Solaris"), None),
+            Some(super::RefreshTarget::Title { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_name_overview_fills_and_replaces() {
+        use super::apply_name_overview;
+
+        let mut entity = BaseItemEntity::default();
+        apply_name_overview(&mut entity, Some("Ep 1"), Some("Plot."), false);
+        assert_eq!(entity.name.as_deref(), Some("Ep 1"));
+        assert_eq!(entity.overview.as_deref(), Some("Plot."));
+
+        // Existing values are kept without replace…
+        apply_name_overview(&mut entity, Some("New"), Some("New plot."), false);
+        assert_eq!(entity.name.as_deref(), Some("Ep 1"));
+        // …and overwritten with it.
+        apply_name_overview(&mut entity, Some("New"), Some("New plot."), true);
+        assert_eq!(entity.name.as_deref(), Some("New"));
+        assert_eq!(entity.overview.as_deref(), Some("New plot."));
+
+        // A missing TMDB value never clears an existing one.
+        apply_name_overview(&mut entity, None, None, true);
+        assert_eq!(entity.name.as_deref(), Some("New"));
     }
 }
