@@ -12,15 +12,24 @@
 //! [`LibraryManager`](hermit_traits::library::LibraryManager) so the same
 //! persistence seam backs everything.
 //!
+//! Playlist **ownership and access** are real: the `Playlists` table records the
+//! owner + open-access flag (C# `Playlist.OwnerUserId`/`OpenAccess`), the
+//! `PlaylistShares` table records per-user share permissions (`Playlist.Shares`),
+//! and every read resolves the caller's [`PlaylistAccess`] — owner, `CanEdit`
+//! share, read-only share, or open-access — with invisible playlists reported as
+//! `NotFound` (the C# `GetPlaylistForUser` null). A playlist with no `Playlists`
+//! row (created before owner tracking, or by an API key) grants `Owner` to every
+//! caller for back-compat.
+//!
 //! Deferred (documented, per the unit-8 minimal-manager rule):
 //! - the on-disk `.m3u`/`.pls` *playlist file* writes (`SavePlaylistFile`) — a
 //!   filesystem concern folded away from the trait; not performed here;
 //!   ordering therefore lives purely in the linked-children rows;
 //!   entry-id addressing (`remove_item_from_playlist`/`move_item` take opaque
 //!   entry-id strings) is approximated by the child item id;
-//! - per-user **share** permissions (`PlaylistUserPermissions`) are stored only
-//!   in memory is *not* attempted — the share methods are accepted no-ops until
-//!   the `PlaylistShares` persistence lands (flagged deferred);
+//! - `remove_playlists` (owned-playlist deletion + share transfer on user
+//!   removal) — ownership is recorded now, but the user-deletion cascade is not
+//!   wired;
 //! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
 //!   user-view tree and returns `None` here.
 
@@ -37,7 +46,10 @@ use hermit_model::playlists::{
 };
 use uuid::Uuid;
 
-use hermit_traits::collections::{CollectionCreationOptions, CollectionManager, PlaylistManager};
+use hermit_traits::collections::{
+    CollectionCreationOptions, CollectionManager, PlaylistAccess, PlaylistAccessLevel,
+    PlaylistManager,
+};
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryManager;
 use hermit_traits::persistence::LinkedChildrenService;
@@ -230,17 +242,78 @@ impl HermitPlaylistManager {
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("playlist {id}")))
     }
+
+    /// Resolves the caller's access to a playlist (C# `Playlist.IsVisible` plus
+    /// the owner/`CanEdit` split the controller checks derive from it).
+    ///
+    /// One LEFT-JOIN query: the base row proves existence, the `Playlists` meta
+    /// row carries owner/open-access, and the caller's own `PlaylistShares` row
+    /// (if any) carries `CanEdit`. Missing **or invisible** → `NotFound`.
+    async fn access(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PlaylistAccess, ServiceError> {
+        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
+            r#"SELECT p."OwnerUserId", p."OpenAccess", s."CanEdit"
+               FROM "BaseItems" bi
+               LEFT JOIN "Playlists" p ON p."PlaylistId" = bi."Id"
+               LEFT JOIN "PlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
+               WHERE bi."Id" = ?1"#,
+        )
+        .bind(playlist_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let not_found = || ServiceError::not_found(format!("playlist {playlist_id}"));
+        let (owner, open_access, can_edit) = row.ok_or_else(not_found)?;
+        // `open_access` is NULL only when the meta row is absent — a legacy
+        // playlist predating owner tracking: every caller is owner-equivalent.
+        let Some(open_access) = open_access else {
+            return Ok(PlaylistAccess {
+                level: PlaylistAccessLevel::Owner,
+                open_access: false,
+            });
+        };
+        let open_access = open_access != 0;
+        // A NULL owner in an existing meta row is an API-key playlist: no user
+        // owns it, so — like a legacy row — every caller is owner-equivalent.
+        let level = if owner.is_none() || owner.as_deref() == Some(user_id.to_string().as_str()) {
+            PlaylistAccessLevel::Owner
+        } else if let Some(can_edit) = can_edit {
+            if can_edit != 0 {
+                PlaylistAccessLevel::CanEdit
+            } else {
+                PlaylistAccessLevel::Read
+            }
+        } else if open_access {
+            PlaylistAccessLevel::Read
+        } else {
+            return Err(not_found());
+        };
+        Ok(PlaylistAccess { level, open_access })
+    }
 }
 
 #[async_trait]
 impl PlaylistManager for HermitPlaylistManager {
+    async fn get_playlist_access(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PlaylistAccess, ServiceError> {
+        self.access(playlist_id, user_id).await
+    }
+
     async fn get_playlist_for_user(
         &self,
         playlist_id: Uuid,
-        _user_id: Uuid,
+        user_id: Uuid,
     ) -> Result<BaseItemEntity, ServiceError> {
-        // Per-user share visibility is a deferred concern; the row is returned
-        // as-is once it exists.
+        // Visibility gate first: invisible reads as missing (the C#
+        // `GetPlaylistForUser` returns null for both).
+        self.access(playlist_id, user_id).await?;
         self.require_playlist(playlist_id).await
     }
 
@@ -251,6 +324,27 @@ impl PlaylistManager for HermitPlaylistManager {
         let id = Uuid::new_v4();
         let name = request.name.clone().unwrap_or_default();
         insert_named_item(&self.db, id, BaseItemKind::Playlist, &name, true).await?;
+        // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
+        // (API-key create) stores NULL — unowned, visible to all.
+        sqlx::query(
+            r#"INSERT INTO "Playlists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+               VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(id.to_string())
+        .bind((!request.user_id.is_nil()).then(|| request.user_id.to_string()))
+        .bind(i64::from(request.public.unwrap_or(false)))
+        .execute(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        // Seed the share list from the request (C# `Shares = options.Users`).
+        for share in &request.users {
+            self.add_user_to_shares(&PlaylistUserUpdateRequest {
+                id,
+                user_id: share.user_id,
+                can_edit: Some(share.can_edit),
+            })
+            .await?;
+        }
         for item_id in &request.item_id_list {
             self.linked_children
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
@@ -271,6 +365,31 @@ impl PlaylistManager for HermitPlaylistManager {
                 .await
                 .map_err(db_err)?;
         }
+        if let Some(public) = request.public {
+            // A legacy playlist has no meta row; updating 0 rows is harmless.
+            sqlx::query(r#"UPDATE "Playlists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#)
+                .bind(request.id.to_string())
+                .bind(i64::from(public))
+                .execute(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        }
+        if let Some(users) = &request.users {
+            // C# replaces `Shares` wholesale on update.
+            sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1"#)
+                .bind(request.id.to_string())
+                .execute(self.db.pool())
+                .await
+                .map_err(db_err)?;
+            for share in users {
+                self.add_user_to_shares(&PlaylistUserUpdateRequest {
+                    id: request.id,
+                    user_id: share.user_id,
+                    can_edit: Some(share.can_edit),
+                })
+                .await?;
+            }
+        }
         if let Some(ids) = &request.ids {
             for item_id in ids {
                 self.linked_children
@@ -281,13 +400,25 @@ impl PlaylistManager for HermitPlaylistManager {
         Ok(())
     }
 
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let type_name = stored_type_name(BaseItemKind::Playlist)
             .ok_or_else(|| ServiceError::backend("no stored type name for Playlist"))?;
+        // Visibility predicate (C# `Playlist.IsVisible`): legacy/unowned rows,
+        // open-access, owned by the caller, or shared with the caller.
         let rows = sqlx::query_as::<_, BaseItemEntity>(
-            r#"SELECT * FROM "BaseItems" WHERE "Type" = ?1 ORDER BY "Name""#,
+            r#"SELECT bi.* FROM "BaseItems" bi
+               LEFT JOIN "Playlists" p ON p."PlaylistId" = bi."Id"
+               WHERE bi."Type" = ?1 AND (
+                   p."PlaylistId" IS NULL
+                   OR p."OwnerUserId" IS NULL
+                   OR p."OpenAccess" = 1
+                   OR p."OwnerUserId" = ?2
+                   OR EXISTS (SELECT 1 FROM "PlaylistShares" s
+                              WHERE s."PlaylistId" = bi."Id" AND s."UserId" = ?2))
+               ORDER BY bi."Name""#,
         )
         .bind(type_name)
+        .bind(user_id.to_string())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -297,11 +428,12 @@ impl PlaylistManager for HermitPlaylistManager {
     async fn get_playlist_items(
         &self,
         playlist_id: Uuid,
-        _user_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // The playlist must exist; per-user visibility filtering is a deferred
-        // parental-control concern, so all members are returned in link order.
-        self.require_playlist(playlist_id).await?;
+        // Visibility gate (invisible → NotFound); the C# `Forbid()` branch is
+        // unreachable here because visible ⇔ permitted-to-read. Per-member
+        // parental-control filtering stays deferred: members return in link order.
+        self.access(playlist_id, user_id).await?;
         let child_ids = self
             .linked_children
             .get_linked_children_ids(playlist_id, Some(LINKED_CHILD_MANUAL))
@@ -467,7 +599,9 @@ impl PlaylistManager for HermitPlaylistManager {
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        // Owner tracking (and share transfer) is deferred; nothing is removed.
+        // Ownership is recorded (the `Playlists` table), but the user-deletion
+        // cascade — delete owned playlists, transfer shared ones (C#
+        // `RemovePlaylists`) — is still deferred; nothing is removed.
         Ok(())
     }
 }
@@ -568,11 +702,14 @@ mod tests {
             Arc::new(HermitLinkedChildrenService::new(db.clone())),
         );
 
+        // Reads below must come from the owner: playlists are visible only to
+        // their owner / shared users now.
+        let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Roadtrip".to_owned()),
                 item_id_list: vec![track],
-                user_id: Uuid::new_v4(),
+                user_id: owner,
                 ..PlaylistCreationRequest::default()
             })
             .await
@@ -580,7 +717,7 @@ mod tests {
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
         let row = mgr
-            .get_playlist_for_user(playlist_id, Uuid::new_v4())
+            .get_playlist_for_user(playlist_id, owner)
             .await
             .expect("get");
         assert_eq!(row.name.as_deref(), Some("Roadtrip"));
@@ -593,25 +730,19 @@ mod tests {
         .await
         .expect("update");
         let row = mgr
-            .get_playlist_for_user(playlist_id, Uuid::new_v4())
+            .get_playlist_for_user(playlist_id, owner)
             .await
             .expect("get2");
         assert_eq!(row.name.as_deref(), Some("Roadtrip 2"));
 
-        let all = mgr.get_playlists(Uuid::new_v4()).await.expect("list");
+        let all = mgr.get_playlists(owner).await.expect("list");
         assert_eq!(all.len(), 1);
 
         // Removing the sole member leaves the playlist row intact.
         mgr.remove_item_from_playlist(&created.id, &[track.to_string()])
             .await
             .expect("remove");
-        assert_eq!(
-            mgr.get_playlists(Uuid::new_v4())
-                .await
-                .expect("list2")
-                .len(),
-            1
-        );
+        assert_eq!(mgr.get_playlists(owner).await.expect("list2").len(), 1);
     }
 
     #[tokio::test]
@@ -628,11 +759,12 @@ mod tests {
             Arc::new(HermitLinkedChildrenService::new(db.clone())),
         );
 
+        let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Mix".to_owned()),
                 item_id_list: vec![track_a, track_b],
-                user_id: Uuid::new_v4(),
+                user_id: owner,
                 ..PlaylistCreationRequest::default()
             })
             .await
@@ -640,7 +772,7 @@ mod tests {
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
         let items = mgr
-            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .get_playlist_items(playlist_id, owner)
             .await
             .expect("items");
         assert_eq!(items.len(), 2);
@@ -661,11 +793,12 @@ mod tests {
             library_manager_over(db.clone()),
             Arc::new(HermitLinkedChildrenService::new(db.clone())),
         );
+        let owner = Uuid::new_v4();
         let created = mgr
             .create_playlist(&PlaylistCreationRequest {
                 name: Some("Ordered".to_owned()),
                 item_id_list: vec![a, b],
-                user_id: Uuid::new_v4(),
+                user_id: owner,
                 ..PlaylistCreationRequest::default()
             })
             .await
@@ -673,11 +806,11 @@ mod tests {
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
         // Insert C at the front: expect [C, A, B].
-        mgr.add_item_to_playlist(playlist_id, &[c], Some(0), Uuid::new_v4())
+        mgr.add_item_to_playlist(playlist_id, &[c], Some(0), owner)
             .await
             .expect("add at 0");
         let order: Vec<String> = mgr
-            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
             .iter()
@@ -692,11 +825,11 @@ mod tests {
         // No position → plain append at the end.
         let d = Uuid::new_v4();
         seed_item(&db, d, BaseItemKind::Audio).await;
-        mgr.add_item_to_playlist(playlist_id, &[d], None, Uuid::new_v4())
+        mgr.add_item_to_playlist(playlist_id, &[d], None, owner)
             .await
             .expect("append");
         let last = mgr
-            .get_playlist_items(playlist_id, Uuid::new_v4())
+            .get_playlist_items(playlist_id, owner)
             .await
             .expect("items2")
             .last()
@@ -805,5 +938,188 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Builds a playlist manager over `db` (the repeated three-collaborator
+    /// constructor the access tests share).
+    fn playlist_manager(db: &hermit_db::Database) -> HermitPlaylistManager {
+        HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        )
+    }
+
+    #[tokio::test]
+    async fn create_playlist_records_owner_and_seeds_shares() {
+        use hermit_model::entities_media::PlaylistUserPermissions;
+        use hermit_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Owned".to_owned()),
+                user_id: alice,
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        let alice_access = mgr.get_playlist_access(playlist_id, alice).await.unwrap();
+        assert_eq!(alice_access.level, PlaylistAccessLevel::Owner);
+        assert!(!alice_access.open_access);
+        let bob_access = mgr.get_playlist_access(playlist_id, bob).await.unwrap();
+        assert_eq!(bob_access.level, PlaylistAccessLevel::CanEdit);
+        // The owner is not in the share list; the seeded share is.
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![PlaylistUserPermissions::new(bob, true)]
+        );
+        // A stranger cannot see the playlist at all.
+        assert!(matches!(
+            mgr.get_playlist_access(playlist_id, carol).await,
+            Err(hermit_traits::error::ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.get_playlist_for_user(playlist_id, carol).await,
+            Err(hermit_traits::error::ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_access_playlist_is_readable_by_anyone() {
+        use hermit_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Public".to_owned()),
+                user_id: Uuid::new_v4(),
+                public: Some(true),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+
+        let stranger = mgr
+            .get_playlist_access(playlist_id, Uuid::new_v4())
+            .await
+            .expect("open playlists are visible to all");
+        assert_eq!(stranger.level, PlaylistAccessLevel::Read);
+        assert!(stranger.open_access);
+        assert!(!stranger.level.can_edit());
+    }
+
+    #[tokio::test]
+    async fn legacy_playlist_without_meta_row_grants_owner_to_all() {
+        use hermit_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        // A pre-ownership row: the BaseItems row exists with no `Playlists` meta.
+        let legacy = Uuid::new_v4();
+        seed_item(&db, legacy, BaseItemKind::Playlist).await;
+
+        let access = mgr
+            .get_playlist_access(legacy, Uuid::new_v4())
+            .await
+            .expect("legacy rows stay visible");
+        assert_eq!(access.level, PlaylistAccessLevel::Owner);
+        assert!(!access.open_access);
+        assert_eq!(mgr.get_playlists(Uuid::new_v4()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_playlists_filters_by_visibility() {
+        use hermit_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (alice, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let create = |name: &str, owner: Uuid, users: Vec<PlaylistUserPermissions>| {
+            PlaylistCreationRequest {
+                name: Some(name.to_owned()),
+                user_id: owner,
+                users,
+                ..PlaylistCreationRequest::default()
+            }
+        };
+        let req = create("Alice's", alice, Vec::new());
+        let p1 = mgr.create_playlist(&req).await.expect("p1").id;
+        let p2 = mgr
+            .create_playlist(&create(
+                "Bob's shared",
+                bob,
+                vec![PlaylistUserPermissions::new(alice, false)],
+            ))
+            .await
+            .expect("p2")
+            .id;
+        mgr.create_playlist(&create("Carol's", carol, Vec::new()))
+            .await
+            .expect("p3");
+
+        let visible: Vec<String> = mgr
+            .get_playlists(alice)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(visible.len(), 2, "alice sees her own + bob's shared");
+        assert!(visible.contains(&p1) && visible.contains(&p2));
+    }
+
+    #[tokio::test]
+    async fn update_playlist_applies_public_and_replaces_shares() {
+        use hermit_model::entities_media::PlaylistUserPermissions;
+        use hermit_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let (alice, bob, dave) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Mutable".to_owned()),
+                user_id: alice,
+                users: vec![PlaylistUserPermissions::new(bob, true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            user_id: alice,
+            users: Some(vec![PlaylistUserPermissions::new(dave, false)]),
+            public: Some(true),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+
+        // The share list was replaced wholesale (bob is gone, dave read-only).
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![PlaylistUserPermissions::new(dave, false)]
+        );
+        // The open-access flag applied: a stranger can now read.
+        let stranger = mgr
+            .get_playlist_access(playlist_id, Uuid::new_v4())
+            .await
+            .expect("now public");
+        assert_eq!(stranger.level, PlaylistAccessLevel::Read);
+        assert!(stranger.open_access);
     }
 }

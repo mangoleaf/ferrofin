@@ -19,11 +19,14 @@
 //! path is faithful (it flows from
 //! [`PlaylistManager::get_playlist_for_user`](hermit_traits::collections::PlaylistManager)).
 //!
-//! Per-user **shares** are persisted (the `PlaylistShares` table): the
-//! `GET/POST/DELETE /Playlists/{id}/Users` routes read and write real permissions,
-//! and `GET /Playlists/{id}` reports them. Still deferred: the playlist row has no
-//! `OwnerUserId`, so the C# owner/share `403 Forbid` access branches aren't
-//! evaluated — an authenticated caller is treated as permitted.
+//! Ownership and shares are persisted and **enforced**: the `Playlists` table
+//! records the owner + open-access flag and `PlaylistShares` the per-user
+//! permissions, and every route resolves the caller's
+//! [`PlaylistAccess`](hermit_traits::collections::PlaylistAccess) first. Edit
+//! actions (update, add/remove/move items) need owner or a `CanEdit` share
+//! (`403` otherwise); share management is owner-only; an invisible playlist is
+//! `404` (the C# `GetPlaylistForUser` null). Playlists predating owner tracking
+//! grant owner-equivalent access to every caller (back-compat).
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -37,6 +40,7 @@ use hermit_model::playlists::{
     PlaylistUserUpdateRequest, UpdatePlaylistDto, UpdatePlaylistUserDto,
 };
 use hermit_model::querying::QueryResult;
+use hermit_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
 use hermit_traits::options::DtoOptions;
 use uuid::Uuid;
 
@@ -44,6 +48,18 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
+
+/// Gates an edit action: owner or a `CanEdit` share passes, anything else is the
+/// C# `Forbid()` → `403`.
+fn require_edit(access: PlaylistAccess) -> Result<PlaylistAccess, ApiError> {
+    if access.level.can_edit() {
+        Ok(access)
+    } else {
+        Err(ApiError::Forbidden(
+            "playlist edit requires the owner or a CanEdit share".to_owned(),
+        ))
+    }
+}
 
 /// The query parameters for the obsolete query-string variant of `POST /Playlists`.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -108,9 +124,9 @@ async fn create_playlist(
 
 /// `GET /Playlists/{playlistId}` — reads a playlist's shares + item ids.
 ///
-/// Port of `PlaylistsController.GetPlaylist`. Ownership/share fields are deferred
-/// (see module docs), so `open_access`/`shares` are reported as their empty
-/// defaults and `item_ids` are the playlist's members.
+/// Port of `PlaylistsController.GetPlaylist`: the caller must be able to see the
+/// playlist (`404` otherwise); the DTO carries the real open-access flag, the
+/// share list, and the member item ids.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}",
@@ -127,9 +143,9 @@ async fn get_playlist(
     Path(playlist_id): Path<Uuid>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
     let user_id = auth.user_id();
-    state
+    let access = state
         .playlists
-        .get_playlist_for_user(playlist_id, user_id)
+        .get_playlist_access(playlist_id, user_id)
         .await?;
     let items = state
         .playlists
@@ -140,7 +156,7 @@ async fn get_playlist(
         .filter_map(|i| Uuid::parse_str(&i.id).ok())
         .collect();
     Ok(Json(PlaylistDto {
-        open_access: false,
+        open_access: access.open_access,
         shares: state.playlists.get_playlist_shares(playlist_id).await?,
         item_ids,
     }))
@@ -148,8 +164,8 @@ async fn get_playlist(
 
 /// `POST /Playlists/{playlistId}` — updates a playlist.
 ///
-/// Port of `PlaylistsController.UpdatePlaylist`. The owner/share `403` branch is
-/// deferred (see module docs); a missing playlist is `404`.
+/// Port of `PlaylistsController.UpdatePlaylist`: requires owner or a `CanEdit`
+/// share (`403` otherwise); a missing/invisible playlist is `404`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}",
@@ -169,10 +185,12 @@ async fn update_playlist(
     Json(body): Json<UpdatePlaylistDto>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
-    state
-        .playlists
-        .get_playlist_for_user(playlist_id, calling_user_id)
-        .await?;
+    require_edit(
+        state
+            .playlists
+            .get_playlist_access(playlist_id, calling_user_id)
+            .await?,
+    )?;
     let request = PlaylistUpdateRequest {
         id: playlist_id,
         user_id: calling_user_id,
@@ -204,7 +222,8 @@ struct GetPlaylistItemsQuery {
 ///
 /// Port of `PlaylistsController.GetPlaylistItems`. Each returned DTO carries its
 /// `PlaylistItemId` (the member item id, matching the minimal port's entry-id
-/// approximation). The owner/share `403` branch is deferred (see module docs).
+/// approximation). An invisible playlist is `404`; the separate C# `Forbid()`
+/// branch is unreachable here because visible ⇔ permitted-to-read.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Items",
@@ -281,14 +300,16 @@ struct AddItemsQuery {
 
 /// `POST /Playlists/{playlistId}/Items` — adds items to a playlist.
 ///
-/// Port of `PlaylistsController.AddItemToPlaylist`. The owner/share `403` branch
-/// is deferred (see module docs); a missing playlist is `404`.
+/// Port of `PlaylistsController.AddItemToPlaylist`: the *effective* user
+/// (`userId` query, else the caller — matching C#) needs owner or a `CanEdit`
+/// share (`403` otherwise); a missing/invisible playlist is `404`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Items",
     params(("playlistId" = String, Path, description = "The playlist id")),
     responses(
         (status = 204, description = "Items added to playlist"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "hermit"
@@ -300,10 +321,12 @@ async fn add_item_to_playlist(
     Query(query): Query<AddItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
-    state
-        .playlists
-        .get_playlist_for_user(playlist_id, user_id)
-        .await?;
+    require_edit(
+        state
+            .playlists
+            .get_playlist_access(playlist_id, user_id)
+            .await?,
+    )?;
     let ids = parse_csv_uuids(query.ids.as_deref())?;
     state
         .playlists
@@ -323,14 +346,16 @@ struct RemoveItemsQuery {
 
 /// `DELETE /Playlists/{playlistId}/Items` — removes entries from a playlist.
 ///
-/// Port of `PlaylistsController.RemoveItemFromPlaylist`. The owner/share `403`
-/// branch is deferred (see module docs); a missing playlist is `404`.
+/// Port of `PlaylistsController.RemoveItemFromPlaylist`: requires owner or a
+/// `CanEdit` share (`403` otherwise). A nil caller (API key) skips the check,
+/// approximating the C# API-key allowance; a missing/invisible playlist is `404`.
 #[utoipa::path(
     delete,
     path = "/Playlists/{playlistId}/Items",
     params(("playlistId" = String, Path, description = "The playlist id")),
     responses(
         (status = 204, description = "Items removed"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "hermit"
@@ -343,10 +368,12 @@ async fn remove_item_from_playlist(
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
     if !calling_user_id.is_nil() {
-        state
-            .playlists
-            .get_playlist_for_user(playlist_id, calling_user_id)
-            .await?;
+        require_edit(
+            state
+                .playlists
+                .get_playlist_access(playlist_id, calling_user_id)
+                .await?,
+        )?;
     }
     let entry_ids: Vec<String> = query
         .entry_ids
@@ -371,8 +398,8 @@ async fn remove_item_from_playlist(
 /// Port of `PlaylistsController.MoveItem`. Because the normalized axum path
 /// captures both the playlist id and the item id under the same positional name
 /// (`{itemId}`), the three path segments are read positionally through
-/// [`axum::extract::RawPathParams`]. The owner/share `403` branch is deferred
-/// (see module docs); a missing playlist is `404`.
+/// [`axum::extract::RawPathParams`]. Requires owner or a `CanEdit` share (`403`
+/// otherwise); a missing/invisible playlist is `404`.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}",
@@ -383,6 +410,7 @@ async fn remove_item_from_playlist(
     ),
     responses(
         (status = 204, description = "Item moved to new index"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "hermit"
@@ -402,10 +430,12 @@ async fn move_item(
     let calling_user_id = auth.user_id();
     let playlist_uuid = Uuid::parse_str(playlist_id)
         .map_err(|_| ApiError::BadRequest(format!("invalid id {playlist_id:?}")))?;
-    state
-        .playlists
-        .get_playlist_for_user(playlist_uuid, calling_user_id)
-        .await?;
+    require_edit(
+        state
+            .playlists
+            .get_playlist_access(playlist_uuid, calling_user_id)
+            .await?,
+    )?;
     state
         .playlists
         .move_item(playlist_id, item_id, new_index, calling_user_id)
@@ -415,15 +445,16 @@ async fn move_item(
 
 /// `GET /Playlists/{playlistId}/Users` — the playlist's share list.
 ///
-/// Port of `PlaylistsController.GetPlaylistUsers`. Shares are deferred (see
-/// module docs), so an existing playlist yields an empty list; a missing
-/// playlist is `404`.
+/// Port of `PlaylistsController.GetPlaylistUsers`: **owner-only** — any other
+/// caller who can see the playlist gets `403`; a missing/invisible playlist is
+/// `404`.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Users",
     params(("playlistId" = String, Path, description = "The playlist id")),
     responses(
         (status = 200, description = "Found shares (list of PlaylistUserPermissions)"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "hermit"
@@ -433,10 +464,15 @@ async fn get_playlist_users(
     RequireAuth(auth): RequireAuth,
     Path(playlist_id): Path<Uuid>,
 ) -> Result<Json<Vec<PlaylistUserPermissions>>, ApiError> {
-    state
+    let access = state
         .playlists
-        .get_playlist_for_user(playlist_id, auth.user_id())
+        .get_playlist_access(playlist_id, auth.user_id())
         .await?;
+    if access.level != PlaylistAccessLevel::Owner {
+        return Err(ApiError::Forbidden(
+            "only the playlist owner may list shares".to_owned(),
+        ));
+    }
     Ok(Json(
         state.playlists.get_playlist_shares(playlist_id).await?,
     ))
@@ -444,9 +480,11 @@ async fn get_playlist_users(
 
 /// `GET /Playlists/{playlistId}/Users/{userId}` — one user's permission.
 ///
-/// Port of `PlaylistsController.GetPlaylistUser`. With shares deferred (see module
-/// docs), the caller is reported as owner-equivalent (`can_edit = true`) when it
-/// is the requested user, otherwise the permission is absent (`404`).
+/// Port of `PlaylistsController.GetPlaylistUser`, including its quirk: an
+/// **owner** caller is answered with their own `(caller, true)` permission even
+/// when asking about a different user. A non-owner is permitted only when they
+/// hold a `CanEdit` share or ask about themselves (`403` otherwise); a share the
+/// lookup doesn't find is `404 User permissions not found`.
 #[utoipa::path(
     get,
     path = "/Playlists/{playlistId}/Users/{userId}",
@@ -456,6 +494,7 @@ async fn get_playlist_users(
     ),
     responses(
         (status = 200, description = "User permission found (PlaylistUserPermissions)"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist or user permissions not found")
     ),
     tag = "hermit"
@@ -466,19 +505,25 @@ async fn get_playlist_user(
     Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<PlaylistUserPermissions>, ApiError> {
     let calling_user_id = auth.user_id();
-    state
+    let access = state
         .playlists
-        .get_playlist_for_user(playlist_id, calling_user_id)
+        .get_playlist_access(playlist_id, calling_user_id)
         .await?;
-    // The caller always has full access to a playlist they can open; any other user
-    // is looked up in the playlist's stored shares (`Shares.FirstOrDefault`).
-    if user_id == calling_user_id {
+    // C# quirk, ported faithfully: the owner's early-return reports the *caller's*
+    // permission regardless of which user was asked about.
+    if access.level == PlaylistAccessLevel::Owner {
         return Ok(Json(PlaylistUserPermissions::new(calling_user_id, true)));
     }
-    state
-        .playlists
-        .get_playlist_shares(playlist_id)
-        .await?
+    let shares = state.playlists.get_playlist_shares(playlist_id).await?;
+    let caller_can_edit = shares
+        .iter()
+        .any(|s| s.can_edit && s.user_id == calling_user_id);
+    if !caller_can_edit && user_id != calling_user_id {
+        return Err(ApiError::Forbidden(
+            "not permitted to view this user's playlist permission".to_owned(),
+        ));
+    }
+    shares
         .into_iter()
         .find(|s| s.user_id == user_id)
         .map(Json)
@@ -487,9 +532,9 @@ async fn get_playlist_user(
 
 /// `POST /Playlists/{playlistId}/Users/{userId}` — sets a user's permission.
 ///
-/// Port of `PlaylistsController.UpdatePlaylistUser`. The owner-only `403` branch
-/// is deferred (see module docs); a missing playlist is `404`. The share upsert
-/// itself is a documented no-op in the minimal manager.
+/// Port of `PlaylistsController.UpdatePlaylistUser`: **owner-only** (`403` for
+/// any other caller); a missing/invisible playlist is `404`. The upsert persists
+/// to the `PlaylistShares` table.
 #[utoipa::path(
     post,
     path = "/Playlists/{playlistId}/Users/{userId}",
@@ -500,6 +545,7 @@ async fn get_playlist_user(
     ),
     responses(
         (status = 204, description = "User's permissions modified"),
+        (status = 403, description = "Access forbidden"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "hermit"
@@ -511,10 +557,15 @@ async fn update_playlist_user(
     body: Option<Json<UpdatePlaylistUserDto>>,
 ) -> Result<StatusCode, ApiError> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    state
+    let access = state
         .playlists
-        .get_playlist_for_user(playlist_id, auth.user_id())
+        .get_playlist_access(playlist_id, auth.user_id())
         .await?;
+    if access.level != PlaylistAccessLevel::Owner {
+        return Err(ApiError::Forbidden(
+            "only the playlist owner may modify shares".to_owned(),
+        ));
+    }
     let request = PlaylistUserUpdateRequest {
         id: playlist_id,
         user_id,
@@ -526,10 +577,10 @@ async fn update_playlist_user(
 
 /// `DELETE /Playlists/{playlistId}/Users/{userId}` — revokes a user's share.
 ///
-/// Port of `PlaylistsController.RemoveUserFromPlaylist`. The owner/share `403`
-/// branch and the share-lookup `404` are deferred (see module docs); a missing
-/// playlist is `404`. The revoke itself is a documented no-op in the minimal
-/// manager.
+/// Port of `PlaylistsController.RemoveUserFromPlaylist`: requires owner or a
+/// `CanEdit` share (`403` otherwise); a missing/invisible playlist is `404`, and
+/// a target user with no share is `404 User permissions not found` (the C#
+/// share-lookup branch).
 #[utoipa::path(
     delete,
     path = "/Playlists/{playlistId}/Users/{userId}",
@@ -539,7 +590,8 @@ async fn update_playlist_user(
     ),
     responses(
         (status = 204, description = "User permissions removed from playlist"),
-        (status = 404, description = "Playlist not found")
+        (status = 403, description = "Access forbidden"),
+        (status = 404, description = "Playlist or user permissions not found")
     ),
     tag = "hermit"
 )]
@@ -549,11 +601,19 @@ async fn remove_user_from_playlist(
     Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
-    state
+    require_edit(
+        state
+            .playlists
+            .get_playlist_access(playlist_id, calling_user_id)
+            .await?,
+    )?;
+    let share = state
         .playlists
-        .get_playlist_for_user(playlist_id, calling_user_id)
-        .await?;
-    let share = PlaylistUserPermissions::new(user_id, false);
+        .get_playlist_shares(playlist_id)
+        .await?
+        .into_iter()
+        .find(|s| s.user_id == user_id)
+        .ok_or_else(|| ApiError::NotFound("User permissions not found".to_owned()))?;
     state
         .playlists
         .remove_user_from_shares(playlist_id, user_id, &share)

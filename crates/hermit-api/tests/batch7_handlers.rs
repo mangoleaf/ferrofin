@@ -24,7 +24,10 @@ use hermit_model::collections::CollectionCreationResult;
 use hermit_model::dto::{BaseItemDto, PlaylistDto};
 use hermit_model::playlists::{PlaylistCreationRequest, PlaylistCreationResult};
 use hermit_model::querying::QueryResult;
-use hermit_traits::collections::{CollectionCreationOptions, CollectionManager, PlaylistManager};
+use hermit_traits::collections::{
+    CollectionCreationOptions, CollectionManager, PlaylistAccess, PlaylistAccessLevel,
+    PlaylistManager,
+};
 use hermit_traits::dto::DtoService;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::UserManager;
@@ -330,16 +333,48 @@ type RemoveCall = (String, Vec<String>);
 type MoveCall = (String, String, i32);
 
 /// A recording [`PlaylistManager`] capturing the last mutating call.
-#[derive(Default)]
+///
+/// `access` configures what `get_playlist_access` reports for [`PLAYLIST_ID`]
+/// (default `Owner`, so success-path tests pass unchanged); `shares` is the
+/// canned `get_playlist_shares` result.
 struct RecordingPlaylists {
     created: Mutex<Option<PlaylistCreationRequest>>,
     added: Mutex<Option<AddCall>>,
     removed: Mutex<Option<RemoveCall>>,
     moved: Mutex<Option<MoveCall>>,
+    access: PlaylistAccess,
+    shares: Vec<hermit_model::entities_media::PlaylistUserPermissions>,
+}
+
+impl Default for RecordingPlaylists {
+    fn default() -> Self {
+        Self {
+            created: Mutex::default(),
+            added: Mutex::default(),
+            removed: Mutex::default(),
+            moved: Mutex::default(),
+            access: PlaylistAccess {
+                level: PlaylistAccessLevel::Owner,
+                open_access: false,
+            },
+            shares: Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
 impl PlaylistManager for RecordingPlaylists {
+    async fn get_playlist_access(
+        &self,
+        playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<PlaylistAccess, ServiceError> {
+        if playlist_id == PLAYLIST_ID {
+            Ok(self.access)
+        } else {
+            Err(ServiceError::not_found("playlist"))
+        }
+    }
     async fn get_playlist_for_user(
         &self,
         playlist_id: Uuid,
@@ -394,7 +429,7 @@ impl PlaylistManager for RecordingPlaylists {
         &self,
         _playlist_id: Uuid,
     ) -> Result<Vec<hermit_model::entities_media::PlaylistUserPermissions>, ServiceError> {
-        Ok(Vec::new())
+        Ok(self.shares.clone())
     }
     async fn add_item_to_playlist(
         &self,
@@ -752,4 +787,144 @@ async fn add_and_remove_collection_items_record_calls() {
     let (cid, ids) = col.removed.lock().unwrap().clone().expect("removed");
     assert_eq!(cid, COLLECTION_ID);
     assert_eq!(ids, vec![ITEM_B]);
+}
+
+/// A [`RecordingPlaylists`] whose access probe reports the given level/flag.
+fn playlists_with_access(level: PlaylistAccessLevel, open_access: bool) -> Arc<RecordingPlaylists> {
+    Arc::new(RecordingPlaylists {
+        access: PlaylistAccess { level, open_access },
+        ..RecordingPlaylists::default()
+    })
+}
+
+#[tokio::test]
+async fn playlist_edit_routes_forbidden_for_read_access() {
+    // A read-only caller (non-edit share / open-access) must get 403 from every
+    // edit action — update, add items, remove items, move.
+    let pl = playlists_with_access(PlaylistAccessLevel::Read, false);
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let cases = [
+        (
+            "POST",
+            format!("/Playlists/{PLAYLIST_ID}"),
+            Body::from("{}"),
+        ),
+        (
+            "POST",
+            format!("/Playlists/{PLAYLIST_ID}/Items?ids={ITEM_A}"),
+            Body::empty(),
+        ),
+        (
+            "DELETE",
+            format!("/Playlists/{PLAYLIST_ID}/Items?entryIds={ITEM_A}"),
+            Body::empty(),
+        ),
+        (
+            "POST",
+            format!("/Playlists/{PLAYLIST_ID}/Items/{ITEM_A}/Move/0"),
+            Body::empty(),
+        ),
+    ];
+    for (method, uri, body) in cases {
+        let (status, _) = send(app.clone(), method, &uri, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    // Nothing was recorded: the gate fired before the manager call.
+    assert!(pl.added.lock().unwrap().is_none());
+    assert!(pl.removed.lock().unwrap().is_none());
+    assert!(pl.moved.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn playlist_users_routes_are_owner_only() {
+    // Even a CanEdit share is not enough for share management (C# owner-only).
+    let pl = playlists_with_access(PlaylistAccessLevel::CanEdit, false);
+    let app = state(pl, Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app.clone(),
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Users"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"),
+        Body::from("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn remove_user_share_missing_is_not_found() {
+    // Owner deleting a share that doesn't exist → the C# 404 branch.
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl, Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app,
+        "DELETE",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_playlist_user_owner_quirk_returns_caller_permission() {
+    // The C# owner early-return reports the *caller's* permission even when the
+    // route names a different user.
+    let pl = playlists_with_access(PlaylistAccessLevel::Owner, false);
+    let app = state(pl, Arc::new(RecordingCollections::default()));
+    let other = Uuid::from_u128(0xDEAD);
+    let (status, bytes) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let perm: hermit_model::entities_media::PlaylistUserPermissions =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        perm.user_id, USER_ID,
+        "the caller, not the asked-about user"
+    );
+    assert!(perm.can_edit);
+}
+
+#[tokio::test]
+async fn get_playlist_user_unrelated_caller_is_forbidden() {
+    // A read-only caller with no CanEdit share asking about a third user → 403.
+    let pl = playlists_with_access(PlaylistAccessLevel::Read, false);
+    let app = state(pl, Arc::new(RecordingCollections::default()));
+    let other = Uuid::from_u128(0xBEEF);
+    let (status, _) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Users/{other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn get_playlist_reports_open_access() {
+    let pl = playlists_with_access(PlaylistAccessLevel::Read, true);
+    let app = state(pl, Arc::new(RecordingCollections::default()));
+    let (status, bytes) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dto: PlaylistDto = serde_json::from_slice(&bytes).unwrap();
+    assert!(dto.open_access, "the DTO carries the real OpenAccess flag");
 }

@@ -1244,6 +1244,13 @@ pub struct FakePlaylists;
 
 #[async_trait]
 impl PlaylistManager for FakePlaylists {
+    async fn get_playlist_access(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<hermit_traits::collections::PlaylistAccess, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn get_playlist_for_user(
         &self,
         _playlist_id: Uuid,

@@ -99,6 +99,38 @@ pub trait CollectionManager: Send + Sync {
 
 fn _assert_object_safe_collection_manager(_: &dyn CollectionManager) {}
 
+/// The caller's effective access level to a playlist.
+///
+/// Port of the checks `PlaylistsController` derives from `Playlist.OwnerUserId`
+/// and `Playlist.Shares`: the owner may do everything, a `CanEdit` share may
+/// edit content, and everything else that can *see* the playlist is read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistAccessLevel {
+    /// The caller owns the playlist (or the row predates owner tracking).
+    Owner,
+    /// The caller holds a share with `CanEdit`.
+    CanEdit,
+    /// The caller can view only (a non-edit share, or an open-access playlist).
+    Read,
+}
+
+impl PlaylistAccessLevel {
+    /// Whether this level permits the C# edit actions (owner or `CanEdit`).
+    #[must_use]
+    pub fn can_edit(self) -> bool {
+        matches!(self, Self::Owner | Self::CanEdit)
+    }
+}
+
+/// A caller's resolved access to an existing, visible playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaylistAccess {
+    /// The caller's effective access level.
+    pub level: PlaylistAccessLevel,
+    /// Whether the playlist is open-access (C# `Playlist.OpenAccess`).
+    pub open_access: bool,
+}
+
 /// Creates and mutates playlists.
 ///
 /// Port of `IPlaylistManager`. The `SavePlaylistFile` side-channel (writes the
@@ -106,23 +138,43 @@ fn _assert_object_safe_collection_manager(_: &dyn CollectionManager) {}
 /// not part of the trait surface.
 #[async_trait]
 pub trait PlaylistManager: Send + Sync {
-    /// Gets a playlist visible to the given user.
+    /// Resolves the caller's access to a playlist.
+    ///
+    /// Returns [`ServiceError::NotFound`] when the playlist does not exist **or**
+    /// is not visible to `user_id` — the C# `GetPlaylistForUser` returns `null`
+    /// for both, and no endpoint distinguishes them. A playlist with no recorded
+    /// owner (created before owner tracking, or by an API key) grants
+    /// [`PlaylistAccessLevel::Owner`] to every caller for back-compat.
+    async fn get_playlist_access(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PlaylistAccess, ServiceError>;
+
+    /// Gets a playlist visible to the given user: the owner, a shared user, or —
+    /// when open-access — anyone. Invisible is [`ServiceError::NotFound`], like
+    /// [`get_playlist_access`](Self::get_playlist_access).
     async fn get_playlist_for_user(
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<BaseItemEntity, ServiceError>;
 
-    /// Creates a new playlist.
+    /// Creates a new playlist, recording the requesting user as its owner,
+    /// seeding shares from the request's `users`, and storing its open-access
+    /// flag (C# `Playlist.OwnerUserId` / `Shares` / `OpenAccess`).
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
     ) -> Result<PlaylistCreationResult, ServiceError>;
 
-    /// Updates an existing playlist.
+    /// Updates an existing playlist. A `Some(users)` replaces the share list
+    /// wholesale and `Some(public)` updates the open-access flag, matching the
+    /// C# update path.
     async fn update_playlist(&self, request: &PlaylistUpdateRequest) -> Result<(), ServiceError>;
 
-    /// Gets all playlists a user has access to.
+    /// Gets all playlists visible to a user (owned, shared, open-access, or
+    /// predating owner tracking).
     async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Gets the member items of a playlist, in playlist order.
@@ -190,7 +242,14 @@ fn _assert_object_safe_playlist_manager(_: &dyn PlaylistManager) {}
 
 #[cfg(test)]
 mod tests {
-    use super::CollectionCreationOptions;
+    use super::{CollectionCreationOptions, PlaylistAccessLevel};
+
+    #[test]
+    fn access_level_edit_permission_matches_csharp() {
+        assert!(PlaylistAccessLevel::Owner.can_edit());
+        assert!(PlaylistAccessLevel::CanEdit.can_edit());
+        assert!(!PlaylistAccessLevel::Read.can_edit());
+    }
 
     #[test]
     fn creation_options_default_is_empty() {
