@@ -54,35 +54,62 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/x-mpegURL";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
+/// Every field carries a PascalCase `alias`: the PlaybackInfo-negotiated
+/// `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase parameters,
+/// while the regenerated playlist's segment URLs lowercase the first character
+/// — both spellings must parse or the master-playlist request silently drops
+/// the negotiated limits.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HlsQuery {
     /// The pinned media source id, if any.
-    #[serde(default)]
+    #[serde(default, alias = "MediaSourceId")]
     media_source_id: Option<String>,
     /// The playback-session id this stream belongs to.
-    #[serde(default)]
+    #[serde(default, alias = "PlaySessionId")]
     play_session_id: Option<String>,
     /// The requesting device id (kill/keep-alive scope).
-    #[serde(default)]
+    #[serde(default, alias = "DeviceId")]
     device_id: Option<String>,
     /// The desired segment container (`ts`/`mp4`).
-    #[serde(default)]
+    #[serde(default, alias = "SegmentContainer")]
     segment_container: Option<String>,
     /// The desired segment length in seconds.
-    #[serde(default)]
+    #[serde(default, alias = "SegmentLength")]
     segment_length: Option<i32>,
     /// The desired output audio codec.
-    #[serde(default)]
+    #[serde(default, alias = "AudioCodec")]
     audio_codec: Option<String>,
     /// The desired output video codec.
-    #[serde(default)]
+    #[serde(default, alias = "VideoCodec")]
     video_codec: Option<String>,
     /// The transcoding profile's max audio channels (drives the `-ac` downmix).
-    #[serde(default)]
+    #[serde(default, alias = "TranscodingMaxAudioChannels")]
     transcoding_max_audio_channels: Option<i32>,
+    /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
+    #[serde(default, alias = "VideoBitrate")]
+    video_bitrate: Option<i32>,
+    /// The negotiated audio bitrate cap in bit/s.
+    #[serde(default, alias = "AudioBitrate")]
+    audio_bitrate: Option<i32>,
+    /// The maximum output width in pixels (bounds the scale filter).
+    #[serde(default, alias = "MaxWidth")]
+    max_width: Option<i32>,
+    /// The maximum output height in pixels.
+    #[serde(default, alias = "MaxHeight")]
+    max_height: Option<i32>,
+    /// The maximum output framerate.
+    #[serde(default, alias = "MaxFramerate")]
+    max_framerate: Option<f32>,
+    /// Whether `-c:v copy` is permitted (PlaybackInfo appends `false` when the
+    /// client forbade it).
+    #[serde(default, alias = "AllowVideoStreamCopy")]
+    allow_video_stream_copy: Option<bool>,
+    /// Whether `-c:a copy` is permitted.
+    #[serde(default, alias = "AllowAudioStreamCopy")]
+    allow_audio_stream_copy: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
-    #[serde(default, rename = "static")]
+    #[serde(default, rename = "static", alias = "Static")]
     is_static: Option<bool>,
 }
 
@@ -105,6 +132,13 @@ fn build_request(item_id: Uuid, query: HlsQuery, raw_query: Option<String>) -> H
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
+        video_bitrate: query.video_bitrate,
+        audio_bitrate: query.audio_bitrate,
+        max_width: query.max_width,
+        max_height: query.max_height,
+        max_framerate: query.max_framerate,
+        allow_video_stream_copy: query.allow_video_stream_copy.unwrap_or(true),
+        allow_audio_stream_copy: query.allow_audio_stream_copy.unwrap_or(true),
         is_static: query.is_static.unwrap_or(false),
         query_string,
     }
@@ -454,4 +488,60 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Videos/{itemId}/{container}/Attachments/{index}",
             get(get_video_attachment),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The PlaybackInfo-negotiated `TranscodingUrl` uses PascalCase parameters
+    /// (`StreamInfo::to_url`); regenerated playlist URLs lowercase the first
+    /// character. Both spellings must reach the same request — dropping the
+    /// PascalCase form silently loses the negotiated caps (the 2026-07-30
+    /// benchmark's full-4K re-encode) and the psid (psid-scoped kills).
+    #[test]
+    fn hls_query_parses_pascal_and_camel_case() {
+        let pascal: HlsQuery = serde_urlencoded::from_str(
+            "DeviceId=d1&PlaySessionId=p1&MediaSourceId=m1&VideoCodec=h264&\
+             VideoBitrate=8000000&MaxWidth=1920&MaxFramerate=30&\
+             TranscodingMaxAudioChannels=2&SegmentContainer=mp4&Static=false",
+        )
+        .expect("pascal query parses");
+        assert_eq!(pascal.device_id.as_deref(), Some("d1"));
+        assert_eq!(pascal.play_session_id.as_deref(), Some("p1"));
+        assert_eq!(pascal.video_bitrate, Some(8_000_000));
+        assert_eq!(pascal.max_width, Some(1920));
+        assert_eq!(pascal.max_framerate, Some(30.0));
+        assert_eq!(pascal.transcoding_max_audio_channels, Some(2));
+
+        let camel: HlsQuery = serde_urlencoded::from_str(
+            "deviceId=d1&playSessionId=p1&videoBitrate=8000000&maxWidth=1920&\
+             allowVideoStreamCopy=false",
+        )
+        .expect("camel query parses");
+        assert_eq!(camel.play_session_id.as_deref(), Some("p1"));
+        assert_eq!(camel.video_bitrate, Some(8_000_000));
+        assert_eq!(camel.allow_video_stream_copy, Some(false));
+    }
+
+    #[test]
+    fn build_request_maps_caps_and_defaults_allow_copy() {
+        let query: HlsQuery =
+            serde_urlencoded::from_str("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            query,
+            Some("MaxWidth=1280".into()),
+        );
+        assert_eq!(req.max_width, Some(1280));
+        assert_eq!(req.video_bitrate, Some(4_000_000));
+        assert!(req.allow_video_stream_copy, "copy allowed by default");
+        assert!(req.allow_audio_stream_copy, "copy allowed by default");
+        assert_eq!(req.query_string, "?MaxWidth=1280");
+
+        let query: HlsQuery =
+            serde_urlencoded::from_str("AllowVideoStreamCopy=false").expect("parses");
+        let req = build_request(uuid::Uuid::from_u128(7), query, None);
+        assert!(!req.allow_video_stream_copy, "explicit veto honored");
+    }
 }

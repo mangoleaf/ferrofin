@@ -225,17 +225,32 @@ fn nvenc_preset(preset: EncoderPreset) -> &'static str {
 /// The NVENC video-encode tokens (quality + rate control) for `encoder`.
 ///
 /// Constant-quality VBR (`-cq`) so 4K keeps its detail without a guessed bitrate
-/// cap. A 10-bit HDR source targeting H.264 (browsers decode only 8-bit H.264)
-/// is down-converted to `nv12` on the GPU via `scale_cuda`; AV1/HEVC keep the
-/// source's 10-bit HDR untouched.
-fn nvenc_video_args(encoder: &str, options: &EncodingOptions, burn_sub: bool) -> Vec<String> {
+/// cap; a client-negotiated bitrate becomes `-maxrate`/`-bufsize` on top (the
+/// cap Jellyfin applies) and a resolution bound becomes a GPU-side
+/// `scale_cuda` downscale. A 10-bit HDR source targeting H.264 (browsers
+/// decode only 8-bit H.264) is down-converted to `nv12` on the GPU; AV1/HEVC
+/// keep the source's 10-bit HDR untouched. The subtitle-burn paths keep their
+/// own in-graph conversions (a `-vf` can't coexist with `-filter_complex`).
+fn nvenc_video_args(
+    encoder: &str,
+    options: &EncodingOptions,
+    burn_sub: bool,
+    output_size: Option<(i32, i32)>,
+    output_bitrate: Option<i32>,
+) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
-    // The h264 8-bit down-convert is a simple `-vf`, but that can't coexist with
-    // the subtitle-burn `-filter_complex`; when burning, the overlay filter does
-    // the `format=nv12` conversion itself (see the burn-in block), so skip it here.
-    if encoder == "h264_nvenc" && !burn_sub {
-        a.push("-vf".to_owned());
-        a.push("scale_cuda=format=nv12".to_owned());
+    if !burn_sub {
+        let mut ops: Vec<String> = Vec::new();
+        if let Some((w, h)) = output_size {
+            ops.push(format!("w={w}:h={h}"));
+        }
+        if encoder == "h264_nvenc" {
+            ops.push("format=nv12".to_owned());
+        }
+        if !ops.is_empty() {
+            a.push("-vf".to_owned());
+            a.push(format!("scale_cuda={}", ops.join(":")));
+        }
     }
     a.push("-preset".to_owned());
     a.push(nvenc_preset(options.encoder_preset).to_owned());
@@ -245,6 +260,15 @@ fn nvenc_video_args(encoder: &str, options: &EncodingOptions, burn_sub: bool) ->
     a.push(NVENC_CQ.to_string());
     a.push("-b:v".to_owned());
     a.push("0".to_owned());
+    if let Some(bitrate) = output_bitrate {
+        let bufsize = i64::from(bitrate)
+            .saturating_mul(2)
+            .min(i64::from(i32::MAX));
+        a.push("-maxrate".to_owned());
+        a.push(bitrate.to_string());
+        a.push("-bufsize".to_owned());
+        a.push(bufsize.to_string());
+    }
     a
 }
 
@@ -445,6 +469,16 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             transcoding_max_audio_channels: request.transcoding_max_audio_channels,
             is_static: request.is_static,
             subtitle_stream_index: subtitle_index,
+            // The PlaybackInfo-negotiated caps: they drive the bitrate params
+            // (`-maxrate`/`-b:a`), the downscale filter, the framerate cap, and
+            // the copy veto.
+            video_bit_rate: request.video_bitrate,
+            audio_bit_rate: request.audio_bitrate,
+            max_width: request.max_width,
+            max_height: request.max_height,
+            max_framerate: request.max_framerate,
+            allow_video_stream_copy: request.allow_video_stream_copy,
+            allow_audio_stream_copy: request.allow_audio_stream_copy,
             ..BaseEncodingJobOptions::default()
         };
 
@@ -529,6 +563,66 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         probe_state
             .output_audio_codec
             .clone_from(&output_audio_codec);
+        // Resolve the target video bitrate for a re-encode: the requested cap
+        // bounded by the source bitrate and codec-efficiency scaled
+        // (`GetVideoBitrateParamValue`); a copy carries no bitrate args.
+        probe_state.output_video_bitrate =
+            if EncodingJobInfo::is_copy_codec(output_video_codec.as_deref()) {
+                None
+            } else {
+                let value = self.encoding_helper.video_bitrate_param_value(
+                    &probe_state.base_request,
+                    probe_state.video_stream.as_ref(),
+                    output_video_codec.as_deref().unwrap_or(DEFAULT_VIDEO_CODEC),
+                );
+                (value > 0).then_some(value)
+            };
+        // Bitrate-driven resolution bound — port of the `ResolutionNormalizer`
+        // application in `StreamingHelpers.GetStreamingState`: a bitrate-capped
+        // re-encode also bounds the output resolution (an 8 Mbps ask on a 4K
+        // source downscales to 1080p, like Jellyfin), unless the requested
+        // bitrate already exceeds the source's.
+        if let Some(output_bitrate) = probe_state.output_video_bitrate {
+            let source_bitrate = probe_state.video_stream.as_ref().and_then(|v| v.bit_rate);
+            let requested_not_reducing = probe_state
+                .base_request
+                .video_bit_rate
+                .zip(source_bitrate)
+                .is_some_and(|(requested, source)| requested >= source);
+            let req = &mut probe_state.base_request;
+            if req.max_width.is_none() && req.max_height.is_none() && requested_not_reducing {
+                // Not reducing bitrate and no explicit bound: pin to the source
+                // dimensions rather than downscaling.
+                if let Some(video) = probe_state.video_stream.as_ref()
+                    && (video.width.is_some() || video.height.is_some())
+                {
+                    req.max_width = video.width;
+                    req.max_height = video.height;
+                }
+            } else {
+                let output_codec = output_video_codec.as_deref().unwrap_or(DEFAULT_VIDEO_CODEC);
+                let h264_equivalent = hermit_mediaencoding::encoding_helper::helper::scale_bitrate(
+                    output_bitrate,
+                    output_codec,
+                    "h264",
+                );
+                let target_fps = req.max_framerate.or(probe_state
+                    .video_stream
+                    .as_ref()
+                    .and_then(|v| v.average_frame_rate.or(v.real_frame_rate)));
+                let resolution = hermit_model::dlna::ResolutionNormalizer::normalize(
+                    source_bitrate,
+                    output_bitrate,
+                    h264_equivalent,
+                    req.max_width,
+                    req.max_height,
+                    target_fps,
+                    false,
+                );
+                req.max_width = resolution.max_width;
+                req.max_height = resolution.max_height;
+            }
+        }
         // Resolve the output channel count now that the copy decision is known.
         // A focused port of `EncodingHelper.GetAudioChannels`: the requested
         // channels (which already fold in `TranscodingMaxAudioChannels`), clamped
@@ -642,6 +736,38 @@ impl HermitStreamStatePlanner {
         let burn_text = burns_text_subtitle(state);
         let burn_sub = burn_graphical || burn_text;
 
+        // The software re-encode's video filters (order matters): the bounded
+        // downscale first (tonemap/burn-in then run on fewer pixels), then the
+        // HDR→SDR tonemap chain — or a bare 8-bit down-convert for 10-bit SDR
+        // sources (libx264 would otherwise emit High10, undecodable in browser
+        // MSE). NVENC keeps its existing GPU-side handling (the hw filter
+        // matrix is deferred).
+        let sw_filters: Vec<String> = if !copying_video && !nvenc_video {
+            let mut filters = Vec::new();
+            if let Some(scale) = hermit_mediaencoding::encoding_helper::helper::scale_filter(
+                state.video_stream.as_ref(),
+                state.base_request.max_width,
+                state.base_request.max_height,
+            ) {
+                filters.push(scale);
+            }
+            if hermit_mediaencoding::encoding_helper::helper::requires_software_tonemap(
+                state.video_stream.as_ref(),
+            ) {
+                filters.push(
+                    hermit_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAP_FILTER
+                        .to_owned(),
+                );
+            } else if hermit_mediaencoding::encoding_helper::helper::requires_8bit_downconvert(
+                state.video_stream.as_ref(),
+            ) {
+                filters.push("format=yuv420p".to_owned());
+            }
+            filters
+        } else {
+            Vec::new()
+        };
+
         // ---- input ------------------------------------------------------------
         // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
         if let Some(id) = segment_id.filter(|&id| id > 0) {
@@ -705,7 +831,18 @@ impl HermitStreamStatePlanner {
             if nvenc_video {
                 // NVENC has its own rate-control/quality flags (no `-crf`); the
                 // software `video_quality_param` would emit libx264-only args.
-                for tok in nvenc_video_args(&video_encoder, options, burn_sub) {
+                let output_size = hermit_mediaencoding::encoding_helper::helper::output_size(
+                    state.video_stream.as_ref(),
+                    state.base_request.max_width,
+                    state.base_request.max_height,
+                );
+                for tok in nvenc_video_args(
+                    &video_encoder,
+                    options,
+                    burn_sub,
+                    output_size,
+                    state.output_video_bitrate,
+                ) {
                     args.push(tok);
                 }
             } else {
@@ -728,6 +865,13 @@ impl HermitStreamStatePlanner {
             if let Some(framerate) = self.encoding_helper.framerate_param(state) {
                 push_split(&mut args, "-r");
                 args.push(framerate.to_string());
+            }
+            // The plain software filter chain (downscale/tonemap/8-bit); the
+            // burn-in branches below fold `sw_filters` into their own graphs
+            // instead (two `-vf`s would override each other).
+            if !burn_sub && !sw_filters.is_empty() {
+                args.push("-vf".to_owned());
+                args.push(sw_filters.join(","));
             }
         }
 
@@ -771,6 +915,11 @@ impl HermitStreamStatePlanner {
         {
             use std::fmt::Write as _;
             let mut chain = String::new();
+            // Downscale/tonemap ahead of the subtitle render, so the text is
+            // drawn at output resolution in SDR.
+            for filter in &sw_filters {
+                let _ = write!(chain, "{filter},");
+            }
             // An input `-ss` seek resets frame PTS to ~0, but the filter picks
             // cues by PTS — shift PTS to the absolute position for the filter,
             // then back so the muxer's `-output_ts_offset` numbering still holds.
@@ -826,7 +975,16 @@ impl HermitStreamStatePlanner {
                 ""
             };
             push_split(&mut args, "-filter_complex");
-            args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay{fmt}[v]"));
+            if sw_filters.is_empty() {
+                args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay{fmt}[v]"));
+            } else {
+                // Downscale/tonemap the base video before compositing, so the
+                // bitmap subtitle is overlaid in SDR at output resolution.
+                args.push(format!(
+                    "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay{fmt}[v]",
+                    sw_filters.join(",")
+                ));
+            }
         }
 
         // ---- HLS muxer -------------------------------------------------------
@@ -1673,5 +1831,181 @@ mod tests {
         assert_eq!(segment_file_extension("mp4"), "mp4");
         assert_eq!(hls_segment_type("ts"), "mpegts");
         assert_eq!(hls_segment_type("mp4"), "fmp4");
+    }
+
+    /// A 4K HDR10 HEVC video stream (the heavy-transcode benchmark shape).
+    fn hdr_4k_video_stream(codec: &str) -> MediaStream {
+        MediaStream {
+            width: Some(3840),
+            height: Some(2160),
+            bit_depth: Some(10),
+            bit_rate: Some(60_000_000),
+            color_transfer: Some("smpte2084".to_owned()),
+            ..video_stream(codec)
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_with_caps_downscales_tonemaps_and_caps_bitrate() {
+        // The negotiated 8 Mbps / 1920-wide re-encode of a 4K HDR source must
+        // scale to 1080p, tonemap to SDR, and cap the encoder bitrate — the
+        // parity gaps the 2026-07-30 benchmark surfaced (Jellyfin: 3.7 s TTFS;
+        // Hermit encoding full 4K HDR: 47 s).
+        let src = source(
+            "abc",
+            vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.video_bitrate = Some(8_000_000);
+        req.max_width = Some(1920);
+        req.max_height = Some(1080);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:v libx264"), "re-encode expected: {args}");
+        assert!(
+            args.contains("scale=1920:1080"),
+            "bounded downscale expected: {args}"
+        );
+        assert!(
+            args.contains("tonemap=tonemap=hable") && args.contains("format=yuv420p"),
+            "HDR→SDR tonemap chain expected: {args}"
+        );
+        assert!(
+            args.contains("-maxrate 8000000") && args.contains("-bufsize 16000000"),
+            "bitrate cap expected: {args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_without_caps_keeps_source_resolution_but_still_tonemaps() {
+        // No negotiated caps: no scale filter and no -maxrate, but an HDR
+        // source re-encoded to (SDR) h264 still needs the tonemap chain.
+        let src = source(
+            "abc",
+            vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        // (`zscale=` from the tonemap chain is expected; a downscale would
+        // prefix the chain as `-vf scale=…`.)
+        assert!(
+            !args.contains("-vf scale="),
+            "no downscale without caps: {args}"
+        );
+        assert!(!args.contains("-maxrate"), "no bitrate cap: {args}");
+        assert!(
+            args.contains("tonemap=tonemap=hable"),
+            "tonemap still applies: {args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_sdr_10bit_source_gets_8bit_downconvert_only() {
+        // A 10-bit SDR source re-encoded to h264 needs `format=yuv420p` (else
+        // libx264 emits High10, undecodable in browser MSE) but no tonemap.
+        let mut stream = video_stream("hevc");
+        stream.bit_depth = Some(10);
+        stream.width = Some(1920);
+        stream.height = Some(1080);
+        let src = source("abc", vec![stream, audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("-vf format=yuv420p"),
+            "8-bit down-convert: {args}"
+        );
+        assert!(!args.contains("tonemap"), "SDR source: no tonemap: {args}");
+    }
+
+    #[tokio::test]
+    async fn plan_honors_allow_video_stream_copy_false() {
+        // A copy-eligible source (client supports hevc) must re-encode when the
+        // request forbade video stream copy (PlaybackInfo appends
+        // `allowVideoStreamCopy=false`).
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
+        let p = planner(vec![src.clone()]);
+        let mut req = request("abc");
+        req.video_codec = Some("hevc,h264".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        assert!(
+            plan.arguments.join(" ").contains("-c:v copy"),
+            "control: copy expected when allowed"
+        );
+
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("hevc,h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            !args.contains("-c:v copy"),
+            "copy forbidden by the request: {args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_bitrate_only_request_still_downscales() {
+        // Jellyfin derives the resolution bound from the bitrate alone
+        // (ResolutionNormalizer): an 8 Mbps ask on a 4K source must downscale
+        // to 1920-wide even when the URL carries no MaxWidth.
+        let src = source(
+            "abc",
+            vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.video_bitrate = Some(8_000_000);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("scale=1920:1080"),
+            "bitrate-driven downscale expected: {args}"
+        );
+        assert!(args.contains("-maxrate 8000000"), "cap expected: {args}");
+    }
+
+    #[test]
+    fn nvenc_args_carry_negotiated_cap_and_gpu_downscale() {
+        let options = EncodingOptions::default();
+        // A negotiated 8 Mbps / 1080p bound: GPU downscale + rate cap on top of
+        // the CQ-VBR quality target.
+        let args = nvenc_video_args(
+            "av1_nvenc",
+            &options,
+            false,
+            Some((1920, 1080)),
+            Some(7_616_000),
+        )
+        .join(" ");
+        assert!(args.contains("-vf scale_cuda=w=1920:h=1080"), "{args}");
+        assert!(
+            args.contains("-maxrate 7616000 -bufsize 15232000"),
+            "{args}"
+        );
+        // h264 adds the 8-bit convert inside the same scale_cuda.
+        let args =
+            nvenc_video_args("h264_nvenc", &options, false, Some((1280, 720)), None).join(" ");
+        assert!(
+            args.contains("scale_cuda=w=1280:h=720:format=nv12"),
+            "{args}"
+        );
+        assert!(!args.contains("-maxrate"), "{args}");
+        // No caps: h264 keeps its bare format convert, others no -vf at all.
+        let args = nvenc_video_args("hevc_nvenc", &options, false, None, None).join(" ");
+        assert!(!args.contains("-vf"), "{args}");
+        // Burning suppresses the -vf (the burn graph owns the conversion).
+        let args =
+            nvenc_video_args("h264_nvenc", &options, true, Some((1920, 1080)), None).join(" ");
+        assert!(!args.contains("-vf"), "{args}");
     }
 }

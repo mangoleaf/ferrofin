@@ -625,8 +625,11 @@ fn video_bitrate_scale_factor(codec: &str) -> f64 {
     1.0
 }
 
-/// Scales a bitrate for a codec transition. Port of `ScaleBitrate`.
-fn scale_bitrate(bitrate: i32, input_video_codec: &str, output_video_codec: &str) -> i32 {
+/// Scales a bitrate for a codec transition. Port of `ScaleBitrate` (public so
+/// the planner can compute the h264-equivalent bitrate the resolution
+/// normalizer keys on).
+#[must_use]
+pub fn scale_bitrate(bitrate: i32, input_video_codec: &str, output_video_codec: &str) -> i32 {
     let input_factor = video_bitrate_scale_factor(input_video_codec);
     let output_factor = video_bitrate_scale_factor(output_video_codec);
 
@@ -974,6 +977,108 @@ pub fn burns_graphical_subtitle(state: &EncodingJobInfo) -> bool {
             .subtitle_stream
             .as_ref()
             .is_some_and(|s| !is_text_subtitle_stream(s))
+}
+
+/// The software HDR→SDR tonemap filter chain, ending in 8-bit `yuv420p`.
+///
+/// The vanilla-ffmpeg (zimg) equivalent of the software half of upstream
+/// `GetHwTonemapParam`/`tonemapx`: linearize at 100-nit nominal peak, convert
+/// to BT.709 primaries, tone-map with the Hable operator (no desaturation, the
+/// upstream default look), then re-encode transfer/matrix/range for SDR and
+/// hand the encoder 8-bit 4:2:0. Requires an ffmpeg built with `--enable-libzimg`
+/// (every mainstream distro/jellyfin build).
+pub const SOFTWARE_TONEMAP_FILTER: &str = "zscale=t=linear:npl=100,format=gbrpf32le,\
+                                           zscale=p=bt709,tonemap=tonemap=hable:desat=0,\
+                                           zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+/// Whether a re-encoded video stream needs the HDR→SDR tonemap chain.
+///
+/// True when the source stream carries an HDR transfer (HDR10/HLG/Dolby
+/// Vision, via [`MediaStream::video_range`]) — the software encode targets are
+/// SDR (`libx264`), so an untonemapped encode renders washed out. Callers only
+/// consult this on the re-encode path (a stream copy passes HDR through).
+#[must_use]
+pub fn requires_software_tonemap(video_stream: Option<&MediaStream>) -> bool {
+    video_stream.is_some_and(|s| s.video_range() == hermit_model::data::VideoRange::Hdr)
+}
+
+/// Whether a re-encoded video stream needs an explicit 8-bit down-convert.
+///
+/// `libx264` fed 10-bit input silently produces High10-profile H.264, which
+/// browser MSE pipelines refuse to decode; SDR 10-bit sources (and any source
+/// whose bit depth is above 8) must be forced to `yuv420p`. HDR sources are
+/// excluded — the tonemap chain already ends in `yuv420p`.
+#[must_use]
+pub fn requires_8bit_downconvert(video_stream: Option<&MediaStream>) -> bool {
+    !requires_software_tonemap(video_stream)
+        && video_stream.is_some_and(|s| s.bit_depth.is_some_and(|d| d > 8))
+}
+
+/// Computes the even-dimension output size for a bounded downscale.
+///
+/// Port of the known-dimensions branch of `GetSizeParam`: when the source
+/// dimensions are known and exceed a `max_width`/`max_height` bound, scale
+/// both down by the same ratio (aspect preserved) and round to even (encoder
+/// requirement). Returns `None` when no scaling is needed or the source
+/// dimensions are unknown.
+#[must_use]
+pub fn output_size(
+    video_stream: Option<&MediaStream>,
+    max_width: Option<i32>,
+    max_height: Option<i32>,
+) -> Option<(i32, i32)> {
+    let stream = video_stream?;
+    let (w, h) = match (stream.width, stream.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+        _ => return None,
+    };
+    let mut ratio = 1.0f64;
+    if let Some(mw) = max_width.filter(|&mw| mw > 0 && mw < w) {
+        ratio = ratio.min(f64::from(mw) / f64::from(w));
+    }
+    if let Some(mh) = max_height.filter(|&mh| mh > 0 && mh < h) {
+        ratio = ratio.min(f64::from(mh) / f64::from(h));
+    }
+    if ratio >= 1.0 {
+        return None;
+    }
+    // Round to even, minimum 2 (encoders reject odd/zero dimensions).
+    #[allow(clippy::cast_possible_truncation)]
+    let even = |v: f64| -> i32 { (((v / 2.0).round() as i32) * 2).max(2) };
+    Some((even(f64::from(w) * ratio), even(f64::from(h) * ratio)))
+}
+
+/// Builds the `scale=` filter for a bounded downscale, if one is needed.
+///
+/// Known source dimensions produce a concrete `scale=W:H`; unknown dimensions
+/// with a cap fall back to the upstream expression forms (`GetSizeParam`) so
+/// ffmpeg bounds at decode time. `None` when no cap applies.
+#[must_use]
+pub fn scale_filter(
+    video_stream: Option<&MediaStream>,
+    max_width: Option<i32>,
+    max_height: Option<i32>,
+) -> Option<String> {
+    if let Some((w, h)) = output_size(video_stream, max_width, max_height) {
+        return Some(format!("scale={w}:{h}"));
+    }
+    // Source dimensions known and within bounds → no filter.
+    if video_stream
+        .is_some_and(|s| matches!((s.width, s.height), (Some(w), Some(h)) if w > 0 && h > 0))
+    {
+        return None;
+    }
+    // Unknown dimensions: bound with the upstream expression forms. `\,` keeps
+    // the commas inside the function arguments from splitting the filter graph.
+    let even = |v: i32| (v / 2) * 2;
+    match (max_width.filter(|&v| v > 0), max_height.filter(|&v| v > 0)) {
+        (Some(mw), Some(mh)) => Some(format!(
+            "scale=trunc(min(max(iw\\,ih*a)\\,{mw})/2)*2:trunc(min(max(iw/a\\,ih)\\,{mh})/2)*2"
+        )),
+        (Some(mw), None) => Some(format!("scale={}:trunc(ow/a/2)*2", even(mw))),
+        (None, Some(mh)) => Some(format!("scale=trunc(oh*a/2)*2:{}", even(mh))),
+        (None, None) => None,
+    }
 }
 
 /// Whether an external subtitle must be muxed as a second FFmpeg input. Port of
@@ -1662,5 +1767,79 @@ mod tests {
             let h = EncodingHelper::with_processor_count(NoOptionalEncoders, 8);
             h.map_args(self)
         }
+    }
+
+    // -- downscale / tonemap helpers ----------------------------------------
+
+    #[test]
+    fn output_size_bounds_and_preserves_aspect() {
+        let mut stream = video_stream("hevc", 0);
+        stream.width = Some(3840);
+        stream.height = Some(2160);
+        assert_eq!(
+            super::output_size(Some(&stream), Some(1920), Some(1080)),
+            Some((1920, 1080))
+        );
+        // Width-only cap scales height along.
+        assert_eq!(
+            super::output_size(Some(&stream), Some(1280), None),
+            Some((1280, 720))
+        );
+        // Within bounds / no caps / unknown dims → no scaling.
+        assert_eq!(super::output_size(Some(&stream), Some(4096), None), None);
+        assert_eq!(super::output_size(Some(&stream), None, None), None);
+        assert_eq!(
+            super::output_size(Some(&video_stream("hevc", 0)), Some(1920), None),
+            None
+        );
+        // Odd results round to even.
+        let mut odd = video_stream("hevc", 0);
+        odd.width = Some(1998);
+        odd.height = Some(1080);
+        let (w, h) = super::output_size(Some(&odd), Some(1000), None).unwrap();
+        assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    #[test]
+    fn scale_filter_concrete_and_expression_forms() {
+        let mut stream = video_stream("hevc", 0);
+        stream.width = Some(3840);
+        stream.height = Some(2160);
+        assert_eq!(
+            super::scale_filter(Some(&stream), Some(1920), Some(1080)).as_deref(),
+            Some("scale=1920:1080")
+        );
+        // Known in-bounds dimensions → no filter.
+        assert_eq!(super::scale_filter(Some(&stream), Some(7680), None), None);
+        // Unknown dimensions fall back to the bounded expression forms.
+        let unknown = video_stream("hevc", 0);
+        let expr = super::scale_filter(Some(&unknown), Some(1920), Some(1080)).unwrap();
+        assert!(expr.contains("min(max(iw\\,ih*a)\\,1920)"), "{expr}");
+        assert_eq!(
+            super::scale_filter(Some(&unknown), Some(1921), None).as_deref(),
+            Some("scale=1920:trunc(ow/a/2)*2")
+        );
+        assert_eq!(super::scale_filter(Some(&unknown), None, None), None);
+    }
+
+    #[test]
+    fn tonemap_and_downconvert_predicates() {
+        // HDR10 (smpte2084) → tonemap, not the bare 8-bit down-convert.
+        let mut hdr = video_stream("hevc", 0);
+        hdr.bit_depth = Some(10);
+        hdr.color_transfer = Some("smpte2084".to_owned());
+        assert!(super::requires_software_tonemap(Some(&hdr)));
+        assert!(!super::requires_8bit_downconvert(Some(&hdr)));
+        // 10-bit SDR → down-convert only.
+        let mut sdr10 = video_stream("hevc", 0);
+        sdr10.bit_depth = Some(10);
+        assert!(!super::requires_software_tonemap(Some(&sdr10)));
+        assert!(super::requires_8bit_downconvert(Some(&sdr10)));
+        // 8-bit SDR → neither. No stream → neither.
+        let sdr8 = video_stream("h264", 0);
+        assert!(!super::requires_software_tonemap(Some(&sdr8)));
+        assert!(!super::requires_8bit_downconvert(Some(&sdr8)));
+        assert!(!super::requires_software_tonemap(None));
+        assert!(!super::requires_8bit_downconvert(None));
     }
 }

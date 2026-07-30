@@ -381,7 +381,7 @@ fn _assert_object_safe_attachment_extractor(_: &dyn AttachmentExtractor) {}
 /// from server defaults by the implementation (see `hermit-mediaencoding`). The
 /// raw `query_string` is preserved verbatim so the generated playlist's segment
 /// URLs carry the client's parameters forward (the C# `Request.QueryString`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HlsStreamRequest {
     /// The item being streamed (`itemId`).
     pub item_id: Uuid,
@@ -405,11 +405,57 @@ pub struct HlsStreamRequest {
     /// ffmpeg `-ac` downmix so a >2ch source doesn't produce AAC the browser's
     /// MSE pipeline can't decode.
     pub transcoding_max_audio_channels: Option<i32>,
+    /// The negotiated video bitrate cap in bit/s (`videoBitRate`) — drives the
+    /// encoder's `-maxrate`/`-bufsize` and the bitrate-driven downscale.
+    pub video_bitrate: Option<i32>,
+    /// The negotiated audio bitrate cap in bit/s (`audioBitRate`).
+    pub audio_bitrate: Option<i32>,
+    /// The maximum output width in pixels (`maxWidth`) — bounds the scale
+    /// filter on re-encode.
+    pub max_width: Option<i32>,
+    /// The maximum output height in pixels (`maxHeight`).
+    pub max_height: Option<i32>,
+    /// The maximum output framerate (`maxFramerate`), applied on re-encode when
+    /// the source exceeds it.
+    pub max_framerate: Option<f32>,
+    /// Whether `-c:v copy` is permitted (`allowVideoStreamCopy`; default true).
+    /// PlaybackInfo appends `allowVideoStreamCopy=false` to the transcode URL
+    /// when the client forbade it.
+    pub allow_video_stream_copy: bool,
+    /// Whether `-c:a copy` is permitted (`allowAudioStreamCopy`; default true).
+    pub allow_audio_stream_copy: bool,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
     /// The raw request query string (including the leading `?`), forwarded into
     /// the generated playlist's segment URLs (`Request.QueryString`).
     pub query_string: String,
+}
+
+impl Default for HlsStreamRequest {
+    fn default() -> Self {
+        Self {
+            item_id: Uuid::nil(),
+            media_source_id: None,
+            play_session_id: None,
+            device_id: None,
+            segment_container: None,
+            segment_length: None,
+            audio_codec: None,
+            video_codec: None,
+            transcoding_max_audio_channels: None,
+            video_bitrate: None,
+            audio_bitrate: None,
+            max_width: None,
+            max_height: None,
+            max_framerate: None,
+            // Stream copy is permitted unless the client explicitly forbade it
+            // (the C# request DTO defaults both to true).
+            allow_video_stream_copy: true,
+            allow_audio_stream_copy: true,
+            is_static: false,
+            query_string: String::new(),
+        }
+    }
 }
 
 /// A resolved on-disk artifact to serve, with the MIME type to serve it as.
