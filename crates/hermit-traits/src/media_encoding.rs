@@ -167,6 +167,48 @@ pub trait MediaEncoder: Send + Sync {
 /// Compile-time assertion that [`MediaEncoder`] is object-safe.
 fn _assert_object_safe_media_encoder(_: &dyn MediaEncoder) {}
 
+/// Extracts evenly spaced trickplay thumbnail frames from a video file.
+///
+/// Port of the software path of
+/// `IMediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: one ffmpeg run with
+/// an `fps=1/interval` + width-bounded `scale` filter chain writing numbered
+/// JPEG thumbnails into a directory. The hardware-acceleration and
+/// keyframe-only variants ride the deferred hw-accel matrix (see the
+/// `hermit-mediaencoding` crate docs) and are not modeled at this seam; the
+/// trickplay manager's `EnableHwAcceleration`/`EnableHwEncoding`/
+/// `EnableKeyFrameOnlyExtraction` options therefore select the software path.
+///
+/// This is a separate small trait (rather than a `MediaEncoder` method) so the
+/// trickplay manager in `hermit-core` can depend on exactly this capability.
+#[async_trait]
+pub trait TrickplayFrameExtractor: Send + Sync {
+    /// Extracts one thumbnail every `interval_ms` milliseconds from
+    /// `input_path`, scaled to at most `max_width` (forced even) pixels wide
+    /// with the display aspect ratio preserved, writing numbered JPEGs into
+    /// `output_dir` (created if absent) and returning their paths sorted by
+    /// file name.
+    ///
+    /// `qscale` is the ffmpeg `-qscale:v` quality (1 best – 31 worst, clamped);
+    /// `threads` is the ffmpeg thread count (`0` lets ffmpeg decide).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when ffmpeg cannot be run or produces no
+    /// frames, or when `interval_ms`/`max_width` are not positive.
+    async fn extract_trickplay_frames(
+        &self,
+        input_path: &str,
+        interval_ms: i32,
+        max_width: i32,
+        qscale: i32,
+        threads: i32,
+        output_dir: &str,
+    ) -> Result<Vec<String>, ServiceError>;
+}
+
+/// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.
+fn _assert_object_safe_trickplay_frame_extractor(_: &dyn TrickplayFrameExtractor) {}
+
 /// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
 ///
 /// Port of the object-safe subset of `ITranscodeManager`. `StartFfMpeg` (which

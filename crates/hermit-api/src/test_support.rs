@@ -1755,6 +1755,9 @@ impl ActivityManager for FakeActivity {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
 }
 
 /// A fake [`TaskManager`]; every method is unused by INFRA-level tests.

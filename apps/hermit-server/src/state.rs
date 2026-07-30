@@ -38,7 +38,9 @@ use hermit_core::{
 use hermit_db::Database;
 use hermit_drawing::{ImageCrateEncoder, ImageProcessor};
 use hermit_livetv::HermitLiveTvManager;
-use hermit_mediaencoding::{MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder};
+use hermit_mediaencoding::{
+    MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, TrickplayFrameExtractorImpl,
+};
 use hermit_providers::LocalProviderManager;
 use hermit_traits::system::ServerApplicationPaths as _;
 
@@ -286,8 +288,13 @@ pub async fn build_app_state(
     let localization: Arc<dyn hermit_traits::localization::LocalizationManager> = Arc::new(
         LocalizationManager::new(&server_config.metadata_country_code),
     );
-    let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> =
-        Arc::new(HermitLyricManager::new().with_items(Arc::clone(&item_repository)));
+    let lyric_providers: Vec<Arc<dyn hermit_traits::stubs::LyricProvider>> =
+        vec![Arc::new(hermit_providers::LrcLibProvider::new())];
+    let lyrics: Arc<dyn hermit_traits::stubs::LyricManager> = Arc::new(
+        HermitLyricManager::new()
+            .with_items(Arc::clone(&item_repository))
+            .with_providers(lyric_providers),
+    );
     let live_tv: Arc<dyn hermit_traits::stubs::LiveTvManager> = Arc::new(HermitLiveTvManager::new(
         db.clone(),
         Arc::new(hermit_livetv::ReqwestFetcher::new()),
@@ -344,9 +351,20 @@ pub async fn build_app_state(
         Arc::new(HermitSimilarItemsManager::new(Arc::clone(&item_repository)));
     let search: Arc<dyn hermit_traits::library::SearchManager> =
         Arc::new(HermitSearchManager::new(Arc::clone(&item_repository)));
-    let trickplay: Arc<dyn hermit_traits::trickplay::TrickplayManager> = Arc::new(
-        HermitTrickplayManager::new(db.clone(), Arc::clone(&path_manager)),
-    );
+    // Kept concrete so the "Migrate Trickplay Image Location" task can call the
+    // inherent `move_generated_trickplay_data` helper.
+    let trickplay_impl = Arc::new(HermitTrickplayManager::new(
+        db.clone(),
+        Arc::clone(&path_manager),
+        Arc::clone(&config_trait),
+        Arc::clone(&item_repository),
+        Arc::new(TrickplayFrameExtractorImpl::new(
+            Arc::new(TokioTranscoder::new()),
+            ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+        )),
+        Arc::new(ImageCrateEncoder::new()),
+    ));
+    let trickplay: Arc<dyn hermit_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
 
     // ---- library + media-sources (consume repositories/services) ----------
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
@@ -403,9 +421,12 @@ pub async fn build_app_state(
         )
         .with_refresh_target(library_impl.clone()),
     );
-    // Scheduled tasks: register the "Scan all libraries" task (drives the same
-    // scan as `POST /Library/Refresh`) so the dashboard button + tasks page work.
+    // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
+    // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
+    // full Library/Maintenance task set is registered below once its backing
+    // managers exist, and the scheduler starts after registration.
     let task_manager = HermitTaskManager::new();
+    task_manager.set_trigger_store(config.config_dir.join("task_triggers.json"));
     task_manager.register(Arc::new(hermit_core::RefreshLibraryTask::new(Arc::clone(
         &library,
     ))));
@@ -490,7 +511,6 @@ pub async fn build_app_state(
         cache_dir: config.cache_dir.join("extensions"),
     };
     hermit_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
-    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager);
     let collections: Arc<dyn hermit_traits::collections::CollectionManager> =
         Arc::new(HermitCollectionManager::new(
             db.clone(),
@@ -503,6 +523,87 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
         ));
+
+    // The full Jellyfin dashboard task set (Library + Maintenance categories),
+    // now that every backing manager exists. Once registered, the scheduler
+    // fires their default (or overridden) triggers.
+    {
+        use hermit_core::scheduled_tasks::library as lib_tasks;
+        use hermit_core::scheduled_tasks::maintenance as maint_tasks;
+        let paths_dyn: Arc<dyn hermit_traits::system::ServerApplicationPaths> =
+            Arc::clone(&paths) as Arc<_>;
+        task_manager.register(Arc::new(lib_tasks::KeyframeExtractionTask::new(
+            Arc::clone(&library),
+            Arc::clone(&keyframe_repository),
+            Arc::clone(&media_encoder),
+        )));
+        task_manager.register(Arc::new(lib_tasks::AudioNormalizationTask::new(
+            db.clone(),
+            Arc::clone(&library),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&media_encoder),
+            Arc::new(lib_tasks::TokioFfmpegRunner),
+            Arc::clone(&paths_dyn),
+        )));
+        task_manager.register(Arc::new(lib_tasks::ChapterImagesTask::new(
+            Arc::clone(&library),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&chapters),
+            Arc::clone(&media_stream_repository),
+            Arc::clone(&media_encoder),
+            Arc::clone(&path_manager),
+            Arc::clone(&paths_dyn),
+        )));
+        task_manager.register(Arc::new(lib_tasks::PeopleValidationTask::new(
+            db.clone(),
+            Arc::clone(&providers),
+        )));
+        task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
+            Arc::clone(&library),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&subtitles),
+            Arc::clone(&media_stream_repository),
+        )));
+        task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
+            Arc::clone(&library),
+            Arc::clone(&lyrics),
+        )));
+        task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
+            Arc::clone(&library),
+            Arc::clone(&trickplay),
+        )));
+        task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(
+            Arc::clone(&config_trait),
+            Arc::clone(&activity),
+        )));
+        task_manager.register(Arc::new(maint_tasks::DeleteCacheFileTask::new(Arc::clone(
+            &paths_dyn,
+        ))));
+        task_manager.register(Arc::new(maint_tasks::DeleteLogFileTask::new(
+            Arc::clone(&config_trait),
+            server_config.log_file_retention_days,
+        )));
+        task_manager.register(Arc::new(maint_tasks::DeleteTranscodeFileTask::new(
+            Arc::clone(&paths_dyn),
+        )));
+        task_manager.register(Arc::new(
+            maint_tasks::CleanupCollectionAndPlaylistPathsTask::new(
+                Arc::clone(&library),
+                Arc::clone(&collections),
+                Arc::clone(&playlists),
+                Arc::clone(&linked_children_service),
+            ),
+        ));
+        task_manager.register(Arc::new(maint_tasks::OptimizeDatabaseTask::new(db.clone())));
+        task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
+        task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
+            Arc::clone(&trickplay_impl),
+        )));
+    }
+    let tasks: Arc<dyn hermit_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
+    // The trigger scheduler: fires startup triggers now, then evaluates
+    // daily/weekly/interval triggers for the life of the process.
+    drop(task_manager.start_scheduler());
     let _external_data: Arc<dyn hermit_traits::system::ExternalDataManager> =
         Arc::new(HermitExternalDataManager::new(
             Arc::clone(&path_manager),

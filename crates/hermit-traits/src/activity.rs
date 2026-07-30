@@ -1,10 +1,9 @@
 //! Activity-log trait — paged retrieval of server activity entries.
 //!
-//! Port of `MediaBrowser.Model.Activity.IActivityManager`, reduced to the
-//! read/query surface the `ActivityLogController` exercises (`GetPagedResultAsync`).
-//! The entry-creation and cleanup members are server-side write concerns not
-//! part of this batch's wire routes and are omitted; the trait can grow them
-//! later without affecting handlers.
+//! Port of `MediaBrowser.Model.Activity.IActivityManager`: the paged query
+//! surface the `ActivityLogController` exercises (`GetPagedResultAsync`), entry
+//! creation (`CreateAsync`), and retention cleanup (`CleanAsync`, driven by the
+//! "Clean Activity Log" scheduled task).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -121,6 +120,10 @@ pub trait ActivityManager: Send + Sync {
     /// Persists a new activity-log entry (C# `CreateAsync`), stamping it with the
     /// current time. Best-effort callers may ignore the result.
     async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError>;
+
+    /// Deletes entries created before `before`, returning how many were removed
+    /// (C# `CleanAsync` — the "Clean Activity Log" scheduled task's backend).
+    async fn clean(&self, before: DateTime<Utc>) -> Result<u64, ServiceError>;
 }
 
 fn _assert_object_safe_activity_manager(_: &dyn ActivityManager) {}

@@ -10,6 +10,8 @@
 pub mod container_types;
 pub mod library_options;
 pub mod local_images;
+#[cfg(feature = "lrclib")]
+pub mod lrclib;
 pub mod mediainfo;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
@@ -17,6 +19,9 @@ pub mod opensubtitles;
 pub mod provider_manager;
 pub mod tmdb;
 pub mod xbmc;
+
+#[cfg(feature = "lrclib")]
+pub use lrclib::{LrcLibConfig, LrcLibProvider};
 
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};

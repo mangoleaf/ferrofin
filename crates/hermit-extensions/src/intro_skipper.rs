@@ -9,9 +9,10 @@
 //! what makes jellyfin-web show the "Skip Intro" / "Skip Credits" button.
 //!
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the
-//! `IntroSkipper.Detect` scheduled task (there is no cron scheduler yet, so it
-//! runs on manual trigger or the post-scan hook). The task self-gates on the
-//! plugin's enabled flag and no-ops when Chromaprint (`fpcalc`) is absent.
+//! `IntroSkipper.Detect` scheduled task and as the provider behind the
+//! "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`). The task
+//! self-gates on the plugin's enabled flag and no-ops when Chromaprint
+//! (`fpcalc`) is absent.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use hermit_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episodes};
-use hermit_core::{PluginConfigPage, ScheduledTask};
+use hermit_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_model::data::BaseItemKind;
 use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
@@ -126,14 +127,56 @@ impl Extension for IntroSkipperExtension {
     }
 
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
-        vec![Arc::new(DetectSegmentsTask {
+        let detect = Arc::new(DetectSegmentsTask {
             library: Arc::clone(&cx.library),
             media_segments: Arc::clone(&cx.media_segments),
             plugins: Arc::clone(&cx.plugins),
             fingerprinter: cx.fingerprinter.clone(),
             cache_dir: cx.cache_dir.join("introskipper"),
             running: Arc::new(AtomicBool::new(false)),
-        })]
+        });
+        vec![
+            Arc::clone(&detect) as Arc<dyn ScheduledTask>,
+            Arc::new(MediaSegmentScanTask { detect }),
+        ]
+    }
+}
+
+/// The "Media Segment Scan" task — port of Jellyfin's
+/// `MediaSegmentExtractionTask` (`TaskExtractMediaSegments`), which runs every
+/// media-segment provider over the library. Hermit's one segment provider is
+/// the Intro Skipper, so the scan drives the same detection pass as
+/// [`DetectSegmentsTask`] (which self-gates on the plugin's enabled flag, the
+/// `fpcalc` binary, and its one-pass-at-a-time latch; re-runs replace only the
+/// provider's own segments and reuse the on-disk fingerprint cache).
+struct MediaSegmentScanTask {
+    detect: Arc<DetectSegmentsTask>,
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for MediaSegmentScanTask {
+    fn key(&self) -> &str {
+        "TaskExtractMediaSegments"
+    }
+    fn name(&self) -> &str {
+        "Media Segment Scan"
+    }
+    fn description(&self) -> &str {
+        "Extracts or obtains media segments from MediaSegment enabled plugins."
+    }
+    fn category(&self) -> &str {
+        "Library"
+    }
+    fn default_triggers(&self) -> Vec<hermit_model::tasks::TaskTriggerInfo> {
+        vec![hermit_model::tasks::TaskTriggerInfo {
+            type_: hermit_model::tasks::TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(12 * 3600 * 10_000_000),
+            ..hermit_model::tasks::TaskTriggerInfo::default()
+        }]
+    }
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        self.detect.execute(progress).await
     }
 }
 
@@ -454,7 +497,7 @@ impl ScheduledTask for DetectSegmentsTask {
         "Intro Skipper"
     }
 
-    async fn execute(&self) -> Result<(), ServiceError> {
+    async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         // Gate on the plugin being enabled (live toggle — no restart needed).
         if !self.enabled().await {
             tracing::debug!("intro skipper disabled; skipping analysis");
@@ -473,14 +516,27 @@ impl ScheduledTask for DetectSegmentsTask {
             tracing::info!("intro skipper: an analysis pass is already running");
             return Ok(());
         }
+        // Release the latch even if the run is aborted mid-await (the task
+        // manager cancels a queued run by aborting its tokio task, which drops
+        // this future at an await point without running the code after it).
+        let _release = ReleaseOnDrop(Arc::clone(&self.running));
         let config = self.load_config().await;
         // Run inline: the task manager queues the execution on its own spawned
         // task, so this body's runtime IS the dashboard's Running state — a
         // fire-and-forget here would flip the task back to Idle in
         // milliseconds and the run button would appear to do nothing.
         self.run_analysis(&fingerprinter, &config).await;
-        self.running.store(false, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// Clears the intro skipper's one-pass-at-a-time latch when dropped, so an
+/// aborted (cancelled) analysis run cannot leave it stuck.
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 

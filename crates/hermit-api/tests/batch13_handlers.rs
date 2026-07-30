@@ -308,6 +308,9 @@ impl ActivityManager for StubActivity {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
 }
 
 /// A filesystem stub returning canned directory entries, drives, and log files.

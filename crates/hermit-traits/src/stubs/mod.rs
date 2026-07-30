@@ -9,8 +9,10 @@
 //!
 //! Each trait ports only a representative slice of its C# interface — enough to
 //! establish the seam and exercise object safety — and omits the sub-strategy
-//! interfaces (`ILiveTvService`, `IChannel`, `IGroupPlaybackRequest`,
-//! `ILyricProvider`, …) entirely, per the port plan's SKIP list.
+//! interfaces (`ILiveTvService`, `IChannel`, `IGroupPlaybackRequest`, …)
+//! entirely, per the port plan's SKIP list. Lyrics have since grown real: the
+//! [`lyrics`] module now also carries the ported `ILyricProvider` strategy
+//! seam ([`LyricProvider`]) backing remote lyric search/download.
 //!
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
@@ -28,6 +30,6 @@ pub use hls_stream::{
 };
 pub use library_monitor::NoopLibraryMonitor;
 pub use live_tv::LiveTvManager;
-pub use lyrics::LyricManager;
+pub use lyrics::{LyricManager, LyricProvider, LyricResponse, RemoteLyricInfo};
 pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 pub use virtual_folders::DisabledVirtualFolderManager;

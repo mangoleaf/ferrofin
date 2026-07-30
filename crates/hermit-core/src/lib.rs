@@ -142,12 +142,11 @@
 //!   stored-external-subtitle slice (delete a stream + its sidecar); the
 //!   provider fan-out (search/download/upload) is a documented deferral;
 //! - [`scheduled_tasks`] — [`HermitTaskManager`] + the local [`ScheduledTask`]
-//!   trait, a minimal register/list/run-now registry over the `hermit-model`
-//!   task DTOs. **No cron loop**: a task only runs on an explicit
-//!   [`run_now`](HermitTaskManager::run_now); the `ITaskTrigger` timers, the
-//!   background queue and the on-disk trigger/result persistence are deferred to
-//!   a future scheduler wave. `FullSystemBackup`/`BackupService` is deferred
-//!   entirely.
+//!   trait: the task registry over the `hermit-model` task DTOs, plus the
+//!   trigger scheduler ([`start_scheduler`](HermitTaskManager::start_scheduler)
+//!   fires daily/weekly/interval/startup triggers), live progress reporting,
+//!   abortable queued runs, and on-disk trigger-override persistence.
+//!   `FullSystemBackup`/`BackupService` is deferred entirely.
 
 pub mod activity_manager;
 pub mod api_key_manager;
@@ -252,7 +251,7 @@ pub use path_manager::HermitPathManager;
 pub use people_repository::HermitPeopleRepository;
 pub use plugin_manager::{HermitPluginManager, PluginConfigPage, RegisteredPlugin};
 pub use quick_connect_manager::HermitQuickConnect;
-pub use scheduled_tasks::{HermitTaskManager, RefreshLibraryTask, ScheduledTask};
+pub use scheduled_tasks::{HermitTaskManager, RefreshLibraryTask, ScheduledTask, TaskProgress};
 pub use search_manager::HermitSearchManager;
 pub use session_bus::HermitSessionMessageBus;
 pub use session_manager::HermitSessionManager;

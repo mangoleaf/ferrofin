@@ -251,6 +251,18 @@ impl ActivityManager for HermitActivityManager {
         .map_err(db_err)?;
         Ok(())
     }
+
+    async fn clean(&self, before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
+        // Port of `ActivityManager.CleanAsync`: bulk-delete entries older than
+        // the cutoff. `DateCreated` is stored as RFC 3339 text, which orders
+        // lexicographically for UTC timestamps, so a text comparison is exact.
+        let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" < ?1"#)
+            .bind(before.to_rfc3339())
+            .execute(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]

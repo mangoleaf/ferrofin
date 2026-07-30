@@ -16,6 +16,7 @@ hermit-db.workspace = true
 hermit-common.workspace = true
 hermit-naming.workspace = true
 hermit-providers.workspace = true
+hermit-keyframes.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 sqlx.workspace = true
@@ -31,5 +32,7 @@ reqwest.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+hermit-drawing.workspace = true
+image.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
