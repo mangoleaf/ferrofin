@@ -69,7 +69,13 @@ bench() {  # $1=service $2=port $3=TARGET
   local svc="$1" base="http://localhost:$2" target="$3"
   echo ">> [$target] clean start"
   docker compose down -v >/dev/null 2>&1 || true
-  docker compose up -d --build "$svc"
+  # BENCH_SKIP_BUILD=1: use the existing hermit-bench:local image (e.g. one built
+  # from a clean `git archive HEAD` while the working tree carries in-flight edits).
+  if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then
+    docker compose up -d "$svc"
+  else
+    docker compose up -d --build "$svc"
+  fi
 
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
@@ -77,9 +83,12 @@ bench() {  # $1=service $2=port $3=TARGET
   sample_rss "$svc" "results/raw/$target-rss.txt" & local rss_pid=$!
 
   TARGET="$target" BASE_URL="$base" k6 run scenario.js
-  [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" k6 run transcode.js || true
 
+  # Stop RSS sampling BEFORE the transcode phase: its ffmpeg child peaks ~1 GB on a
+  # 4K encode and would drown the server-footprint number on both sides identically.
   kill "$rss_pid" 2>/dev/null || true
+
+  [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" k6 run transcode.js || true
   count_items "$base" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
