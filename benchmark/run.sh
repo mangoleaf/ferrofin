@@ -141,9 +141,11 @@ ${TABLE}
 | Items scanned | ${H_N} | ${J_N} |
 EOF
 if [ "${RUN_TRANSCODE:-0}" = "1" ] && [ -f results/raw/hermit-transcode.json ]; then
-  HT=$(jq -r '.ttfs_ms // "N/A"' results/raw/hermit-transcode.json)
-  JT=$(jq -r '.ttfs_ms // "N/A"' results/raw/jellyfin-transcode.json)
-  printf '| Transcode time-to-first-segment (experimental) | %s ms | %s ms |\n' "$HT" "$JT"
+  fmt_ttfs() { jq -r --arg m "$2" '.[$m] | if . then "\(.med) ms (\(.min)–\(.max), \(.runs) runs)" else "N/A" end' "$1"; }
+  printf '| HLS play-start, stream-copy remux (median TTFS) | %s | %s |\n' \
+    "$(fmt_ttfs results/raw/hermit-transcode.json copy)" "$(fmt_ttfs results/raw/jellyfin-transcode.json copy)"
+  printf '| HLS play-start, forced 4K HEVC→H.264 encode (median TTFS) | %s | %s |\n' \
+    "$(fmt_ttfs results/raw/hermit-transcode.json encode)" "$(fmt_ttfs results/raw/jellyfin-transcode.json encode)"
 fi
 } > "$OUT"
 

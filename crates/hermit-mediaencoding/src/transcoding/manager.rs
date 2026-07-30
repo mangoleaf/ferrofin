@@ -20,8 +20,14 @@ use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild}
 ///
 /// The C# `StartFfMpeg` loops unbounded on the cancellation token; this port
 /// adds a bound so a wedged ffmpeg cannot hang the request forever. Configurable
-/// candidate (default 30 s).
-pub const WAIT_FOR_FILE_TIMEOUT_MS: u64 = 30_000;
+/// candidate (default 180 s).
+///
+/// Sized for the worst legitimate cold start: a software 4K HEVC→H.264 encode
+/// of one 6 s segment on a small CPU cap (~4 cores) takes 30–60 s — the old
+/// 30 s bound killed those jobs mid-encode, and because the timeout also
+/// deletes the job, client retries restarted from zero and playback never
+/// began. Jellyfin waits as long as the request stays open.
+pub const WAIT_FOR_FILE_TIMEOUT_MS: u64 = 180_000;
 
 /// The poll cadence for the "wait until the segment file exists" loops, in
 /// milliseconds. Port of the hard-coded `Task.Delay(100)` in `StartFfMpeg` and
