@@ -53,9 +53,16 @@ use hermit_traits::system::ServerApplicationPaths as _;
 
 /// The default HLS segment length, in seconds.
 ///
-/// Port of the `EncodingOptions`/`DynamicHlsController` default segment length
-/// (`6`), used when no `EncodingOptions` override is configured.
-const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 6;
+/// Matches Jellyfin's `StreamState.SegmentLength` default of `3` for H.264/HEVC
+/// output: the first segment file can't close (and playback can't begin) until
+/// this many seconds are encoded, so it directly sets time-to-first-segment.
+/// Used when the request declares no `SegmentLength`.
+const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
+
+/// Assumed output frame rate for the NVENC GOP keyframe calc when the source
+/// frame rate is unknown (probing returned none). Only fires on pathological
+/// sources; `25` is a safe PAL-ish default. Candidate setting.
+const DEFAULT_KEYFRAME_FPS: f32 = 25.0;
 
 /// The default HLS segment container when the request declares none.
 ///
@@ -862,9 +869,47 @@ impl HermitStreamStatePlanner {
                         .video_bitrate_param(state, &video_encoder),
                 );
             }
-            if let Some(framerate) = self.encoding_helper.framerate_param(state) {
+            let output_framerate = self.encoding_helper.framerate_param(state);
+            if let Some(framerate) = output_framerate {
                 push_split(&mut args, "-r");
                 args.push(framerate.to_string());
+            }
+            // Force a keyframe at every segment boundary so the HLS muxer cuts
+            // exactly on `-hls_time`. Without this, ffmpeg can only cut at the
+            // encoder's natural GOP (libx264 keyint ≈250 frames ≈10 s), so the
+            // first segment overruns its target length and time-to-first-segment
+            // — the dominant startup latency — balloons. Port of Jellyfin's
+            // `keyFrameArg`/`gopArg`.
+            if nvenc_video {
+                // NVENC ignores the `-force_key_frames` expression; pin the GOP
+                // instead (Jellyfin's gopArg): N = ceil(segment_len × fps).
+                let fps = output_framerate
+                    .or_else(|| {
+                        state
+                            .video_stream
+                            .as_ref()
+                            .and_then(MediaStream::reference_frame_rate)
+                    })
+                    .unwrap_or(DEFAULT_KEYFRAME_FPS);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "keyint is a small positive frame count"
+                )]
+                let keyint =
+                    (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
+                push_split(&mut args, "-g:v:0");
+                args.push(keyint.to_string());
+                push_split(&mut args, "-keyint_min:v:0");
+                args.push(keyint.to_string());
+                push_split(&mut args, "-sc_threshold:v:0");
+                args.push("0".to_owned());
+            } else {
+                push_split(&mut args, "-force_key_frames:0");
+                args.push(format!(
+                    "expr:gte(t,n_forced*{})",
+                    state.segment_length_secs
+                ));
             }
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
@@ -1375,7 +1420,7 @@ mod tests {
         let plan = p.plan(&request("abc"), false, None).await.unwrap();
         assert_eq!(plan.media_path, "/media/movie.mkv");
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
-        assert_eq!(plan.segment_length_ms, 6000);
+        assert_eq!(plan.segment_length_ms, 3000);
         assert_eq!(plan.segment_container, "ts");
     }
 
@@ -1567,9 +1612,9 @@ mod tests {
             .position(|a| a == "-vf")
             .map(|i| plan.arguments[i + 1].as_str())
             .expect("-vf present");
-        // 3 segments * 6 s = 18 s shift.
+        // 3 segments * 3 s = 9 s shift.
         assert!(
-            vf.starts_with("setpts=PTS+18/TB,subtitles=") && vf.contains(",setpts=PTS-18/TB"),
+            vf.starts_with("setpts=PTS+9/TB,subtitles=") && vf.contains(",setpts=PTS-9/TB"),
             "expected setpts sandwich, got: {vf}"
         );
     }
@@ -1738,7 +1783,7 @@ mod tests {
         let p = planner(vec![src]);
         let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
         assert!(plan.arguments.windows(2).any(|w| w == ["-f", "hls"]));
-        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "6"]));
+        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "3"]));
         assert!(
             plan.arguments
                 .windows(2)
@@ -1767,7 +1812,7 @@ mod tests {
         let src = source("abc", vec![video_stream("mpeg4"), audio_stream("aac")]);
         let p = planner(vec![src]);
         let plan = p.plan(&request("abc"), true, Some(2)).await.unwrap();
-        // Audio-only plan: segment 2 seeks to 2 * 6s = 12s worth of ticks.
+        // Audio-only plan: segment 2 seeks to 2 * 3s = 6s worth of ticks.
         assert!(
             plan.arguments.iter().any(|a| a == "-ss"),
             "{:?}",
@@ -1783,13 +1828,13 @@ mod tests {
             "seek segment must set -start_number: {:?}",
             plan.arguments
         );
-        // ...and shift output timestamps to the segment's playlist time (2 * 6s =
+        // ...and shift output timestamps to the segment's playlist time (2 * 3s =
         // 12s) so the player can splice the seek-restarted segment (else PTS ~0
         // → discontinuity → stall).
         assert!(
             plan.arguments
                 .windows(2)
-                .any(|w| w == ["-output_ts_offset", "12"]),
+                .any(|w| w == ["-output_ts_offset", "6"]),
             "seek segment must set -output_ts_offset to N*segment_len: {:?}",
             plan.arguments
         );
@@ -1864,6 +1909,12 @@ mod tests {
         let plan = p.plan(&req, false, None).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-c:v libx264"), "re-encode expected: {args}");
+        // Force a keyframe on every 3 s segment boundary so the HLS muxer cuts on
+        // `-hls_time` instead of libx264's ~10 s natural GOP — halving TTFS.
+        assert!(
+            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "segment-boundary keyframes expected: {args}"
+        );
         assert!(
             args.contains("scale=1920:1080"),
             "bounded downscale expected: {args}"
