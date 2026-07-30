@@ -64,6 +64,7 @@ use hermit_traits::events::EventManager;
 use hermit_traits::library::{LibraryManager, UserDataManager, UserManager};
 use hermit_traits::net::WebSocketConnection;
 use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use hermit_traits::session_bus::SessionMessageBus;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::has_permission;
@@ -171,6 +172,11 @@ pub struct HermitSessionManager {
     /// The pool of active sessions keyed by session key (`app + deviceId`),
     /// matching the C# `_activeConnections` keying.
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
+    /// The session message bus the HTTP WebSocket handler registers client
+    /// sinks on. A bus-registered socket counts as a live controller (it drives
+    /// `SupportsRemoteControl`) and is the delivery path for remote-control
+    /// pushes when no [`WebSocketConnection`] is attached directly.
+    bus: Option<Arc<dyn SessionMessageBus>>,
 }
 
 impl std::fmt::Debug for HermitSessionManager {
@@ -209,7 +215,40 @@ impl HermitSessionManager {
             db,
             server_id: server_id.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            bus: None,
         }
+    }
+
+    /// Attaches the session message bus, so sessions whose WebSocket registered
+    /// a sink there count as live (remote-controllable) and receive pushes.
+    #[must_use]
+    pub fn with_session_bus(mut self, bus: Arc<dyn SessionMessageBus>) -> Self {
+        self.bus = Some(bus);
+        self
+    }
+
+    /// Whether the session has any live controller — a directly attached
+    /// [`WebSocketConnection`] or a sink registered on the session bus.
+    fn session_is_active(&self, session: &SessionInfo) -> bool {
+        session.is_active()
+            || self
+                .bus
+                .as_ref()
+                .is_some_and(|bus| bus.is_connected(&session.id))
+    }
+
+    /// Bus-aware `SupportsRemoteControl` (C# `SessionInfo.SupportsRemoteControl`).
+    fn session_supports_remote_control(&self, session: &SessionInfo) -> bool {
+        session.capabilities.supports_media_control && self.session_is_active(session)
+    }
+
+    /// Maps a session to its wire DTO with the liveness fields computed against
+    /// the bus (the free [`session_info_to_dto`] only sees direct connections).
+    fn to_dto(&self, session: &SessionInfo) -> SessionInfoDto {
+        let mut dto = session_info_to_dto(session);
+        dto.is_active = self.session_is_active(session);
+        dto.supports_remote_control = self.session_supports_remote_control(session);
+        dto
     }
 
     /// Attaches a live WebSocket connection to the session identified by
@@ -392,6 +431,7 @@ impl HermitSessionManager {
         let payload = envelope_bytes(message_type, data)?;
         let sessions = self.sessions.lock().await;
         for session in sessions.values().filter(|s| predicate(s)) {
+            let mut delivered = false;
             for connection in &session.connections {
                 if !connection.is_open() {
                     continue;
@@ -399,6 +439,16 @@ impl HermitSessionManager {
                 if let Err(err) = connection.send(&payload).await {
                     error!(session_id = %session.id, %err, "failed to push message to session");
                 }
+                delivered = true;
+            }
+            // No direct connection — deliver over the session bus (the HTTP
+            // WebSocket handler's sink), so remote-control pushes reach clients
+            // connected through `/socket`.
+            if !delivered
+                && let Some(bus) = &self.bus
+                && let Ok(text) = std::str::from_utf8(&payload)
+            {
+                bus.send(&session.id, text.to_owned());
             }
         }
         Ok(())
@@ -415,7 +465,7 @@ impl HermitSessionManager {
     ) -> Result<(), ServiceError> {
         // Ensure the target exists and supports remote control.
         let target = self.get_session_snapshot(session_id).await?;
-        if !target.supports_remote_control() {
+        if !self.session_supports_remote_control(&target) {
             return Err(ServiceError::invalid_input(
                 "session does not support remote control",
             ));
@@ -451,7 +501,7 @@ impl SessionManager for HermitSessionManager {
                 Some(user),
             )
             .await?;
-        Ok(session_info_to_dto(&session))
+        Ok(self.to_dto(&session))
     }
 
     async fn update_device_name(
@@ -895,7 +945,7 @@ impl SessionManager for HermitSessionManager {
             }
 
             if controllable_user_to_check.is_some() {
-                if !session.supports_remote_control() {
+                if !self.session_supports_remote_control(session) {
                     continue;
                 }
                 if !user_can_control_others
@@ -916,7 +966,7 @@ impl SessionManager for HermitSessionManager {
                 continue;
             }
 
-            let mut dto = session_info_to_dto(session);
+            let mut dto = self.to_dto(session);
             if !user_is_admin {
                 // Don't report hardware-acceleration detail to non-admins.
                 dto.transcoding_info = None;
@@ -969,7 +1019,7 @@ impl SessionManager for HermitSessionManager {
                 user.as_ref(),
             )
             .await?;
-        Ok(session_info_to_dto(&session))
+        Ok(self.to_dto(&session))
     }
 
     async fn logout(&self, access_token: &str) -> Result<(), ServiceError> {
@@ -1137,7 +1187,7 @@ impl HermitSessionManager {
             )
             .await?;
 
-        let mut dto = session_info_to_dto(&session);
+        let mut dto = self.to_dto(&session);
         dto.server_id = Some(self.server_id.clone());
         // The full `AuthenticationResult` envelope (UserDto + ServerId) is
         // assembled by the caller from this data; the freshly minted token

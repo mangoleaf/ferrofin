@@ -628,8 +628,14 @@ pub async fn build_app_state(
     ));
 
     // ---- sessions + tv_series (consume dto) -------------------------------
-    let sessions: Arc<dyn hermit_traits::session::SessionManager> =
-        Arc::new(HermitSessionManager::new(
+    // The session message bus is created here (not with SyncPlay below) because
+    // the session manager needs it too: a bus-registered `/socket` sink is what
+    // makes a session remote-controllable (cast-to-device), and it is the
+    // delivery path for Play/Playstate/GeneralCommand pushes.
+    let session_bus: Arc<dyn hermit_traits::session_bus::SessionMessageBus> =
+        Arc::new(hermit_core::HermitSessionMessageBus::new());
+    let sessions: Arc<dyn hermit_traits::session::SessionManager> = Arc::new(
+        HermitSessionManager::new(
             Arc::clone(&users),
             Arc::clone(&devices),
             Arc::clone(&user_data),
@@ -638,7 +644,9 @@ pub async fn build_app_state(
             Arc::clone(&event_manager),
             db.clone(),
             server_id.clone(),
-        ));
+        )
+        .with_session_bus(Arc::clone(&session_bus)),
+    );
     let tv_series: Arc<dyn hermit_traits::tv::TvSeriesManager> =
         Arc::new(HermitTvSeriesManager::new(
             Arc::clone(&users),
@@ -795,13 +803,9 @@ pub async fn build_app_state(
     // host). See brain/PLAN_HERMIT_PLUGINS.md.
     let state = state.with_plugins(Arc::clone(&plugins));
 
-    // ---- SyncPlay + the session message bus -------------------------------
-    // The bus is the server→client push registry the session WebSocket registers
-    // its sink on; the SyncPlay manager shares it to deliver group commands to
-    // member sockets. Both are handed to `AppState` so the socket handler and the
-    // `/SyncPlay/*` routes see the same instances.
-    let session_bus: Arc<dyn hermit_traits::session_bus::SessionMessageBus> =
-        Arc::new(hermit_core::HermitSessionMessageBus::new());
+    // ---- SyncPlay ---------------------------------------------------------
+    // The SyncPlay manager shares the session message bus (created with the
+    // session manager above) to deliver group commands to member sockets.
     let sync_play: Arc<dyn hermit_traits::stubs::SyncPlayManager> = Arc::new(
         hermit_core::HermitSyncPlayManager::new(Arc::clone(&session_bus)),
     );

@@ -330,6 +330,71 @@ async fn report_capabilities_updates_session_and_persists() {
 }
 
 #[tokio::test]
+async fn bus_connected_session_is_controllable_and_receives_play() {
+    let db = test_db().await;
+    let bus: Arc<dyn hermit_traits::session_bus::SessionMessageBus> =
+        Arc::new(crate::HermitSessionMessageBus::new());
+    let mgr = Arc::new(
+        manager(&db)
+            .as_ref()
+            .clone()
+            .with_session_bus(Arc::clone(&bus)),
+    );
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    let dto = mgr
+        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+    mgr.report_capabilities(
+        &session_id,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Not yet connected → not remote-controllable, not listed as castable.
+    let listed = mgr
+        .get_sessions(user_id, None, None, Some(user_id), false)
+        .await
+        .unwrap();
+    assert!(listed.is_empty());
+
+    // The `/socket` handler registers a sink on the bus for this session.
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink_received = Arc::clone(&received);
+    bus.register(
+        session_id.clone(),
+        Box::new(move |msg| sink_received.lock().unwrap().push(msg)),
+    );
+
+    let listed = mgr
+        .get_sessions(user_id, None, None, Some(user_id), false)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].supports_remote_control);
+    assert!(listed[0].is_active);
+
+    // A Play command reaches the session over the bus.
+    let play = hermit_model::session::PlayRequest {
+        item_ids: vec![Uuid::new_v4()],
+        play_command: hermit_model::session::PlayCommand::PlayNow,
+        ..hermit_model::session::PlayRequest::default()
+    };
+    mgr.send_play_command("", &session_id, &play).await.unwrap();
+    let messages = received.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    let envelope: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+    assert_eq!(envelope["MessageType"], "Play");
+    assert_eq!(envelope["Data"]["PlayCommand"], "PlayNow");
+}
+
+#[tokio::test]
 async fn report_now_viewing_rejects_bad_id() {
     let db = test_db().await;
     let mgr = manager(&db);

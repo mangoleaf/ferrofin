@@ -9,9 +9,12 @@
 //! The socket accepts the upgrade, answers pings, sends periodic keep-alives,
 //! and — when the caller authenticates via the `api_key` query parameter —
 //! **registers a message sink** on the [`SessionMessageBus`] keyed by the
-//! caller's session id, so server→client pushes (currently SyncPlay commands and
-//! group updates) reach this client. The sink is unregistered when the socket
-//! closes. An anonymous socket still holds open (keep-alive only), so a client
+//! caller's session id, so server→client pushes (SyncPlay commands/group updates
+//! and the remote-control `Play`/`Playstate`/`GeneralCommand` casts) reach this
+//! client. The session manager also treats a bus-registered session as having a
+//! live controller, which is what makes it appear in the cast-to-device menu
+//! (`GET /Sessions?ControllableByUserId=…` → `SupportsRemoteControl`). The sink
+//! is unregistered when the socket closes. An anonymous socket still holds open (keep-alive only), so a client
 //! that opens the socket before authenticating is never dropped.
 
 use std::time::Duration;
