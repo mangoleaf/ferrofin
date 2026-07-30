@@ -70,6 +70,14 @@ impl HermitItemPersistenceService {
     /// fully replaces the stored row (matching the C# save semantics for the
     /// scalar `BaseItems` columns).
     async fn upsert_item(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+        // C# `SaveItem` always stamps `CleanName = GetCleanValue(item.Name)` at
+        // write time (no caller pre-computes it); deriving here keeps every
+        // saved item matchable by the search filter, which queries `CleanName`.
+        let clean_name = item
+            .name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(crate::text_util::get_clean_value);
         sqlx::query(UPSERT_SQL)
             .bind(&item.id)
             .bind(&item.album)
@@ -77,7 +85,7 @@ impl HermitItemPersistenceService {
             .bind(&item.artists)
             .bind(item.audio)
             .bind(&item.channel_id)
-            .bind(&item.clean_name)
+            .bind(clean_name)
             .bind(item.community_rating)
             .bind(item.critic_rating)
             .bind(&item.custom_rating)
@@ -555,6 +563,35 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(remaining, 0, "all links should be cleared");
+    }
+
+    // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes
+    // `GetCleanValue(item.Name)` at write time). No scan path pre-computes it,
+    // and the `searchTerm` filter queries `CleanName` — a NULL there makes the
+    // item invisible to search (the web search page returned nothing).
+    #[tokio::test]
+    async fn save_items_stamps_derived_clean_name() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        let svc = HermitItemPersistenceService::new(db.clone());
+
+        let item = hermit_db::entities::base_items::BaseItemEntity {
+            id: id.to_string(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            name: Some("Amélie".to_owned()),
+            ..hermit_db::entities::base_items::BaseItemEntity::default()
+        };
+        svc.save_items(std::slice::from_ref(&item))
+            .await
+            .expect("save");
+
+        let clean: Option<String> =
+            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(id.to_string())
+                .fetch_one(db.pool())
+                .await
+                .expect("query");
+        assert_eq!(clean.as_deref(), Some("amelie"));
     }
 
     // Saving a movie's genre/studio values must also materialize the browsable
