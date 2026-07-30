@@ -694,6 +694,26 @@ pub trait UserDataManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<UserItemDataDto>, ServiceError>;
 
+    /// Batch form of [`Self::get_user_data_dto`] for one user across many
+    /// items, keyed by item id.
+    ///
+    /// The default loops the per-item call so impls compile unchanged; the
+    /// concrete manager overrides it with a single query — the per-item form
+    /// is an N+1 that dominates list-endpoint latency under concurrent load.
+    async fn get_user_data_dtos(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &item_id in item_ids {
+            if let Some(dto) = self.get_user_data_dto(item_id, user_id).await? {
+                map.insert(item_id, dto);
+            }
+        }
+        Ok(map)
+    }
+
     /// Sets — or clears, when `likes` is `None` — a user's like flag for an item,
     /// returning the refreshed data DTO.
     ///

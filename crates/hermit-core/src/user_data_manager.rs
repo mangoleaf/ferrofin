@@ -244,6 +244,44 @@ impl UserDataManager for HermitUserDataManager {
         Ok(Some(to_dto(&row, item_id)))
     }
 
+    async fn get_user_data_dtos(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        // One IN-query per chunk instead of one query per item. 500 stays far
+        // below SQLite's conservative 999-host-variable floor.
+        for chunk in item_ids.chunks(500) {
+            let placeholders = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "UserData"
+                   WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
+                     AND "CustomDataKey" = "ItemId""#,
+            );
+            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(user_id.to_string());
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+            for row in rows {
+                if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
+                    map.insert(item_id, to_dto(&row, item_id));
+                }
+            }
+        }
+        // Items without a stored row get the empty-row DTO, matching the
+        // per-item path's `unwrap_or_else(empty_row)` fallback.
+        for &item_id in item_ids {
+            map.entry(item_id)
+                .or_insert_with(|| to_dto(&Self::empty_row(item_id, user_id), item_id));
+        }
+        Ok(map)
+    }
+
     async fn set_likes(
         &self,
         user_id: Uuid,
@@ -515,6 +553,44 @@ mod tests {
             .expect("some");
         assert!(dto.is_favorite);
         assert_eq!(dto.play_count, 3);
+    }
+
+    // The batch read must agree with the per-item read for stored rows AND
+    // fabricate the same empty-row DTO for items with no row (the list-endpoint
+    // prefetch replaces the per-item N+1, so any divergence is a play-state bug).
+    #[tokio::test]
+    async fn batch_read_matches_per_item_reads() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let (with_row, without_row) = (Uuid::from_u128(2), Uuid::from_u128(3));
+        seed_user(&db, user).await;
+        seed_item(&db, with_row, BaseItemKind::Movie).await;
+        seed_item(&db, without_row, BaseItemKind::Movie).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        mgr.save_user_data(
+            user,
+            with_row,
+            &UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                playback_position_ticks: Some(42),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save");
+
+        let batch = mgr
+            .get_user_data_dtos(&[with_row, without_row], user)
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), 2);
+        for id in [with_row, without_row] {
+            let single = mgr.get_user_data_dto(id, user).await.expect("read");
+            assert_eq!(batch.get(&id), single.as_ref(), "item {id}");
+        }
+        assert!(batch[&with_row].is_favorite);
+        assert!(!batch[&without_row].is_favorite);
     }
 
     #[tokio::test]

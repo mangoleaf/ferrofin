@@ -57,7 +57,9 @@ use hermit_db::Database;
 use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::{BaseItemKind, MediaType};
-use hermit_model::dto::{BaseItemDto, BaseItemPerson, NameGuidPair, TrickplayInfoDto};
+use hermit_model::dto::{
+    BaseItemDto, BaseItemPerson, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
+};
 use hermit_model::entities::{ExtraType, ImageType, LocationType, VideoType};
 use hermit_model::querying::ItemFields;
 use uuid::Uuid;
@@ -73,6 +75,16 @@ use hermit_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
+
+/// Relation rows bulk-loaded for a whole page of items, so `build_dto` needs
+/// no per-item queries for them (list endpoints); absent entries mean "no rows"
+/// for that item, not "not prefetched".
+struct Prefetched {
+    /// Image rows per item id (same order as [`HermitDtoService::load_images`]).
+    images: HashMap<Uuid, Vec<ItemImageInfo>>,
+    /// The requesting user's play-state per item id.
+    user_data: HashMap<Uuid, UserItemDataDto>,
+}
 use crate::kinds;
 
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
@@ -254,6 +266,41 @@ impl HermitDtoService {
         Ok(rows.iter().map(to_image_info).collect())
     }
 
+    /// Batch form of [`Self::load_images`]: all image rows for `item_ids` in one
+    /// query per chunk, keyed by item id (per-item ordering preserved).
+    ///
+    /// The per-item form is an N+1 that dominates list-endpoint latency under
+    /// concurrent load; list callers prefetch through this instead.
+    async fn load_images_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::with_capacity(item_ids.len());
+        // 500 stays far below SQLite's conservative 999-host-variable floor.
+        for chunk in item_ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "BaseItemImageInfos"
+                   WHERE "ItemId" IN ({placeholders})
+                   ORDER BY "ItemId", "ImageType", "Id""#,
+            );
+            let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+            for row in &rows {
+                if let Ok(item_id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(item_id).or_default().push(to_image_info(row));
+                }
+            }
+        }
+        Ok(map)
+    }
+
     /// Resolves a by-name value (genre/studio/…) to its `ItemValues` id, or the
     /// nil UUID when it has no stored value row.
     ///
@@ -331,22 +378,6 @@ impl HermitDtoService {
             Self::record_blur_hash(dto, image.image_type, &tag, hash);
         }
         Some(tag)
-    }
-
-    /// Attaches the requesting user's play-state to the DTO (port of
-    /// `AttachUserSpecificInfo`, `UserData` half). Folder child-count enrichment
-    /// is applied by the caller since it needs the field toggles.
-    async fn attach_user_data(
-        &self,
-        dto: &mut BaseItemDto,
-        item_id: Uuid,
-        user_id: Uuid,
-        options: &DtoOptions,
-    ) -> Result<(), ServiceError> {
-        if options.enable_user_data {
-            dto.user_data = self.user_data.get_user_data_dto(item_id, user_id).await?;
-        }
-        Ok(())
     }
 
     /// Attaches the item's cast/crew people (port of `AttachPeople`), including
@@ -541,6 +572,9 @@ impl HermitDtoService {
 
     /// Builds the full DTO for one item row (port of `GetBaseItemDtoInternal` +
     /// `AttachBasicFields`), honoring every [`DtoOptions`] toggle.
+    ///
+    /// `prefetched` carries relation rows bulk-loaded for a whole page (list
+    /// endpoints); `None` falls back to per-item queries (single-item callers).
     #[allow(clippy::too_many_lines)]
     async fn build_dto(
         &self,
@@ -548,6 +582,7 @@ impl HermitDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
+        prefetched: Option<&Prefetched>,
     ) -> Result<BaseItemDto, ServiceError> {
         let item_id = row_id(item);
         let kind = row_kind(item);
@@ -555,7 +590,10 @@ impl HermitDtoService {
         let images = if options.enable_images
             || options.contains_field(ItemFields::PrimaryImageAspectRatio)
         {
-            self.load_images(item_id).await?
+            match prefetched {
+                Some(p) => p.images.get(&item_id).cloned().unwrap_or_default(),
+                None => self.load_images(item_id).await?,
+            }
         } else {
             Vec::new()
         };
@@ -586,8 +624,12 @@ impl HermitDtoService {
         // User-specific play-state.
         if let Some(user) = user {
             let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
-            self.attach_user_data(&mut dto, item_id, user_id, options)
-                .await?;
+            if options.enable_user_data {
+                dto.user_data = match prefetched {
+                    Some(p) => p.user_data.get(&item_id).cloned(),
+                    None => self.user_data.get_user_data_dto(item_id, user_id).await?,
+                };
+            }
         }
 
         // Media sources.
@@ -1052,7 +1094,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
-        let mut dto = self.build_dto(item, options, user, owner_id).await?;
+        let mut dto = self.build_dto(item, options, user, owner_id, None).await?;
         if options.contains_field(ItemFields::ItemCounts) {
             self.set_item_by_name_info(&mut dto, user).await?;
         }
@@ -1070,9 +1112,32 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
+
+        // Bulk-load the per-item relations for the whole page up front (2
+        // queries total) instead of 2 queries × N items inside `build_dto` —
+        // the N+1 convoyed the connection pool under concurrent list load.
+        let ids: Vec<Uuid> = items.iter().map(row_id).collect();
+        let images = if options.enable_images
+            || options.contains_field(ItemFields::PrimaryImageAspectRatio)
+        {
+            self.load_images_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        let user_data = match user {
+            Some(user) if options.enable_user_data => {
+                let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+                self.user_data.get_user_data_dtos(&ids, user_id).await?
+            }
+            _ => HashMap::new(),
+        };
+        let prefetched = Prefetched { images, user_data };
+
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            let mut dto = self.build_dto(item, options, user, owner_id).await?;
+            let mut dto = self
+                .build_dto(item, options, user, owner_id, Some(&prefetched))
+                .await?;
             if options.contains_field(ItemFields::ItemCounts) {
                 self.set_item_by_name_info(&mut dto, user).await?;
             }
@@ -1088,7 +1153,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         tagged_item_ids: Option<&[Uuid]>,
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
-        let mut dto = self.build_dto(item, options, user, None).await?;
+        let mut dto = self.build_dto(item, options, user, None, None).await?;
 
         // When the caller pre-supplies the tagged items, count them by kind
         // (port of the static `SetItemByNameInfo` overload); otherwise fall back
