@@ -1,0 +1,40 @@
+# Both servers, identical resource caps, same read-only fixture library.
+# run.sh brings them up ONE AT A TIME (never concurrently — contention corrupts both).
+services:
+  hermit:
+    build:
+      context: ..
+      dockerfile: benchmark/Dockerfile.hermit
+    image: hermit-bench:local
+    cpus: ${BENCH_CPUS}
+    mem_limit: ${BENCH_MEM}
+    ports: ["18096:8096"]   # host 8096 is often a live dev Hermit — stay clear
+    environment:
+      HERMIT_ADMIN_USER: ${BENCH_ADMIN_USER}
+      HERMIT_ADMIN_PASSWORD: ${BENCH_ADMIN_PASSWORD}
+      HERMIT_DATA_DIR: /data
+      HERMIT_BIND_ADDR: 0.0.0.0
+      HERMIT_PORT: "8096"
+    volumes:
+      - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
+      - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
+      - ./fixtures/media:/media/synth:ro
+      - hermit-data:/data
+
+  jellyfin:
+    image: ${JELLYFIN_IMAGE}
+    cpus: ${BENCH_CPUS}
+    mem_limit: ${BENCH_MEM}
+    ports: ["18097:8096"]
+    volumes:
+      - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
+      - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
+      - ./fixtures/media:/media/synth:ro
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+
+# Named volumes so `docker compose down -v` gives each run a clean DB.
+volumes:
+  hermit-data:
+  jellyfin-config:
+  jellyfin-cache:

@@ -1,0 +1,14 @@
+# Release build of the Hermit server + ffmpeg (scan probes with ffprobe; transcode needs ffmpeg).
+# ponytail: plain multi-stage, no cargo-chef layer caching — add it if rebuild time bites.
+FROM rust:1.97.0-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p hermit-server
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
+EXPOSE 8096
+ENTRYPOINT ["hermit-server"]
