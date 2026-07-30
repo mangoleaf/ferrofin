@@ -1,0 +1,38 @@
+# Build & push the hermit-server image to the GitLab registry.
+#
+# Versioning: annotated git tags `vMAJOR.MINOR.PATCH` (starting at v0.1.0) are the
+# release trigger. A tag pushes `:MAJOR.MINOR.PATCH` + `:latest`; pushes to the
+# default branch publish `:main-<shortsha>` for homelab testing between releases.
+stages: [release]
+
+docker-image:
+  stage: release
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    IMAGE: $CI_REGISTRY_IMAGE/hermit-server
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    # On a version tag, the tag must match the workspace Cargo.toml version.
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        TAG="${CI_COMMIT_TAG#v}"
+        CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+        if [ "$TAG" != "$CARGO_VERSION" ]; then
+          echo "tag v$TAG != workspace Cargo.toml version $CARGO_VERSION" >&2; exit 1
+        fi
+      else
+        TAG="main-$CI_COMMIT_SHORT_SHA"
+      fi
+    - docker build -t "$IMAGE:$TAG" .
+    - docker push "$IMAGE:$TAG"
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$IMAGE:$TAG" "$IMAGE:latest"
+        docker push "$IMAGE:latest"
+      fi
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
