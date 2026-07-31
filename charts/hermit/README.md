@@ -15,8 +15,8 @@ release to Hermit is near-zero churn. Two intentional differences:
 The chart is published to the GitLab OCI registry next to the image:
 
 ```bash
-helm registry login registry.gitlab.mangoleafstudios.com
-helm install hermit oci://registry.gitlab.mangoleafstudios.com/mlstudios/hermit/charts/hermit \
+helm registry login registry.mangoleafstudios.com
+helm install hermit oci://registry.mangoleafstudios.com/mlstudios/hermit/charts/hermit \
   --version 0.1.0 -n hermit --create-namespace -f my-values.yaml
 ```
 
