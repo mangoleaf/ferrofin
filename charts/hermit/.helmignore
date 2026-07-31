@@ -1,0 +1,6 @@
+.git/
+.gitignore
+*.tgz
+.DS_Store
+*.orig
+*~

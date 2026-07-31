@@ -42,3 +42,24 @@ docker-image:
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# Package the official Helm chart and push it to the GitLab OCI registry alongside the
+# image. Consumers install with: helm install hermit oci://$REGISTRY/charts/hermit --version X.
+# Tag-only: the chart is released in lockstep with the app, and its version must match the tag.
+helm-chart:
+  stage: release
+  image:
+    name: alpine/helm:3.16.2
+    entrypoint: [""]
+  script:
+    - TAG="${CI_COMMIT_TAG#v}"
+    - CHART_VERSION=$(sed -n 's/^version: *\(.*\)/\1/p' charts/hermit/Chart.yaml | head -1)
+    - |
+      if [ "$TAG" != "$CHART_VERSION" ]; then
+        echo "tag v$TAG != charts/hermit Chart.yaml version $CHART_VERSION" >&2; exit 1
+      fi
+    - helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+    - helm package charts/hermit --destination /tmp
+    - helm push "/tmp/hermit-${CHART_VERSION}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
