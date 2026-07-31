@@ -8,9 +8,11 @@
 #
 # The git tag is the single source of truth for the version: CI stamps it into
 # the crate (Cargo.toml) and the chart (helm --version/--app-version) at build
-# time, so there are no version files to keep in sync. Releasing is just
-# `git tag vX.Y.Z && git push origin vX.Y.Z`. The committed Cargo.toml/Chart.yaml
-# versions are dev placeholders that CI overrides.
+# time, so there are no version files to keep in sync. To release, run the
+# manual `create-release` job on main and pick a bump (patch/minor/major) — CI
+# computes the next tag from the latest one and pushes it, which triggers this
+# pipeline. Nobody hand-creates tags or edits versions. The committed
+# Cargo.toml/Chart.yaml versions are dev placeholders that CI overrides.
 #
 # Tag scheme (see brain/plans/PLAN_RELEASE_STRATEGY.md):
 #   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
@@ -21,6 +23,43 @@
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
 stages: [test, build, release, chart]
+
+# ---------------------------------------------------------------------------
+# create-release — manual, main only. CI owns tag creation: pick a bump level
+# when you run it and it computes the next vX.Y.Z from the latest tag and pushes
+# it. That tag push triggers the build + chart pipeline. No hand-made tags.
+# Requires a CI/CD variable RELEASE_TOKEN — a project access token with the
+# write_repository scope, allowed to create the protected v* tags.
+# ---------------------------------------------------------------------------
+create-release:
+  stage: .pre
+  image: alpine/git:latest
+  variables:
+    BUMP: patch          # override to "minor" or "major" when you run the job
+    GIT_DEPTH: "0"       # need full tag history to find the latest version
+  script:
+    - |
+      set -eu
+      git fetch --tags --quiet
+      LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+      LATEST="${LATEST:-v0.0.0}"; V="${LATEST#v}"
+      MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
+      case "$BUMP" in
+        major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+        minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+        patch) PATCH=$((PATCH+1)) ;;
+        *) echo "BUMP must be patch, minor, or major (got '$BUMP')" >&2; exit 1 ;;
+      esac
+      NEW="v${MAJOR}.${MINOR}.${PATCH}"
+      echo "Latest tag ${LATEST} + ${BUMP} -> ${NEW}"
+      git tag -a "$NEW" -m "release $NEW"
+      git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git push origin "$NEW"
+      echo "Pushed ${NEW} — the tag pipeline will build the image and publish the chart."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
 
 # ---------------------------------------------------------------------------
 # test
