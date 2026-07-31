@@ -1,35 +1,106 @@
-# Build & push the hermit-server image to the GitLab registry.
+# Hermit CI/CD — the canonical pipeline (GitLab is the source of truth).
 #
-# Versioning: annotated git tags `vMAJOR.MINOR.PATCH` (starting at v0.1.0) are the
-# release trigger. A tag pushes `:MAJOR.MINOR.PATCH` + `:latest`; pushes to the
-# default branch publish `:main-<shortsha>` for homelab testing between releases.
+# Stages:
+#   test    — fmt / clippy / unit tests, plus the per-crate 80% coverage gate.
+#   build   — the server container image, built rootless with kaniko.
+#   release — a GitLab Release object with git-cliff-generated notes.
+#   chart   — the official Helm chart, pushed as an OCI artifact.
 #
-# Built with kaniko, not docker build: the homelab runner is in k3s with no
-# Docker daemon (docker:dind can't reach a socket → "Cannot connect to the
-# Docker daemon"). kaniko builds the Dockerfile rootless, no daemon needed.
-stages: [release]
+# Tag scheme (see brain/plans/PLAN_RELEASE_STRATEGY.md):
+#   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart (appVersion must == X.Y.Z)
+#   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
+#   chart-vA.B.C  → chart only (Chart.yaml version must == A.B.C)
+#   main push     → image :main-<shortsha> for homelab testing between releases
+#
+# Portability: release logic is intentionally plain shell so a future move to
+# GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
+stages: [test, build, release, chart]
 
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+lint:
+  stage: test
+  image: rust:1.97.0-bookworm
+  variables:
+    CARGO_TERM_COLOR: always
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths: [.cargo/registry/, target/]
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+    - cargo fmt --all --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo test --workspace
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
+# Per-crate 80% line-coverage gate. Gate EACH crate independently: a merged
+# `-p a -p b --fail-under-lines` check lets a sub-80% crate hide behind a
+# stronger sibling. Line coverage only (branch needs nightly; we pin stable).
+# Runs on MRs and main — a tag is cut from an already-green main, so it is not
+# re-gated on the release pipeline.
+coverage:
+  stage: test
+  image: rust:1.97.0-bookworm
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths: [.cargo/registry/, target/]
+  before_script:
+    - rustup component add llvm-tools-preview
+    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    - cargo binstall -y cargo-llvm-cov cargo-nextest
+  script:
+    - |
+      set -euo pipefail
+      fail=0
+      while read -r crate; do
+        [ -z "$crate" ] && continue
+        case "$crate" in \#*) continue ;; esac
+        echo "── coverage: $crate ──"
+        cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only || fail=1
+      done < .port/gated-crates.txt
+      exit $fail
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# build — server image (kaniko, no Docker daemon: the homelab runner is in k3s)
+# ---------------------------------------------------------------------------
 docker-image:
-  stage: release
+  stage: build
   image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
   variables:
-    IMAGE: $CI_REGISTRY_IMAGE/hermit-server
+    IMAGE: $CI_REGISTRY_IMAGE
   before_script:
     - mkdir -p /kaniko/.docker
     - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
   script:
-    # On a version tag, the tag must match the workspace Cargo.toml version.
     - |
       if [ -n "$CI_COMMIT_TAG" ]; then
         TAG="${CI_COMMIT_TAG#v}"
+        BASE="${TAG%-rc.*}"                    # strip any -rc.N to compare the base version
         CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-        if [ "$TAG" != "$CARGO_VERSION" ]; then
-          echo "tag v$TAG != workspace Cargo.toml version $CARGO_VERSION" >&2; exit 1
+        if [ "$BASE" != "$CARGO_VERSION" ]; then
+          echo "tag v$TAG (base $BASE) != workspace Cargo.toml version $CARGO_VERSION" >&2; exit 1
         fi
-        DESTS="--destination $IMAGE:$TAG --destination $IMAGE:latest"
+        if [ "$TAG" = "$BASE" ]; then
+          DESTS="--destination $IMAGE:$TAG --destination $IMAGE:latest"   # final release
+        else
+          DESTS="--destination $IMAGE:$TAG"                              # -rc.N: no :latest
+        fi
       else
         DESTS="--destination $IMAGE:main-$CI_COMMIT_SHORT_SHA"
       fi
@@ -40,26 +111,78 @@ docker-image:
       $DESTS
       --push-retry 5
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Package the official Helm chart and push it to the GitLab OCI registry alongside the
-# image. Consumers install with: helm install hermit oci://$REGISTRY/charts/hermit --version X.
-# Tag-only: the chart is released in lockstep with the app, and its version must match the tag.
-helm-chart:
+# ---------------------------------------------------------------------------
+# release — GitLab Release with git-cliff notes (final versions only)
+# ---------------------------------------------------------------------------
+release-notes:
   stage: release
+  image:
+    name: orhunp/git-cliff:latest
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: 0                               # git-cliff needs full history + tags
+  script:
+    - git-cliff --current --strip header -o release_notes.md
+    - cat release_notes.md
+  artifacts:
+    paths: [release_notes.md]
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [release-notes]
+  script:
+    - echo "Creating GitLab Release for $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Hermit $CI_COMMIT_TAG"
+    description: release_notes.md
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
+# ---------------------------------------------------------------------------
+# chart — official Helm chart as an OCI artifact
+#   install: helm install hermit oci://$REGISTRY/charts/hermit --version <chart-version>
+#
+# Chart version and app version are DECOUPLED (standard Helm practice):
+#   - on chart-vA.B.C : chart-only release; Chart.yaml version must == A.B.C.
+#   - on vX.Y.Z       : an app release also republishes the chart; its appVersion must
+#                       == X.Y.Z (so you remembered to point the chart at the new app),
+#                       but the chart's own version is whatever Chart.yaml currently says.
+# ---------------------------------------------------------------------------
+helm-chart:
+  stage: chart
   image:
     name: alpine/helm:3.16.2
     entrypoint: [""]
   script:
-    - TAG="${CI_COMMIT_TAG#v}"
-    - CHART_VERSION=$(sed -n 's/^version: *\(.*\)/\1/p' charts/hermit/Chart.yaml | head -1)
     - |
-      if [ "$TAG" != "$CHART_VERSION" ]; then
-        echo "tag v$TAG != charts/hermit Chart.yaml version $CHART_VERSION" >&2; exit 1
-      fi
-    - helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
-    - helm package charts/hermit --destination /tmp
-    - helm push "/tmp/hermit-${CHART_VERSION}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
+      set -eu
+      CHART_VERSION=$(sed -n 's/^version:[[:space:]]*//p' charts/hermit/Chart.yaml | head -1)
+      CHART_APPVERSION=$(sed -n 's/^appVersion:[[:space:]]*//p' charts/hermit/Chart.yaml | head -1 | tr -d '"')
+      case "$CI_COMMIT_TAG" in
+        chart-v*)
+          WANT="${CI_COMMIT_TAG#chart-v}"
+          if [ "$WANT" != "$CHART_VERSION" ]; then
+            echo "tag $CI_COMMIT_TAG implies chart version $WANT but Chart.yaml is $CHART_VERSION" >&2; exit 1
+          fi
+          ;;
+        v*)
+          WANT="${CI_COMMIT_TAG#v}"
+          if [ "$WANT" != "$CHART_APPVERSION" ]; then
+            echo "app tag $CI_COMMIT_TAG requires chart appVersion $WANT but Chart.yaml appVersion is $CHART_APPVERSION — bump it before releasing" >&2; exit 1
+          fi
+          ;;
+      esac
+      helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
+      helm package charts/hermit --destination /tmp
+      helm push "/tmp/hermit-${CHART_VERSION}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+    - if: '$CI_COMMIT_TAG =~ /^chart-v\d+\.\d+\.\d+$/'

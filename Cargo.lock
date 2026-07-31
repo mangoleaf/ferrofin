@@ -1019,7 +1019,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1048,14 +1048,14 @@ dependencies = [
 
 [[package]]
 name = "hermit-chromaprint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "hermit-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pbkdf2",
  "regex",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "hermit-model",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-drawing"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1128,7 +1128,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-extensions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hermit-chromaprint",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-health"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-hls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hermit-keyframes",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-keyframes"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rstest",
  "serde",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-livetv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-mediaencoding"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chardetng",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags",
  "chrono",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-naming"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fancy-regex",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-networking"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fancy-regex",
  "hermit-common",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1331,7 +1331,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-traits"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-util"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand 0.8.7",
  "regex",

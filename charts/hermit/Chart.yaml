@@ -3,9 +3,9 @@ name: hermit
 description: Official Helm chart for the Hermit media server — a from-scratch Rust implementation of the Jellyfin server API.
 type: application
 # Chart version. Bump on any chart change. CI publishes this to the GitLab OCI registry.
-version: 0.1.0
-# Tracks the hermit-server release the chart is validated against (kept in step with Cargo.toml).
-appVersion: "0.1.0"
+version: 0.2.0
+# Tracks the hermit release the chart is validated against (kept in step with Cargo.toml).
+appVersion: "0.2.0"
 home: https://gitlab.mangoleafstudios.com/mlstudios/hermit
 sources:
   - https://gitlab.mangoleafstudios.com/mlstudios/hermit
