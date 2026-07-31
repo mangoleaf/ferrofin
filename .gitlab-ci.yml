@@ -6,10 +6,16 @@
 #   release — a GitLab Release object with git-cliff-generated notes.
 #   chart   — the official Helm chart, pushed as an OCI artifact.
 #
+# The git tag is the single source of truth for the version: CI stamps it into
+# the crate (Cargo.toml) and the chart (helm --version/--app-version) at build
+# time, so there are no version files to keep in sync. Releasing is just
+# `git tag vX.Y.Z && git push origin vX.Y.Z`. The committed Cargo.toml/Chart.yaml
+# versions are dev placeholders that CI overrides.
+#
 # Tag scheme (see brain/plans/PLAN_RELEASE_STRATEGY.md):
-#   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart (appVersion must == X.Y.Z)
+#   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
-#   chart-vA.B.C  → chart only (Chart.yaml version must == A.B.C)
+#   chart-vA.B.C  → chart only @ A.B.C
 #   main push     → image :main-<shortsha> for homelab testing between releases
 #
 # Portability: release logic is intentionally plain shell so a future move to
@@ -91,11 +97,10 @@ docker-image:
     - |
       if [ -n "$CI_COMMIT_TAG" ]; then
         TAG="${CI_COMMIT_TAG#v}"
-        BASE="${TAG%-rc.*}"                    # strip any -rc.N to compare the base version
-        CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-        if [ "$BASE" != "$CARGO_VERSION" ]; then
-          echo "tag v$TAG (base $BASE) != workspace Cargo.toml version $CARGO_VERSION" >&2; exit 1
-        fi
+        BASE="${TAG%-rc.*}"                    # strip any -rc.N for the :latest decision
+        # The git tag is the source of truth: stamp it into the workspace version
+        # (first `version = ` line only) so the built binary reports the release.
+        sed -i "0,/^version = /s/^version = \".*\"/version = \"$TAG\"/" Cargo.toml
         if [ "$TAG" = "$BASE" ]; then
           DESTS="--destination $IMAGE:$TAG --destination $IMAGE:latest"   # final release
         else
@@ -150,11 +155,9 @@ release:
 # chart — official Helm chart as an OCI artifact
 #   install: helm install hermit oci://$REGISTRY/charts/hermit --version <chart-version>
 #
-# Chart version and app version are DECOUPLED (standard Helm practice):
-#   - on chart-vA.B.C : chart-only release; Chart.yaml version must == A.B.C.
-#   - on vX.Y.Z       : an app release also republishes the chart; its appVersion must
-#                       == X.Y.Z (so you remembered to point the chart at the new app),
-#                       but the chart's own version is whatever Chart.yaml currently says.
+# Both chart version and appVersion are taken from the tag (via helm flags):
+#   - chart-vA.B.C : chart-only release @ A.B.C
+#   - vX.Y.Z       : app release also republishes the chart @ X.Y.Z
 # ---------------------------------------------------------------------------
 helm-chart:
   stage: chart
@@ -164,25 +167,14 @@ helm-chart:
   script:
     - |
       set -eu
-      CHART_VERSION=$(sed -n 's/^version:[[:space:]]*//p' charts/hermit/Chart.yaml | head -1)
-      CHART_APPVERSION=$(sed -n 's/^appVersion:[[:space:]]*//p' charts/hermit/Chart.yaml | head -1 | tr -d '"')
+      # The git tag is the source of truth for both chart and app version.
       case "$CI_COMMIT_TAG" in
-        chart-v*)
-          WANT="${CI_COMMIT_TAG#chart-v}"
-          if [ "$WANT" != "$CHART_VERSION" ]; then
-            echo "tag $CI_COMMIT_TAG implies chart version $WANT but Chart.yaml is $CHART_VERSION" >&2; exit 1
-          fi
-          ;;
-        v*)
-          WANT="${CI_COMMIT_TAG#v}"
-          if [ "$WANT" != "$CHART_APPVERSION" ]; then
-            echo "app tag $CI_COMMIT_TAG requires chart appVersion $WANT but Chart.yaml appVersion is $CHART_APPVERSION — bump it before releasing" >&2; exit 1
-          fi
-          ;;
+        chart-v*) VER="${CI_COMMIT_TAG#chart-v}" ;;   # chart-only release
+        v*)       VER="${CI_COMMIT_TAG#v}" ;;         # app release republishes the chart
       esac
       helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
-      helm package charts/hermit --destination /tmp
-      helm push "/tmp/hermit-${CHART_VERSION}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
+      helm package charts/hermit --version "$VER" --app-version "$VER" --destination /tmp
+      helm push "/tmp/hermit-${VER}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
     - if: '$CI_COMMIT_TAG =~ /^chart-v\d+\.\d+\.\d+$/'
