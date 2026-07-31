@@ -896,8 +896,7 @@ impl HermitStreamStatePlanner {
                     clippy::cast_sign_loss,
                     reason = "keyint is a small positive frame count"
                 )]
-                let keyint =
-                    (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
+                let keyint = (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
                 push_split(&mut args, "-g:v:0");
                 args.push(keyint.to_string());
                 push_split(&mut args, "-keyint_min:v:0");
