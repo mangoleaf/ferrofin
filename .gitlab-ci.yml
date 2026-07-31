@@ -62,19 +62,75 @@ create-release:
       allow_failure: true
 
 # ---------------------------------------------------------------------------
+# sccache — compile cache backed by Garage S3, replacing GitLab's cache: (which
+# zipped target/ + .cargo into one archive and timed out uploading to Garage).
+# sccache stores each object directly over S3 instead. Creds come from Vault;
+# the rust jobs install the sccache binary and point RUSTC_WRAPPER at it. Reuses
+# the same bucket / Vault role / secret as the rest workspace — no new infra.
+# ---------------------------------------------------------------------------
+sccache-creds:
+  stage: .pre
+  image: alpine:3
+  variables:
+    VAULT_ADDR: "http://vault.vault.svc.cluster.local:8200"
+    SCCACHE_VAULT_PATH: "secret/data/gitlab/sccache"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - apk add --no-cache curl jq
+    - |
+      set -e
+      JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+      VAULT_TOKEN="$(curl -sf --request POST --data "{\"role\":\"gitlab-ci\",\"jwt\":\"$JWT\"}" "$VAULT_ADDR/v1/auth/kubernetes/login" | jq -r '.auth.client_token')"
+      SECRET="$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/$SCCACHE_VAULT_PATH")"
+      echo "SCCACHE_ACCESS_KEY=$(echo "$SECRET" | jq -r '.data.data.accesskey')" >> sccache.env
+      echo "SCCACHE_SECRET_KEY=$(echo "$SECRET" | jq -r '.data.data.secretkey')" >> sccache.env
+  artifacts:
+    reports:
+      dotenv: sccache.env
+
+# SCCACHE_* env + the optional dep on the creds job. Rust jobs `extends` this.
+.sccache:
+  variables:
+    SCCACHE_VERSION: "0.16.0"
+    SCCACHE_BUCKET: gitlab-sccache
+    SCCACHE_REGION: garage
+    SCCACHE_ENDPOINT: http://garage.garage.svc.cluster.local:3900
+    SCCACHE_S3_USE_SSL: "false"
+  needs:
+    - job: sccache-creds
+      optional: true
+
+# Install the sccache binary and enable it when Vault creds are present.
+# !reference'd as the first step of each rust job's before_script.
+.sccache-setup:
+  script:
+    - |
+      curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+        | tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/sccache'
+      chmod +x /usr/local/bin/sccache
+      if [ -n "${SCCACHE_ACCESS_KEY:-}" ]; then
+        export RUSTC_WRAPPER=sccache
+        export AWS_ACCESS_KEY_ID="$SCCACHE_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SCCACHE_SECRET_KEY"
+        echo ">>> sccache ON -> $SCCACHE_ENDPOINT/$SCCACHE_BUCKET"
+      else
+        echo ">>> sccache OFF (no creds — compiling uncached)"
+      fi
+
+# ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
 lint:
   stage: test
   image: rust:1.97.0-bookworm
+  extends: .sccache
   variables:
     CARGO_TERM_COLOR: always
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  cache:
-    key:
-      files: [Cargo.lock]
-    paths: [.cargo/registry/, target/]
   before_script:
+    - !reference [.sccache-setup, script]
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all --check
@@ -93,13 +149,11 @@ lint:
 coverage:
   stage: test
   image: rust:1.97.0-bookworm
+  extends: .sccache
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  cache:
-    key:
-      files: [Cargo.lock]
-    paths: [.cargo/registry/, target/]
   before_script:
+    - !reference [.sccache-setup, script]
     - rustup component add llvm-tools-preview
     - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
     - cargo binstall -y cargo-llvm-cov cargo-nextest
