@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "77c13a8 2026-08-01",
+  "last_verified": "14666e8 2026-08-01",
   "rows": {
     "DELETE /Collections/{collectionId}/Items": {
       "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",

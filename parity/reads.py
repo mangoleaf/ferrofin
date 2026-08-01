@@ -18,6 +18,7 @@ Offline self-check:
 """
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -123,10 +124,23 @@ def run(hermit_url, jellyfin_url):
         else:
             sample = "; ".join(f"{m['path']}(J={m.get('j')} H={m.get('h')})"
                                for m in buckets["mismatch"][:3])
+            # Dedup diff paths across the correlated items (strip the per-item [key] prefix) so the
+            # detail lists each divergent FIELD once — the actionable enumeration for a fix.
+            def field_paths(bucket):
+                seen = {}
+                for m in bucket:
+                    p = re.sub(r"^\[[^\]]*\]\.?", "", m["path"])
+                    seen.setdefault(p, m)
+                return seen
             rows[op] = {"deep_verified": False,
                         "classification": "flagged: read diff vs Jellyfin (verify)",
                         "note": f"{clean}/{total} clean; mismatch:{len(buckets['mismatch'])} "
-                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}"}
+                                f"missing:{len(buckets['missing'])} extra:{len(buckets['extra'])} | {sample}",
+                        "diffs": {
+                            "missing": sorted(field_paths(buckets["missing"])),
+                            "extra": sorted(field_paths(buckets["extra"])),
+                            "mismatch": sorted(field_paths(buckets["mismatch"])),
+                        }}
 
     for ep in READS:
         if ep["kind"] in ("plain", "user"):
