@@ -77,9 +77,9 @@ def load_seed():
     return by_key, seed.get("last_verified")
 
 
-def load_journeys():
-    """Layer-2 write-journey results — feed deep_verified/classification for write ops."""
-    path = os.path.join(ROOT, "parity/journey-results.json")
+def load_layer2(filename):
+    """Layer-2 results (write journeys or read diffs) — feed deep_verified/classification."""
+    path = os.path.join(ROOT, filename)
     if not os.path.exists(path):
         return {}, None
     data = json.load(open(path))
@@ -180,8 +180,13 @@ def build_curated():
     """Merge curated deep-verification: seed.json (reads) + journey-results.json (writes),
     each row carrying its own last_verified stamp."""
     seed, seed_stamp = load_seed()
-    journeys, j_stamp = load_journeys()
+    reads, r_stamp = load_layer2("parity/reads-results.json")
+    journeys, j_stamp = load_layer2("parity/journey-results.json")
+    # Precedence: static seed < live read diff < write journeys (later, more authoritative wins).
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
+    for k, v in reads.items():
+        if v.get("deep_verified") is not None or v.get("classification"):
+            curated[k] = {**v, "last_verified": r_stamp}
     for k, v in journeys.items():
         curated[k] = {**v, "last_verified": j_stamp}
     return curated

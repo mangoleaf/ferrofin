@@ -1,0 +1,142 @@
+{
+  "correlated_items": 5,
+  "generated_by": "parity/reads.py",
+  "last_verified": "77c13a8 2026-08-01",
+  "rows": {
+    "GET /Genres": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Items/Filters": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Items/Filters2": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:0 missing:0 extra:2 | "
+    },
+    "GET /Items/Latest": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Items/Suggestions": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:0 missing:10 extra:10 | "
+    },
+    "GET /Items/{itemId}": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:15 missing:170 extra:20 | MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].RealFrameRate(J=10 H=5.0); MediaStreams[0].RealFrameRate(J=10 H=5.0); CanDelete(J=true H=false)"
+    },
+    "GET /Items/{itemId}/Ancestors": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:0 missing:10 extra:5 | "
+    },
+    "GET /Items/{itemId}/Images": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:5 missing:5 extra:0 | [Path=/media/synth/movies/Movie 0001 (2020)/poster.jpg].Size(J=6959 H=0); [Path=/media/synth/movies/Movie 0002 (2020)/poster.jpg].Size(J=6959 H=0); [Path=/media/synth/movies/Movie 0003 (2020)/poster.jpg].Size(J=6959 H=0)"
+    },
+    "GET /Items/{itemId}/PlaybackInfo": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:5 missing:95 extra:10 | MediaSources[Path=/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv].MediaStreams[0].RealFrameRate(J=10 H=5.0); MediaSources[Path=/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv].MediaStreams[0].RealFrameRate(J=10 H=5.0); MediaSources[Path=/media/synth/movies/Movie 0003 (2020)/Movie 0003 (2020).mkv].MediaStreams[0].RealFrameRate(J=10 H=5.0)"
+    },
+    "GET /Items/{itemId}/Similar": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:5 missing:79 extra:59 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
+    },
+    "GET /Library/MediaFolders": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:1 missing:2 extra:1 | TotalRecordCount(J=2 H=1)"
+    },
+    "GET /Library/VirtualFolders": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:0 missing:1 extra:0 | "
+    },
+    "GET /Localization/Cultures": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Movies/Recommendations": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:1 missing:0 extra:0 | [](J=len 0 H=len 5)"
+    },
+    "GET /Movies/{itemId}/Similar": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/5 clean; mismatch:5 missing:80 extra:60 | TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12); TotalRecordCount(J=16 H=12)"
+    },
+    "GET /Persons": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Search/Hints": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:1 missing:1 extra:0 | TotalRecordCount(J=1 H=0)"
+    },
+    "GET /Sessions": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Shows/NextUp": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Shows/Upcoming": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /Studios": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /System/Endpoint": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /System/Info": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /UserItems/Resume": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    },
+    "GET /UserViews": {
+      "classification": "flagged: read diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "0/1 clean; mismatch:0 missing:1 extra:1 | "
+    },
+    "GET /Users/Me": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "1/1 clean"
+    }
+  }
+}

@@ -35,6 +35,8 @@ STAMP="$(git rev-parse --short HEAD 2>/dev/null) $(date +%F)"
 export HERMIT_URL=http://localhost:18096 JELLYFIN_URL=http://localhost:18097 PARITY_STAMP="$STAMP"
 echo ">> Layer-1 breadth sweep"
 python3 ../parity/sweep.py
+echo ">> Layer-2 read depth (id-correlated)"
+python3 ../parity/reads.py
 echo ">> Layer-2 write journeys"
 python3 ../parity/journeys.py
 echo ">> regenerating ledger"
