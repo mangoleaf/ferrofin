@@ -186,7 +186,7 @@ impl HermitDeviceManager {
 
 /// Maps recorded [`ClientCapabilities`] to their wire DTO (C#
 /// `ToClientCapabilitiesDto`).
-fn client_capabilities_to_dto(caps: &ClientCapabilities) -> ClientCapabilitiesDto {
+pub(crate) fn client_capabilities_to_dto(caps: &ClientCapabilities) -> ClientCapabilitiesDto {
     ClientCapabilitiesDto {
         playable_media_types: caps.playable_media_types.clone(),
         supported_commands: caps.supported_commands.clone(),

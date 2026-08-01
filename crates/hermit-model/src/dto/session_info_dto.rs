@@ -105,6 +105,10 @@ pub struct SessionInfoDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub now_playing_queue: Option<Vec<QueueItem>>,
 
+    /// Gets or sets the now playing queue full items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_playing_queue_full_items: Option<Vec<crate::dto::BaseItemDto>>,
+
     /// Gets or sets a value indicating whether this session has a custom device name.
     pub has_custom_device_name: bool,
 

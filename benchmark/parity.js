@@ -37,6 +37,8 @@ const VOLATILE = new RegExp('^(' + [
   // Per-session/user instance noise: activity timestamps, the client endpoint, and the session's
   // UserId (users get different GUIDs on each independent server).
   'LastActivityDate', 'LastLoginDate', 'LastPlaybackCheckIn', 'RemoteEndPoint', 'UserId',
+  // Scheduled-task execution timestamps: when a task last ran differs run-to-run.
+  'StartTimeUtc', 'EndTimeUtc',
   'ProductName', 'PackageName', 'WebPath', 'LocalAddress', 'OperatingSystem', 'OperatingSystemDisplayName',
   'SystemArchitecture', 'EncoderLocation', 'StartupWizardCompleted', 'CanSelfRestart',
   'TranscodingTempPath', 'LogPath', 'InternalMetadataPath', 'ItemsByNamePath', 'CachePath', 'ProgramDataPath',

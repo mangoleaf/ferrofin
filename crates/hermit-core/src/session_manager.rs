@@ -1274,6 +1274,14 @@ fn session_info_to_dto(session: &SessionInfo) -> SessionInfoDto {
         has_custom_device_name: session.has_custom_device_name,
         server_id: session.server_id.clone(),
         supported_commands: session.capabilities.supported_commands.clone(),
+        // Jellyfin always emits these: a Capabilities object, a default PlayState, and the two
+        // (empty) now-playing queues.
+        capabilities: Some(crate::device_manager::client_capabilities_to_dto(
+            &session.capabilities,
+        )),
+        play_state: Some(hermit_model::session::PlayerStateInfo::default()),
+        now_playing_queue: Some(Vec::new()),
+        now_playing_queue_full_items: Some(Vec::new()),
         ..SessionInfoDto::default()
     }
 }
