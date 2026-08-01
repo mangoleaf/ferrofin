@@ -26,8 +26,9 @@ stages: [test, build, release, chart]
 
 # ---------------------------------------------------------------------------
 # create-release — manual, main only. CI owns versioning end-to-end: it derives
-# the next version from Conventional Commits since the last tag (feat -> minor,
-# fix/other -> patch, `!`/BREAKING CHANGE -> major), stamps it into
+# the next version from Conventional Commits since the last tag: feat -> minor,
+# fix/other -> patch, breaking change -> major (but while the major is 0, a
+# breaking change bumps MINOR — it never auto-jumps to 1.0.0). Then it stamps
 # Cargo.toml, commits that as `chore(release): vX.Y.Z`, tags the commit, and
 # pushes both. The tag push then triggers the build/release/chart pipeline on a
 # commit whose Cargo.toml already carries the release version — so the binary
@@ -53,15 +54,21 @@ create-release:
       if [ -n "$LATEST" ]; then BASE="$LATEST"; RANGE="${LATEST}..HEAD"; else BASE="v0.0.0"; RANGE=""; fi
       # Derive the bump from Conventional Commits since the last release. grep -c
       # reads all input (no early-exit SIGPIPE); || true covers zero matches.
+      # A breaking change is a `type!:` subject OR a real footer line that STARTS
+      # with `BREAKING CHANGE:`/`BREAKING-CHANGE:` — anchored so that prose merely
+      # mentioning the phrase (e.g. this file's own docs) does NOT trip it.
       SUBJECTS=$(git log --format='%s' $RANGE)
       BODIES=$(git log --format='%b' $RANGE)
-      BREAKING=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^[a-z]+(\([^)]*\))?!:' || true)
-      BREAKING2=$(printf '%s\n' "$BODIES" | grep -c 'BREAKING CHANGE' || true)
+      BANG=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^[a-z]+(\([^)]*\))?!:' || true)
+      FOOTER=$(printf '%s\n' "$BODIES" | grep -Ec '^BREAKING[ -]CHANGE:' || true)
       FEAT=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^feat(\([^)]*\))?:' || true)
-      if [ "$BREAKING" -gt 0 ] || [ "$BREAKING2" -gt 0 ]; then LEVEL=major
+      V="${BASE#v}"; MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
+      if [ "$BANG" -gt 0 ] || [ "$FOOTER" -gt 0 ]; then
+        # SemVer 0.x rule: while major==0 a breaking change bumps MINOR — it must
+        # never auto-jump to 1.0.0. Cutting 1.0.0 is deliberate: FORCE_VERSION=v1.0.0.
+        if [ "$MAJOR" -eq 0 ]; then LEVEL=minor; else LEVEL=major; fi
       elif [ "$FEAT" -gt 0 ]; then LEVEL=minor
       else LEVEL=patch; fi
-      V="${BASE#v}"; MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
       case "$LEVEL" in
         major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
         minor) MINOR=$((MINOR+1)); PATCH=0 ;;
