@@ -79,6 +79,7 @@ use crate::item_type_lookup::kind_from_type_name;
 /// Relation rows bulk-loaded for a whole page of items, so `build_dto` needs
 /// no per-item queries for them (list endpoints); absent entries mean "no rows"
 /// for that item, not "not prefetched".
+#[derive(Default)]
 struct Prefetched {
     /// Image rows per item id (same order as [`HermitDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
@@ -96,6 +97,10 @@ struct Prefetched {
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
     person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
+    /// `ItemValues` id per `(value type, clean value)` for every studio/genre/
+    /// artist name across the page, so `attach_studios`/`_genres`/`_artists`
+    /// resolve from memory instead of a query per name.
+    value_ids: HashMap<(i32, String), Uuid>,
 }
 use crate::kinds;
 
@@ -337,6 +342,65 @@ impl HermitDtoService {
             .unwrap_or_else(Uuid::nil))
     }
 
+    /// Resolves many `(value type, name)` pairs to their `ItemValues` ids in one
+    /// query, keyed by `(type, clean value)`. The batch form of [`Self::value_id`]
+    /// for a page's studios/genres/artists. Pairs with no row are simply absent.
+    async fn resolve_value_ids(
+        &self,
+        pairs: &[(i32, String)],
+    ) -> Result<HashMap<(i32, String), Uuid>, ServiceError> {
+        let mut map = HashMap::new();
+        // Dedup the (type, clean) keys we need.
+        let mut want: std::collections::HashSet<(i32, String)> = std::collections::HashSet::new();
+        for (t, name) in pairs {
+            want.insert((*t, crate::text_util::get_clean_value(name)));
+        }
+        if want.is_empty() {
+            return Ok(map);
+        }
+        let keys: Vec<(i32, String)> = want.into_iter().collect();
+        for chunk in keys.chunks(500) {
+            let ph = (0..chunk.len())
+                .map(|_| "(?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"SELECT "Type", "CleanValue", "ItemValueId" FROM "ItemValues"
+                   WHERE ("Type", "CleanValue") IN ({ph})"#,
+            );
+            let mut query = sqlx::query_as::<_, (i32, String, String)>(&sql);
+            for (t, clean) in chunk {
+                query = query.bind(*t).bind(clean);
+            }
+            for (t, clean, id) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(uuid) = Uuid::parse_str(&id) {
+                    map.insert((t, clean), uuid);
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// A studio/genre/artist id: from the prefetched map on a page projection
+    /// (absent ⇒ the nil id, as [`Self::value_id`] returns for a missing row),
+    /// else the per-item query for single-item callers.
+    async fn value_id_for(
+        &self,
+        prefetched: Option<&Prefetched>,
+        value_type: i32,
+        name: &str,
+    ) -> Result<Uuid, ServiceError> {
+        if let Some(p) = prefetched {
+            let clean = crate::text_util::get_clean_value(name);
+            return Ok(p
+                .value_ids
+                .get(&(value_type, clean))
+                .copied()
+                .unwrap_or_else(Uuid::nil));
+        }
+        self.value_id(value_type, name).await
+    }
+
     /// Computes the primary-image aspect ratio for a set of already-loaded image
     /// rows, or `None` when there is no primary image.
     async fn primary_aspect_ratio(&self, item_id: Uuid, images: &[ItemImageInfo]) -> Option<f64> {
@@ -469,11 +533,12 @@ impl HermitDtoService {
         &self,
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
+        prefetched: Option<&Prefetched>,
     ) -> Result<(), ServiceError> {
         let studios = split_multi(item.studios.as_deref());
         let mut pairs = Vec::with_capacity(studios.len());
         for name in studios {
-            let id = self.value_id(3, &name).await?; // 3 = Studios
+            let id = self.value_id_for(prefetched, 3, &name).await?; // 3 = Studios
             pairs.push(NameGuidPair {
                 name: Some(name),
                 id,
@@ -490,6 +555,7 @@ impl HermitDtoService {
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
         kind: BaseItemKind,
+        prefetched: Option<&Prefetched>,
     ) -> Result<(), ServiceError> {
         let genres = split_multi(item.genres.as_deref());
         // Music items resolve against the MusicGenre value space; everything else
@@ -498,7 +564,7 @@ impl HermitDtoService {
         let _is_music_genres = kinds::is_music(kind);
         let mut pairs = Vec::with_capacity(genres.len());
         for name in &genres {
-            let id = self.value_id(2, name).await?; // 2 = Genre
+            let id = self.value_id_for(prefetched, 2, name).await?; // 2 = Genre
             pairs.push(NameGuidPair {
                 name: Some(name.clone()),
                 id,
@@ -516,12 +582,13 @@ impl HermitDtoService {
         &self,
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
+        prefetched: Option<&Prefetched>,
     ) -> Result<(), ServiceError> {
         let artists = split_multi(item.artists.as_deref());
         if !artists.is_empty() {
             let mut items = Vec::with_capacity(artists.len());
             for name in &artists {
-                let id = self.value_id(0, name).await?; // 0 = Artist
+                let id = self.value_id_for(prefetched, 0, name).await?; // 0 = Artist
                 items.push(NameGuidPair {
                     name: Some(name.clone()),
                     id,
@@ -536,7 +603,7 @@ impl HermitDtoService {
             dto.album_artist = album_artists.first().cloned();
             let mut items = Vec::with_capacity(album_artists.len());
             for name in &album_artists {
-                let id = self.value_id(1, name).await?; // 1 = AlbumArtist
+                let id = self.value_id_for(prefetched, 1, name).await?; // 1 = AlbumArtist
                 items.push(NameGuidPair {
                     name: Some(name.clone()),
                     id,
@@ -692,7 +759,7 @@ impl HermitDtoService {
 
         // Studios.
         if options.contains_field(ItemFields::Studios) {
-            self.attach_studios(&mut dto, item).await?;
+            self.attach_studios(&mut dto, item, prefetched).await?;
         }
 
         self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id, prefetched)
@@ -784,7 +851,7 @@ impl HermitDtoService {
         }
 
         if options.contains_field(ItemFields::Genres) {
-            self.attach_genres(dto, item, kind).await?;
+            self.attach_genres(dto, item, kind, prefetched).await?;
         }
 
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
@@ -877,7 +944,7 @@ impl HermitDtoService {
         }
 
         // Artists / album-artists.
-        self.attach_artists(dto, item).await?;
+        self.attach_artists(dto, item, prefetched).await?;
 
         // Video extras.
         if kinds::is_video(kind) {
@@ -1271,6 +1338,42 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         } else {
             (HashMap::new(), HashMap::new())
         };
+        // Studio/genre/artist ids for every name on the page in one query. Collect
+        // exactly what the attach steps resolve: studios/genres only when their
+        // field is requested, artists/album-artists always (attach_artists is
+        // unconditional) — so a prefetched miss never wrongly nils a real id.
+        let value_ids = {
+            let mut pairs: Vec<(i32, String)> = Vec::new();
+            let want_studios = options.contains_field(ItemFields::Studios);
+            let want_genres = options.contains_field(ItemFields::Genres);
+            for item in items {
+                if want_studios {
+                    pairs.extend(
+                        split_multi(item.studios.as_deref())
+                            .into_iter()
+                            .map(|n| (3, n)),
+                    );
+                }
+                if want_genres {
+                    pairs.extend(
+                        split_multi(item.genres.as_deref())
+                            .into_iter()
+                            .map(|n| (2, n)),
+                    );
+                }
+                pairs.extend(
+                    split_multi(item.artists.as_deref())
+                        .into_iter()
+                        .map(|n| (0, n)),
+                );
+                pairs.extend(
+                    split_multi(item.album_artists.as_deref())
+                        .into_iter()
+                        .map(|n| (1, n)),
+                );
+            }
+            self.resolve_value_ids(&pairs).await?
+        };
         let prefetched = Prefetched {
             images,
             user_data,
@@ -1278,6 +1381,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             provider_ids,
             people,
             person_images,
+            value_ids,
         };
 
         let mut out = Vec::with_capacity(items.len());
@@ -2424,5 +2528,50 @@ mod tests {
         assert_eq!(people.len(), 1);
         assert_eq!(people[0].name.as_deref(), Some("Leonardo DiCaprio"));
         assert_eq!(people[0].type_, hermit_model::data::PersonKind::Actor);
+    }
+
+    #[tokio::test]
+    async fn batched_value_ids_match_single_lookup() {
+        let db = test_db().await;
+        let vid = Uuid::new_v4();
+        let clean = crate::text_util::get_clean_value("Warner Bros.");
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+               VALUES (?1, ?2, 3, 'Warner Bros.')"#,
+        )
+        .bind(vid.to_string())
+        .bind(&clean)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let svc = service(db);
+
+        // The single-item lookup and the batch resolver agree on the id.
+        let single = svc.value_id(3, "Warner Bros.").await.unwrap();
+        let map = svc
+            .resolve_value_ids(&[(3, "Warner Bros.".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(single, vid);
+        assert_eq!(map.get(&(3, clean)).copied(), Some(vid));
+
+        // value_id_for reads the prefetched map without a query, and nil-s a name
+        // with no row (matching value_id's missing-row behaviour).
+        let pf = Prefetched {
+            value_ids: map,
+            ..Prefetched::default()
+        };
+        assert_eq!(
+            svc.value_id_for(Some(&pf), 3, "Warner Bros.")
+                .await
+                .unwrap(),
+            vid
+        );
+        assert!(
+            svc.value_id_for(Some(&pf), 3, "Nobody")
+                .await
+                .unwrap()
+                .is_nil()
+        );
     }
 }
