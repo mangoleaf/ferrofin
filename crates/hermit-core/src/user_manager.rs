@@ -211,12 +211,12 @@ impl HermitUserManager {
                ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
                 "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
                 "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
-                "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+                "HidePlayedInLatest", "CastReceiverId", "InternalId", "InvalidLoginAttemptCount",
                 "MaxActiveSessions", "MustUpdatePassword", "NormalizedUsername",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections",
                 "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 0, ?3, 0, 0, 0, ?4, ?5, 1, 1, 1, 0, 0, 0, ?6)"#,
+               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, ?5, 1, 1, 1, 0, 0, 0, ?6)"#,
         )
         .bind(&id_str)
         .bind(DEFAULT_AUTH_PROVIDER_ID)
@@ -1295,6 +1295,9 @@ mod tests {
         assert_eq!(user.username, "alice");
         assert_eq!(user.normalized_username, "ALICE");
         assert_eq!(user.authentication_provider_id, DEFAULT_AUTH_PROVIDER_ID);
+        // Jellyfin User defaults: Latest hides played, and the default Cast receiver id.
+        assert!(user.hide_played_in_latest);
+        assert_eq!(user.cast_receiver_id.as_deref(), Some("F007D354"));
 
         // Duplicate (case-insensitive) is rejected.
         assert!(matches!(
