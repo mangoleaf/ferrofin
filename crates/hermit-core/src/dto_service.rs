@@ -90,6 +90,12 @@ struct Prefetched {
     /// Provider-id maps per item id (populated only when the `ProviderIds`
     /// field is requested).
     provider_ids: HashMap<Uuid, HashMap<String, String>>,
+    /// Credited people per item id (populated only when the `People` field is
+    /// requested), so a page's cast/crew loads in one query.
+    people: HashMap<Uuid, Vec<hermit_db::entities::base_items::PeopleEntity>>,
+    /// Image rows per *person* id, for the whole page's cast/crew at once, so the
+    /// primary-image tag lookup does not re-query per person per item.
+    person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
 }
 use crate::kinds;
 
@@ -392,25 +398,41 @@ impl HermitDtoService {
         &self,
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
+        prefetched: Option<&Prefetched>,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
-        let query = hermit_traits::options::InternalPeopleQuery {
-            item_id,
-            ..Default::default()
+        // On a page projection the credits and their images were bulk-loaded once;
+        // otherwise fetch this item's people and, in one query, their image rows
+        // (the N+1 `load_images` per cast member is the cost of a large-cast item).
+        // Failure of the image load stays lenient (no tags), as before.
+        let owned_people;
+        let owned_images;
+        let (people, images_by_person): (
+            &[hermit_db::entities::base_items::PeopleEntity],
+            &HashMap<Uuid, Vec<ItemImageInfo>>,
+        ) = if let Some(p) = prefetched {
+            (
+                p.people.get(&item_id).map_or(&[][..], Vec::as_slice),
+                &p.person_images,
+            )
+        } else {
+            owned_people = self
+                .library
+                .get_people(&hermit_traits::options::InternalPeopleQuery {
+                    item_id,
+                    ..Default::default()
+                })
+                .await?;
+            let person_ids: Vec<Uuid> = owned_people
+                .iter()
+                .map(|p| Uuid::parse_str(&p.id).unwrap_or_else(|_| Uuid::nil()))
+                .collect();
+            owned_images = self
+                .load_images_batch(&person_ids)
+                .await
+                .unwrap_or_default();
+            (&owned_people, &owned_images)
         };
-        let people = self.library.get_people(&query).await?;
-
-        // Prefetch every credited person's image rows in one query instead of an
-        // N+1 `load_images` per cast/crew member — the dominant cost of a
-        // large-cast item detail. Failure stays lenient (no tags), as before.
-        let person_ids: Vec<Uuid> = people
-            .iter()
-            .map(|p| Uuid::parse_str(&p.id).unwrap_or_else(|_| Uuid::nil()))
-            .collect();
-        let images_by_person = self
-            .load_images_batch(&person_ids)
-            .await
-            .unwrap_or_default();
 
         let mut list = Vec::with_capacity(people.len());
         for person in people {
@@ -425,7 +447,7 @@ impl HermitDtoService {
                 None => None,
             };
             list.push(BaseItemPerson {
-                name: Some(person.name),
+                name: Some(person.name.clone()),
                 id: person_id,
                 role: person.role.clone(),
                 type_: person
@@ -617,7 +639,7 @@ impl HermitDtoService {
 
         // People.
         if options.contains_field(ItemFields::People) {
-            self.attach_people(&mut dto, item).await?;
+            self.attach_people(&mut dto, item, prefetched).await?;
         }
 
         // Primary-image aspect ratio.
@@ -1232,11 +1254,30 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         } else {
             HashMap::new()
         };
+        // People for the page, then every credited person's images in one further
+        // query — attach_people otherwise runs get_people + load_images per item.
+        let (people, person_images) = if options.contains_field(ItemFields::People) {
+            let people = self.library.get_people_batch(&ids).await?;
+            let person_ids: Vec<Uuid> = people
+                .values()
+                .flatten()
+                .filter_map(|p| Uuid::parse_str(&p.id).ok())
+                .collect();
+            let images = self
+                .load_images_batch(&person_ids)
+                .await
+                .unwrap_or_default();
+            (people, images)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         let prefetched = Prefetched {
             images,
             user_data,
             media_streams,
             provider_ids,
+            people,
+            person_images,
         };
 
         let mut out = Vec::with_capacity(items.len());

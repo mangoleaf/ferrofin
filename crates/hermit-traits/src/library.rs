@@ -354,6 +354,30 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalPeopleQuery,
     ) -> Result<Vec<hermit_db::entities::base_items::PeopleEntity>, ServiceError>;
 
+    /// Gets the credited people for a set of item ids at once, keyed by item —
+    /// the batch form used to project a page of DTOs without a per-item
+    /// `get_people`. The default loops the single-item form; the concrete manager
+    /// overrides it.
+    async fn get_people_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, Vec<hermit_db::entities::base_items::PeopleEntity>>,
+        ServiceError,
+    > {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            let people = self
+                .get_people(&InternalPeopleQuery {
+                    item_id: id,
+                    ..InternalPeopleQuery::default()
+                })
+                .await?;
+            map.insert(id, people);
+        }
+        Ok(map)
+    }
+
     /// Gets the distinct people names matching a query.
     async fn get_people_names(
         &self,

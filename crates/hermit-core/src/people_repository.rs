@@ -243,6 +243,49 @@ impl PeopleRepository for HermitPeopleRepository {
         Ok(QueryResult::new(Some(start), Some(total), rows))
     }
 
+    async fn get_people_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<PeopleEntity>>, ServiceError> {
+        // The credits for the whole page in one query, tagged with their item so
+        // they group back per item in the same ListOrder the single-item read uses.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(rename = "ItemId")]
+            item_id: String,
+            #[sqlx(flatten)]
+            person: PeopleEntity,
+        }
+        let mut out: HashMap<Uuid, Vec<PeopleEntity>> =
+            item_ids.iter().map(|&id| (id, Vec::new())).collect();
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        for chunk in item_ids.chunks(500) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType"
+                   FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
+                   WHERE m."ItemId" IN ("#,
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.to_string());
+            }
+            qb.push(r#") ORDER BY m."ItemId", m."ListOrder", p."PersonType", p."Name""#);
+            let rows = qb
+                .build_query_as::<Row>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+            for row in rows {
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    out.entry(id).or_default().push(row.person);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn update_people(
         &self,
         item_id: Uuid,

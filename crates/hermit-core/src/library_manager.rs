@@ -453,6 +453,13 @@ impl LibraryManager for HermitLibraryManager {
         Ok(self.people.get_people(query).await?.items)
     }
 
+    async fn get_people_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<PeopleEntity>>, ServiceError> {
+        self.people.get_people_batch(item_ids).await
+    }
+
     async fn get_people_names(
         &self,
         query: &InternalPeopleQuery,

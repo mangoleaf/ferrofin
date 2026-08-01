@@ -604,6 +604,28 @@ pub trait PeopleRepository: Send + Sync {
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError>;
 
+    /// Gets the full credited cast/crew for a set of item ids in one query, keyed
+    /// by item and in each item's credit order — the batch form used to project a
+    /// page of DTOs without a `get_people` per item. The default loops the
+    /// single-item form; the concrete repository overrides it.
+    async fn get_people_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<PeopleEntity>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            let people = self
+                .get_people(&InternalPeopleQuery {
+                    item_id: id,
+                    ..InternalPeopleQuery::default()
+                })
+                .await?
+                .items;
+            map.insert(id, people);
+        }
+        Ok(map)
+    }
+
     /// Replaces an item's people with the given set, materializing a browsable
     /// `Person` item per credit.
     ///
