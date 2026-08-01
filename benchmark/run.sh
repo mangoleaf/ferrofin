@@ -4,6 +4,16 @@
 # Requires: docker, docker compose, k6, jq on the host. ffmpeg only for gen-fixtures.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# --- pure helpers, kept above the source guard so run.bats can exercise them ---
+# memory.stat (cgroup v2) on stdin -> anonymous memory in MiB, one number per line.
+# `/^anon /` (trailing space) matches only `anon`, never `anon_thp`/`file` etc.
+anon_mib() { awk '/^anon /{printf "%.1f\n", $2/1048576}'; }
+# Peak (max) value from a file of plain numbers; "?" if the file is unreadable.
+peak() { awk '{if($1+0>m)m=$1+0} END{printf "%.0f", m}' "$1" 2>/dev/null || echo "?"; }
+# Tests source this file to get the helpers, then stop here before running a benchmark.
+if [ -n "${BENCH_TEST_SOURCE:-}" ]; then return 0; fi
+
 set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
 
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
@@ -56,11 +66,16 @@ coldstart() {  # $1=base url
   echo "NaN"
 }
 
-# Sample container memory every 1s into a file until told to stop; report peak MiB.
+# Sample the container's anonymous memory every 1s into a file (MiB), until told to stop.
+# We read cgroup-v2 memory.stat `anon` (page-cache EXCLUDED) instead of `docker stats`
+# MemUsage: MemUsage counts file-backed page cache, and ffprobe reading the whole media
+# library during the scan drags GiBs of media into cache billed to the container — that
+# measured the kernel's cache of your files, not the server's working set. `anon` covers
+# all processes in the container cgroup (server threads + ffprobe children), cache-free.
 sample_rss() {  # $1=service $2=outfile
   while :; do
-    docker compose stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null \
-      | awk -v s="$1" '$0 ~ s {print $2}' >> "$2" || true
+    docker compose exec -T "$1" cat /sys/fs/cgroup/memory.stat 2>/dev/null \
+      | anon_mib >> "$2" || true
     sleep 1
   done
 }
@@ -80,6 +95,7 @@ bench() {  # $1=service $2=port $3=TARGET
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
 
+  : > "results/raw/$target-rss.txt"   # sampler appends; clear stale samples from prior runs
   sample_rss "$svc" "results/raw/$target-rss.txt" & local rss_pid=$!
 
   TARGET="$target" BASE_URL="$base" k6 run scenario.js
@@ -103,7 +119,6 @@ DATE=$(date -u +%Y-%m-%dT%H:%MZ)
 HOST="$(nproc) cores / $(free -h 2>/dev/null | awk '/Mem:/{print $2}' || echo '?') RAM, capped at ${BENCH_CPUS} cpus / ${BENCH_MEM}"
 export VERSION DATE HOST JELLYFIN_IMAGE EXPECTED_ITEMS BENCH_VUS BENCH_DURATION BENCH_CPUS BENCH_MEM
 
-peak() { awk '{gsub(/MiB|GiB/,"",$1); v=$1; if($0 ~ /GiB/) v*=1024; if(v>m)m=v} END{printf "%.0f", m}' "$1" 2>/dev/null || echo "?"; }
 H_RSS=$(peak results/raw/hermit-rss.txt); J_RSS=$(peak results/raw/jellyfin-rss.txt)
 H_COLD=$(cat results/raw/hermit-cold.txt); J_COLD=$(cat results/raw/jellyfin-cold.txt)
 H_N=$(cat results/raw/hermit-count.txt); J_N=$(cat results/raw/jellyfin-count.txt)
@@ -146,7 +161,7 @@ ${TABLE}
 | Metric | Hermit | Jellyfin |
 |---|---|---|
 | Cold start (container → first 200) | ${H_COLD}s | ${J_COLD}s |
-| Peak RSS (scan + load, incl. ffprobe children) | ${H_RSS} MiB | ${J_RSS} MiB |
+| Peak anon memory (cache-excluded; scan + load, incl. ffprobe children) | ${H_RSS} MiB | ${J_RSS} MiB |
 | Items scanned | ${H_N} | ${J_N} |
 EOF
 if [ "${RUN_TRANSCODE:-0}" = "1" ] && [ -f results/raw/hermit-transcode.json ]; then

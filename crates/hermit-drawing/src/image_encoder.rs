@@ -22,8 +22,9 @@
 //!   [`ServiceError::Backend`] for an I/O/encode failure.
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
-//! - `GetImageBlurHash` and `CreateSplashscreen` are deferred features and return
-//!   [`ServiceError::Backend`] (there is no blurhash/splash oracle in this unit).
+//! - `CreateSplashscreen` is a deferred feature returning [`ServiceError::Backend`].
+//!   `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
+//!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
 //!   foreground layer, unplayed/percent-played indicators) is **not** ported —
 //!   this encoder does resize + format-convert only, so `has_default_options`
@@ -245,15 +246,30 @@ impl ImageEncoder for ImageCrateEncoder {
         }
     }
 
-    /// Deferred feature — always [`ServiceError::Backend`]. Port of
-    /// `GetImageBlurHash`, whose blurhash backend is out of scope for this unit.
+    /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
+    /// ("larger is too slow, no visible difference"), then BlurHash-encode with the
+    /// caller's component counts.
+    ///
+    /// The hash is functionally valid but **not byte-identical** to Jellyfin's — its
+    /// pixels come from Skia's decode+resample, which the `image` crate can't reproduce
+    /// exactly (documented divergence; `ImageBlurHashes` is denylisted in the parity test).
     async fn get_image_blur_hash(
         &self,
-        _x_comp: i32,
-        _y_comp: i32,
-        _path: &str,
+        x_comp: i32,
+        y_comp: i32,
+        path: &str,
     ) -> Result<String, ServiceError> {
-        Err(ServiceError::backend(Self::DEFERRED))
+        if path.is_empty() {
+            return Err(ServiceError::invalid_input("path is empty"));
+        }
+        let decoded = Self::decode(path)?;
+        let small = decoded
+            .resize(128, 128, image::imageops::FilterType::Triangle)
+            .to_rgba8();
+        let x = u32::try_from(x_comp.clamp(1, 9)).unwrap_or(1);
+        let y = u32::try_from(y_comp.clamp(1, 9)).unwrap_or(1);
+        blurhash::encode(x, y, small.width(), small.height(), small.as_raw())
+            .map_err(|e| ServiceError::backend(e.to_string()))
     }
 
     /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
@@ -879,16 +895,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blur_hash_and_splashscreen_are_deferred() {
+    async fn splashscreen_is_deferred() {
         let enc = ImageCrateEncoder::new();
-        assert!(matches!(
-            enc.get_image_blur_hash(3, 3, "/a.png").await,
-            Err(ServiceError::Backend(_))
-        ));
         assert!(matches!(
             enc.create_splashscreen(&[], &[]).await,
             Err(ServiceError::Backend(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn blur_hash_encodes_a_well_formed_deterministic_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("swatch.png");
+        let mut img = image::RgbaImage::new(16, 16); // two-tone swatch
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = if x < 8 {
+                image::Rgba([200, 40, 40, 255])
+            } else {
+                image::Rgba([40, 40, 200, 255])
+            };
+        }
+        img.save(&path).unwrap();
+
+        let enc = ImageCrateEncoder::new();
+        let hash = enc
+            .get_image_blur_hash(4, 3, path.to_str().unwrap())
+            .await
+            .expect("blurhash");
+        // Well-formed length: 6 + (xComp*yComp - 1)*2 base83 chars.
+        assert_eq!(
+            hash.len(),
+            6 + (4 * 3 - 1) * 2,
+            "unexpected blurhash: {hash}"
+        );
+        // Deterministic for a fixed input.
+        let again = enc
+            .get_image_blur_hash(4, 3, path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(hash, again, "blurhash must be deterministic");
     }
 
     /// Guards that `ImageProcessingOptions` with a filled image field still

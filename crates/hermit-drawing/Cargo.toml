@@ -16,6 +16,7 @@ hermit-common.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 image.workspace = true
+blurhash.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

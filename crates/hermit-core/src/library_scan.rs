@@ -588,7 +588,7 @@ impl LibraryScanner {
                         | CollectionTypeOptions::homevideos
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
-                    ) => self.plan_movies(location, cf, &naming, &mut out),
+                    ) => self.plan_movies(location, location, cf, &naming, &mut out),
                     // books / photos / boxsets / … aren't scanned in v1.
                     Some(_) => {}
                 }
@@ -626,19 +626,36 @@ impl LibraryScanner {
         Some((id, entity))
     }
 
-    /// Flat video library: every video file (recursing per-title folders) becomes a
-    /// `Movie` directly under the collection folder.
-    fn plan_movies(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
+    /// Video library: every video file becomes a `Movie` directly under the collection
+    /// folder (per-title folders are recursed into). `root` is the library location, used
+    /// to name folder-based movies from their folder.
+    fn plan_movies(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_movies(&entry.path, cf, naming, out);
+                self.plan_movies(&entry.path, root, cf, naming, out);
                 continue;
             }
             if !video_resolver::is_video_file(&entry.path, naming) {
                 continue;
             }
-            let (name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
+            let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
                 .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
+            // Port of MovieResolver: a movie in its OWN folder is named from that folder
+            // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
+            // file in the library root keeps its clean_date_time-parsed name (year stripped).
+            // ProductionYear is still populated either way.
+            let name = if dir == root {
+                clean_name
+            } else {
+                folder_name(dir).unwrap_or(clean_name)
+            };
             let Some((id, mut entity)) =
                 Self::base_item(BaseItemKind::Movie, cf, cf, name, &entry.path, false)
             else {
@@ -1035,6 +1052,15 @@ fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     ))
 }
 
+/// The final path segment (folder name) of a directory path, if any. Mirrors C#
+/// `Path.GetFileName(ContainingFolderPath)` for naming folder-based movies.
+fn folder_name(dir: &str) -> Option<String> {
+    std::path::Path::new(dir)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+}
+
 fn season_display_name(number: i32) -> String {
     if number == 0 {
         "Specials".to_owned()
@@ -1253,6 +1279,63 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(video_codec.as_deref(), Some("h264"));
+    }
+
+    // Port of MovieResolver: a movie in its own folder is named from the FOLDER (raw, year
+    // kept); a flat file in the library root keeps its clean_date_time-parsed name (year
+    // stripped). Both populate ProductionYear. Matches Jellyfin (verified against a live server).
+    #[tokio::test]
+    async fn folder_movie_keeps_folder_name_flat_file_is_cleaned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Movie 0001 (2020)"); // Radarr layout: Title (Year)/Title (Year).mkv
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Movie 0001 (2020).mkv"), b"").unwrap();
+        std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap(); // flat file in root
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
+        scanner.scan_all().await.unwrap();
+
+        let names: Vec<(String, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "Name","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' ORDER BY "Name""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            names
+                .iter()
+                .any(|(n, y)| n == "Movie 0001 (2020)" && *y == Some(2020)),
+            "folder movie should keep the folder name incl. year; got {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|(n, y)| n == "The Matrix" && *y == Some(1999)),
+            "flat file should be cleaned (year stripped); got {names:?}"
+        );
     }
 
     #[tokio::test]

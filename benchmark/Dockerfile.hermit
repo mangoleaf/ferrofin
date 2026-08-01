@@ -1,14 +1,20 @@
 # Release build of the Hermit server + ffmpeg (scan probes with ffprobe; transcode needs ffmpeg).
-# ponytail: plain multi-stage, no cargo-chef layer caching — add it if rebuild time bites.
+# BuildKit cache mounts on target/ + the cargo registry make the parity fix-loop's repeated
+# `up --build hermit` recompile only changed crates (~1 min) instead of the whole graph (~8 min).
+# Requires DOCKER_BUILDKIT=1 (default in modern docker/compose). The binary is copied OUT of the
+# cache in the same RUN, because cache mounts aren't part of the resulting image layer.
 FROM rust:1.97.0-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p hermit-server
+RUN --mount=type=cache,target=/src/target,id=hermit-target \
+    --mount=type=cache,target=/usr/local/cargo/registry,id=hermit-cargo-registry \
+    cargo build --release -p hermit-server \
+ && cp /src/target/release/hermit-server /usr/local/bin/hermit-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
+COPY --from=build /usr/local/bin/hermit-server /usr/local/bin/hermit-server
 EXPOSE 8096
 ENTRYPOINT ["hermit-server"]

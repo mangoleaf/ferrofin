@@ -30,7 +30,9 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    parse_csv_enums, parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// Resolves the effective user for a request: the explicit `user_id` query
@@ -117,6 +119,10 @@ struct ItemsQuery {
     /// Comma-delimited [`ItemFilter`](hermit_model::querying::ItemFilter) flags.
     #[serde(default)]
     filters: Option<String>,
+    /// Comma-delimited [`ItemFields`](hermit_model::querying::ItemFields) to populate
+    /// on each returned DTO (e.g. `Path`, `Genres`). Absent/empty ⇒ the base DTO.
+    #[serde(default)]
+    fields: Option<String>,
     /// Comma-delimited explicit item ids to fetch.
     #[serde(default)]
     ids: Option<String>,
@@ -268,7 +274,13 @@ async fn get_items(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let result = state.library.query_items(&internal).await?;
-    let options = DtoOptions::with_all_fields(false);
+    // Honour the requested `Fields` (Path, Genres, …) — Jellyfin's GetItems builds its
+    // DtoOptions from them. Lenient parse: clients still send deprecated field names, which
+    // Jellyfin drops rather than 400ing. Absent ⇒ empty ⇒ the base DTO (matches Jellyfin).
+    let options = DtoOptions {
+        fields: parse_csv_enums_lenient(query.fields.as_deref()),
+        ..DtoOptions::default()
+    };
     let dtos = state
         .dto
         .get_base_item_dtos(&result.items, &options, Some(&user), None, true)
@@ -684,4 +696,34 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(super::item_update::update_item),
         )
         .route("/Items/{itemId}/Ancestors", get(get_ancestors))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hermit_model::querying::ItemFields;
+
+    // GET /Items must honour the camelCase `fields` param (the OpenAPI contract's casing, what
+    // jellyfin-web sends) and map it onto DtoOptions. Regression for the bug where the handler
+    // hardcoded `with_all_fields(false)` and had no `fields` member, dropping every requested
+    // field (e.g. Path) — which made item DTOs diverge from Jellyfin.
+    #[test]
+    fn items_query_fields_maps_onto_dto_options() {
+        let q: ItemsQuery =
+            serde_urlencoded::from_str("recursive=true&fields=Path,Genres").expect("parses");
+        assert_eq!(q.fields.as_deref(), Some("Path,Genres"));
+        let options = DtoOptions {
+            fields: parse_csv_enums_lenient(q.fields.as_deref()),
+            ..DtoOptions::default()
+        };
+        assert!(options.contains_field(ItemFields::Path));
+        assert!(options.contains_field(ItemFields::Genres));
+
+        // No `fields` ⇒ the base DTO (empty field set), matching Jellyfin's default GetItems.
+        let base: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
+        let base_opts = DtoOptions {
+            fields: parse_csv_enums_lenient(base.fields.as_deref()),
+            ..DtoOptions::default()
+        };
+        assert!(!base_opts.contains_field(ItemFields::Path));
+    }
 }

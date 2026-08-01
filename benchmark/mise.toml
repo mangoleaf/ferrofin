@@ -1,0 +1,4 @@
+# `mise install` here to get bats for run.bats (the benchmark helper tests).
+#   cd benchmark && mise install && bats run.bats
+[tools]
+bats = "latest"
