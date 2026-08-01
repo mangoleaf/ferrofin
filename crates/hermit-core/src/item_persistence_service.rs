@@ -335,8 +335,8 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         for image in images {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
-                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "DateModified")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             )
             .bind(uuid::Uuid::new_v4().hyphenated().to_string())
             .bind(&item)
@@ -344,6 +344,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             .bind(&image.path)
             .bind(i64::from(image.width))
             .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes)) // BLOB of the hash's UTF-8 bytes
             .bind(image.date_modified)
             .execute(&mut *tx)
             .await

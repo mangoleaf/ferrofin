@@ -395,7 +395,10 @@ pub async fn build_app_state(
             &config.omdb_api_key,
         )))
         // Persist TMDB cast/crew credits fetched alongside the metadata.
-        .with_people(Arc::clone(&people_repository)),
+        .with_people(Arc::clone(&people_repository))
+        // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
+        // Width/Height + ImageBlurHashes).
+        .with_image_processor(Arc::clone(&image_processor)),
     );
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).

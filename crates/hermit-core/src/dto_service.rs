@@ -725,6 +725,17 @@ impl HermitDtoService {
         // Images (single-type tags + backdrops).
         self.attach_images(dto, item_id, images, options).await;
 
+        // Width/Height come from the primary image (C# reads item.GetImageInfo(Primary, 0)),
+        // gated by their own ItemFields. Zero dims (unscanned image) are treated as unknown.
+        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
+            if options.contains_field(ItemFields::Width) && primary.width > 0 {
+                dto.width = Some(primary.width);
+            }
+            if options.contains_field(ItemFields::Height) && primary.height > 0 {
+                dto.height = Some(primary.height);
+            }
+        }
+
         if options.contains_field(ItemFields::Genres) {
             self.attach_genres(dto, item, kind).await?;
         }

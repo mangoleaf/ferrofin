@@ -130,6 +130,10 @@ pub struct LibraryScanner {
     people: Option<Arc<dyn hermit_traits::persistence::PeopleRepository>>,
     /// Where probed chapter markers are persisted (paired with the probe seam).
     chapters: Option<Arc<dyn hermit_traits::persistence::ChapterRepository>>,
+    /// Optional image processor. When present, each discovered/downloaded artwork file
+    /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
+    /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
+    image_processor: Option<Arc<dyn hermit_traits::drawing::ImageProcessor>>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -157,7 +161,20 @@ impl LibraryScanner {
             metadata_dir: None,
             people: None,
             chapters: None,
+            image_processor: None,
         }
+    }
+
+    /// Attaches the image processor so discovered artwork gets its pixel dimensions and
+    /// blurhash computed during the scan (feeds the DTO's Width/Height + ImageBlurHashes).
+    /// Wired by the composition root; omitted in unit tests.
+    #[must_use]
+    pub fn with_image_processor(
+        mut self,
+        image_processor: Arc<dyn hermit_traits::drawing::ImageProcessor>,
+    ) -> Self {
+        self.image_processor = Some(image_processor);
+        self
     }
 
     /// Attaches the OMDb client so movies/series get their Rotten Tomatoes critic
@@ -269,6 +286,7 @@ impl LibraryScanner {
             if images.is_empty() {
                 images = self.fetch_remote_images(&entity, &mut art_cache).await;
             }
+            self.fill_image_metadata(&mut images).await;
             if !images.is_empty()
                 && let Err(err) = self.persistence.save_item_images(item.id, &images).await
             {
@@ -276,6 +294,26 @@ impl LibraryScanner {
             }
         }
         Ok(planned.len())
+    }
+
+    /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
+    /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
+    /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
+    /// (unit tests) or a decode fails (the image stays browsable with 0×0 / no hash).
+    async fn fill_image_metadata(&self, images: &mut [ItemImageInfo]) {
+        let Some(processor) = self.image_processor.as_ref() else {
+            return;
+        };
+        for image in images.iter_mut() {
+            let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
+                continue;
+            };
+            image.width = dims.width;
+            image.height = dims.height;
+            if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
+                image.blur_hash = Some(hash);
+            }
+        }
     }
 
     /// Best-effort ffprobe of a leaf media item: enriches `entity` with the probed
@@ -1382,6 +1420,75 @@ mod tests {
         assert!(
             path.as_deref().unwrap_or_default().ends_with("poster.jpg"),
             "primary image path points at the poster: {path:?}"
+        );
+    }
+
+    // With an image processor wired, the scan fills each artwork's pixel dimensions and
+    // blurhash (so the DTO layer can surface Width/Height + ImageBlurHashes).
+    #[tokio::test]
+    async fn scan_fills_image_dimensions_and_blurhash() {
+        use hermit_drawing::{ImageCrateEncoder, ImageProcessor};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap();
+        // A real 40x30 JPEG poster next to the movie → its Primary image.
+        let mut poster = image::RgbImage::new(40, 30);
+        for (x, _y, px) in poster.enumerate_pixels_mut() {
+            *px = if x < 20 {
+                image::Rgb([180, 30, 30])
+            } else {
+                image::Rgb([30, 30, 180])
+            };
+        }
+        poster
+            .save(media.join("The Matrix (1999)-poster.jpg"))
+            .unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let image_processor: Arc<dyn hermit_traits::drawing::ImageProcessor> = Arc::new(
+            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+        );
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+                .with_image_processor(image_processor);
+        scanner.scan_all().await.unwrap();
+
+        // Dimensions come from the poster; the blurhash (a BLOB) is non-empty.
+        let (w, h, blur_len): (i64, i64, Option<i64>) = sqlx::query_as(
+            r#"SELECT "Width","Height",LENGTH("Blurhash") FROM "BaseItemImageInfos" WHERE "ImageType" = 0"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (w, h),
+            (40, 30),
+            "primary image dims filled from the poster"
+        );
+        assert!(
+            blur_len.unwrap_or(0) > 0,
+            "blurhash should be computed and stored"
         );
     }
 
