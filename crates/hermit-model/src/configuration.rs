@@ -446,7 +446,11 @@ pub struct MetadataOptions {
 
 /// Per-type metadata/image provider options.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+// `default`: jellyfin-web's POST /Library/VirtualFolders body nests TypeOptions entries that omit
+// `ImageOptions` (and may omit other arrays). Without container `default`, serde rejects the whole
+// body with a 422 at the Json extractor before the handler runs. Mirrors LibraryOptions. Jellyfin's
+// System.Text.Json fills missing members from default, so this is the faithful behavior.
+#[serde(rename_all = "PascalCase", default)]
 pub struct TypeOptions {
     /// Gets or sets the type.
     #[serde(rename = "Type", skip_serializing_if = "Option::is_none")]
@@ -1526,5 +1530,35 @@ mod tests {
         assert!(json["MetadataSavers"].as_array().unwrap().is_empty());
         let back: LibraryOptionsResultDto = serde_json::from_value(json).unwrap();
         assert_eq!(dto, back);
+    }
+
+    #[test]
+    fn type_options_deserializes_without_image_options() {
+        // jellyfin-web's POST /Library/VirtualFolders nests TypeOptions omitting ImageOptions.
+        // Regression: without container `default` this failed serde with "missing field ImageOptions",
+        // which axum's Json extractor surfaced as a 422 before the handler ran.
+        let body = serde_json::json!({
+            "Type": "Series",
+            "MetadataFetchers": ["TheMovieDb"],
+            "MetadataFetcherOrder": ["TheMovieDb"],
+            "ImageFetchers": ["TheMovieDb"],
+            "ImageFetcherOrder": ["TheMovieDb"]
+        });
+        let opts: TypeOptions = serde_json::from_value(body).unwrap();
+        assert_eq!(opts.type_.as_deref(), Some("Series"));
+        assert_eq!(opts.metadata_fetchers, ["TheMovieDb"]);
+        assert!(opts.image_options.is_empty());
+
+        // And the full LibraryOptions wrapper with such a TypeOptions array must deserialize too.
+        let lib = serde_json::json!({
+            "TypeOptions": [{
+                "Type": "Movie",
+                "MetadataFetchers": [], "MetadataFetcherOrder": [],
+                "ImageFetchers": [], "ImageFetcherOrder": []
+            }]
+        });
+        let parsed: LibraryOptions = serde_json::from_value(lib).unwrap();
+        assert_eq!(parsed.type_options.len(), 1);
+        assert!(parsed.type_options[0].image_options.is_empty());
     }
 }
