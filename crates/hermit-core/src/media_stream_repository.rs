@@ -87,6 +87,38 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    async fn get_media_streams_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>> =
+            std::collections::HashMap::with_capacity(item_ids.len());
+        if item_ids.is_empty() {
+            return Ok(map);
+        }
+        // One query for the whole page; rows arrive in per-item StreamIndex order.
+        for chunk in item_ids.chunks(500) {
+            let ph = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "MediaStreamInfos" WHERE "ItemId" IN ({ph})
+                   ORDER BY "ItemId", "StreamIndex""#,
+            );
+            let mut query = sqlx::query_as::<_, MediaStreamInfoEntity>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(id).or_default().push(row);
+                }
+            }
+        }
+        Ok(map)
+    }
+
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,

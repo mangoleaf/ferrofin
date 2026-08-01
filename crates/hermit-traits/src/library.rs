@@ -844,6 +844,25 @@ pub trait MediaSourceManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<Vec<hermit_model::entities_media::MediaStream>, ServiceError>;
 
+    /// Batch form of [`Self::get_media_streams`] for a whole page, keyed by item.
+    ///
+    /// Lets a list DTO projection load every item's streams in one query instead
+    /// of an N+1 (the 2-connection SQLite pool makes query count the cost). The
+    /// default loops the single-item form; the concrete manager overrides it.
+    async fn get_media_streams_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, Vec<hermit_model::entities_media::MediaStream>>,
+        ServiceError,
+    > {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            map.insert(id, self.get_media_streams(id).await?);
+        }
+        Ok(map)
+    }
+
     /// Gets the media attachments of an item as presentation DTOs.
     async fn get_media_attachments(
         &self,

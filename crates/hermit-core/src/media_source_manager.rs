@@ -351,6 +351,19 @@ impl MediaSourceManager for HermitMediaSourceManager {
         self.streams_dto(item_id).await
     }
 
+    async fn get_media_streams_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStream>>, ServiceError> {
+        // One `ItemId IN (…)` query for the whole page, then map each item's rows
+        // to DTOs — the batch form used by list projection to avoid an N+1.
+        let rows = self.streams.get_media_streams_batch(item_ids).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, streams)| (id, streams.iter().map(stream_to_dto).collect()))
+            .collect())
+    }
+
     async fn get_media_attachments(
         &self,
         item_id: Uuid,

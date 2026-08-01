@@ -484,6 +484,30 @@ pub trait MediaStreamRepository: Send + Sync {
         filter: &MediaStreamQuery,
     ) -> Result<Vec<MediaStreamInfoEntity>, ServiceError>;
 
+    /// Gets every media stream for a set of item ids in one query, keyed by item.
+    ///
+    /// The batch form used to project a whole page of DTOs without an N+1 — the
+    /// 2-connection SQLite pool makes query count the dominant cost. The default
+    /// loops [`Self::get_media_streams`] so alternate impls compile unchanged; the
+    /// concrete repository overrides it with a single `ItemId IN (…)` query.
+    async fn get_media_streams_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            map.insert(
+                id,
+                self.get_media_streams(&MediaStreamQuery {
+                    item_id: id,
+                    ..MediaStreamQuery::default()
+                })
+                .await?,
+            );
+        }
+        Ok(map)
+    }
+
     /// Gets the distinct language codes for a stream type across the library.
     async fn get_media_stream_languages(
         &self,

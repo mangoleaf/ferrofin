@@ -84,6 +84,12 @@ struct Prefetched {
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
     user_data: HashMap<Uuid, UserItemDataDto>,
+    /// Media streams per item id (populated only when the `MediaStreams` field
+    /// is requested), so a page builds them in one query instead of N.
+    media_streams: HashMap<Uuid, Vec<hermit_model::entities_media::MediaStream>>,
+    /// Provider-id maps per item id (populated only when the `ProviderIds`
+    /// field is requested).
+    provider_ids: HashMap<Uuid, HashMap<String, String>>,
 }
 use crate::kinds;
 
@@ -656,7 +662,7 @@ impl HermitDtoService {
             self.attach_studios(&mut dto, item).await?;
         }
 
-        self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id)
+        self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id, prefetched)
             .await?;
 
         // Can-delete / can-download collapse to thin defaults (the C# logic needs
@@ -673,7 +679,7 @@ impl HermitDtoService {
 
     /// Sets the simple scalar/collection fields and the kind-specific extras on
     /// the DTO (port of `AttachBasicFields`).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn attach_basic_fields(
         &self,
         dto: &mut BaseItemDto,
@@ -682,6 +688,7 @@ impl HermitDtoService {
         images: &[ItemImageInfo],
         options: &DtoOptions,
         _owner_id: Option<Uuid>,
+        prefetched: Option<&Prefetched>,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
 
@@ -798,7 +805,10 @@ impl HermitDtoService {
         dto.production_year = item.production_year.and_then(|y| i32::try_from(y).ok());
 
         if options.contains_field(ItemFields::ProviderIds) {
-            dto.provider_ids = Some(self.load_provider_ids(item_id).await?); // {} when none
+            dto.provider_ids = Some(match prefetched {
+                Some(p) => p.provider_ids.get(&item_id).cloned().unwrap_or_default(),
+                None => self.load_provider_ids(item_id).await?, // {} when none
+            });
         }
 
         dto.run_time_ticks = item.run_time_ticks;
@@ -855,7 +865,10 @@ impl HermitDtoService {
 
         // Media streams.
         if options.contains_field(ItemFields::MediaStreams) {
-            let streams = self.media_sources.get_media_streams(item_id).await?;
+            let streams = match prefetched {
+                Some(p) => p.media_streams.get(&item_id).cloned().unwrap_or_default(),
+                None => self.media_sources.get_media_streams(item_id).await?,
+            };
             if !streams.is_empty() {
                 dto.media_streams = Some(streams);
             }
@@ -937,6 +950,40 @@ impl HermitDtoService {
         .map_err(db_err)?;
 
         Ok(rows.into_iter().collect())
+    }
+
+    /// Batch form of [`Self::load_provider_ids`]: all provider ids for `item_ids`
+    /// in one query per chunk, keyed by item id. Prefetched for list DTOs so the
+    /// per-item lookup does not fan out across the 2-connection pool.
+    async fn load_provider_ids_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, HashMap<String, String>>, ServiceError> {
+        let mut map: HashMap<Uuid, HashMap<String, String>> =
+            HashMap::with_capacity(item_ids.len());
+        if item_ids.is_empty() {
+            return Ok(map);
+        }
+        for chunk in item_ids.chunks(500) {
+            let ph = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" IN ({ph})"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for (item_id, key, value) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&item_id) {
+                    map.entry(id).or_default().insert(key, value);
+                }
+            }
+        }
+        Ok(map)
     }
 
     /// Populates the item-by-name counts on a DTO (port of `SetItemByNameInfo`)
@@ -1159,7 +1206,25 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             }
             _ => HashMap::new(),
         };
-        let prefetched = Prefetched { images, user_data };
+        // The heavy per-item relations, bulk-loaded once for the page when their
+        // field is requested (an all-fields list DTO otherwise fans out a query
+        // per item for each — costly on the 2-connection pool).
+        let media_streams = if options.contains_field(ItemFields::MediaStreams) {
+            self.media_sources.get_media_streams_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        let provider_ids = if options.contains_field(ItemFields::ProviderIds) {
+            self.load_provider_ids_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        let prefetched = Prefetched {
+            images,
+            user_data,
+            media_streams,
+            provider_ids,
+        };
 
         let mut out = Vec::with_capacity(items.len());
         for item in items {

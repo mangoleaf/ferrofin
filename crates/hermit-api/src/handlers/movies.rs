@@ -40,6 +40,10 @@ struct RecommendationsQuery {
     /// The maximum number of items to return per category.
     #[serde(default)]
     item_limit: Option<i32>,
+    /// The item fields to project onto each recommendation's DTOs. Absent ⇒
+    /// empty ⇒ the base DTO, matching Jellyfin's `new DtoOptions { Fields = fields }`.
+    #[serde(default)]
+    fields: Option<String>,
 }
 
 /// `GET /Movies/Recommendations` — movie recommendation categories.
@@ -60,7 +64,13 @@ async fn get_movie_recommendations(
 ) -> Result<Json<Vec<RecommendationDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let user_uuid = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
-    let options = DtoOptions::default();
+    // Honour the requested `Fields` like Jellyfin's `new DtoOptions { Fields = fields }`:
+    // absent ⇒ empty ⇒ the base DTO, not all 47 fields (which meant a per-item query
+    // storm — MediaSources/MediaStreams/Chapters/People — across every recommended item).
+    let options = DtoOptions {
+        fields: crate::handlers::query_parse::parse_csv_enums_lenient(query.fields.as_deref()),
+        ..DtoOptions::default()
+    };
 
     let recommendations = state
         .similar_items
