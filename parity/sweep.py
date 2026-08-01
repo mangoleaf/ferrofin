@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Layer-1 breadth sweep: contract-conformance across all 412 operations.
+
+For every operation in the vendored Jellyfin spec, generate a request (path
+params filled from a live fixture library, minimal query, empty/example body for
+writes), send it to Hermit and — if a Jellyfin oracle URL is given — to Jellyfin,
+and record two signals per op into `parity/sweep-results.json`:
+
+  status_conformant  Hermit's HTTP status *class* (2xx/4xx/5xx) matches Jellyfin's.
+                     null if no oracle, or the request couldn't be built.
+  schema_valid       Hermit's 2xx JSON body validates against the op's response
+                     schema in the vendored spec ($ref-resolved, OpenAPI-nullable
+                     aware). null for empty/non-JSON/non-2xx responses.
+
+`gen-ledger.py` ingests the results file (same as seed.json) — this script never
+touches the ledger directly.
+
+Provisioning (wizard/auth/libraries/scan-wait) is ported from benchmark/bench-lib.js;
+sweep.sh brings the two servers up via docker and passes their URLs.
+
+Run (both servers already up + LIBRARIES env set — see sweep.sh):
+  HERMIT_URL=http://localhost:18096 JELLYFIN_URL=http://localhost:18097 parity/sweep.py
+Offline self-check (no servers):
+  parity/sweep.py --check
+"""
+import glob
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+METHODS = ("get", "post", "put", "delete", "patch", "head")
+USER = os.environ.get("BENCH_ADMIN_USER", "bench")
+PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
+# Modern MediaBrowser grammar only — 10.11 rejects X-Emby-* (see bench-lib.js).
+CLIENT = 'Client="parity", Device="parity", DeviceId="parity", Version="1.0"'
+
+# ---------------------------------------------------------------- HTTP
+
+def http(method, url, token=None, body=None):
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f'MediaBrowser Token="{token}", {CLIENT}'
+    elif "AuthenticateByName" in url or "/Startup/" in url:
+        headers["Authorization"] = f"MediaBrowser {CLIENT}"
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return r.status, raw
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        return 0, str(e).encode()
+
+
+def get_json(base, path, token):
+    st, raw = http("GET", base + path, token)
+    if st == 200:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+    return None
+
+# ---------------------------------------------------------------- provisioning (port of bench-lib.js)
+
+def wizard(base):
+    """Jellyfin first-boot: /Startup/Configuration → User → Complete (retry)."""
+    cfg = json.dumps({"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
+    for _ in range(60):
+        st, _ = http("POST", base + "/Startup/Configuration", body=cfg)
+        if st < 300:
+            http("GET", base + "/Startup/User")
+            http("POST", base + "/Startup/User", body=json.dumps({"Name": USER, "Password": PASS}))
+            done, _ = http("POST", base + "/Startup/Complete", body="")
+            if done < 300:
+                return
+        time.sleep(2)
+    raise SystemExit(f"{base}: startup wizard never completed")
+
+
+def authenticate(base):
+    st, raw = http("POST", base + "/Users/AuthenticateByName",
+                   body=json.dumps({"Username": USER, "Pw": PASS}))
+    if st != 200:
+        raise SystemExit(f"{base}: auth failed {st}: {raw[:200]!r}")
+    b = json.loads(raw)
+    return b["AccessToken"], b["User"]["Id"]
+
+
+def provision(base, target, token):
+    # Disable Jellyfin's remote fetchers so both servers do the same (local-only) work.
+    no_remote = {"LibraryOptions": {"EnableRealtimeMonitor": False, "SaveLocalMetadata": False,
+        "TypeOptions": [{"Type": t, "MetadataFetchers": [], "MetadataFetcherOrder": [],
+                         "ImageFetchers": [], "ImageFetcherOrder": []}
+                        for t in ("Movie", "Series", "Season", "Episode")]}}
+    for lib in json.loads(os.environ.get("LIBRARIES", "[]")):
+        q = (f"name={urllib.parse.quote(lib['name'])}&collectionType={lib['type']}"
+             f"&paths={urllib.parse.quote(lib['path'])}")
+        if target == "jellyfin":
+            q += "&refreshLibrary=true"
+        body = json.dumps(no_remote) if target == "jellyfin" else "{}"
+        st, raw = http("POST", f"{base}/Library/VirtualFolders?{q}", token, body)
+        if st >= 300:
+            raise SystemExit(f"{target}: add library {lib['name']} failed {st}: {raw[:200]!r}")
+    if target != "jellyfin":
+        http("POST", base + "/Library/Refresh", token, None)
+
+
+def wait_for_scan(base, token):
+    def count():
+        b = get_json(base, "/Items?userId=%s&recursive=true&limit=0" % CTX_USER[base], token)
+        return b.get("TotalRecordCount", 0) if b else -1
+    last, stable = -1, 0
+    for _ in range(480):
+        n = count()
+        stable = stable + 1 if (n == last and n > 0) else 0
+        if stable >= 8:
+            break
+        last = n
+        time.sleep(5)
+
+
+CTX_USER = {}
+
+def bring_up(base, target):
+    # Idempotent: if already provisioned (e.g. an earlier producer in the same docker cycle),
+    # just connect — don't re-run the wizard (fails once setup is complete) or re-add libraries.
+    try:
+        token, user = authenticate(base)
+        CTX_USER[base] = user
+        b = get_json(base, f"/Items?userId={user}&recursive=true&limit=0", token)
+        if b and b.get("TotalRecordCount", 0) > 0:
+            return token, user
+    except SystemExit:
+        pass
+    if target == "jellyfin":
+        wizard(base)
+    token, user = authenticate(base)
+    CTX_USER[base] = user
+    provision(base, target, token)
+    wait_for_scan(base, token)
+    return token, user
+
+# ---------------------------------------------------------------- fixtures + request generation
+
+def resolve_fixtures(base, token, user):
+    """Live values for the common path params (see the param-frequency table)."""
+    def first(kinds):
+        b = get_json(base, f"/Items?userId={user}&recursive=true&includeItemTypes={kinds}"
+                           f"&limit=1&sortBy=SortName", token)
+        it = (b or {}).get("Items") or []
+        return it[0]["Id"] if it else None
+    movie = first("Movie") or first("Video")
+    series = first("Series")
+    season = first("Season")
+    episode = first("Episode")
+    any_item = movie or series or episode
+    genres = get_json(base, f"/Genres?userId={user}&limit=1", token) or {}
+    genre = (genres.get("Items") or [{}])[0].get("Name") or "Action"
+    sessions = get_json(base, "/Sessions", token) or []
+    session = sessions[0]["Id"] if sessions else None
+    fx = {
+        "itemId": any_item, "videoId": movie or any_item, "id": any_item, "Id": any_item,
+        "routeItemId": any_item, "mediaSourceId": movie or any_item, "routeMediaSourceId": movie or any_item,
+        "seriesId": series or any_item, "SeriesId": series or any_item,
+        "SeasonId": season or any_item, "userId": user, "sessionId": session,
+        "name": genre, "genreName": genre, "imageType": "Primary",
+        "imageIndex": "0", "index": "0", "newIndex": "0", "routeIndex": "0",
+        "year": "2020", "container": "mp4", "segmentContainer": "ts", "format": "ts",
+        "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
+        "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",
+        "routeStartPositionTicks": "0", "streamId": "0",
+    }
+    return {k: v for k, v in fx.items() if v is not None}
+
+
+# Streaming/HLS endpoints don't return a prompt JSON status (they block or stream) — a status
+# sweep can't classify them; Layer-2/transcode.js covers playback. Skipped, not silently passed.
+STREAMING = re.compile(r"(/stream(\.|$)|\.m3u8|/live\.|/hls/|/Videos/\{itemId\}/stream)")
+
+
+def build_url(path, fixtures):
+    """Fill path params from one server's fixtures. Return (url, skip_reason_or_None)."""
+    params = set(re.findall(r"{(\w+)}", path))
+    missing = [p for p in params if p not in fixtures]
+    if missing:
+        return None, "unresolved path param: " + ",".join(sorted(missing))
+    url = path
+    for p in params:
+        url = url.replace("{%s}" % p, urllib.parse.quote(str(fixtures[p]), safe=""))
+    return url, None
+
+
+def with_user_query(url, op, params, user):
+    """Inject userId as a query param when the op declares one and it isn't in the path."""
+    qp = {pp.get("name") for pp in op.get("parameters", []) if pp.get("in") == "query"}
+    if "userId" in qp and "userId" not in params:
+        url += ("&" if "?" in url else "?") + "userId=" + user
+    return url
+
+# ---------------------------------------------------------------- schema validation
+
+def make_validator(spec):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from jsonschema import Draft7Validator, validators, RefResolver
+
+        def _type(validator, types, instance, schema):
+            if instance is None and schema.get("nullable"):   # OpenAPI nullable, not JSON-Schema
+                return
+            yield from Draft7Validator.VALIDATORS["type"](validator, types, instance, schema)
+
+        Nullable = validators.extend(Draft7Validator, {"type": _type})
+        resolver = RefResolver.from_schema(spec)
+
+        def validate(schema, instance):
+            try:
+                Nullable(schema, resolver=resolver).validate(instance)
+                return True
+            except Exception:
+                return False
+        return validate
+
+
+def response_schema(op):
+    resp = op.get("responses", {})
+    key = "200" if "200" in resp else next((k for k in resp if k.startswith("2")), None)
+    if not key:
+        return None
+    return (resp[key].get("content", {}).get("application/json", {}) or {}).get("schema")
+
+# ---------------------------------------------------------------- sweep
+
+def load_spec():
+    f = sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]
+    return json.load(open(f))
+
+
+def sweep(hermit_url, jellyfin_url):
+    spec = load_spec()
+    validate = make_validator(spec)
+    ht, hu = bring_up(hermit_url, "hermit")
+    fixtures = resolve_fixtures(hermit_url, ht, hu)
+    if jellyfin_url:
+        jt, ju = bring_up(jellyfin_url, "jellyfin")
+
+    fixtures_j = resolve_fixtures(jellyfin_url, jt, ju) if jellyfin_url else {}
+
+    results = {}
+    for path, item in spec["paths"].items():
+        params = set(re.findall(r"{(\w+)}", path))
+        for method, op in item.items():
+            if method not in METHODS:
+                continue
+            opkey = f"{method.upper()} {path}"
+            if method not in ("get", "head"):   # writes are destructive/ordered → Layer-2 journeys
+                results[opkey] = {"status_conformant": None, "schema_valid": None,
+                                  "note": "write: deferred to Layer-2 journey"}
+                continue
+            if STREAMING.search(path):
+                results[opkey] = {"status_conformant": None, "schema_valid": None,
+                                  "note": "streaming: not status-classifiable"}
+                continue
+            hurl, skip = build_url(path, fixtures)   # per-server ids: Hermit's on Hermit
+            if skip:
+                results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
+                continue
+            hs, hraw = http(method, hermit_url + with_user_query(hurl, op, params, hu), ht)
+            # schema_valid: Hermit 2xx JSON vs response schema (needs no oracle)
+            sv = None
+            sch = response_schema(op)
+            if 200 <= hs < 300 and sch is not None and hraw:
+                try:
+                    sv = validate(sch, json.loads(hraw))
+                except ValueError:
+                    sv = False
+            if jellyfin_url:
+                jurl, jskip = build_url(path, fixtures_j)   # Jellyfin's own ids on Jellyfin
+                if jskip:
+                    results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs} J=n/a"}
+                    continue
+                js, _ = http(method, jellyfin_url + with_user_query(jurl, op, params, ju), jt)
+                results[opkey] = {"status_conformant": (hs // 100) == (js // 100),
+                                  "schema_valid": sv, "note": f"H={hs} J={js}"}
+            else:
+                results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs}"}
+    return results
+
+
+def write_results(results):
+    conformant = sum(1 for r in results.values() if r["status_conformant"] is True)
+    schema_ok = sum(1 for r in results.values() if r["schema_valid"] is True)
+    skipped = sum(1 for r in results.values() if "unresolved" in (r.get("note") or ""))
+    out = {"generated_by": "parity/sweep.py", "rows": results}
+    with open(os.path.join(ROOT, "parity/sweep-results.json"), "w") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"wrote parity/sweep-results.json — {len(results)} ops, "
+          f"{conformant} status-conformant, {schema_ok} schema-valid, {skipped} skipped (unfillable)")
+
+# ---------------------------------------------------------------- self-check
+
+def selfcheck():
+    spec = load_spec()
+    v = make_validator(spec)
+    # nullable: a null in a nullable field passes; in a non-nullable field fails.
+    assert v({"type": "object", "properties": {"x": {"type": "string", "nullable": True}}}, {"x": None})
+    assert not v({"type": "object", "properties": {"x": {"type": "string"}}}, {"x": None})
+    # $ref against the real spec resolves and validates a minimal instance.
+    assert v({"$ref": "#/components/schemas/AuthenticationResult"}, {}) is True
+    # path-param fill + skip detection.
+    fx = {"itemId": "abc", "userId": "u1"}
+    url, skip = build_url("/Items/{itemId}", fx)
+    assert url == "/Items/abc" and skip is None, (url, skip)
+    _, skip = build_url("/Plugins/{pluginId}", fx)
+    assert skip and "pluginId" in skip
+    # userId query injection.
+    url = with_user_query("/Genres", {"parameters": [{"name": "userId", "in": "query"}]}, set(), "u1")
+    assert url == "/Genres?userId=u1", url
+    # streaming endpoints are excluded.
+    assert STREAMING.search("/Videos/{itemId}/stream") and STREAMING.search("/Audio/{itemId}/main.m3u8")
+    assert not STREAMING.search("/Items/{itemId}")
+    # status-class comparison is by hundreds bucket.
+    assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
+    print("ok: nullable, $ref, param-fill, skip, query-inject, streaming, status-class")
+
+
+def main():
+    if "--check" in sys.argv:
+        selfcheck()
+        return
+    hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
+    jellyfin = os.environ.get("JELLYFIN_URL")   # optional oracle
+    write_results(sweep(hermit, jellyfin))
+
+
+if __name__ == "__main__":
+    main()

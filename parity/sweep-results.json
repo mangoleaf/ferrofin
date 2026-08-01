@@ -1,0 +1,2065 @@
+{
+  "generated_by": "parity/sweep.py",
+  "rows": {
+    "DELETE /Audio/{itemId}/Lyrics": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Auth/Keys/{key}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Branding/Splashscreen": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Collections/{collectionId}/Items": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Devices": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Items": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Items/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Library/VirtualFolders": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Library/VirtualFolders/Paths": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /LiveTv/ListingProviders": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /LiveTv/Recordings/{recordingId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /LiveTv/SeriesTimers/{timerId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /LiveTv/Timers/{timerId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /LiveTv/TunerHosts": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /MediaSegmentsApi/{segmentId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Packages/Installing/{packageId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /PlayingItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Playlists/{playlistId}/Items": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Playlists/{playlistId}/Users/{userId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Plugins/{pluginId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Plugins/{pluginId}/{version}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /ScheduledTasks/Running/{taskId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Sessions/{sessionId}/User/{userId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /UserFavoriteItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /UserImage": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /UserItems/{itemId}/Rating": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /UserPlayedItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Users/{userId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Videos/ActiveEncodings": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Videos/{itemId}/AlternateSources": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "DELETE /Videos/{itemId}/Subtitles/{index}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Albums/{itemId}/InstantMix": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Albums/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Artists": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Artists/AlbumArtists": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Artists/InstantMix": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Artists/{itemId}/InstantMix": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Artists/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Artists/{name}": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Audio/{itemId}/Lyrics": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Audio/{itemId}/RemoteSearch/Lyrics": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
+      "note": "unresolved path param: playlistId,segmentId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/main.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/master.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/stream": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/stream.{container}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Audio/{itemId}/universal": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Auth/Keys": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Auth/PasswordResetProviders": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Auth/Providers": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Backup": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Backup/Manifest": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Branding/Configuration": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Branding/Css": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Branding/Css.css": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Branding/Splashscreen": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Channels": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Channels/Features": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Channels/Items/Latest": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Channels/{channelId}/Features": {
+      "note": "unresolved path param: channelId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Channels/{channelId}/Items": {
+      "note": "unresolved path param: channelId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Devices": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Devices/Info": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Devices/Options": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /DisplayPreferences/{displayPreferencesId}": {
+      "note": "unresolved path param: displayPreferencesId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Environment/DefaultDirectoryBrowser": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Environment/DirectoryContents": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Environment/Drives": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Environment/NetworkShares": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Environment/ParentPath": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Episode/{Id}/Timestamps": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Episode/{id}/IntroSkipperSegments": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /FallbackFont/Fonts": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /FallbackFont/Fonts/{name}": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Genres": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Genres/{genreName}": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Genres/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /GetUtcTime": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /IntroSkipper": {
+      "note": "H=200 J=404",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /IntroSkipper/SupportBundle": {
+      "note": "H=200 J=404",
+      "schema_valid": false,
+      "status_conformant": false
+    },
+    "GET /Intros/AnalyzerActions/{SeasonId}": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Intros/ScanStatus": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Intros/Show/{SeriesId}/{SeasonId}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Items": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/Counts": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/Filters": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/Filters2": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /Items/Latest": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/Root": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Items/Suggestions": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Ancestors": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/CriticReviews": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Download": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/ExternalIdInfos": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/File": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Images": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Images/{imageType}": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "note": "H=200 J=400",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Items/{itemId}/InstantMix": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Intros": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/LocalTrailers": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/MetadataEditor": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/PlaybackInfo": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/RemoteImages": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/RemoteImages/Providers": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/SpecialFeatures": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/ThemeMedia": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/ThemeSongs": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Items/{itemId}/ThemeVideos": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Libraries/AvailableOptions": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Library/MediaFolders": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Library/PhysicalPaths": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Library/VirtualFolders": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/ChannelMappingOptions": {
+      "note": "H=200 J=500",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /LiveTv/Channels": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Channels/{channelId}": {
+      "note": "unresolved path param: channelId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/GuideInfo": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Info": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/ListingProviders/Default": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/ListingProviders/Lineups": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/Programs": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Programs/Recommended": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Programs/{programId}": {
+      "note": "unresolved path param: programId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/Recordings": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Recordings/Folders": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Recordings/Groups": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Recordings/Groups/{groupId}": {
+      "note": "unresolved path param: groupId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/Recordings/Series": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Recordings/{recordingId}": {
+      "note": "unresolved path param: recordingId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/SeriesTimers": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/SeriesTimers/{timerId}": {
+      "note": "unresolved path param: timerId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/Timers": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Timers/Defaults": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Timers/{timerId}": {
+      "note": "unresolved path param: timerId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /LiveTv/TunerHosts/Types": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Tuners/Discover": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /LiveTv/Tuners/Discvover": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Localization/Countries": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Localization/Cultures": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Localization/Options": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Localization/ParentalRatings": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /MediaSegments/{itemId}": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /MediaSegmentsApi": {
+      "note": "H=200 J=404",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Movies/Recommendations": {
+      "note": "H=200 J=200",
+      "schema_valid": false,
+      "status_conformant": true
+    },
+    "GET /Movies/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /MusicGenres": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /MusicGenres/InstantMix": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /MusicGenres/{genreName}": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /MusicGenres/{name}/InstantMix": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Packages": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Packages/{name}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Persons": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Persons/{name}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Persons/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Playback/BitrateTest": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Playlists/{itemId}/InstantMix": {
+      "note": "H=200 J=404",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Playlists/{playlistId}": {
+      "note": "unresolved path param: playlistId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Playlists/{playlistId}/Items": {
+      "note": "unresolved path param: playlistId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Playlists/{playlistId}/Users": {
+      "note": "unresolved path param: playlistId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Playlists/{playlistId}/Users/{userId}": {
+      "note": "unresolved path param: playlistId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Plugins": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Plugins/{pluginId}/Configuration": {
+      "note": "unresolved path param: pluginId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Plugins/{pluginId}/{version}/Image": {
+      "note": "unresolved path param: pluginId,version",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Providers/Lyrics/{lyricId}": {
+      "note": "unresolved path param: lyricId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
+      "note": "unresolved path param: subtitleId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /QuickConnect/Connect": {
+      "note": "H=404 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /QuickConnect/Enabled": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Repositories": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /ScheduledTasks": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /ScheduledTasks/{taskId}": {
+      "note": "unresolved path param: taskId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Search/Hints": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Sessions": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Shows/NextUp": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Shows/Upcoming": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Shows/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Shows/{seriesId}/Episodes": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Shows/{seriesId}/Seasons": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Songs/{itemId}/InstantMix": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Startup/Configuration": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Startup/FirstUser": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Startup/User": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Studios": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Studios/{name}": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Studios/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /SyncPlay/List": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /SyncPlay/{id}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /System/ActivityLog/Entries": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Configuration": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Configuration/MetadataOptions/Default": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Configuration/{key}": {
+      "note": "unresolved path param: key",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /System/Endpoint": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Info": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Info/Public": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Info/Storage": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Logs": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /System/Logs/Log": {
+      "note": "H=400 J=400",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /System/Ping": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Tmdb/ClientConfiguration": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Trailers": {
+      "note": "H=200 J=500",
+      "schema_valid": true,
+      "status_conformant": false
+    },
+    "GET /Trailers/{itemId}/Similar": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /UserImage": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /UserItems/Resume": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /UserItems/{itemId}/UserData": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /UserViews": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /UserViews/GroupingOptions": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Users": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Users/Me": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Users/Public": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Users/{userId}": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Videos/{itemId}/AdditionalParts": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
+      "note": "H=400 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
+      "note": "unresolved path param: playlistId,segmentId",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/live.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/main.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/master.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/stream": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/stream.{container}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
+      "note": "H=404 J=500",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
+      "note": "H=404 J=500",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /Years": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "GET /Years/{year}": {
+      "note": "H=404 J=200",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "GET /web/ConfigurationPage": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "GET /web/ConfigurationPages": {
+      "note": "H=200 J=200",
+      "schema_valid": true,
+      "status_conformant": true
+    },
+    "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Audio/{itemId}/master.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "HEAD /Audio/{itemId}/stream": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "HEAD /Audio/{itemId}/stream.{container}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "HEAD /Audio/{itemId}/universal": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Genres/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "note": "H=200 J=200",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "note": "H=200 J=400",
+      "schema_valid": null,
+      "status_conformant": false
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Persons/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Studios/{name}/Images/{imageType}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /UserImage": {
+      "note": "H=404 J=404",
+      "schema_valid": null,
+      "status_conformant": true
+    },
+    "HEAD /Videos/{itemId}/master.m3u8": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "HEAD /Videos/{itemId}/stream": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "HEAD /Videos/{itemId}/stream.{container}": {
+      "note": "streaming: not status-classifiable",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Audio/{itemId}/Lyrics": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Auth/Keys": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Backup/Create": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Backup/Restore": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Branding/Splashscreen": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /ClientLog/Document": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Collections": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Collections/{collectionId}/Items": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Devices/Options": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /DisplayPreferences/{displayPreferencesId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Environment/ValidatePath": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Episode/{Id}/Timestamps": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /FileTransformation/RegisterTransformation": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Intros/AnalyzerActions/UpdateSeason": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Intros/EraseTimestamps": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Intros/RebuildDatabase": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Apply/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Book": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/BoxSet": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Movie": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/MusicAlbum": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/MusicArtist": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/MusicVideo": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Person": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Series": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/RemoteSearch/Trailer": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/ContentType": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/Images/{imageType}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/PlaybackInfo": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/Refresh": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/RemoteImages/Download": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Media/Updated": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Movies/Added": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Movies/Updated": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Refresh": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Series/Added": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/Series/Updated": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/VirtualFolders": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/VirtualFolders/LibraryOptions": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/VirtualFolders/Name": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/VirtualFolders/Paths": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Library/VirtualFolders/Paths/Update": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveStreams/Close": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveStreams/Open": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/ChannelMappings": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/ListingProviders": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/Programs": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/SeriesTimers": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/SeriesTimers/{timerId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/Timers": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/Timers/{timerId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/TunerHosts": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /LiveTv/Tuners/{tunerId}/Reset": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /MediaSegmentsApi/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /MergeVersions/MergeEpisodes": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /MergeVersions/MergeMovies": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /MergeVersions/SplitEpisodes": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /MergeVersions/SplitMovies": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Packages/Installed/{name}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /PlayingItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /PlayingItems/{itemId}/Progress": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Playlists": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Playlists/{playlistId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Playlists/{playlistId}/Items": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Playlists/{playlistId}/Users/{userId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Plugins/{pluginId}/Configuration": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Plugins/{pluginId}/Manifest": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Plugins/{pluginId}/{version}/Disable": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Plugins/{pluginId}/{version}/Enable": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /QuickConnect/Authorize": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /QuickConnect/Initiate": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Repositories": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /ScheduledTasks/Running/{taskId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /ScheduledTasks/{taskId}/Triggers": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Capabilities": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Capabilities/Full": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Logout": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Playing": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Playing/Ping": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Playing/Progress": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Playing/Stopped": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/Viewing": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Command": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Command/{command}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Message": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Playing": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Playing/{command}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/System/{command}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/User/{userId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Sessions/{sessionId}/Viewing": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SkipButtonCss/InjectCss": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SkipButtonCss/UpdateSkipDuration": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Startup/Complete": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Startup/Configuration": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Startup/RemoteAccess": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Startup/User": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Buffering": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Join": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Leave": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/MovePlaylistItem": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/New": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/NextItem": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Pause": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Ping": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/PreviousItem": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Queue": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Ready": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/RemoveFromPlaylist": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Seek": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/SetIgnoreWait": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/SetNewQueue": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/SetPlaylistItem": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/SetRepeatMode": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/SetShuffleMode": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Stop": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /SyncPlay/Unpause": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Configuration": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Configuration/Branding": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Configuration/{key}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Ping": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Restart": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /System/Shutdown": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /UserFavoriteItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /UserImage": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /UserItems/{itemId}/Rating": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /UserItems/{itemId}/UserData": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /UserPlayedItems/{itemId}": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/AuthenticateByName": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/AuthenticateWithQuickConnect": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/Configuration": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/ForgotPassword": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/ForgotPassword/Pin": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/New": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/Password": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Users/{userId}/Policy": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Videos/MergeVersions": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    },
+    "POST /Videos/{itemId}/Subtitles": {
+      "note": "write: deferred to Layer-2 journey",
+      "schema_valid": null,
+      "status_conformant": null
+    }
+  }
+}

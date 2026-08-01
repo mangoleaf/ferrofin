@@ -1,0 +1,102 @@
+{
+  "errors": {},
+  "generated_by": "parity/journeys.py",
+  "last_verified": "c09e8cc 2026-08-01",
+  "rows": {
+    "DELETE /Collections/{collectionId}/Items": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "DELETE /Playlists/{playlistId}/Items": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "DELETE /UserFavoriteItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /UserItems/{itemId}/Rating": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /UserPlayedItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Playlists/{playlistId}/Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Collections": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Collections/{collectionId}/Items": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Items/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Playlists": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Playlists/{playlistId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Playlists/{playlistId}/Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /UserFavoriteItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /UserItems/{itemId}/Rating": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /UserPlayedItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users/New": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users/{userId}/Policy": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    }
+  }
+}
