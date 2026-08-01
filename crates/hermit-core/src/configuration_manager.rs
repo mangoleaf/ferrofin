@@ -145,7 +145,17 @@ pub fn default_server_configuration() -> ServerConfiguration {
         dummy_chapter_duration: 0,
         chapter_image_resolution: hermit_model::drawing::ImageResolution::MatchSource,
         parallel_image_encoding_limit: 0,
-        cast_receiver_applications: Vec::new(),
+        // Jellyfin's ServerConfiguration ships two built-in cast receivers.
+        cast_receiver_applications: vec![
+            hermit_model::system::CastReceiverApplication {
+                id: "F007D354".to_owned(),
+                name: "Stable".to_owned(),
+            },
+            hermit_model::system::CastReceiverApplication {
+                id: "6F511C87".to_owned(),
+                name: "Unstable".to_owned(),
+            },
+        ],
         trickplay_options: hermit_model::configuration::TrickplayOptions::default(),
         enable_legacy_authorization: false,
     }
