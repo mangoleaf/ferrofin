@@ -26,7 +26,8 @@ stages: [test, build, release, chart]
 
 # ---------------------------------------------------------------------------
 # create-release — manual, main only. CI owns versioning end-to-end: it derives
-# the next version from Conventional Commits (git-cliff), stamps it into
+# the next version from Conventional Commits since the last tag (feat -> minor,
+# fix/other -> patch, `!`/BREAKING CHANGE -> major), stamps it into
 # Cargo.toml, commits that as `chore(release): vX.Y.Z`, tags the commit, and
 # pushes both. The tag push then triggers the build/release/chart pipeline on a
 # commit whose Cargo.toml already carries the release version — so the binary
@@ -38,21 +39,38 @@ stages: [test, build, release, chart]
 # ---------------------------------------------------------------------------
 create-release:
   stage: .pre
-  image:
-    name: orhunp/git-cliff:latest
-    entrypoint: [""]
+  image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
-    GIT_DEPTH: "0"   # git-cliff needs full history + tags to derive the bump
+    GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
   script:
     - |
       set -eu
       git config user.email "ci@mangoleafstudios.com"
       git config user.name "GitLab CI"
-      # Next version from Conventional Commits (feat->minor, fix->patch,
-      # breaking->major). FORCE_VERSION=vX.Y.Z overrides.
-      NEW="${FORCE_VERSION:-$(git-cliff --bumped-version)}"
+      git fetch --tags --quiet
+      # Latest release tag (sed -n 1p reads to EOF — no head/SIGPIPE 141).
+      LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
+      if [ -n "$LATEST" ]; then BASE="$LATEST"; RANGE="${LATEST}..HEAD"; else BASE="v0.0.0"; RANGE=""; fi
+      # Derive the bump from Conventional Commits since the last release. grep -c
+      # reads all input (no early-exit SIGPIPE); || true covers zero matches.
+      SUBJECTS=$(git log --format='%s' $RANGE)
+      BODIES=$(git log --format='%b' $RANGE)
+      BREAKING=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^[a-z]+(\([^)]*\))?!:' || true)
+      BREAKING2=$(printf '%s\n' "$BODIES" | grep -c 'BREAKING CHANGE' || true)
+      FEAT=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^feat(\([^)]*\))?:' || true)
+      if [ "$BREAKING" -gt 0 ] || [ "$BREAKING2" -gt 0 ]; then LEVEL=major
+      elif [ "$FEAT" -gt 0 ]; then LEVEL=minor
+      else LEVEL=patch; fi
+      V="${BASE#v}"; MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
+      case "$LEVEL" in
+        major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+        minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+        patch) PATCH=$((PATCH+1)) ;;
+      esac
+      NEW="v${MAJOR}.${MINOR}.${PATCH}"
+      [ -n "${FORCE_VERSION:-}" ] && NEW="$FORCE_VERSION"
       VER="${NEW#v}"
-      echo "Releasing ${NEW}"
+      echo "Latest ${BASE} + ${LEVEL} -> ${NEW}"
       # Stamp the workspace version — first `version = ` line only (busybox-safe awk,
       # unlike GNU sed's `0,/re/` which silently no-ops in the kaniko image).
       awk -v v="$VER" '!d && /^version = / {sub(/"[^"]*"/, "\"" v "\""); d=1} {print}' \
