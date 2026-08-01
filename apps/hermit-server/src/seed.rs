@@ -16,7 +16,6 @@
 //! unconditionally on every boot: an existing install is never disturbed.
 
 use anyhow::Context as _;
-use hermit_model::users::UserPolicy;
 use hermit_traits::library::UserManager;
 use uuid::Uuid;
 
@@ -108,14 +107,24 @@ pub async fn seed_default_admin(
         }
     };
 
+    // create_user already set the Jellyfin per-user defaults (auth/password-reset provider
+    // ids, preference access, …); fetch that policy and ELEVATE it to admin rather than
+    // overwriting with UserPolicy::default(), which would blank the provider ids and reset
+    // the per-user flags. Mirrors Jellyfin's admin: content deletion + remote control on,
+    // login lockout disabled (-1).
+    let mut policy = users
+        .get_user_dto(&user, None)
+        .await
+        .context("failed to read the seeded admin's policy")?
+        .policy
+        .unwrap_or_default();
+    policy.is_administrator = true;
+    policy.enable_user_preference_access = true;
+    policy.enable_content_deletion = true;
+    policy.enable_remote_control_of_other_users = true;
+    policy.login_attempts_before_lockout = -1;
     users
-        .update_policy(
-            user_id,
-            &UserPolicy {
-                is_administrator: true,
-                ..UserPolicy::default()
-            },
-        )
+        .update_policy(user_id, &policy)
         .await
         .context("failed to grant the default admin administrator policy")?;
 
@@ -182,7 +191,15 @@ mod tests {
             .unwrap()
             .expect("seeded admin exists");
         let dto = users.get_user_dto(&user, None).await.unwrap();
-        assert!(dto.policy.is_some_and(|p| p.is_administrator));
+        let policy = dto.policy.expect("seeded admin has a policy");
+        assert!(policy.is_administrator);
+        // The per-user defaults create_user set (provider id, preference access) are preserved
+        // rather than blanked, and login lockout is disabled — Jellyfin's admin. (The
+        // content-deletion / remote-control PERMISSION flags await the permission-persistence
+        // follow-up in update_policy, so they are not asserted here yet.)
+        assert!(policy.enable_user_preference_access);
+        assert_eq!(policy.login_attempts_before_lockout, -1);
+        assert!(!policy.authentication_provider_id.is_empty());
 
         let authed = users
             .authenticate_user("boss", "s3cret-pass", "", true)
