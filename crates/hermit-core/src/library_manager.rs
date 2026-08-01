@@ -523,6 +523,16 @@ impl LibraryManager for HermitLibraryManager {
             .await
     }
 
+    async fn get_media_stream_languages_by_type(
+        &self,
+        stream_types: &[MediaStreamType],
+        query: &InternalItemsQuery,
+    ) -> Result<std::collections::HashMap<MediaStreamType, Vec<String>>, ServiceError> {
+        self.items
+            .get_media_stream_languages_by_type(query, stream_types)
+            .await
+    }
+
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         let Some(scanner) = &self.scanner else {
             tracing::debug!("library scan queued (no scanner attached — no-op)");

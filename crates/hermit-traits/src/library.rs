@@ -548,6 +548,21 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<Vec<String>, ServiceError>;
 
+    /// Gets the distinct language codes for several stream types at once, keyed
+    /// by type. The default loops [`Self::get_media_stream_languages`]; the
+    /// concrete manager overrides it to resolve the item set once.
+    async fn get_media_stream_languages_by_type(
+        &self,
+        stream_types: &[MediaStreamType],
+        query: &InternalItemsQuery,
+    ) -> Result<std::collections::HashMap<MediaStreamType, Vec<String>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(stream_types.len());
+        for &t in stream_types {
+            map.insert(t, self.get_media_stream_languages(t, query).await?);
+        }
+        Ok(map)
+    }
+
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 }

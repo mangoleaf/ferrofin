@@ -151,7 +151,14 @@ impl HermitMediaSourceManager {
 
     /// Builds the static [`MediaSourceInfo`] for a resolved item row and its
     /// streams (C# `GetStaticMediaSources` inner assembly).
-    fn static_source(item: &BaseItemEntity, streams: Vec<MediaStream>) -> MediaSourceInfo {
+    ///
+    /// `pub(crate)` so the DTO service can assemble a list item's media source
+    /// from the row it already holds plus prefetched streams, skipping the
+    /// per-item `retrieve_item` + `streams_dto` round-trips.
+    pub(crate) fn static_source(
+        item: &BaseItemEntity,
+        streams: Vec<MediaStream>,
+    ) -> MediaSourceInfo {
         MediaSourceInfo {
             id: Some(item.id.clone()),
             path: item.path.clone(),

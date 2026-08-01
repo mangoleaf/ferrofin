@@ -647,11 +647,22 @@ impl HermitDtoService {
 
         // Media sources.
         if options.contains_field(ItemFields::MediaSources) {
-            let user_id = user.and_then(|u| Uuid::parse_str(&u.id).ok());
-            let sources = self
-                .media_sources
-                .get_static_media_sources(item_id, true, user_id)
-                .await?;
+            // On a page projection we hold the row and its streams already, so
+            // assemble the static source directly — no per-item retrieve_item +
+            // streams_dto. Falls back to the manager for single-item callers.
+            let sources = if let Some(p) = prefetched {
+                let streams = p.media_streams.get(&item_id).cloned().unwrap_or_default();
+                vec![
+                    crate::media_source_manager::HermitMediaSourceManager::static_source(
+                        item, streams,
+                    ),
+                ]
+            } else {
+                let user_id = user.and_then(|u| Uuid::parse_str(&u.id).ok());
+                self.media_sources
+                    .get_static_media_sources(item_id, true, user_id)
+                    .await?
+            };
             if !sources.is_empty() {
                 dto.media_sources = Some(sources);
             }
@@ -1209,7 +1220,9 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
-        let media_streams = if options.contains_field(ItemFields::MediaStreams) {
+        let media_streams = if options.contains_field(ItemFields::MediaStreams)
+            || options.contains_field(ItemFields::MediaSources)
+        {
             self.media_sources.get_media_streams_batch(&ids).await?
         } else {
             HashMap::new()

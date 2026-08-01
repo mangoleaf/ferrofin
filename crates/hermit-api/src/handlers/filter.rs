@@ -249,18 +249,19 @@ async fn get_query_filters(
             include_item_types: language_types,
             ..base.clone()
         };
-        filters.audio_languages = language_pairs(
-            state
-                .library
-                .get_media_stream_languages(MediaStreamType::Audio, &language_query)
-                .await?,
-        );
-        filters.subtitle_languages = language_pairs(
-            state
-                .library
-                .get_media_stream_languages(MediaStreamType::Subtitle, &language_query)
-                .await?,
-        );
+        // Audio + subtitle in one pass: the item set is materialized once, not
+        // per type (Jellyfin reads both facets from the same query).
+        let mut langs = state
+            .library
+            .get_media_stream_languages_by_type(
+                &[MediaStreamType::Audio, MediaStreamType::Subtitle],
+                &language_query,
+            )
+            .await?;
+        filters.audio_languages =
+            language_pairs(langs.remove(&MediaStreamType::Audio).unwrap_or_default());
+        filters.subtitle_languages =
+            language_pairs(langs.remove(&MediaStreamType::Subtitle).unwrap_or_default());
     }
 
     Ok(Json(filters))

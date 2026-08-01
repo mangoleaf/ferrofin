@@ -252,6 +252,23 @@ pub trait ItemRepository: Send + Sync {
         stream_type: MediaStreamType,
     ) -> Result<Vec<String>, ServiceError>;
 
+    /// Gets the distinct language codes for several stream types at once, keyed
+    /// by type. The default loops [`Self::get_media_stream_languages`]; the
+    /// concrete repository overrides it to resolve the item set once and read
+    /// every requested type in a single query (`Items/Filters2` asks for audio
+    /// and subtitle together, which otherwise doubles the id-materialization).
+    async fn get_media_stream_languages_by_type(
+        &self,
+        filter: &InternalItemsQuery,
+        stream_types: &[MediaStreamType],
+    ) -> Result<std::collections::HashMap<MediaStreamType, Vec<String>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(stream_types.len());
+        for &t in stream_types {
+            map.insert(t, self.get_media_stream_languages(filter, t).await?);
+        }
+        Ok(map)
+    }
+
     /// Gets aggregated legacy query-filter values for the matching items.
     async fn get_query_filters_legacy(
         &self,

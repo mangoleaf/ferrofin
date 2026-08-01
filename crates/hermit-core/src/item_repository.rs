@@ -625,6 +625,49 @@ impl ItemRepository for HermitItemRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    async fn get_media_stream_languages_by_type(
+        &self,
+        filter: &InternalItemsQuery,
+        stream_types: &[MediaStreamType],
+    ) -> Result<std::collections::HashMap<MediaStreamType, Vec<String>>, ServiceError> {
+        let mut out: std::collections::HashMap<MediaStreamType, Vec<String>> =
+            stream_types.iter().map(|&t| (t, Vec::new())).collect();
+        // Resolve the item set once (the fetch_ids + IN was previously run per
+        // type — audio and subtitle each re-materialized the same ids).
+        let ids = self.fetch_ids(filter).await?;
+        if ids.is_empty() || stream_types.is_empty() {
+            return Ok(out);
+        }
+        // Map disc -> type so the grouped rows sort back into per-type lists.
+        let by_disc: std::collections::HashMap<i64, MediaStreamType> = stream_types
+            .iter()
+            .map(|&t| (i64::from(media_stream_type_disc(t)), t))
+            .collect();
+        let mut sql = String::from(
+            r#"SELECT DISTINCT ms."StreamType",
+                 CASE WHEN ms."Language" IS NULL OR ms."Language" = '' THEN 'und'
+                      ELSE ms."Language" END
+               FROM "MediaStreamInfos" ms WHERE ms."StreamType" IN ("#,
+        );
+        sql.push_str(&placeholders(by_disc.len()));
+        sql.push_str(r#") AND ms."ItemId" IN ("#);
+        sql.push_str(&placeholders(ids.len()));
+        sql.push(')');
+        let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+        for disc in by_disc.keys() {
+            query = query.bind(*disc);
+        }
+        for id in &ids {
+            query = query.bind(id.to_string());
+        }
+        for (disc, lang) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+            if let Some(t) = by_disc.get(&disc) {
+                out.entry(*t).or_default().push(lang);
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_query_filters_legacy(
         &self,
         filter: &InternalItemsQuery,
