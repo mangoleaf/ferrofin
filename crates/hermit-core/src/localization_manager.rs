@@ -38,141 +38,10 @@ const DEFAULT_METADATA_COUNTRY_CODE: &str = "US";
 /// Values that mean "no rating" and resolve to `None` (C# `_unratedValues`).
 const UNRATED_VALUES: &[&str] = &["n/a", "unrated", "not rated", "nr"];
 
-/// One row of the embedded ISO 639 culture table.
-///
-/// `(iso639_2t, iso639_2b, iso639_1, display_name)` — the same four fields C#
-/// reads out of `iso6392.txt` (columns 0,1,2,3). An empty `iso639_2b` means the
-/// B and T codes coincide.
-struct CultureRow {
-    iso639_2t: &'static str,
-    iso639_2b: &'static str,
-    iso639_1: &'static str,
-    display_name: &'static str,
-}
-
-/// The compact embedded culture dataset (common media languages).
-const CULTURE_ROWS: &[CultureRow] = &[
-    CultureRow {
-        iso639_2t: "eng",
-        iso639_2b: "",
-        iso639_1: "en",
-        display_name: "English",
-    },
-    CultureRow {
-        iso639_2t: "spa",
-        iso639_2b: "",
-        iso639_1: "es",
-        display_name: "Spanish; Castilian",
-    },
-    CultureRow {
-        iso639_2t: "fra",
-        iso639_2b: "fre",
-        iso639_1: "fr",
-        display_name: "French",
-    },
-    CultureRow {
-        iso639_2t: "deu",
-        iso639_2b: "ger",
-        iso639_1: "de",
-        display_name: "German",
-    },
-    CultureRow {
-        iso639_2t: "ita",
-        iso639_2b: "",
-        iso639_1: "it",
-        display_name: "Italian",
-    },
-    CultureRow {
-        iso639_2t: "por",
-        iso639_2b: "",
-        iso639_1: "pt",
-        display_name: "Portuguese",
-    },
-    CultureRow {
-        iso639_2t: "nld",
-        iso639_2b: "dut",
-        iso639_1: "nl",
-        display_name: "Dutch; Flemish",
-    },
-    CultureRow {
-        iso639_2t: "rus",
-        iso639_2b: "",
-        iso639_1: "ru",
-        display_name: "Russian",
-    },
-    CultureRow {
-        iso639_2t: "jpn",
-        iso639_2b: "",
-        iso639_1: "ja",
-        display_name: "Japanese",
-    },
-    CultureRow {
-        iso639_2t: "kor",
-        iso639_2b: "",
-        iso639_1: "ko",
-        display_name: "Korean",
-    },
-    CultureRow {
-        iso639_2t: "zho",
-        iso639_2b: "chi",
-        iso639_1: "zh",
-        display_name: "Chinese",
-    },
-    CultureRow {
-        iso639_2t: "ara",
-        iso639_2b: "",
-        iso639_1: "ar",
-        display_name: "Arabic",
-    },
-    CultureRow {
-        iso639_2t: "hin",
-        iso639_2b: "",
-        iso639_1: "hi",
-        display_name: "Hindi",
-    },
-    CultureRow {
-        iso639_2t: "swe",
-        iso639_2b: "",
-        iso639_1: "sv",
-        display_name: "Swedish",
-    },
-    CultureRow {
-        iso639_2t: "nor",
-        iso639_2b: "",
-        iso639_1: "no",
-        display_name: "Norwegian",
-    },
-    CultureRow {
-        iso639_2t: "dan",
-        iso639_2b: "",
-        iso639_1: "da",
-        display_name: "Danish",
-    },
-    CultureRow {
-        iso639_2t: "fin",
-        iso639_2b: "",
-        iso639_1: "fi",
-        display_name: "Finnish",
-    },
-    CultureRow {
-        iso639_2t: "pol",
-        iso639_2b: "",
-        iso639_1: "pl",
-        display_name: "Polish",
-    },
-    CultureRow {
-        iso639_2t: "tur",
-        iso639_2b: "",
-        iso639_1: "tr",
-        display_name: "Turkish",
-    },
-    CultureRow {
-        iso639_2t: "ces",
-        iso639_2b: "cze",
-        iso639_1: "cs",
-        display_name: "Czech",
-    },
-];
+/// Jellyfin's embedded ISO 639-2 language table (`iso6392.txt`), one language per line,
+/// pipe-delimited `iso639-2/T | iso639-2/B | iso639-1 | English name | French name`. Ported
+/// verbatim from upstream so `GET /Localization/Cultures` yields the same ~200-language list.
+const ISO6392: &str = include_str!("data/iso6392.txt");
 
 /// The compact embedded country dataset (common metadata regions).
 /// `(name, two-letter, three-letter, display)`.
@@ -231,30 +100,42 @@ impl LocalizationManager {
     /// Builds the manager over the embedded dataset, using `metadata_country_code`
     /// (e.g. `"US"`) as the default for rating lookups.
     #[must_use]
+    #[allow(clippy::similar_names)] // iso639_2t / iso639_2b are the standard ISO 639-2 column names
     pub fn new(metadata_country_code: &str) -> Self {
-        let mut cultures = Vec::with_capacity(CULTURE_ROWS.len());
+        let mut cultures = Vec::new();
         let mut iso6392_b_to_t = HashMap::new();
-        for row in CULTURE_ROWS {
-            // Match C#: the display name uses column 3; the "name" is the
-            // two-letter code when present.
-            let name = if row.iso639_1.is_empty() {
-                row.iso639_2t.to_owned()
+        // Port of C# `LoadCultures`: parse iso6392.txt (`T|B|1|EnglishName|FrenchName`).
+        for line in ISO6392.lines() {
+            let mut cols = line.split('|');
+            let iso639_2t = cols.next().unwrap_or("");
+            let iso639_2b = cols.next().unwrap_or("");
+            let iso639_1 = cols.next().unwrap_or("");
+            let display_name = cols.next().unwrap_or("");
+            // C# skips a row when the two-letter code or the English name is empty — which is
+            // why only the ~200 languages that have an ISO 639-1 code appear in the list.
+            if iso639_1.is_empty() || display_name.is_empty() {
+                continue;
+            }
+            // Name = the two-letter code when it is a region tag (contains '-'), else the
+            // English display name (C# `twoCharName.Contains('-') ? twoCharName : displayName`).
+            let name = if iso639_1.contains('-') {
+                iso639_1
             } else {
-                row.iso639_1.to_owned()
+                display_name
             };
-            let three_letter_names = if row.iso639_2b.is_empty() {
-                vec![row.iso639_2t.to_owned()]
+            let three_letter_names = if iso639_2b.is_empty() {
+                vec![iso639_2t.to_owned()]
             } else {
                 // Record the B→T mapping (C# `iso6392BtoTdict.TryAdd`).
                 iso6392_b_to_t
-                    .entry(row.iso639_2b.to_ascii_lowercase())
-                    .or_insert_with(|| row.iso639_2t.to_owned());
-                vec![row.iso639_2t.to_owned(), row.iso639_2b.to_owned()]
+                    .entry(iso639_2b.to_ascii_lowercase())
+                    .or_insert_with(|| iso639_2t.to_owned());
+                vec![iso639_2t.to_owned(), iso639_2b.to_owned()]
             };
             cultures.push(CultureDto {
-                name,
-                display_name: row.display_name.to_owned(),
-                two_letter_iso_language_name: row.iso639_1.to_owned(),
+                name: name.to_owned(),
+                display_name: display_name.to_owned(),
+                two_letter_iso_language_name: iso639_1.to_owned(),
                 three_letter_iso_language_name: three_letter_names.first().cloned(),
                 three_letter_iso_language_names: three_letter_names,
             });
@@ -572,8 +453,28 @@ mod tests {
         let by_three_b = m.find_language_info("fre").expect("three-letter B");
         assert_eq!(by_three_b.two_letter_iso_language_name, "fr");
         let by_display = m.find_language_info("German").expect("display");
-        assert_eq!(by_display.name, "de");
+        // Name is the English display name (C# uses the 2-letter code only for region tags).
+        assert_eq!(by_display.name, "German");
         assert!(m.find_language_info("zzz").is_none());
+    }
+
+    // The full iso6392.txt list is served (Jellyfin's ~200 ISO-639-1 languages), each with
+    // Name = the English display name — regression for the compact 21-language subset.
+    #[test]
+    fn cultures_cover_the_full_iso6392_list() {
+        let m = LocalizationManager::new("US");
+        let cultures = m.get_cultures();
+        assert!(
+            cultures.len() > 180,
+            "expected the full culture list, got {}",
+            cultures.len()
+        );
+        let abk = cultures
+            .iter()
+            .find(|c| c.two_letter_iso_language_name == "ab")
+            .expect("Abkhazian present");
+        assert_eq!(abk.name, "Abkhazian");
+        assert_eq!(abk.display_name, "Abkhazian");
     }
 
     #[test]
