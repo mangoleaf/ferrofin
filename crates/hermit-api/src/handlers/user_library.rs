@@ -541,6 +541,10 @@ struct LatestQuery {
     /// Whether to group items into a parent container (default `true`).
     #[serde(default)]
     group_items: Option<bool>,
+    /// Comma-delimited [`ItemFields`](hermit_model::querying::ItemFields) to populate on
+    /// each DTO. Absent/empty ⇒ the base DTO (matches Jellyfin's GetLatestMedia).
+    #[serde(default)]
+    fields: Option<String>,
 }
 
 /// `GET /Items/Latest` — the user's newest media.
@@ -562,7 +566,7 @@ async fn get_latest_media(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<LatestQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
-    use crate::handlers::query_parse::parse_csv_enums;
+    use crate::handlers::query_parse::{parse_csv_enums, parse_csv_enums_lenient};
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
@@ -575,7 +579,12 @@ async fn get_latest_media(
     let include_item_types = parse_csv_enums(query.include_item_types.as_deref())?;
     let group_items = query.group_items.unwrap_or(true);
 
-    let options = DtoOptions::default();
+    // Honour the requested `fields` (Jellyfin's GetLatestMedia builds DtoOptions from them);
+    // was hardcoded to all fields, which over-populated the response vs Jellyfin's fields=Path.
+    let options = DtoOptions {
+        fields: parse_csv_enums_lenient(query.fields.as_deref()),
+        ..DtoOptions::default()
+    };
     let groups = state
         .user_views
         .get_latest_items(user_uuid, &options)

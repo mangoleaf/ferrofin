@@ -425,9 +425,7 @@ impl HermitDtoService {
                 image_blur_hashes: None,
             });
         }
-        if !list.is_empty() {
-            dto.people = Some(list);
-        }
+        dto.people = Some(list); // Jellyfin emits [] when People is requested but there are none
         Ok(())
     }
 
@@ -539,9 +537,7 @@ impl HermitDtoService {
                     tags.push(tag);
                 }
             }
-            if !tags.is_empty() {
-                dto.backdrop_image_tags = Some(tags);
-            }
+            dto.backdrop_image_tags = Some(tags); // [] when the item has no backdrops (matches Jellyfin)
         }
 
         if options.enable_images {
@@ -624,6 +620,10 @@ impl HermitDtoService {
         // User-specific play-state.
         if let Some(user) = user {
             let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+            // C# `item.GetPlayAccess(user)` — Full unless parental control blocks it (not ported).
+            if options.contains_field(ItemFields::PlayAccess) {
+                dto.play_access = Some(hermit_model::library::PlayAccess::Full);
+            }
             if options.enable_user_data {
                 dto.user_data = match prefetched {
                     Some(p) => p.user_data.get(&item_id).cloned(),
@@ -687,22 +687,39 @@ impl HermitDtoService {
             dto.forced_sort_name = item.forced_sort_name.clone();
             dto.preferred_metadata_country_code = item.preferred_metadata_country_code.clone();
             dto.preferred_metadata_language = item.preferred_metadata_language.clone();
+            dto.locked_fields = Some(Vec::new()); // Jellyfin emits item.LockedFields ([] here)
         }
 
         dto.end_date = item.end_date;
 
+        // Container is always set from the file extension (C# `dto.Container = item.Container`,
+        // which resolution fills from the extension) — folders have none, so it stays absent.
+        dto.container = item
+            .path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+
+        // Gated scalar defaults Jellyfin emits when the field is requested (item_detail, not lists).
+        if options.contains_field(ItemFields::EnableMediaSourceDisplay) {
+            dto.enable_media_source_display = Some(true);
+        }
+        if options.contains_field(ItemFields::SpecialFeatureCount) {
+            dto.special_feature_count = Some(0); // no extras subsystem yet
+        }
+        if options.contains_field(ItemFields::LocalTrailerCount) {
+            dto.local_trailer_count = Some(0);
+        }
+
+        // Jellyfin emits an empty [] / {} for these when the field is requested but the item has
+        // none (its DtoService always assigns the collection), so populate the empty default.
         if options.contains_field(ItemFields::ExternalUrls) {
-            let urls = self.providers.get_external_urls(item_id).await?;
-            if !urls.is_empty() {
-                dto.external_urls = Some(urls);
-            }
+            dto.external_urls = Some(self.providers.get_external_urls(item_id).await?);
         }
 
         if options.contains_field(ItemFields::Tags) {
-            let tags = split_multi(item.tags.as_deref());
-            if !tags.is_empty() {
-                dto.tags = Some(tags);
-            }
+            dto.tags = Some(split_multi(item.tags.as_deref()));
         }
 
         // Images (single-type tags + backdrops).
@@ -763,10 +780,7 @@ impl HermitDtoService {
         dto.production_year = item.production_year.and_then(|y| i32::try_from(y).ok());
 
         if options.contains_field(ItemFields::ProviderIds) {
-            let ids = self.load_provider_ids(item_id).await?;
-            if !ids.is_empty() {
-                dto.provider_ids = Some(ids);
-            }
+            dto.provider_ids = Some(self.load_provider_ids(item_id).await?); // {} when none
         }
 
         dto.run_time_ticks = item.run_time_ticks;
@@ -810,19 +824,15 @@ impl HermitDtoService {
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
 
             if options.contains_field(ItemFields::Trickplay) {
+                // Jellyfin emits {} when requested but there is no manifest.
                 let manifest = self.trickplay.get_trickplay_manifest(item_id).await?;
-                if !manifest.is_empty() {
-                    dto.trickplay = Some(to_trickplay_manifest(&manifest));
-                }
+                dto.trickplay = Some(to_trickplay_manifest(&manifest));
             }
         }
 
-        // Chapters.
+        // Chapters — [] when requested but there are none (matches Jellyfin).
         if options.contains_field(ItemFields::Chapters) {
-            let chapters = self.chapters.get_chapters(item_id).await?;
-            if !chapters.is_empty() {
-                dto.chapters = Some(chapters);
-            }
+            dto.chapters = Some(self.chapters.get_chapters(item_id).await?);
         }
 
         // Media streams.

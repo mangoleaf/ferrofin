@@ -131,8 +131,8 @@ pub struct BaseItemDto {
     /// Gets or sets the custom rating.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_rating: Option<String>,
-    /// Gets or sets the channel identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Gets or sets the channel identifier. Serialized even when null — Jellyfin always
+    /// emits `ChannelId` (null for non-LiveTV items), so it is not skipped.
     #[schema(value_type = Option<String>, format = "uuid")]
     pub channel_id: Option<Uuid>,
     /// Gets or sets the channel name.
