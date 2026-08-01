@@ -34,6 +34,9 @@ const VOLATILE = new RegExp('^(' + [
   // (its pixels come from Skia's 128x128 downsample+decode) — a documented, accepted divergence.
   'ImageBlurHashes',
   'DateCreated', 'DateModified', 'DateLastSaved', 'DateLastMediaAdded', 'DateLastRefreshed',
+  // Per-session/user instance noise: activity timestamps, the client endpoint, and the session's
+  // UserId (users get different GUIDs on each independent server).
+  'LastActivityDate', 'LastLoginDate', 'LastPlaybackCheckIn', 'RemoteEndPoint', 'UserId',
   'ProductName', 'PackageName', 'WebPath', 'LocalAddress', 'OperatingSystem', 'OperatingSystemDisplayName',
   'SystemArchitecture', 'EncoderLocation', 'StartupWizardCompleted', 'CanSelfRestart',
   'TranscodingTempPath', 'LogPath', 'InternalMetadataPath', 'ItemsByNamePath', 'CachePath', 'ProgramDataPath',

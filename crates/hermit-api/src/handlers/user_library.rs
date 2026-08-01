@@ -649,9 +649,8 @@ async fn get_latest_media(
         .get_base_item_dtos(&entities, &options, Some(&user), None, true)
         .await?;
     for (dto, count) in dtos.iter_mut().zip(child_counts) {
-        if count > 0 {
-            dto.child_count = Some(count);
-        }
+        // Jellyfin's GetLatestMedia sets ChildCount on every latest item (0 for ungrouped movies).
+        dto.child_count = Some(count);
     }
     Ok(Json(dtos))
 }
