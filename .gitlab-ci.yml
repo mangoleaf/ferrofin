@@ -2,7 +2,8 @@
 #
 # Stages:
 #   test    — fmt / clippy / unit tests, plus the per-crate 80% coverage gate.
-#   build   — the server container image, built rootless with kaniko.
+#   tag     — create-release (manual, main): cuts the release tag, gated on test.
+#   build   — the server container image, built rootless with kaniko (tags only).
 #   release — a GitLab Release object with git-cliff-generated notes.
 #   chart   — the official Helm chart, pushed as an OCI artifact.
 #
@@ -18,11 +19,11 @@
 #   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
-#   main push     → image :main-<shortsha> for homelab testing between releases
+# The image is built ONLY for a release tag — never on a bare commit/branch push.
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
-stages: [test, build, release, chart]
+stages: [test, tag, build, release, chart]
 
 # ---------------------------------------------------------------------------
 # create-release — manual, main only. CI owns versioning end-to-end: it derives
@@ -39,7 +40,12 @@ stages: [test, build, release, chart]
 # Maintainer) allowed to push the protected default branch and create v* tags.
 # ---------------------------------------------------------------------------
 create-release:
-  stage: .pre
+  stage: tag
+  # Gate tag creation on the quality bar: only playable once lint + coverage pass,
+  # so a release can never be cut from a red commit.
+  needs:
+    - job: lint
+    - job: coverage
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
@@ -218,20 +224,14 @@ docker-image:
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
   script:
     - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        # Release build: Cargo.toml already carries this version (stamped + committed
-        # by create-release), so no build-time patching. SERVICE_VERSION is the tag.
-        TAG="${CI_COMMIT_TAG#v}"
-        BASE="${TAG%-rc.*}"                    # strip any -rc.N for the :latest decision
-        VERSION="$TAG"
-        if [ "$TAG" = "$BASE" ]; then
-          DESTS="--destination $IMAGE:$TAG --destination $IMAGE:latest"   # final release
-        else
-          DESTS="--destination $IMAGE:$TAG"                              # -rc.N: no :latest
-        fi
+      # Runs ONLY on a release tag (see rules) — Cargo.toml already carries this
+      # version (stamped + committed by create-release), so no build-time patching.
+      VERSION="${CI_COMMIT_TAG#v}"
+      BASE="${VERSION%-rc.*}"                  # strip any -rc.N for the :latest decision
+      if [ "$VERSION" = "$BASE" ]; then
+        DESTS="--destination $IMAGE:$VERSION --destination $IMAGE:latest"   # final release
       else
-        VERSION="main-$CI_COMMIT_SHORT_SHA"
-        DESTS="--destination $IMAGE:main-$CI_COMMIT_SHORT_SHA"
+        DESTS="--destination $IMAGE:$VERSION"                              # -rc.N: no :latest
       fi
     - >-
       /kaniko/executor
@@ -242,7 +242,6 @@ docker-image:
       --push-retry 5
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # ---------------------------------------------------------------------------
 # release — GitLab Release with git-cliff notes (final versions only)
