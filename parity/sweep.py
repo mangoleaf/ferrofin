@@ -97,7 +97,10 @@ def authenticate(base):
 
 
 def provision(base, target, token):
-    # Disable Jellyfin's remote fetchers so both servers do the same (local-only) work.
+    # Send BOTH servers the realistic jellyfin-web body shape: TypeOptions entries that OMIT
+    # ImageOptions (and other arrays). This disables remote fetchers for fairness AND exercises the
+    # exact deserialization path real clients use — a server missing serde container defaults 422s
+    # here and fails the sweep loudly, instead of being masked by a minimal `{}` body.
     no_remote = {"LibraryOptions": {"EnableRealtimeMonitor": False, "SaveLocalMetadata": False,
         "TypeOptions": [{"Type": t, "MetadataFetchers": [], "MetadataFetcherOrder": [],
                          "ImageFetchers": [], "ImageFetcherOrder": []}
@@ -107,8 +110,7 @@ def provision(base, target, token):
              f"&paths={urllib.parse.quote(lib['path'])}")
         if target == "jellyfin":
             q += "&refreshLibrary=true"
-        body = json.dumps(no_remote) if target == "jellyfin" else "{}"
-        st, raw = http("POST", f"{base}/Library/VirtualFolders?{q}", token, body)
+        st, raw = http("POST", f"{base}/Library/VirtualFolders?{q}", token, json.dumps(no_remote))
         if st >= 300:
             raise SystemExit(f"{target}: add library {lib['name']} failed {st}: {raw[:200]!r}")
     if target != "jellyfin":
