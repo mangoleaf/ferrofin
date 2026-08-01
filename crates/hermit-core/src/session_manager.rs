@@ -116,11 +116,14 @@ impl SessionInfo {
         self.user_id == user_id || self.additional_users.iter().any(|u| u.user_id == user_id)
     }
 
-    /// Whether the session is currently active — a live connection or recent
-    /// playback (C# `SessionInfo.IsActive`, simplified to "has a live
-    /// connection").
+    /// Whether the session has a live (open) connection — a directly attached controller.
     fn is_active(&self) -> bool {
         self.connections.iter().any(|c| c.is_open())
+    }
+
+    /// Whether the session has any connection object at all (open or not).
+    fn has_connections(&self) -> bool {
+        !self.connections.is_empty()
     }
 
     /// Whether the session can be remote-controlled — it reports media control
@@ -237,6 +240,13 @@ impl HermitSessionManager {
                 .is_some_and(|bus| bus.is_connected(&session.id))
     }
 
+    /// C# `SessionInfo.IsActive` for the DTO: a session with NO controllers at all is still
+    /// active (e.g. an HTTP-only session that never opened a websocket); with controllers, one
+    /// must be live. Distinct from remote-controllability, which always needs a live controller.
+    fn session_is_active_dto(&self, session: &SessionInfo) -> bool {
+        !session.has_connections() || self.session_is_active(session)
+    }
+
     /// Bus-aware `SupportsRemoteControl` (C# `SessionInfo.SupportsRemoteControl`).
     fn session_supports_remote_control(&self, session: &SessionInfo) -> bool {
         session.capabilities.supports_media_control && self.session_is_active(session)
@@ -246,7 +256,7 @@ impl HermitSessionManager {
     /// the bus (the free [`session_info_to_dto`] only sees direct connections).
     fn to_dto(&self, session: &SessionInfo) -> SessionInfoDto {
         let mut dto = session_info_to_dto(session);
-        dto.is_active = self.session_is_active(session);
+        dto.is_active = self.session_is_active_dto(session);
         dto.supports_remote_control = self.session_supports_remote_control(session);
         dto
     }
