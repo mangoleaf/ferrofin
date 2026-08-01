@@ -25,42 +25,45 @@
 stages: [test, build, release, chart]
 
 # ---------------------------------------------------------------------------
-# create-release — manual, main only. CI owns tag creation: pick a bump level
-# when you run it and it computes the next vX.Y.Z from the latest tag and pushes
-# it. That tag push triggers the build + chart pipeline. No hand-made tags.
-# Requires a CI/CD variable RELEASE_TOKEN — a project access token with the
-# write_repository scope, allowed to create the protected v* tags.
+# create-release — manual, main only. CI owns versioning end-to-end: it derives
+# the next version from Conventional Commits (git-cliff), stamps it into
+# Cargo.toml, commits that as `chore(release): vX.Y.Z`, tags the commit, and
+# pushes both. The tag push then triggers the build/release/chart pipeline on a
+# commit whose Cargo.toml already carries the release version — so the binary
+# reports the right version with no build-time patching. No hand-made tags.
+#
+# Override the auto-derived bump with FORCE_VERSION=vX.Y.Z when you need to.
+# Requires CI/CD var RELEASE_TOKEN — a project access token (write_repository,
+# Maintainer) allowed to push the protected default branch and create v* tags.
 # ---------------------------------------------------------------------------
 create-release:
   stage: .pre
-  image: alpine/git:latest
+  image:
+    name: orhunp/git-cliff:latest
+    entrypoint: [""]
   variables:
-    BUMP: patch          # override to "minor" or "major" when you run the job
-    GIT_DEPTH: "0"       # need full tag history to find the latest version
+    GIT_DEPTH: "0"   # git-cliff needs full history + tags to derive the bump
   script:
     - |
       set -eu
-      git fetch --tags --quiet
-      # `sed -n 1p` reads the whole stream (unlike `head -1`, which closes the pipe
-      # early and SIGPIPEs git/grep → exit 141). `|| true` covers the no-tags-yet case.
-      LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
-      LATEST="${LATEST:-v0.0.0}"; V="${LATEST#v}"
-      MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
-      case "$BUMP" in
-        major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
-        minor) MINOR=$((MINOR+1)); PATCH=0 ;;
-        patch) PATCH=$((PATCH+1)) ;;
-        *) echo "BUMP must be patch, minor, or major (got '$BUMP')" >&2; exit 1 ;;
-      esac
-      NEW="v${MAJOR}.${MINOR}.${PATCH}"
-      echo "Latest tag ${LATEST} + ${BUMP} -> ${NEW}"
-      # Annotated tags need a tagger identity, which a fresh CI clone lacks.
       git config user.email "ci@mangoleafstudios.com"
       git config user.name "GitLab CI"
+      # Next version from Conventional Commits (feat->minor, fix->patch,
+      # breaking->major). FORCE_VERSION=vX.Y.Z overrides.
+      NEW="${FORCE_VERSION:-$(git-cliff --bumped-version)}"
+      VER="${NEW#v}"
+      echo "Releasing ${NEW}"
+      # Stamp the workspace version — first `version = ` line only (busybox-safe awk,
+      # unlike GNU sed's `0,/re/` which silently no-ops in the kaniko image).
+      awk -v v="$VER" '!d && /^version = / {sub(/"[^"]*"/, "\"" v "\""); d=1} {print}' \
+        Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
+      git add Cargo.toml
+      git commit -m "chore(release): ${NEW}"
       git tag -a "$NEW" -m "release $NEW"
       git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git push origin "HEAD:${CI_DEFAULT_BRANCH}"
       git push origin "$NEW"
-      echo "Pushed ${NEW} — the tag pipeline will build the image and publish the chart."
+      echo "Pushed release commit + ${NEW}; the tag pipeline builds and publishes."
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
@@ -194,23 +197,25 @@ docker-image:
   script:
     - |
       if [ -n "$CI_COMMIT_TAG" ]; then
+        # Release build: Cargo.toml already carries this version (stamped + committed
+        # by create-release), so no build-time patching. SERVICE_VERSION is the tag.
         TAG="${CI_COMMIT_TAG#v}"
         BASE="${TAG%-rc.*}"                    # strip any -rc.N for the :latest decision
-        # The git tag is the source of truth: stamp it into the workspace version
-        # (first `version = ` line only) so the built binary reports the release.
-        sed -i "0,/^version = /s/^version = \".*\"/version = \"$TAG\"/" Cargo.toml
+        VERSION="$TAG"
         if [ "$TAG" = "$BASE" ]; then
           DESTS="--destination $IMAGE:$TAG --destination $IMAGE:latest"   # final release
         else
           DESTS="--destination $IMAGE:$TAG"                              # -rc.N: no :latest
         fi
       else
+        VERSION="main-$CI_COMMIT_SHORT_SHA"
         DESTS="--destination $IMAGE:main-$CI_COMMIT_SHORT_SHA"
       fi
     - >-
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+      --build-arg SERVICE_VERSION="$VERSION"
       $DESTS
       --push-retry 5
   rules:

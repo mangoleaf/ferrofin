@@ -36,6 +36,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
 COPY --from=web /web/dist /usr/share/hermit/web
+# The release version, passed from CI (--build-arg SERVICE_VERSION=<tag>). The
+# binary reports it (falling back to the crate version when unset for local builds).
+ARG SERVICE_VERSION=
+ENV SERVICE_VERSION=$SERVICE_VERSION
 # HERMIT_WEB_DIR lives OUTSIDE /data on purpose: /data is a mounted volume that
 # would shadow anything baked under it.
 ENV HERMIT_DATA_DIR=/data HERMIT_BIND_ADDR=0.0.0.0 HERMIT_PORT=8096 \

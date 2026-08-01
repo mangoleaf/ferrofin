@@ -44,6 +44,19 @@ use crate::config::Config;
 use crate::seed::{SeedOutcome, seed_default_admin};
 use crate::state::build_app_state;
 
+/// The version Hermit reports for itself (startup log line and the session
+/// app-version fallback in the authorization context).
+///
+/// Prefers the `SERVICE_VERSION` environment variable — stamped into the release
+/// image via a Docker build arg from the git tag — and falls back to the compiled
+/// crate version (`CARGO_PKG_VERSION`) for local/dev builds where it is unset.
+pub(crate) fn service_version() -> String {
+    std::env::var("SERVICE_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+}
+
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
 /// This is the whole composition root, in order: initialise logging, open +
@@ -77,7 +90,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         library_roots = config.library_roots.len(),
         admin_user = %config.admin_user,
         admin_password_set = !config.admin_password.is_empty(),
-        version = env!("CARGO_PKG_VERSION"),
+        version = service_version(),
         "hermit-server starting"
     );
 

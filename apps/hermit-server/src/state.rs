@@ -711,7 +711,7 @@ pub async fn build_app_state(
         Arc::clone(&app_host_trait),
         Arc::clone(&config_trait),
         server_id.clone(),
-        env!("CARGO_PKG_VERSION").to_owned(),
+        crate::service_version(),
     );
     let auth_service: Arc<dyn hermit_traits::net::AuthService> =
         Arc::new(HermitAuthService::new(auth_context_concrete.clone()));
