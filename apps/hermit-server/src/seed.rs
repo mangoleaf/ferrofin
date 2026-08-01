@@ -193,10 +193,10 @@ mod tests {
         let dto = users.get_user_dto(&user, None).await.unwrap();
         let policy = dto.policy.expect("seeded admin has a policy");
         assert!(policy.is_administrator);
-        // The per-user defaults create_user set (provider id, preference access) are preserved
-        // rather than blanked, and login lockout is disabled — Jellyfin's admin. (The
-        // content-deletion / remote-control PERMISSION flags await the permission-persistence
-        // follow-up in update_policy, so they are not asserted here yet.)
+        // Jellyfin's admin: content-deletion + remote-control permissions on, login lockout
+        // disabled, and the per-user provider id create_user set is preserved (not blanked).
+        assert!(policy.enable_content_deletion);
+        assert!(policy.enable_remote_control_of_other_users);
         assert!(policy.enable_user_preference_access);
         assert_eq!(policy.login_attempts_before_lockout, -1);
         assert!(!policy.authentication_provider_id.is_empty());

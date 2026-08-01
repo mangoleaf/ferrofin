@@ -874,6 +874,20 @@ impl UserManager for HermitUserManager {
             policy.is_disabled,
         )
         .await?;
+        set_permission(
+            self.db.pool(),
+            &id,
+            PermissionKind::EnableContentDeletion,
+            policy.enable_content_deletion,
+        )
+        .await?;
+        set_permission(
+            self.db.pool(),
+            &id,
+            PermissionKind::EnableRemoteControlOfOtherUsers,
+            policy.enable_remote_control_of_other_users,
+        )
+        .await?;
         Ok(())
     }
 
