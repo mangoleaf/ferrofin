@@ -455,6 +455,16 @@ fn image_info_dto(image: &ItemImageInfo, image_index: Option<i32>) -> ImageInfo 
     } else {
         (None, None)
     };
+    // Size is the on-disk file length, stat'd at projection time (Jellyfin's GetImageInfo does the
+    // same: `length = fileInfo.Length` for local files). Remote/missing files report 0.
+    let size = if image.is_local_file() {
+        std::fs::metadata(&image.path)
+            .ok()
+            .and_then(|m| i64::try_from(m.len()).ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
     ImageInfo {
         image_type: image.image_type,
         image_index,
@@ -465,7 +475,7 @@ fn image_info_dto(image: &ItemImageInfo, image_index: Option<i32>) -> ImageInfo 
         blur_hash: image.blur_hash.clone(),
         height,
         width,
-        size: 0,
+        size,
     }
 }
 
@@ -970,4 +980,42 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(post_user_image)
                 .delete(delete_user_image),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn img(path: String) -> ItemImageInfo {
+        ItemImageInfo {
+            path,
+            image_type: ImageType::Primary,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }
+    }
+
+    #[test]
+    fn image_info_size_is_file_length_for_local_files() {
+        // Regression (parity): Size was hardcoded to 0; Jellyfin reports the on-disk length.
+        let dir = std::env::temp_dir().join(format!("hermit-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("poster.jpg");
+        std::fs::write(&file, b"0123456789").unwrap(); // 10 bytes
+        let dto = image_info_dto(&img(file.to_string_lossy().into_owned()), None);
+        assert_eq!(dto.size, 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn image_info_size_is_zero_for_remote_or_missing() {
+        assert_eq!(image_info_dto(&img("https://x/y.jpg".into()), None).size, 0);
+        assert_eq!(
+            image_info_dto(&img("/no/such/file.jpg".into()), None).size,
+            0
+        );
+    }
 }
