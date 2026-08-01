@@ -213,6 +213,7 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
         comment: row.comment.clone(),
         time_base: row.time_base.clone(),
         codec_time_base: row.codec_time_base.clone(),
+        nal_length_size: row.nal_length_size.clone(),
         profile: row.profile.clone(),
         aspect_ratio: row.aspect_ratio.clone(),
         path: row.path.clone(),
@@ -263,6 +264,10 @@ fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
     // Compose the display title from the now-populated codec/language/channel
     // fields so clients don't fall back to "Undefined".
     stream.display_title = stream.display_title();
+    // Materialize the computed-property fields (VideoRange/VideoRangeType/
+    // AudioSpatialFormat/IsTextSubtitleStream/ReferenceFrameRate) Jellyfin serializes
+    // as getters — derived on every load, not persisted.
+    stream.populate_computed_fields();
     // Port of `MediaSourceManager.StreamSupportsExternalStream`: stamp whether a
     // subtitle can be delivered as a separate stream (external file, extractable
     // text, or PGS/VobSub). Not persisted — derived on every load, like C#.

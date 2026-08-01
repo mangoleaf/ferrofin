@@ -553,6 +553,27 @@ pub struct MediaStream {
     /// A value indicating whether this instance is anamorphic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_anamorphic: Option<bool>,
+    /// The video color range (SDR/HDR), derived from the color / Dolby-Vision
+    /// metadata by [`video_range`](Self::video_range). Populated when the wire DTO
+    /// is built (Jellyfin serializes it as a computed property).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_range: Option<VideoRange>,
+    /// The specific video range type (HDR10/HLG/DOVI/…), from
+    /// [`video_range_type`](Self::video_range_type). Populated when the DTO is built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_range_type: Option<VideoRangeType>,
+    /// The spatial audio format (Dolby Atmos / DTS:X), from
+    /// [`audio_spatial_format`](Self::audio_spatial_format). Populated when the DTO is built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_spatial_format: Option<AudioSpatialFormat>,
+    /// Whether this is a text-based subtitle stream (from the codec), from
+    /// [`is_text_subtitle_stream`](Self::is_text_subtitle_stream). Populated when the DTO is built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_text_subtitle_stream: Option<bool>,
+    /// The reference frame rate (average, or real when average is missing/unrealistic),
+    /// from [`reference_frame_rate`](Self::reference_frame_rate). Populated when the DTO is built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_frame_rate: Option<f32>,
 }
 
 impl MediaStream {
@@ -629,6 +650,17 @@ impl MediaStream {
             Some(avg) if avg < 1000.0 => Some(avg),
             _ => self.real_frame_rate,
         }
+    }
+
+    /// Materializes the computed-property fields (video range, spatial audio,
+    /// text-subtitle flag, reference frame rate) into their DTO slots, matching
+    /// Jellyfin, which serializes these as getters. Call when building a wire DTO.
+    pub fn populate_computed_fields(&mut self) {
+        self.video_range = Some(self.video_range());
+        self.video_range_type = Some(self.video_range_type());
+        self.audio_spatial_format = Some(self.audio_spatial_format());
+        self.is_text_subtitle_stream = Some(self.is_text_subtitle_stream());
+        self.reference_frame_rate = self.reference_frame_rate();
     }
 
     /// Gets the derived display title for this stream.
@@ -1757,6 +1789,25 @@ mod tests {
         fr.average_frame_rate = Some(9999.0);
         fr.real_frame_rate = Some(25.0);
         assert_eq!(fr.reference_frame_rate(), Some(25.0));
+    }
+
+    #[test]
+    fn populate_computed_fields_materializes_getter_properties() {
+        // Regression (parity): these are getters in Jellyfin and were absent from Hermit's
+        // MediaStream DTO until materialized. After populate, they serialize.
+        let mut s = stream(MediaStreamType::Audio);
+        s.profile = Some("Dolby Atmos".to_owned());
+        s.average_frame_rate = Some(23.976);
+        assert!(s.video_range.is_none()); // not set until populated
+        s.populate_computed_fields();
+        assert_eq!(s.audio_spatial_format, Some(AudioSpatialFormat::DolbyAtmos));
+        assert_eq!(s.is_text_subtitle_stream, Some(false));
+        assert_eq!(s.reference_frame_rate, Some(23.976));
+        assert!(s.video_range.is_some() && s.video_range_type.is_some());
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["AudioSpatialFormat"], "DolbyAtmos");
+        assert_eq!(json["IsTextSubtitleStream"], false);
+        assert!(json.get("VideoRange").is_some() && json.get("ReferenceFrameRate").is_some());
     }
 
     #[test]
