@@ -256,7 +256,10 @@ pub struct ChannelMappingOptionsDto {
 /// Base timer info DTO (flattened into [`TimerInfoDto`] and
 /// [`SeriesTimerInfoDto`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+// `default`: flattened into TimerInfoDto/SeriesTimerInfoDto, so a client body omitting any base
+// field would 422 the whole request (container default on the outer type can't cover a flattened
+// inner's required fields). Mirrors TypeOptions; faithful to Jellyfin's System.Text.Json.
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BaseTimerInfoDto {
     /// Gets or sets the id of the recording.
@@ -348,7 +351,7 @@ pub struct BaseTimerInfoDto {
 
 /// Timer info DTO. Flattens [`BaseTimerInfoDto`].
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct TimerInfoDto {
     /// Flattened base timer info.
@@ -377,7 +380,7 @@ pub struct TimerInfoDto {
 
 /// Series timer info DTO. Flattens [`BaseTimerInfoDto`].
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SeriesTimerInfoDto {
     /// Flattened base timer info.
@@ -617,7 +620,7 @@ pub struct LiveTvChannelQuery {
 
 /// Information about a listings provider.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct ListingsProviderInfo {
     /// Gets or sets the id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -691,7 +694,7 @@ pub struct ListingsProviderInfo {
 
 /// Information about a tuner host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct TunerHostInfo {
     /// Gets or sets the id.

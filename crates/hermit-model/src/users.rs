@@ -122,7 +122,7 @@ pub struct PinRedeemResult {
 
 /// A user's access policy.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct UserPolicy {
     /// Gets or sets a value indicating whether this instance is administrator.

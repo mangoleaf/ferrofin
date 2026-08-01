@@ -63,7 +63,7 @@ pub struct DeviceInfoDto {
 /// /Devices/Options` and accepted (only its [`custom_name`](Self::custom_name))
 /// by `POST /Devices/Options`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct DeviceOptionsDto {
     /// Gets or sets the id.
     pub id: i32,

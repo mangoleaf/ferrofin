@@ -14,7 +14,7 @@ use crate::session::{ClientCapabilities, GeneralCommandType};
 /// collection JSON converter for query-string binding; on the wire in JSON they
 /// serialize as plain arrays, which is what the derived serde impl produces.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct ClientCapabilitiesDto {
     /// Gets or sets the list of playable media types.
     pub playable_media_types: Vec<MediaType>,

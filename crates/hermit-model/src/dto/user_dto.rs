@@ -13,7 +13,7 @@ use crate::users::UserPolicy;
 /// The public representation of a user, returned by the users endpoints and
 /// embedded in [`AuthenticationResult`](crate::session::AuthenticationResult).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct UserDto {
     /// Gets or sets the name.
     #[serde(skip_serializing_if = "Option::is_none")]

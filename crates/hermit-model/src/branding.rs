@@ -28,7 +28,7 @@ pub struct BrandingOptions {
 /// This DTO excludes `SplashscreenLocation` to prevent it from being updated
 /// via the API.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct BrandingOptionsDto {
     /// Gets or sets the login disclaimer.
     #[serde(skip_serializing_if = "Option::is_none")]

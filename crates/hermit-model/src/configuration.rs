@@ -335,7 +335,7 @@ impl Default for XbmcMetadataOptions {
 
 /// A user's configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct UserConfiguration {
     /// Gets or sets the audio language preference.
@@ -977,7 +977,7 @@ impl Default for EncodingOptions {
 /// The server configuration. Flattens the C# base
 /// `BaseApplicationConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfiguration {
     // --- Flattened BaseApplicationConfiguration fields ---
