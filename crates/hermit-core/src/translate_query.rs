@@ -522,6 +522,23 @@ fn append_name_predicates(
         }
     }
 
+    // Batch form of the exact-name match: `CleanName IN (…)`. Used to resolve a
+    // whole page of by-name items (people, years) in one query instead of N.
+    let clean_names: Vec<String> = filter
+        .names
+        .iter()
+        .filter_map(|n| non_blank(Some(n)))
+        .map(get_clean_value)
+        .collect();
+    if !clean_names.is_empty() {
+        qb.push(r#" AND bi."CleanName" IN ("#);
+        let mut sep = qb.separated(", ");
+        for clean in &clean_names {
+            sep.push_bind(clean.clone());
+        }
+        qb.push(")");
+    }
+
     if let Some(contains) = non_blank(filter.name_contains.as_ref()) {
         let clean = format!("%{}%", get_clean_value(contains).trim_matches('%'));
         qb.push(r#" AND (bi."CleanName" LIKE "#)

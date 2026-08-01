@@ -394,22 +394,29 @@ impl HermitDtoService {
         };
         let people = self.library.get_people(&query).await?;
 
+        // Prefetch every credited person's image rows in one query instead of an
+        // N+1 `load_images` per cast/crew member — the dominant cost of a
+        // large-cast item detail. Failure stays lenient (no tags), as before.
+        let person_ids: Vec<Uuid> = people
+            .iter()
+            .map(|p| Uuid::parse_str(&p.id).unwrap_or_else(|_| Uuid::nil()))
+            .collect();
+        let images_by_person = self
+            .load_images_batch(&person_ids)
+            .await
+            .unwrap_or_default();
+
         let mut list = Vec::with_capacity(people.len());
         for person in people {
             let person_id = Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil());
             // Resolve the person's primary image tag (from the materialized Person
             // item's image rows) so the client renders cast/crew artwork.
-            let primary_image_tag = match self.load_images(person_id).await {
-                Ok(images) => {
-                    if let Some(primary) =
-                        images.iter().find(|i| i.image_type == ImageType::Primary)
-                    {
-                        self.image_tag(person_id, primary).await
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
+            let primary_image_tag = match images_by_person
+                .get(&person_id)
+                .and_then(|images| images.iter().find(|i| i.image_type == ImageType::Primary))
+            {
+                Some(primary) => self.image_tag(person_id, primary).await,
+                None => None,
             };
             list.push(BaseItemPerson {
                 name: Some(person.name),

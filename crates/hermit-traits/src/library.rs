@@ -447,20 +447,37 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalPeopleQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         let people = self.get_people(query).await?;
-        let mut items = Vec::with_capacity(people.len());
-        for person in people {
-            if let Some(item) = self
-                .get_named_item(BaseItemKind::Person, &person.name)
-                .await?
-            {
-                items.push(item);
-            }
-        }
+        let names: Vec<String> = people.into_iter().map(|p| p.name).collect();
+        let items: Vec<BaseItemEntity> = self
+            .get_named_items(BaseItemKind::Person, &names)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(QueryResult::new(
             query.start_index,
             Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),
             items,
         ))
+    }
+
+    /// Batch form of [`Self::get_named_item`]: resolves each of `names` to its
+    /// by-name item row of `kind`, returning one slot per input name in order
+    /// (`None` where no row resolves), so callers can preserve their paging.
+    ///
+    /// The default loops [`Self::get_named_item`]; the concrete manager overrides
+    /// it with a single `CleanName IN (…)` query — resolving a whole page of
+    /// people/years in one round-trip instead of N.
+    async fn get_named_items(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            out.push(self.get_named_item(kind, name).await?);
+        }
+        Ok(out)
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`
@@ -482,21 +499,28 @@ pub trait LibraryManager: Send + Sync {
         years.sort_unstable();
         years.dedup();
         let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
-        let mut items = Vec::new();
-        for year in years.into_iter().skip(start) {
-            if let Some(limit) = query.limit
-                && limit >= 0
-                && items.len() >= usize::try_from(limit).unwrap_or(usize::MAX)
-            {
-                break;
-            }
-            if let Some(item) = self
-                .get_named_item(BaseItemKind::Year, &year.to_string())
-                .await?
-            {
-                items.push(item);
-            }
-        }
+        // Page the year list first, then resolve the slice in one query. Years are
+        // materialized during the scan, so every one resolves — matching the old
+        // per-year loop that stopped once it had `limit` resolved items.
+        let paged: Vec<String> = match query.limit.filter(|l| *l >= 0) {
+            Some(limit) => years
+                .into_iter()
+                .skip(start)
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .map(|y| y.to_string())
+                .collect(),
+            None => years
+                .into_iter()
+                .skip(start)
+                .map(|y| y.to_string())
+                .collect(),
+        };
+        let items: Vec<BaseItemEntity> = self
+            .get_named_items(BaseItemKind::Year, &paged)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(QueryResult::new(
             query.start_index,
             Some(i32::try_from(items.len()).unwrap_or(i32::MAX)),

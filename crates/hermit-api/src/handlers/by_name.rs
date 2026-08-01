@@ -124,14 +124,14 @@ pub(crate) async fn project_item_rows(
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let start_index = Some(result.start_index);
     let total = Some(result.total_record_count);
-    let mut dtos = Vec::with_capacity(result.items.len());
-    for item in &result.items {
-        let dto = state
-            .dto
-            .get_item_by_name_dto(item, options, None, user)
-            .await?;
-        dtos.push(dto);
-    }
+    // With no pre-supplied tagged ids and no `ItemCounts` field requested (the
+    // by-name list options), `get_item_by_name_dto` reduces to `build_dto` — the
+    // same thing `get_base_item_dtos` does, but batching the per-item image and
+    // user-data loads into two queries instead of 2×N. Same rows, same order.
+    let dtos = state
+        .dto
+        .get_base_item_dtos(&result.items, options, user, None, true)
+        .await?;
     Ok(QueryResult::new(start_index, total, dtos))
 }
 
@@ -151,13 +151,20 @@ pub(crate) async fn project_query_result(
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
     let start_index = Some(result.start_index);
     let total = Some(result.total_record_count);
-    let mut dtos = Vec::with_capacity(result.items.len());
-    for ItemWithCounts { item, counts } in result.items {
-        let mut dto = state
-            .dto
-            .get_item_by_name_dto(&item, options, None, user)
-            .await?;
-        if include_item_types {
+    // Split the count-carrying aggregates into rows + counts; batch-build the
+    // DTOs (two prefetch queries instead of an N+1 loop), then fold the
+    // aggregated counts back on by index — order is preserved by the builder.
+    let (items, counts): (Vec<_>, Vec<_>) = result
+        .items
+        .into_iter()
+        .map(|iwc| (iwc.item, iwc.counts))
+        .unzip();
+    let mut dtos = state
+        .dto
+        .get_base_item_dtos(&items, options, user, None, true)
+        .await?;
+    if include_item_types {
+        for (dto, counts) in dtos.iter_mut().zip(counts.iter()) {
             dto.child_count = Some(counts.item_count);
             dto.program_count = Some(counts.program_count);
             dto.series_count = Some(counts.series_count);
@@ -168,7 +175,6 @@ pub(crate) async fn project_query_result(
             dto.song_count = Some(counts.song_count);
             dto.artist_count = Some(counts.artist_count);
         }
-        dtos.push(dto);
     }
     Ok(QueryResult::new(start_index, total, dtos))
 }

@@ -192,6 +192,48 @@ impl LibraryManager for HermitLibraryManager {
         self.items.get_item_list(query).await
     }
 
+    async fn get_named_items(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        let trimmed: Vec<String> = names.iter().map(|n| n.trim().to_owned()).collect();
+        let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
+        if lookup.is_empty() {
+            return Ok(vec![None; names.len()]);
+        }
+        // One `CleanName IN (…)` query for the whole page (the batch form of
+        // `get_named_item`, which matches by cleaned name filtered to `kind`).
+        let rows = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                names: lookup,
+                include_item_types: vec![kind],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        // Key by the row's stored CleanName (what the query matched on); first
+        // match wins, mirroring `get_named_item`'s `FirstOrDefault`.
+        let mut by_clean: HashMap<String, BaseItemEntity> = HashMap::new();
+        for row in rows {
+            if let Some(clean) = row.clean_name.clone() {
+                by_clean.entry(clean).or_insert(row);
+            }
+        }
+        Ok(trimmed
+            .into_iter()
+            .map(|n| {
+                if n.is_empty() {
+                    None
+                } else {
+                    by_clean
+                        .get(&crate::text_util::get_clean_value(&n))
+                        .cloned()
+                }
+            })
+            .collect())
+    }
+
     async fn get_latest_item_list(
         &self,
         query: &InternalItemsQuery,
@@ -666,6 +708,52 @@ mod tests {
             .expect("some");
         assert_eq!(found.id, id.to_string());
         assert_eq!(found.name.as_deref(), Some("Science Fiction"));
+    }
+
+    #[tokio::test]
+    async fn get_named_items_batches_and_preserves_order() {
+        let db = test_db().await;
+        let scifi = Uuid::from_u128(0x211);
+        let drama = Uuid::from_u128(0x212);
+        seed_named_item(&db, scifi, BaseItemKind::Genre, "Science Fiction").await;
+        set_clean_name(&db, scifi, "Science Fiction").await;
+        seed_named_item(&db, drama, BaseItemKind::Genre, "Drama").await;
+        set_clean_name(&db, drama, "Drama").await;
+        // A same-name row of a different kind must not leak into Genre results.
+        let studio = Uuid::from_u128(0x213);
+        seed_named_item(&db, studio, BaseItemKind::Studio, "Drama").await;
+        set_clean_name(&db, studio, "Drama").await;
+        let mgr = manager(&db);
+
+        // Order follows the input, unresolved names become None, and the
+        // wrong-kind "Drama" studio is excluded.
+        let names = vec![
+            "Drama".to_owned(),
+            "Nope".to_owned(),
+            "Science Fiction".to_owned(),
+        ];
+        let got = mgr
+            .get_named_items(BaseItemKind::Genre, &names)
+            .await
+            .expect("batch lookup");
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            got[0].as_ref().map(|e| e.id.clone()),
+            Some(drama.to_string())
+        );
+        assert!(got[1].is_none());
+        assert_eq!(
+            got[2].as_ref().map(|e| e.id.clone()),
+            Some(scifi.to_string())
+        );
+
+        // Empty input yields an empty result without a query.
+        assert!(
+            mgr.get_named_items(BaseItemKind::Genre, &[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

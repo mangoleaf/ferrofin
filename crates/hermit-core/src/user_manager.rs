@@ -27,6 +27,7 @@
 //!   load-bearing permission flags into `Permissions`; the broader
 //!   folder/channel/schedule policy mapping is a flagged follow-up.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -50,8 +51,8 @@ use crate::auth_providers::{
 };
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
-    get_preference, has_permission, is_parental_schedule_allowed, seed_defaults, set_permission,
-    set_permission_tx, set_preference,
+    has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
+    set_preference,
 };
 
 /// The C# type name of the default password-reset provider, stored on
@@ -707,12 +708,17 @@ impl UserManager for HermitUserManager {
         let id = &user.id;
         let pool = self.db.pool();
 
+        // Bulk-load this user's permissions and preferences up front — two indexed
+        // queries — instead of the ~40 per-kind lookups the policy/config build
+        // otherwise fans out (an N+1 that convoyed the pool under concurrent load).
+        let perms = load_permission_map(pool, id).await?;
+        let prefs = load_preference_map(pool, id).await?;
+
         // Config-only list-valued preferences → the DTO's Guid collections.
-        let ordered_views = guid_preference(pool, id, PreferenceKind::OrderedViews).await?;
-        let grouped_folders = guid_preference(pool, id, PreferenceKind::GroupedFolders).await?;
-        let my_media_excludes = guid_preference(pool, id, PreferenceKind::MyMediaExcludes).await?;
-        let latest_items_excludes =
-            guid_preference(pool, id, PreferenceKind::LatestItemExcludes).await?;
+        let ordered_views = guid_pref(&prefs, PreferenceKind::OrderedViews);
+        let grouped_folders = guid_pref(&prefs, PreferenceKind::GroupedFolders);
+        let my_media_excludes = guid_pref(&prefs, PreferenceKind::MyMediaExcludes);
+        let latest_items_excludes = guid_pref(&prefs, PreferenceKind::LatestItemExcludes);
 
         let configuration = UserConfiguration {
             subtitle_mode: subtitle_mode_from_i32(user.subtitle_mode),
@@ -737,7 +743,7 @@ impl UserManager for HermitUserManager {
             cast_receiver_id: user.cast_receiver_id.clone(),
         };
 
-        let policy = build_user_policy(pool, user).await?;
+        let policy = build_user_policy(pool, user, &perms, &prefs).await?;
 
         Ok(UserDto {
             name: Some(user.username.clone()),
@@ -970,23 +976,83 @@ impl UserManager for HermitUserManager {
 /// permission flags, and a single struct literal reads best (splitting it would
 /// only scatter the mapping), so the line-count lint is allowed here.
 #[allow(clippy::too_many_lines)]
+/// Loads all of a user's permission rows in one query, keyed by `Kind`.
+///
+/// Replaces the per-kind `has_permission` fan-out when building a `UserDto`: the
+/// `(UserId, Kind)` unique index makes this one indexed scan of the handful of
+/// rows a user owns.
+async fn load_permission_map(
+    pool: &sqlx::sqlite::SqlitePool,
+    user_id: &str,
+) -> Result<HashMap<i32, bool>, ServiceError> {
+    let rows: Vec<(i32, bool)> =
+        sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?1"#)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Loads all of a user's preference rows in one query, keyed by `Kind` (the raw
+/// stored string; list values are delimiter-joined and split by [`pref`]).
+async fn load_preference_map(
+    pool: &sqlx::sqlite::SqlitePool,
+    user_id: &str,
+) -> Result<HashMap<i32, String>, ServiceError> {
+    let rows: Vec<(i32, String)> =
+        sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?1"#)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await
+            .map_err(db_err)?;
+    Ok(rows.into_iter().collect())
+}
+
+/// A permission's value from a preloaded map, defaulting to `false` when absent
+/// (C# `Permissions.FirstOrDefault(...)?.Value ?? false`).
+fn perm(map: &HashMap<i32, bool>, kind: PermissionKind) -> bool {
+    map.get(&i32::from(kind)).copied().unwrap_or(false)
+}
+
+/// A list-valued preference from a preloaded map, split on the stored `,`
+/// delimiter (the same split `get_preference` does per-row).
+fn pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<String> {
+    match map.get(&i32::from(kind)) {
+        Some(v) if !v.is_empty() => v.split(',').map(str::to_owned).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A list-valued preference parsed as [`Uuid`]s, discarding unparseable entries
+/// (C# `GetPreferenceValues<Guid>`).
+fn guid_pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<Uuid> {
+    pref(map, kind)
+        .iter()
+        .filter_map(|v| Uuid::parse_str(v).ok())
+        .collect()
+}
+
 async fn build_user_policy(
     pool: &sqlx::sqlite::SqlitePool,
     user: &UserEntity,
+    perms: &HashMap<i32, bool>,
+    prefs: &HashMap<i32, String>,
 ) -> Result<UserPolicy, ServiceError> {
     let id = &user.id;
 
-    let blocked_tags = get_preference(pool, id, PreferenceKind::BlockedTags).await?;
-    let allowed_tags = get_preference(pool, id, PreferenceKind::AllowedTags).await?;
-    let enabled_channels = guid_preference(pool, id, PreferenceKind::EnabledChannels).await?;
-    let enabled_devices = get_preference(pool, id, PreferenceKind::EnabledDevices).await?;
-    let enabled_folders = guid_preference(pool, id, PreferenceKind::EnabledFolders).await?;
-    let content_deletion_folders =
-        get_preference(pool, id, PreferenceKind::EnableContentDeletionFromFolders).await?;
-    let blocked_channels = guid_preference(pool, id, PreferenceKind::BlockedChannels).await?;
-    let blocked_media_folders =
-        guid_preference(pool, id, PreferenceKind::BlockedMediaFolders).await?;
-    let block_unrated_items = unrated_preference(pool, id).await?;
+    let blocked_tags = pref(prefs, PreferenceKind::BlockedTags);
+    let allowed_tags = pref(prefs, PreferenceKind::AllowedTags);
+    let enabled_channels = guid_pref(prefs, PreferenceKind::EnabledChannels);
+    let enabled_devices = pref(prefs, PreferenceKind::EnabledDevices);
+    let enabled_folders = guid_pref(prefs, PreferenceKind::EnabledFolders);
+    let content_deletion_folders = pref(prefs, PreferenceKind::EnableContentDeletionFromFolders);
+    let blocked_channels = guid_pref(prefs, PreferenceKind::BlockedChannels);
+    let blocked_media_folders = guid_pref(prefs, PreferenceKind::BlockedMediaFolders);
+    let block_unrated_items = pref(prefs, PreferenceKind::BlockUnratedItems)
+        .iter()
+        .filter_map(|v| parse_unrated_item(v))
+        .collect();
 
     Ok(UserPolicy {
         max_parental_rating: user.max_parental_rating_score.map(cast_i32),
@@ -998,78 +1064,39 @@ async fn build_user_policy(
         invalid_login_attempt_count: cast_i32(user.invalid_login_attempt_count),
         login_attempts_before_lockout: user.login_attempts_before_lockout.map_or(-1, cast_i32),
         max_active_sessions: cast_i32(user.max_active_sessions),
-        is_administrator: has_permission(pool, id, PermissionKind::IsAdministrator).await?,
-        is_hidden: has_permission(pool, id, PermissionKind::IsHidden).await?,
-        is_disabled: has_permission(pool, id, PermissionKind::IsDisabled).await?,
-        enable_shared_device_control: has_permission(
-            pool,
-            id,
-            PermissionKind::EnableSharedDeviceControl,
-        )
-        .await?,
-        enable_remote_access: has_permission(pool, id, PermissionKind::EnableRemoteAccess).await?,
-        enable_live_tv_management: has_permission(pool, id, PermissionKind::EnableLiveTvManagement)
-            .await?,
-        enable_live_tv_access: has_permission(pool, id, PermissionKind::EnableLiveTvAccess).await?,
-        enable_media_playback: has_permission(pool, id, PermissionKind::EnableMediaPlayback)
-            .await?,
-        enable_audio_playback_transcoding: has_permission(
-            pool,
-            id,
+        is_administrator: perm(perms, PermissionKind::IsAdministrator),
+        is_hidden: perm(perms, PermissionKind::IsHidden),
+        is_disabled: perm(perms, PermissionKind::IsDisabled),
+        enable_shared_device_control: perm(perms, PermissionKind::EnableSharedDeviceControl),
+        enable_remote_access: perm(perms, PermissionKind::EnableRemoteAccess),
+        enable_live_tv_management: perm(perms, PermissionKind::EnableLiveTvManagement),
+        enable_live_tv_access: perm(perms, PermissionKind::EnableLiveTvAccess),
+        enable_media_playback: perm(perms, PermissionKind::EnableMediaPlayback),
+        enable_audio_playback_transcoding: perm(
+            perms,
             PermissionKind::EnableAudioPlaybackTranscoding,
-        )
-        .await?,
-        enable_video_playback_transcoding: has_permission(
-            pool,
-            id,
+        ),
+        enable_video_playback_transcoding: perm(
+            perms,
             PermissionKind::EnableVideoPlaybackTranscoding,
-        )
-        .await?,
-        enable_content_deletion: has_permission(pool, id, PermissionKind::EnableContentDeletion)
-            .await?,
-        enable_content_downloading: has_permission(
-            pool,
-            id,
-            PermissionKind::EnableContentDownloading,
-        )
-        .await?,
-        enable_sync_transcoding: has_permission(pool, id, PermissionKind::EnableSyncTranscoding)
-            .await?,
-        enable_media_conversion: has_permission(pool, id, PermissionKind::EnableMediaConversion)
-            .await?,
-        enable_all_channels: has_permission(pool, id, PermissionKind::EnableAllChannels).await?,
-        enable_all_devices: has_permission(pool, id, PermissionKind::EnableAllDevices).await?,
-        enable_all_folders: has_permission(pool, id, PermissionKind::EnableAllFolders).await?,
-        enable_remote_control_of_other_users: has_permission(
-            pool,
-            id,
+        ),
+        enable_content_deletion: perm(perms, PermissionKind::EnableContentDeletion),
+        enable_content_downloading: perm(perms, PermissionKind::EnableContentDownloading),
+        enable_sync_transcoding: perm(perms, PermissionKind::EnableSyncTranscoding),
+        enable_media_conversion: perm(perms, PermissionKind::EnableMediaConversion),
+        enable_all_channels: perm(perms, PermissionKind::EnableAllChannels),
+        enable_all_devices: perm(perms, PermissionKind::EnableAllDevices),
+        enable_all_folders: perm(perms, PermissionKind::EnableAllFolders),
+        enable_remote_control_of_other_users: perm(
+            perms,
             PermissionKind::EnableRemoteControlOfOtherUsers,
-        )
-        .await?,
-        enable_playback_remuxing: has_permission(pool, id, PermissionKind::EnablePlaybackRemuxing)
-            .await?,
-        force_remote_source_transcoding: has_permission(
-            pool,
-            id,
-            PermissionKind::ForceRemoteSourceTranscoding,
-        )
-        .await?,
-        enable_public_sharing: has_permission(pool, id, PermissionKind::EnablePublicSharing)
-            .await?,
-        enable_collection_management: has_permission(
-            pool,
-            id,
-            PermissionKind::EnableCollectionManagement,
-        )
-        .await?,
-        enable_subtitle_management: has_permission(
-            pool,
-            id,
-            PermissionKind::EnableSubtitleManagement,
-        )
-        .await?,
-        enable_lyric_management: has_permission(pool, id, PermissionKind::EnableLyricManagement)
-            .await?,
+        ),
+        enable_playback_remuxing: perm(perms, PermissionKind::EnablePlaybackRemuxing),
+        force_remote_source_transcoding: perm(perms, PermissionKind::ForceRemoteSourceTranscoding),
+        enable_public_sharing: perm(perms, PermissionKind::EnablePublicSharing),
+        enable_collection_management: perm(perms, PermissionKind::EnableCollectionManagement),
+        enable_subtitle_management: perm(perms, PermissionKind::EnableSubtitleManagement),
+        enable_lyric_management: perm(perms, PermissionKind::EnableLyricManagement),
         access_schedules: access_schedules(pool, id).await?,
         blocked_tags,
         allowed_tags,
@@ -1095,34 +1122,6 @@ async fn set_uuid_preference(
 ) -> Result<(), ServiceError> {
     let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
     set_preference(pool, user_id, kind, &strings).await
-}
-
-/// Reads a list-valued preference and parses each entry as a [`Uuid`],
-/// discarding any that do not parse (C# `GetPreferenceValues<Guid>`).
-async fn guid_preference(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-    kind: PreferenceKind,
-) -> Result<Vec<Uuid>, ServiceError> {
-    let values = get_preference(pool, user_id, kind).await?;
-    Ok(values
-        .iter()
-        .filter_map(|v| Uuid::parse_str(v).ok())
-        .collect())
-}
-
-/// Reads the `BlockUnratedItems` preference, parsing each entry as an
-/// [`UnratedItem`] (C# `GetPreferenceValues<UnratedItem>`). Entries are stored
-/// as the enum's PascalCase name; unrecognized entries are skipped.
-async fn unrated_preference(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-) -> Result<Vec<UnratedItem>, ServiceError> {
-    let values = get_preference(pool, user_id, PreferenceKind::BlockUnratedItems).await?;
-    Ok(values
-        .iter()
-        .filter_map(|v| parse_unrated_item(v))
-        .collect())
 }
 
 /// Loads a user's access schedules as wire [`AccessSchedule`] rows.
