@@ -3,3 +3,5 @@ fixtures/
 results/*.md
 results/raw/
 !results/raw/.gitkeep
+bench-data.json
+

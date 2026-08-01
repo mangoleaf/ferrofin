@@ -148,6 +148,79 @@ export const ENDPOINTS = [
   { name: 'item_ancestors', path: (c) => `/Items/${c.itemId}/Ancestors?userId=${c.userId}` },
   { name: 'item_images', path: (c) => `/Items/${c.itemId}/Images` },
   { name: 'item_similar', path: (c) => `/Items/${c.itemId}/Similar?userId=${c.userId}&limit=12` },
+
+  // ── Broader read surface ──────────────────────────────────────────────────
+  // Every endpoint below is a GET the parity ledger certifies both servers answer
+  // 200 (parity/ledger.json, note "H=200 J=200"), needing only userId/itemId — so
+  // no extra setup ids and parity.js stays in lockstep. Grouped by subsystem.
+
+  // System / diagnostics / meta.
+  { name: 'system_ping', path: () => '/System/Ping' },
+  { name: 'system_storage', path: () => '/System/Info/Storage' },
+  { name: 'system_config', path: () => '/System/Configuration' },
+  { name: 'metadata_options', path: () => '/System/Configuration/MetadataOptions/Default' },
+  { name: 'activity_log', path: () => '/System/ActivityLog/Entries' },
+  { name: 'system_logs', path: () => '/System/Logs' },
+  { name: 'utc_time', path: () => '/GetUtcTime' },
+
+  // Localization / branding / auth dictionaries (cheap, mostly-static payloads).
+  { name: 'loc_countries', path: () => '/Localization/Countries' },
+  { name: 'loc_options', path: () => '/Localization/Options' },
+  { name: 'loc_parental', path: () => '/Localization/ParentalRatings' },
+  { name: 'branding', path: () => '/Branding/Configuration' },
+  { name: 'auth_providers', path: () => '/Auth/Providers' },
+  { name: 'auth_pw_providers', path: () => '/Auth/PasswordResetProviders' },
+  { name: 'auth_keys', path: () => '/Auth/Keys' },
+  { name: 'quick_connect', path: () => '/QuickConnect/Enabled' },
+
+  // Users / devices / view grouping.
+  { name: 'users_all', path: () => '/Users' },
+  { name: 'users_public', path: () => '/Users/Public' },
+  { name: 'devices', path: () => '/Devices' },
+  { name: 'grouping_options', path: () => '/UserViews/GroupingOptions' },
+
+  // Library configuration + faceted browse.
+  { name: 'physical_paths', path: () => '/Library/PhysicalPaths' },
+  { name: 'available_options', path: () => '/Libraries/AvailableOptions' },
+  { name: 'items_counts', path: (c) => `/Items/Counts?userId=${c.userId}` },
+  { name: 'items_filters2', path: (c) => `/Items/Filters2?userId=${c.userId}&includeItemTypes=Movie` },
+  { name: 'suggestions', path: (c) => `/Items/Suggestions?userId=${c.userId}&limit=20` },
+  { name: 'artists', path: (c) => `/Artists?userId=${c.userId}` },
+  { name: 'album_artists', path: (c) => `/Artists/AlbumArtists?userId=${c.userId}` },
+  { name: 'music_genres', path: (c) => `/MusicGenres?userId=${c.userId}` },
+  { name: 'movie_recommendations', path: (c) => `/Movies/Recommendations?userId=${c.userId}&categoryLimit=6&itemLimit=8` },
+
+  // Query-planner variety — same /Items path, different sort/filter/paging shapes.
+  { name: 'items_random', path: (c) => `/Items?userId=${c.userId}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=Random` },
+  { name: 'items_rating', path: (c) => `/Items?userId=${c.userId}&recursive=true&includeItemTypes=Movie&limit=50&sortBy=CommunityRating&sortOrder=Descending` },
+  { name: 'items_paged', path: (c) => `/Items?userId=${c.userId}&recursive=true&includeItemTypes=Movie&startIndex=100&limit=50&sortBy=SortName` },
+  { name: 'items_boxset', path: (c) => `/Items?userId=${c.userId}&recursive=true&includeItemTypes=BoxSet&limit=50` },
+  { name: 'items_favorite', path: (c) => `/Items?userId=${c.userId}&recursive=true&includeItemTypes=Movie&limit=50&filters=IsFavorite` },
+
+  // Channels / SyncPlay / Live TV subsystem handlers (return empty defaults, but
+  // exercise the real route + serializer on both servers).
+  { name: 'channels', path: () => '/Channels' },
+  { name: 'syncplay_list', path: () => '/SyncPlay/List' },
+  { name: 'livetv_info', path: () => '/LiveTv/Info' },
+  { name: 'livetv_channels', path: () => '/LiveTv/Channels' },
+  { name: 'livetv_programs', path: () => '/LiveTv/Programs' },
+  { name: 'livetv_recordings', path: () => '/LiveTv/Recordings' },
+  { name: 'livetv_series_timers', path: () => '/LiveTv/SeriesTimers' },
+  { name: 'livetv_timers', path: () => '/LiveTv/Timers' },
+
+  // Item detail sub-resources (all keyed on the picked movie itemId).
+  { name: 'item_playbackinfo', path: (c) => `/Items/${c.itemId}/PlaybackInfo?userId=${c.userId}` },
+  { name: 'item_external_ids', path: (c) => `/Items/${c.itemId}/ExternalIdInfos` },
+  { name: 'item_critic_reviews', path: (c) => `/Items/${c.itemId}/CriticReviews` },
+  { name: 'item_intros', path: (c) => `/Items/${c.itemId}/Intros?userId=${c.userId}` },
+  { name: 'item_special_features', path: (c) => `/Items/${c.itemId}/SpecialFeatures?userId=${c.userId}` },
+  { name: 'item_local_trailers', path: (c) => `/Items/${c.itemId}/LocalTrailers?userId=${c.userId}` },
+  { name: 'item_theme_media', path: (c) => `/Items/${c.itemId}/ThemeMedia?userId=${c.userId}` },
+  { name: 'item_instant_mix', path: (c) => `/Items/${c.itemId}/InstantMix?userId=${c.userId}&limit=20` },
+  { name: 'item_userdata', path: (c) => `/UserItems/${c.itemId}/UserData?userId=${c.userId}` },
+  { name: 'item_similar_movie', path: (c) => `/Movies/${c.itemId}/Similar?userId=${c.userId}&limit=12` },
+  { name: 'media_segments', path: (c) => `/MediaSegments/${c.itemId}` },
+
   // Image serve + resize (hermit-drawing). Best-effort: N/A if no local poster is discovered.
   { name: 'image_primary', path: (c) => `/Items/${c.imageItemId}/Images/Primary?fillHeight=400&fillWidth=400` },
 ];
