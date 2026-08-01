@@ -52,18 +52,15 @@ create-release:
       # Latest release tag (sed -n 1p reads to EOF — no head/SIGPIPE 141).
       LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
       if [ -n "$LATEST" ]; then BASE="$LATEST"; RANGE="${LATEST}..HEAD"; else BASE="v0.0.0"; RANGE=""; fi
-      # Derive the bump from Conventional Commits since the last release. grep -c
-      # reads all input (no early-exit SIGPIPE); || true covers zero matches.
-      # A breaking change is a `type!:` subject OR a real footer line that STARTS
-      # with `BREAKING CHANGE:`/`BREAKING-CHANGE:` — anchored so that prose merely
-      # mentioning the phrase (e.g. this file's own docs) does NOT trip it.
+      # Derive the bump from the Conventional Commit SUBJECT line only (never the
+      # body — prose there, e.g. docs, must not sway the version). grep -c reads
+      # all input (no early-exit SIGPIPE); || true covers zero matches.
+      #   type!: (feat!:, fix!:, ...) -> breaking ;  feat: -> minor ;  else patch.
       SUBJECTS=$(git log --format='%s' $RANGE)
-      BODIES=$(git log --format='%b' $RANGE)
       BANG=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^[a-z]+(\([^)]*\))?!:' || true)
-      FOOTER=$(printf '%s\n' "$BODIES" | grep -Ec '^BREAKING[ -]CHANGE:' || true)
       FEAT=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^feat(\([^)]*\))?:' || true)
       V="${BASE#v}"; MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
-      if [ "$BANG" -gt 0 ] || [ "$FOOTER" -gt 0 ]; then
+      if [ "$BANG" -gt 0 ]; then
         # SemVer 0.x rule: while major==0 a breaking change bumps MINOR — it must
         # never auto-jump to 1.0.0. Cutting 1.0.0 is deliberate: FORCE_VERSION=v1.0.0.
         if [ "$MAJOR" -eq 0 ]; then LEVEL=minor; else LEVEL=major; fi
