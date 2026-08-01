@@ -129,6 +129,17 @@ impl ChapterManager for HermitChapterManager {
             .collect())
     }
 
+    async fn get_chapters_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ChapterInfo>>, ServiceError> {
+        let rows = self.repository.get_chapters_batch(item_ids).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, chapters)| (id, chapters.into_iter().map(Self::to_info).collect()))
+            .collect())
+    }
+
     async fn delete_chapter_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.repository.delete_chapters(item_id).await
     }

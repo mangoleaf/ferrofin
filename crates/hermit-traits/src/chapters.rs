@@ -52,6 +52,19 @@ pub trait ChapterManager: Send + Sync {
     /// Gets all chapters for an item, ordered by position.
     async fn get_chapters(&self, item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError>;
 
+    /// Batch form of [`Self::get_chapters`] for a page, keyed by item. The default
+    /// loops the single-item form; the concrete manager overrides it.
+    async fn get_chapters_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ChapterInfo>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            map.insert(id, self.get_chapters(id).await?);
+        }
+        Ok(map)
+    }
+
     /// Deletes all chapter data for an item.
     async fn delete_chapter_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
 }

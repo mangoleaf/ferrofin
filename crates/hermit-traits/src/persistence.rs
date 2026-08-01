@@ -479,6 +479,20 @@ pub trait ChapterRepository: Send + Sync {
     /// Gets all chapters of an item, in order.
     async fn get_chapters(&self, item_id: Uuid) -> Result<Vec<ChapterEntity>, ServiceError>;
 
+    /// Gets every chapter for a set of item ids in one query, keyed by item. The
+    /// default loops [`Self::get_chapters`]; the concrete repository overrides it
+    /// with a single `ItemId IN (…)` query for list DTO projection.
+    async fn get_chapters_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ChapterEntity>>, ServiceError> {
+        let mut map = std::collections::HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            map.insert(id, self.get_chapters(id).await?);
+        }
+        Ok(map)
+    }
+
     /// Gets a single chapter of an item by index, or `None`.
     async fn get_chapter(
         &self,

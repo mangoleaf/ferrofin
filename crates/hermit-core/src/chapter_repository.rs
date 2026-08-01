@@ -99,6 +99,37 @@ impl ChapterRepository for HermitChapterRepository {
         Ok(rows)
     }
 
+    async fn get_chapters_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<ChapterEntity>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<ChapterEntity>> =
+            std::collections::HashMap::with_capacity(item_ids.len());
+        if item_ids.is_empty() {
+            return Ok(map);
+        }
+        for chunk in item_ids.chunks(500) {
+            let ph = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "Chapters" WHERE "ItemId" IN ({ph})
+                   ORDER BY "ItemId", "StartPositionTicks""#,
+            );
+            let mut query = sqlx::query_as::<_, ChapterEntity>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(id).or_default().push(row);
+                }
+            }
+        }
+        Ok(map)
+    }
+
     async fn get_chapter(
         &self,
         item_id: Uuid,

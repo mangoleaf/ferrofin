@@ -101,6 +101,14 @@ struct Prefetched {
     /// artist name across the page, so `attach_studios`/`_genres`/`_artists`
     /// resolve from memory instead of a query per name.
     value_ids: HashMap<(i32, String), Uuid>,
+    /// Chapters per item id (populated only when the `Chapters` field is requested).
+    chapters: HashMap<Uuid, Vec<hermit_model::entities_media::ChapterInfo>>,
+    /// Trickplay manifest per item id (populated only when the `Trickplay` field
+    /// is requested).
+    trickplay: HashMap<
+        Uuid,
+        HashMap<String, HashMap<i32, hermit_db::entities::playback::TrickplayInfoEntity>>,
+    >,
 }
 use crate::kinds;
 
@@ -953,14 +961,20 @@ impl HermitDtoService {
 
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
-                let manifest = self.trickplay.get_trickplay_manifest(item_id).await?;
+                let manifest = match prefetched {
+                    Some(p) => p.trickplay.get(&item_id).cloned().unwrap_or_default(),
+                    None => self.trickplay.get_trickplay_manifest(item_id).await?,
+                };
                 dto.trickplay = Some(to_trickplay_manifest(&manifest));
             }
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
         if options.contains_field(ItemFields::Chapters) {
-            dto.chapters = Some(self.chapters.get_chapters(item_id).await?);
+            dto.chapters = Some(match prefetched {
+                Some(p) => p.chapters.get(&item_id).cloned().unwrap_or_default(),
+                None => self.chapters.get_chapters(item_id).await?,
+            });
         }
 
         // Media streams.
@@ -1276,6 +1290,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         Ok(dto)
     }
 
+    #[allow(clippy::too_many_lines)] // a flat sequence of independent page prefetches
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
@@ -1374,6 +1389,16 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             }
             self.resolve_value_ids(&pairs).await?
         };
+        let chapters = if options.contains_field(ItemFields::Chapters) {
+            self.chapters.get_chapters_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        let trickplay = if options.contains_field(ItemFields::Trickplay) {
+            self.trickplay.get_trickplay_manifest_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
         let prefetched = Prefetched {
             images,
             user_data,
@@ -1382,6 +1407,8 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             people,
             person_images,
             value_ids,
+            chapters,
+            trickplay,
         };
 
         let mut out = Vec::with_capacity(items.len());

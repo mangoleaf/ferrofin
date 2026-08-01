@@ -683,6 +683,44 @@ impl TrickplayManager for HermitTrickplayManager {
         Ok(manifest)
     }
 
+    async fn get_trickplay_manifest_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>>, ServiceError>
+    {
+        let mut out: HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>> =
+            HashMap::with_capacity(item_ids.len());
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        // One query for the page's resolutions, grouped into a per-item manifest
+        // (media-source id = the item's own id, as the single-item form does).
+        for chunk in item_ids.chunks(500) {
+            let ph = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT * FROM "TrickplayInfos" WHERE "ItemId" IN ({ph})
+                   ORDER BY "ItemId", "Width""#,
+            );
+            let mut query = sqlx::query_as::<_, TrickplayInfoEntity>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    out.entry(id)
+                        .or_default()
+                        .entry(row.item_id.clone())
+                        .or_default()
+                        .insert(row.width, row);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     async fn get_hls_playlist(
         &self,
         item_id: Uuid,

@@ -69,6 +69,21 @@ pub trait TrickplayManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError>;
 
+    /// Batch form of [`Self::get_trickplay_manifest`] for a page, keyed by item.
+    /// The default loops the single-item form; the concrete manager overrides it
+    /// with one query for list DTO projection.
+    async fn get_trickplay_manifest_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>>, ServiceError>
+    {
+        let mut map = HashMap::with_capacity(item_ids.len());
+        for &id in item_ids {
+            map.insert(id, self.get_trickplay_manifest(id).await?);
+        }
+        Ok(map)
+    }
+
     /// Builds the trickplay HLS (`.m3u8`) playlist text for a resolution.
     async fn get_hls_playlist(
         &self,
