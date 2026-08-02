@@ -11,9 +11,21 @@ RUN --mount=type=cache,target=/src/target,id=hermit-target \
     cargo build --release -p hermit-server \
  && cp /src/target/release/hermit-server /usr/local/bin/hermit-server
 
+# jellyfin-ffmpeg instead of Debian's ffmpeg: it carries the SIMD single-pass
+# `tonemapx` HDR→SDR filter (several× faster than vanilla ffmpeg's zscale chain
+# on a 4K HDR encode — the difference that put Jellyfin ahead on TTFS) plus a
+# current ffmpeg/libx264. Symlinked onto $PATH so Hermit's discovery finds it.
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+ && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
+      | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian bookworm main" \
+      > /etc/apt/sources.list.d/jellyfin.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+ && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
+ && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/hermit-server /usr/local/bin/hermit-server
 EXPOSE 8096

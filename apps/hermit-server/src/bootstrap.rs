@@ -27,6 +27,19 @@ pub struct FfmpegPaths {
     pub ffmpeg: PathBuf,
     /// The validated `ffprobe` executable path.
     pub ffprobe: PathBuf,
+    /// The filter names the validated ffmpeg reported via `-filters` (empty
+    /// when the probe failed). Gates capability-specific arguments like the
+    /// jellyfin-ffmpeg-only `tonemapx` software tonemap.
+    pub filters: Vec<String>,
+}
+
+impl FfmpegPaths {
+    /// Whether the validated ffmpeg reports the filter `name`. Port of
+    /// `IMediaEncoder.SupportsFilter`.
+    #[must_use]
+    pub fn supports_filter(&self, name: &str) -> bool {
+        self.filters.iter().any(|f| f == name)
+    }
 }
 
 /// Initialises the global `tracing` subscriber from the configured log filter.
@@ -159,12 +172,48 @@ pub async fn discover_ffmpeg(
             )
         })?;
 
+    let filters = probe_filters(&ffmpeg).await;
     tracing::info!(
         ffmpeg = %ffmpeg.display(),
         ffprobe = %ffprobe.display(),
+        filters = filters.len(),
+        tonemapx = filters.iter().any(|f| f == "tonemapx"),
         "media encoder ready"
     );
-    Ok(FfmpegPaths { ffmpeg, ffprobe })
+    Ok(FfmpegPaths {
+        ffmpeg,
+        ffprobe,
+        filters,
+    })
+}
+
+/// Captures `ffmpeg -filters` and parses the available filter names.
+///
+/// Port of `EncoderValidator.GetFFmpegFilters` (the process half; the parse is
+/// [`EncoderValidator::get_filters_internal`]). A probe failure is not fatal —
+/// capability-gated arguments are simply skipped — so errors log and return an
+/// empty list, matching the C# catch-and-return-empty.
+async fn probe_filters(ffmpeg: &Path) -> Vec<String> {
+    let output = tokio::process::Command::new(ffmpeg)
+        .args(["-hide_banner", "-filters"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            EncoderValidator::get_filters_internal(&String::from_utf8_lossy(&out.stdout))
+        }
+        Ok(out) => {
+            tracing::warn!(status = %out.status, "`ffmpeg -filters` failed; assuming no optional filters");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "error detecting available filters");
+            Vec::new()
+        }
+    }
 }
 
 /// Picks the ffmpeg candidate path and a human label for how it was found,
@@ -407,8 +456,16 @@ mod tests {
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
         // `ffprobe` banner (whose first line the `^ffmpeg version` regex skips).
+        // A `-filters` invocation instead answers with a tiny filter table so
+        // `probe_filters` has something to parse.
         let script = format!(
-            "#!/bin/sh\ncat <<'EOF'\n{banner_tool} version 6.1.1 Copyright (c) 2000-2023\n\
+            "#!/bin/sh\n\
+             if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
+             \x20 T.. = Timeline support\n\
+             \x20T.C scale             V->V       Scale the input video size.\n\
+             \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
+             EOF\nexit 0; fi\n\
+             cat <<'EOF'\n{banner_tool} version 6.1.1 Copyright (c) 2000-2023\n\
              libavutil      58. 29.100\nlibavcodec     60. 31.102\nlibavformat    60. 16.100\n\
              libavdevice    60.  3.100\nlibavfilter     9. 12.100\nlibswscale      7.  5.100\n\
              libswresample   4. 12.100\nEOF\n"
@@ -435,6 +492,10 @@ mod tests {
             .expect("discovery succeeds");
         assert_eq!(paths.ffmpeg, ffmpeg);
         assert_eq!(paths.ffprobe, tmp.path().join("ffprobe"));
+        // The `-filters` probe parsed the fake's filter table.
+        assert!(paths.supports_filter("tonemapx"));
+        assert!(paths.supports_filter("scale"));
+        assert!(!paths.supports_filter("tonemap_cuda"));
     }
 
     #[cfg(unix)]

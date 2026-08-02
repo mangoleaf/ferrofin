@@ -36,6 +36,13 @@ static LIBRARY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
+/// `^\s\S{2,3}\s(?<filter>[\w|-]+)\s+.+$` (multiline) — matches each filter
+/// name in `ffmpeg -filters` output (one leading space, the 2–3 char capability
+/// flags, the name). The legend lines are indented two spaces and never match.
+static FILTER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s\S{2,3}\s(?P<filter>[\w|-]+)\s+.+$").expect("valid regex")
+});
+
 /// The library versions corresponding to the minimum ffmpeg version 4.4.
 ///
 /// Refers to the versions in <https://ffmpeg.org/download.html>. Used to work
@@ -147,6 +154,22 @@ impl EncoderValidator {
         }
     }
 
+    /// Parses captured `ffmpeg -filters` output into the available filter names.
+    ///
+    /// The pure half of C# `GetFFmpegFilters`: the caller shells out for the
+    /// output (the process seam stays outside this unit, like the version
+    /// probes) and consults the returned names for capability-gated arguments
+    /// (e.g. the jellyfin-ffmpeg-only `tonemapx` software tonemap). The C#
+    /// intersection with its `_requiredFilters` allowlist is skipped — callers
+    /// check exactly the filters they need.
+    #[must_use]
+    pub fn get_filters_internal(output: &str) -> Vec<String> {
+        FILTER_REGEX
+            .captures_iter(output)
+            .map(|caps| caps["filter"].to_owned())
+            .collect()
+    }
+
     /// Grabs the library names and `major.minor` versions from `ffmpeg -version`
     /// output. Mirrors C# `GetFFmpegLibraryVersions`.
     fn get_ffmpeg_library_versions(output: &str) -> HashMap<String, FfmpegVersion> {
@@ -209,5 +232,22 @@ mod tests {
     #[case(d::FFMPEG_GIT_UNKNOWN_OUTPUT, false)]
     fn validate_version_internal_test(#[case] version_output: &str, #[case] valid: bool) {
         assert_eq!(valid, validator().validate_version_internal(version_output));
+    }
+
+    #[test]
+    fn get_filters_internal_parses_names_and_skips_legend() {
+        // Shape of real `ffmpeg -filters` output: a header, two-space-indented
+        // legend lines, then one-space-indented ` <flags> <name> <io> <desc>`.
+        let output = "Filters:\n\
+             \x20 T.. = Timeline support\n\
+             \x20 .S. = Slice threading\n\
+             \x20 A = Audio input/output\n\
+             \x20... abench            A->A       Benchmark part of a filtergraph.\n\
+             \x20T.C scale             V->V       Scale the input video size.\n\
+             \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
+             \x20..C scale_cuda        V->V       GPU accelerated video resizer.\n";
+        let filters = EncoderValidator::get_filters_internal(output);
+        assert_eq!(filters, ["abench", "scale", "tonemapx", "scale_cuda"]);
+        assert!(EncoderValidator::get_filters_internal("").is_empty());
     }
 }

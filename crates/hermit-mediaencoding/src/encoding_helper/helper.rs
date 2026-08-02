@@ -991,6 +991,34 @@ pub const SOFTWARE_TONEMAP_FILTER: &str = "zscale=t=linear:npl=100,format=gbrpf3
                                            zscale=p=bt709,tonemap=tonemap=hable:desat=0,\
                                            zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
 
+/// The `tonemapx` software HDR→SDR tonemap filter (jellyfin-ffmpeg only).
+///
+/// Port of the software-tonemap branch of upstream
+/// `GetVideoProcessingFilterParam` with the default `EncodingOptions`
+/// (algorithm `bt2390`, desat `0`, peak `100`, param unset, range `auto`):
+/// one SIMD pass straight to 8-bit `yuv420p`. Several times faster than the
+/// [`SOFTWARE_TONEMAP_FILTER`] zscale chain on a 4K HDR encode — it is what
+/// puts Jellyfin ahead on time-to-first-segment — but the filter only exists
+/// in jellyfin-ffmpeg builds, so callers must gate on the probed filter list.
+pub const SOFTWARE_TONEMAPX_FILTER: &str =
+    "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p";
+
+/// The `setparams` filter tagging input frames with their HDR colour metadata,
+/// emitted ahead of a `tonemapx` so untagged streams still tonemap correctly.
+///
+/// Port of `GetInputHdrParam`: an HLG source (`arib-std-b67` transfer) keeps
+/// its transfer, everything else is tagged HDR10 (`smpte2084`).
+#[must_use]
+pub fn input_hdr_setparams(color_transfer: Option<&str>) -> &'static str {
+    if color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67")) {
+        // HLG
+        "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc"
+    } else {
+        // HDR10
+        "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc"
+    }
+}
+
 /// Whether a re-encoded video stream needs the HDR→SDR tonemap chain.
 ///
 /// True when the source stream carries an HDR transfer (HDR10/HLG/Dolby
@@ -1841,5 +1869,13 @@ mod tests {
         assert!(!super::requires_8bit_downconvert(Some(&sdr8)));
         assert!(!super::requires_software_tonemap(None));
         assert!(!super::requires_8bit_downconvert(None));
+    }
+
+    #[test]
+    fn input_hdr_setparams_keys_on_transfer() {
+        // HLG keeps its transfer; HDR10/unknown tag smpte2084 (GetInputHdrParam).
+        assert!(super::input_hdr_setparams(Some("arib-std-b67")).contains("arib-std-b67"));
+        assert!(super::input_hdr_setparams(Some("smpte2084")).contains("smpte2084"));
+        assert!(super::input_hdr_setparams(None).contains("smpte2084"));
     }
 }

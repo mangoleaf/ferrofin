@@ -136,6 +136,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             FfmpegPaths {
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
+                filters: Vec::new(),
             }
         }
     };

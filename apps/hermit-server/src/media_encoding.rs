@@ -59,6 +59,10 @@ use crate::planner::HermitStreamStatePlanner;
 /// The `NoopSessionReporter` is used for job teardown (progress → session-layer
 /// reporting is deferred; killed-job partial-file cleanup is handled by the
 /// manager's `FsFileCleaner`).
+///
+/// `supports_tonemapx` is the startup `-filters` probe result: whether the
+/// discovered ffmpeg has the jellyfin-ffmpeg-only `tonemapx` software tonemap
+/// (the planner falls back to the vanilla zscale chain without it).
 #[must_use]
 pub fn build_media_encoding(
     media_sources: Arc<dyn MediaSourceManager>,
@@ -66,6 +70,7 @@ pub fn build_media_encoding(
     config: Arc<dyn ServerConfigurationManager>,
     paths: Arc<HermitServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
+    supports_tonemapx: bool,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
@@ -94,6 +99,7 @@ pub fn build_media_encoding(
         config,
         Arc::clone(&paths),
         Arc::clone(&subtitles),
+        supports_tonemapx,
     );
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -631,7 +637,7 @@ mod tests {
         });
         // The trio builds without panicking; every slot is a real trait object.
         let (_hls, _attachments, _subtitles) =
-            build_media_encoding(media_sources, encoder, config, paths, path_manager);
+            build_media_encoding(media_sources, encoder, config, paths, path_manager, false);
     }
 
     #[tokio::test]

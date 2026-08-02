@@ -25,9 +25,8 @@
 //! uses **NVENC** hardware encoding (h264/hevc/av1 + NVDEC decode) if the
 //! persisted encoding options select it, else software `libx264`. What it does
 //! *not* do is the full device-profile negotiation, the rest of the
-//! hardware-acceleration matrix (QSV/VAAPI/AMF), HDR→SDR tonemapping, or subtitle
-//! provider fan-out (only stored/embedded burn-in). Those are deferred (see
-//! `brain/DEFERRED.md`).
+//! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
+//! (only stored/embedded burn-in). Those are deferred (see `brain/DEFERRED.md`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,6 +112,10 @@ pub struct HermitStreamStatePlanner {
     /// extracted/external file (cached across requests), so the `subtitles`
     /// filter doesn't re-demux the whole media file on every ffmpeg (re)start.
     subtitles: Arc<dyn SubtitleEncoder>,
+    /// Whether the discovered ffmpeg reports the `tonemapx` filter
+    /// (jellyfin-ffmpeg builds only). Selects the fast single-pass software
+    /// HDR→SDR tonemap over the vanilla zscale chain; probed once at startup.
+    supports_tonemapx: bool,
 }
 
 impl HermitStreamStatePlanner {
@@ -125,6 +128,8 @@ impl HermitStreamStatePlanner {
     /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
     /// * `subtitles` — resolves a burned text subtitle to its cached file.
+    /// * `supports_tonemapx` — whether the discovered ffmpeg has `tonemapx`
+    ///   (from the startup `-filters` probe).
     #[must_use]
     pub fn new(
         media_sources: Arc<dyn MediaSourceManager>,
@@ -133,6 +138,7 @@ impl HermitStreamStatePlanner {
         config: Arc<dyn ServerConfigurationManager>,
         paths: Arc<HermitServerApplicationPaths>,
         subtitles: Arc<dyn SubtitleEncoder>,
+        supports_tonemapx: bool,
     ) -> Self {
         Self {
             media_sources,
@@ -141,6 +147,7 @@ impl HermitStreamStatePlanner {
             config,
             paths,
             subtitles,
+            supports_tonemapx,
         }
     }
 
@@ -751,6 +758,23 @@ impl HermitStreamStatePlanner {
         // matrix is deferred).
         let sw_filters: Vec<String> = if !copying_video && !nvenc_video {
             let mut filters = Vec::new();
+            let tonemap = hermit_mediaencoding::encoding_helper::helper::requires_software_tonemap(
+                state.video_stream.as_ref(),
+            );
+            // The fast tonemapx path tags the input frames' HDR colour metadata
+            // ahead of the downscale (upstream's filter order), so untagged
+            // streams still tonemap correctly.
+            if tonemap && self.supports_tonemapx {
+                filters.push(
+                    hermit_mediaencoding::encoding_helper::helper::input_hdr_setparams(
+                        state
+                            .video_stream
+                            .as_ref()
+                            .and_then(|s| s.color_transfer.as_deref()),
+                    )
+                    .to_owned(),
+                );
+            }
             if let Some(scale) = hermit_mediaencoding::encoding_helper::helper::scale_filter(
                 state.video_stream.as_ref(),
                 state.base_request.max_width,
@@ -758,12 +782,16 @@ impl HermitStreamStatePlanner {
             ) {
                 filters.push(scale);
             }
-            if hermit_mediaencoding::encoding_helper::helper::requires_software_tonemap(
-                state.video_stream.as_ref(),
-            ) {
+            if tonemap {
+                // jellyfin-ffmpeg's single-pass SIMD `tonemapx` when available;
+                // else the vanilla zscale/hable chain (~3× slower per frame).
                 filters.push(
-                    hermit_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAP_FILTER
-                        .to_owned(),
+                    if self.supports_tonemapx {
+                        hermit_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAPX_FILTER
+                    } else {
+                        hermit_mediaencoding::encoding_helper::helper::SOFTWARE_TONEMAP_FILTER
+                    }
+                    .to_owned(),
                 );
             } else if hermit_mediaencoding::encoding_helper::helper::requires_8bit_downconvert(
                 state.video_stream.as_ref(),
@@ -1351,6 +1379,13 @@ mod tests {
     }
 
     fn planner(sources: Vec<MediaSourceInfo>) -> HermitStreamStatePlanner {
+        planner_with_tonemapx(sources, false)
+    }
+
+    fn planner_with_tonemapx(
+        sources: Vec<MediaSourceInfo>,
+        supports_tonemapx: bool,
+    ) -> HermitStreamStatePlanner {
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeMediaSources { sources });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
         let helper = EncodingHelper::with_processor_count(NoOptionalEncoders, 8);
@@ -1365,7 +1400,15 @@ mod tests {
         // The disabled stub always errors, exercising the `si=` burn fallback.
         let subtitles: Arc<dyn SubtitleEncoder> =
             Arc::new(hermit_traits::stubs::DisabledSubtitleEncoder);
-        HermitStreamStatePlanner::new(media_sources, encoder, helper, config, paths, subtitles)
+        HermitStreamStatePlanner::new(
+            media_sources,
+            encoder,
+            helper,
+            config,
+            paths,
+            subtitles,
+            supports_tonemapx,
+        )
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
@@ -1926,6 +1969,38 @@ mod tests {
             args.contains("-maxrate 8000000") && args.contains("-bufsize 16000000"),
             "bitrate cap expected: {args}"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_with_tonemapx_support_uses_single_pass_tonemap() {
+        // When the discovered ffmpeg reports `tonemapx` (jellyfin-ffmpeg), the
+        // HDR re-encode must use it — `setparams` (input HDR tag) → downscale →
+        // `tonemapx`, upstream's filter order — instead of the zscale chain.
+        let src = source(
+            "abc",
+            vec![hdr_4k_video_stream("hevc"), audio_stream("aac")],
+        );
+        let p = planner_with_tonemapx(vec![src], true);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.video_bitrate = Some(8_000_000);
+        req.max_width = Some(1920);
+        req.max_height = Some(1080);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        let vf = plan
+            .arguments
+            .iter()
+            .position(|a| a == "-vf")
+            .map(|i| plan.arguments[i + 1].as_str())
+            .expect("-vf expected");
+        assert_eq!(
+            vf,
+            "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
+             scale=1920:1080,\
+             tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p",
+        );
+        assert!(!args.contains("zscale"), "no zscale fallback: {args}");
     }
 
     #[tokio::test]

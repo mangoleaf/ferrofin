@@ -200,6 +200,7 @@ async fn boot() -> Harness {
     let ffmpeg = hermit_server::bootstrap::FfmpegPaths {
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
+        filters: Vec::new(),
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
     let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
