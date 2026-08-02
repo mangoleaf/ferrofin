@@ -52,8 +52,11 @@ profile() {   # $1=service $2=port $3=target
   echo ">> [$target] up + scan"
   docker compose down -v >/dev/null 2>&1 || true
   if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
-  until curl -sf "$base/System/Info/Public" >/dev/null 2>&1; do sleep 1; done
-  k6 run -e TARGET="$target" -e BASE_URL="$base" bootstrap.js
+  local up=0; for _ in $(seq 1 120); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
+  if [ "$up" != 1 ] || ! k6 run -e TARGET="$target" -e BASE_URL="$base" bootstrap.js; then
+    echo "   [$target] bootstrap/scan failed (container likely OOM'd at ${BENCH_MEM}) — skipping this server"
+    docker compose stop "$svc" >/dev/null 2>&1 || true; return 0
+  fi
 
   # Idle baseline: CPU the server burns doing nothing, to subtract per-endpoint.
   # `|| echo 0` so a transient `docker exec` hiccup can never abort the run.
