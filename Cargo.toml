@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-only"          # matches the GPL-3.0-only package metadata on the Jellyfin crates being ported
 publish = false
