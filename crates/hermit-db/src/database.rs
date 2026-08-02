@@ -63,13 +63,14 @@ impl Database {
 
     /// Builds the pool from fully-formed connect options.
     ///
-    /// Pool size defaults to the host's available parallelism (CPU count);
-    /// `HERMIT_DB_POOL` overrides. Each sqlx SQLite connection is backed by its
-    /// own dedicated OS thread (libsqlite3 is synchronous C), so the pool size
-    /// *is* the DB thread count — and, under WAL, the number of reads that can
-    /// run concurrently. Reads are CPU-bound, so throughput scales with pool
-    /// size up to core count and no further; sizing to `available_parallelism`
-    /// tracks that ceiling. This mirrors upstream Jellyfin, whose pooled
+    /// Pool size defaults to the number of CPUs the process may actually use —
+    /// see [`default_pool_size`]; `HERMIT_DB_POOL` overrides. Each sqlx SQLite
+    /// connection is backed by its own dedicated OS thread (libsqlite3 is
+    /// synchronous C), so the pool size *is* the DB thread count — and, under
+    /// WAL, the number of reads that can run concurrently. Reads are CPU-bound,
+    /// so throughput scales with pool size up to usable-core count and no
+    /// further; oversizing it past that only thrashes the scheduler and WAL.
+    /// This mirrors upstream Jellyfin, whose pooled
     /// `DbContextFactory` + on-demand ADO.NET SQLite pool is effectively
     /// unbounded but is likewise bottlenecked at ~core-count concurrent reads.
     ///
@@ -81,12 +82,7 @@ impl Database {
         let max_connections = std::env::var("HERMIT_DB_POOL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .ok()
-                    .and_then(|n| u32::try_from(n.get()).ok())
-                    .unwrap_or(4)
-            });
+            .unwrap_or_else(default_pool_size);
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(options)
@@ -111,6 +107,57 @@ impl Database {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// The pool size to use when `HERMIT_DB_POOL` is unset.
+///
+/// The min of the CPU affinity mask (`available_parallelism`) and the cgroup
+/// CFS quota. The two disagree under container CPU *limits*: Docker `--cpus`
+/// and Kubernetes CPU limits set a CFS quota but leave the affinity mask
+/// spanning every host core, so `available_parallelism` alone over-sizes the
+/// pool (e.g. 32 connection threads under a 4-CPU quota — pure scheduler/WAL
+/// thrash). Falls back to 4 when neither signal is readable.
+fn default_pool_size() -> u32 {
+    let affinity = std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u32::try_from(n.get()).ok());
+    match (affinity, cgroup_cpu_quota()) {
+        (Some(a), Some(q)) => a.min(q).max(1),
+        (Some(n), None) | (None, Some(n)) => n.max(1),
+        (None, None) => 4,
+    }
+}
+
+/// The whole-core CPU budget from the cgroup CFS quota, if one is set.
+///
+/// Reads cgroup v2 (`/sys/fs/cgroup/cpu.max`) when present, else falls back to
+/// v1. Returns `None` when unlimited or unreadable (bare metal, quota `max`,
+/// or non-Linux). The quota is rounded **up** — a 1.5-core limit permits 2.
+fn cgroup_cpu_quota() -> Option<u32> {
+    // cgroup v2: single `cpu.max` file present ⇒ trust it (`max` ⇒ unlimited).
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        return quota_cores_from_cpu_max(&s);
+    }
+    // cgroup v1: quota and period live in separate files; -1 ⇒ unlimited.
+    let q = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?;
+    let p = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?;
+    quota_cores(q.trim().parse().ok()?, p.trim().parse().ok()?)
+}
+
+/// Parse a cgroup v2 `cpu.max` line (`"<quota|max> <period>"`) into whole cores.
+fn quota_cores_from_cpu_max(s: &str) -> Option<u32> {
+    let mut it = s.split_whitespace();
+    let quota = it.next()?; // an integer, or the literal `max` (⇒ parse fails ⇒ None)
+    let period = it.next()?.parse().ok()?;
+    quota_cores(quota.parse().ok()?, period)
+}
+
+/// `ceil(quota / period)` as a core count, or `None` if either is non-positive.
+fn quota_cores(quota: i64, period: i64) -> Option<u32> {
+    if quota <= 0 || period <= 0 {
+        return None;
+    }
+    u32::try_from((quota + period - 1) / period).ok() // ceil; i64 div_ceil is unstable
 }
 
 #[cfg(test)]
@@ -151,6 +198,19 @@ mod tests {
         "UserData",
         "Users",
     ];
+
+    #[test]
+    fn cpu_max_parses_to_usable_cores() {
+        assert_eq!(quota_cores_from_cpu_max("400000 100000"), Some(4)); // --cpus=4
+        assert_eq!(quota_cores_from_cpu_max("150000 100000"), Some(2)); // 1.5 rounds up
+        assert_eq!(quota_cores_from_cpu_max("100000 100000"), Some(1));
+        assert_eq!(quota_cores_from_cpu_max("max 100000"), None); // unlimited
+        assert_eq!(quota_cores_from_cpu_max("garbage"), None);
+        assert_eq!(quota_cores_from_cpu_max(""), None);
+        assert_eq!(quota_cores(-1, 100_000), None); // cgroup v1 unlimited sentinel
+        // A quota never inflates the pool above it, and never below 1.
+        assert!(default_pool_size() >= 1);
+    }
 
     #[tokio::test]
     async fn connect_and_migrate_creates_expected_tables() {
