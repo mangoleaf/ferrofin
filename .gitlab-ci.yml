@@ -269,8 +269,6 @@ image-version:
       git fetch --tags --quiet
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         VERSION="${CI_COMMIT_TAG#v}"                 # release: the tag is the version
-        BASE="${VERSION%-rc.*}"
-        if [ "$VERSION" = "$BASE" ]; then PUSH_LATEST=true; else PUSH_LATEST=false; fi
       else
         LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
         if [ -n "$LATEST" ]; then BASE="${LATEST#v}"; RANGE="${LATEST}..HEAD"; else BASE="0.0.0"; RANGE="HEAD"; fi
@@ -278,9 +276,8 @@ image-version:
         COUNT=$(git rev-list --count $RANGE -- crates apps Cargo.toml Cargo.lock Dockerfile)
         SHA=$(git rev-parse --short=12 HEAD)
         VERSION="${BASE}-${COUNT}-${SHA}"            # dev: {M.m.p}-{N}-{sha12}
-        PUSH_LATEST=false
       fi
-      printf 'IMAGE_VERSION=%s\nPUSH_LATEST=%s\n' "$VERSION" "$PUSH_LATEST" | tee image.env
+      printf 'IMAGE_VERSION=%s\n' "$VERSION" | tee image.env
   artifacts:
     reports:
       dotenv: image.env
@@ -312,9 +309,14 @@ docker-image:
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
   script:
     - |
-      # IMAGE_VERSION / PUSH_LATEST come from the image-version job's dotenv.
+      # IMAGE_VERSION comes from the image-version job's dotenv.
       DESTS="--destination $IMAGE:$IMAGE_VERSION"
-      [ "$PUSH_LATEST" = "true" ] && DESTS="$DESTS --destination $IMAGE:latest"
+      # :latest tracks FINAL releases ONLY — never a -rc or a dev/main build. The
+      # single source of truth for that is this regex on the tag, right here at the
+      # push site, so no other job can move :latest.
+      if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        DESTS="$DESTS --destination $IMAGE:latest"
+      fi
     - >-
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
