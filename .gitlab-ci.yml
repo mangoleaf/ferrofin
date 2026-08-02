@@ -41,11 +41,12 @@ stages: [test, tag, build, release, chart]
 # ---------------------------------------------------------------------------
 create-release:
   stage: tag
-  # Gate tag creation on the quality bar: only playable once lint + coverage pass,
-  # so a release can never be cut from a red commit.
-  needs:
-    - job: lint
-    - job: coverage
+  # In the `tag` stage (after `test`), with NO `needs`, so it can be triggered
+  # EARLY — even while lint/coverage are still running — yet only RUNS once the
+  # test stage passes (stage ordering). If lint/coverage fail, the test stage
+  # fails, the tag stage is never reached, and this queued job is auto-cancelled,
+  # so a release can never be cut from a red commit. (A `needs` on lint/coverage
+  # would instead disable the play button until they finish — no early trigger.)
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
