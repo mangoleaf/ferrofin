@@ -35,28 +35,6 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// The content-type options offered by the metadata editor for a single item.
-///
-/// Port of `ItemUpdateController.GetContentTypeOptions(isForItem: true)`: the
-/// `Inherit` (empty value) option plus the per-item collection types. The
-/// `!isForItem` extras (`Books`, `MixedContent`) are omitted, matching the C#
-/// call the editor makes with `isForItem = true`. Names are the English labels
-/// (the C# `GetLocalizedString` pass is identity for the default culture).
-fn item_content_type_options() -> Vec<NameValuePair> {
-    [
-        ("Inherit", ""),
-        ("Movies", "movies"),
-        ("Music", "music"),
-        ("Shows", "tvshows"),
-        ("HomeVideos", "homevideos"),
-        ("MusicVideos", "musicvideos"),
-        ("Photos", "photos"),
-    ]
-    .into_iter()
-    .map(|(name, value)| NameValuePair::new(name, value))
-    .collect()
-}
-
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
 ///
 /// Port of `ItemUpdateController.UpdateItem` (scalar/collection subset). A
@@ -560,7 +538,11 @@ async fn get_metadata_editor(
         cultures,
         external_id_infos,
         content_type: None,
-        content_type_options: item_content_type_options(),
+        // Jellyfin's GetMetadataEditorInfo only populates ContentTypeOptions for a collection-folder
+        // whose content type is configurable; a plain library item (e.g. a Movie) gets an empty list.
+        // Hermit doesn't model the configurable-content-type folder tree here, so a plain item — the
+        // common case this endpoint serves — matches Jellyfin's empty array.
+        content_type_options: Vec::new(),
     };
     Ok(Json(info))
 }

@@ -170,10 +170,12 @@ impl LiveTvManager for HermitLiveTvManager {
         // Always emit the built-in "Emby" service, mirroring Jellyfin's
         // DefaultLiveTvService (which is always registered), then optionally
         // append the M3U/XMLTV entry once a tuner host is configured.
+        // Jellyfin's DefaultLiveTvService reports IsVisible=false and an (empty) Tuners array.
         let mut services = vec![LiveTvServiceInfo {
             name: Some("Emby".to_owned()),
             status: LiveTvServiceStatus::Ok,
-            is_visible: true,
+            is_visible: false,
+            tuners: Some(Vec::new()),
             ..LiveTvServiceInfo::default()
         }];
         if !self.get_tuner_hosts().await?.is_empty() {
