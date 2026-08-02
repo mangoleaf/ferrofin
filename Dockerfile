@@ -1,27 +1,17 @@
-# Release image of the Hermit server. Bundles three things:
+# Release image of the Hermit server:
 #   - the hermit-server binary (built from this workspace),
 #   - ffmpeg/ffprobe (scan probes with ffprobe, transcode needs ffmpeg),
-#   - the jellyfin-web client, built from a PINNED tag and served at /web.
+#   - jellyfin-web (served at /web), pulled PREBUILT from the web CI image so this
+#     build never runs npm/webpack.
 #
-# jellyfin-web is NOT vendored in this repo — it is cloned + built here so the
-# image is self-contained and a browser at / loads the UI. The version is pinned
-# (JELLYFIN_WEB_VERSION) so an upstream web release can't silently break the
-# image; bump it deliberately, matching the Jellyfin API version Hermit reports.
+# jellyfin-web is built once by the `web-image` CI job (ci/web.Dockerfile) and
+# published to $CI_REGISTRY_IMAGE/ci:web-<JELLYFIN_WEB_VERSION>. WEB_IMAGE points
+# at that tag; CI passes it via --build-arg (kept in sync with the pinned
+# JELLYFIN_WEB_VERSION variable), and the default here matches for local builds.
 
-# ── jellyfin-web ───────────────────────────────────────────────────
-# Pinned to the Jellyfin API version Hermit advertises. Override at build time
-# with --build-arg JELLYFIN_WEB_VERSION=<x.y.z>; change the default to bump.
-ARG JELLYFIN_WEB_VERSION=10.11.8
-FROM node:20-bookworm AS web
-ARG JELLYFIN_WEB_VERSION
-# webpack's production build is memory-hungry; give Node headroom so CI doesn't OOM.
-ENV NODE_OPTIONS=--max-old-space-size=4096
-WORKDIR /web
-RUN git clone --depth 1 --branch "v${JELLYFIN_WEB_VERSION}" \
-      https://github.com/jellyfin/jellyfin-web.git . \
- && npm ci --no-audit --no-fund \
- && npm run build:production
-# build:production emits the static client bundle to /web/dist.
+# ── jellyfin-web (prebuilt — no npm/webpack here) ────────────────────
+ARG WEB_IMAGE=registry.mangoleafstudios.com/mlstudios/hermit/ci:web-10.11.8
+FROM ${WEB_IMAGE} AS web
 
 # ── server binary ──────────────────────────────────────────────────
 FROM rust:1.97.0-bookworm AS build
@@ -35,7 +25,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
-COPY --from=web /web/dist /usr/share/hermit/web
+COPY --from=web /dist /usr/share/hermit/web
 # The release version, passed from CI (--build-arg SERVICE_VERSION=<tag>). The
 # binary reports it (falling back to the crate version when unset for local builds).
 ARG SERVICE_VERSION=

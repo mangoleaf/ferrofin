@@ -24,6 +24,11 @@
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
 stages: [test, tag, build, release, chart]
 
+# Pinned jellyfin-web version — single source of truth. web-image builds
+# ci:web-$JELLYFIN_WEB_VERSION; the service image pulls it via WEB_IMAGE.
+variables:
+  JELLYFIN_WEB_VERSION: "10.11.8"
+
 # ---------------------------------------------------------------------------
 # request-release — the manual release GATE. It has NO needs and lives in .pre,
 # so its Play button is available the instant the pipeline starts: click it any
@@ -148,6 +153,38 @@ ci-image:
       changes:
         - ci/Dockerfile
     - if: '$REBUILD_CI_IMAGE'   # force a rebuild: run a pipeline with this var set
+
+# ---------------------------------------------------------------------------
+# web-image — prebuilds jellyfin-web (ci/web.Dockerfile) once and pushes it to
+# ci:web-$JELLYFIN_WEB_VERSION, so the service image build never runs npm/webpack
+# (it COPY --from=s this). Rebuilds when ci/web.Dockerfile changes or on demand
+# via REBUILD_WEB_IMAGE. Bumping JELLYFIN_WEB_VERSION → run once with
+# REBUILD_WEB_IMAGE=1 to publish the new ci:web-<ver> tag. Lives in .pre.
+# ---------------------------------------------------------------------------
+web-image:
+  stage: .pre
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    WEB_IMAGE: $CI_REGISTRY_IMAGE/ci:web-$JELLYFIN_WEB_VERSION
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
+  script:
+    - >-
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/ci/web.Dockerfile"
+      --build-arg JELLYFIN_WEB_VERSION="$JELLYFIN_WEB_VERSION"
+      --destination "$WEB_IMAGE"
+      --push-retry 5
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - ci/web.Dockerfile
+    - if: '$REBUILD_WEB_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
 # sccache — compile cache backed by Garage S3, replacing GitLab's cache: (which
@@ -330,6 +367,7 @@ docker-image:
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
       --build-arg SERVICE_VERSION="$IMAGE_VERSION"
+      --build-arg WEB_IMAGE="$CI_REGISTRY_IMAGE/ci:web-$JELLYFIN_WEB_VERSION"
       $DESTS
       --push-retry 5
   rules:
