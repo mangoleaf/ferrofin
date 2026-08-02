@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "09cc64d 2026-08-02",
+  "last_verified": "7c638fd 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -9,9 +9,9 @@
       "note": "H=True J=True"
     },
     "DELETE /Collections/{collectionId}/Items": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "deep_verified": false,
-      "note": "H=True J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "DELETE /Playlists/{playlistId}/Items": {
       "classification": "ok",
@@ -64,9 +64,9 @@
       "note": "H=True J=True"
     },
     "POST /Collections/{collectionId}/Items": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "deep_verified": false,
-      "note": "H=True J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Devices/Options": {
       "classification": "ok",
@@ -119,14 +119,14 @@
       "note": "H=True J=True"
     },
     "POST /Sessions/Playing": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/Playing/Progress": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "deep_verified": false,
-      "note": "H=False J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/Playing/Stopped": {
       "classification": "ok",
