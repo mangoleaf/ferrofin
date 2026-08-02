@@ -1081,12 +1081,10 @@ async fn metadata_editor_returns_descriptor() {
     let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/MetadataEditor"), None).await;
     assert_eq!(status, StatusCode::OK);
     let info: MetadataEditorInfo = serde_json::from_slice(&body).expect("editor");
-    // The per-item content-type options include Inherit + the collection types.
-    assert!(
-        info.content_type_options
-            .iter()
-            .any(|o| o.name.as_deref() == Some("Movies"))
-    );
+    // A plain library item (e.g. a Movie) gets an empty ContentTypeOptions —
+    // Jellyfin only populates it for a collection-folder whose content type is
+    // configurable. See get_metadata_editor.
+    assert!(info.content_type_options.is_empty());
     assert_eq!(info.external_id_infos.len(), 1);
 }
 
