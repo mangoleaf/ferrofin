@@ -56,31 +56,12 @@ create-release:
       git config user.email "ci@mangoleafstudios.com"
       git config user.name "GitLab CI"
       git fetch --tags --quiet
-      # Latest release tag (sed -n 1p reads to EOF — no head/SIGPIPE 141).
-      LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
-      if [ -n "$LATEST" ]; then BASE="$LATEST"; RANGE="${LATEST}..HEAD"; else BASE="v0.0.0"; RANGE=""; fi
-      # Derive the bump from the Conventional Commit SUBJECT line only (never the
-      # body — prose there, e.g. docs, must not sway the version). grep -c reads
-      # all input (no early-exit SIGPIPE); || true covers zero matches.
-      #   type!: (feat!:, fix!:, ...) -> breaking ;  feat: -> minor ;  else patch.
-      SUBJECTS=$(git log --format='%s' $RANGE)
-      BANG=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^[a-z]+(\([^)]*\))?!:' || true)
-      FEAT=$(printf '%s\n' "$SUBJECTS" | grep -Ec '^feat(\([^)]*\))?:' || true)
-      V="${BASE#v}"; MAJOR="${V%%.*}"; REST="${V#*.}"; MINOR="${REST%%.*}"; PATCH="${REST##*.}"
-      if [ "$BANG" -gt 0 ]; then
-        # SemVer 0.x rule: while major==0 a breaking change bumps MINOR — it must
-        # never auto-jump to 1.0.0. Cutting 1.0.0 is deliberate: FORCE_VERSION=v1.0.0.
-        if [ "$MAJOR" -eq 0 ]; then LEVEL=minor; else LEVEL=major; fi
-      elif [ "$FEAT" -gt 0 ]; then LEVEL=minor
-      else LEVEL=patch; fi
-      case "$LEVEL" in
-        major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
-        minor) MINOR=$((MINOR+1)); PATCH=0 ;;
-        patch) PATCH=$((PATCH+1)) ;;
-      esac
-      NEW="v${MAJOR}.${MINOR}.${PATCH}"
-      [ -n "${FORCE_VERSION:-}" ] && NEW="$FORCE_VERSION"
-      echo "Latest ${BASE} + ${LEVEL} -> ${NEW} (tagging ${CI_COMMIT_SHORT_SHA})"
+      # Next version from git tags + Conventional Commits — logic lives in
+      # scripts/version.sh (bats-tested, shellcheck-clean). FORCE_VERSION honored
+      # inside. alpine/git has no bash, which the script needs.
+      apk add --no-cache bash >/dev/null
+      NEW=$(bash scripts/version.sh next)
+      echo "Releasing ${NEW} (tagging ${CI_COMMIT_SHORT_SHA})"
       # Tag the commit this job ran on and push ONLY the tag — no commit to main.
       # A tag needs no fast-forward, so this succeeds even if main has moved on
       # since the pipeline started (you can trigger the release early / not at the
@@ -279,18 +260,11 @@ image-version:
   script:
     - |
       set -eu
+      # Version logic lives in scripts/version.sh (bats-tested, shellcheck-clean).
+      # alpine/git has no bash, which the script needs.
+      apk add --no-cache bash >/dev/null
       git fetch --tags --quiet
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        VERSION="${CI_COMMIT_TAG#v}"                 # release: the tag is the version
-      else
-        LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
-        if [ -n "$LATEST" ]; then BASE="${LATEST#v}"; RANGE="${LATEST}..HEAD"; else BASE="0.0.0"; RANGE="HEAD"; fi
-        # count only commits that would change the image (build-relevant paths)
-        COUNT=$(git rev-list --count $RANGE -- crates apps Cargo.toml Cargo.lock Dockerfile)
-        SHA=$(git rev-parse --short=12 HEAD)
-        VERSION="${BASE}-${COUNT}-${SHA}"            # dev: {M.m.p}-{N}-{sha12}
-      fi
-      printf 'IMAGE_VERSION=%s\n' "$VERSION" | tee image.env
+      printf 'IMAGE_VERSION=%s\n' "$(bash scripts/version.sh image)" | tee image.env
   artifacts:
     reports:
       dotenv: image.env
