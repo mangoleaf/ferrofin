@@ -262,7 +262,11 @@ async fn counts_group_by_kind() {
     assert_eq!(by_kind.movie_count, 2);
     assert_eq!(by_kind.series_count, 1);
     assert_eq!(by_kind.episode_count, 1);
-    assert_eq!(by_kind.item_count, 4);
+    // Top-level ItemCount serializes as 0: Jellyfin's LibraryController never
+    // assigns it, so get_item_counts zeroes the grand total (the per-type counts
+    // above still populate). The real total is available via get_count, asserted
+    // as 4 above.
+    assert_eq!(by_kind.item_count, 0);
 }
 
 #[tokio::test]
