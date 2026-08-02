@@ -396,7 +396,9 @@ helm-chart:
         v*)       VER="${CI_COMMIT_TAG#v}" ;;         # app release republishes the chart
       esac
       helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
-      helm package charts/hermit --version "$VER" --app-version "$VER" --destination /tmp
+      # Chart version is bare semver (Helm requires it). appVersion keeps the v so
+      # the chart's default image.tag (= appVersion) matches the v-tagged image.
+      helm package charts/hermit --version "$VER" --app-version "v${VER}" --destination /tmp
       helm push "/tmp/hermit-${VER}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'

@@ -11,9 +11,10 @@
 #           While the major is 0, a breaking change bumps MINOR (never auto-1.0.0).
 #           FORCE_VERSION=vX.Y.Z overrides the computed value.
 #   image   Print the image/build version. On a release-tag pipeline
-#           (CI_COMMIT_TAG set) that's the tag without its leading 'v'; otherwise a
-#           dev version {Major}.{Minor}.{Patch}-{N}-{sha12}, where N counts commits
-#           since the latest tag that touched build-relevant paths.
+#           (CI_COMMIT_TAG set) that's the tag verbatim, e.g. v0.5.2 (keeps the
+#           leading v to match the git tag); otherwise a dev version
+#           v{Major}.{Minor}.{Patch}-{N}-{sha12}, where N counts commits since the
+#           latest tag that touched build-relevant paths.
 #
 # Reads only git state + the CI_COMMIT_TAG / FORCE_VERSION env vars, so it runs
 # identically in CI and in a bats test against a throwaway repo.
@@ -74,16 +75,16 @@ next_version() {
 
 image_version() {
   if [ -n "${CI_COMMIT_TAG:-}" ]; then
-    printf '%s\n' "${CI_COMMIT_TAG#v}"
+    printf '%s\n' "$CI_COMMIT_TAG"          # keep the leading v, e.g. v0.5.2
     return
   fi
   local latest base range count sha
   latest=$(latest_tag)
   if [ -n "$latest" ]; then
-    base=${latest#v}
+    base=$latest                            # keep the leading v
     range="${latest}..HEAD"
   else
-    base="0.0.0"
+    base="v0.0.0"
     range="HEAD"
   fi
   count=$(git rev-list --count "$range" -- "${BUILD_PATHS[@]}")

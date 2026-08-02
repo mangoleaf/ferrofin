@@ -89,18 +89,18 @@ build_commit() {
 
 # --- image: release vs dev version ----------------------------------------
 
-@test "image: on a release tag -> the tag without leading v" {
+@test "image: on a release tag -> the tag verbatim (keeps leading v)" {
   git tag v0.5.0
   CI_COMMIT_TAG=v0.5.0 run "$SCRIPT" image
-  [ "$output" = "0.5.0" ]
+  [ "$output" = "v0.5.0" ]
 }
 
-@test "image: on an -rc tag -> tag without leading v" {
+@test "image: on an -rc tag -> tag verbatim (keeps leading v)" {
   CI_COMMIT_TAG=v0.5.0-rc.1 run "$SCRIPT" image
-  [ "$output" = "0.5.0-rc.1" ]
+  [ "$output" = "v0.5.0-rc.1" ]
 }
 
-@test "image: dev version = base-<build-relevant count>-<sha12>" {
+@test "image: dev version = vbase-<build-relevant count>-<sha12>" {
   git tag v0.4.1
   build_commit "feat: code change"          # build-relevant
   git commit -q --allow-empty -m "docs: not build-relevant"
@@ -108,7 +108,7 @@ build_commit() {
   run "$SCRIPT" image
   [ "$status" -eq 0 ]
   sha=$(git rev-parse --short=12 HEAD)
-  [ "$output" = "0.4.1-2-${sha}" ]          # count is 2 (docs commit excluded)
+  [ "$output" = "v0.4.1-2-${sha}" ]         # count is 2 (docs commit excluded); keeps v
 }
 
 @test "image: dev sha component is 12 hex chars" {
