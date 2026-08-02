@@ -293,6 +293,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .map_err(|e| format!("create output dir {}: {e}", directory.display()))?;
 
         // 3. Build the spawn request (steps 2 = Acquire/attachment deferred).
+        let stderr_log = log_path.clone();
         let req = SpawnRequest {
             program: program.to_owned(),
             arguments,
@@ -363,7 +364,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 .flatten();
             if code.unwrap_or(0) != 0 {
                 self.remove_job_by_path(&handle.path, handle.job_type);
-                return Err(format!("FFmpeg exited with code {}", code.unwrap_or(-1)));
+                // The bare exit code hides the actual cause (unreadable input,
+                // bad args); ffmpeg's stderr in the transcode log names it.
+                let tail = stderr_log_tail(&stderr_log);
+                return Err(format!(
+                    "FFmpeg exited with code {}{tail}",
+                    code.unwrap_or(-1)
+                ));
             }
         }
 
@@ -500,6 +507,31 @@ fn segment_file_extension(segment_container: Option<&str>) -> String {
     match segment_container.map(str::trim).filter(|s| !s.is_empty()) {
         Some("mp4") => ".mp4".to_owned(),
         _ => ".ts".to_owned(),
+    }
+}
+
+/// The last few lines of ffmpeg's stderr log, formatted for appending to the
+/// exit-code error (empty when the log is absent or empty).
+///
+/// A failed transcode's bare exit code says nothing; stderr names the cause
+/// (unreadable input, bad arguments). The log is small at start-failure — the
+/// process died before producing output.
+fn stderr_log_tail(log_path: &Path) -> String {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr tail: {}", tail.join(" | "))
     }
 }
 
@@ -1144,5 +1176,24 @@ mod start_ffmpeg_tests {
         assert_eq!(segment_file_extension(Some("mp4")), ".mp4");
         assert_eq!(segment_file_extension(Some("  ")), ".ts");
         assert_eq!(segment_file_extension(None), ".ts");
+    }
+
+    #[test]
+    fn stderr_log_tail_reports_last_lines() {
+        use super::stderr_log_tail;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("ffmpeg.log");
+
+        // Absent or empty log → no tail appended.
+        assert_eq!(stderr_log_tail(&log), "");
+        std::fs::write(&log, "\n  \n").expect("write");
+        assert_eq!(stderr_log_tail(&log), "");
+
+        // Only the last (up to 4) non-empty lines survive, in order.
+        std::fs::write(&log, "one\ntwo\n\nthree\nfour\nfive: Stale file handle\n").expect("write");
+        assert_eq!(
+            stderr_log_tail(&log),
+            "; stderr tail: two | three | four | five: Stale file handle"
+        );
     }
 }

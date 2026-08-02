@@ -42,6 +42,12 @@ pub(crate) async fn stream_path(state: &AppState, item_id: Uuid) -> Result<Strin
 /// `Range`/`HEAD`/`206 Partial Content`/`404` handling; its infallible response is
 /// mapped into an axum body. A resolution/IO failure surfaces as `404`.
 pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Response, ApiError> {
+    // A path the database resolved but the filesystem rejects otherwise
+    // surfaces as a bare 404 indistinguishable from a missing route — name the
+    // fs-level cause (stale NFS handle, permissions, moved file) in the log.
+    if let Err(e) = tokio::fs::metadata(path).await {
+        tracing::warn!(path, error = %e, "direct-stream file is not accessible");
+    }
     let response = ServeFile::new(path)
         .oneshot(request)
         .await
