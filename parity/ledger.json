@@ -2997,8 +2997,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "last_verified": "09cc64d 2026-08-02"
+      "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin's read-back still lists it (oracle behavior), so this is not a Hermit defect.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Users/{userId}",
@@ -3381,8 +3381,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "last_verified": "09cc64d 2026-08-02"
+      "classification": "instance/methodology: the harness read-back check (item UserData.PlaybackPositionTicks) doesn't reflect a bare progress ping on EITHER server (needs a real PlaySessionId to correlate); the endpoint itself accepts the report \u2014 not a Hermit defect.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Sessions/Playing/Stopped",

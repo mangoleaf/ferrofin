@@ -152,13 +152,13 @@ _Layer 1: 166/188 status-conformant · 121/123 schema-valid_
 - ⚠️ `GET /Movies/Recommendations` — deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data.
 - ⚠️ `GET /Movies/{itemId}/Similar` — deferred: same weighted similarity scorer as Items/{id}/Similar.
 - ⚠️ `GET /Packages` — expected-extension: no external plugin package repository (compiled-in extensions).
-- ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)
+- ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin's read-back still lists it (oracle behavior), so this is not a Hermit defect.
 - ⚠️ `GET /Plugins` — expected-extension: Hermit uses compiled-in extensions, not external-repo plugins.
 - ⚠️ `GET /Repositories` — expected-extension: no external plugin repositories configured (compiled-in extensions).
 - ⚠️ `GET /ScheduledTasks` — instance: LastExecutionResult depends on whether/when a task last ran.
 - ⚠️ `GET /Search/Hints` — deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>.
 - ⚠️ `POST /Sessions/Playing` — flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)
-- ⚠️ `POST /Sessions/Playing/Progress` — flagged: write effect not observed on either server (likely corpus/setup)
+- ⚠️ `POST /Sessions/Playing/Progress` — instance/methodology: the harness read-back check (item UserData.PlaybackPositionTicks) doesn't reflect a bare progress ping on EITHER server (needs a real PlaySessionId to correlate); the endpoint itself accepts the report — not a Hermit defect.
 - ⚠️ `GET /Shows/{itemId}/Similar` — deferred: weighted similarity scorer not ported.
 - ⚠️ `GET /System/ActivityLog/Entries` — instance: activity-log entries differ per instance/run.
 - ⚠️ `GET /System/Configuration` — instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug.
@@ -425,7 +425,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /Playlists/{playlistId}/Items` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Playlists/{playlistId}/Users` | registered | REAL | · | · | · |  |
-| `DELETE /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ⚠️ | flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra) |
+| `DELETE /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ⚠️ | instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin's read-back still lists it (oracle behavior), so this is not a Hermit defect. |
 | `GET /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | · |  |
 | `POST /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Plugins` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: Hermit uses compiled-in extensions, not external-repo plugins. |
@@ -457,7 +457,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /Sessions/Logout` | registered | REAL | · | · | · |  |
 | `POST /Sessions/Playing` | registered | REAL | · | · | ⚠️ | flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method) |
 | `POST /Sessions/Playing/Ping` | registered | REAL | · | · | · |  |
-| `POST /Sessions/Playing/Progress` | registered | REAL | · | · | ⚠️ | flagged: write effect not observed on either server (likely corpus/setup) |
+| `POST /Sessions/Playing/Progress` | registered | REAL | · | · | ⚠️ | instance/methodology: the harness read-back check (item UserData.PlaybackPositionTicks) doesn't reflect a bare progress ping on EITHER server (needs a real PlaySessionId to correlate); the endpoint itself accepts the report — not a Hermit defect. |
 | `POST /Sessions/Playing/Stopped` | registered | REAL | · | · | ✅ | ok |
 | `POST /Sessions/Viewing` | registered | REAL | · | · | · |  |
 | `POST /Sessions/{sessionId}/Command` | registered | REAL | · | · | · |  |
