@@ -448,10 +448,10 @@ async fn get_users(
 
 /// `GET /Users/Public` — the login-screen-visible users.
 ///
-/// Port of `UserController.GetPublicUsers`. Before the startup wizard completes,
-/// every user is returned; afterwards only non-hidden, non-disabled users are.
-/// The device/network narrowing the C# applies needs a network manager (deferred
-/// at this layer), so it is not applied.
+/// Port of `UserController.GetPublicUsers`: only non-hidden, non-disabled users
+/// are returned, regardless of the startup-wizard state (Jellyfin excludes hidden
+/// and disabled users in both wizard states). The device/network narrowing the C#
+/// applies needs a network manager (deferred at this layer), so it is not applied.
 #[utoipa::path(
     get,
     path = "/Users/Public",
@@ -459,16 +459,7 @@ async fn get_users(
     tag = "hermit"
 )]
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let wizard_done = state
-        .config
-        .configuration()
-        .await?
-        .is_startup_wizard_completed;
-    let dtos = if wizard_done {
-        filtered_user_dtos(&state, Some(false), Some(false)).await?
-    } else {
-        filtered_user_dtos(&state, None, None).await?
-    };
+    let dtos = filtered_user_dtos(&state, Some(false), Some(false)).await?;
     Ok(Json(dtos))
 }
 

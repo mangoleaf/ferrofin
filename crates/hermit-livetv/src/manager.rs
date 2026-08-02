@@ -167,21 +167,26 @@ impl HermitLiveTvManager {
 #[async_trait]
 impl LiveTvManager for HermitLiveTvManager {
     async fn get_live_tv_info(&self) -> Result<LiveTvInfo, ServiceError> {
-        let tuners = self.get_tuner_hosts().await?;
-        let enabled = !tuners.is_empty();
-        let services = if enabled {
-            vec![LiveTvServiceInfo {
+        // Always emit the built-in "Emby" service, mirroring Jellyfin's
+        // DefaultLiveTvService (which is always registered), then optionally
+        // append the M3U/XMLTV entry once a tuner host is configured.
+        let mut services = vec![LiveTvServiceInfo {
+            name: Some("Emby".to_owned()),
+            status: LiveTvServiceStatus::Ok,
+            is_visible: true,
+            ..LiveTvServiceInfo::default()
+        }];
+        if !self.get_tuner_hosts().await?.is_empty() {
+            services.push(LiveTvServiceInfo {
                 name: Some("M3U/XMLTV".to_owned()),
                 status: LiveTvServiceStatus::Ok,
                 is_visible: true,
                 ..LiveTvServiceInfo::default()
-            }]
-        } else {
-            Vec::new()
-        };
+            });
+        }
         Ok(LiveTvInfo {
+            is_enabled: !services.is_empty(),
             services,
-            is_enabled: enabled,
             enabled_users: Vec::new(),
         })
     }
@@ -775,6 +780,30 @@ mod tests {
         <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
         <title>Morning Show</title><desc>News.</desc><category>News</category></programme>\
         </tv>";
+
+    #[tokio::test]
+    async fn info_always_has_emby_service_and_is_enabled() {
+        // No tuner host configured: the built-in "Emby" service is still
+        // present and IsEnabled is true, mirroring DefaultLiveTvService.
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let info = mgr.get_live_tv_info().await.expect("info");
+        assert!(info.is_enabled);
+        assert_eq!(info.services.len(), 1);
+        assert_eq!(info.services[0].name.as_deref(), Some("Emby"));
+
+        // Once a tuner exists, the M3U/XMLTV service is appended alongside Emby.
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        let info = mgr.get_live_tv_info().await.expect("info2");
+        assert!(info.is_enabled);
+        assert_eq!(info.services.len(), 2);
+        assert_eq!(info.services[0].name.as_deref(), Some("Emby"));
+        assert_eq!(info.services[1].name.as_deref(), Some("M3U/XMLTV"));
+    }
 
     #[tokio::test]
     async fn tuner_host_crud_roundtrips() {

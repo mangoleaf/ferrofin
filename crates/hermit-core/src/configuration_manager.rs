@@ -116,8 +116,9 @@ pub fn default_server_configuration() -> ServerConfiguration {
         inactive_session_threshold: 0,
         library_monitor_delay: 60,
         library_update_duration: 30,
-        // C# uses ProcessorCount * 100; a fixed sensible default here.
-        cache_size: 6 * 100,
+        // C# leaves CacheSize null on a fresh instance (computed lazily), which
+        // serializes to 0 on the wire; match that fresh-instance value.
+        cache_size: 0,
         image_saving_convention: hermit_model::configuration::ImageSavingConvention::default(),
         metadata_options: default_metadata_options(),
         skip_deserialization_for_basic_types: true,
@@ -131,7 +132,12 @@ pub fn default_server_configuration() -> ServerConfiguration {
         enable_grouping_shows_into_collections: false,
         display_specials_within_seasons: true,
         codecs_used: Vec::new(),
-        plugin_repositories: Vec::new(),
+        // Jellyfin ships one default plugin repository (the Jellyfin Stable feed).
+        plugin_repositories: vec![hermit_model::updates::RepositoryInfo {
+            name: Some("Jellyfin Stable".to_owned()),
+            url: Some("https://repo.jellyfin.org/files/plugin/manifest.json".to_owned()),
+            enabled: true,
+        }],
         enable_external_content_in_suggestions: true,
         image_extraction_timeout_ms: 0,
         path_substitutions: Vec::new(),
@@ -157,7 +163,8 @@ pub fn default_server_configuration() -> ServerConfiguration {
             },
         ],
         trickplay_options: hermit_model::configuration::TrickplayOptions::default(),
-        enable_legacy_authorization: false,
+        // Jellyfin's ServerConfiguration seeds EnableLegacyAuthorization = true.
+        enable_legacy_authorization: true,
     }
 }
 
@@ -391,6 +398,29 @@ fn io_err(action: &str, path: &std::path::Path, err: &std::io::Error) -> Service
 mod tests {
     use super::*;
     use crate::app_paths::test_paths;
+
+    #[test]
+    fn default_configuration_matches_jellyfin_fresh_instance() {
+        let cfg = default_server_configuration();
+
+        // A single default plugin repository: the Jellyfin Stable feed.
+        assert_eq!(cfg.plugin_repositories.len(), 1);
+        let repo = &cfg.plugin_repositories[0];
+        assert_eq!(repo.name.as_deref(), Some("Jellyfin Stable"));
+        assert_eq!(
+            repo.url.as_deref(),
+            Some("https://repo.jellyfin.org/files/plugin/manifest.json")
+        );
+        assert!(repo.enabled);
+
+        // Legacy authorization is enabled by default.
+        assert!(cfg.enable_legacy_authorization);
+        // Cache size is the fresh-instance wire value (0).
+        assert_eq!(cfg.cache_size, 0);
+        // Fresh-instance runtime state is left untouched.
+        assert!(!cfg.is_startup_wizard_completed);
+        assert!(!cfg.is_port_authorized);
+    }
 
     #[tokio::test]
     async fn load_writes_default_then_reloads() {

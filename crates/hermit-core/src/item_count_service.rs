@@ -135,7 +135,12 @@ impl ItemCountService for HermitItemCountService {
             *by_type.entry(row.type_).or_insert(0) += 1;
         }
 
-        Ok(counts_from_type_map(&by_type))
+        // Jellyfin's LibraryController.GetItemCounts never assigns ItemCount, so
+        // it serializes as 0 for the top-level endpoint. Match that: build the
+        // per-type counts, then zero the grand total.
+        let mut counts = counts_from_type_map(&by_type);
+        counts.item_count = 0;
+        Ok(counts)
     }
 
     async fn get_item_counts_for_name_item(
@@ -657,5 +662,26 @@ mod tests {
             .await
             .expect("no clean");
         assert_eq!(zero.item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn get_item_counts_zeroes_the_grand_total() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // Two movies and one series → per-type counts populate, but the
+        // top-level ItemCount must serialize as 0 (Jellyfin never assigns it).
+        seed_item(&db, Uuid::from_u128(0xCC01), BaseItemKind::Movie).await;
+        seed_item(&db, Uuid::from_u128(0xCC02), BaseItemKind::Movie).await;
+        seed_item(&db, Uuid::from_u128(0xCC03), BaseItemKind::Series).await;
+
+        let counts = service
+            .get_item_counts(&InternalItemsQuery::default())
+            .await
+            .expect("item counts");
+
+        assert_eq!(counts.movie_count, 2);
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.item_count, 0);
     }
 }

@@ -619,7 +619,7 @@ pub struct LiveTvChannelQuery {
 }
 
 /// Information about a listings provider.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ListingsProviderInfo {
     /// Gets or sets the id.
@@ -690,6 +690,49 @@ pub struct ListingsProviderInfo {
     /// Gets or sets the user agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+}
+
+impl Default for ListingsProviderInfo {
+    /// Mirrors Jellyfin's `ListingsProviderInfo` constructor: all tuners
+    /// enabled by default, with the built-in category keyword lists seeded.
+    fn default() -> Self {
+        Self {
+            id: None,
+            type_: None,
+            username: None,
+            password: None,
+            listings_id: None,
+            zip_code: None,
+            country: None,
+            path: None,
+            enabled_tuners: Vec::new(),
+            enable_all_tuners: true,
+            news_categories: Some(vec![
+                "news".to_owned(),
+                "journalism".to_owned(),
+                "documentary".to_owned(),
+                "current affairs".to_owned(),
+            ]),
+            sports_categories: Some(vec![
+                "sports".to_owned(),
+                "basketball".to_owned(),
+                "baseball".to_owned(),
+                "football".to_owned(),
+            ]),
+            kids_categories: Some(vec![
+                "kids".to_owned(),
+                "family".to_owned(),
+                "children".to_owned(),
+                "childrens".to_owned(),
+                "disney".to_owned(),
+            ]),
+            movie_categories: Some(vec!["movie".to_owned()]),
+            channel_mappings: Vec::new(),
+            movie_prefix: None,
+            preferred_language: None,
+            user_agent: None,
+        }
+    }
 }
 
 /// Information about a tuner host.
@@ -863,6 +906,28 @@ impl Default for LiveTvOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listings_provider_default_matches_jellyfin_ctor() {
+        let p = ListingsProviderInfo::default();
+        assert!(p.enable_all_tuners);
+        assert_eq!(
+            p.news_categories.unwrap(),
+            ["news", "journalism", "documentary", "current affairs"]
+        );
+        assert_eq!(
+            p.sports_categories.unwrap(),
+            ["sports", "basketball", "baseball", "football"]
+        );
+        assert_eq!(
+            p.kids_categories.unwrap(),
+            ["kids", "family", "children", "childrens", "disney"]
+        );
+        assert_eq!(p.movie_categories.unwrap(), ["movie"]);
+        assert!(p.id.is_none());
+        assert!(p.enabled_tuners.is_empty());
+        assert!(p.channel_mappings.is_empty());
+    }
 
     #[test]
     fn channel_type_uses_tv_alias() {

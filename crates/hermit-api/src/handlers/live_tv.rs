@@ -17,6 +17,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::Utc;
 use uuid::Uuid;
 
 use hermit_model::dto::{BaseItemDto, NameIdPair, NameValuePair};
@@ -46,11 +47,24 @@ async fn get_live_tv_info(
     }
 }
 
+/// Number of days of guide data the window spans, forward from now.
+///
+/// Mirrors Jellyfin's `LiveTvOptions.GuideDays` fallback (7). This is a
+/// candidate configuration value (valid range 1..=14); it is hardcoded here
+/// until Live TV options are surfaced in Hermit's config.
+const GUIDE_DAYS_DEFAULT: i64 = 7;
+
 /// `GET /LiveTv/GuideInfo` — the guide's date range.
 ///
-/// Port of `LiveTvController.GetGuideInfo`.
+/// Port of `LiveTvController.GetGuideInfo`. Returns a now-relative window
+/// spanning [`GUIDE_DAYS_DEFAULT`] days forward from the current instant.
 async fn get_guide_info(RequireAuth(_auth): RequireAuth) -> Json<GuideInfo> {
-    Json(GuideInfo::default())
+    let start = Utc::now();
+    let end = start + chrono::Duration::days(GUIDE_DAYS_DEFAULT);
+    Json(GuideInfo {
+        start_date: start,
+        end_date: end,
+    })
 }
 
 /// `GET /LiveTv/Channels` — the user's Live TV channels.
@@ -738,6 +752,28 @@ mod tests {
     }
 
     // ---- the 5 previously-stubbed routes ---------------------------------
+
+    #[tokio::test]
+    async fn guide_info_is_now_relative_seven_day_window() {
+        let before = chrono::Utc::now();
+        let info = get_guide_info(auth()).await.0;
+        let after = chrono::Utc::now();
+        // Start is "now" (bracketed by the call), not the epoch/default.
+        assert!(info.start_date >= before && info.start_date <= after);
+        // End is exactly GUIDE_DAYS_DEFAULT days past start.
+        assert_eq!(
+            info.end_date - info.start_date,
+            chrono::Duration::days(GUIDE_DAYS_DEFAULT)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_listing_provider_seeds_categories() {
+        let p = get_default_listing_provider(auth()).await.0;
+        assert!(p.enable_all_tuners);
+        assert_eq!(p.movie_categories.unwrap(), ["movie"]);
+        assert!(p.news_categories.is_some());
+    }
 
     #[tokio::test]
     async fn schedules_direct_countries_is_empty() {
