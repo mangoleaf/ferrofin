@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "f83429c 2026-08-02",
+  "last_verified": "abe154f 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -44,6 +44,11 @@
       "note": "H=True J=True"
     },
     "DELETE /Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Videos/{itemId}/AlternateSources": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -189,9 +194,9 @@
       "note": "H=True J=True"
     },
     "POST /Videos/MergeVersions": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     }
   }
 }
