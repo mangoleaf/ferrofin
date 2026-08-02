@@ -25,13 +25,37 @@
 stages: [test, tag, build, release, chart]
 
 # ---------------------------------------------------------------------------
-# create-release — manual, main only. Derives the next version from Conventional
-# Commit subjects since the last tag: feat -> minor, fix/other -> patch, breaking
-# -> major (but while major is 0 a breaking change bumps MINOR — never auto-1.0.0).
-# It then TAGS the commit it ran on and pushes ONLY the tag — no commit to main,
-# so it needs no fast-forward and works even when main has moved on since (you can
-# trigger it early / not at the tip). The tag pipeline builds + publishes; the
-# release version is injected via SERVICE_VERSION, so Cargo.toml is left untouched.
+# request-release — the manual release GATE. It has NO needs and lives in .pre,
+# so its Play button is available the instant the pipeline starts: click it any
+# time (even while lint/coverage are still running) and walk away. create-release
+# `needs` it, and per GitLab 13.12+ a job that needs an un-played manual job is
+# SKIPPED — so nothing releases unless you click this. allow_failure: true keeps
+# it non-blocking, so lint/coverage/build still run normally when it isn't clicked.
+# ---------------------------------------------------------------------------
+request-release:
+  stage: .pre
+  image: alpine:3
+  script:
+    - echo "Release requested — create-release runs once lint + coverage pass."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
+# create-release — main only. GATED by the manual request-release job above plus
+# lint + coverage (via needs): it is SKIPPED unless you clicked request-release
+# AND both checks passed. This is how a release is triggered early WITHOUT waiting
+# — click request-release any time; this then runs automatically once the checks
+# go green, or is skipped/cancelled if they fail. It never auto-releases: no
+# request-release click means this is skipped.
+#
+# Derives the next version from Conventional Commit subjects since the last tag
+# (feat -> minor, fix/other -> patch, breaking -> major; while major is 0 a
+# breaking change bumps MINOR, never auto-1.0.0). It TAGS the commit it ran on and
+# pushes ONLY the tag — no commit to main, so no fast-forward needed even if main
+# moved on. The tag pipeline builds + publishes; the version is injected via
+# SERVICE_VERSION, so Cargo.toml is left untouched.
 #
 # Override the auto-derived bump with FORCE_VERSION=vX.Y.Z when you need to.
 # Requires CI/CD var RELEASE_TOKEN — a project access token (Maintainer) allowed
@@ -39,12 +63,8 @@ stages: [test, tag, build, release, chart]
 # ---------------------------------------------------------------------------
 create-release:
   stage: tag
-  # Manual (never auto-runs — when:manual below). `needs` makes it a DAG job, so
-  # its play button is available from pipeline start: trigger it EARLY, while
-  # lint/coverage are still running, and it runs once they succeed. If either
-  # fails, the need is unmet and this job is skipped (cancelled) — a release can
-  # never be cut from a red commit.
   needs:
+    - job: request-release
     - job: lint
     - job: coverage
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
@@ -87,9 +107,10 @@ create-release:
         echo "No docker-image job in this pipeline to cancel."
       fi
   rules:
+    # No `when:` -> on_success. The manual gate is request-release (a need above);
+    # this runs automatically once request-release + lint + coverage all succeed,
+    # and is skipped otherwise — so it never releases without a request-release click.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-      allow_failure: true
 
 # ---------------------------------------------------------------------------
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
