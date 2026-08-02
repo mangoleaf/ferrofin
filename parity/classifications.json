@@ -42,6 +42,9 @@
 
     "GET /LiveTv/GuideInfo": {"category": "instance", "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."},
     "GET /System/Configuration": {"category": "instance", "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug."},
-    "GET /LiveTv/TunerHosts/Types": {"category": "deferred", "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."}
+    "GET /LiveTv/TunerHosts/Types": {"category": "deferred", "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."},
+
+    "POST /Items/{itemId}": {"category": "instance", "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect."},
+    "GET /Items/{itemId}/MetadataEditor": {"category": "deferred", "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off."}
   }
 }

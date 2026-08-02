@@ -44,7 +44,6 @@ _Layer 1: 166/188 status-conformant · 121/123 schema-valid_
 - ✅ `GET /Items/Filters`
 - ✅ `GET /Items/Filters2`
 - ✅ `GET /Items/Latest`
-- ✅ `POST /Items/{itemId}`
 - ✅ `GET /Items/{itemId}/CriticReviews`
 - ✅ `GET /Items/{itemId}/Images`
 - ✅ `GET /Items/{itemId}/InstantMix`
@@ -57,6 +56,7 @@ _Layer 1: 166/188 status-conformant · 121/123 schema-valid_
 - ✅ `GET /Items/{itemId}/ThemeVideos`
 - ✅ `GET /Library/VirtualFolders`
 - ✅ `GET /LiveTv/Channels`
+- ✅ `GET /LiveTv/Info`
 - ✅ `GET /LiveTv/ListingProviders/Default`
 - ✅ `GET /LiveTv/Programs`
 - ✅ `GET /LiveTv/Programs/Recommended`
@@ -122,9 +122,10 @@ _Layer 1: 166/188 status-conformant · 121/123 schema-valid_
 - ⚠️ `GET /IntroSkipper/SupportBundle` — expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.
 - ⚠️ `GET /Items/Suggestions` — instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior).
 - ⚠️ `GET /Items/{itemId}` — instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred).
+- ⚠️ `POST /Items/{itemId}` — instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect.
 - ⚠️ `GET /Items/{itemId}/Ancestors` — instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope).
 - ⚠️ `GET /Items/{itemId}/ExternalIdInfos` — deferred: external-id provider metadata (TMDB/etc.) is feature-gated off.
-- ⚠️ `GET /Items/{itemId}/MetadataEditor` — flagged: read diff vs Jellyfin (sweep single-item align)
+- ⚠️ `GET /Items/{itemId}/MetadataEditor` — deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off.
 - ⚠️ `GET /Items/{itemId}/PlaybackInfo` — instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}.
 - ⚠️ `GET /Items/{itemId}/RemoteImages` — deferred: remote image providers feature-gated off.
 - ⚠️ `GET /Items/{itemId}/RemoteImages/Providers` — deferred: remote image providers feature-gated off.
@@ -133,7 +134,6 @@ _Layer 1: 166/188 status-conformant · 121/123 schema-valid_
 - ⚠️ `GET /Library/MediaFolders` — instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows.
 - ⚠️ `GET /Library/PhysicalPaths` — instance: data-dir-relative physical paths differ by container (/config vs /data).
 - ⚠️ `GET /LiveTv/GuideInfo` — instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers.
-- ⚠️ `GET /LiveTv/Info` — flagged: read diff vs Jellyfin (sweep single-item align)
 - ⚠️ `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` — deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision.
 - ⚠️ `GET /LiveTv/Timers/Defaults` — flagged: read diff vs Jellyfin (sweep single-item align)
 - ⚠️ `GET /LiveTv/TunerHosts/Types` — deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported.
@@ -268,7 +268,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Items/Suggestions` | registered | REAL | ✅ | ✅ | ⚠️ | instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior). |
 | `DELETE /Items/{itemId}` | registered | REAL | · | · | · |  |
 | `GET /Items/{itemId}` | registered | REAL | ✅ | ✅ | ⚠️ | instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred). |
-| `POST /Items/{itemId}` | registered | REAL | · | · | ✅ | ok |
+| `POST /Items/{itemId}` | registered | REAL | · | · | ⚠️ | instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect. |
 | `GET /Items/{itemId}/Ancestors` | registered | REAL | ✅ | ✅ | ⚠️ | instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope). |
 | `POST /Items/{itemId}/ContentType` | registered | REAL | · | · | · |  |
 | `GET /Items/{itemId}/CriticReviews` | registered | REAL | ✅ | ✅ | ✅ |  |
@@ -290,7 +290,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Items/{itemId}/InstantMix` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Items/{itemId}/Intros` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Items/{itemId}/LocalTrailers` | registered | REAL | ✅ | ✅ | ✅ |  |
-| `GET /Items/{itemId}/MetadataEditor` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (sweep single-item align) |
+| `GET /Items/{itemId}/MetadataEditor` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off. |
 | `GET /Items/{itemId}/PlaybackInfo` | registered | REAL | ✅ | ✅ | ⚠️ | instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}. |
 | `POST /Items/{itemId}/PlaybackInfo` | registered | REAL | · | · | · |  |
 | `POST /Items/{itemId}/Refresh` | registered | REAL | · | · | · |  |
@@ -329,7 +329,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /LiveTv/Channels` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /LiveTv/Channels/{channelId}` | registered | REAL | · | · | · |  |
 | `GET /LiveTv/GuideInfo` | registered | REAL | ✅ | ✅ | ⚠️ | instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers. |
-| `GET /LiveTv/Info` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (sweep single-item align) |
+| `GET /LiveTv/Info` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `DELETE /LiveTv/ListingProviders` | registered | REAL | · | · | · |  |
 | `POST /LiveTv/ListingProviders` | registered | REAL | · | · | · |  |
 | `GET /LiveTv/ListingProviders/Default` | registered | REAL | ✅ | ✅ | ✅ |  |

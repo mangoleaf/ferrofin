@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "8e9f5b9 2026-08-02",
+  "last_verified": "b19dc00 2026-08-02",
   "rows": {
     "DELETE /Collections/{collectionId}/Items": {
       "classification": "ok",
@@ -54,9 +54,9 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
     },
     "POST /Playlists": {
       "classification": "ok",

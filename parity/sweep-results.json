@@ -1,6 +1,6 @@
 {
   "generated_by": "parity/sweep.py",
-  "last_verified": "8e9f5b9 2026-08-02",
+  "last_verified": "b19dc00 2026-08-02",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",
@@ -8659,15 +8659,7 @@
       "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          "ContentTypeOptions[Name=HomeVideos] (whole item)",
-          "ContentTypeOptions[Name=Inherit] (whole item)",
-          "ContentTypeOptions[Name=Movies] (whole item)",
-          "ContentTypeOptions[Name=MusicVideos] (whole item)",
-          "ContentTypeOptions[Name=Music] (whole item)",
-          "ContentTypeOptions[Name=Photos] (whole item)",
-          "ContentTypeOptions[Name=Shows] (whole item)"
-        ],
+        "extra": [],
         "mismatch": [
           "ExternalIdInfos[]"
         ],
@@ -9393,17 +9385,7 @@
       "status_conformant": true
     },
     "GET /LiveTv/Info": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "Services[Name=Emby].IsVisible"
-        ],
-        "missing": [
-          "Services[Name=Emby].Tuners"
-        ]
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
