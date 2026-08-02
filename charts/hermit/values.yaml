@@ -123,8 +123,15 @@ hermit:
   args: []
   # -- Extra environment variables. Config is HERMIT_* env or {data_dir}/config.toml.
   env: []
-  # -- Load env from ConfigMaps/Secrets (e.g. HERMIT_OMDB_KEY, TMDB keys).
+  # -- Load env from EXISTING ConfigMaps/Secrets (e.g. a Secret with HERMIT_OMDB_KEY).
   envFrom: []
+  # -- Key/value pairs rendered into a chart-managed ConfigMap and injected into
+  # the container as environment variables (via envFrom). For non-secret config;
+  # put secrets in a Secret referenced through `envFrom`. Changing a value rolls
+  # the pod so it takes effect.
+  config: {}
+    # HERMIT_PUBLISHED_URL: "https://hermit.example.com"
+    # HERMIT_LOG_LEVEL: "info"
 
 # -- Liveness probe. Hermit serves GET /health/live (process-only 200).
 livenessProbe:

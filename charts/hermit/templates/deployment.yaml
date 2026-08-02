@@ -14,9 +14,16 @@ spec:
       {{- include "hermit.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations .Values.hermit.config }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.hermit.config }}
+        # Roll the pod when the chart-managed env ConfigMap changes (envFrom is
+        # only re-read on restart, so a config change otherwise wouldn't apply).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
       {{- end }}
       labels:
         {{- include "hermit.selectorLabels" . | nindent 8 }}
@@ -53,9 +60,15 @@ spec:
           env:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.hermit.envFrom }}
+          {{- if or .Values.hermit.config .Values.hermit.envFrom }}
           envFrom:
+            {{- if .Values.hermit.config }}
+            - configMapRef:
+                name: {{ include "hermit.fullname" . }}-env
+            {{- end }}
+            {{- with .Values.hermit.envFrom }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           {{- with .Values.startupProbe }}
           startupProbe:
