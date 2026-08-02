@@ -80,20 +80,29 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     init_tracing(&config);
     tracing::info!(
         server_name = %config.server_name,
+        version = service_version(),
+        "hermit-server starting"
+    );
+    tracing::info!(
         data_dir = %config.data_dir.display(),
         config_dir = %config.config_dir.display(),
         cache_dir = %config.cache_dir.display(),
         web_dir = %config.web_dir.display(),
+        "paths"
+    );
+    tracing::info!(
         bind = %config.bind_addr,
         port = config.port,
         https_port = config.https_port,
         base_url = %config.base_url,
         published_url = config.published_url.as_deref().unwrap_or("<auto>"),
+        "network"
+    );
+    tracing::info!(
         library_roots = config.library_roots.len(),
         admin_user = %config.admin_user,
         admin_password_set = !config.admin_password.is_empty(),
-        version = service_version(),
-        "hermit-server starting"
+        "library & admin"
     );
 
     let db = open_database(&config).await?;
