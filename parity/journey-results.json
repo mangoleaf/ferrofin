@@ -1,8 +1,13 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "b19dc00 2026-08-02",
+  "last_verified": "43def21 2026-08-02",
   "rows": {
+    "DELETE /Auth/Keys/{key}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "DELETE /Collections/{collectionId}/Items": {
       "classification": "ok",
       "deep_verified": true,
@@ -43,6 +48,11 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Auth/Keys": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /Collections": {
       "classification": "ok",
       "deep_verified": true,
@@ -53,10 +63,20 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Devices/Options": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /DisplayPreferences/{displayPreferencesId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /Items/{itemId}": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "deep_verified": false,
-      "note": "H=True J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Playlists": {
       "classification": "ok",
@@ -73,12 +93,27 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /ScheduledTasks/{taskId}/Triggers": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /UserFavoriteItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
     },
     "POST /UserItems/{itemId}/Rating": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /UserItems/{itemId}/UserData": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"

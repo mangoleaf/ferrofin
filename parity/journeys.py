@@ -82,6 +82,13 @@ def j_playlist(base, token, user, mid, m2):
         st, _ = http("POST", f"{base}/Playlists/{pid}/Items?ids={m2}&userId={user}", token, "")
         after = q(base, f"/Playlists/{pid}/Items", token, user) or {}
         r["POST /Playlists/{playlistId}/Items"] = st < 300 and after.get("TotalRecordCount", 0) >= 2
+        # Move the 2nd entry to index 0 and verify the order flips.
+        items2 = after.get("Items") or []
+        if len(items2) >= 2:
+            st, _ = http("POST", f"{base}/Playlists/{pid}/Items/{items2[1]['PlaylistItemId']}/Move/0", token, "")
+            moved = (q(base, f"/Playlists/{pid}/Items", token, user) or {}).get("Items") or [{}]
+            r["POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}"] = \
+                st < 300 and moved[0].get("Id") == items2[1].get("Id")
         entry = (after.get("Items") or [{}])[0].get("PlaylistItemId")
         st, _ = http("DELETE", f"{base}/Playlists/{pid}/Items?entryIds={entry}&userId={user}", token)
         rem = q(base, f"/Playlists/{pid}/Items", token, user) or {}
@@ -139,7 +146,70 @@ def j_item_edit(base, token, user, mid, _m2):
     return r
 
 
-JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit]
+def j_api_keys(base, token, user, _m, _m2):
+    r = {}
+    http("POST", f"{base}/Auth/Keys?app=parity-probe", token, "")
+    keys = (get_json(base, "/Auth/Keys", token) or {}).get("Items") or []
+    mine = next((k for k in keys if k.get("AppName") == "parity-probe"), None)
+    r["POST /Auth/Keys"] = mine is not None
+    if mine:
+        st, _ = http("DELETE", f"{base}/Auth/Keys/{mine['AccessToken']}", token)
+        after = (get_json(base, "/Auth/Keys", token) or {}).get("Items") or []
+        r["DELETE /Auth/Keys/{key}"] = st < 300 and not any(k.get("AppName") == "parity-probe" for k in after)
+    return r
+
+
+def j_user_item_data(base, token, user, mid, _m2):
+    r = {}
+    st, _ = http("POST", f"{base}/UserItems/{mid}/UserData?userId={user}", token,
+                 json.dumps({"Rating": 8.0, "Played": True}))
+    ud = user_data(base, token, user, mid)
+    r["POST /UserItems/{itemId}/UserData"] = st < 300 and ud.get("Rating") == 8.0 and ud.get("Played") is True
+    return r
+
+
+def j_display_prefs(base, token, user, _m, _m2):
+    r = {}
+    path = f"/DisplayPreferences/usersettings?userId={user}&client=parity"
+    dto = get_json(base, path, token)
+    if dto is not None:
+        dto.setdefault("CustomPrefs", {})["parityProbe"] = "1"
+        st, _ = http("POST", f"{base}{path}", token, json.dumps(dto))
+        back = get_json(base, path, token) or {}
+        r["POST /DisplayPreferences/{displayPreferencesId}"] = \
+            st < 300 and (back.get("CustomPrefs") or {}).get("parityProbe") == "1"
+    return r
+
+
+def j_scheduled_task_triggers(base, token, user, _m, _m2):
+    r = {}
+    tasks = get_json(base, "/ScheduledTasks", token) or []
+    if tasks:
+        tid = tasks[0]["Id"]
+        triggers = [{"Type": "IntervalTrigger", "IntervalTicks": 36_000_000_000}]
+        st, _ = http("POST", f"{base}/ScheduledTasks/{tid}/Triggers", token, json.dumps(triggers))
+        back = get_json(base, f"/ScheduledTasks/{tid}", token) or {}
+        got = [t.get("Type") for t in (back.get("Triggers") or [])]
+        r["POST /ScheduledTasks/{taskId}/Triggers"] = st < 300 and "IntervalTrigger" in got
+    return r
+
+
+def j_device_options(base, token, user, _m, _m2):
+    r = {}
+    devices = (get_json(base, "/Devices", token) or {}).get("Items") or []
+    dev = next((d for d in devices if d.get("Id")), None)
+    if dev:
+        st, _ = http("POST", f"{base}/Devices/Options?id={dev['Id']}", token,
+                     json.dumps({"CustomName": "ParityRenamed"}))
+        after = (get_json(base, "/Devices", token) or {}).get("Items") or []
+        renamed = next((d for d in after if d.get("Id") == dev["Id"]), {})
+        r["POST /Devices/Options"] = st < 300 and renamed.get("CustomName") == "ParityRenamed"
+    return r
+
+
+JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
+            j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
+            j_device_options]
 
 # ---------------------------------------------------------------- run
 
