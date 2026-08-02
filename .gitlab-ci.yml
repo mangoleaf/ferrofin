@@ -168,10 +168,13 @@ lint:
   before_script:
     - !reference [.sccache-setup, script]
     - rustup component add rustfmt clippy
+    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    - cargo binstall -y cargo-nextest
   script:
     - cargo fmt --all --check
     - cargo clippy --all-targets --all-features -- -D warnings
-    - cargo test --workspace
+    - cargo nextest run --workspace
+    - cargo test --workspace --doc   # nextest can't run doctests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
