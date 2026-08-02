@@ -14,7 +14,7 @@ ARG WEB_IMAGE=registry.mangoleafstudios.com/mlstudios/hermit/ci:web-10.11.8
 FROM ${WEB_IMAGE} AS web
 
 # ── server binary ──────────────────────────────────────────────────
-FROM rust:1.97.0-bookworm AS build
+FROM rust:1.97.1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p hermit-server

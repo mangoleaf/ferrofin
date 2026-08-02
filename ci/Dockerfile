@@ -1,9 +1,9 @@
 # CI base image: the pinned Rust toolchain plus the tools every Rust CI job needs,
 # baked in so lint/coverage don't reinstall them on each pipeline run. Built and
-# pushed by the `ci-image` job to $CI_REGISTRY_IMAGE/ci:rust-1.97.0 whenever this
-# file changes; lint/coverage use it as their `image:`. Bump the tag when the
-# toolchain moves.
-FROM rust:1.97.0-bookworm
+# pushed by the `ci-image` job to $CI_REGISTRY_IMAGE/ci:rust-1.97.1 whenever this
+# file changes; lint/coverage use it as their `image:`. Keep this in step with
+# rust-toolchain.toml; bump the tag (ci:rust-<version>) whenever the toolchain moves.
+FROM rust:1.97.1-bookworm
 
 # rustfmt + clippy (lint) and llvm-tools-preview (coverage instrumentation).
 RUN rustup component add rustfmt clippy llvm-tools-preview
