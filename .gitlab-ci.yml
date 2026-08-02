@@ -39,12 +39,14 @@ stages: [test, tag, build, release, chart]
 # ---------------------------------------------------------------------------
 create-release:
   stage: tag
-  # In the `tag` stage (after `test`), with NO `needs`, so it can be triggered
-  # EARLY — even while lint/coverage are still running — yet only RUNS once the
-  # test stage passes (stage ordering). If lint/coverage fail, the test stage
-  # fails, the tag stage is never reached, and this queued job is auto-cancelled,
-  # so a release can never be cut from a red commit. (A `needs` on lint/coverage
-  # would instead disable the play button until they finish — no early trigger.)
+  # Manual (never auto-runs — when:manual below). `needs` makes it a DAG job, so
+  # its play button is available from pipeline start: trigger it EARLY, while
+  # lint/coverage are still running, and it runs once they succeed. If either
+  # fails, the need is unmet and this job is skipped (cancelled) — a release can
+  # never be cut from a red commit.
+  needs:
+    - job: lint
+    - job: coverage
   image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
