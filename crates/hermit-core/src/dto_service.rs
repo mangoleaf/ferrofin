@@ -694,14 +694,10 @@ impl HermitDtoService {
             dto.image_tags = Some(image_tags);
         }
 
-        // Drop the blurhash map if nothing was recorded, so the wire form omits it.
-        if dto
-            .image_blur_hashes
-            .as_ref()
-            .is_some_and(HashMap::is_empty)
-        {
-            dto.image_blur_hashes = None;
-        }
+        // Keep the blurhash map even when empty: Jellyfin sets
+        // `dto.ImageBlurHashes = []` unconditionally in `AttachBasicFields` and
+        // never nulls it, so strict clients that deref it (same crash class as
+        // `ImageTags`) always see `{}`, not null.
     }
 
     /// Builds the full DTO for one item row (port of `GetBaseItemDtoInternal` +
@@ -2416,6 +2412,12 @@ mod tests {
             image_tags.is_empty(),
             "empty map for an item with no images"
         );
+        // Same rule for ImageBlurHashes: Jellyfin always emits `{}`, never null.
+        let hashes = dto
+            .image_blur_hashes
+            .as_ref()
+            .expect("ImageBlurHashes must be present");
+        assert!(hashes.is_empty(), "empty blurhash map, not null");
     }
 
     #[tokio::test]
