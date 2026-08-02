@@ -1,6 +1,6 @@
 {
   "generated_by": "parity/sweep.py",
-  "last_verified": "7737d79 2026-08-02",
+  "last_verified": "665935a 2026-08-02",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",
@@ -1996,15 +1996,7 @@
       "status_conformant": true
     },
     "GET /Items/Counts": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "ItemCount"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
@@ -9590,10 +9582,10 @@
       "diffs": {
         "extra": [],
         "mismatch": [
-          "IsEnabled"
+          "Services[Name=Emby].IsVisible"
         ],
         "missing": [
-          "Services[Name=Emby] (whole item)"
+          "Services[Name=Emby].Tuners"
         ]
       },
       "note": "H=200 J=200",
@@ -9601,20 +9593,7 @@
       "status_conformant": true
     },
     "GET /LiveTv/ListingProviders/Default": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "EnableAllTuners"
-        ],
-        "missing": [
-          "KidsCategories",
-          "MovieCategories",
-          "NewsCategories",
-          "SportsCategories"
-        ]
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
@@ -11175,13 +11154,10 @@
         "extra": [],
         "mismatch": [
           "CacheSize",
-          "EnableLegacyAuthorization",
           "IsPortAuthorized",
           "IsStartupWizardCompleted"
         ],
-        "missing": [
-          "PluginRepositories[Name=Jellyfin Stable] (whole item)"
-        ]
+        "missing": []
       },
       "note": "H=200 J=200",
       "schema_valid": true,
@@ -11862,15 +11838,7 @@
       "status_conformant": true
     },
     "GET /Users/Public": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          " (whole item)"
-        ],
-        "mismatch": [],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
