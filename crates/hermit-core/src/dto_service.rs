@@ -109,6 +109,9 @@ struct Prefetched {
         Uuid,
         HashMap<String, HashMap<i32, hermit_db::entities::playback::TrickplayInfoEntity>>,
     >,
+    /// Direct-child counts per folder item id (populated only when the
+    /// `ChildCount` field is requested and a user is present).
+    child_counts: HashMap<Uuid, i32>,
 }
 use crate::kinds;
 
@@ -173,6 +176,28 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
 /// unrecognized stored `Type` (the conservative default used across the crate).
 fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
+}
+
+/// Sets `ChildCount` on a folder DTO from the prefetched per-parent counts.
+///
+/// Port of the `AttachUserSpecificInfo` ChildCount attach + `GetChildCount`:
+/// only folders get a count, and an already-set value is kept (`??=`).
+/// Collection folders and user views skip the count: C# returns
+/// `Random.Shared.Next(1, 10)` there ("too slow to calculate for top level
+/// folders on a per-user basis — just return something so that apps that are
+/// expecting a value won't think the folders are empty"); an id-derived 1..=9
+/// honors the same contract (nonzero, meaningless) without a rand dependency.
+fn attach_child_count(dto: &mut BaseItemDto, item: &BaseItemEntity, counts: &HashMap<Uuid, i32>) {
+    if dto.child_count.is_some() || !item.is_folder {
+        return;
+    }
+    let id = row_id(item);
+    dto.child_count = Some(match row_kind(item) {
+        BaseItemKind::CollectionFolder | BaseItemKind::UserView => {
+            i32::from(id.as_bytes()[15] % 9) + 1
+        }
+        _ => counts.get(&id).copied().unwrap_or(0),
+    });
 }
 
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
@@ -661,9 +686,12 @@ impl HermitDtoService {
                     image_tags.insert(image.image_type, tag);
                 }
             }
-            if !image_tags.is_empty() {
-                dto.image_tags = Some(image_tags);
-            }
+            // Always emit the map (empty `{}` when the item has no single-image
+            // tags), matching Jellyfin's `dto.ImageTags = []` inside
+            // `EnableImages`. A `None` here omits the field → the SDK sees null,
+            // and the Android TV client NPEs on `getImageTags().containsKey(...)`
+            // while binding a 16:9 card.
+            dto.image_tags = Some(image_tags);
         }
 
         // Drop the blurhash map if nothing was recorded, so the wire form omits it.
@@ -1292,6 +1320,18 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         if options.contains_field(ItemFields::ItemCounts) {
             self.set_item_by_name_info(&mut dto, user).await?;
         }
+        if let Some(user) = user
+            && options.contains_field(ItemFields::ChildCount)
+            && dto.child_count.is_none()
+            && item.is_folder
+        {
+            let user_id = Uuid::parse_str(&user.id).ok();
+            let counts = self
+                .item_counts
+                .get_child_count_batch(&[row_id(item)], user_id)
+                .await?;
+            attach_child_count(&mut dto, item, &counts);
+        }
         Ok(dto)
     }
 
@@ -1404,6 +1444,32 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         } else {
             HashMap::new()
         };
+        // Child counts for the page's folders in one batch (C# prefetches the
+        // same way before `AttachUserSpecificInfo`, which is user-gated).
+        let child_counts = match user {
+            Some(user) if options.contains_field(ItemFields::ChildCount) => {
+                let folder_ids: Vec<Uuid> = items
+                    .iter()
+                    .filter(|i| {
+                        i.is_folder
+                            && !matches!(
+                                row_kind(i),
+                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
+                            )
+                    })
+                    .map(row_id)
+                    .collect();
+                if folder_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    let user_id = Uuid::parse_str(&user.id).ok();
+                    self.item_counts
+                        .get_child_count_batch(&folder_ids, user_id)
+                        .await?
+                }
+            }
+            _ => HashMap::new(),
+        };
         let prefetched = Prefetched {
             images,
             user_data,
@@ -1414,6 +1480,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             value_ids,
             chapters,
             trickplay,
+            child_counts,
         };
 
         let mut out = Vec::with_capacity(items.len());
@@ -1423,6 +1490,9 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                 .await?;
             if options.contains_field(ItemFields::ItemCounts) {
                 self.set_item_by_name_info(&mut dto, user).await?;
+            }
+            if user.is_some() && options.contains_field(ItemFields::ChildCount) {
+                attach_child_count(&mut dto, item, &prefetched.child_counts);
             }
             out.push(dto);
         }
@@ -1803,10 +1873,11 @@ mod tests {
         }
         async fn get_child_count_batch(
             &self,
-            _parent_ids: &[Uuid],
+            parent_ids: &[Uuid],
             _user_id: Option<Uuid>,
         ) -> Result<HashMap<Uuid, i32>, ServiceError> {
-            Ok(HashMap::new())
+            // Every requested parent reports a fixed 4 children.
+            Ok(parent_ids.iter().map(|&p| (p, 4)).collect())
         }
     }
 
@@ -2325,6 +2396,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_tags_is_empty_map_not_null_when_item_has_no_images() {
+        // An item with no images must still serialize `ImageTags` as `{}` (not
+        // omit it → null). The Jellyfin Android TV client NPEs on
+        // `getImageTags().containsKey(...)` when it is null. Matches Jellyfin's
+        // `dto.ImageTags = []` inside `EnableImages`.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        let image_tags = dto.image_tags.as_ref().expect("ImageTags must be present");
+        assert!(
+            image_tags.is_empty(),
+            "empty map for an item with no images"
+        );
+    }
+
+    #[tokio::test]
     async fn primary_aspect_ratio_endpoint_matches_processor() {
         let db = test_db().await;
         let id = Uuid::new_v4();
@@ -2367,6 +2461,89 @@ mod tests {
         assert_eq!(dto.series_count, Some(2));
         // Child count sums the per-kind counts.
         assert_eq!(dto.child_count, Some(5));
+    }
+
+    #[tokio::test]
+    async fn child_count_attaches_to_folders_when_requested() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Season, "Season 1").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
+            .bind(id.to_string())
+            .execute(db.pool())
+            .await
+            .expect("mark folder");
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::ChildCount],
+            ..DtoOptions::default()
+        };
+
+        // Both the single and the batch path attach the count-service value.
+        let dto = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.child_count, Some(4));
+        let dtos = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&item),
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].child_count, Some(4));
+
+        // C# attaches ChildCount in `AttachUserSpecificInfo`: no user → no count.
+        let anon = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(anon.child_count, None);
+        // And only when the field is requested (default options enable every
+        // field, so pass an explicitly empty list).
+        let no_fields = DtoOptions {
+            fields: vec![],
+            ..DtoOptions::default()
+        };
+        let no_field = svc
+            .get_base_item_dto(&item, &no_fields, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(no_field.child_count, None);
+    }
+
+    #[tokio::test]
+    async fn child_count_placeholder_for_collection_folders() {
+        // C# `GetChildCount` returns a random 1..10 for collection folders and
+        // user views instead of a real count; the port derives a stable 1..=9.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::CollectionFolder, "Shows").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
+            .bind(id.to_string())
+            .execute(db.pool())
+            .await
+            .expect("mark folder");
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::ChildCount],
+            ..DtoOptions::default()
+        };
+
+        let dto = svc
+            .get_base_item_dto(&item, &options, Some(&user), None)
+            .await
+            .unwrap();
+        let count = dto.child_count.expect("placeholder set");
+        assert!((1..=9).contains(&count));
     }
 
     #[tokio::test]
