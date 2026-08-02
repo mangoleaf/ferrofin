@@ -43,36 +43,118 @@ const UNRATED_VALUES: &[&str] = &["n/a", "unrated", "not rated", "nr"];
 /// verbatim from upstream so `GET /Localization/Cultures` yields the same ~200-language list.
 const ISO6392: &str = include_str!("data/iso6392.txt");
 
-/// The compact embedded country dataset (common metadata regions).
-/// `(name, two-letter, three-letter, display)`.
-const COUNTRY_ROWS: &[(&str, &str, &str, &str)] = &[
-    ("US", "US", "USA", "United States"),
-    ("GB", "GB", "GBR", "United Kingdom"),
-    ("CA", "CA", "CAN", "Canada"),
-    ("AU", "AU", "AUS", "Australia"),
-    ("DE", "DE", "DEU", "Germany"),
-    ("FR", "FR", "FRA", "France"),
-    ("ES", "ES", "ESP", "Spain"),
-    ("IT", "IT", "ITA", "Italy"),
-    ("JP", "JP", "JPN", "Japan"),
-    ("NL", "NL", "NLD", "Netherlands"),
+/// Jellyfin's bundled country dataset, vendored verbatim from
+/// `Emby.Server.Implementations/Localization/countries.json` (v10.11.8, 139 ISO-3166 entries).
+const COUNTRIES_JSON: &str = include_str!("data/countries.json");
+
+/// Jellyfin's bundled US parental-rating system, vendored verbatim from
+/// `Emby.Server.Implementations/Localization/Ratings/us.json` (v10.11.8).
+const RATINGS_US_JSON: &str = include_str!("data/ratings-us.json");
+
+/// The fixed UI-language option list, ported verbatim from Jellyfin's
+/// `LocalizationManager.GetLocalizationOptions` (v10.11.8). `(name, value)`.
+const LOCALIZATION_OPTIONS: &[(&str, &str)] = &[
+    ("Afrikaans", "af"),
+    ("العربية", "ar"),
+    ("Беларуская", "be"),
+    ("Български", "bg-BG"),
+    ("বাংলা (বাংলাদেশ)", "bn"),
+    ("Català", "ca"),
+    ("Čeština", "cs"),
+    ("Cymraeg", "cy"),
+    ("Dansk", "da"),
+    ("Deutsch", "de"),
+    ("English (United Kingdom)", "en-GB"),
+    ("English", "en-US"),
+    ("Ελληνικά", "el"),
+    ("Esperanto", "eo"),
+    ("Español", "es"),
+    ("Español americano", "es_419"),
+    ("Español (Argentina)", "es-AR"),
+    ("Español (Dominicana)", "es_DO"),
+    ("Español (México)", "es-MX"),
+    ("Eesti", "et"),
+    ("Basque", "eu"),
+    ("فارسی", "fa"),
+    ("Suomi", "fi"),
+    ("Filipino", "fil"),
+    ("Français", "fr"),
+    ("Français (Canada)", "fr-CA"),
+    ("Galego", "gl"),
+    ("Schwiizerdütsch", "gsw"),
+    ("עִבְרִית", "he"),
+    ("हिन्दी", "hi"),
+    ("Hrvatski", "hr"),
+    ("Magyar", "hu"),
+    ("Bahasa Indonesia", "id"),
+    ("Íslenska", "is"),
+    ("Italiano", "it"),
+    ("日本語", "ja"),
+    ("Qazaqşa", "kk"),
+    ("한국어", "ko"),
+    ("Lietuvių", "lt"),
+    ("Latviešu", "lv"),
+    ("Македонски", "mk"),
+    ("മലയാളം", "ml"),
+    ("मराठी", "mr"),
+    ("Bahasa Melayu", "ms"),
+    ("Norsk bokmål", "nb"),
+    ("नेपाली", "ne"),
+    ("Nederlands", "nl"),
+    ("Norsk nynorsk", "nn"),
+    ("ਪੰਜਾਬੀ", "pa"),
+    ("Polski", "pl"),
+    ("Pirate", "pr"),
+    ("Português", "pt"),
+    ("Português (Brasil)", "pt-BR"),
+    ("Português (Portugal)", "pt-PT"),
+    ("Românește", "ro"),
+    ("Русский", "ru"),
+    ("Slovenčina", "sk"),
+    ("Slovenščina", "sl-SI"),
+    ("Shqip", "sq"),
+    ("Српски", "sr"),
+    ("Svenska", "sv"),
+    ("தமிழ்", "ta"),
+    ("తెలుగు", "te"),
+    ("ภาษาไทย", "th"),
+    ("Türkçe", "tr"),
+    ("Українська", "uk"),
+    ("اُردُو", "ur_PK"),
+    ("Tiếng Việt", "vi"),
+    ("汉语 (简体字)", "zh-CN"),
+    ("漢語 (繁體字)", "zh-TW"),
+    ("廣東話 (香港)", "zh-HK"),
 ];
 
-/// The US parental rating system (rating string → score). Mirrors the entries
-/// Jellyfin ships in `Ratings/us.json` for the common film/TV ratings.
-const US_RATINGS: &[(&str, i32)] = &[
-    ("G", 0),
-    ("TV-G", 0),
-    ("TV-Y", 0),
-    ("PG", 10),
-    ("TV-PG", 10),
-    ("TV-Y7", 7),
-    ("PG-13", 13),
-    ("TV-14", 14),
-    ("R", 17),
-    ("NC-17", 18),
-    ("TV-MA", 17),
-];
+/// One country row as stored in `countries.json` (PascalCase keys).
+#[derive(serde::Deserialize)]
+struct CountryRow {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "DisplayName")]
+    display_name: String,
+    #[serde(rename = "TwoLetterISORegionName")]
+    two: String,
+    #[serde(rename = "ThreeLetterISORegionName")]
+    three: String,
+}
+
+/// A parental-rating system as stored in `Ratings/*.json` (C# `ParentalRatingSystem`).
+#[derive(serde::Deserialize)]
+struct ParentalRatingSystem {
+    #[serde(rename = "ratings", default)]
+    ratings: Vec<ParentalRatingEntry>,
+}
+
+/// One entry: several rating strings sharing one score (C# `ParentalRatingEntry`).
+#[derive(serde::Deserialize)]
+struct ParentalRatingEntry {
+    #[serde(rename = "ratingStrings", default)]
+    rating_strings: Vec<String>,
+    #[serde(rename = "ratingScore")]
+    rating_score: Option<ParentalRatingScore>,
+}
 
 /// A concrete culture/country/parental-rating service over a minimal dataset.
 ///
@@ -141,9 +223,18 @@ impl LocalizationManager {
             });
         }
 
+        // Load the US rating system from the vendored Ratings/us.json, expanding each entry's
+        // ratingStrings to share its score+subScore (C# LoadAll ratings loop). Keyed upper-case
+        // to match parental_ratings_for's lookup.
         let mut us = HashMap::new();
-        for (rating, score) in US_RATINGS {
-            us.insert((*rating).to_owned(), ParentalRatingScore::new(*score, None));
+        if let Ok(system) = serde_json::from_str::<ParentalRatingSystem>(RATINGS_US_JSON) {
+            for entry in system.ratings {
+                if let Some(score) = entry.rating_score {
+                    for rating in entry.rating_strings {
+                        us.insert(rating, score);
+                    }
+                }
+            }
         }
         let mut parental_ratings = HashMap::new();
         parental_ratings.insert("US".to_owned(), us);
@@ -165,13 +256,15 @@ impl LocalizationManager {
     /// All known countries (C# `GetCountries`).
     #[must_use]
     pub fn get_countries(&self) -> Vec<CountryInfo> {
-        COUNTRY_ROWS
-            .iter()
-            .map(|(name, two, three, display)| CountryInfo {
-                name: (*name).to_owned(),
-                display_name: (*display).to_owned(),
-                two_letter_iso_region_name: (*two).to_owned(),
-                three_letter_iso_region_name: (*three).to_owned(),
+        // Port of C# GetCountries: deserialize the bundled countries.json (139 ISO-3166 regions).
+        serde_json::from_str::<Vec<CountryRow>>(COUNTRIES_JSON)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| CountryInfo {
+                name: c.name,
+                display_name: c.display_name,
+                two_letter_iso_region_name: c.two,
+                three_letter_iso_region_name: c.three,
             })
             .collect()
     }
@@ -185,29 +278,15 @@ impl LocalizationManager {
     /// entry the C# adds explicitly.
     #[must_use]
     pub fn get_localization_options(&self) -> Vec<LocalizationOption> {
-        let mut options = vec![LocalizationOption {
-            name: "English".to_owned(),
-            value: "en-US".to_owned(),
-        }];
-        for culture in &self.cultures {
-            if culture.two_letter_iso_language_name.is_empty()
-                || culture.two_letter_iso_language_name == "en"
-            {
-                continue;
-            }
-            let name = culture
-                .display_name
-                .split([';', ','])
-                .next()
-                .unwrap_or(&culture.display_name)
-                .trim()
-                .to_owned();
-            options.push(LocalizationOption {
-                name,
-                value: culture.two_letter_iso_language_name.clone(),
-            });
-        }
-        options
+        // Port of C# GetLocalizationOptions: a fixed list of UI-language options (the translation
+        // catalogs Jellyfin ships), not derived from the culture dataset.
+        LOCALIZATION_OPTIONS
+            .iter()
+            .map(|(name, value)| LocalizationOption {
+                name: (*name).to_owned(),
+                value: (*value).to_owned(),
+            })
+            .collect()
     }
 
     /// Finds the culture matching a language token by display name, name,
@@ -545,5 +624,36 @@ mod tests {
         let mut sorted = scores.clone();
         sorted.sort_unstable();
         assert_eq!(scores, sorted);
+    }
+
+    #[test]
+    fn vendored_localization_data_matches_jellyfin() {
+        let m = LocalizationManager::default();
+        // Countries: the full bundled ISO-3166 set (139), incl. the region codes the old 10-row
+        // table lacked (029 = Caribbean, AT = Austria).
+        let countries = m.get_countries();
+        assert_eq!(countries.len(), 139);
+        assert!(countries.iter().any(|c| c.name == "029"));
+        assert!(
+            countries
+                .iter()
+                .any(|c| c.name == "AT" && c.display_name == "Austria")
+        );
+
+        // Parental ratings: NC-17 is score 17 / subScore 1 (grouped with TV-MA), not the old 18.
+        let ratings = m.get_parental_ratings();
+        let nc17 = ratings.iter().find(|r| r.name == "NC-17").expect("NC-17");
+        assert_eq!(nc17.rating_score.map(|s| s.score), Some(17));
+        assert_eq!(nc17.rating_score.and_then(|s| s.sub_score), Some(1));
+
+        // Localization options: the fixed 71-entry UI-language list, incl. es_419.
+        let options = m.get_localization_options();
+        assert_eq!(options.len(), 71);
+        assert!(options.iter().any(|o| o.value == "es_419"));
+        assert!(
+            options
+                .iter()
+                .any(|o| o.value == "en-US" && o.name == "English")
+        );
     }
 }
