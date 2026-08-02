@@ -48,13 +48,15 @@ use crate::state::build_app_state;
 /// app-version fallback in the authorization context).
 ///
 /// Prefers the `SERVICE_VERSION` environment variable — stamped into the release
-/// image via a Docker build arg from the git tag — and falls back to the compiled
-/// crate version (`CARGO_PKG_VERSION`) for local/dev builds where it is unset.
+/// image from the git tag by CI. When unset (local/dev builds), it falls back to
+/// `HERMIT_BUILD_VERSION`, a `git describe` value baked in at compile time by
+/// `build.rs` (latest tag + commits-since + HEAD sha), so the reported version is
+/// derived from git rather than a hardcoded number that goes stale.
 pub(crate) fn service_version() -> String {
     std::env::var("SERVICE_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        .unwrap_or_else(|| env!("HERMIT_BUILD_VERSION").to_owned())
 }
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
