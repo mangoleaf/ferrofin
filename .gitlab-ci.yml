@@ -247,7 +247,57 @@ coverage:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # ---------------------------------------------------------------------------
-# build — server image (kaniko, no Docker daemon: the homelab runner is in k3s)
+# image-version — computes the server image's version and exports it as a dotenv,
+# because the kaniko job (docker-image) has no git. On a release tag the version
+# is the tag; otherwise it is a describe-style dev version
+#   {Major}.{Minor}.{Patch}-{N}-{sha12}
+# where {Major.Minor.Patch} is the last release tag and {N} is the count of
+# commits since that tag that touched build-relevant paths (crates / apps /
+# Cargo.toml / Cargo.lock / Dockerfile). This lets us publish a testable image
+# for any build-worthy commit WITHOUT cutting a release. Same rules as
+# docker-image, so the two are always present together; docker-image inherits
+# this dotenv via stage ordering (no `needs`, so the test stage still gates it).
+# ---------------------------------------------------------------------------
+image-version:
+  stage: .pre
+  image: alpine/git:latest
+  variables:
+    GIT_DEPTH: "0"   # full history + tags to count build-relevant commits
+  script:
+    - |
+      set -eu
+      git fetch --tags --quiet
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        VERSION="${CI_COMMIT_TAG#v}"                 # release: the tag is the version
+        BASE="${VERSION%-rc.*}"
+        if [ "$VERSION" = "$BASE" ]; then PUSH_LATEST=true; else PUSH_LATEST=false; fi
+      else
+        LATEST=$(git tag -l --sort=-v:refname 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n 1p || true)
+        if [ -n "$LATEST" ]; then BASE="${LATEST#v}"; RANGE="${LATEST}..HEAD"; else BASE="0.0.0"; RANGE="HEAD"; fi
+        # count only commits that would change the image (build-relevant paths)
+        COUNT=$(git rev-list --count $RANGE -- crates apps Cargo.toml Cargo.lock Dockerfile)
+        SHA=$(git rev-parse --short=12 HEAD)
+        VERSION="${BASE}-${COUNT}-${SHA}"            # dev: {M.m.p}-{N}-{sha12}
+        PUSH_LATEST=false
+      fi
+      printf 'IMAGE_VERSION=%s\nPUSH_LATEST=%s\n' "$VERSION" "$PUSH_LATEST" | tee image.env
+  artifacts:
+    reports:
+      dotenv: image.env
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - crates/**/*
+        - apps/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
+
+# ---------------------------------------------------------------------------
+# build — server image (kaniko, no Docker daemon: the homelab runner is in k3s).
+# Builds on a release tag AND on a build-worthy main commit (dev image); the
+# version + :latest decision come from image-version's dotenv.
 # ---------------------------------------------------------------------------
 docker-image:
   stage: build
@@ -262,24 +312,25 @@ docker-image:
     - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
   script:
     - |
-      # Runs ONLY on a release tag (see rules) — Cargo.toml already carries this
-      # version (stamped + committed by create-release), so no build-time patching.
-      VERSION="${CI_COMMIT_TAG#v}"
-      BASE="${VERSION%-rc.*}"                  # strip any -rc.N for the :latest decision
-      if [ "$VERSION" = "$BASE" ]; then
-        DESTS="--destination $IMAGE:$VERSION --destination $IMAGE:latest"   # final release
-      else
-        DESTS="--destination $IMAGE:$VERSION"                              # -rc.N: no :latest
-      fi
+      # IMAGE_VERSION / PUSH_LATEST come from the image-version job's dotenv.
+      DESTS="--destination $IMAGE:$IMAGE_VERSION"
+      [ "$PUSH_LATEST" = "true" ] && DESTS="$DESTS --destination $IMAGE:latest"
     - >-
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
-      --build-arg SERVICE_VERSION="$VERSION"
+      --build-arg SERVICE_VERSION="$IMAGE_VERSION"
       $DESTS
       --push-retry 5
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - crates/**/*
+        - apps/**/*
+        - Cargo.toml
+        - Cargo.lock
+        - Dockerfile
 
 # ---------------------------------------------------------------------------
 # release — GitLab Release with git-cliff notes (final versions only)
