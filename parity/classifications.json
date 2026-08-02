@@ -11,6 +11,33 @@
     "GET /Search/Hints": {"category": "deferred", "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>."},
     "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {"category": "deferred", "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision."},
     "GET /UserViews": {"category": "instance", "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."},
-    "GET /Library/MediaFolders": {"category": "instance", "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."}
+    "GET /Library/MediaFolders": {"category": "instance", "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."},
+
+    "GET /Albums/{itemId}/Similar": {"category": "deferred", "classification": "deferred: weighted similarity scorer not ported (same as Items/{id}/Similar)."},
+    "GET /Artists/{itemId}/Similar": {"category": "deferred", "classification": "deferred: weighted similarity scorer not ported."},
+    "GET /Shows/{itemId}/Similar": {"category": "deferred", "classification": "deferred: weighted similarity scorer not ported."},
+    "GET /Trailers/{itemId}/Similar": {"category": "deferred", "classification": "deferred: weighted similarity scorer not ported."},
+
+    "GET /Plugins": {"category": "expected-extension", "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins."},
+    "GET /Packages": {"category": "expected-extension", "classification": "expected-extension: no external plugin package repository (compiled-in extensions)."},
+    "GET /Repositories": {"category": "expected-extension", "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions)."},
+    "GET /web/ConfigurationPages": {"category": "expected-extension", "classification": "expected-extension: plugin configuration pages come from external plugins Hermit doesn't host."},
+
+    "GET /Items/{itemId}/ExternalIdInfos": {"category": "deferred", "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off."},
+    "GET /Items/{itemId}/RemoteImages": {"category": "deferred", "classification": "deferred: remote image providers feature-gated off."},
+    "GET /Items/{itemId}/RemoteImages/Providers": {"category": "deferred", "classification": "deferred: remote image providers feature-gated off."},
+
+    "GET /Items/{itemId}": {"category": "instance", "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred)."},
+    "GET /Items/{itemId}/PlaybackInfo": {"category": "instance", "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}."},
+
+    "GET /Years": {"category": "expected-extension", "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope)."},
+    "GET /ScheduledTasks": {"category": "instance", "classification": "instance: LastExecutionResult depends on whether/when a task last ran."},
+
+    "GET /System/Info/Storage": {"category": "instance", "classification": "instance: per-host disk paths and free/used space."},
+    "GET /System/Ping": {"category": "instance", "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name)."},
+    "GET /Environment/Drives": {"category": "instance", "classification": "instance: per-host filesystem drives."},
+    "GET /Library/PhysicalPaths": {"category": "instance", "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."},
+    "GET /System/Logs": {"category": "instance", "classification": "instance: log-file set differs per instance/run."},
+    "GET /System/ActivityLog/Entries": {"category": "instance", "classification": "instance: activity-log entries differ per instance/run."}
   }
 }

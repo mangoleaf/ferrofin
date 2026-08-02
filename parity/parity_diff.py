@@ -21,6 +21,10 @@ VOLATILE = re.compile("^(" + "|".join([
     "DisplayPreferencesId",
     # BlurHash: valid, but not byte-identical to Jellyfin's Skia 128px downsample (documented deferral).
     "BlurHash",
+    # Per-instance derived values: ImageTag is an md5(path+mtime) cache tag (mtime differs per scan);
+    # OwnerId references another per-scan item id; the rest are per-session/per-request server values.
+    "ImageTag", "OwnerId", "AccessToken", "DateLastActivity", "LastUserId",
+    "RequestReceptionTime", "ResponseTransmissionTime",
     "DateCreated", "DateModified", "DateLastSaved", "DateLastMediaAdded", "DateLastRefreshed",
     "LastActivityDate", "LastLoginDate", "LastPlaybackCheckIn", "RemoteEndPoint", "UserId",
     "StartTimeUtc", "EndTimeUtc",

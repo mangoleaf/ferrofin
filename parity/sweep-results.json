@@ -1,6 +1,6 @@
 {
   "generated_by": "parity/sweep.py",
-  "last_verified": "d92a710 2026-08-02",
+  "last_verified": "f38e54a 2026-08-02",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",
@@ -1348,18 +1348,7 @@
       "status_conformant": null
     },
     "GET /Devices": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [
-          "Items[Name=parity].AccessToken"
-        ],
-        "mismatch": [
-          "Items[Name=parity].DateLastActivity",
-          "Items[Name=parity].LastUserId"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
@@ -1458,16 +1447,7 @@
       "status_conformant": true
     },
     "GET /GetUtcTime": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "RequestReceptionTime",
-          "ResponseTransmissionTime"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
@@ -8645,15 +8625,7 @@
       "status_conformant": true
     },
     "GET /Items/{itemId}/Images": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "ImageTag"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
@@ -9465,45 +9437,19 @@
       "status_conformant": true
     },
     "GET /Items/{itemId}/ThemeMedia": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "SoundtrackSongsResult.OwnerId",
-          "ThemeSongsResult.OwnerId",
-          "ThemeVideosResult.OwnerId"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/{itemId}/ThemeSongs": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "OwnerId"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/{itemId}/ThemeVideos": {
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "deep_verified": false,
-      "diffs": {
-        "extra": [],
-        "mismatch": [
-          "OwnerId"
-        ],
-        "missing": []
-      },
+      "deep_verified": true,
       "note": "H=200 J=200",
       "schema_valid": true,
       "status_conformant": true
