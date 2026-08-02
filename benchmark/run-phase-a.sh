@@ -13,6 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+. ./_phase-common.sh
 mkdir -p results/raw
 
 # ── knobs (magic numbers surfaced as env, sensible defaults) ────────────────
@@ -49,14 +50,7 @@ cpu_usec() { docker compose exec -T "$1" cat /sys/fs/cgroup/cpu.stat </dev/null 
 
 profile() {   # $1=service $2=port $3=target
   local svc="$1" base="http://localhost:$2" target="$3"
-  echo ">> [$target] up + scan"
-  docker compose down -v >/dev/null 2>&1 || true
-  if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
-  local up=0; for _ in $(seq 1 120); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
-  if [ "$up" != 1 ] || ! k6 run -e TARGET="$target" -e BASE_URL="$base" bootstrap.js; then
-    echo "   [$target] bootstrap/scan failed (container likely OOM'd at ${BENCH_MEM}) — skipping this server"
-    docker compose stop "$svc" >/dev/null 2>&1 || true; return 0
-  fi
+  bringup_scan "$svc" "$base" "$target" || return 0
 
   # Idle baseline: CPU the server burns doing nothing, to subtract per-endpoint.
   # `|| echo 0` so a transient `docker exec` hiccup can never abort the run.

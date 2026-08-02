@@ -13,6 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+. ./_phase-common.sh
 mkdir -p results/raw
 
 SWEEP_RATES=${SWEEP_RATES:-"25 50 100 200 400 800 1600 3200 6400"}   # req/s ladder
@@ -37,14 +38,7 @@ jnum() { node -pe "require('./$1').$2" 2>/dev/null || echo "$3"; }   # $1=file $
 
 sweep() {   # $1=service $2=port $3=target
   local svc="$1" base="http://localhost:$2" target="$3"
-  echo ">> [$target] up + scan"
-  docker compose down -v >/dev/null 2>&1 || true
-  if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then docker compose up -d "$svc"; else docker compose up -d --build "$svc"; fi
-  local up=0; for _ in $(seq 1 120); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
-  if [ "$up" != 1 ] || ! k6 run -e TARGET="$target" -e BASE_URL="$base" bootstrap.js; then
-    echo "   [$target] bootstrap/scan failed (container likely OOM'd at ${BENCH_MEM}) — skipping this server"
-    docker compose stop "$svc" >/dev/null 2>&1 || true; return 0
-  fi
+  bringup_scan "$svc" "$base" "$target" || return 0
 
   for name in $PHASE_B_ENDPOINTS; do
     local maxrate=0 lastp99=null
