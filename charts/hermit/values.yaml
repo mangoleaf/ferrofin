@@ -131,7 +131,7 @@ hermit:
   # the pod so it takes effect.
   config: {}
     # HERMIT_PUBLISHED_URL: "https://hermit.example.com"
-    # HERMIT_LOG_LEVEL: "info"
+    # HERMIT_LOG: "info"   # EnvFilter/RUST_LOG syntax, e.g. "debug" or "hermit_api=debug,info"
 
 # -- Liveness probe. Hermit serves GET /health/live (process-only 200).
 livenessProbe:
