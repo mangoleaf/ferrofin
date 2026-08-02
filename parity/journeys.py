@@ -207,9 +207,92 @@ def j_device_options(base, token, user, _m, _m2):
     return r
 
 
+def my_session(base, token):
+    sessions = get_json(base, "/Sessions", token) or []
+    return next((s["Id"] for s in sessions if s.get("Client") == "parity"),
+                sessions[0]["Id"] if sessions else None)
+
+
+def j_playstate(base, token, user, mid, _m2):
+    r = {}
+    ticks = 6_000_000_000
+    st, _ = http("POST", f"{base}/Sessions/Playing", token,
+                 json.dumps({"ItemId": mid, "PlayMethod": "DirectPlay"}))
+    sid = my_session(base, token)
+    now = next((s.get("NowPlayingItem") for s in (get_json(base, "/Sessions", token) or [])
+                if s.get("Id") == sid), None) or {}
+    r["POST /Sessions/Playing"] = st < 300 and now.get("Id") == mid
+    st, _ = http("POST", f"{base}/Sessions/Playing/Progress", token,
+                 json.dumps({"ItemId": mid, "PositionTicks": ticks, "PlayMethod": "DirectPlay"}))
+    r["POST /Sessions/Playing/Progress"] = st < 300 and \
+        user_data(base, token, user, mid).get("PlaybackPositionTicks") == ticks
+    st, _ = http("POST", f"{base}/Sessions/Playing/Stopped", token,
+                 json.dumps({"ItemId": mid, "PositionTicks": ticks}))
+    stopped = next((s.get("NowPlayingItem") for s in (get_json(base, "/Sessions", token) or [])
+                    if s.get("Id") == sid), None)
+    r["POST /Sessions/Playing/Stopped"] = st < 300 and stopped is None
+    return r
+
+
+def j_capabilities(base, token, user, _m, _m2):
+    r = {}
+    sid = my_session(base, token)
+    if sid:
+        st, _ = http("POST", f"{base}/Sessions/Capabilities/Full?id={sid}", token,
+                     json.dumps({"PlayableMediaTypes": ["Video"], "SupportedCommands": ["DisplayMessage"],
+                                 "SupportsMediaControl": True}))
+        caps = next((s.get("Capabilities") for s in (get_json(base, "/Sessions", token) or [])
+                     if s.get("Id") == sid), None) or {}
+        r["POST /Sessions/Capabilities/Full"] = st < 300 and caps.get("SupportsMediaControl") is True
+    return r
+
+
+def j_user_config(base, token, user, _m, _m2):
+    r = {}
+    cfg = (get_json(base, f"/Users/{user}", token) or {}).get("Configuration") or {}
+    cfg["PlayDefaultAudioTrack"] = not cfg.get("PlayDefaultAudioTrack", True)
+    st, _ = http("POST", f"{base}/Users/Configuration?userId={user}", token, json.dumps(cfg))
+    back = (get_json(base, f"/Users/{user}", token) or {}).get("Configuration") or {}
+    r["POST /Users/Configuration"] = st < 300 and back.get("PlayDefaultAudioTrack") == cfg["PlayDefaultAudioTrack"]
+    return r
+
+
+def j_system_config(base, token, user, _m, _m2):
+    r = {}
+    cfg = get_json(base, "/System/Configuration", token)
+    if cfg is not None:
+        cfg["EnableFolderView"] = not cfg.get("EnableFolderView", False)
+        st, _ = http("POST", f"{base}/System/Configuration", token, json.dumps(cfg))
+        back = get_json(base, "/System/Configuration", token) or {}
+        r["POST /System/Configuration"] = st < 300 and back.get("EnableFolderView") == cfg["EnableFolderView"]
+    return r
+
+
+def j_playlist_share(base, token, user, mid, _m2):
+    r = {}
+    _, praw = http("POST", f"{base}/Playlists", token,
+                   json.dumps({"Name": "SharePL", "Ids": [mid], "UserId": user}))
+    pid = json.loads(praw).get("Id") if praw else None
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "shareprobe", "Password": "Parity!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if pid and uid:
+        st, _ = http("POST", f"{base}/Playlists/{pid}/Users/{uid}", token,
+                     json.dumps({"CanEdit": True}))
+        shared = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
+        r["POST /Playlists/{playlistId}/Users/{userId}"] = st < 300 and any(s.get("UserId") == uid for s in shared)
+        st, _ = http("DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)
+        after = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
+        r["DELETE /Playlists/{playlistId}/Users/{userId}"] = st < 300 and not any(s.get("UserId") == uid for s in after)
+        http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
+        http("DELETE", f"{base}/Items/{pid}", token)
+    return r
+
+
 JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
-            j_device_options]
+            j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
+            j_playlist_share]
 
 # ---------------------------------------------------------------- run
 
