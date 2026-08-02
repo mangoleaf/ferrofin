@@ -47,7 +47,6 @@
     "POST /Items/{itemId}": {"category": "instance", "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect."},
     "GET /Items/{itemId}/MetadataEditor": {"category": "deferred", "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off."},
 
-    "POST /Sessions/Playing/Progress": {"category": "instance", "classification": "instance/methodology: the harness read-back check (item UserData.PlaybackPositionTicks) doesn't reflect a bare progress ping on EITHER server (needs a real PlaySessionId to correlate); the endpoint itself accepts the report — not a Hermit defect."},
-    "DELETE /Playlists/{playlistId}/Users/{userId}": {"category": "instance", "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin's read-back still lists it (oracle behavior), so this is not a Hermit defect."}
+    "DELETE /Playlists/{playlistId}/Users/{userId}": {"category": "instance", "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect."}
   }
 }

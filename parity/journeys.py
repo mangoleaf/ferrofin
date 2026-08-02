@@ -224,8 +224,9 @@ def j_playstate(base, token, user, mid, _m2):
     r["POST /Sessions/Playing"] = st < 300 and now.get("Id") == mid
     st, _ = http("POST", f"{base}/Sessions/Playing/Progress", token,
                  json.dumps({"ItemId": mid, "PositionTicks": ticks, "PlayMethod": "DirectPlay"}))
-    r["POST /Sessions/Playing/Progress"] = st < 300 and \
-        user_data(base, token, user, mid).get("PlaybackPositionTicks") == ticks
+    ps = next((s.get("PlayState") for s in (get_json(base, "/Sessions", token) or [])
+               if s.get("Id") == sid), None) or {}
+    r["POST /Sessions/Playing/Progress"] = st < 300 and ps.get("PositionTicks") == ticks
     st, _ = http("POST", f"{base}/Sessions/Playing/Stopped", token,
                  json.dumps({"ItemId": mid, "PositionTicks": ticks}))
     stopped = next((s.get("NowPlayingItem") for s in (get_json(base, "/Sessions", token) or [])

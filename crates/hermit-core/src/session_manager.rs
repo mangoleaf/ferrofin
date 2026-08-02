@@ -96,6 +96,10 @@ struct SessionInfo {
     last_playback_check_in: DateTime<Utc>,
     last_paused_date: Option<DateTime<Utc>>,
     now_playing_item_id: Option<Uuid>,
+    /// The current playback position + paused flag reported for the now-playing item,
+    /// surfaced as the session's `PlayState` (C# `Session.PlayState`). Cleared on stop.
+    now_playing_position_ticks: Option<i64>,
+    now_playing_is_paused: bool,
     now_viewing_item_id: Option<Uuid>,
     additional_users: Vec<SessionUserInfo>,
     capabilities: ClientCapabilities,
@@ -354,6 +358,8 @@ impl HermitSessionManager {
                 last_playback_check_in: now,
                 last_paused_date: None,
                 now_playing_item_id: None,
+                now_playing_position_ticks: None,
+                now_playing_is_paused: false,
                 now_viewing_item_id: None,
                 additional_users: Vec::new(),
                 capabilities: ClientCapabilities::default(),
@@ -540,6 +546,8 @@ impl SessionManager for HermitSessionManager {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.now_playing_item_id = (!info.item_id.is_nil()).then_some(info.item_id);
+                s.now_playing_position_ticks = info.position_ticks;
+                s.now_playing_is_paused = info.is_paused;
                 s.is_playing = true;
                 s.last_playback_check_in = Utc::now();
             }
@@ -580,6 +588,8 @@ impl SessionManager for HermitSessionManager {
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.last_activity_date = Utc::now();
                 s.last_playback_check_in = Utc::now();
+                s.now_playing_position_ticks = info.position_ticks;
+                s.now_playing_is_paused = info.is_paused;
                 if info.is_paused {
                     s.last_paused_date = Some(Utc::now());
                 } else {
@@ -618,6 +628,8 @@ impl SessionManager for HermitSessionManager {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.now_playing_item_id = None;
+                s.now_playing_position_ticks = None;
+                s.now_playing_is_paused = false;
                 s.is_playing = false;
                 s.last_activity_date = Utc::now();
             }
@@ -981,12 +993,35 @@ impl SessionManager for HermitSessionManager {
                 // Don't report hardware-acceleration detail to non-admins.
                 dto.transcoding_info = None;
             }
-            result.push(dto);
+            result.push((dto, session.now_playing_item_id));
+        }
+        drop(sessions); // release before the async NowPlayingItem enrichment below
+
+        // Enrich NowPlayingItem: C# `UpdateNowPlayingItem` builds a BaseItemDto for the
+        // session's current item. Done after dropping the sessions lock (async DTO build).
+        let mut dtos = Vec::with_capacity(result.len());
+        for (mut dto, now_playing_id) in result {
+            if let Some(id) = now_playing_id
+                && let Some(item) = self.library_manager.get_item_by_id(id).await?
+                && let Ok(mut built) = self
+                    .dto_service
+                    .get_base_item_dtos(
+                        std::slice::from_ref(&item),
+                        &hermit_traits::options::DtoOptions::default(),
+                        None,
+                        None,
+                        true,
+                    )
+                    .await
+            {
+                dto.now_playing_item = built.pop();
+            }
+            dtos.push(dto);
         }
 
         // Newest activity first (C# `OrderByDescending(LastActivityDate)`).
-        result.sort_by_key(|s| std::cmp::Reverse(s.last_activity_date));
-        Ok(result)
+        dtos.sort_by_key(|s| std::cmp::Reverse(s.last_activity_date));
+        Ok(dtos)
     }
 
     async fn get_session_by_authentication_token(
@@ -1279,7 +1314,12 @@ fn session_info_to_dto(session: &SessionInfo) -> SessionInfoDto {
         capabilities: Some(crate::device_manager::client_capabilities_to_dto(
             &session.capabilities,
         )),
-        play_state: Some(hermit_model::session::PlayerStateInfo::default()),
+        play_state: Some(hermit_model::session::PlayerStateInfo {
+            position_ticks: session.now_playing_position_ticks,
+            is_paused: session.now_playing_is_paused,
+            can_seek: session.now_playing_item_id.is_some(),
+            ..Default::default()
+        }),
         now_playing_queue: Some(Vec::new()),
         now_playing_queue_full_items: Some(Vec::new()),
         ..SessionInfoDto::default()
