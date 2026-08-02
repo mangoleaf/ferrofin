@@ -72,6 +72,10 @@ const BASE_ITEM_KIND_NAMES: &[(BaseItemKind, &str)] = &[
         "MediaBrowser.Controller.Entities.Genre",
     ),
     (
+        BaseItemKind::ManualPlaylistsFolder,
+        "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder",
+    ),
+    (
         BaseItemKind::Movie,
         "MediaBrowser.Controller.Entities.Movies.Movie",
     ),
@@ -260,10 +264,19 @@ mod tests {
 
     #[test]
     fn omits_kinds_without_a_stored_type() {
-        // Program/Recording/ChannelFolderItem/ManualPlaylistsFolder are absent
-        // upstream too.
+        // Program/Recording/ChannelFolderItem are absent upstream too.
         assert_eq!(stored_type_name(BaseItemKind::Program), None);
-        assert_eq!(stored_type_name(BaseItemKind::ManualPlaylistsFolder), None);
+    }
+
+    #[test]
+    fn manual_playlists_folder_has_a_stored_type() {
+        // The auto-provisioned Playlists media folder is persisted, so it needs a
+        // stored `BaseItems.Type` name (matching upstream's
+        // `Emby.Server.Implementations.Playlists.ManualPlaylistsFolder`).
+        assert_eq!(
+            stored_type_name(BaseItemKind::ManualPlaylistsFolder),
+            Some("Emby.Server.Implementations.Playlists.ManualPlaylistsFolder")
+        );
     }
 
     #[test]

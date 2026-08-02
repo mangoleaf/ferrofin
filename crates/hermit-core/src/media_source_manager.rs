@@ -25,7 +25,7 @@ use hermit_db::entities::base_items::{
     AttachmentStreamInfoEntity, BaseItemEntity, MediaStreamInfoEntity,
 };
 use hermit_model::dto::{MediaSourceInfo, MediaSourceType};
-use hermit_model::entities::MediaStreamType;
+use hermit_model::entities::{MediaStreamType, VideoType};
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
 use hermit_model::media_info::{LiveStreamRequest, MediaProtocol};
 use uuid::Uuid;
@@ -159,7 +159,26 @@ impl HermitMediaSourceManager {
         item: &BaseItemEntity,
         streams: Vec<MediaStream>,
     ) -> MediaSourceInfo {
-        MediaSourceInfo {
+        // A video item's source reports `VideoType.VideoFile` (Jellyfin's
+        // `Video.VideoType` default); audio/other sources leave it unset.
+        let video_type =
+            (item.media_type.as_deref() == Some("Video")).then_some(VideoType::VideoFile);
+
+        // Default audio stream index: the audio stream marked default, else the
+        // first audio stream (mirrors `MediaSourceInfo.DefaultAudioStreamIndex`
+        // resolution in `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndexes`).
+        let default_audio_stream_index = streams
+            .iter()
+            .filter(|s| s.stream_type == MediaStreamType::Audio)
+            .find(|s| s.is_default)
+            .or_else(|| {
+                streams
+                    .iter()
+                    .find(|s| s.stream_type == MediaStreamType::Audio)
+            })
+            .map(|s| s.index);
+
+        let mut source = MediaSourceInfo {
             id: Some(item.id.clone()),
             path: item.path.clone(),
             name: item.name.clone(),
@@ -172,8 +191,15 @@ impl HermitMediaSourceManager {
             supports_direct_play: true,
             supports_direct_stream: true,
             supports_transcoding: true,
+            video_type,
+            default_audio_stream_index,
+            e_tag: Some(source_etag(item)),
             ..Default::default()
-        }
+        };
+        // Sum the internal streams' bit rates into the source total
+        // (`MediaSourceInfo.InferTotalBitrate`).
+        source.infer_total_bitrate(false);
+        source
     }
 }
 
@@ -198,6 +224,21 @@ fn container_of(item: &BaseItemEntity) -> Option<String> {
         .and_then(|ext| ext.to_str())
         .map(str::to_lowercase)
         .filter(|ext| !ext.is_empty())
+}
+
+/// A stable `ETag` for a static media source.
+///
+/// Mirrors Jellyfin's `BaseItem.GetEtag`, which MD5-hashes a pipe-joined value
+/// list (there, the item's `DateLastSaved.Ticks`) and renders it as a 32-char
+/// dashless hex string (`Guid.ToString("N")`). Hermit hashes the item id plus
+/// its last-modified time, so the tag changes whenever the item's media does.
+/// The MD5-over-UTF-16LE helper is the same one Jellyfin uses (`GetMD5`).
+fn source_etag(item: &BaseItemEntity) -> String {
+    let modified = item.date_modified.map_or(0, |d| d.timestamp_millis());
+    let input = format!("{}|{modified}", item.id);
+    hermit_common::extensions::get_md5(&input)
+        .simple()
+        .to_string()
 }
 
 /// Maps a persisted media-stream row to the wire [`MediaStream`] DTO. Fields the
@@ -894,6 +935,80 @@ mod tests {
         assert_eq!(sources[0].path.as_deref(), Some("/media/m.mkv"));
         assert_eq!(sources[0].container.as_deref(), Some("mkv"));
         assert_eq!(sources[0].run_time_ticks, Some(100));
+    }
+
+    #[test]
+    fn static_source_fills_video_source_fields() {
+        let item = BaseItemEntity {
+            id: "item-1".to_owned(),
+            name: Some("Movie".to_owned()),
+            path: Some("/media/m.mkv".to_owned()),
+            media_type: Some("Video".to_owned()),
+            run_time_ticks: Some(100),
+            date_modified: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        // Stream 1 is the default audio track (index 0 is video).
+        let streams = vec![
+            MediaStream {
+                index: 0,
+                stream_type: MediaStreamType::Video,
+                bit_rate: Some(4_000_000),
+                ..MediaStream::default()
+            },
+            MediaStream {
+                index: 1,
+                stream_type: MediaStreamType::Audio,
+                is_default: true,
+                bit_rate: Some(128_000),
+                ..MediaStream::default()
+            },
+        ];
+
+        let source = HermitMediaSourceManager::static_source(&item, streams);
+        assert_eq!(source.video_type, Some(VideoType::VideoFile));
+        assert_eq!(source.default_audio_stream_index, Some(1));
+        // Total bitrate = sum of the internal streams.
+        assert_eq!(source.bitrate, Some(4_128_000));
+        // ETag is a 32-char dashless MD5 hex, stable for the same id+modified.
+        let etag = source.e_tag.expect("etag");
+        assert_eq!(etag.len(), 32);
+        assert!(etag.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(source_etag(&item), etag);
+    }
+
+    #[test]
+    fn static_source_first_audio_when_none_default() {
+        let item = BaseItemEntity {
+            id: "item-2".to_owned(),
+            media_type: Some("Video".to_owned()),
+            ..Default::default()
+        };
+        let streams = vec![
+            MediaStream {
+                index: 2,
+                stream_type: MediaStreamType::Audio,
+                ..MediaStream::default()
+            },
+            MediaStream {
+                index: 3,
+                stream_type: MediaStreamType::Audio,
+                ..MediaStream::default()
+            },
+        ];
+        let source = HermitMediaSourceManager::static_source(&item, streams);
+        assert_eq!(source.default_audio_stream_index, Some(2));
+    }
+
+    #[test]
+    fn static_source_audio_item_has_no_video_type() {
+        let item = BaseItemEntity {
+            id: "item-3".to_owned(),
+            media_type: Some("Audio".to_owned()),
+            ..Default::default()
+        };
+        let source = HermitMediaSourceManager::static_source(&item, Vec::new());
+        assert_eq!(source.video_type, None);
     }
 
     #[tokio::test]

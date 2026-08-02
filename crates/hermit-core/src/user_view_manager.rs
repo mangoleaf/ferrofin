@@ -12,9 +12,11 @@
 //! (all-movies/all-tv merges), channel views, and per-user view ordering from
 //! display preferences. Those layer on top of the row set returned here.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::SortOrder;
@@ -24,21 +26,42 @@ use uuid::Uuid;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::UserViewManager;
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
-use hermit_traits::persistence::ItemRepository;
+use hermit_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+use crate::item_type_lookup;
+use crate::resolvers::sort_name as create_sort_name;
 
 /// How many latest items to return per view by default (C#
 /// `GetLatestItems` uses the request's `Limit`, defaulting to 20 when unset).
 const DEFAULT_LATEST_LIMIT: i32 = 20;
 
+/// The display name of the auto-provisioned playlists media folder
+/// (C# `ManualPlaylistsFolder.Name`).
+const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
+
 /// The concrete user-view manager.
 #[derive(Clone)]
 pub struct HermitUserViewManager {
     items: Arc<dyn ItemRepository>,
+    /// The item store, set by the composition root. When present (together with a
+    /// [`playlists_path`](Self::playlists_path)), [`get_media_folders`] lazily
+    /// provisions the [`BaseItemKind::ManualPlaylistsFolder`] row on first read —
+    /// the same self-healing stance `HermitVirtualFolderManager` takes for a
+    /// library's `CollectionFolder`. `None` in unit tests keeps the manager
+    /// read-only.
+    ///
+    /// [`get_media_folders`]: UserViewManager::get_media_folders
+    persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// The on-disk playlists directory (`{data}/playlists`), the provisioned
+    /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
+    playlists_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for HermitUserViewManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HermitUserViewManager")
+            .field("has_item_store", &self.persistence.is_some())
+            .field("playlists_path", &self.playlists_path)
             .finish_non_exhaustive()
     }
 }
@@ -47,7 +70,74 @@ impl HermitUserViewManager {
     /// Creates a user-view manager over the injected item repository.
     #[must_use]
     pub fn new(items: Arc<dyn ItemRepository>) -> Self {
-        Self { items }
+        Self {
+            items,
+            persistence: None,
+            playlists_path: None,
+        }
+    }
+
+    /// Attaches the item store and the playlists directory so
+    /// [`get_media_folders`](UserViewManager::get_media_folders) can lazily
+    /// provision the `ManualPlaylistsFolder` row (and create its directory) on
+    /// first read. Called once by the composition root.
+    #[must_use]
+    pub fn with_playlists_store(
+        mut self,
+        persistence: Arc<dyn ItemPersistenceService>,
+        playlists_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.persistence = Some(persistence);
+        self.playlists_path = Some(playlists_path.into());
+        self
+    }
+
+    /// The deterministic `ManualPlaylistsFolder` item id (`GetNewItemIdInternal`
+    /// over the folder path).
+    fn playlists_folder_id(playlists_path: &std::path::Path) -> Option<Uuid> {
+        item_type_lookup::derive_item_id(
+            BaseItemKind::ManualPlaylistsFolder,
+            &playlists_path.to_string_lossy(),
+        )
+    }
+
+    /// Upserts the `ManualPlaylistsFolder` row (and its directory) when it is
+    /// missing (idempotent). No-op without an item store + playlists path wired.
+    ///
+    /// Port of Jellyfin's lazy `GetUserRootFolder()` provisioning of its
+    /// `ManualPlaylistsFolder` child: the folder is `Name="Playlists"`,
+    /// `Path={data}/playlists`, and appears among the media folders.
+    async fn ensure_playlists_folder(&self) -> Result<(), ServiceError> {
+        let (Some(persistence), Some(playlists_path)) = (&self.persistence, &self.playlists_path)
+        else {
+            return Ok(());
+        };
+        let Some(id) = Self::playlists_folder_id(playlists_path) else {
+            return Ok(());
+        };
+        if persistence.item_exists(id).await? {
+            return Ok(());
+        }
+        // Create the backing directory (C# `ManualPlaylistsFolder` lives on disk).
+        tokio::fs::create_dir_all(playlists_path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
+        let entity = BaseItemEntity {
+            id: id.to_string(),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::ManualPlaylistsFolder)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some(PLAYLISTS_FOLDER_NAME.to_owned()),
+            sort_name: Some(create_sort_name(PLAYLISTS_FOLDER_NAME)),
+            path: Some(playlists_path.to_string_lossy().into_owned()),
+            is_folder: true,
+            date_created: Some(Utc::now()),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await?;
+        Ok(())
     }
 }
 
@@ -60,6 +150,25 @@ impl UserViewManager for HermitUserViewManager {
         // collection folder / user view, name-sorted.
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::CollectionFolder, BaseItemKind::UserView],
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        self.items.get_item_list(&query).await
+    }
+
+    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // Jellyfin's LibraryController.GetMediaFolders returns
+        // GetUserRootFolder().Children sorted by SortName — the library collection
+        // folders plus the auto-provisioned ManualPlaylistsFolder. Provision the
+        // playlists folder on first read (lazy, self-healing), then project the
+        // user-root child kinds, name-sorted.
+        self.ensure_playlists_folder().await?;
+        let query = InternalItemsQuery {
+            include_item_types: vec![
+                BaseItemKind::CollectionFolder,
+                BaseItemKind::UserView,
+                BaseItemKind::ManualPlaylistsFolder,
+            ],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
         };
@@ -96,6 +205,7 @@ impl UserViewManager for HermitUserViewManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item_persistence_service::HermitItemPersistenceService;
     use crate::item_repository::HermitItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::test_support::{seed_item, seed_named_item, test_db};
@@ -105,6 +215,15 @@ mod tests {
         let lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());
         HermitUserViewManager::new(Arc::new(HermitItemRepository::new(db.clone(), lookup)))
+    }
+
+    fn manager_with_playlists(
+        db: &Database,
+        playlists_path: impl Into<PathBuf>,
+    ) -> HermitUserViewManager {
+        let persistence: Arc<dyn ItemPersistenceService> =
+            Arc::new(HermitItemPersistenceService::new(db.clone()));
+        manager(db).with_playlists_store(persistence, playlists_path)
     }
 
     #[tokio::test]
@@ -151,5 +270,62 @@ mod tests {
             .expect("latest");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].0.id, view.to_string());
+    }
+
+    #[tokio::test]
+    async fn media_folders_include_the_provisioned_playlists_folder() {
+        let db = test_db().await;
+        // Two libraries, one already present.
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x101),
+            BaseItemKind::CollectionFolder,
+            "Movies",
+        )
+        .await;
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x102),
+            BaseItemKind::CollectionFolder,
+            "Shows",
+        )
+        .await;
+        let libraries = 2usize;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let playlists_path = tmp.path().join("data").join("playlists");
+        let mgr = manager_with_playlists(&db, &playlists_path);
+
+        let folders = mgr
+            .get_media_folders(Uuid::from_u128(9))
+            .await
+            .expect("media folders");
+
+        // The user-root children are the libraries plus the auto-provisioned
+        // Playlists folder (C# GetUserRootFolder().Children).
+        assert_eq!(folders.len(), libraries + 1);
+        let playlists = folders
+            .iter()
+            .find(|f| {
+                f.type_ == "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder"
+                    && f.name.as_deref() == Some("Playlists")
+            })
+            .expect("Playlists media folder present");
+        assert!(
+            playlists
+                .path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("/data/playlists")),
+            "playlists path should end with /data/playlists, got {:?}",
+            playlists.path
+        );
+        // The backing directory is created on disk.
+        assert!(playlists_path.is_dir());
+
+        // Provisioning is idempotent — a second read does not add a duplicate.
+        let again = mgr
+            .get_media_folders(Uuid::from_u128(9))
+            .await
+            .expect("media folders again");
+        assert_eq!(again.len(), libraries + 1);
     }
 }

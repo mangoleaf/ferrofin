@@ -463,13 +463,14 @@ async fn get_media_folders(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, None).await?;
     let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
-    // The user's collection folders are the media folders; the view seam returns
-    // them name-sorted.
+    // The media folders are the user-root children — the collection folders plus
+    // the auto-provisioned Playlists folder — returned name-sorted by the view seam
+    // (C# GetUserRootFolder().Children).
     let folders = if query.is_hidden == Some(true) {
         // No folder carries a hidden flag, so none match `isHidden=true`.
         Vec::new()
     } else {
-        state.user_views.get_user_views(user_uuid).await?
+        state.user_views.get_media_folders(user_uuid).await?
     };
     let options = DtoOptions::default();
     let dtos = state

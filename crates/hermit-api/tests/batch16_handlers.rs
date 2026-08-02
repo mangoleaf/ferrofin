@@ -291,6 +291,9 @@ impl UserViewManager for StubUserViews {
             minimal_base_item(Uuid::from_u128(0x102), "Movies", "CollectionFolder"),
         ])
     }
+    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views(user_id).await
+    }
     async fn get_latest_items(
         &self,
         _user_id: Uuid,

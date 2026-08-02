@@ -860,6 +860,17 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Gets the server's media folders — the user-root children.
+    ///
+    /// Port of `LibraryController.GetMediaFolders`, which returns
+    /// `GetUserRootFolder().Children` sorted by `SortName`. Unlike
+    /// [`get_user_views`](Self::get_user_views) (the library collection folders
+    /// only), this also includes the auto-provisioned
+    /// [`BaseItemKind`](hermit_model::data::BaseItemKind)`::ManualPlaylistsFolder`,
+    /// provisioning it on first read if absent (Jellyfin lazily materializes it as
+    /// a user-root child).
+    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
     /// Gets latest items grouped per parent view.
     async fn get_latest_items(
         &self,

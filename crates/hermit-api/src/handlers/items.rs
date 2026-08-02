@@ -206,9 +206,11 @@ struct ItemsQuery {
 /// `GET /Items` — a paged, filtered, user-scoped library query.
 ///
 /// Port of `ItemsController.GetItems`. The wide query is mapped onto
-/// [`InternalItemsQuery`]; the box-set/collection-type dispatch and search-
-/// provider ranking that need the un-ported `Folder` OOP tree are deferred, but
-/// every persistable filter is honoured.
+/// [`InternalItemsQuery`]; the collection-type dispatch and search-provider
+/// ranking that need the un-ported `Folder` OOP tree are deferred, but every
+/// persistable filter is honoured. A non-recursive `parentId` browse of a
+/// box-set or playlist surfaces its manual `LinkedChildren` members (the SQL
+/// merge that mirrors C# `Folder.GetChildren`; see `translate_query`).
 #[utoipa::path(
     get,
     path = "/Items",

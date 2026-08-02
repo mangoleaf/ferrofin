@@ -776,7 +776,12 @@ impl HermitDtoService {
         // Can-delete / can-download collapse to thin defaults (the C# logic needs
         // the domain tree; see the module docs).
         if options.contains_field(ItemFields::CanDelete) {
-            dto.can_delete = Some(false);
+            // Jellyfin's `BaseItem.CanDelete(user)` is true for a real (non-virtual)
+            // file item when the user's policy grants deletion (globally or for the
+            // item's library). The user policy is not plumbed into this DTO builder,
+            // so we report the file-level fact only; full per-user-policy fidelity
+            // needs the policy threaded through here (a separate WI).
+            dto.can_delete = Some(!item.is_virtual_item);
         }
         if options.contains_field(ItemFields::CanDownload) {
             dto.can_download = Some(!item.is_folder);
@@ -2250,6 +2255,21 @@ mod tests {
         );
         assert_eq!(dto.genre_items.as_ref().unwrap().len(), 2);
         assert_eq!(dto.tags, Some(vec!["imax".to_owned(), "4k".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn can_delete_true_for_non_virtual_item() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, id).await;
+        assert!(!item.is_virtual_item, "seeded item is a real file item");
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.can_delete, Some(true));
     }
 
     #[tokio::test]

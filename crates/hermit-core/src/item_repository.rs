@@ -918,6 +918,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn boxset_parent_browse_surfaces_linked_children() {
+        use crate::linked_children_service::HermitLinkedChildrenService;
+        use hermit_traits::persistence::LinkedChildrenService;
+
+        let db = test_db().await;
+        let repository = repo(&db);
+        // A box-set and a movie. Membership lives ONLY as a LinkedChildren edge
+        // (the movie's physical ParentId is unrelated), so a plain `ParentId`
+        // browse must not see it — the merged `GetChildren` behaviour must.
+        let boxset = Uuid::from_u128(0xB5E7);
+        let movie = Uuid::from_u128(0xB5E8);
+        seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Trilogy").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Part One").await;
+
+        let links = HermitLinkedChildrenService::new(db.clone());
+        // `add_to_collection` inserts a manual (ChildType = 0) edge.
+        links
+            .upsert_linked_child(boxset, movie, 0)
+            .await
+            .expect("add_to_collection");
+
+        let query = InternalItemsQuery {
+            parent_id: boxset,
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository.get_item_list(&query).await.expect("browse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, movie.to_string());
+
+        // Removing the membership makes the browse empty again.
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
+            .bind(boxset.to_string())
+            .bind(movie.to_string())
+            .execute(db.pool())
+            .await
+            .expect("remove_from_collection");
+        assert!(
+            repository
+                .get_item_list(&query)
+                .await
+                .expect("browse after remove")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn person_ids_filter_returns_that_persons_filmography() {
         let db = test_db().await;
         let repository = repo(&db);

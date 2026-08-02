@@ -178,8 +178,18 @@ fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Internal
             .push_bind(filter.parent_id.to_string())
             .push(")");
         } else {
-            qb.push(r#" AND bi."ParentId" = "#)
-                .push_bind(filter.parent_id.to_string());
+            // Direct children: the physical `ParentId`, plus manually linked
+            // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
+            // box-sets and playlists carry `LinkedChildren` rows, so the `IN`
+            // subquery is empty for ordinary folders and this stays identical to
+            // a plain `ParentId` equality for non-collection browses.
+            qb.push(r#" AND (bi."ParentId" = "#)
+                .push_bind(filter.parent_id.to_string())
+                .push(
+                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = "#,
+                )
+                .push_bind(filter.parent_id.to_string())
+                .push(r#" AND "ChildType" = 0))"#);
         }
     }
 

@@ -538,6 +538,9 @@ impl UserViewManager for FakeUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
+    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
     async fn get_latest_items(
         &self,
         _user_id: Uuid,

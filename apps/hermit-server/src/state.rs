@@ -343,8 +343,13 @@ pub async fn build_app_state(
         Arc::new(HermitDisplayPreferencesManager::new(db.clone()));
     let activity: Arc<dyn hermit_traits::activity::ActivityManager> =
         Arc::new(HermitActivityManager::new(db.clone()));
-    let user_views: Arc<dyn hermit_traits::library::UserViewManager> =
-        Arc::new(HermitUserViewManager::new(Arc::clone(&item_repository)));
+    // The playlists media folder lives at `{data}/playlists` (C#
+    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
+    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
+    let user_views: Arc<dyn hermit_traits::library::UserViewManager> = Arc::new(
+        HermitUserViewManager::new(Arc::clone(&item_repository))
+            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path),
+    );
     let music: Arc<dyn hermit_traits::library::MusicManager> =
         Arc::new(HermitMusicManager::new(Arc::clone(&item_repository)));
     let similar_items: Arc<dyn hermit_traits::library::SimilarItemsManager> =
