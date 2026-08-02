@@ -59,25 +59,9 @@ pub(crate) fn service_version() -> String {
         .unwrap_or_else(|| env!("HERMIT_BUILD_VERSION").to_owned())
 }
 
-/// Boots the server from a resolved [`Config`] and serves until shutdown.
-///
-/// This is the whole composition root, in order: initialise logging, open +
-/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
-/// it, playback just 500s until configured), wire every concrete manager into the
-/// shared `AppState`, seed a default administrator when the install is fresh, mount
-/// the `hermit-api` router, and `axum::serve` on the configured bind address with
-/// graceful shutdown.
-///
-/// The binary calls this after parsing CLI flags; it is the single entry point so
-/// the boot sequence has exactly one implementation.
-///
-/// # Errors
-///
-/// Returns an error if the database cannot be opened/migrated, manager wiring
-/// fails, seeding fails, the listener cannot bind the configured address, or the
-/// server loop errors.
-pub async fn run(config: Config) -> anyhow::Result<()> {
-    init_tracing(&config);
+/// Logs the resolved configuration at startup, grouped into a few `INFO` lines
+/// (server/version, paths, network, library & admin).
+fn log_startup_banner(config: &Config) {
     tracing::info!(
         server_name = %config.server_name,
         version = service_version(),
@@ -104,6 +88,28 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         admin_password_set = !config.admin_password.is_empty(),
         "library & admin"
     );
+}
+
+/// Boots the server from a resolved [`Config`] and serves until shutdown.
+///
+/// This is the whole composition root, in order: initialise logging, open +
+/// migrate the database, discover ffmpeg (non-fatal — the API still boots without
+/// it, playback just 500s until configured), wire every concrete manager into the
+/// shared `AppState`, seed a default administrator when the install is fresh, mount
+/// the `hermit-api` router, and `axum::serve` on the configured bind address with
+/// graceful shutdown.
+///
+/// The binary calls this after parsing CLI flags; it is the single entry point so
+/// the boot sequence has exactly one implementation.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened/migrated, manager wiring
+/// fails, seeding fails, the listener cannot bind the configured address, or the
+/// server loop errors.
+pub async fn run(config: Config) -> anyhow::Result<()> {
+    init_tracing(&config);
+    log_startup_banner(&config);
 
     let db = open_database(&config).await?;
 
