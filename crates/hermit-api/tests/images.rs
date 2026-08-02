@@ -1,15 +1,15 @@
-//! Batch-9 handler **success-path** tests: the image surface — item images,
-//! by-name images, the item image-info list, user profile images, and remote
-//! (provider) images.
+//! Image integration tests: item images, by-name images, the item image-info
+//! list, user profile images, remote (provider) images, item image write/delete/
+//! reorder, user-image upload, and TMDb image configuration.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
-//! stub `hermit-traits` impls that authenticate and return canned data. Image
-//! serving is exercised against a real temp file so the `200` + body assertion
-//! covers the `ServeFile` tail; the resolution/`404` outcomes are asserted with
-//! canned image rows. Managers a given handler never touches reuse the
-//! `test_support` panic fakes, catching a handler that strays.
+//! stub `hermit-traits` impls that authenticate as a fixed user and return (or
+//! record) canned data. Image serving is exercised against a real temp file so
+//! the `200` + body assertion covers the `ServeFile` tail; resolution/`404`
+//! outcomes are asserted with canned image rows. Managers a given handler never
+//! touches reuse the `test_support` panic fakes, catching a handler that strays.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -17,9 +17,11 @@ use axum::http::{Request, StatusCode};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
 use hermit_api::test_support::{
-    FakeAppHost, FakeCollections, FakeConfig, FakeMediaSources, FakeMusic, FakePlaylists,
-    FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSystem, FakeTvSeries,
-    FakeUserData, FakeUserViews,
+    FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeConfig,
+    FakeDevices, FakeDisplayPreferences, FakeFileSystem, FakeLocalization, FakeLyrics,
+    FakeMediaSegments, FakeMediaSources, FakeMusic, FakePlaylists, FakeQuickConnect, FakeSearch,
+    FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay,
+    FakeTvSeries, FakeUserData, FakeUserViews,
 };
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
@@ -39,6 +41,7 @@ use uuid::Uuid;
 const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_1A6E);
 const GENRE_ID: Uuid = Uuid::from_u128(0x0D_6E_46);
+const MISSING_ID: Uuid = Uuid::from_u128(0xDEAD);
 
 /// A unique on-disk PNG-ish file for the serve-path tests, removed on drop.
 struct TempImage {
@@ -224,12 +227,16 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
-/// A [`LibraryManager`] returning a fixed item, its images, and a by-name genre.
+/// A [`LibraryManager`] returning a fixed item, its images, and a by-name genre,
+/// and recording each `swap_images` reorder the handler asks for.
 ///
 /// `image_path` is the on-disk file the item's Primary image points at; the
 /// by-name genre carries the same image so the by-name serve path is covered.
 struct StubLibrary {
     image_path: String,
+    /// Records each `(item_id, image_type, index1, index2)` swap the handler asks
+    /// for, so the reorder test can assert the request reached the manager.
+    swaps: Mutex<Vec<(Uuid, ImageType, i32, i32)>>,
 }
 
 #[async_trait]
@@ -262,6 +269,25 @@ impl LibraryManager for StubLibrary {
         } else {
             Ok(vec![])
         }
+    }
+
+    async fn swap_images(
+        &self,
+        item_id: Uuid,
+        image_type: ImageType,
+        index1: i32,
+        index2: i32,
+    ) -> Result<(), ServiceError> {
+        // Mirror the real manager's 400 guard so the "wrong type" test exercises
+        // it, then record the accepted swap.
+        if !matches!(image_type, ImageType::Backdrop | ImageType::Chapter) {
+            return Err(ServiceError::invalid_input("not reorderable"));
+        }
+        self.swaps
+            .lock()
+            .expect("lock")
+            .push((item_id, image_type, index1, index2));
+        Ok(())
     }
 
     async fn get_named_item(
@@ -405,9 +431,11 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`UserManager`] resolving the fixed user and its profile image.
+/// A [`UserManager`] resolving the fixed user, its profile image, and recording
+/// `save_profile_image`.
 struct StubUsers {
     profile_path: String,
+    saved: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 #[async_trait]
@@ -428,6 +456,20 @@ impl UserManager for StubUsers {
     }
 
     async fn clear_profile_image(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn save_profile_image(
+        &self,
+        user: &UserEntity,
+        _content: &[u8],
+        mime_type: &str,
+        _extension: &str,
+    ) -> Result<(), ServiceError> {
+        self.saved
+            .lock()
+            .expect("lock")
+            .push((user.id.clone(), mime_type.to_owned()));
         Ok(())
     }
 
@@ -506,8 +548,12 @@ impl UserManager for StubUsers {
     }
 }
 
-/// A [`ProviderManager`] returning a canned remote image + provider.
-struct StubProviders;
+/// A [`ProviderManager`] recording `save_image`/`delete_image` and returning a
+/// canned remote image + provider.
+struct StubProviders {
+    saved: Arc<Mutex<Vec<(Uuid, String)>>>,
+    deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+}
 
 #[async_trait]
 impl ProviderManager for StubProviders {
@@ -544,12 +590,28 @@ impl ProviderManager for StubProviders {
     }
     async fn save_image(
         &self,
-        _item_id: Uuid,
+        item_id: Uuid,
         _content: &[u8],
-        _mime_type: &str,
+        mime_type: &str,
         _image_type: ImageType,
         _image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
+        self.saved
+            .lock()
+            .expect("lock")
+            .push((item_id, mime_type.to_owned()));
+        Ok(())
+    }
+    async fn delete_image(
+        &self,
+        item_id: Uuid,
+        _image_type: ImageType,
+        image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        self.deleted
+            .lock()
+            .expect("lock")
+            .push((item_id, image_index.unwrap_or(0)));
         Ok(())
     }
     async fn get_available_remote_images(
@@ -608,12 +670,37 @@ impl ProviderManager for StubProviders {
     }
 }
 
-/// Builds an [`AppState`] wired with the batch-9 stubs, serving `image_path` for
-/// item/by-name images and `profile_path` for the user image.
-fn state(image_path: String, profile_path: String) -> AppState {
+/// Bundles the image stubs and their recording handles for one test.
+struct Stubs {
+    library: Arc<StubLibrary>,
+    users: Arc<StubUsers>,
+    providers: Arc<StubProviders>,
+}
+
+/// Builds the image stubs, serving `image_path` for item/by-name images and
+/// `profile_path` for the user image; write routes record into the stub mutexes.
+fn stubs(image_path: String, profile_path: String) -> Stubs {
+    Stubs {
+        library: Arc::new(StubLibrary {
+            image_path,
+            swaps: Mutex::new(Vec::new()),
+        }),
+        users: Arc::new(StubUsers {
+            profile_path,
+            saved: Arc::new(Mutex::new(Vec::new())),
+        }),
+        providers: Arc::new(StubProviders {
+            saved: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+        }),
+    }
+}
+
+/// Builds an [`AppState`] wired with the image stubs.
+fn state(s: &Stubs) -> AppState {
     AppState::new(
-        Arc::new(StubLibrary { image_path }),
-        Arc::new(StubUsers { profile_path }),
+        s.library.clone(),
+        s.users.clone(),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -621,7 +708,7 @@ fn state(image_path: String, profile_path: String) -> AppState {
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
         Arc::new(FakeConfig),
-        Arc::new(StubProviders),
+        s.providers.clone(),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
@@ -632,47 +719,60 @@ fn state(image_path: String, profile_path: String) -> AppState {
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
         Arc::new(FakeTvSeries),
-        Arc::new(hermit_api::test_support::FakeSubtitles),
-        Arc::new(hermit_api::test_support::FakeLyrics),
-        Arc::new(hermit_api::test_support::FakeMediaSegments),
-        Arc::new(hermit_api::test_support::FakeTrickplay),
-        Arc::new(hermit_api::test_support::FakeDevices),
-        Arc::new(hermit_api::test_support::FakeClientEventLogger),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(hermit_api::test_support::FakeLocalization),
-        Arc::new(hermit_api::test_support::FakeDisplayPreferences),
-        Arc::new(hermit_api::test_support::FakeActivity),
-        Arc::new(hermit_api::test_support::FakeFileSystem),
-        Arc::new(hermit_api::test_support::FakeTasks),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
     )
 }
 
-/// Drives one authenticated request through the router.
-async fn send(state: AppState, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state);
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("Authorization", "Bearer token")
-                .body(Body::empty())
-                .expect("request"),
-        )
+/// Drives one authenticated request through the router, with an optional
+/// `(content_type, payload)` body.
+async fn send(
+    s: &Stubs,
+    method: &str,
+    uri: &str,
+    body: Option<(&str, &str)>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", "Bearer token");
+    let request = if let Some((content_type, payload)) = body {
+        builder = builder.header("Content-Type", content_type);
+        builder
+            .body(Body::from(payload.to_owned()))
+            .expect("request")
+    } else {
+        builder.body(Body::empty()).expect("request")
+    };
+    let response = create_router(state(s))
+        .oneshot(request)
         .await
         .expect("response");
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("body");
-    (status, bytes.to_vec())
+        .expect("body")
+        .to_vec();
+    (status, bytes)
 }
+
+// ---- item image serve (batch9) ------------------------------------------------
 
 #[tokio::test]
 async fn get_item_image_serves_the_local_file() {
     let img = TempImage::new(b"PNGDATA");
-    let st = state(img.path(), String::new());
-    let (status, body) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images/Primary")).await;
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"PNGDATA");
 }
@@ -680,8 +780,14 @@ async fn get_item_image_serves_the_local_file() {
 #[tokio::test]
 async fn head_item_image_is_ok_without_body() {
     let img = TempImage::new(b"PNGDATA");
-    let st = state(img.path(), String::new());
-    let (status, body) = send(st, "HEAD", &format!("/Items/{ITEM_ID}/Images/Primary")).await;
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(
+        &s,
+        "HEAD",
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty());
 }
@@ -689,51 +795,63 @@ async fn head_item_image_is_ok_without_body() {
 #[tokio::test]
 async fn item_image_by_index_serves_the_file() {
     let img = TempImage::new(b"IDX0");
-    let st = state(img.path(), String::new());
-    let (status, body) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images/Primary/0")).await;
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Primary/0"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"IDX0");
 }
 
 #[tokio::test]
 async fn item_image_missing_item_is_404() {
-    let st = state(String::new(), String::new());
+    let s = stubs(String::new(), String::new());
     let missing = Uuid::from_u128(0xDEAD);
-    let (status, _) = send(st, "GET", &format!("/Items/{missing}/Images/Primary")).await;
+    let (status, _) = send(&s, "GET", &format!("/Items/{missing}/Images/Primary"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn item_image_wrong_type_is_404() {
     let img = TempImage::new(b"X");
-    let st = state(img.path(), String::new());
+    let s = stubs(img.path(), String::new());
     // The item has no Logo image → 404.
-    let (status, _) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images/Logo")).await;
+    let (status, _) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Logo"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn remote_image_backdrop_is_404_no_local_file() {
     let img = TempImage::new(b"X");
-    let st = state(img.path(), String::new());
+    let s = stubs(img.path(), String::new());
     // The Backdrop image is a remote URL; with no image processor it cannot be
     // served locally → 404.
-    let (status, _) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images/Backdrop")).await;
+    let (status, _) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn bad_image_type_is_400() {
-    let st = state(String::new(), String::new());
-    let (status, _) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images/Bogus")).await;
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Bogus"), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn item_image_infos_lists_images() {
     let img = TempImage::new(b"X");
-    let st = state(img.path(), String::new());
-    let (status, body) = send(st, "GET", &format!("/Items/{ITEM_ID}/Images")).await;
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images"), None).await;
     assert_eq!(status, StatusCode::OK);
     let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
     let arr = value.as_array().expect("array");
@@ -750,39 +868,39 @@ async fn item_image_infos_lists_images() {
 #[tokio::test]
 async fn by_name_genre_image_serves_the_file() {
     let img = TempImage::new(b"GENREIMG");
-    let st = state(img.path(), String::new());
-    let (status, body) = send(st, "GET", "/Genres/Drama/Images/Primary").await;
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Primary", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"GENREIMG");
 }
 
 #[tokio::test]
 async fn by_name_missing_is_404() {
-    let st = state(String::new(), String::new());
-    let (status, _) = send(st, "GET", "/Genres/Nonexist/Images/Primary").await;
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "GET", "/Genres/Nonexist/Images/Primary", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn user_image_serves_profile() {
     let img = TempImage::new(b"PROFILE");
-    let st = state(String::new(), img.path());
-    let (status, body) = send(st, "GET", "/UserImage").await;
+    let s = stubs(String::new(), img.path());
+    let (status, body) = send(&s, "GET", "/UserImage", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"PROFILE");
 }
 
 #[tokio::test]
 async fn delete_user_image_is_204() {
-    let st = state(String::new(), String::new());
-    let (status, _) = send(st, "DELETE", "/UserImage").await;
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "DELETE", "/UserImage", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
 async fn remote_images_returns_result() {
-    let st = state(String::new(), String::new());
-    let (status, body) = send(st, "GET", &format!("/Items/{ITEM_ID}/RemoteImages")).await;
+    let s = stubs(String::new(), String::new());
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/RemoteImages"), None).await;
     assert_eq!(status, StatusCode::OK);
     let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(value["TotalRecordCount"], 1);
@@ -792,11 +910,12 @@ async fn remote_images_returns_result() {
 
 #[tokio::test]
 async fn remote_image_providers_returns_list() {
-    let st = state(String::new(), String::new());
+    let s = stubs(String::new(), String::new());
     let (status, body) = send(
-        st,
+        &s,
         "GET",
         &format!("/Items/{ITEM_ID}/RemoteImages/Providers"),
+        None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -806,11 +925,12 @@ async fn remote_image_providers_returns_list() {
 
 #[tokio::test]
 async fn download_remote_image_is_204() {
-    let st = state(String::new(), String::new());
+    let s = stubs(String::new(), String::new());
     let (status, _) = send(
-        st,
+        &s,
         "POST",
         &format!("/Items/{ITEM_ID}/RemoteImages/Download?type=Primary&imageUrl=https://x/y.jpg"),
+        None,
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -818,11 +938,232 @@ async fn download_remote_image_is_204() {
 
 #[tokio::test]
 async fn download_remote_image_missing_type_is_400() {
-    let st = state(String::new(), String::new());
+    let s = stubs(String::new(), String::new());
     let (status, _) = send(
-        st,
+        &s,
         "POST",
         &format!("/Items/{ITEM_ID}/RemoteImages/Download?imageUrl=https://x/y.jpg"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---- item image write/delete (batch16) ----------------------------------------
+
+#[tokio::test]
+async fn set_item_image_saves_and_returns_204() {
+    let s = stubs(String::new(), String::new());
+    // "hi" base64-encoded.
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        Some(("image/png", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved = s.providers.saved.lock().expect("lock");
+    assert_eq!(saved.as_slice(), [(ITEM_ID, "image/png".to_owned())]);
+}
+
+#[tokio::test]
+async fn set_item_image_by_index_saves() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop/2"),
+        Some(("image/jpeg", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(s.providers.saved.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn set_item_image_bad_content_type_is_400() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        Some(("application/json", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(s.providers.saved.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn set_item_image_missing_item_is_404() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{MISSING_ID}/Images/Primary"),
+        Some(("image/png", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_item_image_returns_204() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "DELETE",
+        &format!("/Items/{ITEM_ID}/Images/Primary?imageIndex=3"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.providers.deleted.lock().expect("lock").as_slice(),
+        [(ITEM_ID, 3)]
+    );
+}
+
+#[tokio::test]
+async fn delete_item_image_by_index_returns_204() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "DELETE",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop/1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.providers.deleted.lock().expect("lock").as_slice(),
+        [(ITEM_ID, 1)]
+    );
+}
+
+#[tokio::test]
+async fn delete_item_image_missing_item_is_404() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "DELETE",
+        &format!("/Items/{MISSING_ID}/Images/Primary"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- item image reorder (UpdateItemImageIndex) --------------------------------
+
+#[tokio::test]
+async fn update_item_image_index_swaps_and_returns_204() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop/1/Index?newIndex=3"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.library.swaps.lock().expect("lock").as_slice(),
+        [(ITEM_ID, ImageType::Backdrop, 1, 3)]
+    );
+}
+
+#[tokio::test]
+async fn update_item_image_index_non_multiple_type_is_400() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{ITEM_ID}/Images/Primary/0/Index?newIndex=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(s.library.swaps.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn update_item_image_index_missing_item_is_404() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Items/{MISSING_ID}/Images/Backdrop/0/Index?newIndex=1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(s.library.swaps.lock().expect("lock").is_empty());
+}
+
+// ---- TMDb client configuration ------------------------------------------------
+
+#[tokio::test]
+async fn tmdb_client_configuration_returns_image_config() {
+    let s = stubs(String::new(), String::new());
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let config: hermit_model::dto::ConfigImageTypes =
+        serde_json::from_slice(&body).expect("config");
+    assert_eq!(
+        config.secure_base_url.as_deref(),
+        Some("https://image.tmdb.org/t/p/")
+    );
+    assert!(
+        config
+            .poster_sizes
+            .as_deref()
+            .expect("poster sizes")
+            .contains(&"original".to_owned())
+    );
+}
+
+// ---- user image upload --------------------------------------------------------
+
+#[tokio::test]
+async fn post_user_image_saves_and_returns_204() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "POST", "/UserImage", Some(("image/png", "aGk="))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved = s.users.saved.lock().expect("lock");
+    assert_eq!(
+        saved.as_slice(),
+        [(USER_ID.to_string(), "image/png".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn post_user_image_bad_content_type_is_400() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "POST", "/UserImage", Some(("text/plain", "aGk="))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ---- image missing / bad type (handler_success_paths) -------------------------
+
+#[tokio::test]
+async fn item_image_missing_is_404() {
+    // No image processor is wired, so a valid item + valid image type still 404s
+    // (there is no image path to serve) — the contract's not-found outcome.
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn item_image_bad_type_is_400() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/NotAnImageType"),
+        None,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

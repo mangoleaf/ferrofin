@@ -1,5 +1,4 @@
-//! Batch-3 handler **success-path** tests: filters, suggestions, instant-mix,
-//! movie recommendations, trailers, and search hints.
+//! Instant-mix handler tests: item / song / music-genre / artist instant mix.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
 //! stub `hermit-traits` impls that authenticate and return canned data, asserting
@@ -20,10 +19,10 @@ use hermit_api::test_support::{
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::{BaseItemKind, MediaType};
-use hermit_model::dto::{BaseItemDto, NameGuidPair, RecommendationDto, RecommendationType};
+use hermit_model::dto::{BaseItemDto, RecommendationType};
 use hermit_model::entities::MediaStreamType;
-use hermit_model::querying::{QueryFilters, QueryFiltersLegacy, QueryResult};
-use hermit_model::search::{SearchHint, SearchHintResult, SearchQuery};
+use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
+use hermit_model::search::{SearchHint, SearchQuery};
 use hermit_traits::dto::DtoService;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::{
@@ -329,8 +328,7 @@ impl DtoService for OkDto {
     }
 }
 
-/// A [`LibraryManager`] whose reads back the filter/suggestions/trailers routes;
-/// unused methods panic.
+/// A [`LibraryManager`] backing the instant-mix seed lookups; unused methods panic.
 struct StubLibrary;
 
 #[async_trait]
@@ -595,7 +593,7 @@ impl SearchManager for StubSearch {
     }
 }
 
-/// Builds an [`AppState`] wired with the batch-3 stubs.
+/// Builds an [`AppState`] wired with the instant-mix stubs.
 fn state() -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
@@ -654,59 +652,6 @@ async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn items_filters_returns_legacy_facets() {
-    let (status, body) = get("/Items/Filters?includeItemTypes=Movie").await;
-    assert_eq!(status, StatusCode::OK);
-    let filters: QueryFiltersLegacy = serde_json::from_slice(&body).expect("legacy filters");
-    assert_eq!(filters.genres, vec!["Action".to_owned()]);
-    assert_eq!(filters.years, vec![1999]);
-}
-
-#[tokio::test]
-async fn items_filters2_returns_genre_facets() {
-    let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
-    assert_eq!(status, StatusCode::OK);
-    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
-    assert_eq!(
-        filters.genres,
-        vec![NameGuidPair {
-            name: Some("Action".to_owned()),
-            id: Uuid::from_u128(0x21),
-        }]
-    );
-    // The response schema is exactly {Genres, Tags} (Jellyfin's QueryFilters):
-    // no fabricated audio/subtitle language facets leak into the body.
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let keys: Vec<&str> = value
-        .as_object()
-        .expect("object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(keys, vec!["Genres", "Tags"]);
-}
-
-#[tokio::test]
-async fn items_filters2_music_type_uses_music_genres() {
-    let (status, body) = get("/Items/Filters2?includeItemTypes=Audio").await;
-    assert_eq!(status, StatusCode::OK);
-    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
-    assert_eq!(
-        filters.genres.first().and_then(|p| p.name.clone()),
-        Some("Jazz".to_owned())
-    );
-}
-
-#[tokio::test]
-async fn items_suggestions_returns_query_result() {
-    let (status, body) = get("/Items/Suggestions?type=Movie").await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("suggestions");
-    assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].name.as_deref(), Some("Result"));
-}
-
-#[tokio::test]
 async fn item_instant_mix_returns_songs() {
     let (status, body) = get(&format!("/Items/{SEED_ID}/InstantMix?limit=1")).await;
     assert_eq!(status, StatusCode::OK);
@@ -737,39 +682,4 @@ async fn artists_instant_mix_by_id_returns_songs() {
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("mix");
     assert_eq!(result.items.len(), 2);
-}
-
-#[tokio::test]
-async fn movie_recommendations_returns_categories() {
-    let (status, body) = get("/Movies/Recommendations").await;
-    assert_eq!(status, StatusCode::OK);
-    let recs: Vec<RecommendationDto> = serde_json::from_slice(&body).expect("recommendations");
-    assert_eq!(recs.len(), 1);
-    assert_eq!(
-        recs[0].baseline_item_name.as_deref(),
-        Some("Because you watched Alien")
-    );
-    assert_eq!(recs[0].items.as_ref().map(Vec::len), Some(1));
-}
-
-#[tokio::test]
-async fn trailers_returns_query_result() {
-    let (status, body) = get("/Trailers").await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("trailers");
-    assert_eq!(result.items.len(), 1);
-}
-
-#[tokio::test]
-async fn search_hints_returns_hint_result() {
-    let (status, body) = get("/Search/Hints?searchTerm=matrix").await;
-    assert_eq!(status, StatusCode::OK);
-    let result: SearchHintResult = serde_json::from_slice(&body).expect("hints");
-    assert_eq!(result.total_record_count, 1);
-    assert_eq!(result.search_hints.len(), 1);
-    assert_eq!(result.search_hints[0].name.as_deref(), Some("Matrix"));
-    assert_eq!(
-        result.search_hints[0].matched_term.as_deref(),
-        Some("matrix")
-    );
 }

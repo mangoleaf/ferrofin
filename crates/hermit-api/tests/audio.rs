@@ -1,11 +1,10 @@
-//! Batch-10 handler success/failure-path tests: Videos + Audio direct streaming,
-//! Universal audio, media download, version-group management, and the MediaInfo
-//! live-stream + bitrate-test routes.
+//! Audio handler tests: direct/container + universal audio streaming, and Lyrics
+//! read/delete/remote-search.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
-//! stub `hermit-traits` impls that authenticate and return canned data. The direct
-//! stream / download routes serve a real temp file so the `ServeFile` Range/`HEAD`
-//! path is exercised end to end.
+//! stub `hermit-traits` impls that authenticate and return canned data. The
+//! direct stream routes serve a real temp file so the `ServeFile` path is
+//! exercised end to end.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,14 +14,15 @@ use axum::http::{Request, StatusCode};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
 use hermit_api::test_support::{
-    FakeAppHost, FakeCollections, FakeConfig, FakeMusic, FakePlaylists, FakeProviders,
-    FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSystem, FakeTvSeries,
-    FakeUserData, FakeUserViews, minimal_base_item,
+    FakeAppHost, FakeCollections, FakeConfig, FakeMediaSegments, FakeMusic, FakePlaylists,
+    FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
+    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, minimal_base_item,
 };
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::dto::{MediaSourceInfo, MediaSourceType};
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
+use hermit_model::lyrics::{LyricDto, RemoteLyricInfoDto};
 use hermit_model::media_info::{LiveStreamRequest, MediaProtocol};
 use hermit_model::querying::QueryResult;
 use hermit_traits::error::ServiceError;
@@ -32,6 +32,7 @@ use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use hermit_traits::persistence::ItemWithCounts;
+use hermit_traits::stubs::LyricManager;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -202,14 +203,10 @@ impl UserManager for OkUsers {
     }
 }
 
-/// A [`MediaSourceManager`] that serves a static source for a temp file, and
-/// records live-stream open/close so the round-trip is observable.
+/// A [`MediaSourceManager`] that serves a static source for a temp file.
 struct StreamSources {
     /// The on-disk path the static source points at.
     path: String,
-    /// Ids passed to `open_live_stream`/`close_live_stream`, for assertions.
-    opened: Arc<Mutex<Vec<String>>>,
-    closed: Arc<Mutex<Vec<String>>>,
 }
 
 fn static_source(path: &str) -> MediaSourceInfo {
@@ -254,17 +251,9 @@ impl MediaSourceManager for StreamSources {
     }
     async fn open_live_stream(
         &self,
-        request: &LiveStreamRequest,
+        _request: &LiveStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        let live_id = "live-123".to_owned();
-        self.opened
-            .lock()
-            .unwrap()
-            .push(request.item_id.to_string());
-        let mut source = static_source(&self.path);
-        source.live_stream_id = Some(live_id);
-        source.requires_closing = true;
-        Ok(source)
+        unimplemented!()
     }
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
@@ -272,48 +261,18 @@ impl MediaSourceManager for StreamSources {
     async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
-        self.closed.lock().unwrap().push(id.to_owned());
-        Ok(())
+    async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
+        unimplemented!()
     }
 }
 
-/// A [`LibraryManager`] that resolves [`ITEM_ID`] and records merge/remove calls.
-struct StreamLibrary {
-    merged: Arc<Mutex<Vec<Vec<Uuid>>>>,
-    removed: Arc<Mutex<Vec<Uuid>>>,
-    /// Names of the bulk `MergeVersions`-plugin ops invoked, in order.
-    bulk: Arc<Mutex<Vec<&'static str>>>,
-}
+/// A [`LibraryManager`] that resolves [`ITEM_ID`] and 404s everything else.
+struct StreamLibrary;
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Movie", "Movie")))
-    }
-    async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
-        self.merged.lock().unwrap().push(ids.to_vec());
-        Ok(())
-    }
-    async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        self.removed.lock().unwrap().push(item_id);
-        Ok(())
-    }
-    async fn merge_all_movie_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("merge_movies");
-        Ok(())
-    }
-    async fn split_all_movie_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("split_movies");
-        Ok(())
-    }
-    async fn merge_all_episode_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("merge_episodes");
-        Ok(())
-    }
-    async fn split_all_episode_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("split_episodes");
-        Ok(())
+        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Song", "Audio")))
     }
     async fn query_items(
         &self,
@@ -423,45 +382,58 @@ impl LibraryManager for StreamLibrary {
     }
 }
 
-/// The wired [`AppState`] plus the call-recording handles the tests assert on.
-struct Harness {
-    /// The assembled application state to build a router from.
-    app: AppState,
-    /// Item ids passed to `open_live_stream`.
-    opened: Arc<Mutex<Vec<String>>>,
-    /// Ids passed to `close_live_stream`.
-    closed: Arc<Mutex<Vec<String>>>,
-    /// Id lists passed to `merge_versions`.
-    merged: Arc<Mutex<Vec<Vec<Uuid>>>>,
-    /// Ids passed to `remove_alternate_sources`.
-    removed: Arc<Mutex<Vec<Uuid>>>,
-    /// Bulk `MergeVersions`-plugin ops invoked, in order.
-    bulk: Arc<Mutex<Vec<&'static str>>>,
+/// A [`LyricManager`] whose stored lyrics / mutation results are configurable.
+struct CannedLyrics {
+    stored: Option<LyricDto>,
+    deleted: Arc<Mutex<bool>>,
 }
 
-/// Builds a [`Harness`] with the batch-10 stubs, serving `path` for streams.
-fn state(path: &str) -> Harness {
-    let opened = Arc::new(Mutex::new(Vec::new()));
-    let closed = Arc::new(Mutex::new(Vec::new()));
-    let merged = Arc::new(Mutex::new(Vec::new()));
-    let removed = Arc::new(Mutex::new(Vec::new()));
-    let bulk = Arc::new(Mutex::new(Vec::new()));
-    let sources = StreamSources {
-        path: path.to_owned(),
-        opened: opened.clone(),
-        closed: closed.clone(),
-    };
-    let library = StreamLibrary {
-        merged: merged.clone(),
-        removed: removed.clone(),
-        bulk: bulk.clone(),
-    };
-    let app = AppState::new(
-        Arc::new(library),
+#[async_trait]
+impl LyricManager for CannedLyrics {
+    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(self.stored.clone())
+    }
+    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn download_lyrics(
+        &self,
+        _item_id: Uuid,
+        _lyric_id: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(None)
+    }
+    async fn save_lyric(
+        &self,
+        _item_id: Uuid,
+        _format: &str,
+        _lyrics: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(None)
+    }
+    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        *self.deleted.lock().unwrap() = true;
+        Ok(())
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<hermit_model::providers::LyricProviderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Builds an [`AppState`] serving `path` for streams and using `lyrics` for the
+/// Lyrics routes; every other manager is a shared panic fake.
+fn state(path: &str, lyrics: Arc<dyn LyricManager>) -> AppState {
+    AppState::new(
+        Arc::new(StreamLibrary),
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
-        Arc::new(sources),
+        Arc::new(StreamSources {
+            path: path.to_owned(),
+        }),
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
@@ -477,10 +449,10 @@ fn state(path: &str) -> Harness {
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
         Arc::new(FakeTvSeries),
-        Arc::new(hermit_api::test_support::FakeSubtitles),
-        Arc::new(hermit_api::test_support::FakeLyrics),
-        Arc::new(hermit_api::test_support::FakeMediaSegments),
-        Arc::new(hermit_api::test_support::FakeTrickplay),
+        Arc::new(FakeSubtitles),
+        lyrics,
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
         Arc::new(hermit_api::test_support::FakeDevices),
         Arc::new(hermit_api::test_support::FakeClientEventLogger),
         Arc::new(hermit_api::test_support::FakeApiKeys),
@@ -489,15 +461,13 @@ fn state(path: &str) -> Harness {
         Arc::new(hermit_api::test_support::FakeActivity),
         Arc::new(hermit_api::test_support::FakeFileSystem),
         Arc::new(hermit_api::test_support::FakeTasks),
-    );
-    Harness {
-        app,
-        opened,
-        closed,
-        merged,
-        removed,
-        bulk,
-    }
+    )
+}
+
+/// A [`LyricManager`] that panics if reached — for the stream tests that never
+/// touch lyrics.
+fn no_lyrics() -> Arc<dyn LyricManager> {
+    Arc::new(hermit_api::test_support::FakeLyrics)
 }
 
 /// An RAII temp media file: writes known contents under the system temp dir and
@@ -510,7 +480,7 @@ impl TempMedia {
     fn new() -> Self {
         let mut path = std::env::temp_dir();
         // A unique name per invocation so parallel tests don't collide.
-        path.push(format!("hermit-batch10-{}-movie.mkv", Uuid::new_v4()));
+        path.push(format!("hermit-audio-{}-movie.mkv", Uuid::new_v4()));
         std::fs::write(&path, b"hello-hermit-media").expect("write temp media");
         Self {
             path: path.to_string_lossy().into_owned(),
@@ -540,26 +510,24 @@ fn authed(method: &str, uri: &str) -> Request<Body> {
         .expect("request")
 }
 
-#[tokio::test]
-async fn video_stream_serves_file() {
-    let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+/// Sends an authenticated request and returns `(status, body-bytes)`.
+async fn call(app: AppState, method: &str, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = create_router(app)
+        .oneshot(authed(method, uri))
         .await
         .unwrap();
-    assert_eq!(&body[..], b"hello-hermit-media");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, bytes)
 }
 
 #[tokio::test]
 async fn audio_stream_by_container_serves_file() {
     let (_dir, path) = temp_media();
-    let app = state(&path).app;
+    let app = state(&path, no_lyrics());
     let router = create_router(app);
     // `/Audio/{itemId}/stream.mp3` normalizes to `/Audio/{itemId}/{container}`.
     let resp = router
@@ -572,7 +540,7 @@ async fn audio_stream_by_container_serves_file() {
 #[tokio::test]
 async fn universal_audio_serves_file() {
     let (_dir, path) = temp_media();
-    let app = state(&path).app;
+    let app = state(&path, no_lyrics());
     let router = create_router(app);
     let resp = router
         .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/universal")))
@@ -582,183 +550,67 @@ async fn universal_audio_serves_file() {
 }
 
 #[tokio::test]
-async fn download_sets_content_disposition() {
+async fn lyrics_get_returns_stored_or_404() {
     let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let resp = router
-        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let cd = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    assert!(cd.contains("attachment"), "got: {cd}");
-    assert!(cd.contains("movie.mkv"), "got: {cd}");
+    let mut dto = LyricDto::default();
+    dto.lyrics.push(hermit_model::lyrics::LyricLine {
+        text: "la la la".to_owned(),
+        start: Some(0),
+        cues: None,
+    });
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(dto),
+            deleted: Arc::new(Mutex::new(false)),
+        }),
+    );
+    let (ok, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
+    assert_eq!(ok, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Lyrics"][0]["Text"], "la la la");
+
+    // No stored lyrics → 404.
+    let (_dir, path) = temp_media();
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            deleted: Arc::new(Mutex::new(false)),
+        }),
+    );
+    let (missing, _) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
+    assert_eq!(missing, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn bitrate_test_returns_requested_size() {
+async fn lyrics_delete_is_204_and_calls_manager() {
     let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let resp = router
-        .oneshot(authed("GET", "/Playback/BitrateTest?size=2048"))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(body.len(), 2048);
+    let deleted = Arc::new(Mutex::new(false));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            deleted: deleted.clone(),
+        }),
+    );
+    let (status, _) = call(app, "DELETE", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(*deleted.lock().unwrap());
 }
 
 #[tokio::test]
-async fn bitrate_test_rejects_oversize() {
+async fn lyrics_remote_search_is_empty_list() {
     let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let resp = router
-        .oneshot(authed("GET", "/Playback/BitrateTest?size=999999999"))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn live_stream_open_then_close() {
-    let (_dir, path) = temp_media();
-    let h = state(&path);
-    let (opened, closed) = (h.opened.clone(), h.closed.clone());
-    let router = create_router(h.app);
-
-    let open = router
-        .clone()
-        .oneshot(authed(
-            "POST",
-            &format!("/LiveStreams/Open?itemId={ITEM_ID}"),
-        ))
-        .await
-        .expect("open response");
-    assert_eq!(open.status(), StatusCode::OK);
-    assert_eq!(opened.lock().unwrap().len(), 1);
-
-    let close = router
-        .oneshot(authed("POST", "/LiveStreams/Close?liveStreamId=live-123"))
-        .await
-        .expect("close response");
-    assert_eq!(close.status(), StatusCode::NO_CONTENT);
-    assert_eq!(closed.lock().unwrap().as_slice(), ["live-123"]);
-}
-
-#[tokio::test]
-async fn merge_versions_requires_two_ids() {
-    let (_dir, path) = temp_media();
-    let h = state(&path);
-    let merged = h.merged.clone();
-    let router = create_router(h.app);
-    let resp = router
-        .oneshot(authed(
-            "POST",
-            &format!("/Videos/MergeVersions?ids={ITEM_ID}"),
-        ))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert!(merged.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn merge_versions_merges_two_ids() {
-    let (_dir, path) = temp_media();
-    let h = state(&path);
-    let merged = h.merged.clone();
-    let router = create_router(h.app);
-    let other = Uuid::from_u128(0x00A1_0002);
-    let resp = router
-        .oneshot(authed(
-            "POST",
-            &format!("/Videos/MergeVersions?ids={ITEM_ID},{other}"),
-        ))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(merged.lock().unwrap().len(), 1);
-    assert_eq!(merged.lock().unwrap()[0].len(), 2);
-}
-
-#[tokio::test]
-async fn delete_alternate_sources_ok() {
-    let (_dir, path) = temp_media();
-    let h = state(&path);
-    let removed = h.removed.clone();
-    let router = create_router(h.app);
-    let resp = router
-        .oneshot(authed(
-            "DELETE",
-            &format!("/Videos/{ITEM_ID}/AlternateSources"),
-        ))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    assert_eq!(removed.lock().unwrap().as_slice(), [ITEM_ID]);
-}
-
-/// The four parameterless `MergeVersions`-plugin routes each drive their bulk
-/// manager op and return `204`.
-#[tokio::test]
-async fn merge_versions_plugin_routes_drive_bulk_ops() {
-    let cases = [
-        ("/MergeVersions/MergeMovies", "merge_movies"),
-        ("/MergeVersions/SplitMovies", "split_movies"),
-        ("/MergeVersions/MergeEpisodes", "merge_episodes"),
-        ("/MergeVersions/SplitEpisodes", "split_episodes"),
-    ];
-    for (route, expected) in cases {
-        let (_dir, path) = temp_media();
-        let h = state(&path);
-        let bulk = h.bulk.clone();
-        let router = create_router(h.app);
-        let resp = router
-            .oneshot(authed("POST", route))
-            .await
-            .expect("response");
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{route}");
-        assert_eq!(bulk.lock().unwrap().as_slice(), [expected], "{route}");
-    }
-}
-
-#[tokio::test]
-async fn additional_parts_empty_for_known_item() {
-    let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/AdditionalParts")))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["Items"].as_array().map(Vec::len), Some(0));
-    assert_eq!(json["TotalRecordCount"].as_i64(), Some(0));
-}
-
-#[tokio::test]
-async fn additional_parts_missing_item_is_404() {
-    let (_dir, path) = temp_media();
-    let app = state(&path).app;
-    let router = create_router(app);
-    let missing = Uuid::from_u128(0x00FF_FFFF);
-    let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{missing}/AdditionalParts")))
-        .await
-        .expect("response");
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: None,
+            deleted: Arc::new(Mutex::new(false)),
+        }),
+    );
+    let (status, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.as_array().unwrap().is_empty());
 }

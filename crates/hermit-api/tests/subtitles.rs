@@ -1,17 +1,20 @@
-//! Batch-5 handler tests: on-the-fly subtitle transcode + FallbackFont.
+//! Subtitle handler tests: on-the-fly subtitle transcode, the HLS subtitle
+//! playlist, FallbackFont listing/serving, and remote subtitle search.
 //!
 //! Drives the real handlers through `tower::ServiceExt::oneshot`:
 //! - `GET /Videos/{id}/{source}/Subtitles/{index}/{format}` (+ the ticks and
 //!   `subtitles.m3u8` variants) call the [`SubtitleEncoder`] seam;
 //! - `GET /FallbackFont/Fonts` + `/{name}` resolve `EncodingOptions.
 //!   FallbackFontPath` via the config seam and read fonts through the
-//!   [`FileSystem`] seam.
+//!   [`FileSystem`] seam;
+//! - `GET /Items/{id}/RemoteSearch/Subtitles/{lang}` calls the
+//!   [`SubtitleManager`] seam.
 //!
-//! Purpose-built fakes stand in for the four managers these handlers touch
-//! (library, config, file-system, media-sources) plus the encoder; every other
-//! manager is a `test_support` panic double, catching a strayed handler.
+//! Purpose-built fakes stand in for the managers these handlers touch (library,
+//! config, file-system, media-sources, subtitle manager) plus the encoder; every
+//! other manager is a `test_support` panic double.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -19,7 +22,14 @@ use axum::http::{Request, StatusCode};
 use chrono::{TimeZone, Utc};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
-use hermit_api::test_support::{authed_state_for_subtitles, minimal_base_item};
+use hermit_api::test_support::{
+    AuthedAuthService, FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger,
+    FakeCollections, FakeDevices, FakeDisplayPreferences, FakeDto, FakeLocalization, FakeLyrics,
+    FakeMediaSegments, FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch,
+    FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay,
+    FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers, minimal_base_item,
+};
+use hermit_api::test_support::{FakeAuthContext, FakeMediaSources};
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use hermit_model::configuration::EncodingOptions;
 use hermit_model::data::CollectionType;
@@ -27,6 +37,7 @@ use hermit_model::dto::{ItemCounts, MediaSourceInfo};
 use hermit_model::entities::MediaStreamType;
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
 use hermit_model::media_info::LiveStreamRequest;
+use hermit_model::providers::RemoteSubtitleInfo;
 use hermit_model::querying::{QueryFiltersLegacy, QueryResult};
 use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
@@ -35,6 +46,7 @@ use hermit_traits::library::{LibraryManager, MediaSourceManager};
 use hermit_traits::media_encoding::SubtitleEncoder;
 use hermit_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use hermit_traits::persistence::ItemWithCounts;
+use hermit_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
 use hermit_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -312,6 +324,99 @@ impl SubtitleEncoder for StubEncoder {
     }
 }
 
+/// A [`SubtitleManager`] recording deletes and returning empty search results.
+struct CannedSubtitles {
+    deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+}
+
+#[async_trait]
+impl SubtitleManager for CannedSubtitles {
+    async fn search_subtitles(
+        &self,
+        _request: &SubtitleSearchRequest,
+    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn download_subtitles(
+        &self,
+        _item_id: Uuid,
+        _subtitle_id: &str,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::invalid_input("no providers"))
+    }
+    async fn upload_subtitle(
+        &self,
+        _item_id: Uuid,
+        _response: &SubtitleResponse,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::invalid_input("no providers"))
+    }
+    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
+        Err(ServiceError::invalid_input("no providers"))
+    }
+    async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
+        self.deleted.lock().unwrap().push((item_id, index));
+        Ok(())
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<hermit_model::providers::SubtitleProviderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+}
+
+// ---- Harness ---------------------------------------------------------------
+
+/// Builds an authenticated [`AppState`] wired for the subtitle handlers. Every
+/// manager the subtitle/font routes touch is caller-supplied; the rest are the
+/// shared panic fakes.
+#[allow(clippy::too_many_arguments)]
+fn build_state(
+    library: Arc<dyn LibraryManager>,
+    config: Arc<dyn ServerConfigurationManager>,
+    file_system: Arc<dyn FileSystem>,
+    media_sources: Arc<dyn MediaSourceManager>,
+    subtitles: Arc<dyn SubtitleManager>,
+    subtitle_encoder: Arc<dyn SubtitleEncoder>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        media_sources,
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        config,
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        subtitles,
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        file_system,
+        Arc::new(FakeTasks),
+    )
+    .with_subtitle_encoder(subtitle_encoder)
+}
+
 // ---- Helpers ---------------------------------------------------------------
 
 fn font(name: &str, size: i64) -> FileMetadata {
@@ -326,7 +431,7 @@ fn font(name: &str, size: i64) -> FileMetadata {
 }
 
 fn subtitle_state(encoder: StubEncoder) -> AppState {
-    authed_state_for_subtitles(
+    build_state(
         Arc::new(OneItemLibrary),
         Arc::new(FontConfig(EncodingOptions::default())),
         Arc::new(FontFs {
@@ -334,22 +439,24 @@ fn subtitle_state(encoder: StubEncoder) -> AppState {
             bytes: Vec::new(),
         }),
         Arc::new(FixedSources(Vec::new())),
+        Arc::new(FakeSubtitles),
         Arc::new(encoder),
     )
 }
 
 fn font_state(options: EncodingOptions, fs: FontFs) -> AppState {
-    authed_state_for_subtitles(
+    build_state(
         Arc::new(OneItemLibrary),
         Arc::new(FontConfig(options)),
         Arc::new(fs),
         Arc::new(FixedSources(Vec::new())),
+        Arc::new(FakeSubtitles),
         Arc::new(StubEncoder(Ok(Vec::new()))),
     )
 }
 
 fn playlist_state(sources: Vec<MediaSourceInfo>) -> AppState {
-    authed_state_for_subtitles(
+    build_state(
         Arc::new(OneItemLibrary),
         Arc::new(FontConfig(EncodingOptions::default())),
         Arc::new(FontFs {
@@ -357,6 +464,21 @@ fn playlist_state(sources: Vec<MediaSourceInfo>) -> AppState {
             bytes: Vec::new(),
         }),
         Arc::new(FixedSources(sources)),
+        Arc::new(FakeSubtitles),
+        Arc::new(StubEncoder(Ok(Vec::new()))),
+    )
+}
+
+fn remote_search_state(subtitles: Arc<dyn SubtitleManager>) -> AppState {
+    build_state(
+        Arc::new(OneItemLibrary),
+        Arc::new(FontConfig(EncodingOptions::default())),
+        Arc::new(FontFs {
+            files: Vec::new(),
+            bytes: Vec::new(),
+        }),
+        Arc::new(FakeMediaSources),
+        subtitles,
         Arc::new(StubEncoder(Ok(Vec::new()))),
     )
 }
@@ -522,6 +644,20 @@ async fn subtitle_playlist_unknown_source_is_not_found() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- Remote subtitle search ------------------------------------------------
+
+#[tokio::test]
+async fn subtitle_remote_search_is_empty_list() {
+    let app = remote_search_state(Arc::new(CannedSubtitles {
+        deleted: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let (status, body, _) =
+        call(app, &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v.as_array().unwrap().is_empty());
 }
 
 // ---- FallbackFont ----------------------------------------------------------

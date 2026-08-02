@@ -1,14 +1,12 @@
-//! Batch-15 handler **success-path** tests: `ScheduledTasksController`
-//! read/run (`GET /ScheduledTasks`, `GET /ScheduledTasks/{taskId}`,
-//! `POST /ScheduledTasks/Running/{taskId}`).
+//! Scheduled-tasks handler tests: `ScheduledTasksController` read/run/stop and
+//! trigger update (`GET /ScheduledTasks`, `GET /ScheduledTasks/{taskId}`,
+//! `POST /ScheduledTasks/Running/{taskId}`, `DELETE /ScheduledTasks/Running/{taskId}`,
+//! `POST /ScheduledTasks/{taskId}/Triggers`).
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with a
 //! compact [`TaskManager`] stub that returns canned [`TaskInfo`]s and records
-//! run-now calls; every manager the handler does not touch reuses the
-//! `test_support` panic fakes. The deferred `ScheduledTasks` routes (the `DELETE`
-//! cancel and the `POST …/Triggers` update) and every `ChannelsController` route
-//! stay registered as `501` stubs — covered by the contract-superset test, not
-//! here.
+//! run-now/cancel/trigger calls; every manager the handler does not touch reuses
+//! the `test_support` panic fakes.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -323,15 +321,6 @@ async fn get_tasks_requires_auth() {
     let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
     let (status, _body) = send(tasks, false, "GET", "/ScheduledTasks").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn channels_route_returns_empty_not_501() {
-    // `ChannelsController` is implemented: with no channel providers it resolves
-    // to an empty result (a stock Jellyfin with none registered behaves the same).
-    let tasks = Arc::new(StubTasks::new(Vec::new()));
-    let (status, _body) = send(tasks, true, "GET", "/Channels").await;
-    assert_eq!(status, StatusCode::OK);
 }
 
 /// Drives one request with a JSON `body` through a router built from

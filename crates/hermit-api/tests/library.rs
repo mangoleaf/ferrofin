@@ -1,4 +1,4 @@
-//! Batch 2 — Filesystem-monitor change-report webhooks.
+//! Library — filesystem-monitor change-report webhooks + library scan trigger.
 //!
 //! Drives the five `LibraryController` external-source change-report routes
 //! through the real router, against a [`RecordingLibrary`] (filters a preset item
@@ -10,6 +10,7 @@
 //! - `POST /Library/Series/Added` / `Updated` — by TVDB id.
 //! - `POST /Library/Movies/Added` / `Updated` — by IMDb id (preferred) or TMDb id.
 //! - `POST /Library/Media/Updated` — by request-body paths.
+//! - `POST /Library/Refresh` — queues a full library scan.
 
 use std::sync::{Arc, Mutex};
 
@@ -253,7 +254,9 @@ impl LibraryManager for RecordingLibrary {
         unimplemented!("unused")
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        unimplemented!("unused")
+        // Merged from batch14's `StubLibrary` so `POST /Library/Refresh` succeeds
+        // under this harness (the change-report webhooks never call it).
+        Ok(())
     }
 }
 
@@ -452,4 +455,14 @@ async fn movies_updated_empty_imdb_falls_back_to_tmdb() {
     let status = post(router, "/Library/Movies/Updated?imdbId=&tmdbId=500", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(reported(&monitor), vec!["/movies/Only Tmdb".to_owned()]);
+}
+
+#[tokio::test]
+async fn refresh_library_returns_204() {
+    // Moved from batch14: `POST /Library/Refresh` queues a scan and returns 204.
+    // Re-homed onto this file's `router_with`/`post` harness, whose
+    // `RecordingLibrary::queue_library_scan` returns `Ok(())`.
+    let (router, _monitor) = router_with(seeded_items());
+    let status = post(router, "/Library/Refresh", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }

@@ -1,10 +1,10 @@
-//! Batch-8 handler **success-path** tests: the `/Shows` TV surface — next-up,
-//! upcoming, seasons, episodes, and similar shows.
+//! Item-filters handler tests: `/Items/Filters` (legacy) and `/Items/Filters2`.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
-//! stub `hermit-traits` impls that authenticate and return canned data, asserting
-//! the success status and the wire-body shape. Managers a given handler never
-//! touches reuse the `test_support` panic fakes, catching a handler that strays.
+//! stub `hermit-traits` impls that authenticate and return canned facets,
+//! asserting the success status and the wire-body shape. Managers a given handler
+//! never touches reuse the `test_support` panic fakes, catching a handler that
+//! strays.
 
 use std::sync::Arc;
 
@@ -14,32 +14,35 @@ use axum::http::{Request, StatusCode};
 use hermit_api::create_router;
 use hermit_api::state::AppState;
 use hermit_api::test_support::{
-    FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSystem, FakeUserData, FakeUserViews,
+    FakeAppHost, FakeConfig, FakeMediaSources, FakeProviders, FakeSessions, FakeSystem,
+    FakeUserData, FakeUserViews,
 };
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
-use hermit_model::dto::BaseItemDto;
-use hermit_model::querying::QueryResult;
+use hermit_model::data::{BaseItemKind, MediaType};
+use hermit_model::dto::{BaseItemDto, NameGuidPair, RecommendationType};
+use hermit_model::entities::MediaStreamType;
+use hermit_model::querying::{QueryFilters, QueryFiltersLegacy, QueryResult};
+use hermit_model::search::{SearchHint, SearchQuery};
 use hermit_traits::dto::DtoService;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::{
-    LibraryManager, SimilarItemsManager, SimilarItemsRecommendation, UserManager,
+    LibraryManager, MusicManager, SearchManager, SearchResult, SimilarItemsManager,
+    SimilarItemsRecommendation, UserManager,
 };
 use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use hermit_traits::persistence::ItemWithCounts;
-use hermit_traits::tv::{NextUpQuery, TvSeriesManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
-const SERIES_ID: Uuid = Uuid::from_u128(0x005E_21E5);
-const SEASON_ID: Uuid = Uuid::from_u128(0x05EA_5074);
+const SEED_ID: Uuid = Uuid::from_u128(0xBEEF);
 
-/// Builds a minimal [`UserEntity`]; every non-id field is a neutral zero value.
+/// Builds a minimal [`UserEntity`] with the given id/name; every other field is a
+/// neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
         id: id.to_string(),
@@ -77,8 +80,8 @@ fn user_entity(id: Uuid, username: &str) -> UserEntity {
     }
 }
 
-/// Builds a minimal [`BaseItemEntity`] of the given kind carrying id + name.
-fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
+/// Builds a minimal [`BaseItemEntity`] with the given id + name.
+fn item_entity(id: Uuid, name: &str) -> BaseItemEntity {
     BaseItemEntity {
         id: id.to_string(),
         album: None,
@@ -130,7 +133,7 @@ fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
         preferred_metadata_country_code: None,
         preferred_metadata_language: None,
         premiere_date: None,
-        presentation_unique_key: Some(format!("key-{name}")),
+        presentation_unique_key: None,
         primary_version_id: None,
         production_locations: None,
         production_year: None,
@@ -149,7 +152,7 @@ fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
         tags: None,
         top_parent_id: None,
         total_bitrate: None,
-        type_: kind.to_owned(),
+        type_: "Audio".to_owned(),
         unrated_type: None,
         width: None,
     }
@@ -326,48 +329,81 @@ impl DtoService for OkDto {
     }
 }
 
-/// A [`LibraryManager`] backing the seasons/episodes/upcoming reads.
-///
-/// `get_item_by_id` resolves the series (as a `Series`) and the season (as a
-/// `Season`); `get_item_list` echoes back either seasons or episodes depending
-/// on the query's `include_item_types`.
+/// A [`LibraryManager`] backing the filters/filters2 facet routes; unused methods
+/// panic.
 struct StubLibrary;
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok(match id {
-            _ if id == SERIES_ID => Some(item_entity(SERIES_ID, "The Series", "Series")),
-            _ if id == SEASON_ID => Some(item_entity(SEASON_ID, "Season 1", "Season")),
-            _ => None,
-        })
-    }
-    async fn get_item_list(
-        &self,
-        query: &InternalItemsQuery,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        use hermit_model::data::BaseItemKind;
-        if query.include_item_types.contains(&BaseItemKind::Season) {
-            Ok(vec![
-                item_entity(Uuid::from_u128(0x01), "Season 1", "Season"),
-                item_entity(Uuid::from_u128(0x02), "Season 2", "Season"),
-            ])
-        } else {
-            // Episodes (or the Upcoming episode query).
-            Ok(vec![
-                item_entity(Uuid::from_u128(0x11), "Episode 1", "Episode"),
-                item_entity(Uuid::from_u128(0x12), "Episode 2", "Episode"),
-                item_entity(Uuid::from_u128(0x13), "Episode 3", "Episode"),
-            ])
-        }
+        Ok((id == SEED_ID).then(|| item_entity(SEED_ID, "Seed")))
     }
     async fn query_items(
         &self,
-        _q: &InternalItemsQuery,
+        _query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        Ok(QueryResult::new(
+            Some(0),
+            Some(1),
+            vec![item_entity(Uuid::from_u128(0x11), "Result")],
+        ))
+    }
+    async fn get_genres(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        Ok(QueryResult::new(
+            Some(0),
+            Some(1),
+            vec![ItemWithCounts {
+                item: item_entity(Uuid::from_u128(0x21), "Action"),
+                counts: hermit_model::dto::ItemCounts::default(),
+            }],
+        ))
+    }
+    async fn get_music_genres(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        Ok(QueryResult::new(
+            Some(0),
+            Some(1),
+            vec![ItemWithCounts {
+                item: item_entity(Uuid::from_u128(0x22), "Jazz"),
+                counts: hermit_model::dto::ItemCounts::default(),
+            }],
+        ))
+    }
+    async fn get_query_filters_legacy(
+        &self,
+        _query: &InternalItemsQuery,
+    ) -> Result<QueryFiltersLegacy, ServiceError> {
+        Ok(QueryFiltersLegacy {
+            genres: vec!["Action".to_owned()],
+            tags: vec!["Cult".to_owned()],
+            official_ratings: vec!["PG".to_owned()],
+            years: vec![1999],
+        })
+    }
+    async fn get_media_stream_languages(
+        &self,
+        stream_type: MediaStreamType,
+        _query: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(match stream_type {
+            MediaStreamType::Audio => vec!["eng".to_owned(), "deu".to_owned()],
+            MediaStreamType::Subtitle => vec!["fra".to_owned()],
+            _ => Vec::new(),
+        })
+    }
+    // Remaining methods are never reached by these tests.
+    async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
-    async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+    async fn get_item_list(
+        &self,
+        _q: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
     async fn get_latest_item_list(
@@ -415,12 +451,6 @@ impl LibraryManager for StubLibrary {
     ) -> Result<hermit_model::dto::ItemCounts, ServiceError> {
         unimplemented!()
     }
-    async fn get_genres(
-        &self,
-        _q: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_studios(
         &self,
         _q: &InternalItemsQuery,
@@ -433,29 +463,10 @@ impl LibraryManager for StubLibrary {
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         unimplemented!()
     }
-    async fn get_music_genres(
-        &self,
-        _q: &InternalItemsQuery,
-    ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_album_artists(
         &self,
         _q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_query_filters_legacy(
-        &self,
-        _q: &InternalItemsQuery,
-    ) -> Result<hermit_model::querying::QueryFiltersLegacy, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_media_stream_languages(
-        &self,
-        _stream_type: hermit_model::entities::MediaStreamType,
-        _q: &InternalItemsQuery,
-    ) -> Result<Vec<String>, ServiceError> {
         unimplemented!()
     }
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
@@ -463,29 +474,45 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`TvSeriesManager`] returning a fixed one-episode next-up queue.
-struct StubTvSeries;
+/// A [`MusicManager`] returning a two-song mix for any seed.
+struct StubMusic;
+
+fn mix() -> Vec<BaseItemEntity> {
+    vec![
+        item_entity(Uuid::from_u128(0x31), "Song A"),
+        item_entity(Uuid::from_u128(0x32), "Song B"),
+    ]
+}
 
 #[async_trait]
-impl TvSeriesManager for StubTvSeries {
-    async fn get_next_up(
+impl MusicManager for StubMusic {
+    async fn get_instant_mix_from_item(
         &self,
-        query: &NextUpQuery,
-        _options: &DtoOptions,
-    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        Ok(QueryResult::new(
-            query.start_index,
-            query.enable_total_record_count.then_some(1),
-            vec![BaseItemDto {
-                id: Uuid::from_u128(0x9E27),
-                name: Some("Next Episode".to_owned()),
-                ..BaseItemDto::default()
-            }],
-        ))
+        _item_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(mix())
+    }
+    async fn get_instant_mix_from_artist(
+        &self,
+        _artist_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(mix())
+    }
+    async fn get_instant_mix_from_genres(
+        &self,
+        _genres: &[String],
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(mix())
     }
 }
 
-/// A [`SimilarItemsManager`] returning two similar shows.
+/// A [`SimilarItemsManager`] returning one recommendation category.
 struct StubSimilar;
 
 #[async_trait]
@@ -498,10 +525,7 @@ impl SimilarItemsManager for StubSimilar {
         _dto_options: &DtoOptions,
         _limit: Option<i32>,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![
-            item_entity(Uuid::from_u128(0xA1), "Similar A", "Series"),
-            item_entity(Uuid::from_u128(0xA2), "Similar B", "Series"),
-        ])
+        unimplemented!()
     }
     async fn get_movie_recommendations(
         &self,
@@ -511,11 +535,66 @@ impl SimilarItemsManager for StubSimilar {
         _item_limit: i32,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        Ok(vec![SimilarItemsRecommendation {
+            baseline_item_name: "Because you watched Alien".to_owned(),
+            category_id: Uuid::from_u128(0x41),
+            recommendation_type: RecommendationType::SimilarToRecentlyPlayed,
+            items: vec![item_entity(Uuid::from_u128(0x42), "Aliens")],
+        }])
+    }
+}
+
+/// A [`SearchManager`] returning one hint.
+struct StubSearch;
+
+#[async_trait]
+impl SearchManager for StubSearch {
+    async fn get_search_hints(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<QueryResult<SearchHint>, ServiceError> {
+        let hint = SearchHint {
+            item_id: Uuid::from_u128(0x51),
+            id: Uuid::from_u128(0x51),
+            name: Some("Matrix".to_owned()),
+            matched_term: Some(query.search_term.clone()),
+            index_number: None,
+            production_year: None,
+            parent_index_number: None,
+            primary_image_tag: None,
+            thumb_image_tag: None,
+            thumb_image_item_id: None,
+            backdrop_image_tag: None,
+            backdrop_image_item_id: None,
+            type_: BaseItemKind::Movie,
+            is_folder: Some(false),
+            run_time_ticks: None,
+            media_type: MediaType::Video,
+            start_date: None,
+            end_date: None,
+            series: None,
+            status: None,
+            album: None,
+            album_id: None,
+            album_artist: None,
+            artists: Vec::new(),
+            song_count: None,
+            episode_count: None,
+            channel_id: None,
+            channel_name: None,
+            primary_image_aspect_ratio: None,
+        };
+        Ok(QueryResult::new(Some(0), Some(1), vec![hint]))
+    }
+    async fn get_search_results(
+        &self,
+        _query: &SearchQuery,
+    ) -> Result<Vec<SearchResult>, ServiceError> {
         unimplemented!()
     }
 }
 
-/// Builds an [`AppState`] wired with the batch-8 stubs.
+/// Builds an [`AppState`] wired with the filter stubs.
 fn state() -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
@@ -528,16 +607,16 @@ fn state() -> AppState {
         Arc::new(FakeAppHost),
         Arc::new(FakeConfig),
         Arc::new(FakeProviders),
-        Arc::new(FakeMusic),
+        Arc::new(StubMusic),
         Arc::new(StubSimilar),
-        Arc::new(FakeSearch),
+        Arc::new(StubSearch),
         Arc::new(OkDto),
         Arc::new(OkAuth),
         Arc::new(OkAuth),
         Arc::new(hermit_api::test_support::FakeQuickConnect),
         Arc::new(hermit_api::test_support::FakePlaylists),
         Arc::new(hermit_api::test_support::FakeCollections),
-        Arc::new(StubTvSeries),
+        Arc::new(hermit_api::test_support::FakeTvSeries),
         Arc::new(hermit_api::test_support::FakeSubtitles),
         Arc::new(hermit_api::test_support::FakeLyrics),
         Arc::new(hermit_api::test_support::FakeMediaSegments),
@@ -553,7 +632,7 @@ fn state() -> AppState {
     )
 }
 
-/// Drives one authenticated GET request through the router.
+/// Drives one GET request through the router and returns (status, body bytes).
 async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
     let router = create_router(state());
     let response = router
@@ -574,79 +653,45 @@ async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn next_up_returns_queue() {
-    let (status, body) = get("/Shows/NextUp").await;
+async fn items_filters_returns_legacy_facets() {
+    let (status, body) = get("/Items/Filters?includeItemTypes=Movie").await;
     assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("next up");
-    assert_eq!(result.total_record_count, 1);
-    assert_eq!(result.items[0].name.as_deref(), Some("Next Episode"));
+    let filters: QueryFiltersLegacy = serde_json::from_slice(&body).expect("legacy filters");
+    assert_eq!(filters.genres, vec!["Action".to_owned()]);
+    assert_eq!(filters.years, vec![1999]);
 }
 
 #[tokio::test]
-async fn upcoming_returns_episodes() {
-    let (status, body) = get("/Shows/Upcoming").await;
+async fn items_filters2_returns_genre_facets() {
+    let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
     assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("upcoming");
-    assert_eq!(result.items.len(), 3);
-    assert_eq!(result.total_record_count, 3);
+    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+    assert_eq!(
+        filters.genres,
+        vec![NameGuidPair {
+            name: Some("Action".to_owned()),
+            id: Uuid::from_u128(0x21),
+        }]
+    );
+    // The response schema is exactly {Genres, Tags} (Jellyfin's QueryFilters):
+    // no fabricated audio/subtitle language facets leak into the body.
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let keys: Vec<&str> = value
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["Genres", "Tags"]);
 }
 
 #[tokio::test]
-async fn seasons_returns_series_seasons() {
-    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Seasons")).await;
+async fn items_filters2_music_type_uses_music_genres() {
+    let (status, body) = get("/Items/Filters2?includeItemTypes=Audio").await;
     assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("seasons");
-    assert_eq!(result.items.len(), 2);
-    assert_eq!(result.items[0].name.as_deref(), Some("Season 1"));
-}
-
-#[tokio::test]
-async fn seasons_missing_series_is_404() {
-    let missing = Uuid::from_u128(0xDEAD);
-    let (status, _) = get(&format!("/Shows/{missing}/Seasons")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn episodes_returns_series_episodes() {
-    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Episodes")).await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
-    assert_eq!(result.items.len(), 3);
-    assert_eq!(result.total_record_count, 3);
-}
-
-#[tokio::test]
-async fn episodes_paginate_with_start_and_limit() {
-    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?startIndex=1&limit=1")).await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
-    // Total is the pre-page count (3); the page skips 1 and takes 1.
-    assert_eq!(result.total_record_count, 3);
-    assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].name.as_deref(), Some("Episode 2"));
-}
-
-#[tokio::test]
-async fn episodes_by_season_id_resolves_season() {
-    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?seasonId={SEASON_ID}")).await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
-    assert_eq!(result.items.len(), 3);
-}
-
-#[tokio::test]
-async fn episodes_bad_season_id_is_404() {
-    let missing = Uuid::from_u128(0xDEAD);
-    let (status, _) = get(&format!("/Shows/{SERIES_ID}/Episodes?seasonId={missing}")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn similar_shows_returns_items() {
-    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Similar")).await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
-    assert_eq!(result.items.len(), 2);
-    assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
+    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+    assert_eq!(
+        filters.genres.first().and_then(|p| p.name.clone()),
+        Some("Jazz".to_owned())
+    );
 }

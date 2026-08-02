@@ -1,4 +1,4 @@
-//! Batch 1 — Library admin / virtual folders.
+//! Library structure — virtual folders, media paths, library options, physical/available.
 //!
 //! Drives every `LibraryStructureController` + the two `LibraryController`
 //! structure-read routes through the real router, against the in-memory

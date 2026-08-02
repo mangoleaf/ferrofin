@@ -1,9 +1,14 @@
-//! Batch-12 handler success/failure-path tests: Devices + ApiKeys + ClientLog.
+//! API keys handler tests: list, create, and revoke auth keys.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
 //! stub `hermit-traits` impls that authenticate and return canned data. Managers
 //! a given handler never touches reuse the `test_support` panic fakes, so a
 //! handler that strays trips a panic.
+//!
+//! This file carries the shared batch-12 harness (auth stub + `state()` builder
+//! wiring every manager); the Devices/ClientLog/Config stubs the harness defines
+//! are exercised only by their own domain files, so they are `dead_code` here.
+#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
@@ -378,149 +383,6 @@ async fn call_with_body(
 fn ok_auth() -> Arc<OkAuth> {
     Arc::new(OkAuth { is_api_key: false })
 }
-
-// ---- Devices ---------------------------------------------------------------
-
-#[tokio::test]
-async fn get_devices_returns_the_users_devices() {
-    let devices = Arc::new(StubDevices {
-        known: vec![device("dev-1"), device("dev-2")],
-        ..Default::default()
-    });
-    let app = state(
-        ok_auth(),
-        devices,
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, body) = call(app, "GET", "/Devices").await;
-    assert_eq!(status, StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["TotalRecordCount"], 2);
-    assert_eq!(json["Items"][0]["Id"], "dev-1");
-}
-
-#[tokio::test]
-async fn get_device_info_found_and_not_found() {
-    let devices = Arc::new(StubDevices {
-        known: vec![device("dev-1")],
-        ..Default::default()
-    });
-    let app = state(
-        ok_auth(),
-        devices,
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, body) = call(app.clone(), "GET", "/Devices/Info?id=dev-1").await;
-    assert_eq!(status, StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["Id"], "dev-1");
-
-    let (status, _) = call(app, "GET", "/Devices/Info?id=nope").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn get_device_info_missing_id_is_bad_request() {
-    let app = state(
-        ok_auth(),
-        Arc::new(StubDevices::default()),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, _) = call(app, "GET", "/Devices/Info").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn get_device_options_projects_the_row() {
-    let devices = Arc::new(StubDevices {
-        options: Some(DeviceOptionsEntity {
-            id: 7,
-            custom_name: Some("Living Room".to_owned()),
-            device_id: "dev-1".to_owned(),
-        }),
-        ..Default::default()
-    });
-    let app = state(
-        ok_auth(),
-        devices,
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, body) = call(app, "GET", "/Devices/Options?id=dev-1").await;
-    assert_eq!(status, StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["Id"], 7);
-    assert_eq!(json["DeviceId"], "dev-1");
-    assert_eq!(json["CustomName"], "Living Room");
-}
-
-#[tokio::test]
-async fn get_device_options_absent_is_not_found() {
-    let app = state(
-        ok_auth(),
-        Arc::new(StubDevices::default()),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, _) = call(app, "GET", "/Devices/Options?id=dev-1").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn update_device_options_captures_custom_name() {
-    let devices = Arc::new(StubDevices::default());
-    let captured = devices.clone();
-    let app = state(
-        ok_auth(),
-        devices,
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, _) = call_with_body(
-        app,
-        "POST",
-        "/Devices/Options?id=dev-1",
-        Body::from(r#"{"CustomName":"Den","DeviceId":"dev-1","Id":0}"#),
-        Some("application/json"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let updates = captured.updates.lock().unwrap();
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].0, "dev-1");
-    assert_eq!(updates[0].1.as_deref(), Some("Den"));
-}
-
-#[tokio::test]
-async fn delete_devices_success_and_unknown_is_bad_request() {
-    let devices = Arc::new(StubDevices {
-        known: vec![device("dev-1")],
-        ..Default::default()
-    });
-    let app = state(
-        ok_auth(),
-        devices,
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(FakeClientEventLogger),
-        Arc::new(FakeConfig),
-    );
-    let (status, _) = call(app.clone(), "DELETE", "/Devices?id=dev-1").await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-
-    // An unknown id fails the whole request.
-    let (status, _) = call(app, "DELETE", "/Devices?id=dev-1,ghost").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
 // ---- ApiKeys ---------------------------------------------------------------
 
 #[tokio::test]
@@ -589,80 +451,4 @@ async fn revoke_key_passes_token() {
     let (status, _) = call(app, "DELETE", "/Auth/Keys/tok-123").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(captured.deleted.lock().unwrap().as_slice(), &["tok-123"]);
-}
-
-// ---- ClientLog -------------------------------------------------------------
-
-#[tokio::test]
-async fn client_log_saves_document_and_returns_filename() {
-    let logger = Arc::new(StubClientLog::default());
-    let captured = logger.clone();
-    let app = state(
-        ok_auth(),
-        Arc::new(FakeDevices),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        logger,
-        Arc::new(StubConfig { allow_upload: true }),
-    );
-    let (status, body) = call_with_body(
-        app,
-        "POST",
-        "/ClientLog/Document",
-        Body::from("diagnostic contents"),
-        Some("text/plain"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["FileName"], "upload_saved.log");
-    let calls = captured.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, "Test Client");
-    assert_eq!(calls[0].1, "9.9.9");
-    assert_eq!(calls[0].2, b"diagnostic contents");
-}
-
-#[tokio::test]
-async fn client_log_uses_apikey_version_for_api_key_callers() {
-    let logger = Arc::new(StubClientLog::default());
-    let captured = logger.clone();
-    let app = state(
-        Arc::new(OkAuth { is_api_key: true }),
-        Arc::new(FakeDevices),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        logger,
-        Arc::new(StubConfig { allow_upload: true }),
-    );
-    let (status, _) = call_with_body(
-        app,
-        "POST",
-        "/ClientLog/Document",
-        Body::from("x"),
-        Some("text/plain"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(captured.calls.lock().unwrap()[0].1, "apikey");
-}
-
-#[tokio::test]
-async fn client_log_forbidden_when_upload_disabled() {
-    let app = state(
-        ok_auth(),
-        Arc::new(FakeDevices),
-        Arc::new(hermit_api::test_support::FakeApiKeys),
-        Arc::new(StubClientLog::default()),
-        Arc::new(StubConfig {
-            allow_upload: false,
-        }),
-    );
-    let (status, _) = call_with_body(
-        app,
-        "POST",
-        "/ClientLog/Document",
-        Body::from("x"),
-        Some("text/plain"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
 }

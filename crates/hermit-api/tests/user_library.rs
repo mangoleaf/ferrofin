@@ -1,5 +1,5 @@
-//! Batch-4 handler **success-path** tests: user library + user items +
-//! play-state flags.
+//! User-library integration tests: user data, favorites, rating, resume,
+//! user-scoped browse, user views, grouping options, and media folders.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
 //! stub `hermit-traits` impls that authenticate and return canned data, asserting
@@ -23,7 +23,9 @@ use hermit_api::test_support::{
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::BaseItemKind;
-use hermit_model::dto::{BaseItemDto, UpdateUserItemDataDto, UserItemDataDto};
+use hermit_model::dto::{
+    BaseItemDto, SpecialViewOptionDto, UpdateUserItemDataDto, UserItemDataDto,
+};
 use hermit_model::querying::QueryResult;
 use hermit_traits::dto::DtoService;
 use hermit_traits::error::ServiceError;
@@ -40,6 +42,8 @@ const ITEM_ID: Uuid = Uuid::from_u128(0xBEEF);
 const ROOT_ID: Uuid = Uuid::from_u128(0x0F00);
 const TRAILER_ID: Uuid = Uuid::from_u128(0xA1);
 const SPECIAL_ID: Uuid = Uuid::from_u128(0xA2);
+const SHOWS_ID: Uuid = Uuid::from_u128(0x101);
+const MOVIES_ID: Uuid = Uuid::from_u128(0x102);
 
 /// Builds a minimal [`UserEntity`] with the given id/name; neutral zero fields.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -424,17 +428,17 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`UserViewManager`] returning one view with one latest item.
+/// A [`UserViewManager`] returning two collection folders as the user's views,
+/// plus one latest row for the user-scoped-latest forwarding test.
 struct StubUserViews;
 
 #[async_trait]
 impl UserViewManager for StubUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(
-            ROOT_ID,
-            "Movies",
-            BaseItemKind::CollectionFolder,
-        )])
+        Ok(vec![
+            item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
+            item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
+        ])
     }
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         self.get_user_views(user_id).await
@@ -584,7 +588,7 @@ impl DtoService for OkDto {
     }
 }
 
-/// Builds an [`AppState`] wired with the batch-4 stubs.
+/// Builds an [`AppState`] wired with the user-library stubs.
 fn state() -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
@@ -727,72 +731,6 @@ async fn user_data_missing_item_is_404() {
 }
 
 #[tokio::test]
-async fn root_folder_returns_root() {
-    let (status, body) = send("GET", "/Items/Root", Body::empty()).await;
-    assert_eq!(status, StatusCode::OK);
-    let dto: BaseItemDto = serde_json::from_slice(&body).expect("dto");
-    assert_eq!(dto.id, ROOT_ID);
-}
-
-#[tokio::test]
-async fn local_trailers_returns_trailer_extra() {
-    let (status, body) = send(
-        "GET",
-        &format!("/Items/{ITEM_ID}/LocalTrailers"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
-    assert_eq!(dtos.len(), 1);
-    assert_eq!(dtos[0].id, TRAILER_ID);
-}
-
-#[tokio::test]
-async fn special_features_returns_display_extra() {
-    let (status, body) = send(
-        "GET",
-        &format!("/Items/{ITEM_ID}/SpecialFeatures"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
-    assert_eq!(dtos.len(), 1);
-    assert_eq!(dtos[0].id, SPECIAL_ID);
-}
-
-#[tokio::test]
-async fn intros_are_empty() {
-    let (status, body) = send("GET", &format!("/Items/{ITEM_ID}/Intros"), Body::empty()).await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
-}
-
-#[tokio::test]
-async fn critic_reviews_are_empty() {
-    let (status, body) = send(
-        "GET",
-        &format!("/Items/{ITEM_ID}/CriticReviews"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
-}
-
-#[tokio::test]
-async fn latest_returns_flattened_items() {
-    let (status, body) = send("GET", "/Items/Latest", Body::empty()).await;
-    assert_eq!(status, StatusCode::OK);
-    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
-    assert_eq!(dtos.len(), 1);
-    assert_eq!(dtos[0].id, ITEM_ID);
-}
-
-#[tokio::test]
 async fn resume_returns_in_progress_items() {
     let (status, body) = send("GET", "/UserItems/Resume", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
@@ -846,8 +784,8 @@ async fn user_scoped_item_forwards_to_get_item() {
 #[tokio::test]
 async fn routes_require_auth() {
     // The default `fake_state` uses the rejecting `FakeAuthService`, so a
-    // protected batch-4 route returns `401` (route exists, auth fails) rather
-    // than the `501` stub or a `404`.
+    // protected user-library route returns `401` (route exists, auth fails)
+    // rather than the `501` stub or a `404`.
     let router = create_router(hermit_api::test_support::fake_state());
     let response = router
         .oneshot(
@@ -860,4 +798,34 @@ async fn routes_require_auth() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn user_views_returns_query_result() {
+    let (status, body) = send("GET", "/UserViews", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.items[0].id, SHOWS_ID);
+}
+
+#[tokio::test]
+async fn grouping_options_returns_name_sorted_views() {
+    let (status, body) = send("GET", "/UserViews/GroupingOptions", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let opts: Vec<SpecialViewOptionDto> = serde_json::from_slice(&body).expect("options");
+    assert_eq!(opts.len(), 2);
+    // Name-sorted: Movies before Shows.
+    assert_eq!(opts[0].name.as_deref(), Some("Movies"));
+    assert_eq!(opts[1].name.as_deref(), Some("Shows"));
+    // Ids are dashless guids.
+    assert!(opts[0].id.as_deref().is_some_and(|i| !i.contains('-')));
+}
+
+#[tokio::test]
+async fn media_folders_returns_collection_folders() {
+    let (status, body) = send("GET", "/Library/MediaFolders", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
+    assert_eq!(result.items.len(), 2);
 }

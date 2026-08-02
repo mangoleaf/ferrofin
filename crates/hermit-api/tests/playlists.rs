@@ -1,10 +1,10 @@
-//! Batch-7 handler **success-path** tests: Playlists + Collections.
+//! Playlists handler tests: CRUD, items, and share management.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
 //! recording `hermit-traits` fakes that authenticate and capture the manager
 //! calls, asserting the wire status/body and the arguments handed to the
-//! [`PlaylistManager`]/[`CollectionManager`] seam. Managers a handler never
-//! touches reuse the `test_support` panic fakes, catching a handler that strays.
+//! [`PlaylistManager`] seam. Managers a handler never touches reuse the
+//! `test_support` panic fakes, catching a handler that strays.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -20,7 +20,6 @@ use hermit_api::test_support::{
 };
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
-use hermit_model::collections::CollectionCreationResult;
 use hermit_model::dto::{BaseItemDto, PlaylistDto};
 use hermit_model::playlists::{PlaylistCreationRequest, PlaylistCreationResult};
 use hermit_model::querying::QueryResult;
@@ -572,7 +571,6 @@ async fn send(app: AppState, method: &str, uri: &str, body: Body) -> (StatusCode
         .to_vec();
     (status, bytes)
 }
-
 #[tokio::test]
 async fn create_playlist_from_body_returns_id() {
     let pl = Arc::new(RecordingPlaylists::default());
@@ -739,56 +737,6 @@ async fn get_playlist_user_self_is_owner_equivalent() {
     assert_eq!(perm.user_id, USER_ID);
     assert!(perm.can_edit);
 }
-
-#[tokio::test]
-async fn create_collection_returns_id_and_seeds_caller() {
-    let col = Arc::new(RecordingCollections::default());
-    let app = state(Arc::new(RecordingPlaylists::default()), col.clone());
-    let (status, bytes) = send(
-        app,
-        "POST",
-        &format!("/Collections?name=Favourites&ids={ITEM_A}"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let result: CollectionCreationResult = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result.id, COLLECTION_ID);
-    let created = col.created.lock().unwrap().clone().expect("recorded");
-    assert_eq!(created.name, "Favourites");
-    assert_eq!(created.item_id_list, vec![ITEM_A]);
-    assert_eq!(created.user_ids, vec![USER_ID]);
-}
-
-#[tokio::test]
-async fn add_and_remove_collection_items_record_calls() {
-    let col = Arc::new(RecordingCollections::default());
-    let app = state(Arc::new(RecordingPlaylists::default()), col.clone());
-    let (add_status, _) = send(
-        app.clone(),
-        "POST",
-        &format!("/Collections/{COLLECTION_ID}/Items?ids={ITEM_A}"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(add_status, StatusCode::NO_CONTENT);
-    let (cid, ids) = col.added.lock().unwrap().clone().expect("added");
-    assert_eq!(cid, COLLECTION_ID);
-    assert_eq!(ids, vec![ITEM_A]);
-
-    let (del_status, _) = send(
-        app,
-        "DELETE",
-        &format!("/Collections/{COLLECTION_ID}/Items?ids={ITEM_B}"),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(del_status, StatusCode::NO_CONTENT);
-    let (cid, ids) = col.removed.lock().unwrap().clone().expect("removed");
-    assert_eq!(cid, COLLECTION_ID);
-    assert_eq!(ids, vec![ITEM_B]);
-}
-
 /// A [`RecordingPlaylists`] whose access probe reports the given level/flag.
 fn playlists_with_access(level: PlaylistAccessLevel, open_access: bool) -> Arc<RecordingPlaylists> {
     Arc::new(RecordingPlaylists {

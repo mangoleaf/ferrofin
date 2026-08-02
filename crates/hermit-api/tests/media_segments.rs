@@ -1,13 +1,11 @@
-//! Batch-11 handler success/failure-path tests: Subtitles + Lyrics +
-//! MediaSegments + Trickplay.
+//! Media segments handler tests: segment query/filtering + the Intro Skipper
+//! plugin SegmentEditor route.
 //!
 //! Each test drives one real handler through `tower::ServiceExt::oneshot` with
 //! stub `hermit-traits` impls that authenticate and return canned data. Managers
-//! a given handler never touches reuse the `test_support` panic fakes, catching a
-//! handler that strays. The trickplay tile route serves a real temp file so the
-//! `ServeFile` tail is covered.
+//! a given handler never touches reuse the `test_support` panic fakes.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -22,9 +20,7 @@ use hermit_api::test_support::{
 };
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
-use hermit_model::lyrics::{LyricDto, RemoteLyricInfoDto};
 use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
-use hermit_model::providers::RemoteSubtitleInfo;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryManager;
 use hermit_traits::media_segments::{MediaSegmentManager, MediaSegmentProviderInfo};
@@ -33,9 +29,8 @@ use hermit_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use hermit_traits::stubs::LyricManager;
-use hermit_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
+use hermit_traits::subtitles::SubtitleManager;
 use hermit_traits::trickplay::TrickplayManager;
-use std::collections::HashMap;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -312,163 +307,8 @@ impl MediaSegmentManager for OneSegment {
     }
 }
 
-/// A [`TrickplayManager`] returning a canned playlist + a caller-supplied tile
-/// path (so the file-serving tail can be exercised against a temp file).
-struct CannedTrickplay {
-    tile_path: Option<String>,
-}
-
-#[async_trait]
-impl TrickplayManager for CannedTrickplay {
-    async fn refresh_trickplay_data(
-        &self,
-        _item_id: Uuid,
-        _replace: bool,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn get_trickplay_resolutions(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<HashMap<i32, hermit_db::entities::playback::TrickplayInfoEntity>, ServiceError>
-    {
-        Ok(HashMap::new())
-    }
-    async fn get_trickplay_items(
-        &self,
-        _limit: i32,
-        _offset: i32,
-    ) -> Result<Vec<hermit_db::entities::playback::TrickplayInfoEntity>, ServiceError> {
-        Ok(Vec::new())
-    }
-    async fn save_trickplay_info(
-        &self,
-        _info: &hermit_db::entities::playback::TrickplayInfoEntity,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn get_trickplay_manifest(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<
-        HashMap<String, HashMap<i32, hermit_db::entities::playback::TrickplayInfoEntity>>,
-        ServiceError,
-    > {
-        Ok(HashMap::new())
-    }
-    async fn get_hls_playlist(
-        &self,
-        _item_id: Uuid,
-        width: i32,
-        _api_key: Option<&str>,
-    ) -> Result<Option<String>, ServiceError> {
-        // Width 320 has a playlist; anything else does not.
-        if width == 320 {
-            Ok(Some(
-                "#EXTM3U\n#EXT-X-IMAGES-ONLY\n#EXT-X-ENDLIST\n".to_owned(),
-            ))
-        } else {
-            Ok(None)
-        }
-    }
-    async fn get_trickplay_tile_path(
-        &self,
-        _item_id: Uuid,
-        _width: i32,
-        _index: i32,
-    ) -> Result<Option<String>, ServiceError> {
-        Ok(self.tile_path.clone())
-    }
-}
-
-/// A [`LyricManager`] whose stored lyrics / mutation results are configurable.
-struct CannedLyrics {
-    stored: Option<LyricDto>,
-    deleted: Arc<Mutex<bool>>,
-}
-
-#[async_trait]
-impl LyricManager for CannedLyrics {
-    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
-        Ok(self.stored.clone())
-    }
-    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
-        Ok(Vec::new())
-    }
-    async fn download_lyrics(
-        &self,
-        _item_id: Uuid,
-        _lyric_id: &str,
-    ) -> Result<Option<LyricDto>, ServiceError> {
-        Ok(None)
-    }
-    async fn save_lyric(
-        &self,
-        _item_id: Uuid,
-        _format: &str,
-        _lyrics: &str,
-    ) -> Result<Option<LyricDto>, ServiceError> {
-        Ok(None)
-    }
-    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
-        *self.deleted.lock().unwrap() = true;
-        Ok(())
-    }
-    async fn get_supported_providers(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Vec<hermit_model::providers::LyricProviderInfo>, ServiceError> {
-        Ok(Vec::new())
-    }
-}
-
-/// A [`SubtitleManager`] recording deletes and returning empty search results.
-struct CannedSubtitles {
-    deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
-}
-
-#[async_trait]
-impl SubtitleManager for CannedSubtitles {
-    async fn search_subtitles(
-        &self,
-        _request: &SubtitleSearchRequest,
-    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
-        Ok(Vec::new())
-    }
-    async fn download_subtitles(
-        &self,
-        _item_id: Uuid,
-        _subtitle_id: &str,
-    ) -> Result<(), ServiceError> {
-        Err(ServiceError::invalid_input("no providers"))
-    }
-    async fn upload_subtitle(
-        &self,
-        _item_id: Uuid,
-        _response: &SubtitleResponse,
-    ) -> Result<(), ServiceError> {
-        Err(ServiceError::invalid_input("no providers"))
-    }
-    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
-        Err(ServiceError::invalid_input("no providers"))
-    }
-    async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
-        self.deleted.lock().unwrap().push((item_id, index));
-        Ok(())
-    }
-    async fn get_supported_providers(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Vec<hermit_model::providers::SubtitleProviderInfo>, ServiceError> {
-        Ok(Vec::new())
-    }
-}
-
-/// Builds an [`AppState`] over the batch-11 managers, defaulting the untouched
-/// ones to the shared panic fakes.
+/// Builds an [`AppState`] over the media-segment manager, defaulting the
+/// untouched ones to the shared panic fakes.
 #[allow(clippy::too_many_arguments)]
 fn state(
     segments: Arc<dyn MediaSegmentManager>,
@@ -542,8 +382,6 @@ async fn call_with_body(
         .to_vec();
     (status, bytes)
 }
-
-// ---- MediaSegments ---------------------------------------------------------
 
 #[tokio::test]
 async fn media_segments_returns_query_result() {
@@ -619,226 +457,6 @@ async fn media_segments_missing_item_is_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
-
-// ---- Trickplay -------------------------------------------------------------
-
-#[tokio::test]
-async fn trickplay_playlist_ok_and_not_found() {
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(CannedTrickplay { tile_path: None }),
-        Arc::new(FakeLyrics),
-        Arc::new(FakeSubtitles),
-    );
-    let (ok, body) = call(
-        app.clone(),
-        "GET",
-        &format!("/Videos/{ITEM_ID}/Trickplay/320/tiles.m3u8"),
-    )
-    .await;
-    assert_eq!(ok, StatusCode::OK);
-    assert!(String::from_utf8_lossy(&body).contains("#EXTM3U"));
-
-    let (missing, _) = call(
-        app,
-        "GET",
-        &format!("/Videos/{ITEM_ID}/Trickplay/999/tiles.m3u8"),
-    )
-    .await;
-    assert_eq!(missing, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn trickplay_tile_serves_file_then_404() {
-    // A real temp tile file so the ServeFile tail runs.
-    let mut path = std::env::temp_dir();
-    path.push(format!("hermit-tile-{}.jpg", Uuid::new_v4()));
-    std::fs::write(&path, b"\xff\xd8\xff\xe0JFIF-ish").expect("write tile");
-
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(CannedTrickplay {
-            tile_path: Some(path.to_string_lossy().into_owned()),
-        }),
-        Arc::new(FakeLyrics),
-        Arc::new(FakeSubtitles),
-    );
-    let (ok, body) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
-    assert_eq!(ok, StatusCode::OK);
-    assert!(body.starts_with(&[0xff, 0xd8]));
-    std::fs::remove_file(&path).ok();
-
-    // No tile path resolved → 404.
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(CannedTrickplay { tile_path: None }),
-        Arc::new(FakeLyrics),
-        Arc::new(FakeSubtitles),
-    );
-    let (missing, _) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
-    assert_eq!(missing, StatusCode::NOT_FOUND);
-}
-
-// ---- Lyrics ----------------------------------------------------------------
-
-#[tokio::test]
-async fn lyrics_get_returns_stored_or_404() {
-    let mut dto = LyricDto::default();
-    dto.lyrics.push(hermit_model::lyrics::LyricLine {
-        text: "la la la".to_owned(),
-        start: Some(0),
-        cues: None,
-    });
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(CannedLyrics {
-            stored: Some(dto),
-            deleted: Arc::new(Mutex::new(false)),
-        }),
-        Arc::new(FakeSubtitles),
-    );
-    let (ok, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
-    assert_eq!(ok, StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(v["Lyrics"][0]["Text"], "la la la");
-
-    // No stored lyrics → 404.
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(CannedLyrics {
-            stored: None,
-            deleted: Arc::new(Mutex::new(false)),
-        }),
-        Arc::new(FakeSubtitles),
-    );
-    let (missing, _) = call(app, "GET", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
-    assert_eq!(missing, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn lyrics_delete_is_204_and_calls_manager() {
-    let deleted = Arc::new(Mutex::new(false));
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(CannedLyrics {
-            stored: None,
-            deleted: deleted.clone(),
-        }),
-        Arc::new(FakeSubtitles),
-    );
-    let (status, _) = call(app, "DELETE", &format!("/Audio/{ITEM_ID}/Lyrics")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(*deleted.lock().unwrap());
-}
-
-#[tokio::test]
-async fn lyrics_remote_search_is_empty_list() {
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(CannedLyrics {
-            stored: None,
-            deleted: Arc::new(Mutex::new(false)),
-        }),
-        Arc::new(FakeSubtitles),
-    );
-    let (status, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics")).await;
-    assert_eq!(status, StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v.as_array().unwrap().is_empty());
-}
-
-// ---- Subtitles -------------------------------------------------------------
-
-#[tokio::test]
-async fn subtitle_delete_records_and_204() {
-    let deleted = Arc::new(Mutex::new(Vec::new()));
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(FakeLyrics),
-        Arc::new(CannedSubtitles {
-            deleted: deleted.clone(),
-        }),
-    );
-    let (status, _) = call(app, "DELETE", &format!("/Videos/{ITEM_ID}/Subtitles/3")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(*deleted.lock().unwrap(), vec![(ITEM_ID, 3)]);
-}
-
-#[tokio::test]
-async fn subtitle_delete_missing_item_404() {
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(FakeLyrics),
-        Arc::new(CannedSubtitles {
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
-    let (status, _) = call(
-        app,
-        "DELETE",
-        &format!("/Videos/{}/Subtitles/0", Uuid::from_u128(7)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn subtitle_remote_search_is_empty_list() {
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(FakeLyrics),
-        Arc::new(CannedSubtitles {
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
-    let (status, body) = call(
-        app,
-        "GET",
-        &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v.as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn subtitle_upload_bad_base64_is_400() {
-    let app = state(
-        Arc::new(FakeMediaSegments),
-        Arc::new(FakeTrickplay),
-        Arc::new(FakeLyrics),
-        Arc::new(CannedSubtitles {
-            deleted: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
-    let body = serde_json::json!({
-        "Language": "eng",
-        "Format": "srt",
-        "IsForced": false,
-        "IsHearingImpaired": false,
-        "Data": "!!!not-base64!!!"
-    })
-    .to_string();
-    let (status, _) = call_with_body(
-        app,
-        "POST",
-        &format!("/Videos/{ITEM_ID}/Subtitles"),
-        Body::from(body),
-        Some("application/json"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-// ---- The Intro Skipper plugin SegmentEditor route is now implemented --------
 
 #[tokio::test]
 async fn plugin_segment_editor_route_is_implemented() {
