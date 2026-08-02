@@ -92,6 +92,21 @@ create-release:
       git push origin "HEAD:${CI_DEFAULT_BRANCH}"
       git push origin "$NEW"
       echo "Pushed release commit + ${NEW}; the tag pipeline builds and publishes."
+      # This commit is now being released, so the tag pipeline will build the
+      # release image — cancel THIS main pipeline's now-redundant dev image build
+      # (docker-image is still pending: it's in a later stage than this one).
+      # Best-effort: never fail the release over the cleanup. Needs RELEASE_TOKEN
+      # to have the `api` scope; without it the cancel just no-ops.
+      apk add --no-cache curl jq >/dev/null 2>&1 || true
+      API="$CI_API_V4_URL/projects/$CI_PROJECT_ID"
+      JOB_ID=$(curl -sf --header "PRIVATE-TOKEN: ${RELEASE_TOKEN}" "$API/pipelines/$CI_PIPELINE_ID/jobs?per_page=100" 2>/dev/null | jq -r '.[] | select(.name=="docker-image") | .id' | sed -n 1p || true)
+      if [ -n "${JOB_ID:-}" ]; then
+        echo "Cancelling redundant docker-image job ${JOB_ID} in pipeline ${CI_PIPELINE_ID}"
+        curl -sf --request POST --header "PRIVATE-TOKEN: ${RELEASE_TOKEN}" "$API/jobs/$JOB_ID/cancel" >/dev/null 2>&1 \
+          || echo "  cancel failed (grant RELEASE_TOKEN the api scope to enable this) — non-fatal"
+      else
+        echo "No docker-image job in this pipeline to cancel."
+      fi
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
