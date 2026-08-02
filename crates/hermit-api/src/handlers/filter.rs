@@ -5,23 +5,18 @@
 //! - `GET /Items/Filters`  — the legacy flat-string facets ([`QueryFiltersLegacy`]:
 //!   genres, tags, official ratings, years) aggregated over a parent's items.
 //! - `GET /Items/Filters2` — the richer facets ([`QueryFilters`]: genre
-//!   name/id pairs plus audio/subtitle languages) for a query.
+//!   name/id pairs plus tags) for a query.
 //!
 //! Both endpoints scope to an optional parent and honor the `includeItemTypes`
 //! restriction (a lone `Trailer`/`Program` type skips the parent lookup, exactly
 //! as Jellyfin does). The genre facet dispatches to the music-genre aggregate for
-//! a music-only type set and to the plain-genre aggregate otherwise; the language
-//! facets read the matching items' media-stream languages. The localization
-//! embellishment of a language's display name (Jellyfin's
-//! `ILocalizationManager.FindLanguageInfo`) is not applied here — the localization
-//! manager is not part of `AppState` — so a language's `Name` is its code.
+//! a music-only type set and to the plain-genre aggregate otherwise.
 
 use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use hermit_model::data::{BaseItemKind, MediaType};
-use hermit_model::dto::{NameGuidPair, NameValuePair};
-use hermit_model::entities::MediaStreamType;
+use hermit_model::dto::NameGuidPair;
 use hermit_model::querying::{QueryFilters, QueryFiltersLegacy};
 use hermit_traits::options::InternalItemsQuery;
 use uuid::Uuid;
@@ -149,36 +144,10 @@ fn is_music_type_set(types: &[BaseItemKind]) -> bool {
         )
 }
 
-/// Whether the type set contains any of the video kinds that carry
-/// audio/subtitle language facets (Movie/Series/Season/Episode).
-fn has_language_facets(types: &[BaseItemKind]) -> bool {
-    types.iter().any(|t| {
-        matches!(
-            t,
-            BaseItemKind::Movie
-                | BaseItemKind::Series
-                | BaseItemKind::Season
-                | BaseItemKind::Episode
-        )
-    })
-}
-
-/// Maps distinct language codes to sorted [`NameValuePair`]s. Jellyfin embellishes
-/// the name via localization; without the localization manager the name is the
-/// code itself.
-fn language_pairs(mut languages: Vec<String>) -> Vec<NameValuePair> {
-    languages.sort_unstable();
-    languages
-        .into_iter()
-        .map(|language| NameValuePair::new(language.clone(), language))
-        .collect()
-}
-
-/// `GET /Items/Filters2` — the richer genre + language filter facets.
+/// `GET /Items/Filters2` — the richer genre filter facets.
 ///
 /// Port of `FilterController.GetQueryFilters`. The genre facet routes to the
-/// music-genre aggregate for a music-only type set, and the audio/subtitle
-/// language facets are read for a video type set.
+/// music-genre aggregate for a music-only type set.
 #[utoipa::path(
     get,
     path = "/Items/Filters2",
@@ -203,23 +172,24 @@ async fn get_query_filters(
         ancestor_ids.push(parent);
     }
 
+    let is_music = is_music_type_set(&include_item_types);
     let base = InternalItemsQuery {
-        user: user.clone(),
-        include_item_types: include_item_types.clone(),
+        user,
+        include_item_types,
         is_airing: query.is_airing,
         is_movie: query.is_movie,
         is_sports: query.is_sports,
         is_kids: query.is_kids,
         is_news: query.is_news,
         is_series: query.is_series,
-        ancestor_ids: ancestor_ids.clone(),
+        ancestor_ids,
         ..InternalItemsQuery::default()
     };
 
     let mut filters = QueryFilters::default();
 
     // Genre facet: music-genre aggregate for a music-only type set, else genres.
-    let genre_result = if is_music_type_set(&include_item_types) {
+    let genre_result = if is_music {
         state.library.get_music_genres(&base).await?
     } else {
         state.library.get_genres(&base).await?
@@ -232,37 +202,6 @@ async fn get_query_filters(
             id: Uuid::parse_str(&iwc.item.id).unwrap_or_else(|_| Uuid::nil()),
         })
         .collect();
-
-    // Language facets apply only to the video type set. Streams join on episodes,
-    // so a Series/Season set is widened to include Episode (as in C#), and owned
-    // items are included since alternative versions may carry other languages.
-    if has_language_facets(&include_item_types) {
-        let mut language_types = include_item_types.clone();
-        if (language_types.contains(&BaseItemKind::Series)
-            || language_types.contains(&BaseItemKind::Season))
-            && !language_types.contains(&BaseItemKind::Episode)
-        {
-            language_types.push(BaseItemKind::Episode);
-        }
-        let language_query = InternalItemsQuery {
-            include_owned_items: true,
-            include_item_types: language_types,
-            ..base.clone()
-        };
-        // Audio + subtitle in one pass: the item set is materialized once, not
-        // per type (Jellyfin reads both facets from the same query).
-        let mut langs = state
-            .library
-            .get_media_stream_languages_by_type(
-                &[MediaStreamType::Audio, MediaStreamType::Subtitle],
-                &language_query,
-            )
-            .await?;
-        filters.audio_languages =
-            language_pairs(langs.remove(&MediaStreamType::Audio).unwrap_or_default());
-        filters.subtitle_languages =
-            language_pairs(langs.remove(&MediaStreamType::Subtitle).unwrap_or_default());
-    }
 
     Ok(Json(filters))
 }

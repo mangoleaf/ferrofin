@@ -378,6 +378,10 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
                 item_id: Self::collection_folder_id(&path).map(|g| g.to_string()),
+                // Jellyfin always reports a non-null refresh status; at rest it is
+                // "Idle" (it becomes "Queued"/"Active" only while a scan is running,
+                // which this manager does not track).
+                refresh_status: Some("Idle".to_string()),
                 ..VirtualFolderInfo::default()
             });
         }
@@ -638,6 +642,9 @@ mod tests {
 
         let folders = mgr.get_virtual_folders().await.expect("get");
         let item_id = folders[0].item_id.clone().expect("ItemId projected");
+
+        // Jellyfin always emits a non-null RefreshStatus; at rest it is "Idle".
+        assert_eq!(folders[0].refresh_status.as_deref(), Some("Idle"));
 
         // The persisted CollectionFolder row exists with the projected id.
         let (type_, is_folder): (String, bool) =

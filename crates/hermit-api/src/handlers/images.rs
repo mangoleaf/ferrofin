@@ -409,7 +409,9 @@ async fn get_item_image_infos(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let images = state.library.get_item_images(item_id).await?;
-    Ok(axum::Json(project_image_infos(&images)))
+    Ok(axum::Json(
+        project_image_infos(&images, state.image_processor.as_deref(), item_id).await,
+    ))
 }
 
 /// Projects an item's image rows into the [`ImageInfo`] list the API returns.
@@ -418,11 +420,15 @@ async fn get_item_image_infos(
 /// index; multi-instance types are numbered from `0` in stored order, matching
 /// Jellyfin's `GetItemImageInfos` two-pass grouping. Width/height of `0` (the
 /// "unknown" sentinel) are nulled out, as in `GetImageInfo`.
-fn project_image_infos(images: &[ItemImageInfo]) -> Vec<ImageInfo> {
+async fn project_image_infos(
+    images: &[ItemImageInfo],
+    processor: Option<&dyn hermit_traits::drawing::ImageProcessor>,
+    item_id: Uuid,
+) -> Vec<ImageInfo> {
     let mut list = Vec::with_capacity(images.len());
     for image in images {
         if !allows_multiple_images(image.image_type) {
-            list.push(image_info_dto(image, None));
+            list.push(image_info_dto(image, None, processor, item_id).await);
         }
     }
     for multi_type in [ImageType::Backdrop, ImageType::Chapter] {
@@ -431,10 +437,15 @@ fn project_image_infos(images: &[ItemImageInfo]) -> Vec<ImageInfo> {
             .filter(|i| i.image_type == multi_type)
             .enumerate()
         {
-            list.push(image_info_dto(
-                image,
-                Some(i32::try_from(index).unwrap_or(0)),
-            ));
+            list.push(
+                image_info_dto(
+                    image,
+                    Some(i32::try_from(index).unwrap_or(0)),
+                    processor,
+                    item_id,
+                )
+                .await,
+            );
         }
     }
     list
@@ -449,7 +460,17 @@ fn allows_multiple_images(image_type: ImageType) -> bool {
 }
 
 /// Builds one [`ImageInfo`] DTO from an image row and its optional index.
-fn image_info_dto(image: &ItemImageInfo, image_index: Option<i32>) -> ImageInfo {
+///
+/// When an [`ImageProcessor`](hermit_traits::drawing::ImageProcessor) is present
+/// the cache tag (md5 of path + mtime ticks) is computed exactly as
+/// `DtoService` does for `ImageTags`; processor failures are tolerated
+/// (logged-and-skipped in C#) and a `None` tag is emitted.
+async fn image_info_dto(
+    image: &ItemImageInfo,
+    image_index: Option<i32>,
+    processor: Option<&dyn hermit_traits::drawing::ImageProcessor>,
+    item_id: Uuid,
+) -> ImageInfo {
     let (width, height) = if image.width > 0 && image.height > 0 {
         (Some(image.width), Some(image.height))
     } else {
@@ -465,12 +486,18 @@ fn image_info_dto(image: &ItemImageInfo, image_index: Option<i32>) -> ImageInfo 
     } else {
         0
     };
+    let image_tag = match processor {
+        Some(processor) => processor
+            .get_image_cache_tag(item_id, image)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     ImageInfo {
         image_type: image.image_type,
         image_index,
-        // The cache tag is computed by the image processor (not yet ported); the
-        // stored path already lets a client key its cache, so the tag is omitted.
-        image_tag: None,
+        image_tag,
         path: Some(image.path.clone()),
         blur_hash: image.blur_hash.clone(),
         height,
@@ -998,23 +1025,175 @@ mod tests {
         }
     }
 
-    #[test]
-    fn image_info_size_is_file_length_for_local_files() {
+    /// A minimal [`ImageProcessor`] that computes the real cache tag
+    /// (`md5(path + dotnet-ticks)` as 32-char lowercase hex), mirroring the
+    /// concrete `hermit-drawing` processor `DtoService` uses for `ImageTags`.
+    struct TagProcessor;
+
+    #[async_trait::async_trait]
+    impl hermit_traits::drawing::ImageProcessor for TagProcessor {
+        fn supports_image_collage_creation(&self) -> bool {
+            false
+        }
+
+        fn supported_image_output_formats(&self) -> Vec<hermit_model::drawing::ImageFormat> {
+            Vec::new()
+        }
+
+        fn supported_input_formats(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn get_image_dimensions(
+            &self,
+            _path: &str,
+        ) -> Result<hermit_model::drawing::ImageDimensions, hermit_traits::error::ServiceError>
+        {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+
+        async fn get_item_image_dimensions(
+            &self,
+            _item_id: Uuid,
+            _info: &ItemImageInfo,
+        ) -> Result<hermit_model::drawing::ImageDimensions, hermit_traits::error::ServiceError>
+        {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+
+        async fn create_image_collage(
+            &self,
+            _options: &hermit_traits::options::ImageCollageOptions,
+            _library_name: Option<&str>,
+        ) -> Result<(), hermit_traits::error::ServiceError> {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+
+        async fn get_image_cache_tag(
+            &self,
+            _item_id: Uuid,
+            image: &ItemImageInfo,
+        ) -> Result<Option<String>, hermit_traits::error::ServiceError> {
+            // .NET ticks: 100-ns intervals since 0001-01-01, offset from the Unix epoch.
+            const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+            let ticks = UNIX_EPOCH_TICKS
+                + image.date_modified.timestamp() * 10_000_000
+                + i64::from(image.date_modified.timestamp_subsec_nanos()) / 100;
+            let key = format!("{}{ticks}", image.path);
+            Ok(Some(
+                hermit_common::extensions::get_md5(&key)
+                    .simple()
+                    .to_string(),
+            ))
+        }
+
+        async fn get_image_cache_tag_for_path(
+            &self,
+            _base_item_path: &str,
+            _image_date_modified: chrono::DateTime<Utc>,
+        ) -> Result<Option<String>, hermit_traits::error::ServiceError> {
+            Ok(None)
+        }
+
+        async fn process_image(
+            &self,
+            _options: &hermit_traits::options::ImageProcessingOptions,
+        ) -> Result<hermit_traits::drawing::ProcessedImage, hermit_traits::error::ServiceError>
+        {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+
+        async fn get_image_blur_hash(
+            &self,
+            _path: &str,
+        ) -> Result<String, hermit_traits::error::ServiceError> {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+
+        async fn get_image_blur_hash_sized(
+            &self,
+            _path: &str,
+            _image_dimensions: hermit_model::drawing::ImageDimensions,
+        ) -> Result<String, hermit_traits::error::ServiceError> {
+            Err(hermit_traits::error::ServiceError::NotFound(
+                "unused".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn image_info_emits_cache_tag_when_processor_present() {
+        // Parity: ImageTag is the processor's cache tag (32-char lowercase md5 hex),
+        // not hardcoded None. A local image with a processor must be tagged.
+        let processor = TagProcessor;
+        let dto = image_info_dto(
+            &img("/media/movie/poster.jpg".into()),
+            None,
+            Some(&processor),
+            Uuid::nil(),
+        )
+        .await;
+        let tag = dto.image_tag.expect("processor must produce a tag");
+        assert_eq!(tag.len(), 32, "cache tag is 32-char hex: {tag}");
+        assert!(
+            tag.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "cache tag is lowercase hex: {tag}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_info_tag_is_none_without_processor() {
+        let dto = image_info_dto(
+            &img("/media/movie/poster.jpg".into()),
+            None,
+            None,
+            Uuid::nil(),
+        )
+        .await;
+        assert!(dto.image_tag.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_info_size_is_file_length_for_local_files() {
         // Regression (parity): Size was hardcoded to 0; Jellyfin reports the on-disk length.
         let dir = std::env::temp_dir().join(format!("hermit-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("poster.jpg");
         std::fs::write(&file, b"0123456789").unwrap(); // 10 bytes
-        let dto = image_info_dto(&img(file.to_string_lossy().into_owned()), None);
+        let dto = image_info_dto(
+            &img(file.to_string_lossy().into_owned()),
+            None,
+            None,
+            Uuid::nil(),
+        )
+        .await;
         assert_eq!(dto.size, 10);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn image_info_size_is_zero_for_remote_or_missing() {
-        assert_eq!(image_info_dto(&img("https://x/y.jpg".into()), None).size, 0);
+    #[tokio::test]
+    async fn image_info_size_is_zero_for_remote_or_missing() {
         assert_eq!(
-            image_info_dto(&img("/no/such/file.jpg".into()), None).size,
+            image_info_dto(&img("https://x/y.jpg".into()), None, None, Uuid::nil())
+                .await
+                .size,
+            0
+        );
+        assert_eq!(
+            image_info_dto(&img("/no/such/file.jpg".into()), None, None, Uuid::nil())
+                .await
+                .size,
             0
         );
     }

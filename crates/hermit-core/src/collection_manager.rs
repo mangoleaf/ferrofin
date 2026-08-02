@@ -550,14 +550,21 @@ impl PlaylistManager for HermitPlaylistManager {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), ServiceError> {
-        // Entry ids are approximated by the child item id (see module docs).
+        // Entry ids are approximated by the child item id (see module docs). The
+        // wire form is a dashless `Guid('N')` (`GetPlaylistItems` emits
+        // `item.id.replace('-', "")`), but `ChildId` is stored dashed. Parse and
+        // re-`to_string()` to normalise back to the stored dashed form; skip any
+        // entry id that isn't a valid GUID.
         for entry_id in entry_ids {
+            let Ok(child) = Uuid::parse_str(entry_id) else {
+                continue;
+            };
             sqlx::query(
                 r#"DELETE FROM "LinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(playlist_id)
-            .bind(entry_id)
+            .bind(child.to_string())
             .execute(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -586,7 +593,14 @@ impl PlaylistManager for HermitPlaylistManager {
         .await
         .map_err(db_err)?;
 
-        let Some(pos) = order.iter().position(|c| c == entry_id) else {
+        // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored dashed.
+        // Normalise before locating the entry position (see
+        // `remove_item_from_playlist`).
+        let Ok(child_id) = Uuid::parse_str(entry_id) else {
+            return Ok(()); // not a GUID — nothing to move
+        };
+        let needle = child_id.to_string();
+        let Some(pos) = order.iter().position(|c| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
         let child = order.remove(pos);
@@ -779,6 +793,56 @@ mod tests {
         let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
         assert!(ids.contains(&track_a.to_string()));
         assert!(ids.contains(&track_b.to_string()));
+    }
+
+    #[tokio::test]
+    async fn remove_by_dashless_playlist_item_id_removes_member() {
+        // `GetPlaylistItems` emits `PlaylistItemId` dashless (`Guid('N')`), but
+        // `ChildId` is stored dashed. Removing by the dashless id the DTO exposes
+        // must still hit the row (regression: it matched zero rows before).
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        // Read the entry id exactly as the wire DTO exposes it: dashless.
+        let items = mgr
+            .get_playlist_items(playlist_id, owner)
+            .await
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        let dashless = items[0].id.replace('-', "");
+        assert!(!dashless.contains('-'));
+
+        mgr.remove_item_from_playlist(&created.id, &[dashless])
+            .await
+            .expect("remove");
+
+        let after = mgr
+            .get_playlist_items(playlist_id, owner)
+            .await
+            .expect("items after");
+        assert!(
+            after.is_empty(),
+            "removing by dashless PlaylistItemId should empty the playlist"
+        );
     }
 
     #[tokio::test]

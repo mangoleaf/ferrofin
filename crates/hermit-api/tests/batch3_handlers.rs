@@ -663,7 +663,7 @@ async fn items_filters_returns_legacy_facets() {
 }
 
 #[tokio::test]
-async fn items_filters2_returns_genre_and_language_facets() {
+async fn items_filters2_returns_genre_facets() {
     let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
     assert_eq!(status, StatusCode::OK);
     let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
@@ -674,20 +674,16 @@ async fn items_filters2_returns_genre_and_language_facets() {
             id: Uuid::from_u128(0x21),
         }]
     );
-    // Audio languages sort ascending (deu before eng); subtitles carry fra.
-    let audio: Vec<_> = filters
-        .audio_languages
-        .iter()
-        .filter_map(|p| p.value.clone())
+    // The response schema is exactly {Genres, Tags} (Jellyfin's QueryFilters):
+    // no fabricated audio/subtitle language facets leak into the body.
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let keys: Vec<&str> = value
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
         .collect();
-    assert_eq!(audio, vec!["deu".to_owned(), "eng".to_owned()]);
-    assert_eq!(
-        filters
-            .subtitle_languages
-            .first()
-            .and_then(|p| p.value.clone()),
-        Some("fra".to_owned())
-    );
+    assert_eq!(keys, vec!["Genres", "Tags"]);
 }
 
 #[tokio::test]
@@ -699,8 +695,6 @@ async fn items_filters2_music_type_uses_music_genres() {
         filters.genres.first().and_then(|p| p.name.clone()),
         Some("Jazz".to_owned())
     );
-    // No video kinds → no language facets.
-    assert!(filters.audio_languages.is_empty());
 }
 
 #[tokio::test]
