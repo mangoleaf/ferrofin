@@ -456,7 +456,17 @@ impl MediaSourceManager for HermitMediaSourceManager {
             return self.channel_media_source(item_id).await;
         };
         let streams = self.streams_dto(item_id).await?;
-        Ok(vec![Self::static_source(&item, streams)])
+        let mut sources = vec![Self::static_source(&item, streams)];
+        // Append merged alternate versions' sources (C# GetStaticMediaSources includes the item's
+        // LinkedAlternateVersions). After MergeVersions the alternates point at this item via
+        // PrimaryVersionId, so a merged item reports all its versions as selectable sources.
+        for alt in self.items.get_items_by_primary_version(item_id).await? {
+            if let Ok(alt_id) = Uuid::parse_str(&alt.id) {
+                let alt_streams = self.streams_dto(alt_id).await?;
+                sources.push(Self::static_source(&alt, alt_streams));
+            }
+        }
+        Ok(sources)
     }
 
     async fn open_live_stream(
