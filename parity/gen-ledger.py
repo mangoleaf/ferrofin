@@ -182,6 +182,7 @@ def build_curated():
     seed, seed_stamp = load_seed()
     reads, r_stamp = load_layer2("parity/reads-results.json")
     journeys, j_stamp = load_layer2("parity/journey-results.json")
+    accepted, a_stamp = load_layer2("parity/classifications.json")
     # Precedence: static seed < live read diff < write journeys (later, more authoritative wins).
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
     for k, v in reads.items():
@@ -189,6 +190,15 @@ def build_curated():
             curated[k] = {**v, "last_verified": r_stamp}
     for k, v in journeys.items():
         curated[k] = {**v, "last_verified": j_stamp}
+    # Curated accepted-divergence classifications win the classification field over the auto
+    # "flagged: verify" text (human decision > detector). deep_verified stays as the live layer
+    # reported it (these diverge by design and are not deep-verified); a row not otherwise present
+    # is created as a classified (non-verified) divergence so it counts, not "untested".
+    for k, v in accepted.items():
+        row = curated.get(k, {"deep_verified": None})
+        row["classification"] = v["classification"]
+        row["last_verified"] = a_stamp
+        curated[k] = row
     return curated
 
 

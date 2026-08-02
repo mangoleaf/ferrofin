@@ -1,0 +1,16 @@
+{
+  "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
+  "last_verified": "af3dda1 2026-08-01",
+  "rows": {
+    "GET /IntroSkipper/SupportBundle": {"category": "expected-extension", "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design."},
+    "GET /Items/Suggestions": {"category": "instance", "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."},
+    "GET /Items/{itemId}/Ancestors": {"category": "instance", "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope)."},
+    "GET /Items/{itemId}/Similar": {"category": "deferred", "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak)."},
+    "GET /Movies/{itemId}/Similar": {"category": "deferred", "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar."},
+    "GET /Movies/Recommendations": {"category": "deferred", "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."},
+    "GET /Search/Hints": {"category": "deferred", "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>."},
+    "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {"category": "deferred", "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision."},
+    "GET /UserViews": {"category": "instance", "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."},
+    "GET /Library/MediaFolders": {"category": "instance", "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."}
+  }
+}

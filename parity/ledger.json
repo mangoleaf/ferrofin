@@ -945,8 +945,8 @@
       "schema_valid": false,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Intros/AnalyzerActions/UpdateSeason",
@@ -1257,8 +1257,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Items/{itemId}",
@@ -1305,8 +1305,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/{itemId}/ContentType",
@@ -1665,8 +1665,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/SpecialFeatures",
@@ -1761,8 +1761,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Library/Movies/Added",
@@ -2085,8 +2085,8 @@
       "schema_valid": false,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/LiveRecordings/{recordingId}/stream",
@@ -2601,8 +2601,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Movies/{itemId}/Similar",
@@ -2613,8 +2613,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /MusicGenres",
@@ -3297,8 +3297,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Sessions",
@@ -4437,8 +4437,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "f383a85 2026-08-01"
+      "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /UserViews/GroupingOptions",
