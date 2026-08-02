@@ -101,8 +101,14 @@ create-release:
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
 # built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.97.0. The lint and
 # coverage jobs use it as their `image:` so they don't reinstall tools every run.
-# Rebuilds automatically when ci/Dockerfile changes on main; otherwise run it
-# manually to refresh. Lives in .pre so it publishes before the test stage.
+# Rebuilds automatically when ci/Dockerfile changes on main; force a rebuild
+# otherwise by running a pipeline with REBUILD_CI_IMAGE set. Lives in .pre so it
+# publishes before the test stage.
+#
+# IMPORTANT: this job must be ABSENT from a pipeline when it shouldn't build — NOT
+# present-as-manual. lint/coverage carry an optional `needs: ci-image`, and an
+# optional need is only ignored when the job is absent; a present-but-unplayed
+# manual job would instead skip lint/coverage. So there is no `when: manual` rule.
 # ---------------------------------------------------------------------------
 ci-image:
   stage: .pre
@@ -126,9 +132,7 @@ ci-image:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - ci/Dockerfile
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-      allow_failure: true
+    - if: '$REBUILD_CI_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
 # sccache — compile cache backed by Garage S3, replacing GitLab's cache: (which
