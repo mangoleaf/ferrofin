@@ -304,15 +304,43 @@ impl ItemCountService for HermitItemCountService {
         parent_ids: &[Uuid],
         _user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
+        // `BaseItems` children plus one of `LinkedChildren` rows; a parent with
+        // linked children reports those instead of its hierarchical children.
+        let ids: Vec<String> = parent_ids.iter().map(Uuid::to_string).collect();
+        let grouped_count = |table: &str| {
+            let mut sql =
+                format!(r#"SELECT "ParentId", COUNT(*) FROM "{table}" WHERE "ParentId" IN ("#);
+            sql.push_str(&placeholders(ids.len()));
+            sql.push_str(r#") GROUP BY "ParentId""#);
+            sql
+        };
+        let mut hierarchical: HashMap<String, i64> = HashMap::new();
+        let mut linked: HashMap<String, i64> = HashMap::new();
+        for (table, into) in [
+            ("BaseItems", &mut hierarchical),
+            ("LinkedChildren", &mut linked),
+        ] {
+            let sql = grouped_count(table);
+            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            for id in &ids {
+                query = query.bind(id.clone());
+            }
+            into.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+
         let mut out = HashMap::with_capacity(parent_ids.len());
-        for &parent in parent_ids {
-            let count: i64 =
-                sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "ParentId" = ?1"#)
-                    .bind(parent.to_string())
-                    .fetch_one(self.db.pool())
-                    .await
-                    .map_err(db_err)?;
-            out.insert(parent, i32::try_from(count).unwrap_or(i32::MAX));
+        for (parent, key) in parent_ids.iter().zip(&ids) {
+            let linked_count = linked.get(key).copied().unwrap_or(0);
+            let count = if linked_count > 0 {
+                linked_count
+            } else {
+                hierarchical.get(key).copied().unwrap_or(0)
+            };
+            out.insert(*parent, i32::try_from(count).unwrap_or(i32::MAX));
         }
         Ok(out)
     }
@@ -481,6 +509,38 @@ mod tests {
             .expect("child counts");
         assert_eq!(counts[&parent], 1);
         assert_eq!(counts[&folder], 0);
+
+        // A parent with linked children reports those instead of its
+        // hierarchical children (C# `linkedCount > 0 ? linkedCount : ...`).
+        let boxset = Uuid::from_u128(0xE003);
+        seed_item(&db, boxset, BaseItemKind::BoxSet).await;
+        for (n, linked) in [(0xE004_u128, true), (0xE005, true), (0xE006, false)] {
+            let child = Uuid::from_u128(n);
+            seed_item(&db, child, BaseItemKind::Movie).await;
+            if linked {
+                sqlx::query(
+                    r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType")
+                       VALUES (?1, ?2, 0)"#,
+                )
+                .bind(boxset.to_string())
+                .bind(child.to_string())
+                .execute(db.pool())
+                .await
+                .expect("link child");
+            } else {
+                sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+                    .bind(child.to_string())
+                    .bind(boxset.to_string())
+                    .execute(db.pool())
+                    .await
+                    .expect("set parent");
+            }
+        }
+        let counts = service
+            .get_child_count_batch(&[boxset], None)
+            .await
+            .expect("linked child counts");
+        assert_eq!(counts[&boxset], 2);
     }
 
     #[tokio::test]
