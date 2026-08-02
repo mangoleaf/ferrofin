@@ -7,37 +7,35 @@
 #   release — a GitLab Release object with git-cliff-generated notes.
 #   chart   — the official Helm chart, pushed as an OCI artifact.
 #
-# The git tag is the single source of truth for the version: CI stamps it into
-# the crate (Cargo.toml) and the chart (helm --version/--app-version) at build
-# time, so there are no version files to keep in sync. To release, run the
-# manual `create-release` job on main and pick a bump (patch/minor/major) — CI
-# computes the next tag from the latest one and pushes it, which triggers this
-# pipeline. Nobody hand-creates tags or edits versions. The committed
-# Cargo.toml/Chart.yaml versions are dev placeholders that CI overrides.
+# The git tag is the single source of truth for the version. CI never edits
+# version files: the release version is injected at build time — into the image
+# via SERVICE_VERSION and into the chart via `helm --version/--app-version` — so
+# the committed Cargo.toml/Chart.yaml versions stay as dev placeholders. To
+# release, run the manual `create-release` job; it derives the next version and
+# pushes a TAG on the commit it ran on (it does NOT commit to main). No hand-made tags.
 #
 # Tag scheme (see brain/plans/PLAN_RELEASE_STRATEGY.md):
 #   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
-# The image is built ONLY for a release tag — never on a bare commit/branch push.
+#   main commit   → dev image {M.m.p}-{N}-{sha12} when build-relevant paths change
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
 stages: [test, tag, build, release, chart]
 
 # ---------------------------------------------------------------------------
-# create-release — manual, main only. CI owns versioning end-to-end: it derives
-# the next version from Conventional Commits since the last tag: feat -> minor,
-# fix/other -> patch, breaking change -> major (but while the major is 0, a
-# breaking change bumps MINOR — it never auto-jumps to 1.0.0). Then it stamps
-# Cargo.toml, commits that as `chore(release): vX.Y.Z`, tags the commit, and
-# pushes both. The tag push then triggers the build/release/chart pipeline on a
-# commit whose Cargo.toml already carries the release version — so the binary
-# reports the right version with no build-time patching. No hand-made tags.
+# create-release — manual, main only. Derives the next version from Conventional
+# Commit subjects since the last tag: feat -> minor, fix/other -> patch, breaking
+# -> major (but while major is 0 a breaking change bumps MINOR — never auto-1.0.0).
+# It then TAGS the commit it ran on and pushes ONLY the tag — no commit to main,
+# so it needs no fast-forward and works even when main has moved on since (you can
+# trigger it early / not at the tip). The tag pipeline builds + publishes; the
+# release version is injected via SERVICE_VERSION, so Cargo.toml is left untouched.
 #
 # Override the auto-derived bump with FORCE_VERSION=vX.Y.Z when you need to.
-# Requires CI/CD var RELEASE_TOKEN — a project access token (write_repository,
-# Maintainer) allowed to push the protected default branch and create v* tags.
+# Requires CI/CD var RELEASE_TOKEN — a project access token (Maintainer) allowed
+# to create the protected v* tags. (It no longer pushes the default branch.)
 # ---------------------------------------------------------------------------
 create-release:
   stage: tag
@@ -80,19 +78,16 @@ create-release:
       esac
       NEW="v${MAJOR}.${MINOR}.${PATCH}"
       [ -n "${FORCE_VERSION:-}" ] && NEW="$FORCE_VERSION"
-      VER="${NEW#v}"
-      echo "Latest ${BASE} + ${LEVEL} -> ${NEW}"
-      # Stamp the workspace version — first `version = ` line only (busybox-safe awk,
-      # unlike GNU sed's `0,/re/` which silently no-ops in the kaniko image).
-      awk -v v="$VER" '!d && /^version = / {sub(/"[^"]*"/, "\"" v "\""); d=1} {print}' \
-        Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
-      git add Cargo.toml
-      git commit -m "chore(release): ${NEW}"
+      echo "Latest ${BASE} + ${LEVEL} -> ${NEW} (tagging ${CI_COMMIT_SHORT_SHA})"
+      # Tag the commit this job ran on and push ONLY the tag — no commit to main.
+      # A tag needs no fast-forward, so this succeeds even if main has moved on
+      # since the pipeline started (you can trigger the release early / not at the
+      # tip). The release version is injected at build time via SERVICE_VERSION
+      # (the tag); Cargo.toml is intentionally left untouched.
       git tag -a "$NEW" -m "release $NEW"
       git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-      git push origin "HEAD:${CI_DEFAULT_BRANCH}"
       git push origin "$NEW"
-      echo "Pushed release commit + ${NEW}; the tag pipeline builds and publishes."
+      echo "Pushed tag ${NEW}; the tag pipeline builds and publishes."
       # This commit is now being released, so the tag pipeline will build the
       # release image — cancel THIS main pipeline's now-redundant dev image build
       # (docker-image is still pending: it's in a later stage than this one).
