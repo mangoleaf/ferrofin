@@ -63,21 +63,30 @@ impl Database {
 
     /// Builds the pool from fully-formed connect options.
     ///
-    /// The pool is deliberately **small** (default 2; `HERMIT_DB_POOL`
-    /// overrides). Measured on `/Items?Limit=100` at 20 concurrent users
-    /// (2600-item library, 400 fixed requests): latency and server CPU *rise*
-    /// with connection count — SQLite connections contend in the kernel on the
-    /// shared WAL/database file, and system time explodes ~30x between 2 and
-    /// 10 connections (131 → 3811 ticks/400 req) while median latency doubles
-    /// (65 ms → 126 ms). More connections is strictly worse for this workload:
-    /// concurrency belongs to the async executor, not to SQLite handles. Two
-    /// (not one) so a single slow statement cannot head-of-line block every
-    /// other request.
+    /// Pool size defaults to the host's available parallelism (CPU count);
+    /// `HERMIT_DB_POOL` overrides. Each sqlx SQLite connection is backed by its
+    /// own dedicated OS thread (libsqlite3 is synchronous C), so the pool size
+    /// *is* the DB thread count — and, under WAL, the number of reads that can
+    /// run concurrently. Reads are CPU-bound, so throughput scales with pool
+    /// size up to core count and no further; sizing to `available_parallelism`
+    /// tracks that ceiling. This mirrors upstream Jellyfin, whose pooled
+    /// `DbContextFactory` + on-demand ADO.NET SQLite pool is effectively
+    /// unbounded but is likewise bottlenecked at ~core-count concurrent reads.
+    ///
+    /// Earlier this was a flat 2, chosen from a fixed-load micro-benchmark where
+    /// extra connections only added scheduler overhead; under Phase B saturation
+    /// on a many-core host that left most cores idle and cost ~2x throughput vs
+    /// Jellyfin on read endpoints.
     async fn connect_with(options: SqliteConnectOptions) -> Result<Self> {
         let max_connections = std::env::var("HERMIT_DB_POOL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .ok()
+                    .and_then(|n| u32::try_from(n.get()).ok())
+                    .unwrap_or(4)
+            });
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(options)
