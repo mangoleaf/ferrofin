@@ -50,7 +50,7 @@ use crate::media_encoding::build_media_encoding;
 
 /// The product / package identity advertised by the server, ported from
 /// Jellyfin's `ApplicationHost` constants.
-const PRODUCT_NAME: &str = "Hermit Server";
+const PRODUCT_NAME: &str = "Jellyfin Server";
 
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "hermit-server";
