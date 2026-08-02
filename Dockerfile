@@ -22,7 +22,7 @@ RUN cargo build --release -p hermit-server
 # ── runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+ && apt-get install -y --no-install-recommends ffmpeg libchromaprint-tools ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
 COPY --from=web /dist /usr/share/hermit/web
