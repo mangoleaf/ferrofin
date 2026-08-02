@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "f531ca0 2026-08-01",
+  "last_verified": "f383a85 2026-08-01",
   "rows": {
     "DELETE /Collections/{collectionId}/Items": {
       "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
@@ -9,9 +9,9 @@
       "note": "H=False J=True"
     },
     "DELETE /Playlists/{playlistId}/Items": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "DELETE /UserFavoriteItems/{itemId}": {
       "classification": "ok",
@@ -52,11 +52,6 @@
       "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
       "deep_verified": false,
       "note": "H=False J=True"
-    },
-    "POST /Items/{itemId}": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
     },
     "POST /Playlists": {
       "classification": "ok",

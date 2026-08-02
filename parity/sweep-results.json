@@ -468,7 +468,7 @@
     },
     "GET /Items/Filters2": {
       "note": "H=200 J=200",
-      "schema_valid": false,
+      "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/Latest": {
@@ -483,12 +483,12 @@
     },
     "GET /Items/Suggestions": {
       "note": "H=200 J=200",
-      "schema_valid": false,
+      "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/{itemId}": {
       "note": "H=200 J=200",
-      "schema_valid": false,
+      "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/{itemId}/Ancestors": {
@@ -558,7 +558,7 @@
     },
     "GET /Items/{itemId}/PlaybackInfo": {
       "note": "H=200 J=200",
-      "schema_valid": false,
+      "schema_valid": true,
       "status_conformant": true
     },
     "GET /Items/{itemId}/RemoteImages": {

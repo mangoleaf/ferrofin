@@ -11,7 +11,7 @@ import re
 
 # Keys that legitimately differ between two independent instances/scans (from parity.js).
 VOLATILE = re.compile("^(" + "|".join([
-    "Id", "Key", "ItemId", "ImageTags", "ServerId", "ServerName", "Etag", "PlaySessionId",
+    "Id", "Key", "ItemId", "ImageTags", "ServerId", "ServerName", "Etag", "ETag", "PlaySessionId",
     "ImageBlurHashes",
     # Divergent-GUID family: item GUIDs derive per-scan, so every id that references another item
     # differs between independent servers (documented deferral — resolved by the shared-DB path).
