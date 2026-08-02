@@ -38,6 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hermit_model::session::SessionMessageType;
 use tracing::warn;
+use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
 use hermit_traits::net::{
@@ -82,6 +83,9 @@ impl HermitSessionWebSocketListener {
 fn force_keep_alive_bytes() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "MessageType": SessionMessageType::ForceKeepAlive,
+        // Required `format: uuid` field on every outbound message; strict clients
+        // (the Jellyfin Kotlin SDK) crash without it.
+        "MessageId": Uuid::new_v4().hyphenated().to_string(),
         "Data": WEB_SOCKET_LOST_TIMEOUT_SECS,
     }))
     .unwrap_or_default()

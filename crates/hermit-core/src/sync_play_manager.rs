@@ -565,11 +565,20 @@ impl Group {
 }
 
 /// Wraps a payload in the Jellyfin WebSocket message envelope, consuming `data`.
+///
+/// Every outbound message carries a `MessageId` (C# `OutboundWebSocketMessage`
+/// sets `Guid.NewGuid()`); it is `format: uuid` and required by strict clients
+/// (the Jellyfin Kotlin SDK rejects a message missing it), so emit a fresh,
+/// canonically-hyphenated UUID here too.
 fn envelope(message_type: &str, data: serde_json::Value) -> String {
     let mut map = serde_json::Map::new();
     map.insert(
         "MessageType".to_owned(),
         serde_json::Value::String(message_type.to_owned()),
+    );
+    map.insert(
+        "MessageId".to_owned(),
+        serde_json::Value::String(Uuid::new_v4().hyphenated().to_string()),
     );
     map.insert("Data".to_owned(), data);
     serde_json::Value::Object(map).to_string()

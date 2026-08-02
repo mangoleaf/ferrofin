@@ -1297,7 +1297,10 @@ fn envelope_bytes(message_type: SessionMessageType, data: &str) -> Result<Vec<u8
     };
     let envelope = OutboundMessage {
         message_type,
-        message_id: Uuid::new_v4().simple().to_string(),
+        // Hyphenated (canonical) form: `MessageId` is `format: uuid`, and the
+        // Jellyfin Kotlin SDK parses it via `UUID.fromString`, which rejects the
+        // dash-less form. `.simple()` here crashed Android clients on every push.
+        message_id: Uuid::new_v4().hyphenated().to_string(),
         data: data_value,
         _marker: std::marker::PhantomData,
     };

@@ -190,8 +190,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
 }
 
 /// The `ForceKeepAlive` message body Jellyfin's protocol uses.
+///
+/// Every outbound message carries a `MessageId` (C# `OutboundWebSocketMessage`
+/// sets `Guid.NewGuid()`). It is `format: uuid` and *required* by strict
+/// clients: without it the Jellyfin Kotlin SDK throws `MissingFieldException`
+/// and the Android TV app crashes mid-playback. Emit a fresh, canonically
+/// hyphenated UUID (the SDK parses it via `UUID.fromString`, which rejects the
+/// dash-less form).
 fn force_keep_alive_message() -> String {
-    format!("{{\"MessageType\":\"ForceKeepAlive\",\"Data\":{KEEPALIVE_SECS}}}")
+    let message_id = uuid::Uuid::new_v4().hyphenated();
+    format!(
+        "{{\"MessageType\":\"ForceKeepAlive\",\"MessageId\":\"{message_id}\",\"Data\":{KEEPALIVE_SECS}}}"
+    )
 }
 
 #[cfg(test)]
@@ -258,5 +268,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&m).unwrap();
         assert_eq!(v["MessageType"], "ForceKeepAlive");
         assert_eq!(v["Data"], KEEPALIVE_SECS);
+        // The SDK requires `MessageId` (`format: uuid`) or the Android client
+        // crashes with MissingFieldException. Must be a canonical, hyphenated
+        // UUID — the dash-less form fails the SDK's `UUID.fromString`.
+        let id = v["MessageId"].as_str().expect("MessageId present");
+        assert!(
+            uuid::Uuid::try_parse(id).is_ok(),
+            "MessageId is a UUID: {id}"
+        );
+        assert_eq!(id.len(), 36, "hyphenated form (8-4-4-4-12)");
     }
 }
