@@ -754,6 +754,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_collection_does_not_delete_its_members() {
+        // Data-loss regression: DELETE /Items/{boxset} cascades to PHYSICAL children only.
+        // A box-set/playlist's members are LinkedChildren (references); deleting the container
+        // must leave the referenced items intact. (WI-6 made parentId browse merge LinkedChildren;
+        // without physical_children_only the delete-cascade would wipe the movies.)
+        use hermit_traits::options::DeleteOptions;
+        let db = test_db().await;
+        let movie_a = Uuid::new_v4();
+        let movie_b = Uuid::new_v4();
+        seed_item(&db, movie_a, BaseItemKind::Movie).await;
+        seed_item(&db, movie_b, BaseItemKind::Movie).await;
+
+        let library = library_manager_over(db.clone());
+        let mgr = HermitCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let created = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Doomed".to_owned(),
+                item_id_list: vec![movie_a, movie_b],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let cid = Uuid::parse_str(&created.id).expect("uuid");
+
+        library
+            .delete_item(cid, &DeleteOptions::default())
+            .await
+            .expect("delete collection");
+
+        // The collection is gone, but both movies survive.
+        assert!(library.get_item_by_id(cid).await.expect("q").is_none());
+        assert!(
+            library.get_item_by_id(movie_a).await.expect("q").is_some(),
+            "movie_a deleted!"
+        );
+        assert!(
+            library.get_item_by_id(movie_b).await.expect("q").is_some(),
+            "movie_b deleted!"
+        );
+    }
+
+    #[tokio::test]
     async fn create_and_update_playlist() {
         let db = test_db().await;
         let track = Uuid::new_v4();

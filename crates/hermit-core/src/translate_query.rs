@@ -177,6 +177,12 @@ fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Internal
             )
             .push_bind(filter.parent_id.to_string())
             .push(")");
+        } else if filter.physical_children_only {
+            // Physical children only (delete-cascade): NEVER merge LinkedChildren, so
+            // deleting a box-set/playlist removes only the container, not the items it
+            // references (linked children are references, not owned children).
+            qb.push(r#" AND bi."ParentId" = "#)
+                .push_bind(filter.parent_id.to_string());
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only

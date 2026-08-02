@@ -259,6 +259,11 @@ pub struct InternalItemsQuery {
     pub is_virtual_item: Option<bool>,
     /// The parent item id (`Guid.Empty` ⇒ nil means unset).
     pub parent_id: Uuid,
+    /// When set, a non-recursive `parent_id` browse matches only PHYSICAL children
+    /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `LinkedChildren`
+    /// members. Used by delete-cascade so removing a box-set/playlist never deletes
+    /// the referenced items (linked children are references, not owned children).
+    pub physical_children_only: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
     /// Restrict to descendants of these ancestors.
@@ -487,6 +492,7 @@ impl Default for InternalItemsQuery {
             has_dead_parent_id: None,
             is_virtual_item: None,
             parent_id: Uuid::nil(),
+            physical_children_only: false,
             parent_type: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),

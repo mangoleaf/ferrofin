@@ -282,8 +282,13 @@ impl LibraryManager for HermitLibraryManager {
         // (honoring `delete_file_location`) is the filesystem layer's job, not this
         // persistence seam, and is deferred.
         if row.is_folder {
+            // Cascade to PHYSICAL children only. A box-set/playlist is a folder whose
+            // members are LinkedChildren (references), not owned children — deleting the
+            // container must never delete the referenced media (data loss). physical_children_only
+            // suppresses the LinkedChildren merge the browse path uses.
             let child_query = InternalItemsQuery {
                 parent_id: id,
+                physical_children_only: true,
                 ..Default::default()
             };
             ids.extend(self.items.get_item_ids(&child_query).await?);
