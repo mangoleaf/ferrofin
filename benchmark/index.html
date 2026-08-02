@@ -48,6 +48,11 @@
   .pill.bad { background: #260f0f99; border: 1px solid #4a1c1c; }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
   .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #toast { position: fixed; right: 20px; bottom: 20px; max-width: 360px; background: var(--panel);
+    border: 1px solid var(--accent); color: var(--fg); padding: 12px 16px; border-radius: 10px;
+    box-shadow: 0 8px 28px #000a; font-size: 13px; z-index: 50;
+    opacity: 0; transform: translateY(10px); transition: opacity .3s, transform .3s; pointer-events: none; }
+  #toast.show { opacity: 1; transform: none; }
 </style>
 </head>
 <body>
@@ -77,19 +82,58 @@
 <script>
 const $ = s => document.querySelector(s);
 let DATA = null, sortKey = null, sortDir = -1;
+let knownFiles = new Set();
+const POLL_MS = 10000;   // how often to check for a freshly-rendered benchmark
 
-fetch('bench-data.json').then(r => r.json()).then(d => {
-  DATA = d.versions;
-  if (!DATA.length) { $('#sub').textContent = 'no benchmark reports found — run ./run.sh first'; return; }
+const selectedFile = sel => (DATA && DATA[+sel.value]) ? DATA[+sel.value].file : null;
+
+function buildOptions(keepVerFile, keepCmpFile) {
   const opts = DATA.map((v, i) => `<option value="${i}">${v.hermit} — ${v.when}</option>`).join('');
   $('#ver').innerHTML = opts;
   $('#cmp').innerHTML = `<option value="-1">— none (single view) —</option>` + opts;
-  $('#ver').value = DATA.length - 1;   // newest by default
-  $('#cmp').value = -1;                // no comparison by default
-  for (const el of ['ver','cmp','q','onlyChanged','hideJf'])
-    $('#'+el).addEventListener('input', render);
+  const vi = DATA.findIndex(v => v.file === keepVerFile);
+  $('#ver').value = vi >= 0 ? vi : DATA.length - 1;          // newest by default
+  const ci = DATA.findIndex(v => v.file === keepCmpFile);
+  $('#cmp').value = ci >= 0 ? ci : -1;                       // no comparison by default
+}
+
+function showToast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(showToast._t); showToast._t = setTimeout(() => t.classList.remove('show'), 9000);
+}
+function notifyNew(vs) {
+  const msg = `New benchmark${vs.length > 1 ? 's' : ''}: ${vs.map(v => v.hermit).join(', ')}`;
+  showToast('🔔 ' + msg + ' — switched to it');
+  if ('Notification' in window && Notification.permission === 'granted')
+    new Notification('Hermit benchmark viewer', { body: msg });
+}
+
+async function loadData(isPoll) {
+  let d;
+  try { d = await (await fetch('bench-data.json?t=' + Date.now(), { cache: 'no-store' })).json(); }
+  catch { return; }                                          // server not ready / transient
+  const versions = d.versions || [];
+  const newOnes = versions.filter(v => !knownFiles.has(v.file));
+  if (isPoll && !newOnes.length) return;                     // nothing changed since last poll
+  const keepVer = DATA && selectedFile($('#ver'));
+  const keepCmp = DATA && selectedFile($('#cmp'));
+  DATA = versions;
+  knownFiles = new Set(versions.map(v => v.file));
+  if (!DATA.length) { $('#sub').textContent = 'no benchmark reports found — run ./run.sh first'; return; }
+  if (isPoll && newOnes.length) {
+    buildOptions(newOnes[newOnes.length - 1].file, keepCmp); // auto-refresh: jump to the newest new run
+    notifyNew(newOnes);
+  } else {
+    buildOptions(keepVer, keepCmp);                          // first load / no change: keep selection
+  }
   render();
-});
+}
+
+for (const el of ['ver', 'cmp', 'q', 'onlyChanged', 'hideJf'])
+  $('#' + el).addEventListener('input', render);
+if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+loadData(false);
+setInterval(() => loadData(true), POLL_MS);
 
 const fmt = (n, d=2) => n == null ? '·' : n.toFixed(d);
 const pct = (a, b) => (a == null || b == null || a === 0) ? null : (b - a) / a * 100;
@@ -149,12 +193,13 @@ function renderSingle(V, q, hideJf) {
   if (sortKey === null) { sortKey = 'speedup'; sortDir = -1; }
   const cols = [['name', 'Endpoint'], ['h_p50', 'p50'], ['h_p95', 'p95'], ['h_p99', 'p99'],
     ['h_rps', 'RPS H'], ['okc', '200-rate H/J'], ['speedup', 'Speedup']];
-  if (!hideJf) cols.push(['j_p50', 'JF p50']);
+  if (!hideJf) cols.push(['j_p50', 'JF p50'], ['j_p95', 'JF p95'], ['j_p99', 'JF p99']);
   drawTable(rs, cols, q, false, r => {
     let t = `<td><code>${r.name}</code></td><td>${fmt(r.h_p50)}</td><td>${fmt(r.h_p95)}</td>`
       + `<td>${fmt(r.h_p99)}</td><td class="muted">${fmt(r.h_rps, 1)}</td>`
       + okCell(r.h_ok, r.j_ok) + speedCell(r.speedup);
-    if (!hideJf) t += `<td class="muted">${fmt(r.j_p50)}</td>`;
+    if (!hideJf) t += `<td class="muted">${fmt(r.j_p50)}</td><td class="muted">${fmt(r.j_p95)}</td>`
+      + `<td class="muted">${fmt(r.j_p99)}</td>`;
     return t;
   });
 }
@@ -170,6 +215,7 @@ function renderCompare(V, C, q, onlyChanged, hideJf) {
     name, a_p50: a[name]?.h_p50 ?? null, b_p50: b[name]?.h_p50 ?? null, b_p95: b[name]?.h_p95 ?? null,
     dp50: pct(a[name]?.h_p50, b[name]?.h_p50), a_spd: a[name]?.speedup ?? null,
     b_spd: b[name]?.speedup ?? null, j_p50: b[name]?.j_p50 ?? null,
+    j_p95: b[name]?.j_p95 ?? null, j_p99: b[name]?.j_p99 ?? null,
   }));
 
   const both = rs.filter(r => r.a_p50 != null && r.b_p50 != null);
@@ -186,16 +232,17 @@ function renderCompare(V, C, q, onlyChanged, hideJf) {
     ['B beats Jellyfin', `${bWins}/${bTot}`],
   ]);
 
-  if (sortKey === null || !['name','a_p50','b_p50','dp50','b_p95','a_spd','b_spd','j_p50'].includes(sortKey)) {
+  if (sortKey === null || !['name','a_p50','b_p50','dp50','b_p95','a_spd','b_spd','j_p50','j_p95','j_p99'].includes(sortKey)) {
     sortKey = 'dp50'; sortDir = -1;
   }
   const cols = [['name', 'Endpoint'], ['a_p50', 'A p50'], ['b_p50', 'B p50'], ['dp50', 'Δ p50'],
     ['b_p95', 'B p95'], ['a_spd', 'A speedup'], ['b_spd', 'B speedup']];
-  if (!hideJf) cols.push(['j_p50', 'B JF p50']);
+  if (!hideJf) cols.push(['j_p50', 'B JF p50'], ['j_p95', 'B JF p95'], ['j_p99', 'B JF p99']);
   drawTable(rs, cols, q, onlyChanged, r => {
     let t = `<td><code>${r.name}</code></td><td>${fmt(r.a_p50)}</td><td>${fmt(r.b_p50)}</td>`
       + deltaCell(r.dp50) + `<td class="muted">${fmt(r.b_p95)}</td>` + speedCell(r.a_spd) + speedCell(r.b_spd);
-    if (!hideJf) t += `<td class="muted">${fmt(r.j_p50)}</td>`;
+    if (!hideJf) t += `<td class="muted">${fmt(r.j_p50)}</td><td class="muted">${fmt(r.j_p95)}</td>`
+      + `<td class="muted">${fmt(r.j_p99)}</td>`;
     return t;
   });
 }
@@ -239,5 +286,6 @@ function renderFootprint(V, C, hideJf) {
   }).join('');
 }
 </script>
+<div id="toast"></div>
 </body>
 </html>

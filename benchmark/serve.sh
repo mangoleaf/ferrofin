@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate the benchmark viewer data and serve it. Usage: benchmark/serve.sh [port]
+# Serve the benchmark viewer. serve.py regenerates bench-data.json on each
+# request, so the page (which polls every 10s) auto-detects and switches to a
+# freshly-rendered run and notifies — no restart needed. Usage: serve.sh [port]
 set -euo pipefail
 cd "$(dirname "$0")"
-python3 gen-viewer.py
-PORT="${1:-8124}"
-echo "→ http://127.0.0.1:$PORT/"
-exec python3 -m http.server "$PORT" --bind 127.0.0.1
+python3 gen-viewer.py                 # seed the file so the first load is instant
+PORT="${1:-8124}" exec python3 serve.py
