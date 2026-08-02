@@ -98,6 +98,39 @@ create-release:
       allow_failure: true
 
 # ---------------------------------------------------------------------------
+# ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
+# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.97.0. The lint and
+# coverage jobs use it as their `image:` so they don't reinstall tools every run.
+# Rebuilds automatically when ci/Dockerfile changes on main; otherwise run it
+# manually to refresh. Lives in .pre so it publishes before the test stage.
+# ---------------------------------------------------------------------------
+ci-image:
+  stage: .pre
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.97.0
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
+  script:
+    - >-
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/ci/Dockerfile"
+      --destination "$CI_IMAGE"
+      --push-retry 5
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - ci/Dockerfile
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
 # sccache — compile cache backed by Garage S3, replacing GitLab's cache: (which
 # zipped target/ + .cargo into one archive and timed out uploading to Garage).
 # sccache stores each object directly over S3 instead. Creds come from Vault;
@@ -138,6 +171,10 @@ sccache-creds:
   needs:
     - job: sccache-creds
       optional: true
+    # When ci-image runs (ci/Dockerfile changed) wait for it, so the base image is
+    # published before lint/coverage pull it; ignored on runs where it's skipped.
+    - job: ci-image
+      optional: true
 
 # Install the sccache binary and enable it when Vault creds are present.
 # !reference'd as the first step of each rust job's before_script.
@@ -160,16 +197,13 @@ sccache-creds:
 # ---------------------------------------------------------------------------
 lint:
   stage: test
-  image: rust:1.97.0-bookworm
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.97.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_TERM_COLOR: always
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
     - !reference [.sccache-setup, script]
-    - rustup component add rustfmt clippy
-    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-    - cargo binstall -y cargo-nextest
   script:
     - cargo fmt --all --check
     - cargo clippy --all-targets --all-features -- -D warnings
@@ -187,15 +221,12 @@ lint:
 # re-gated on the release pipeline.
 coverage:
   stage: test
-  image: rust:1.97.0-bookworm
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.97.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
   before_script:
     - !reference [.sccache-setup, script]
-    - rustup component add llvm-tools-preview
-    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
-    - cargo binstall -y cargo-llvm-cov cargo-nextest
   script:
     - |
       set -euo pipefail
