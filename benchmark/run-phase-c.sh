@@ -44,8 +44,8 @@ mixed() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && mixed hermit   18096 hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && mixed jellyfin 18097 jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && mixed hermit "$HERMIT_HOST_PORT" hermit
+[ "${BENCH_ONLY:-}" != "hermit" ]   && mixed jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase C report"

@@ -75,8 +75,8 @@ profile() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && profile hermit   18096 hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && profile jellyfin 18097 jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && profile hermit "$HERMIT_HOST_PORT" hermit
+[ "${BENCH_ONLY:-}" != "hermit" ]   && profile jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase A report"

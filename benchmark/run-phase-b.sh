@@ -60,8 +60,8 @@ sweep() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && sweep hermit   18096 hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && sweep jellyfin 18097 jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && sweep hermit "$HERMIT_HOST_PORT" hermit
+[ "${BENCH_ONLY:-}" != "hermit" ]   && sweep jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase B report"
