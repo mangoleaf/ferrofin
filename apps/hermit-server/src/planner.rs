@@ -881,6 +881,9 @@ impl HermitStreamStatePlanner {
                     args.push(tok);
                 }
             } else {
+                // `video_quality_param` already includes the bitrate (`-maxrate/
+                // -bufsize`) and `-r` params, mirroring `GetVideoQualityParam` —
+                // no separate pushes, or ffmpeg gets them twice.
                 push_split(
                     &mut args,
                     &self.encoding_helper.video_quality_param(
@@ -890,15 +893,10 @@ impl HermitStreamStatePlanner {
                         DEFAULT_ENCODER_PRESET,
                     ),
                 );
-                push_split(
-                    &mut args,
-                    &self
-                        .encoding_helper
-                        .video_bitrate_param(state, &video_encoder),
-                );
             }
             let output_framerate = self.encoding_helper.framerate_param(state);
-            if let Some(framerate) = output_framerate {
+            if nvenc_video && let Some(framerate) = output_framerate {
+                // NVENC skips `video_quality_param`, so it emits `-r` itself.
                 push_split(&mut args, "-r");
                 args.push(framerate.to_string());
             }
@@ -1968,6 +1966,13 @@ mod tests {
         assert!(
             args.contains("-maxrate 8000000") && args.contains("-bufsize 16000000"),
             "bitrate cap expected: {args}"
+        );
+        // Exactly once: `video_quality_param` already carries the bitrate pair,
+        // and a second `video_bitrate_param` push used to duplicate it.
+        assert_eq!(
+            args.matches("-maxrate").count(),
+            1,
+            "bitrate cap emitted exactly once: {args}"
         );
     }
 
