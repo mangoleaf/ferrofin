@@ -705,6 +705,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_members_visible_via_parentid_browse() {
+        // Live-path repro (WI-6): create a collection with one member, add a second,
+        // then browse it the way GET /Items?parentId=<collection> does —
+        // library.query_items -> item_repository.get_items -> translate_query.
+        // Both members must surface (C# Folder.GetChildren merges LinkedChildren).
+        use hermit_traits::options::InternalItemsQuery;
+        let db = test_db().await;
+        let movie_a = Uuid::new_v4();
+        let movie_b = Uuid::new_v4();
+        seed_item(&db, movie_a, BaseItemKind::Movie).await;
+        seed_item(&db, movie_b, BaseItemKind::Movie).await;
+
+        let library = library_manager_over(db.clone());
+        let mgr = HermitCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let created = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Watchlist".to_owned(),
+                item_id_list: vec![movie_a],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let cid = Uuid::parse_str(&created.id).expect("uuid");
+        mgr.add_to_collection(cid, &[movie_b]).await.expect("add");
+
+        let result = library
+            .query_items(&InternalItemsQuery {
+                parent_id: cid,
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("browse");
+        let ids: Vec<_> = result.items.iter().map(|i| i.id.clone()).collect();
+        assert!(
+            ids.contains(&movie_a.to_string()),
+            "movie_a missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&movie_b.to_string()),
+            "movie_b missing: {ids:?}"
+        );
+        assert_eq!(result.total_record_count, 2);
+    }
+
+    #[tokio::test]
     async fn create_and_update_playlist() {
         let db = test_db().await;
         let track = Uuid::new_v4();
