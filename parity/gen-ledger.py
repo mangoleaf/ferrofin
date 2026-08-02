@@ -183,8 +183,19 @@ def build_curated():
     reads, r_stamp = load_layer2("parity/reads-results.json")
     journeys, j_stamp = load_layer2("parity/journey-results.json")
     accepted, a_stamp = load_layer2("parity/classifications.json")
-    # Precedence: static seed < live read diff < write journeys (later, more authoritative wins).
+    sweep = load_sweep()
+    sweep_stamp = None
+    sp = os.path.join(ROOT, "parity/sweep-results.json")
+    if os.path.exists(sp):
+        sweep_stamp = json.load(open(sp)).get("last_verified")
+    # Precedence: static seed < sweep single-item diff < live curated read diff < write journeys
+    # < curated accepted classifications (later, more authoritative wins).
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
+    for k, v in sweep.items():
+        if "deep_verified" in v:   # only GET 200/200 ops the sweep deep-diffed
+            curated[k] = {"deep_verified": v["deep_verified"],
+                          "classification": v.get("classification", ""),
+                          "last_verified": sweep_stamp}
     for k, v in reads.items():
         if v.get("deep_verified") is not None or v.get("classification"):
             curated[k] = {**v, "last_verified": r_stamp}

@@ -240,6 +240,18 @@ def response_schema(op):
         return None
     return (resp[key].get("content", {}).get("application/json", {}) or {}).get("schema")
 
+# ---------------------------------------------------------------- deep diff (Layer-2 over all GET ops)
+
+from parity_diff import diff_counts  # noqa: E402
+
+
+def dedup_fields(buckets):
+    """Collapse per-item [key] prefixes so each divergent FIELD is listed once."""
+    def fields(bucket):
+        return sorted({re.sub(r"^\[[^\]]*\]\.?", "", m["path"]) for m in bucket})
+    return {k: fields(buckets[k]) for k in ("missing", "extra", "mismatch")}
+
+
 # ---------------------------------------------------------------- sweep
 
 def load_spec():
@@ -290,9 +302,23 @@ def sweep(hermit_url, jellyfin_url):
                 if jskip:
                     results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs} J=n/a"}
                     continue
-                js, _ = http(method, jellyfin_url + with_user_query(jurl, op, params, ju), jt)
-                results[opkey] = {"status_conformant": (hs // 100) == (js // 100),
-                                  "schema_valid": sv, "note": f"H={hs} J={js}"}
+                js, jraw = http(method, jellyfin_url + with_user_query(jurl, op, params, ju), jt)
+                row = {"status_conformant": (hs // 100) == (js // 100),
+                       "schema_valid": sv, "note": f"H={hs} J={js}"}
+                # Layer-2 deep diff over the whole GET surface: when BOTH return 200 JSON, diff the
+                # bodies (Path/Name array alignment + volatile denylist). Single-item ops align
+                # because "first item by SortName" is the same title on both servers; the curated
+                # multi-item reads.py wins precedence in the ledger where it also covers an op.
+                if method == "get" and hs == 200 and js == 200 and hraw and jraw:
+                    try:
+                        n, buckets = diff_counts(json.loads(jraw), json.loads(hraw))
+                        row["deep_verified"] = n == 0
+                        if n:
+                            row["classification"] = "flagged: read diff vs Jellyfin (sweep single-item align)"
+                            row["diffs"] = dedup_fields(buckets)
+                    except ValueError:
+                        pass
+                results[opkey] = row
             else:
                 results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs}"}
     return results
@@ -302,12 +328,16 @@ def write_results(results):
     conformant = sum(1 for r in results.values() if r["status_conformant"] is True)
     schema_ok = sum(1 for r in results.values() if r["schema_valid"] is True)
     skipped = sum(1 for r in results.values() if "unresolved" in (r.get("note") or ""))
-    out = {"generated_by": "parity/sweep.py", "rows": results}
+    deep_ok = sum(1 for r in results.values() if r.get("deep_verified") is True)
+    deep_run = sum(1 for r in results.values() if "deep_verified" in r)
+    out = {"generated_by": "parity/sweep.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
+           "rows": results}
     with open(os.path.join(ROOT, "parity/sweep-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     print(f"wrote parity/sweep-results.json — {len(results)} ops, "
-          f"{conformant} status-conformant, {schema_ok} schema-valid, {skipped} skipped (unfillable)")
+          f"{conformant} status-conformant, {schema_ok} schema-valid, {skipped} skipped (unfillable), "
+          f"{deep_ok}/{deep_run} GET deep-diffed clean")
 
 # ---------------------------------------------------------------- self-check
 
@@ -325,6 +355,10 @@ def selfcheck():
     assert url == "/Items/abc" and skip is None, (url, skip)
     _, skip = build_url("/Plugins/{pluginId}", fx)
     assert skip and "pluginId" in skip
+    # deep-diff field dedup collapses per-item [key] prefixes to one field each.
+    df = dedup_fields({"missing": [{"path": "[Path=/a].Foo"}, {"path": "[Path=/b].Foo"}],
+                       "extra": [], "mismatch": [{"path": "Bar"}]})
+    assert df["missing"] == ["Foo"] and df["mismatch"] == ["Bar"], df
     # userId query injection.
     url = with_user_query("/Genres", {"parameters": [{"name": "userId", "in": "query"}]}, set(), "u1")
     assert url == "/Genres?userId=u1", url
