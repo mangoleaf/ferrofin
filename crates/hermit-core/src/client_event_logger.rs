@@ -116,6 +116,14 @@ impl ClientEventLogger for HermitClientEventLogger {
             ));
         }
 
+        // Jellyfin's `ClientEventLogger` assumes the log dir exists (Serilog
+        // creates it at startup). Don't depend on that side-effect: a missing
+        // dir here silently drops the client's crash/diagnostic upload — the very
+        // data this endpoint exists to capture — as a 500.
+        tokio::fs::create_dir_all(&log_dir)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create log directory: {e}")))?;
+
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -188,6 +196,26 @@ mod tests {
         );
         let written = tokio::fs::read(logs.join(&name)).await.unwrap();
         assert_eq!(written, b"hello diagnostics");
+    }
+
+    #[tokio::test]
+    async fn write_document_creates_missing_log_dir() {
+        // Regression: the log dir not existing must not drop the upload (it did
+        // in prod — client crash logs 500'd with "No such file or directory").
+        let tmp = tempfile::tempdir().unwrap();
+        // Note: no `logs` subdir created here.
+        let logs = tmp.path().join("logs");
+        assert!(!logs.exists());
+
+        let logger = HermitClientEventLogger::new(paths_in(tmp.path()));
+        let name = logger
+            .write_document("Jellyfin Android TV", "0.18.0", b"crash trace")
+            .await
+            .expect("upload succeeds even when log dir is absent");
+        assert_eq!(
+            tokio::fs::read(logs.join(&name)).await.unwrap(),
+            b"crash trace"
+        );
     }
 
     #[tokio::test]

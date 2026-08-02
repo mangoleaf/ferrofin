@@ -534,6 +534,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1025,7 +1034,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-api"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1054,14 +1063,14 @@ dependencies = [
 
 [[package]]
 name = "hermit-chromaprint"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "hermit-common"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "pbkdf2",
  "regex",
@@ -1075,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-core"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1103,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-db"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "hermit-model",
@@ -1117,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-drawing"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "blurhash",
@@ -1135,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-extensions"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hermit-chromaprint",
@@ -1155,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-health"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1169,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-hls"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hermit-keyframes",
@@ -1185,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-keyframes"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "rstest",
  "serde",
@@ -1196,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-livetv"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1215,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-mediaencoding"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chardetng",
@@ -1238,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-model"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "bitflags",
  "chrono",
@@ -1254,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-naming"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "fancy-regex",
@@ -1267,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-networking"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "fancy-regex",
  "hermit-common",
@@ -1280,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-providers"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1301,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-server"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1332,13 +1341,14 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "hermit-traits"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1353,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-util"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "rand 0.8.7",
  "regex",
@@ -3051,6 +3061,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3145,6 +3161,7 @@ dependencies = [
  "powerfmt",
  "serde_core",
  "time-core",
+ "time-macros",
 ]
 
 [[package]]
@@ -3152,6 +3169,16 @@ name = "time-core"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+
+[[package]]
+name = "time-macros"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+dependencies = [
+ "num-conv",
+ "time-core",
+]
 
 [[package]]
 name = "tiny-keccak"
@@ -3370,6 +3397,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

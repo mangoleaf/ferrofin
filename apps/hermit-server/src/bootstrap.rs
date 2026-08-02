@@ -36,17 +36,56 @@ pub struct FfmpegPaths {
 /// environment still takes precedence, matching the standard `tracing`
 /// convention. Safe to call once at startup; a second call is a no-op because
 /// the global subscriber can only be set once.
+///
+/// Output is written to **both** stdout (for `kubectl logs` / journald) and a
+/// daily-rotating file `log_YYYY-MM-DD.log` under `{data_dir}/log` — the same
+/// directory `GET /System/Logs` serves, so server logs appear in the Jellyfin
+/// dashboard log viewer, matching Jellyfin's Serilog file sink. If the log
+/// directory can't be prepared, logging falls back to stdout only.
 pub fn init_tracing(config: &Config) {
+    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    // Log dir mirrors the composition root's `{data_dir}/log` (state.rs). The
+    // rolling appender needs it to exist up front.
+    let log_dir = config.data_dir.join("log");
+    let file_appender = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("log")
+            .filename_suffix("log")
+            .build(&log_dir)
+            .ok()
+    });
+
     // `try_init` returns Err if a subscriber is already set (e.g. in tests);
     // that is fine — we only need one.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .try_init();
+    //
+    // ponytail: blocking file writes + no retention pruning. Fine at this log
+    // volume; add `.max_log_files(n)` (from `log_file_retention_days`) or a
+    // non-blocking `WorkerGuard` if the log dir grows unbounded or write
+    // latency shows up.
+    match file_appender {
+        // ANSI off so the file (and stdout, tee'd through one writer) carry no
+        // colour escapes — the dashboard renders raw text.
+        Some(appender) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(appender))
+                .try_init();
+        }
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .try_init();
+        }
+    }
 }
 
 /// Opens the SQLite database at `{data_dir}/hermit.db` and applies migrations.
@@ -329,11 +368,17 @@ mod tests {
     }
 
     #[test]
-    fn init_tracing_does_not_panic() {
-        // Idempotent: a second global-subscriber set is swallowed.
-        let cfg = config_with_ffmpeg(None);
+    fn init_tracing_creates_log_dir_and_is_idempotent() {
+        // Point data_dir at a tempdir so init_tracing prepares `{data_dir}/log`
+        // — the directory `GET /System/Logs` serves. Creating it is the
+        // deterministic side effect (the global subscriber is set-once, so a
+        // second call is swallowed and file writes can't be asserted through it).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config_with_ffmpeg(None);
+        cfg.data_dir = tmp.path().to_path_buf();
         init_tracing(&cfg);
         init_tracing(&cfg);
+        assert!(tmp.path().join("log").is_dir(), "log directory created");
     }
 
     #[tokio::test]
