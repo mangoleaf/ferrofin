@@ -290,10 +290,62 @@ def j_playlist_share(base, token, user, mid, _m2):
     return r
 
 
+def j_item_delete(base, token, user, mid, _m2):
+    r = {}
+    # Create a throwaway box-set and delete it (never touches real media).
+    _, raw = http("POST", f"{base}/Collections?name=DeleteMe&ids={mid}", token, "{}")
+    cid = json.loads(raw).get("Id") if raw else None
+    if cid:
+        st, _ = http("DELETE", f"{base}/Items/{cid}", token)
+        gone = http("GET", f"{base}/Items/{cid}?userId={user}", token)[0]
+        r["DELETE /Items/{itemId}"] = st < 300 and gone >= 400
+    return r
+
+
+def j_capabilities_query(base, token, user, _m, _m2):
+    r = {}
+    sid = my_session(base, token)
+    if sid:
+        st, _ = http("POST", f"{base}/Sessions/Capabilities?id={sid}&playableMediaTypes=Audio", token, "")
+        caps = next((s.get("Capabilities") for s in (get_json(base, "/Sessions", token) or [])
+                     if s.get("Id") == sid), None) or {}
+        r["POST /Sessions/Capabilities"] = st < 300 and caps.get("PlayableMediaTypes") == ["Audio"]
+    return r
+
+
+def j_environment_validate(base, token, user, _m, _m2):
+    r = {}
+    ok, _ = http("POST", f"{base}/Environment/ValidatePath", token,
+                 json.dumps({"Path": "/media/synth/movies", "ValidateWritable": False}))
+    bad, _ = http("POST", f"{base}/Environment/ValidatePath", token,
+                  json.dumps({"Path": "/no/such/parity/path", "ValidateWritable": False}))
+    # A real path validates (2xx); a bogus one is rejected (>=400).
+    r["POST /Environment/ValidatePath"] = ok < 300 and bad >= 400
+    return r
+
+
+def j_merge_versions(base, token, user, mid, m2):
+    r = {}
+    st, _ = http("POST", f"{base}/Videos/MergeVersions?ids={mid},{m2}", token, "")
+    survivor = None
+    for cand in (mid, m2):
+        it = q(base, f"/Items/{cand}?fields=MediaSources", token, user)
+        if it and len(it.get("MediaSources") or []) >= 2:
+            survivor = cand
+            break
+    r["POST /Videos/MergeVersions"] = st < 300 and survivor is not None
+    if survivor:
+        st, _ = http("DELETE", f"{base}/Videos/{survivor}/AlternateSources", token)
+        after = q(base, f"/Items/{survivor}?fields=MediaSources", token, user) or {}
+        r["DELETE /Videos/{itemId}/AlternateSources"] = st < 300 and len(after.get("MediaSources") or []) <= 1
+    return r
+
+
 JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
-            j_playlist_share]
+            j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
+            j_merge_versions]
 
 # ---------------------------------------------------------------- run
 

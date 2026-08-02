@@ -1,6 +1,6 @@
 {
   "generated_by": "parity/sweep.py",
-  "last_verified": "7c638fd 2026-08-02",
+  "last_verified": "f83429c 2026-08-02",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",

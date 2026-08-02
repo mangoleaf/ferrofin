@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "7c638fd 2026-08-02",
+  "last_verified": "f83429c 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -9,6 +9,11 @@
       "note": "H=True J=True"
     },
     "DELETE /Collections/{collectionId}/Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Items/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -78,6 +83,11 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Environment/ValidatePath": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /Items/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
@@ -109,6 +119,11 @@
       "note": "H=True J=True"
     },
     "POST /ScheduledTasks/{taskId}/Triggers": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Sessions/Capabilities": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -172,6 +187,11 @@
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
+    },
+    "POST /Videos/MergeVersions": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
     }
   }
 }
