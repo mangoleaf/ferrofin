@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use hermit_core::HermitServerApplicationPaths;
 use hermit_hls::{StreamStatePlanner, TranscodePlan};
 use hermit_mediaencoding::{
-    BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, NoOptionalEncoders,
+    BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, ProbedEncoders,
 };
 use hermit_model::configuration::EncodingOptions;
 use hermit_model::dlna::SubtitleDeliveryMethod;
@@ -103,7 +103,7 @@ const MS_PER_SECOND: i32 = 1000;
 pub struct HermitStreamStatePlanner {
     media_sources: Arc<dyn MediaSourceManager>,
     encoder: Arc<dyn MediaEncoder>,
-    encoding_helper: EncodingHelper<NoOptionalEncoders>,
+    encoding_helper: EncodingHelper<ProbedEncoders>,
     /// The server config manager — read for the persisted `encoding` options
     /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
@@ -124,7 +124,8 @@ impl HermitStreamStatePlanner {
     /// * `media_sources` — resolves an item id into its [`MediaSourceInfo`].
     /// * `encoder` — formats the ffmpeg input argument and the `-ss` seek time.
     /// * `encoding_helper` — builds the encoder/map/bitrate/quality/thread args
-    ///   and the stream-copy decision (`NoOptionalEncoders` → software only).
+    ///   and the stream-copy decision (its [`ProbedEncoders`] carrying the
+    ///   `-encoders` probe, so e.g. `libfdk_aac` is preferred when present).
     /// * `config` — the server configuration (persisted encoding options).
     /// * `paths` — the application paths (the transcode cache root).
     /// * `subtitles` — resolves a burned text subtitle to its cached file.
@@ -134,7 +135,7 @@ impl HermitStreamStatePlanner {
     pub fn new(
         media_sources: Arc<dyn MediaSourceManager>,
         encoder: Arc<dyn MediaEncoder>,
-        encoding_helper: EncodingHelper<NoOptionalEncoders>,
+        encoding_helper: EncodingHelper<ProbedEncoders>,
         config: Arc<dyn ServerConfigurationManager>,
         paths: Arc<HermitServerApplicationPaths>,
         subtitles: Arc<dyn SubtitleEncoder>,
@@ -969,6 +970,14 @@ impl HermitStreamStatePlanner {
                     push_split(&mut args, "-ac");
                     args.push(channels.to_string());
                 }
+                // Downmix volume boost (GetAudioFilterParam): a >stereo →
+                // stereo downmix is roughly half as loud, so boost it back.
+                if let Some(af) = hermit_mediaencoding::encoding_helper::helper::audio_filter_param(
+                    state, options,
+                ) {
+                    push_split(&mut args, "-af");
+                    args.push(af);
+                }
             }
         }
 
@@ -1377,16 +1386,27 @@ mod tests {
     }
 
     fn planner(sources: Vec<MediaSourceInfo>) -> HermitStreamStatePlanner {
-        planner_with_tonemapx(sources, false)
+        planner_full(sources, false, &[])
     }
 
     fn planner_with_tonemapx(
         sources: Vec<MediaSourceInfo>,
         supports_tonemapx: bool,
     ) -> HermitStreamStatePlanner {
+        planner_full(sources, supports_tonemapx, &[])
+    }
+
+    fn planner_full(
+        sources: Vec<MediaSourceInfo>,
+        supports_tonemapx: bool,
+        encoders: &[&str],
+    ) -> HermitStreamStatePlanner {
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeMediaSources { sources });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
-        let helper = EncodingHelper::with_processor_count(NoOptionalEncoders, 8);
+        let helper = EncodingHelper::with_processor_count(
+            ProbedEncoders::new(encoders.iter().map(|e| (*e).to_owned()).collect()),
+            8,
+        );
         let paths = Arc::new(HermitServerApplicationPaths::new(
             "/data",
             std::path::PathBuf::from("/data/log"),
@@ -1539,6 +1559,41 @@ mod tests {
             Some("2"),
             "expected `-ac 2`, got: {:?}",
             plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_stereo_downmix_boosts_volume_and_prefers_libfdk() {
+        // A >stereo → 2ch downmix gets `-af volume=2` (GetAudioFilterParam's
+        // DownMixAudioBoost default), and `aac` maps to `libfdk_aac` when the
+        // probed ffmpeg has it (GetAudioEncoder's preference order).
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner_full(vec![src], false, &["libfdk_aac"]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.transcoding_max_audio_channels = Some(2);
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("-c:a libfdk_aac"),
+            "libfdk_aac preferred: {args}"
+        );
+        assert!(args.contains("-af volume=2"), "downmix boost: {args}");
+
+        // Same request without the 2ch cap: no downmix, no boost.
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            !args.contains("-af volume"),
+            "no boost without downmix: {args}"
         );
     }
 

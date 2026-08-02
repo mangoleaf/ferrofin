@@ -1030,6 +1030,32 @@ pub fn requires_software_tonemap(video_stream: Option<&MediaStream>) -> bool {
     video_stream.is_some_and(|s| s.video_range() == hermit_model::data::VideoRange::Hdr)
 }
 
+/// The `-af` audio filter value for a re-encoded audio stream, if any.
+///
+/// Port of `GetAudioFilterParam`'s downmix branch: when downmixing a
+/// more-than-stereo source to 2 channels, boost the volume by the configured
+/// `DownMixAudioBoost` (default `2` — a plain downmix roughly halves perceived
+/// loudness, so Jellyfin doubles it back). The `DownMixStereoAlgorithm` filter
+/// table is not consulted: the default algorithm `None` maps to no filter
+/// string upstream, and Hermit doesn't yet expose the setting. The `asetpts`
+/// branch is skipped — it only fires when timestamps are *not* copied, and
+/// segmented (HLS) transcodes always copy them.
+#[must_use]
+pub fn audio_filter_param(
+    state: &EncodingJobInfo,
+    encoding_options: &EncodingOptions,
+) -> Option<String> {
+    let downmixing_to_stereo = state.output_audio_channels == Some(2)
+        && state
+            .audio_stream
+            .as_ref()
+            .is_some_and(|s| s.channels.is_some_and(|c| c > 2));
+    if downmixing_to_stereo && (encoding_options.down_mix_audio_boost - 1.0).abs() > f64::EPSILON {
+        return Some(format!("volume={}", encoding_options.down_mix_audio_boost));
+    }
+    None
+}
+
 /// Whether a re-encoded video stream needs an explicit 8-bit down-convert.
 ///
 /// `libx264` fed 10-bit input silently produces High10-profile H.264, which
@@ -1869,6 +1895,30 @@ mod tests {
         assert!(!super::requires_8bit_downconvert(Some(&sdr8)));
         assert!(!super::requires_software_tonemap(None));
         assert!(!super::requires_8bit_downconvert(None));
+    }
+
+    #[test]
+    fn audio_filter_param_boosts_stereo_downmix() {
+        // 5.1 → stereo downmix gets the default volume=2 boost (GetAudioFilterParam).
+        let mut surround = audio_stream("ac3", 0);
+        surround.channels = Some(6);
+        let mut state = job(&[surround.clone()]);
+        state.output_audio_channels = Some(2);
+        let opts = EncodingOptions::default();
+        assert_eq!(
+            super::audio_filter_param(&state, &opts).as_deref(),
+            Some("volume=2")
+        );
+        // A boost of exactly 1 emits nothing.
+        let mut unity = opts.clone();
+        unity.down_mix_audio_boost = 1.0;
+        assert_eq!(super::audio_filter_param(&state, &unity), None);
+        // Stereo source or non-stereo output: no downmix, no boost.
+        state.output_audio_channels = Some(6);
+        assert_eq!(super::audio_filter_param(&state, &opts), None);
+        let mut stereo_state = job(&[audio_stream("aac", 0)]);
+        stereo_state.output_audio_channels = Some(2);
+        assert_eq!(super::audio_filter_param(&stereo_state, &opts), None);
     }
 
     #[test]

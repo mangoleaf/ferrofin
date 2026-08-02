@@ -23,7 +23,7 @@ use hermit_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
 };
 use hermit_mediaencoding::{
-    AttachmentExtractorImpl, EncodingHelper, NoOptionalEncoders, NoopSessionReporter,
+    AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, ProbedEncoders,
     TokioSegmentTranscoder, TranscodeManagerImpl,
 };
 use hermit_model::configuration::EncodingOptions;
@@ -41,6 +41,7 @@ use hermit_traits::media_encoding::{
 use hermit_traits::system::PathManager;
 use uuid::Uuid;
 
+use crate::bootstrap::FfmpegPaths;
 use crate::planner::HermitStreamStatePlanner;
 
 /// Builds the concrete media-encoding pair injected via
@@ -60,9 +61,10 @@ use crate::planner::HermitStreamStatePlanner;
 /// reporting is deferred; killed-job partial-file cleanup is handled by the
 /// manager's `FsFileCleaner`).
 ///
-/// `supports_tonemapx` is the startup `-filters` probe result: whether the
-/// discovered ffmpeg has the jellyfin-ffmpeg-only `tonemapx` software tonemap
-/// (the planner falls back to the vanilla zscale chain without it).
+/// `ffmpeg` carries the startup capability probes: the `-filters` list gates
+/// the jellyfin-ffmpeg-only `tonemapx` software tonemap (the planner falls
+/// back to the vanilla zscale chain without it), and the `-encoders` list lets
+/// the audio path prefer `aac_at`/`libfdk_aac` over native `aac` when present.
 #[must_use]
 pub fn build_media_encoding(
     media_sources: Arc<dyn MediaSourceManager>,
@@ -70,7 +72,7 @@ pub fn build_media_encoding(
     config: Arc<dyn ServerConfigurationManager>,
     paths: Arc<HermitServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
-    supports_tonemapx: bool,
+    ffmpeg: &FfmpegPaths,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
@@ -95,11 +97,11 @@ pub fn build_media_encoding(
     let planner = HermitStreamStatePlanner::new(
         Arc::clone(&media_sources),
         Arc::clone(&encoder),
-        EncodingHelper::new(NoOptionalEncoders),
+        EncodingHelper::new(ProbedEncoders::new(ffmpeg.encoders.clone())),
         config,
         Arc::clone(&paths),
         Arc::clone(&subtitles),
-        supports_tonemapx,
+        ffmpeg.supports_filter("tonemapx"),
     );
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -636,8 +638,14 @@ mod tests {
             root: "/cache/att".to_owned(),
         });
         // The trio builds without panicking; every slot is a real trait object.
+        let ffmpeg = FfmpegPaths {
+            ffmpeg: "ffmpeg".into(),
+            ffprobe: "ffprobe".into(),
+            filters: Vec::new(),
+            encoders: Vec::new(),
+        };
         let (_hls, _attachments, _subtitles) =
-            build_media_encoding(media_sources, encoder, config, paths, path_manager, false);
+            build_media_encoding(media_sources, encoder, config, paths, path_manager, &ffmpeg);
     }
 
     #[tokio::test]

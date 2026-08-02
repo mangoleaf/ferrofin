@@ -43,6 +43,12 @@ static FILTER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s\S{2,3}\s(?P<filter>[\w|-]+)\s+.+$").expect("valid regex")
 });
 
+/// `^\s\S{6}\s(?<codec>[\w|-]+)\s+.+$` (multiline) — matches each codec name in
+/// `ffmpeg -encoders` / `-decoders` output (one leading space, the 6-char
+/// capability flags, the name). The legend and `------` divider never match.
+static CODEC_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s\S{6}\s(?P<codec>[\w|-]+)\s+.+$").expect("valid regex"));
+
 /// The library versions corresponding to the minimum ffmpeg version 4.4.
 ///
 /// Refers to the versions in <https://ffmpeg.org/download.html>. Used to work
@@ -170,6 +176,22 @@ impl EncoderValidator {
             .collect()
     }
 
+    /// Parses captured `ffmpeg -encoders` (or `-decoders`) output into the
+    /// available codec names.
+    ///
+    /// The pure half of C# `GetCodecs`: the caller shells out for the output
+    /// and consults the returned names for capability-gated encoder selection
+    /// (e.g. preferring `libfdk_aac` over native `aac` when present). The C#
+    /// intersection with its required-codecs allowlist is skipped — callers
+    /// check exactly the codecs they need.
+    #[must_use]
+    pub fn get_codecs_internal(output: &str) -> Vec<String> {
+        CODEC_REGEX
+            .captures_iter(output)
+            .map(|caps| caps["codec"].to_owned())
+            .collect()
+    }
+
     /// Grabs the library names and `major.minor` versions from `ffmpeg -version`
     /// output. Mirrors C# `GetFFmpegLibraryVersions`.
     fn get_ffmpeg_library_versions(output: &str) -> HashMap<String, FfmpegVersion> {
@@ -249,5 +271,22 @@ mod tests {
         let filters = EncoderValidator::get_filters_internal(output);
         assert_eq!(filters, ["abench", "scale", "tonemapx", "scale_cuda"]);
         assert!(EncoderValidator::get_filters_internal("").is_empty());
+    }
+
+    #[test]
+    fn get_codecs_internal_parses_names_and_skips_legend() {
+        // Shape of real `ffmpeg -encoders` output: header, legend, `------`
+        // divider, then ` <6 flags> <name> <description>` lines.
+        let output = "Encoders:\n\
+             \x20V..... = Video\n\
+             \x20A..... = Audio\n\
+             \x20.F.... = Frame-level multithreading\n\
+             \x20------\n\
+             \x20V....D libx264              libx264 H.264 / AVC (codec h264)\n\
+             \x20A....D aac                  AAC (Advanced Audio Coding)\n\
+             \x20A....D libfdk_aac           Fraunhofer FDK AAC (codec aac)\n";
+        let codecs = EncoderValidator::get_codecs_internal(output);
+        assert_eq!(codecs, ["libx264", "aac", "libfdk_aac"]);
+        assert!(EncoderValidator::get_codecs_internal("").is_empty());
     }
 }

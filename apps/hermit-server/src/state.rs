@@ -782,7 +782,7 @@ pub async fn build_app_state(
         me_config,
         Arc::clone(&paths),
         me_path_manager,
-        ffmpeg.supports_filter("tonemapx"),
+        ffmpeg,
     );
     let state = state
         .with_media_encoding(hls, attachments)
@@ -896,6 +896,7 @@ mod tests {
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: PathBuf::from("ffprobe"),
             filters: Vec::new(),
+            encoders: Vec::new(),
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
 

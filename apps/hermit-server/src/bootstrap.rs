@@ -31,6 +31,10 @@ pub struct FfmpegPaths {
     /// when the probe failed). Gates capability-specific arguments like the
     /// jellyfin-ffmpeg-only `tonemapx` software tonemap.
     pub filters: Vec<String>,
+    /// The encoder names the validated ffmpeg reported via `-encoders` (empty
+    /// when the probe failed). Gates encoder selection like preferring
+    /// `libfdk_aac` over native `aac`.
+    pub encoders: Vec<String>,
 }
 
 impl FfmpegPaths {
@@ -39,6 +43,13 @@ impl FfmpegPaths {
     #[must_use]
     pub fn supports_filter(&self, name: &str) -> bool {
         self.filters.iter().any(|f| f == name)
+    }
+
+    /// Whether the validated ffmpeg reports the encoder `name`. Port of
+    /// `IMediaEncoder.SupportsEncoder`.
+    #[must_use]
+    pub fn supports_encoder(&self, name: &str) -> bool {
+        self.encoders.iter().any(|e| e == name)
     }
 }
 
@@ -172,45 +183,48 @@ pub async fn discover_ffmpeg(
             )
         })?;
 
-    let filters = probe_filters(&ffmpeg).await;
+    let filters = probe_list(&ffmpeg, "-filters", EncoderValidator::get_filters_internal).await;
+    let encoders = probe_list(&ffmpeg, "-encoders", EncoderValidator::get_codecs_internal).await;
     tracing::info!(
         ffmpeg = %ffmpeg.display(),
         ffprobe = %ffprobe.display(),
         filters = filters.len(),
+        encoders = encoders.len(),
         tonemapx = filters.iter().any(|f| f == "tonemapx"),
+        libfdk_aac = encoders.iter().any(|e| e == "libfdk_aac"),
         "media encoder ready"
     );
     Ok(FfmpegPaths {
         ffmpeg,
         ffprobe,
         filters,
+        encoders,
     })
 }
 
-/// Captures `ffmpeg -filters` and parses the available filter names.
+/// Captures `ffmpeg <flag>` (`-filters` / `-encoders`) and parses the names.
 ///
-/// Port of `EncoderValidator.GetFFmpegFilters` (the process half; the parse is
-/// [`EncoderValidator::get_filters_internal`]). A probe failure is not fatal —
-/// capability-gated arguments are simply skipped — so errors log and return an
-/// empty list, matching the C# catch-and-return-empty.
-async fn probe_filters(ffmpeg: &Path) -> Vec<String> {
+/// Port of `EncoderValidator.GetFFmpegFilters` / `GetCodecs` (the process
+/// half; the parses are the `EncoderValidator::get_*_internal` pure fns). A
+/// probe failure is not fatal — capability-gated arguments are simply skipped —
+/// so errors log and return an empty list, matching the C#
+/// catch-and-return-empty.
+async fn probe_list(ffmpeg: &Path, flag: &str, parse: fn(&str) -> Vec<String>) -> Vec<String> {
     let output = tokio::process::Command::new(ffmpeg)
-        .args(["-hide_banner", "-filters"])
+        .args(["-hide_banner", flag])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await;
     match output {
-        Ok(out) if out.status.success() => {
-            EncoderValidator::get_filters_internal(&String::from_utf8_lossy(&out.stdout))
-        }
+        Ok(out) if out.status.success() => parse(&String::from_utf8_lossy(&out.stdout)),
         Ok(out) => {
-            tracing::warn!(status = %out.status, "`ffmpeg -filters` failed; assuming no optional filters");
+            tracing::warn!(status = %out.status, flag, "ffmpeg capability probe failed; assuming none");
             Vec::new()
         }
         Err(e) => {
-            tracing::warn!(error = %e, "error detecting available filters");
+            tracing::warn!(error = %e, flag, "error running ffmpeg capability probe");
             Vec::new()
         }
     }
@@ -456,14 +470,20 @@ mod tests {
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
         // `ffprobe` banner (whose first line the `^ffmpeg version` regex skips).
-        // A `-filters` invocation instead answers with a tiny filter table so
-        // `probe_filters` has something to parse.
+        // `-filters` / `-encoders` invocations instead answer with tiny
+        // capability tables so `probe_list` has something to parse.
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
              \x20 T.. = Timeline support\n\
              \x20T.C scale             V->V       Scale the input video size.\n\
              \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
+             EOF\nexit 0; fi\n\
+             if [ \"$2\" = -encoders ]; then cat <<'EOF'\nEncoders:\n\
+             \x20A..... = Audio\n\
+             \x20------\n\
+             \x20A....D aac                  AAC (Advanced Audio Coding)\n\
+             \x20A....D libfdk_aac           Fraunhofer FDK AAC (codec aac)\n\
              EOF\nexit 0; fi\n\
              cat <<'EOF'\n{banner_tool} version 6.1.1 Copyright (c) 2000-2023\n\
              libavutil      58. 29.100\nlibavcodec     60. 31.102\nlibavformat    60. 16.100\n\
@@ -492,10 +512,12 @@ mod tests {
             .expect("discovery succeeds");
         assert_eq!(paths.ffmpeg, ffmpeg);
         assert_eq!(paths.ffprobe, tmp.path().join("ffprobe"));
-        // The `-filters` probe parsed the fake's filter table.
+        // The `-filters` / `-encoders` probes parsed the fake's tables.
         assert!(paths.supports_filter("tonemapx"));
         assert!(paths.supports_filter("scale"));
         assert!(!paths.supports_filter("tonemap_cuda"));
+        assert!(paths.supports_encoder("libfdk_aac"));
+        assert!(!paths.supports_encoder("aac_at"));
     }
 
     #[cfg(unix)]
