@@ -87,5 +87,8 @@ export function handleSummary(data) {
     // since the orchestrator snapshots cgroup cpu.stat around the whole k6 run.
     reqs: reqs.count || 0,
   };
-  return { [`results/raw/phaseA-${TARGET}-${NAME}.json`]: JSON.stringify(out), stdout: '' };
+  // PHASE_OUT lets the Phase B sweep write per-rate files without clobbering the
+  // Phase A per-endpoint file; default is the Phase A name.
+  const key = __ENV.PHASE_OUT || `phaseA-${TARGET}-${NAME}`;
+  return { [`results/raw/${key}.json`]: JSON.stringify(out), stdout: '' };
 }
