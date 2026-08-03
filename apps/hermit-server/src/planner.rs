@@ -812,6 +812,16 @@ impl HermitStreamStatePlanner {
             let ss = self.encoder.get_time_parameter(seek_ticks);
             push_split(&mut args, "-ss");
             push_split(&mut args, ss.trim_start_matches("-ss").trim());
+            // A copied video stream restarts at the keyframe *before* the seek
+            // target, but ffmpeg's default accurate seek still trims re-encoded
+            // audio forward to the exact target — the muxed audio then leads the
+            // video by (target − keyframe), an audible desync on every seeked
+            // copy-video stream (measured 0.7–1.6 s on real media). Start the
+            // audio at the same keyframe instead; the segment already begins
+            // there for video anyway.
+            if copying_video {
+                args.push("-noaccurate_seek".to_owned());
+            }
         }
         // Decode the source on the GPU too (NVDEC) when we're NVENC-encoding, so
         // the whole pipeline stays on the card — this is what makes 4K transcode
@@ -1931,6 +1941,55 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["-output_ts_offset", "6"]),
             "seek segment must set -output_ts_offset to N*segment_len: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_seek_with_video_copy_disables_accurate_seek() {
+        // A seeked copy-video stream: ffmpeg's accurate seek would trim the
+        // re-encoded audio forward to the seek target while the copied video
+        // restarts at the previous keyframe — audio then leads video by
+        // (target − keyframe) in every segment after a seek. `-noaccurate_seek`
+        // starts both streams at the keyframe.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
+        let plan = p.plan(&req, false, Some(2)).await.unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "seek + video copy must disable accurate seek: {:?}",
+            plan.arguments
+        );
+
+        // A seeked re-encode discards up to the target on BOTH streams — accurate
+        // seek is correct there, and the flag must not appear.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let plan = p.plan(&request("abc"), false, Some(2)).await.unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "re-encode seek keeps accurate seek: {:?}",
+            plan.arguments
+        );
+
+        // No seek (segment 0): no flag either way.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "no seek, no flag: {:?}",
             plan.arguments
         );
     }
