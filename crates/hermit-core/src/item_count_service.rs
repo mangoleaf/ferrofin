@@ -293,8 +293,12 @@ impl ItemCountService for HermitItemCountService {
         user: &UserEntity,
     ) -> Result<HashMap<Uuid, PlayedAndTotal>, ServiceError> {
         let mut out = HashMap::with_capacity(folder_ids.len());
+        // Jellyfin's `Folder.GetUnplayedCount`/`GetPlayedPercentage` count only leaf
+        // (media) descendants — a series' unplayed count is its unplayed episodes,
+        // not its seasons — so constrain to non-folder items.
         let base = InternalItemsQuery {
             recursive: true,
+            is_folder: Some(false),
             user: Some(user.clone()),
             ..Default::default()
         };

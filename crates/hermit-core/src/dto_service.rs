@@ -112,6 +112,9 @@ struct Prefetched {
     /// Direct-child counts per folder item id (populated only when the
     /// `ChildCount` field is requested and a user is present).
     child_counts: HashMap<Uuid, i32>,
+    /// Played/total leaf-descendant counts per folder item id (populated when
+    /// user data is enabled and a user is present), for folder `UnplayedItemCount`.
+    played_counts: HashMap<Uuid, hermit_traits::persistence::PlayedAndTotal>,
 }
 use crate::kinds;
 
@@ -176,6 +179,25 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
 /// unrecognized stored `Type` (the conservative default used across the crate).
 fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
+}
+
+/// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
+/// `UserDataManager` returns for an item with no stored row, used when a folder
+/// needs a UserData object solely to carry `UnplayedItemCount`.
+fn empty_user_data_dto(item_id: Uuid) -> UserItemDataDto {
+    UserItemDataDto {
+        rating: None,
+        played_percentage: None,
+        unplayed_item_count: None,
+        playback_position_ticks: 0,
+        play_count: 0,
+        is_favorite: false,
+        likes: None,
+        last_played_date: None,
+        played: false,
+        key: item_id.to_string(),
+        item_id,
+    }
 }
 
 /// Sets `ChildCount` on a folder DTO from the prefetched per-parent counts.
@@ -763,6 +785,35 @@ impl HermitDtoService {
                     Some(p) => p.user_data.get(&item_id).cloned(),
                     None => self.user_data.get_user_data_dto(item_id, user_id).await?,
                 };
+                // Folder UserData carries UnplayedItemCount = unplayed leaf descendants
+                // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
+                if item.is_folder
+                    && !matches!(
+                        kind,
+                        BaseItemKind::CollectionFolder | BaseItemKind::UserView
+                    )
+                {
+                    let counts = match prefetched {
+                        Some(p) => p.played_counts.get(&item_id).copied(),
+                        None => Some(
+                            self.item_counts
+                                .get_played_and_total_count_batch(
+                                    std::slice::from_ref(&item_id),
+                                    user,
+                                )
+                                .await?
+                                .get(&item_id)
+                                .copied()
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    if let Some(c) = counts {
+                        let ud = dto
+                            .user_data
+                            .get_or_insert_with(|| empty_user_data_dto(item_id));
+                        ud.unplayed_item_count = Some(c.total - c.played);
+                    }
+                }
             }
         }
 
@@ -1466,6 +1517,31 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             }
             _ => HashMap::new(),
         };
+        // Played/total leaf counts for the page's folders in one pass, so folder
+        // UserData can carry UnplayedItemCount (C# AttachUserSpecificInfo folder branch).
+        let played_counts = match user {
+            Some(user) if options.enable_user_data => {
+                let folder_ids: Vec<Uuid> = items
+                    .iter()
+                    .filter(|i| {
+                        i.is_folder
+                            && !matches!(
+                                row_kind(i),
+                                BaseItemKind::CollectionFolder | BaseItemKind::UserView
+                            )
+                    })
+                    .map(row_id)
+                    .collect();
+                if folder_ids.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.item_counts
+                        .get_played_and_total_count_batch(&folder_ids, user)
+                        .await?
+                }
+            }
+            _ => HashMap::new(),
+        };
         let prefetched = Prefetched {
             images,
             user_data,
@@ -1477,6 +1553,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             chapters,
             trickplay,
             child_counts,
+            played_counts,
         };
 
         let mut out = Vec::with_capacity(items.len());
@@ -1800,6 +1877,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn folder_user_data_carries_unplayed_item_count() {
+        let db = test_db().await;
+        let folder_id = Uuid::new_v4();
+        seed_named_item(&db, folder_id, BaseItemKind::Season, "Season 1").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
+            .bind(folder_id.to_string())
+            .execute(db.pool())
+            .await
+            .expect("mark folder");
+        let leaf_id = Uuid::new_v4();
+        seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let folder = fetch_item(&db, folder_id).await;
+        let leaf = fetch_item(&db, leaf_id).await;
+        let svc = service(db);
+        let options = DtoOptions::default(); // enables user data
+
+        // FakeCounts reports 1/4 leaf descendants played → UnplayedItemCount = 3,
+        // on both the single-item and the batch (prefetched) path.
+        let single = svc
+            .get_base_item_dto(&folder, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            single.user_data.as_ref().unwrap().unplayed_item_count,
+            Some(3)
+        );
+        let batch = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&folder),
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch[0].user_data.as_ref().unwrap().unplayed_item_count,
+            Some(3)
+        );
+
+        // A leaf (non-folder) item never carries UnplayedItemCount.
+        let leaf_dto = svc
+            .get_base_item_dto(&leaf, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            leaf_dto.user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+    }
+
     /// An [`ItemCountService`] fake returning fixed name-item counts.
     #[derive(Default)]
     struct FakeCounts;
@@ -1861,11 +1992,23 @@ mod tests {
         }
         async fn get_played_and_total_count_batch(
             &self,
-            _folder_ids: &[Uuid],
+            folder_ids: &[Uuid],
             _user: &UserEntity,
         ) -> Result<HashMap<Uuid, hermit_traits::persistence::PlayedAndTotal>, ServiceError>
         {
-            Ok(HashMap::new())
+            // Every folder reports 1 of 4 leaf descendants played → 3 unplayed.
+            Ok(folder_ids
+                .iter()
+                .map(|&f| {
+                    (
+                        f,
+                        hermit_traits::persistence::PlayedAndTotal {
+                            played: 1,
+                            total: 4,
+                        },
+                    )
+                })
+                .collect())
         }
         async fn get_child_count_batch(
             &self,

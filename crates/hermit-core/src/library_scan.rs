@@ -796,6 +796,7 @@ impl LibraryScanner {
             }
             let info = series_resolver::resolve(naming, &entry.path);
             let name = info.name.unwrap_or_else(|| entry.name.clone());
+            let series_name = name.clone();
             let Some((series_id, mut series)) =
                 Self::base_item(BaseItemKind::Series, cf, cf, name, &entry.path, true)
             else {
@@ -812,7 +813,7 @@ impl LibraryScanner {
                 entity: series,
                 ancestors: vec![cf],
             });
-            self.plan_series(&entry.path, cf, series_id, naming, out);
+            self.plan_series(&entry.path, cf, series_id, &series_name, naming, out);
         }
     }
 
@@ -824,6 +825,7 @@ impl LibraryScanner {
         series_dir: &str,
         cf: Uuid,
         series_id: Uuid,
+        series_name: &str,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
@@ -844,7 +846,7 @@ impl LibraryScanner {
                         BaseItemKind::Season,
                         cf,
                         series_id,
-                        name,
+                        name.clone(),
                         &entry.path,
                         true,
                     ) else {
@@ -852,6 +854,7 @@ impl LibraryScanner {
                     };
                     e.index_number = num.map(i64::from);
                     e.series_id = Some(series_id.to_string());
+                    e.series_name = Some(series_name.to_owned());
                     e.series_presentation_unique_key = Some(series_id.to_string());
                     out.push(Planned {
                         id: season_id,
@@ -863,6 +866,8 @@ impl LibraryScanner {
                         cf,
                         series_id,
                         Some((season_id, num)),
+                        series_name,
+                        Some(&name),
                         naming,
                         out,
                     );
@@ -875,7 +880,7 @@ impl LibraryScanner {
                 loose.push(entry.path);
             }
         }
-        Self::plan_loose_episodes(&loose, cf, series_id, series_dir, naming, out);
+        Self::plan_loose_episodes(&loose, cf, series_id, series_name, series_dir, naming, out);
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths`.
@@ -897,6 +902,7 @@ impl LibraryScanner {
         paths: &[String],
         cf: Uuid,
         series_id: Uuid,
+        series_name: &str,
         series_dir: &str,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
@@ -931,6 +937,7 @@ impl LibraryScanner {
             e.path = None;
             e.index_number = num.map(i64::from);
             e.series_id = Some(series_id.to_string());
+            e.series_name = Some(series_name.to_owned());
             e.series_presentation_unique_key = Some(series_id.to_string());
             out.push(Planned {
                 id: season_id,
@@ -942,26 +949,57 @@ impl LibraryScanner {
 
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
-            Self::emit_episode(path, cf, series_id, season, naming, out);
+            let season_name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
+            Self::emit_episode(
+                path,
+                cf,
+                series_id,
+                season,
+                series_name,
+                Some(&season_name),
+                naming,
+                out,
+            );
         }
     }
 
     /// Plans every video under `dir` (recursively) as an `Episode`. `season` is the
     /// `(season_id, season_number)` when the files live in a season folder.
+    #[allow(clippy::too_many_arguments)]
     fn plan_episodes(
         &self,
         dir: &str,
         cf: Uuid,
         series_id: Uuid,
         season: Option<(Uuid, Option<i32>)>,
+        series_name: &str,
+        season_name: Option<&str>,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_episodes(&entry.path, cf, series_id, season, naming, out);
+                self.plan_episodes(
+                    &entry.path,
+                    cf,
+                    series_id,
+                    season,
+                    series_name,
+                    season_name,
+                    naming,
+                    out,
+                );
             } else if video_resolver::is_video_file(&entry.path, naming) {
-                Self::emit_episode(&entry.path, cf, series_id, season, naming, out);
+                Self::emit_episode(
+                    &entry.path,
+                    cf,
+                    series_id,
+                    season,
+                    series_name,
+                    season_name,
+                    naming,
+                    out,
+                );
             }
         }
     }
@@ -969,11 +1007,14 @@ impl LibraryScanner {
     /// Emits one `Episode` row, parented to its season (or the series when there is
     /// no season folder), carrying `IndexNumber`/`ParentIndexNumber` from the
     /// filename's episode/season numbers.
+    #[allow(clippy::too_many_arguments)]
     fn emit_episode(
         path: &str,
         cf: Uuid,
         series_id: Uuid,
         season: Option<(Uuid, Option<i32>)>,
+        series_name: &str,
+        season_name: Option<&str>,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
@@ -998,7 +1039,14 @@ impl LibraryScanner {
             .and_then(|(_, n)| n)
             .or_else(|| info.as_ref().and_then(|i| i.season_number))
             .map(i64::from);
-        entity.series_name = info.and_then(|i| i.series_name);
+        // The series/season display names come from the parent folders (the
+        // filename resolver rarely carries the series name and never the season
+        // name); Jellyfin surfaces both as Episode.SeriesName/SeasonName.
+        entity.series_name = Some(
+            info.and_then(|i| i.series_name)
+                .unwrap_or_else(|| series_name.to_owned()),
+        );
+        entity.season_name = season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
         entity.series_id = Some(series_id.to_string());
@@ -2012,6 +2060,31 @@ mod tests {
         .unwrap();
         assert_eq!(season_row.1, series.0, "season parents to the series");
         assert_eq!(season_row.2, Some(1));
+
+        // Season carries its SeriesName; episodes carry both SeriesName + SeasonName
+        // (Jellyfin surfaces these on /Shows/{id}/Seasons and /Episodes).
+        let season_series_name: Option<String> = sqlx::query_scalar(
+            r#"SELECT "SeriesName" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Season'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(season_series_name.as_deref(), Some("Breaking Bad"));
+        let ep_names: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT "SeriesName","SeasonName" FROM "BaseItems"
+               WHERE "Type"='MediaBrowser.Controller.Entities.TV.Episode'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            ep_names
+                .iter()
+                .all(|(sr, sn)| sr.as_deref() == Some("Breaking Bad")
+                    && sn.as_deref() == Some("Season 1")),
+            "episodes carry SeriesName + SeasonName: {ep_names:?}"
+        );
 
         // Two episodes → parented to the season, with Index/ParentIndex numbers.
         let eps: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
