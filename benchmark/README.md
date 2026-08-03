@@ -171,7 +171,6 @@ jobs:
 | `scenario.js` | k6: provision → scan-wait → warm → per-endpoint load |
 | `transcode.js` | k6: experimental time-to-first-segment (opt-in) |
 | `run.sh` | orchestrate both, capture footprint, render the report |
-| `perf-gate.sh` | fast Hermit-only regression gate vs `perf-baseline.json` (p50/p95/p99) |
+| `perf-gate.sh` | fast Hermit-only regression gate vs `../suite/perf-baseline.json` (p50/p95/p99) |
 | `perf-gate.js` | k6: closed-model per-endpoint load for the gate (emits the percentiles) |
-| `perf-gate.mjs` | comparator: diff current results vs baseline, print the before/after table |
 | `.env.example` | every tunable, with defaults |

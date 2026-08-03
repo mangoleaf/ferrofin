@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
-"""suite/gate.py — the regression gate, reading the merged run record (Plan 4 + Plan 6 step 6).
+"""suite/gate.py — THE regression gate: the single comparator and single baseline.
 
-Compares the latest merged run (suite/results/runs.json → last entry) against
-suite/perf-baseline.json and FAILS (exit 1) when, for any benched op:
-  - Hermit p50/p95/p99 exceeds baseline × factor (PERF_GATE_FACTOR, default 1.5), or
-  - Hermit's 200-rate is below 100%, or
-  - an op that was `deep_verified` in the baseline has regressed to unverified
-    (parity and perf now gate each other — the reason the merged suite exists).
+One place computes "regressed = ANY of p50/p95/p99 > factor × baseline, or
+200-rate < 100%" (the all-three-percentiles rule is a repo-owner hard
+requirement — median-only gating hides tail regressions). Two input shapes,
+one baseline file (this directory's perf-baseline.json, sections `raw` and
+`merged`):
+
+Raw capture mode — driven by benchmark/perf-gate.sh, which runs k6 per
+sentinel endpoint into results/raw/perfgate-hermit-<name>.json (CWD-relative,
+the runner cd's into benchmark/):
+
+  python3 ../suite/gate.py compare-raw    <baselineFile> <factor> <name...>
+  python3 ../suite/gate.py rebaseline-raw <baselineFile> <vus> <secs> <name...>
+
+compare-raw prints a before/after table (all three percentiles) to STDERR and
+the space-separated regressed endpoint names to STDOUT — the runner re-runs
+just those once to rule out short-window noise. Exit 0 normally; exit 2 only
+on hard errors (missing baseline/section) so the shell can distinguish
+"regression" (names on stdout) from "couldn't run" and never silently pass.
+
+Merged record mode — reads the latest merged suite run (results/runs.json)
+and additionally fails when an op that was `deep_verified` in the baseline has
+regressed to unverified (parity and perf gate each other):
 
   python3 suite/gate.py               check latest run vs baseline
-  python3 suite/gate.py --rebaseline  write baseline from the latest run
+  python3 suite/gate.py --rebaseline  write the merged baseline from the latest run
 """
 import json
 import os
@@ -19,7 +35,102 @@ from pathlib import Path
 RESULTS = Path(__file__).resolve().parent / "results"
 BASELINE = Path(__file__).resolve().parent / "perf-baseline.json"
 FACTOR = float(os.environ.get("PERF_GATE_FACTOR", "1.5"))
+PCTS = ("p50", "p95", "p99")
 
+
+def classify(base, cur, factor):
+    """Which checks trip for one endpoint: [] = ok.
+
+    `cur` needs {p50,p95,p99,ok,bad}; no result / no measured 200s ⇒
+    ['nodata']. A percentile trips on strictly-greater than factor× (equal is
+    not a regression); a zero baseline with a nonzero current is Infinity.
+    Any non-200 ⇒ '200%'.
+    """
+    if not cur or not cur.get("ok"):
+        return ["nodata"]
+    tripped = []
+    for p in PCTS:
+        b, c = base[p], cur[p]
+        ratio = (c / b) if b > 0 else (float("inf") if c > 0 else 1.0)
+        if ratio > factor:
+            tripped.append(p)
+    if cur.get("bad", 0) > 0:
+        tripped.append("200%")
+    return tripped
+
+
+# ── raw capture mode (benchmark/perf-gate.sh) ────────────────────────────────
+
+def _load_raw(name):
+    try:
+        return json.loads(Path(f"results/raw/perfgate-hermit-{name}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_baseline_file(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def rebaseline_raw(baseline_file, vus, secs, names):
+    """Writes the `raw` section from the current captures, preserving `merged`."""
+    endpoints = {}
+    for name in names:
+        cur = _load_raw(name)
+        if not cur or not cur.get("ok"):
+            sys.exit(f"rebaseline: no data for {name} — aborting")
+        if cur.get("bad"):
+            sys.exit(f"rebaseline: {name} had {cur['bad']} non-200s — refusing to baseline a broken endpoint")
+        endpoints[name] = {p: cur[p] for p in PCTS}
+    doc = _read_baseline_file(baseline_file)
+    doc["raw"] = {"params": {"vus": int(vus), "secs": int(secs)}, "endpoints": endpoints}
+    Path(baseline_file).write_text(json.dumps(doc, indent=2) + "\n")
+    print(f"baselined {len(names)} endpoints @ {vus} VUs × {secs}s → {baseline_file} [raw]",
+          file=sys.stderr)
+
+
+def compare_raw(baseline_file, factor, names):
+    doc = _read_baseline_file(baseline_file)
+    raw = doc.get("raw")
+    if not raw:
+        print(f"perf-gate: no raw baseline in {baseline_file} — run `./perf-gate.sh --rebaseline` first",
+              file=sys.stderr)
+        sys.exit(2)
+    bp = raw.get("params", {})
+    err = sys.stderr
+    fmt = lambda n: "—" if n is None else f"{n:.1f}"  # noqa: E731 — tiny table formatter
+    print(f"perf-gate: factor {factor}×, baseline @ {bp.get('vus', '?')} VUs × {bp.get('secs', '?')}s", file=err)
+    print("endpoint".ljust(24) + "".join(f"{p} base→cur (×)".ljust(22) for p in PCTS) + "200%  verdict", file=err)
+
+    regressed = []
+    for name in names:
+        base = raw.get("endpoints", {}).get(name)
+        cur = _load_raw(name)
+        if not cur or not cur.get("ok"):
+            regressed.append(name)
+            print(name.ljust(24) + "NO DATA (k6 produced no measured 200s)", file=err)
+            continue
+        if not base:
+            print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   (no baseline — skipped)",
+                  file=err)
+            continue
+        tripped = classify(base, cur, factor)
+        rate200 = f"{100 * cur['ok'] / (cur['ok'] + cur['bad']):.0f}%"
+        cols = ""
+        for p in PCTS:
+            ratio = (cur[p] / base[p]) if base[p] > 0 else float("inf")
+            cols += f"{fmt(base[p])}→{fmt(cur[p])} ({ratio:.2f}{'!' if ratio > factor else ''})".ljust(22)
+        print(name.ljust(24) + cols + rate200.ljust(6) + (f"FAIL {','.join(tripped)}" if tripped else "ok"),
+              file=err)
+        if tripped:
+            regressed.append(name)
+    sys.stdout.write(" ".join(regressed))
+
+
+# ── merged record mode (suite/run.sh gate) ───────────────────────────────────
 
 def latest_run():
     runs = json.loads((RESULTS / "runs.json").read_text())["runs"]
@@ -29,7 +140,7 @@ def latest_run():
     return live[-1]
 
 
-def rebaseline(run):
+def rebaseline_merged(run):
     # Keyed by VARIANT (each /Items variant has its own latency); deep_verified is its op's.
     variants = {}
     for o in run["operations"]:
@@ -38,15 +149,18 @@ def rebaseline(run):
             continue
         variants[p["variant"]] = {"op": o["op"], "h_p50": p["h_p50"], "h_p95": p["h_p95"],
                                   "h_p99": p["h_p99"], "deep_verified": o["parity"]["deep_verified"]}
-    BASELINE.write_text(json.dumps({"factor": FACTOR, "hermit": run["meta"]["hermit"],
-                                    "variants": variants}, indent=2) + "\n")
-    print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['hermit']}")
+    doc = _read_baseline_file(BASELINE)
+    doc["merged"] = {"factor": FACTOR, "hermit": run["meta"]["hermit"], "variants": variants}
+    BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
+    print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['hermit']} [merged]")
 
 
-def check(run):
-    if not BASELINE.exists():
-        sys.exit("gate: no baseline — run `suite/run.sh gate --rebaseline` once to establish one")
-    base = json.loads(BASELINE.read_text())["variants"]
+def check_merged(run):
+    doc = _read_baseline_file(BASELINE)
+    merged = doc.get("merged")
+    if not merged:
+        sys.exit("gate: no merged baseline — run `suite/run.sh gate --rebaseline` once to establish one")
+    base = merged["variants"]
     fails = []
     for o in run["operations"]:
         op, p, par = o["op"], o["perf"], o["parity"]
@@ -57,7 +171,7 @@ def check(run):
             fails.append(f"{p['variant']}: Hermit 200-rate {p['h_ok']}% < 100%")
         for pct in ("h_p50", "h_p95", "h_p99"):
             if p[pct] is not None and b[pct] and p[pct] > b[pct] * FACTOR:
-                fails.append(f"{p['variant']} {pct}: {p[pct]} > {b[pct]}×{FACTOR} (={round(b[pct]*FACTOR,1)})")
+                fails.append(f"{p['variant']} {pct}: {p[pct]} > {b[pct]}×{FACTOR} (={round(b[pct] * FACTOR, 1)})")
         if b.get("deep_verified") and not par["deep_verified"]:
             fails.append(f"{op} ({p['variant']}): parity regressed — was deep_verified, now "
                          f"{par['depth']}/unverified")
@@ -72,8 +186,12 @@ def check(run):
 
 
 if __name__ == "__main__":
-    run = latest_run()
-    if "--rebaseline" in sys.argv:
-        rebaseline(run)
+    argv = sys.argv[1:]
+    if argv[:1] == ["compare-raw"]:
+        compare_raw(argv[1], float(argv[2]), argv[3:])
+    elif argv[:1] == ["rebaseline-raw"]:
+        rebaseline_raw(argv[1], argv[2], argv[3], argv[4:])
+    elif "--rebaseline" in argv:
+        rebaseline_merged(latest_run())
     else:
-        check(run)
+        check_merged(latest_run())

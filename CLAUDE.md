@@ -192,7 +192,9 @@ cd benchmark && ./perf-gate.sh          # Hermit-only; fails if any sentinel end
                                         # exceeds 1.5× baseline on p50, p95, or p99
 ```
 
-~5 min; compares Hermit to `benchmark/perf-baseline.json`. Re-`./perf-gate.sh --rebaseline`
+~5 min; compares Hermit to the `raw` section of `suite/perf-baseline.json` — the ONE
+baseline file, with `suite/gate.py` as the ONE comparator (also driven by
+`suite/run.sh gate` over the merged parity+perf record). Re-`./perf-gate.sh --rebaseline`
 at each release and after any *intended* perf change so only unintended slowdowns trip it.
 All three percentiles gate (tail regressions are what users feel). See `benchmark/README.md`.
 

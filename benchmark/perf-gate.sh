@@ -29,7 +29,10 @@ FACTOR=${PERF_GATE_FACTOR:-1.5}
 VUS=${PERF_GATE_VUS:-10}
 SECS=${PERF_GATE_SECONDS:-10}
 ENDPOINTS_LIST=${PERF_GATE_ENDPOINTS:-"info_public user_me items_sortname items_mixed item_detail persons studios suggestions movie_recommendations items_filters2 image_primary"}
-BASELINE=perf-baseline.json
+# The ONE baseline file (suite/perf-baseline.json, section `raw`) — the
+# comparator is suite/gate.py, the single implementation of the
+# any-of-p50/p95/p99 rule for both this runner and `suite/run.sh gate`.
+BASELINE=../suite/perf-baseline.json
 export PERF_GATE_VUS="$VUS" PERF_GATE_SECONDS="$SECS"
 
 REBASELINE=0
@@ -62,7 +65,7 @@ run_endpoints "$ENDPOINTS_LIST"
 
 if [ "$REBASELINE" = 1 ]; then
   # shellcheck disable=SC2086  # word-splitting is intentional: names → separate args
-  node perf-gate.mjs rebaseline "$BASELINE" "$VUS" "$SECS" $ENDPOINTS_LIST
+  python3 ../suite/gate.py rebaseline-raw "$BASELINE" "$VUS" "$SECS" $ENDPOINTS_LIST
   docker compose down -v >/dev/null 2>&1 || true
   exit 0
 fi
@@ -72,7 +75,7 @@ fi
 # on a missing baseline. A non-zero exit means a hard error (missing baseline); a
 # zero exit with names on stdout means those endpoints regressed.
 # shellcheck disable=SC2086  # word-splitting is intentional: names → separate args
-if ! fails=$(node perf-gate.mjs compare "$BASELINE" "$FACTOR" $ENDPOINTS_LIST); then
+if ! fails=$(python3 ../suite/gate.py compare-raw "$BASELINE" "$FACTOR" $ENDPOINTS_LIST); then
   docker compose down -v >/dev/null 2>&1 || true
   echo ">> perf-gate ERROR: comparator failed (missing baseline? run --rebaseline)"; exit 2
 fi
@@ -86,7 +89,7 @@ fi
 echo ">> perf-gate: [$fails] regressed on round 1 — retrying once to rule out noise"
 run_endpoints "$fails"
 # shellcheck disable=SC2086  # word-splitting is intentional: names → separate args
-if ! fails2=$(node perf-gate.mjs compare "$BASELINE" "$FACTOR" $fails); then
+if ! fails2=$(python3 ../suite/gate.py compare-raw "$BASELINE" "$FACTOR" $fails); then
   docker compose down -v >/dev/null 2>&1 || true
   echo ">> perf-gate ERROR: comparator failed on retry"; exit 2
 fi
