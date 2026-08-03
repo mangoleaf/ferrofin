@@ -333,7 +333,14 @@ impl UserDataManager for HermitUserDataManager {
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
 
-        let mut position_ticks = reported_position_ticks.unwrap_or(runtime_ticks);
+        // A report with no position (an interrupted/failed start where the client
+        // can't say where it was) tells us nothing. Jellyfin assumes "finished"
+        // here, which marks the item played and wipes a still-valid resume point;
+        // we preserve existing play-state instead so a hung resume doesn't destroy
+        // progress. ponytail: deliberate divergence from Jellyfin, see bug notes.
+        let Some(mut position_ticks) = reported_position_ticks else {
+            return Ok(false);
+        };
         let has_runtime = runtime_ticks > 0;
         let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
         let is_book = matches!(kind, BaseItemKind::Book);
@@ -669,6 +676,39 @@ mod tests {
             .expect("some");
         assert!(dto.played);
         assert_eq!(dto.playback_position_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn update_play_state_none_position_preserves_resume_point() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        let runtime = 3600 * TICKS_PER_SECOND;
+        seed_movie_with_runtime(&db, item, runtime).await;
+        let mgr = HermitUserDataManager::new(db, config());
+
+        // Establish a mid-video resume point.
+        let position = runtime / 2;
+        mgr.update_play_state(user, item, Some(position))
+            .await
+            .expect("seed resume point");
+
+        // A stop report with no position (failed/hung resume) must NOT mark the
+        // item played or wipe the resume point.
+        let played = mgr
+            .update_play_state(user, item, None)
+            .await
+            .expect("update");
+        assert!(!played);
+
+        let dto = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("some");
+        assert!(!dto.played);
+        assert_eq!(dto.playback_position_ticks, position);
     }
 
     #[tokio::test]
