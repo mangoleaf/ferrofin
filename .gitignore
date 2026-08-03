@@ -13,3 +13,4 @@
 
 brain/
 .rcg/
+__pycache__/

@@ -54,3 +54,17 @@ perf runs them one at a time (no resource sharing during measurement).
 
 `migrate-history.py` (one-shot) folds the old `bench-data.json` runs into `results/runs.json` as
 greyed `legacy: true` / `comparable: false` entries — visible in the trend, never comparable.
+
+## Accepted deviations (decided — do not re-litigate)
+
+- **`MediaSourceManager::get_alternate_versions_batch` trait default returns "no alternates".**
+  Kept: the sole concrete impl overrides it with the repository query, the test fakes rely on
+  the default, and the doc comment warns any future third implementor. Not a stub in production.
+- **Commit `f108b19` contains Plan 6's four `benchmark/parity.*` deletions.** A shared-index
+  sweep during the multi-agent wave attributed them to the Plan 4 commit. Content is correct;
+  history stays as-is (rewriting shared `main` is worse than a muddled attribution).
+- **The CI perf-gate job is best-effort/non-blocking by design** (`.github/workflows/ci.yml`):
+  shared runners are too noisy for a latency threshold to block on, and it never reads the
+  repo's committed baseline (dev-host numbers aren't comparable to runner numbers — it
+  rebaselines from the PR's merge-base on the same runner instead). The mandatory gate is the
+  local `benchmark/perf-gate.sh` per `CLAUDE.md`.
