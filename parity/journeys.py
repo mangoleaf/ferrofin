@@ -211,6 +211,9 @@ def j_device_options(base, token, user, _m, _m2):
         after = (get_json(base, "/Devices", token) or {}).get("Items") or []
         renamed = next((d for d in after if d.get("Id") == dev["Id"]), {})
         r["POST /Devices/Options"] = st < 300 and renamed.get("CustomName") == "ParityRenamed"
+        # Read the options back by id (needs a device that has options set — just did).
+        opts = get_json(base, f"/Devices/Options?id={dev['Id']}", token) or {}
+        r["GET /Devices/Options"] = opts.get("CustomName") == "ParityRenamed"
     return r
 
 
@@ -665,6 +668,34 @@ def j_bulk_item_delete(base, token, user, mid, _m2):
     return r
 
 
+def j_subtitles_upload(base, token, user, mid, _m2):
+    import base64
+    srt = "1\n00:00:00,000 --> 00:00:01,000\nParity\n"
+    body = json.dumps({
+        "Language": "eng", "Format": "srt", "IsForced": False,
+        "IsHearingImpaired": False,
+        "Data": base64.b64encode(srt.encode()).decode(),
+    })
+    st, _ = http("POST", f"{base}/Videos/{mid}/Subtitles", token, body)
+    return {"POST /Videos/{itemId}/Subtitles": st < 300}
+
+
+def j_merge_versions_controller(base, token, user, mid, m2):
+    """The /MergeVersions/* controller (no documented params/body). Probe each with the
+    ids query the sibling /Videos/MergeVersions uses; records acceptance so the differential
+    reveals whether both servers implement it identically."""
+    r = {}
+    for op, path in [
+        ("POST /MergeVersions/MergeMovies", f"/MergeVersions/MergeMovies?ids={mid},{m2}"),
+        ("POST /MergeVersions/MergeEpisodes", f"/MergeVersions/MergeEpisodes?ids={mid},{m2}"),
+        ("POST /MergeVersions/SplitMovies", f"/MergeVersions/SplitMovies?id={mid}"),
+        ("POST /MergeVersions/SplitEpisodes", f"/MergeVersions/SplitEpisodes?id={mid}"),
+    ]:
+        st, _ = http("POST", f"{base}{path}", token, "")
+        r[op] = st < 300
+    return r
+
+
 def j_users_password(base, token, user, _m, _m2):
     r = {}
     _, uraw = http("POST", f"{base}/Users/New", token,
@@ -689,7 +720,7 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_system_and_refresh]
+            j_subtitles_upload, j_merge_versions_controller, j_system_and_refresh]
 
 # ---------------------------------------------------------------- run
 

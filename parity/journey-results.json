@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "f5ef42b 2026-08-02",
+  "last_verified": "e77ec91 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -89,6 +89,11 @@
       "note": "H=True J=True"
     },
     "DELETE /Videos/{itemId}/AlternateSources": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Devices/Options": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -207,6 +212,26 @@
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
+    },
+    "POST /MergeVersions/MergeEpisodes": {
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
+    },
+    "POST /MergeVersions/MergeMovies": {
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
+    },
+    "POST /MergeVersions/SplitEpisodes": {
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
+    },
+    "POST /MergeVersions/SplitMovies": {
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
     },
     "POST /PlayingItems/{itemId}": {
       "classification": "ok",
@@ -407,6 +432,11 @@
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
+    },
+    "POST /Videos/{itemId}/Subtitles": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
     }
   }
 }

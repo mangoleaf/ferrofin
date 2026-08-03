@@ -97,7 +97,7 @@ READS = [
     user("GET /DisplayPreferences/{displayPreferencesId}",
          "/DisplayPreferences/usersettings?userId={u}&client=emby"),
     user("GET /Devices/Info", "/Devices/Info?id={device}"),
-    user("GET /Devices/Options", "/Devices/Options?id={device}"),
+    # GET /Devices/Options is exercised in the write journey (needs a device that has options set).
 ]
 
 # ---------------------------------------------------------------- correlation
