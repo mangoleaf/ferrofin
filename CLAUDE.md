@@ -182,6 +182,20 @@ HERMIT_FFMPEG_TESTS=1 cargo test -p hermit-mediaencoding --test segment_transcod
 HERMIT_FFMPEG_TESTS=1 cargo test -p hermit-hls          --test hls_stream_manager_ffmpeg
 ```
 
+### Perf regression gate (mandatory for perf-touching changes)
+Body-diff correctness is not a latency signal — a 100× slowdown can land "green." Any
+change touching `hermit-core`, `hermit-db`, `hermit-api`, or the query/repository/DTO
+paths (`translate_query`, `item_repository`, `dto_service`) **must pass the perf gate**:
+
+```bash
+cd benchmark && ./perf-gate.sh          # Hermit-only; fails if any sentinel endpoint
+                                        # exceeds 1.5× baseline on p50, p95, or p99
+```
+
+~5 min; compares Hermit to `benchmark/perf-baseline.json`. Re-`./perf-gate.sh --rebaseline`
+at each release and after any *intended* perf change so only unintended slowdowns trip it.
+All three percentiles gate (tail regressions are what users feel). See `benchmark/README.md`.
+
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
 by **running the server and exercising it over real HTTP** (e.g. login once returned no

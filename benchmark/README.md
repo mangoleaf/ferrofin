@@ -93,6 +93,50 @@ Every knob is in `.env`: fixture size, VU count, load duration, resource caps, J
 > **Match the Jellyfin version to your vendored OpenAPI spec** (`contracts/jellyfin-openapi-*.json`).
 > Comparing against a different Jellyfin version compares against a different API contract.
 
+## Perf regression gate (`perf-gate.sh`)
+
+`run.sh` is the full release comparison (both servers, every endpoint) and runs per
+release. That's too slow to catch a regression the moment an agent introduces one —
+and its only in-loop signal is body-diff *correctness*, so a 100× latency regression
+can land "green" (this happened: studios p50 191 ms → 19,152 ms, invisibly). The gate
+closes that hole.
+
+`perf-gate.sh` builds the **current working tree**, brings up **Hermit only** (it
+compares Hermit to its own past self, not to Jellyfin — half the containers, half the
+time), drives the sentinel endpoints at a light fixed load, and **fails (exit 1)** if
+any endpoint exceeds `1.5×` its baseline on **p50, p95, *or* p99**, or if its 200-rate
+drops below 100%. All three percentiles gate deliberately: median-only gating has hidden
+2× p99 tail regressions before, and tail latency is what users feel as stutter.
+
+```bash
+cd benchmark
+./perf-gate.sh --rebaseline   # once: capture perf-baseline.json from current HEAD
+./perf-gate.sh                # per change: gate the working tree against the baseline
+```
+
+Short runs make percentiles (p99 especially) noisy, so a first-round failure is
+**re-run once** and must reproduce before the gate fails — a one-off blip passes.
+
+Knobs (env; defaults tuned "loose enough to ignore noise, tight enough to catch a 2×
+regression" — **ask the repo owner before changing**):
+
+| Env | Default | Meaning |
+|---|---|---|
+| `PERF_GATE_FACTOR` | `1.5` | fail if any percentile exceeds this × baseline |
+| `PERF_GATE_VUS` | `10` | closed-model VUs per endpoint |
+| `PERF_GATE_SECONDS` | `10` | measured window per endpoint |
+| `PERF_GATE_ENDPOINTS` | 11 sentinels | endpoint ids (from `bench-lib.js`) to gate |
+
+`perf-baseline.json` stores all three percentiles per endpoint plus the params it was
+captured under. **Re-`--rebaseline` at each release** (and after any intended perf change
+— e.g. a DB pool-size change), so the baseline tracks intended improvements and only
+*unintended* slowdowns trip the gate. It reads `.env` like the other scripts, so capture
+the baseline and gate on the same host/fixture.
+
+> Runs in ~5 min, so the loop agent runs it per iteration on any change touching
+> `hermit-core`, `hermit-db`, `hermit-api`, or the query/repository/DTO paths. See the
+> quality-gates section of the root `CLAUDE.md`.
+
 ## Regenerating on every release
 
 `./run.sh` *is* the regeneration command — run it at each Hermit release and commit the new
@@ -127,4 +171,7 @@ jobs:
 | `scenario.js` | k6: provision → scan-wait → warm → per-endpoint load |
 | `transcode.js` | k6: experimental time-to-first-segment (opt-in) |
 | `run.sh` | orchestrate both, capture footprint, render the report |
+| `perf-gate.sh` | fast Hermit-only regression gate vs `perf-baseline.json` (p50/p95/p99) |
+| `perf-gate.js` | k6: closed-model per-endpoint load for the gate (emits the percentiles) |
+| `perf-gate.mjs` | comparator: diff current results vs baseline, print the before/after table |
 | `.env.example` | every tunable, with defaults |
