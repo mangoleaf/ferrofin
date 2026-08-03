@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "abee3d6 2026-08-02",
+  "last_verified": "8451f23 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -14,6 +14,16 @@
       "note": "H=True J=True"
     },
     "DELETE /Items/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Library/VirtualFolders": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Library/VirtualFolders/Paths": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -103,7 +113,27 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Library/VirtualFolders": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Library/VirtualFolders/LibraryOptions": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /Library/VirtualFolders/Name": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Library/VirtualFolders/Paths": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Library/VirtualFolders/Paths/Update": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"

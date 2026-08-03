@@ -92,6 +92,10 @@ READS = [
     user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
     user("GET /Shows/{seriesId}/Seasons", "/Shows/{series}/Seasons?userId={u}"),
     user("GET /Shows/{seriesId}/Episodes", "/Shows/{series}/Episodes?userId={u}"),
+    # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
+    user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
+    user("GET /DisplayPreferences/{displayPreferencesId}",
+         "/DisplayPreferences/usersettings?userId={u}&client=emby"),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -127,6 +131,10 @@ def resolve_named(base, token, user_id):
         it = (b or {}).get("Items") or []
         return it[0]["Id"] if it else ""
 
+    def first_task():
+        tasks = get_json(base, "/ScheduledTasks", token) or []
+        return tasks[0]["Id"] if tasks and tasks[0].get("Id") else ""
+
     return {
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
@@ -134,6 +142,7 @@ def resolve_named(base, token, user_id):
         "studio": first_name("/Studios"),
         "person": first_name("/Persons"),
         "series": first_id("Series"),
+        "task": first_task(),
     }
 
 
@@ -248,7 +257,8 @@ def selfcheck():
     assert not bad, f"read op-keys not in spec: {bad}"
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
-    ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE"}
+    ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
+           "task": "T"}
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key

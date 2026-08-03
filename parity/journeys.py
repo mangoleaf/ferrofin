@@ -377,6 +377,61 @@ def j_virtualfolder_rename(base, token, user, _m, _m2):
     return r
 
 
+def j_virtualfolder_crud(base, token, user, _m, _m2):
+    """Full VirtualFolders lifecycle on a throwaway library: create → add/update/remove a
+    media path → toggle a library option → delete. Each step verifies its effect via
+    GET /Library/VirtualFolders, and the library is removed at the end so shared state is
+    untouched (it runs last, so it can't perturb the other journeys)."""
+    r = {}
+    name = "ParityCRUD"
+    qn = urllib.parse.quote(name)
+    tv = "/media/synth/tv"
+    qtv = urllib.parse.quote(tv)
+
+    def find():
+        for f in get_json(base, "/Library/VirtualFolders", token) or []:
+            if f.get("Name") == name:
+                return f
+        return None
+
+    if find():  # leftover from a prior aborted run
+        http("DELETE", f"{base}/Library/VirtualFolders?name={qn}&refreshLibrary=false", token)
+
+    st, _ = http("POST", f"{base}/Library/VirtualFolders?name={qn}&collectionType=movies"
+                         f"&paths=%2Fmedia%2Fsynth%2Fmovies&refreshLibrary=false", token, "{}")
+    created = find()
+    r["POST /Library/VirtualFolders"] = st < 300 and created is not None
+    if not created:
+        return r
+    lib_id = created.get("ItemId")
+
+    st, _ = http("POST", f"{base}/Library/VirtualFolders/Paths?refreshLibrary=false", token,
+                 json.dumps({"Name": name, "PathInfo": {"Path": tv}}))
+    r["POST /Library/VirtualFolders/Paths"] = st < 300 and tv in ((find() or {}).get("Locations") or [])
+
+    # Update the added path's info (no observable location change) — verify 204 + lib intact.
+    st, _ = http("POST", f"{base}/Library/VirtualFolders/Paths/Update?refreshLibrary=false", token,
+                 json.dumps({"Name": name, "PathInfo": {"Path": tv}}))
+    r["POST /Library/VirtualFolders/Paths/Update"] = st < 300 and find() is not None
+
+    # Toggle a library option and verify it round-trips through GET.
+    opts = (find() or {}).get("LibraryOptions") or {}
+    want = not opts.get("EnablePhotos", True)
+    opts["EnablePhotos"] = want
+    st, _ = http("POST", f"{base}/Library/VirtualFolders/LibraryOptions", token,
+                 json.dumps({"Id": lib_id, "LibraryOptions": opts}))
+    got = ((find() or {}).get("LibraryOptions") or {}).get("EnablePhotos")
+    r["POST /Library/VirtualFolders/LibraryOptions"] = st < 300 and got == want
+
+    st, _ = http("DELETE", f"{base}/Library/VirtualFolders/Paths?name={qn}&path={qtv}"
+                          f"&refreshLibrary=false", token)
+    r["DELETE /Library/VirtualFolders/Paths"] = st < 300 and tv not in ((find() or {}).get("Locations") or [])
+
+    st, _ = http("DELETE", f"{base}/Library/VirtualFolders?name={qn}&refreshLibrary=false", token)
+    r["DELETE /Library/VirtualFolders"] = st < 300 and find() is None
+    return r
+
+
 def j_users_password(base, token, user, _m, _m2):
     r = {}
     _, uraw = http("POST", f"{base}/Users/New", token,
@@ -398,7 +453,7 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
             j_merge_versions, j_playing_items, j_virtualfolder_rename,
-            j_users_password]
+            j_users_password, j_virtualfolder_crud]
 
 # ---------------------------------------------------------------- run
 
