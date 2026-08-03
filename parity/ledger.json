@@ -105,8 +105,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}",
@@ -117,8 +117,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Audio/{itemId}/Lyrics",
@@ -129,8 +129,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/Lyrics",
@@ -141,8 +141,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Audio/{itemId}/Lyrics",
@@ -153,8 +153,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/RemoteSearch/Lyrics",
@@ -165,8 +165,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
@@ -177,8 +177,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
@@ -189,8 +189,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
@@ -201,8 +201,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -213,8 +213,8 @@
       "schema_valid": null,
       "note": "unresolved path param: playlistId,segmentId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/main.m3u8",
@@ -225,8 +225,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/master.m3u8",
@@ -237,8 +237,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/master.m3u8",
@@ -249,8 +249,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/stream",
@@ -261,8 +261,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream",
@@ -273,8 +273,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/stream.{container}",
@@ -285,8 +285,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream.{container}",
@@ -297,8 +297,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Audio/{itemId}/universal",
@@ -309,8 +309,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Audio/{itemId}/universal",
@@ -321,8 +321,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Auth/Keys",
@@ -453,8 +453,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Branding/Css.css",
@@ -465,8 +465,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Branding/Splashscreen",
@@ -477,8 +477,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Branding/Splashscreen",
@@ -489,8 +489,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Branding/Splashscreen",
@@ -501,8 +501,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Channels",
@@ -549,8 +549,8 @@
       "schema_valid": null,
       "note": "unresolved path param: channelId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Channels/{channelId}/Items",
@@ -561,8 +561,8 @@
       "schema_valid": null,
       "note": "unresolved path param: channelId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /ClientLog/Document",
@@ -777,8 +777,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Episode/{Id}/Timestamps",
@@ -789,8 +789,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Episode/{id}/IntroSkipperSegments",
@@ -801,8 +801,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /FallbackFont/Fonts",
@@ -825,8 +825,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /FileTransformation/RegisterTransformation",
@@ -837,8 +837,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Genres",
@@ -873,8 +873,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}",
@@ -885,8 +885,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -897,8 +897,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -909,8 +909,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /GetUtcTime",
@@ -933,8 +933,8 @@
       "schema_valid": null,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /IntroSkipper/SupportBundle",
@@ -957,8 +957,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Intros/AnalyzerActions/{SeasonId}",
@@ -969,8 +969,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Intros/EraseTimestamps",
@@ -981,8 +981,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Intros/RebuildDatabase",
@@ -993,8 +993,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}",
@@ -1005,8 +1005,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Intros/ScanStatus",
@@ -1017,8 +1017,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1029,8 +1029,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1041,8 +1041,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Items",
@@ -1125,8 +1125,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Book",
@@ -1137,8 +1137,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/BoxSet",
@@ -1149,8 +1149,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Movie",
@@ -1161,8 +1161,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicAlbum",
@@ -1173,8 +1173,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicArtist",
@@ -1185,8 +1185,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicVideo",
@@ -1197,8 +1197,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Person",
@@ -1209,8 +1209,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Series",
@@ -1221,8 +1221,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/RemoteSearch/Trailer",
@@ -1233,8 +1233,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/Root",
@@ -1341,8 +1341,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/ExternalIdInfos",
@@ -1365,8 +1365,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images",
@@ -1389,8 +1389,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}",
@@ -1401,8 +1401,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}",
@@ -1413,8 +1413,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}",
@@ -1425,8 +1425,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1437,8 +1437,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1449,8 +1449,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1461,8 +1461,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1473,8 +1473,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
@@ -1485,8 +1485,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -1497,8 +1497,8 @@
       "schema_valid": null,
       "note": "H=200 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -1509,8 +1509,8 @@
       "schema_valid": null,
       "note": "H=200 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/InstantMix",
@@ -1617,8 +1617,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages/Providers",
@@ -1653,8 +1653,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/{itemId}/Similar",
@@ -1725,8 +1725,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Libraries/AvailableOptions",
@@ -1749,8 +1749,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Library/MediaFolders",
@@ -1773,8 +1773,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Library/Movies/Updated",
@@ -1785,8 +1785,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Library/PhysicalPaths",
@@ -1821,8 +1821,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Library/Series/Updated",
@@ -1833,8 +1833,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Library/VirtualFolders",
@@ -1965,8 +1965,8 @@
       "schema_valid": true,
       "note": "H=200 J=500",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /LiveTv/ChannelMappings",
@@ -1977,8 +1977,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Channels",
@@ -2001,8 +2001,8 @@
       "schema_valid": null,
       "note": "unresolved path param: channelId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/GuideInfo",
@@ -2037,8 +2037,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /LiveTv/ListingProviders",
@@ -2049,8 +2049,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/Default",
@@ -2073,8 +2073,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/SchedulesDirect/Countries",
@@ -2097,8 +2097,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
@@ -2109,8 +2109,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Programs",
@@ -2133,8 +2133,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Programs/Recommended",
@@ -2157,8 +2157,8 @@
       "schema_valid": null,
       "note": "unresolved path param: programId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Recordings",
@@ -2205,8 +2205,8 @@
       "schema_valid": null,
       "note": "unresolved path param: groupId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Recordings/Series",
@@ -2229,8 +2229,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Recordings/{recordingId}",
@@ -2241,8 +2241,8 @@
       "schema_valid": null,
       "note": "unresolved path param: recordingId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/SeriesTimers",
@@ -2265,8 +2265,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /LiveTv/SeriesTimers/{timerId}",
@@ -2277,8 +2277,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/SeriesTimers/{timerId}",
@@ -2289,8 +2289,8 @@
       "schema_valid": null,
       "note": "unresolved path param: timerId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /LiveTv/SeriesTimers/{timerId}",
@@ -2301,8 +2301,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Timers",
@@ -2325,8 +2325,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Timers/Defaults",
@@ -2349,8 +2349,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/Timers/{timerId}",
@@ -2361,8 +2361,8 @@
       "schema_valid": null,
       "note": "unresolved path param: timerId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /LiveTv/Timers/{timerId}",
@@ -2373,8 +2373,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /LiveTv/TunerHosts",
@@ -2385,8 +2385,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /LiveTv/TunerHosts",
@@ -2397,8 +2397,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /LiveTv/TunerHosts/Types",
@@ -2445,8 +2445,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Localization/Countries",
@@ -2517,8 +2517,8 @@
       "schema_valid": null,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /MediaSegmentsApi/{itemId}",
@@ -2529,8 +2529,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /MediaSegmentsApi/{segmentId}",
@@ -2541,8 +2541,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /MergeVersions/MergeEpisodes",
@@ -2661,8 +2661,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}",
@@ -2673,8 +2673,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -2685,8 +2685,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -2697,8 +2697,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /MusicGenres/{name}/InstantMix",
@@ -2733,8 +2733,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Packages/Installing/{packageId}",
@@ -2745,8 +2745,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Packages/{name}",
@@ -2757,8 +2757,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Persons",
@@ -2793,8 +2793,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}",
@@ -2805,8 +2805,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -2817,8 +2817,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -2829,8 +2829,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Playback/BitrateTest",
@@ -2841,8 +2841,8 @@
       "schema_valid": null,
       "note": "H=200 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /PlayingItems/{itemId}",
@@ -3045,8 +3045,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Plugins/{pluginId}/Configuration",
@@ -3057,8 +3057,8 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Configuration",
@@ -3069,8 +3069,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Manifest",
@@ -3081,8 +3081,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "DELETE /Plugins/{pluginId}/{version}",
@@ -3093,8 +3093,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Disable",
@@ -3105,8 +3105,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Enable",
@@ -3117,8 +3117,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Plugins/{pluginId}/{version}/Image",
@@ -3129,8 +3129,8 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId,version",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Providers/Lyrics/{lyricId}",
@@ -3141,8 +3141,8 @@
       "schema_valid": null,
       "note": "unresolved path param: lyricId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Providers/Subtitles/Subtitles/{subtitleId}",
@@ -3153,8 +3153,8 @@
       "schema_valid": null,
       "note": "unresolved path param: subtitleId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /QuickConnect/Authorize",
@@ -3225,8 +3225,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /ScheduledTasks",
@@ -3585,8 +3585,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SkipButtonCss/UpdateSkipDuration",
@@ -3597,8 +3597,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Songs/{itemId}/InstantMix",
@@ -3729,8 +3729,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}",
@@ -3741,8 +3741,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -3753,8 +3753,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -3765,8 +3765,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Buffering",
@@ -3777,8 +3777,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Join",
@@ -3789,8 +3789,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Leave",
@@ -3801,8 +3801,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /SyncPlay/List",
@@ -3825,8 +3825,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/New",
@@ -3837,8 +3837,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/NextItem",
@@ -3849,8 +3849,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Pause",
@@ -3861,8 +3861,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Ping",
@@ -3873,8 +3873,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/PreviousItem",
@@ -3885,8 +3885,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Queue",
@@ -3897,8 +3897,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Ready",
@@ -3909,8 +3909,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/RemoveFromPlaylist",
@@ -3921,8 +3921,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Seek",
@@ -3933,8 +3933,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/SetIgnoreWait",
@@ -3945,8 +3945,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/SetNewQueue",
@@ -3957,8 +3957,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/SetPlaylistItem",
@@ -3969,8 +3969,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/SetRepeatMode",
@@ -3981,8 +3981,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/SetShuffleMode",
@@ -3993,8 +3993,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Stop",
@@ -4005,8 +4005,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /SyncPlay/Unpause",
@@ -4017,8 +4017,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /SyncPlay/{id}",
@@ -4029,8 +4029,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /System/ActivityLog/Entries",
@@ -4185,8 +4185,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /System/Ping",
@@ -4305,8 +4305,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /UserImage",
@@ -4317,8 +4317,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /UserImage",
@@ -4329,8 +4329,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /UserImage",
@@ -4341,8 +4341,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary image/font/css output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /UserItems/Resume",
@@ -4689,8 +4689,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8",
@@ -4701,8 +4701,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
@@ -4713,8 +4713,8 @@
       "schema_valid": null,
       "note": "H=400 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8",
@@ -4725,8 +4725,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}",
@@ -4737,8 +4737,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -4749,8 +4749,8 @@
       "schema_valid": null,
       "note": "unresolved path param: playlistId,segmentId",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/live.m3u8",
@@ -4761,8 +4761,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/main.m3u8",
@@ -4773,8 +4773,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/master.m3u8",
@@ -4785,8 +4785,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/master.m3u8",
@@ -4797,8 +4797,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/stream",
@@ -4809,8 +4809,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream",
@@ -4821,8 +4821,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/stream.{container}",
@@ -4833,8 +4833,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream.{container}",
@@ -4845,8 +4845,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8",
@@ -4857,8 +4857,8 @@
       "schema_valid": null,
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}",
@@ -4869,8 +4869,8 @@
       "schema_valid": null,
       "note": "H=404 J=500",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}",
@@ -4881,8 +4881,8 @@
       "schema_valid": null,
       "note": "H=404 J=500",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
@@ -4893,8 +4893,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Years",
@@ -4929,8 +4929,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /web/ConfigurationPages",
