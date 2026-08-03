@@ -22,6 +22,7 @@ Offline self-check:
 import json
 import os
 import sys
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT   # reuse HTTP + provisioning
@@ -341,11 +342,63 @@ def j_merge_versions(base, token, user, mid, m2):
     return r
 
 
+def j_playing_items(base, token, user, mid, _m2):
+    r = {}
+    sid = my_session(base, token)
+    ticks = 7_000_000_000
+    st, _ = http("POST", f"{base}/PlayingItems/{mid}?playMethod=DirectPlay", token, "")
+    now = next((s.get("NowPlayingItem") for s in (get_json(base, "/Sessions", token) or [])
+                if s.get("Id") == sid), None) or {}
+    r["POST /PlayingItems/{itemId}"] = st < 300 and now.get("Id") == mid
+    st, _ = http("POST", f"{base}/PlayingItems/{mid}/Progress?positionTicks={ticks}", token, "")
+    ps = next((s.get("PlayState") for s in (get_json(base, "/Sessions", token) or [])
+               if s.get("Id") == sid), None) or {}
+    r["POST /PlayingItems/{itemId}/Progress"] = st < 300 and ps.get("PositionTicks") == ticks
+    st, _ = http("DELETE", f"{base}/PlayingItems/{mid}?positionTicks={ticks}", token)
+    cleared = next((s.get("NowPlayingItem") for s in (get_json(base, "/Sessions", token) or [])
+                    if s.get("Id") == sid), None)
+    r["DELETE /PlayingItems/{itemId}"] = st < 300 and cleared is None
+    return r
+
+
+def j_virtualfolder_rename(base, token, user, _m, _m2):
+    r = {}
+    folders = get_json(base, "/Library/VirtualFolders", token) or []
+    if folders:
+        old = folders[0].get("Name") or ""
+        new = f"{old} Renamed"
+        qo, qn = urllib.parse.quote(old), urllib.parse.quote(new)
+        st, _ = http("POST", f"{base}/Library/VirtualFolders/Name?name={qo}&newName={qn}", token, "")
+        after = get_json(base, "/Library/VirtualFolders", token) or []
+        renamed = any(f.get("Name") == new for f in after)
+        r["POST /Library/VirtualFolders/Name"] = st < 300 and renamed
+        if renamed:  # restore original name so library state is unchanged
+            http("POST", f"{base}/Library/VirtualFolders/Name?name={qn}&newName={qo}", token, "")
+    return r
+
+
+def j_users_password(base, token, user, _m, _m2):
+    r = {}
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "pwprobe", "Password": "Old!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if uid:
+        st, _ = http("POST", f"{base}/Users/Password?userId={uid}", token,
+                     json.dumps({"CurrentPw": "Old!123", "NewPw": "New!456"}))
+        # Effect: authenticating with the NEW password succeeds.
+        auth = http("POST", f"{base}/Users/AuthenticateByName", token,
+                    json.dumps({"Username": "pwprobe", "Pw": "New!456"}))[0]
+        r["POST /Users/Password"] = st < 300 and auth == 200
+        http("DELETE", f"{base}/Users/{uid}", token)   # cleanup
+    return r
+
+
 JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
-            j_merge_versions]
+            j_merge_versions, j_playing_items, j_virtualfolder_rename,
+            j_users_password]
 
 # ---------------------------------------------------------------- run
 

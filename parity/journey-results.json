@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "abe154f 2026-08-02",
+  "last_verified": "b1c1fc6 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -14,6 +14,11 @@
       "note": "H=True J=True"
     },
     "DELETE /Items/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /PlayingItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -94,6 +99,21 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Library/VirtualFolders/Name": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /PlayingItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /PlayingItems/{itemId}/Progress": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -184,6 +204,11 @@
       "note": "H=True J=True"
     },
     "POST /Users/New": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users/Password": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"

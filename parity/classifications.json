@@ -853,6 +853,14 @@
   "GET /web/ConfigurationPage": {
    "category": "expected-extension",
    "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+  },
+  "POST /LiveStreams/Open": {
+   "category": "not-testable-this-way",
+   "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff."
+  },
+  "POST /LiveStreams/Close": {
+   "category": "not-testable-this-way",
+   "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
   }
  }
 }
