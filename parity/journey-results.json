@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "e77ec91 2026-08-02",
+  "last_verified": "97ab7d0 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -118,6 +118,11 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "GET /QuickConnect/Connect": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "GET /System/Configuration/{key}": {
       "classification": "ok",
       "deep_verified": true,
@@ -169,9 +174,9 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}/ContentType": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
+      "deep_verified": false,
+      "note": "H=False J=False"
     },
     "POST /Items/{itemId}/PlaybackInfo": {
       "classification": "ok",
@@ -179,14 +184,14 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}/Refresh": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
+      "deep_verified": false,
+      "note": "H=False J=False"
     },
     "POST /Library/Refresh": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
+      "deep_verified": false,
+      "note": "H=False J=False"
     },
     "POST /Library/VirtualFolders": {
       "classification": "ok",
@@ -264,6 +269,16 @@
       "note": "H=True J=True"
     },
     "POST /Playlists/{playlistId}/Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /QuickConnect/Authorize": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /QuickConnect/Initiate": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -404,6 +419,11 @@
       "note": "H=True J=True"
     },
     "POST /Users/AuthenticateByName": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users/AuthenticateWithQuickConnect": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"

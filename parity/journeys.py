@@ -696,6 +696,29 @@ def j_merge_versions_controller(base, token, user, mid, m2):
     return r
 
 
+def j_quickconnect(base, token, user, _m, _m2):
+    """Full QuickConnect handshake: initiate → admin authorizes the code → the device polls
+    Connect (now authenticated) → exchange the secret for an access token. Requires
+    QuickConnect active on both servers (it is, by default)."""
+    r = {}
+    st, raw = http("POST", f"{base}/QuickConnect/Initiate", token, "")
+    init = json.loads(raw) if st < 300 and raw else {}
+    secret, code = init.get("Secret"), init.get("Code")
+    r["POST /QuickConnect/Initiate"] = bool(secret and code)
+    if not (secret and code):
+        return r
+    st, _ = http("POST", f"{base}/QuickConnect/Authorize?code={code}&userId={user}", token, "")
+    r["POST /QuickConnect/Authorize"] = st < 300
+    # The device polls Connect with its secret; after authorize it is Authenticated.
+    conn = get_json(base, f"/QuickConnect/Connect?secret={secret}", token) or {}
+    r["GET /QuickConnect/Connect"] = conn.get("Authenticated") is True
+    st, raw = http("POST", f"{base}/Users/AuthenticateWithQuickConnect", token,
+                   json.dumps({"Secret": secret}))
+    tok2 = json.loads(raw).get("AccessToken") if st < 300 and raw else None
+    r["POST /Users/AuthenticateWithQuickConnect"] = bool(tok2)
+    return r
+
+
 def j_users_password(base, token, user, _m, _m2):
     r = {}
     _, uraw = http("POST", f"{base}/Users/New", token,
@@ -720,7 +743,8 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_subtitles_upload, j_merge_versions_controller, j_system_and_refresh]
+            j_subtitles_upload, j_merge_versions_controller, j_quickconnect,
+            j_system_and_refresh]
 
 # ---------------------------------------------------------------- run
 
