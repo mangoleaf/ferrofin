@@ -947,7 +947,7 @@ fn append_paging(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery)
 ///
 /// Values are cloned into the builder, so the source slice need not outlive it;
 /// the cloned owned values (`String`/`i64`/`bool`) satisfy the `'a` encode bound.
-fn push_in_list<'a, T>(qb: &mut QueryBuilder<'a, Sqlite>, column: &str, values: &[T])
+pub(crate) fn push_in_list<'a, T>(qb: &mut QueryBuilder<'a, Sqlite>, column: &str, values: &[T])
 where
     T: sqlx::Type<Sqlite> + sqlx::Encode<'a, Sqlite> + Clone + 'a,
 {

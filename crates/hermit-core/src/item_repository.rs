@@ -32,7 +32,9 @@ use hermit_traits::persistence::{ItemRepository, ItemTypeLookup, ItemWithCounts}
 
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{PLACEHOLDER_ID, QueryShape, append_predicates, build_query};
+use crate::translate_query::{
+    PLACEHOLDER_ID, QueryShape, append_predicates, build_query, push_in_list,
+};
 use sqlx::{QueryBuilder, Sqlite};
 
 /// The concrete item repository.
@@ -172,84 +174,154 @@ impl HermitItemRepository {
         content_type_names.extend(include_content_types.iter().cloned());
         let ancestors: Vec<String> = filter.ancestor_ids.iter().map(Uuid::to_string).collect();
 
-        // The value ids referenced by in-scope content items, with in-scope counts.
-        let mut sql = String::from(
-            r#"SELECT iv."ItemValueId", COUNT(DISTINCT ivm."ItemId")
-               FROM "ItemValues" iv
-               JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
-               JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
-               WHERE iv."Type" IN ("#,
+        // The page of by-name rows, joined to the value-count aggregate so the count
+        // comes back in the same query (id = ItemValueId), with the caller's name
+        // filters, ORDER BY, and LIMIT/OFFSET pushed into SQL — no in-memory sort and
+        // no second IN-list round-trip over the full value set (port of C#
+        // `GetItemValues`, whose outer query applies the same name/paging filters).
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT bi.*, agg.cnt FROM "BaseItems" AS bi JOIN "#);
+        push_value_aggregate(
+            &mut qb,
+            &type_ints,
+            &content_type_names,
+            exclude_content_types,
+            &ancestors,
         );
-        sql.push_str(&placeholders(type_ints.len()));
-        sql.push(')');
-        if !content_type_names.is_empty() {
-            sql.push_str(r#" AND bi."Type" IN ("#);
-            sql.push_str(&placeholders(content_type_names.len()));
-            sql.push(')');
-        }
-        if !exclude_content_types.is_empty() {
-            sql.push_str(r#" AND bi."Type" NOT IN ("#);
-            sql.push_str(&placeholders(exclude_content_types.len()));
-            sql.push(')');
-        }
-        if !ancestors.is_empty() {
-            sql.push_str(
-                r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = bi."Id" AND a."ParentItemId" IN ("#,
-            );
-            sql.push_str(&placeholders(ancestors.len()));
-            sql.push_str("))");
-        }
-        sql.push_str(r#" GROUP BY iv."ItemValueId""#);
-
-        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
-        for t in &type_ints {
-            query = query.bind(*t);
-        }
-        for n in &content_type_names {
-            query = query.bind(n.clone());
-        }
-        for n in exclude_content_types {
-            query = query.bind(n.clone());
-        }
-        for a in &ancestors {
-            query = query.bind(a.clone());
-        }
-        let counts: Vec<(String, i64)> = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-        if counts.is_empty() {
-            return Ok(QueryResult::default());
+        qb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+        append_by_name_filters(&mut qb, filter);
+        // ORDER BY Name (the key the old in-memory sort used); parity harness is the
+        // oracle for divergences from Jellyfin's SortName ordering.
+        qb.push(r#" ORDER BY bi."Name" ASC"#);
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ").push_bind(i64::from(limit));
+            let offset = filter.start_index.unwrap_or(0);
+            if offset > 0 {
+                qb.push(" OFFSET ").push_bind(i64::from(offset));
+            }
+        } else if let Some(offset) = filter.start_index.filter(|o| *o > 0) {
+            qb.push(" LIMIT -1 OFFSET ").push_bind(i64::from(offset));
         }
 
-        // Load the materialized by-name rows (id = ItemValueId) for those values.
-        let ids: Vec<String> = counts.iter().map(|(id, _)| id.clone()).collect();
-        let mut esql = String::from(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
-        esql.push_str(&placeholders(ids.len()));
-        esql.push(')');
-        let mut equery = sqlx::query_as::<_, BaseItemEntity>(&esql);
-        for id in &ids {
-            equery = equery.bind(id.clone());
-        }
-        let mut by_id: std::collections::HashMap<String, BaseItemEntity> = equery
+        let rows = qb
+            .build_query_as::<ByNameCountRow>()
             .fetch_all(self.db.pool())
             .await
-            .map_err(db_err)?
+            .map_err(db_err)?;
+        let items: Vec<ItemWithCounts> = rows
             .into_iter()
-            .map(|e| (e.id.clone(), e))
-            .collect();
-
-        let mut items: Vec<ItemWithCounts> = counts
-            .into_iter()
-            .filter_map(|(id, cnt)| {
-                by_id.remove(&id).map(|item| ItemWithCounts {
-                    item,
-                    counts: hermit_model::dto::ItemCounts {
-                        item_count: i32::try_from(cnt).unwrap_or(i32::MAX),
-                        ..Default::default()
-                    },
-                })
+            .map(|r| ItemWithCounts {
+                item: r.item,
+                counts: hermit_model::dto::ItemCounts {
+                    item_count: i32::try_from(r.cnt).unwrap_or(i32::MAX),
+                    ..Default::default()
+                },
             })
             .collect();
-        items.sort_by(|a, b| a.item.name.cmp(&b.item.name));
-        Ok(QueryResult::from_items(items))
+
+        // Total: only worth a COUNT(*) when paged (C# forces EnableTotalRecordCount
+        // off when there is no Limit — an unpaged request already returns the full
+        // set, so its length is the total).
+        let start_index = filter.start_index.unwrap_or(0);
+        let total = if filter.enable_total_record_count && filter.limit.is_some() {
+            let mut cqb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
+            push_value_aggregate(
+                &mut cqb,
+                &type_ints,
+                &content_type_names,
+                exclude_content_types,
+                &ancestors,
+            );
+            cqb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+            append_by_name_filters(&mut cqb, filter);
+            let count: i64 = cqb
+                .build_query_scalar::<i64>()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err)?;
+            i32::try_from(count).unwrap_or(i32::MAX)
+        } else {
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
+        };
+        Ok(QueryResult::new(Some(start_index), Some(total), items))
+    }
+}
+
+/// A by-name row plus its in-scope item count, read from the joined by-name
+/// aggregate query (the `cnt` column is the aggregate's `COUNT(DISTINCT ItemId)`).
+#[derive(sqlx::FromRow)]
+struct ByNameCountRow {
+    #[sqlx(flatten)]
+    item: BaseItemEntity,
+    cnt: i64,
+}
+
+/// Pushes the value-count aggregate as a derived table `agg(vid, cnt)`: for each
+/// `ItemValueId` of one of `type_ints`, the count of distinct in-scope content
+/// items that reference it, scoped by content-type include/exclude and the
+/// browse's `ancestors`. Shared by the page query and the total-count query so
+/// their WHERE stays identical (C# `GetItemValues` inner filter).
+fn push_value_aggregate<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    type_ints: &'a [i64],
+    content_type_names: &'a [String],
+    exclude_content_types: &'a [String],
+    ancestors: &'a [String],
+) {
+    qb.push(
+        r#"(SELECT iv."ItemValueId" AS vid, COUNT(DISTINCT ivm."ItemId") AS cnt
+           FROM "ItemValues" iv
+           JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+           JOIN "BaseItems" ci ON ci."Id" = ivm."ItemId"
+           WHERE "#,
+    );
+    push_in_list(qb, r#"iv."Type""#, type_ints);
+    if !content_type_names.is_empty() {
+        qb.push(" AND ");
+        push_in_list(qb, r#"ci."Type""#, content_type_names);
+    }
+    if !exclude_content_types.is_empty() {
+        qb.push(r#" AND ci."Type" NOT IN ("#);
+        let mut sep = qb.separated(", ");
+        for n in exclude_content_types {
+            sep.push_bind(n.clone());
+        }
+        qb.push(")");
+    }
+    if !ancestors.is_empty() {
+        qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
+        push_in_list(qb, r#"a."ParentItemId""#, ancestors);
+        qb.push(")");
+    }
+    qb.push(r#" GROUP BY iv."ItemValueId") AS agg"#);
+}
+
+/// Appends the caller's name filters against the by-name `bi` row (C#
+/// `ApplyNameFilters` on the outer query). `SearchTerm` is a *contains* match on
+/// `CleanName`; `NameStartsWith*`/`NameLessThan` are prefix/range on the sort key.
+/// By-name rows leave `SortName` NULL, so range filters fall back to `Name` (their
+/// sort key equals the display name).
+fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+    let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(term) = non_blank(&filter.search_term) {
+        let like = format!(
+            "%{}%",
+            crate::text_util::get_clean_value(term).trim_matches('%')
+        );
+        qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
+    }
+    if let Some(prefix) = non_blank(&filter.name_starts_with) {
+        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) LIKE "#)
+            .push_bind(format!("{}%", prefix.to_lowercase()));
+    }
+    if let Some(bound) = non_blank(&filter.name_starts_with_or_greater) {
+        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) >= "#)
+            .push_bind(bound.to_lowercase());
+    }
+    if let Some(bound) = non_blank(&filter.name_less_than) {
+        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) < "#)
+            .push_bind(bound.to_lowercase());
     }
 }
 
@@ -1270,6 +1342,69 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn by_name_paging_and_filters_push_into_sql() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        // Five distinct genres, ordered by Name: Action, Adventure, Comedy, Drama,
+        // Horror. A second movie shares "Drama" so its in-scope count is 2.
+        let movie = Uuid::from_u128(0xA001);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for g in ["Action", "Adventure", "Comedy", "Drama", "Horror"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+        let movie2 = Uuid::from_u128(0xA002);
+        seed_named_item(&db, movie2, BaseItemKind::Movie, "Two").await;
+        seed_item_genre(&db, movie2, "Drama").await;
+
+        // Paging: offset 1, limit 2 → [Adventure, Comedy], total = all 5.
+        let page = InternalItemsQuery {
+            start_index: Some(1),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let paged = repository.get_genres(&page).await.expect("paged");
+        let names: Vec<_> = paged
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Adventure", "Comedy"]);
+        assert_eq!(paged.start_index, 1);
+        assert_eq!(paged.total_record_count, 5);
+
+        // nameStartsWith is a prefix filter on the by-name row; unpaged total is the
+        // filtered length.
+        let starts = InternalItemsQuery {
+            name_starts_with: Some("A".to_owned()),
+            ..Default::default()
+        };
+        let a = repository.get_genres(&starts).await.expect("starts");
+        let a_names: Vec<_> = a.items.iter().filter_map(|i| i.item.name.clone()).collect();
+        assert_eq!(a_names, vec!["Action", "Adventure"]);
+        assert_eq!(a.total_record_count, 2);
+
+        // nameLessThan is an exclusive range on the sort key.
+        let less = InternalItemsQuery {
+            name_less_than: Some("Comedy".to_owned()),
+            ..Default::default()
+        };
+        let l = repository.get_genres(&less).await.expect("less");
+        let l_names: Vec<_> = l.items.iter().filter_map(|i| i.item.name.clone()).collect();
+        assert_eq!(l_names, vec!["Action", "Adventure"]);
+
+        // searchTerm is a contains-match on CleanName, and the count survives it.
+        let search = InternalItemsQuery {
+            search_term: Some("ram".to_owned()),
+            ..Default::default()
+        };
+        let s = repository.get_genres(&search).await.expect("search");
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].item.name.as_deref(), Some("Drama"));
+        assert_eq!(s.items[0].counts.item_count, 2);
     }
 
     #[tokio::test]
