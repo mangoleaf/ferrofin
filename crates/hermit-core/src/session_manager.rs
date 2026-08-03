@@ -479,13 +479,13 @@ impl HermitSessionManager {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError> {
-        // Ensure the target exists and supports remote control.
-        let target = self.get_session_snapshot(session_id).await?;
-        if !self.session_supports_remote_control(&target) {
-            return Err(ServiceError::invalid_input(
-                "session does not support remote control",
-            ));
-        }
+        // Ensure the target session exists (C# `GetSessionToRemoteControl` throws
+        // `ResourceNotFoundException` → 404 when it doesn't). Jellyfin does NOT gate
+        // command *delivery* on remote-control support — it hands the message to
+        // whatever controllers the session has (none → a no-op) and returns 204 — so
+        // neither do we; the guard here previously rejected controller-less sessions
+        // that Jellyfin accepts.
+        let _target = self.get_session_snapshot(session_id).await?;
         if !controlling_session_id.is_empty() {
             // The controlling session must exist; full permission arbitration
             // (own-vs-others) is deferred with the note below.

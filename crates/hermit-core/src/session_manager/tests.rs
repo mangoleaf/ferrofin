@@ -648,7 +648,7 @@ async fn broadcast_pushes_to_attached_connections() {
 }
 
 #[tokio::test]
-async fn send_message_command_requires_remote_control_support() {
+async fn send_message_command_accepts_any_existing_session() {
     let db = test_db().await;
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
@@ -658,16 +658,24 @@ async fn send_message_command_requires_remote_control_support() {
         .unwrap();
     let session_id = dto.id.unwrap();
 
-    // No capabilities / no open connection → not controllable.
     let command = MessageCommand {
         text: "hi".to_owned(),
         ..MessageCommand::default()
     };
+    // Jellyfin's SendMessageToSession hands the message to whatever controllers the
+    // session has (here none → a no-op) and returns success — it does NOT gate on
+    // remote-control support or an open connection.
+    mgr.send_message_command("", &session_id, &command)
+        .await
+        .unwrap();
+
+    // A command to a session that does not exist is a NotFound (C#
+    // GetSessionToRemoteControl → ResourceNotFoundException → 404).
     let err = mgr
-        .send_message_command("", &session_id, &command)
+        .send_message_command("", &Uuid::new_v4().to_string(), &command)
         .await
         .unwrap_err();
-    assert!(matches!(err, ServiceError::InvalidInput(_)));
+    assert!(matches!(err, ServiceError::NotFound(_)));
 }
 
 #[tokio::test]

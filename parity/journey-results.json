@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "9b68017 2026-08-02",
+  "last_verified": "df97bef 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -254,34 +254,34 @@
       "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Command": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Command/{command}": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Message": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Playing": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Playing/{command}": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/System/{command}": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
@@ -289,9 +289,9 @@
       "note": "H=True J=True"
     },
     "POST /Sessions/{sessionId}/Viewing": {
-      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
-      "deep_verified": false,
-      "note": "H=False J=True"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /System/Configuration": {
       "classification": "ok",
