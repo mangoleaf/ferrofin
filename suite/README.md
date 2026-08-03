@@ -12,8 +12,17 @@ suite/run.sh perf     # one at a time    → k6 load bench → benchmark/results
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
 suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
 suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
-suite/viewer/serve.sh # → http://127.0.0.1:8125/viewer/   (parity × perf, one page)
+suite/viewer/serve.sh # → http://127.0.0.1:8125/suite/viewer/   (THE dashboard, one page)
 ```
+
+## Where the old dashboards went (bookmark update)
+
+The parity ledger viewer (`:8123`) and the benchmark viewer (`:8124`) are **retired**; both
+lived as separate pages over separate data and could disagree. Everything they showed is on
+the one page above: the full contract ledger (all ops, with depth/status/schema/deep filters),
+the per-endpoint version-vs-version compare (pick a base run — Δ vs base column,
+comparability-guarded), the footprint line (cold start / peak RSS / items), and the trend.
+Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
 
 ## Why the numbers are fair (the whole point)
 

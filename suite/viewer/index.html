@@ -34,6 +34,7 @@
 <table id="ops"><thead><tr>
   <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
   <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
+  <th title="Hermit p50 change vs the selected base run">Δ vs base</th>
   <th>speedup</th><th>verdict</th><th class="l">note</th>
 </tr></thead><tbody></tbody></table>
 
@@ -41,6 +42,23 @@
 <table id="trend"><thead><tr>
   <th class="l">build</th><th class="l">when</th><th>comparable rows</th>
   <th>median speedup</th><th>win-rate</th><th>parity coverage</th><th class="l">tail losses</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Full parity ledger <span class="muted">(all contract operations, benched or not — from parity/ledger.json)</span></h2>
+<div>
+  <input type="search" id="lq" placeholder="filter operation / classification…" style="width:280px">
+  <select id="ldepth"><option value="">depth: all</option></select>
+  <select id="ldeep">
+    <option value="">deep: all</option>
+    <option value="true">✓ verified</option>
+    <option value="class">⚠ classified</option>
+    <option value="untested">· untested</option>
+  </select>
+  <span id="lstats" class="muted"></span>
+</div>
+<table id="ledger"><thead><tr>
+  <th class="l">operation</th><th class="l">depth</th><th>status</th><th>schema</th>
+  <th>deep</th><th class="l">classification</th>
 </tr></thead><tbody></tbody></table>
 
 <script>
@@ -74,12 +92,21 @@ function render() {
   guardBanner(r, b);
 
   const h = r.headline, m = r.meta;
+  const fp = m.footprint;
+  const fpLine = fp ? `<br><span class="muted">footprint: cold ${fp.h_cold_s ?? "?"}s vs ${fp.j_cold_s ?? "?"}s ·
+    peak anon ${fp.h_rss_peak_mib ?? "?"} MiB vs ${fp.j_rss_peak_mib ?? "?"} MiB ·
+    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)</span>` : "";
   head.innerHTML = `<span><b>${m.hermit}</b></span><span>${m.when || ""}</span>
     <span>Jellyfin: ${m.jellyfin_image || "?"}</span>
     <span>median speedup <b>${h.median_speedup ?? "—"}×</b></span>
     <span>win-rate <b>${pct(h.win_rate)}</b></span>
     <span>parity coverage <b>${pct(h.parity_coverage)}</b></span>
-    <span>comparable rows <b>${h.comparable_rows}</b></span>`;
+    <span>comparable rows <b>${h.comparable_rows}</b></span>${fpLine}`;
+
+  // Per-variant Hermit p50 deltas against the selected base run (the old
+  // benchmark viewer's version-vs-version compare, comparability-guarded above).
+  const baseP50 = {};
+  if (b) for (const o of b.operations) baseP50[o.perf.variant] = o.perf.h_p50;
 
   const rows = r.operations.filter(o => !compOnly.checked || o.perf.comparable);
   ops.tBodies[0].innerHTML = rows.map(o => {
@@ -88,16 +115,48 @@ function render() {
       : p.tail_loss ? `<span class="tail">tail loss</span>`
       : p.comparable ? `<span class="loss">loss</span>` : "—";
     const depth = o.parity.depth || "—";
+    let delta = "—";
+    if (b && baseP50[p.variant] != null && p.h_p50 != null && baseP50[p.variant] > 0) {
+      const d = (p.h_p50 - baseP50[p.variant]) / baseP50[p.variant] * 100;
+      delta = `<span class="${d > 10 ? "loss" : d < -10 ? "win" : "muted"}">${d > 0 ? "+" : ""}${d.toFixed(0)}%</span>`;
+    }
     return `<tr class="${cls}">
       <td class="l">${o.op}</td><td class="l">${p.variant}</td>
       <td class="l"><span class="pill ${depth}">${depth}</span></td>
       <td>${o.parity.deep_verified ? "✓" : "·"}</td>
       <td>${num(p.h_p50)}</td><td>${num(p.h_p95)}</td><td>${num(p.h_p99)}</td>
       <td>${num(p.j_p50)}</td><td>${num(p.j_p95)}</td><td>${num(p.j_p99)}</td>
+      <td>${delta}</td>
       <td>${p.speedup == null ? "—" : p.speedup + "×"}</td>
       <td>${verdict}</td><td class="l muted">${p.comparable ? "" : (p.reason || "")}</td>
     </tr>`;
   }).join("");
+}
+
+// ── full parity ledger (all contract ops — port of the retired :8123 viewer) ──
+let LEDGER = [];
+function renderLedger() {
+  const q = lq.value.trim().toLowerCase();
+  const fd = ldepth.value, fv = ldeep.value;
+  const mark = (v) => v === true ? "✓" : v === false ? "⚠" : "·";
+  const rows = LEDGER.filter(x => {
+    if (fd && x.depth !== fd) return false;
+    if (fv === "true" && x.deep_verified !== true) return false;
+    if (fv === "class" && !(x.classification && x.deep_verified !== true)) return false;
+    if (fv === "untested" && (x.deep_verified !== null || x.classification)) return false;
+    if (q && !(`${x.operation} ${x.classification || ""}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const deep = LEDGER.filter(x => x.deep_verified === true).length;
+  const cls = LEDGER.filter(x => x.classification && x.deep_verified !== true).length;
+  lstats.textContent = ` ${LEDGER.length} ops · ${deep} deep-verified · ${cls} classified · ${LEDGER.length - deep - cls} untested · showing ${rows.length}`;
+  ledger.tBodies[0].innerHTML = rows.map(x => `<tr>
+    <td class="l">${x.operation}</td>
+    <td class="l"><span class="pill ${x.depth}">${x.depth}</span></td>
+    <td>${mark(x.status_conformant)}</td><td>${mark(x.schema_valid)}</td>
+    <td title="${x.deep_verified === true ? "verified" : x.deep_verified === false ? "classified" : "untested"}">${mark(x.deep_verified)}</td>
+    <td class="l muted">${x.classification || ""}</td>
+  </tr>`).join("");
 }
 
 function renderTrend() {
@@ -110,11 +169,19 @@ function renderTrend() {
   }).join("");
 }
 
-fetch("/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => {
+fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => {
   RUNS = d.runs;
   fillSelects();
   run.value = RUNS.length - 1;
   [run, base, compOnly].forEach(el => el.onchange = render);
   render(); renderTrend();
 });
+
+fetch("/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
+  LEDGER = d.operations;
+  ldepth.innerHTML = `<option value="">depth: all</option>` +
+    [...new Set(LEDGER.map(x => x.depth))].sort().map(v => `<option>${v}</option>`).join("");
+  [lq, ldepth, ldeep].forEach(el => el.oninput = renderLedger);
+  renderLedger();
+}).catch(() => { lstats.textContent = " ledger.json not found — run parity/sweep.sh + gen-ledger.py"; });
 </script>

@@ -52,6 +52,40 @@ def parity_by_op():
     return {r["operation"]: r for r in led["operations"]}
 
 
+def footprint():
+    """Cold-start / peak-RSS / item-count per server from run.sh's raw files,
+    when the perf leg was a full `run.sh` (the phase scripts don't write them).
+    All-None when absent — the viewer just omits the footprint line."""
+    raw = ROOT / "benchmark" / "results" / "raw"
+
+    def read1(name):
+        p = raw / name
+        try:
+            return p.read_text().strip().splitlines()
+        except OSError:
+            return []
+
+    def first(name):
+        lines = read1(name)
+        return lines[0].strip() if lines else None
+
+    def peak(name):
+        vals = []
+        for line in read1(name):
+            try:
+                vals.append(float(line))
+            except ValueError:
+                pass
+        return round(max(vals)) if vals else None
+
+    out = {}
+    for tgt, key in (("hermit", "h"), ("jellyfin", "j")):
+        out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
+        out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
+        out[f"{key}_items"] = first(f"{tgt}-count.txt")
+    return out if any(v is not None for v in out.values()) else None
+
+
 def perf_by_variant():
     """{variant: {h_p50,h_p95,h_p99,h_rps,h_ok, j_*}} from raw summaries, else bench-data latest."""
     h = load_json(RAW.parent.parent.parent / "benchmark/results/raw/hermit-summary.json")
@@ -162,6 +196,7 @@ def main():
             "load": {"vus": int(os.environ["BENCH_VUS"]) if os.environ.get("BENCH_VUS") else None,
                      "duration": os.environ.get("BENCH_DURATION")},
             "perf_source": perf_src,
+            "footprint": footprint(),
             "when": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         },
         "headline": headline,
