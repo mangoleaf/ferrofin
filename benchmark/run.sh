@@ -14,47 +14,19 @@ peak() { awk '{if($1+0>m)m=$1+0} END{printf "%.0f", m}' "$1" 2>/dev/null || echo
 # Tests source this file to get the helpers, then stop here before running a benchmark.
 if [ -n "${BENCH_TEST_SOURCE:-}" ]; then return 0; fi
 
-set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+# shellcheck source=../suite/lib.sh
+source ../suite/lib.sh
+suite_load_env .env
+suite_mint_device_id run
 
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
 # BENCH_ONLY=hermit|jellyfin re-runs one leg, keeping the other's raw results.
 if [ -z "${BENCH_ONLY:-}" ]; then rm -f results/raw/*.json; fi
 
-# Build the library list from your real media (REAL_MEDIA_DIR) and/or synthetic padding.
-# Same JSON drives provisioning on both servers.
-LIBS="["; sep=""
-[ -n "${REAL_MEDIA_DIR:-}" ] && { LIBS="$LIBS${sep}{\"name\":\"Movies\",\"type\":\"movies\",\"path\":\"/media/movies-real\"}"; sep=","; }
-[ -n "${REAL_TV_DIR:-}" ]    && { LIBS="$LIBS${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
-if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then
-  EXPECTED_ITEMS=0   # real count is unknown up front; scenario waits for the count to settle
-else
-  EXPECTED_ITEMS=$(( FIXTURE_MOVIES + FIXTURE_SERIES * FIXTURE_EPISODES_PER_SERIES ))
-fi
-[ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
-[ "${FIXTURE_SERIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
-LIBS="$LIBS]"
-[ "$LIBS" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in .env"; exit 1; }
-
-export LIBRARIES="$LIBS" REAL_MEDIA_DIR REAL_TV_DIR BENCH_VUS BENCH_DURATION BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD EXPECTED_ITEMS BENCH_WARMUP_SECONDS
+# Library list + synthetic fixtures (shared bring-up — see suite/lib.sh).
+suite_build_libraries
 echo ">> libraries: $LIBRARIES"
-
-# Synthetic fixtures only when padding is requested.
-if { [ "${FIXTURE_MOVIES:-0}" -gt 0 ] || [ "${FIXTURE_SERIES:-0}" -gt 0 ]; } && \
-   [ -z "$(find fixtures/media -type f 2>/dev/null | head -1)" ]; then
-  echo ">> generating synthetic fixtures"; ./gen-fixtures.sh
-fi
-
-# Authoritative item count for the fairness check (naming resolvers can diverge on real files).
-count_items() {  # $1=base url
-  local resp tok uid
-  resp=$(curl -sf -X POST "$1/Users/AuthenticateByName" -H 'Content-Type: application/json' \
-    -H 'Authorization: MediaBrowser Client="bench", Device="bench", DeviceId="bench", Version="1.0"' \
-    -d "{\"Username\":\"$BENCH_ADMIN_USER\",\"Pw\":\"$BENCH_ADMIN_PASSWORD\"}") || { echo "?"; return; }
-  tok=$(echo "$resp" | jq -r .AccessToken); uid=$(echo "$resp" | jq -r .User.Id)
-  curl -sf "$1/Items?userId=$uid&Recursive=true&IncludeItemTypes=Movie,Episode&Limit=0" \
-    -H "Authorization: MediaBrowser Token=\"$tok\", Client=\"bench\", Device=\"bench\", DeviceId=\"bench\", Version=\"1.0\"" \
-    | jq -r '.TotalRecordCount // "?"'
-}
+suite_gen_fixtures
 
 # Wait for container start -> first 200, return elapsed seconds (cold-start metric).
 coldstart() {  # $1=base url
@@ -105,7 +77,11 @@ bench() {  # $1=service $2=port $3=TARGET
   kill "$rss_pid" 2>/dev/null || true
 
   [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" k6 run transcode.js || true
-  count_items "$base" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
+  suite_count_items "$base" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
+  # Perf-side body fingerprint (Hermit only) — merge.py compares it against the parity pass to
+  # flag any op whose body drifted since (fast-because-wrong). Best-effort; never fails the bench.
+  [ "$target" = hermit ] && { mkdir -p ../suite/results/raw; \
+    python3 ../suite/fingerprint.py capture "$base" ../suite/results/raw/perf-fingerprints.json || true; }
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 

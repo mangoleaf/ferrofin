@@ -20,7 +20,7 @@ export const options = {
   },
 };
 
-// ENDPOINTS (the read surface) is shared with parity.js via bench-lib.js.
+// ENDPOINTS (the read surface) is defined in bench-lib.js; suite/registry.json mirrors it by op.
 const trends = {};
 for (const e of ENDPOINTS) trends[e.name] = new Trend(`lat_${e.name}`, true);
 // Fairness: only 200s enter the latency trend (an error path is cheap and would fake a win);

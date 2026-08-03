@@ -12,7 +12,10 @@
 #   BENCH_ONLY=hermit ./run-phase-b.sh
 set -euo pipefail
 cd "$(dirname "$0")"
-set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+# shellcheck source=../suite/lib.sh
+source ../suite/lib.sh
+suite_load_env .env
+suite_mint_device_id phase-b
 . ./_phase-common.sh
 mkdir -p results/raw
 
@@ -22,17 +25,8 @@ SWEEP_WARMUP=${SWEEP_WARMUP:-2s}
 PHASE_B_ENDPOINTS=${PHASE_B_ENDPOINTS:-"info_public user_me items_sortname items_mixed item_detail persons studios suggestions movie_recommendations items_filters2 image_primary"}
 export PHASE_DUR="$SWEEP_DUR" PHASE_WARMUP="$SWEEP_WARMUP" PHASE_PRE_VUS="${PHASE_PRE_VUS:-50}" PHASE_MAX_VUS="${PHASE_MAX_VUS:-1000}"
 
-# Library list — same construction as run.sh (parsed by k6).
-LIBS="["; sep=""
-[ -n "${REAL_MEDIA_DIR:-}" ] && { LIBS="$LIBS${sep}{\"name\":\"Movies\",\"type\":\"movies\",\"path\":\"/media/movies-real\"}"; sep=","; }
-[ -n "${REAL_TV_DIR:-}" ]    && { LIBS="$LIBS${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
-[ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
-[ "${FIXTURE_SERIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
-LIBS="$LIBS]"
-[ "$LIBS" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in .env"; exit 1; }
-if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then EXPECTED_ITEMS=0
-else EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} )); fi
-export LIBRARIES="$LIBS" REAL_MEDIA_DIR REAL_TV_DIR BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD EXPECTED_ITEMS JELLYFIN_IMAGE
+# Library list (shared bring-up — see suite/lib.sh; LIBRARIES is parsed by k6).
+suite_build_libraries
 
 jnum() { node -pe "require('./$1').$2" 2>/dev/null || echo "$3"; }   # $1=file $2=field $3=default
 

@@ -1,4 +1,4 @@
-// Shared k6 helpers for both scenario.js (load) and parity.js (correctness). The fiddly
+// Shared k6 helpers for the load scripts (scenario.js, phase-*.js, bootstrap.js). The fiddly
 // first-boot + provisioning sequence — with all its 10.11 gotchas (modern auth grammar only,
 // JSON body required, startup-wizard race) — lives here ONCE so the two scripts can't drift.
 // Every function takes the target's base URL explicitly, so one script can drive both servers.
@@ -152,7 +152,7 @@ export const ENDPOINTS = [
   // ── Broader read surface ──────────────────────────────────────────────────
   // Every endpoint below is a GET the parity ledger certifies both servers answer
   // 200 (parity/ledger.json, note "H=200 J=200"), needing only userId/itemId — so
-  // no extra setup ids and parity.js stays in lockstep. Grouped by subsystem.
+  // no extra setup ids. suite/registry.json mirrors this list keyed by contract op. Grouped by subsystem.
 
   // System / diagnostics / meta.
   { name: 'system_ping', path: () => '/System/Ping' },

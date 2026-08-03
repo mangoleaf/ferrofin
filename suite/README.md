@@ -1,0 +1,47 @@
+# suite/ — merged parity + perf suite
+
+One harness, one join key, one fair scoreboard (Plan 6). Replaces the three stacks that grew
+separately: the k6 load bench (`benchmark/`), the retired k6 parity diff (`benchmark/parity.*`,
+deleted), and the Python parity suite (`parity/`, still the parity engine — this wraps it).
+
+## Entry points
+
+```
+suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → parity/ledger.json (+fingerprints)
+suite/run.sh perf     # one at a time    → k6 load bench → benchmark/results/raw/*-summary.json (+fingerprints)
+suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
+suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
+suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
+suite/viewer/serve.sh # → http://127.0.0.1:8125/viewer/   (parity × perf, one page)
+```
+
+## Why the numbers are fair (the whole point)
+
+- **Speed is shown only for deep-verified ops.** A row is `comparable` only if the parity ledger
+  deep-verified that op, both servers answered 200, and the body didn't drift since the parity pass
+  (`suite/fingerprint.py`). Median-speedup / win-rate are computed over comparable rows **only** —
+  so "Hermit got slower" can't secretly mean "Hermit started doing the work correctly."
+- **A win means p50 AND p95 AND p99.** A p50 win with a tail regression is surfaced as `tail_loss`,
+  never folded into "faster" (median-only boards hid 2× p99 regressions before).
+- **`suite/run.sh gate`** fails on a >1.5× latency regression *or* when a previously deep-verified
+  op regresses to unverified — parity and perf gate each other.
+
+## The join key
+
+`suite/registry.json` keys every bench variant by its contract operation (`items_filters2` →
+`GET /Items/Filters2`). Variant ids are permanent trend keys; rename only via a `was` alias.
+Regenerate with `gen-registry.py`; `registry_selftest.py` is the hard gate (every op in the
+vendored spec, no dup ids, aliases resolve). The parity sweep still enumerates the full spec —
+the registry only adds bench variants on top, never shrinks parity coverage.
+
+## Gotchas encoded (not tribal)
+
+`suite/lib.sh` is the single copy of the bring-up: modern `MediaBrowser` auth grammar only (no
+legacy `X-Emby-*`), DeviceId minted per stage, and `suite_guard_no_probe` refuses probes while a
+measured k6 phase is running. Parity keeps both servers up (diffing needs simultaneous state);
+perf runs them one at a time (no resource sharing during measurement).
+
+## History
+
+`migrate-history.py` (one-shot) folds the old `bench-data.json` runs into `results/runs.json` as
+greyed `legacy: true` / `comparable: false` entries — visible in the trend, never comparable.
