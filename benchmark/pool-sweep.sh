@@ -16,7 +16,9 @@
 # each extra size costs ~1 min, not a rescan.
 set -euo pipefail
 cd "$(dirname "$0")"
-set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+# shellcheck source=../suite/lib.sh
+source ../suite/lib.sh
+suite_load_env
 
 POOL_SIZES=${POOL_SIZES:-"4 8 16 32 64"}
 # Surface the db_pool sampler (bootstrap.rs) in container logs.
@@ -26,17 +28,8 @@ export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-hermit-sweep}"
 export HERMIT_HOST_PORT="${HERMIT_HOST_PORT:-18296}"
 BASE="http://localhost:$HERMIT_HOST_PORT"
 
-# Library list — same construction as run.sh (parsed by k6).
-LIBS="["; sep=""
-[ -n "${REAL_MEDIA_DIR:-}" ] && { LIBS="$LIBS${sep}{\"name\":\"Movies\",\"type\":\"movies\",\"path\":\"/media/movies-real\"}"; sep=","; }
-[ -n "${REAL_TV_DIR:-}" ]    && { LIBS="$LIBS${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
-[ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
-[ "${FIXTURE_SERIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
-LIBS="$LIBS]"
-[ "$LIBS" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in .env"; exit 1; }
-if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then EXPECTED_ITEMS=0
-else EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} )); fi
-export LIBRARIES="$LIBS" REAL_MEDIA_DIR REAL_TV_DIR BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD EXPECTED_ITEMS
+# Shared bring-up: library list + passthrough env (suite/lib.sh).
+suite_build_libraries
 export BENCH_VUS BENCH_DURATION BENCH_WARMUP_SECONDS
 
 mkdir -p results/raw

@@ -60,7 +60,10 @@ run_endpoints() {   # $1 = space-separated endpoint names → results/raw/perfga
 }
 
 echo ">> perf-gate: ${VUS} VUs × ${SECS}s/endpoint, factor ${FACTOR}× (Hermit only)"
-bringup_scan hermit "$HERMIT_HOST_PORT" hermit || { echo "perf-gate: Hermit failed to come up"; exit 2; }
+# bringup_scan takes the base URL, not the bare port — passing the port made
+# the readiness loop poll host "18196" and hang (caught the first time this
+# script was actually run end-to-end; plan 08 step 2).
+bringup_scan hermit "$BASE" hermit || { echo "perf-gate: Hermit failed to come up"; exit 2; }
 run_endpoints "$ENDPOINTS_LIST"
 
 if [ "$REBASELINE" = 1 ]; then

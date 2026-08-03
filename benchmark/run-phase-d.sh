@@ -8,23 +8,16 @@
 #   PHASE_D_VUS=8 PHASE_D_DUR=120s     knobs (defaults shown)
 set -euo pipefail
 cd "$(dirname "$0")"
-set -a; [ -f .env ] || cp .env.example .env; . ./.env; set +a
+# shellcheck source=../suite/lib.sh
+source ../suite/lib.sh
+suite_load_env
 . ./_phase-common.sh
 mkdir -p results/raw
 
 export PHASE_D_VUS="${PHASE_D_VUS:-8}" PHASE_D_DUR="${PHASE_D_DUR:-120s}"
 
-# Library list — same construction as run.sh (parsed by k6).
-LIBS="["; sep=""
-[ -n "${REAL_MEDIA_DIR:-}" ] && { LIBS="$LIBS${sep}{\"name\":\"Movies\",\"type\":\"movies\",\"path\":\"/media/movies-real\"}"; sep=","; }
-[ -n "${REAL_TV_DIR:-}" ]    && { LIBS="$LIBS${sep}{\"name\":\"Shows\",\"type\":\"tvshows\",\"path\":\"/media/tv-real\"}"; sep=","; }
-[ "${FIXTURE_MOVIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Movies (synth)\",\"type\":\"movies\",\"path\":\"/media/synth/movies\"}"; sep=","; }
-[ "${FIXTURE_SERIES:-0}" -gt 0 ] && { LIBS="$LIBS${sep}{\"name\":\"Shows (synth)\",\"type\":\"tvshows\",\"path\":\"/media/synth/tv\"}"; sep=","; }
-LIBS="$LIBS]"
-[ "$LIBS" = "[]" ] && { echo "No media: set REAL_MEDIA_DIR or FIXTURE_MOVIES>0 in .env"; exit 1; }
-if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then EXPECTED_ITEMS=0
-else EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} )); fi
-export LIBRARIES="$LIBS" REAL_MEDIA_DIR REAL_TV_DIR BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD EXPECTED_ITEMS JELLYFIN_IMAGE
+# Shared bring-up: library list + passthrough env (suite/lib.sh).
+suite_build_libraries
 
 phase_d() {  # $1=service $2=port $3=target
   local svc="$1" base="http://localhost:$2" target="$3"
