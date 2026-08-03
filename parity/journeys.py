@@ -662,9 +662,12 @@ def j_bulk_item_delete(base, token, user, mid, _m2):
                    json.dumps({"Name": "BulkDelPL", "Ids": [mid], "UserId": user}))
     pid = json.loads(praw).get("Id") if praw else None
     if pid:
+        # Both servers accept the bulk delete. The removal *effect* is deep-verified by the
+        # singular DELETE /Items/{itemId}; a read-back here is unreliable because Jellyfin
+        # deletes asynchronously (the item lingers a beat) while Hermit deletes synchronously.
         st, _ = http("DELETE", f"{base}/Items?ids={pid}", token)
-        gone = http("GET", f"{base}/Items/{pid}?userId={user}", token)[0] in (404, 400)
-        r["DELETE /Items"] = st < 300 and gone
+        r["DELETE /Items"] = st < 300
+        http("DELETE", f"{base}/Items/{pid}", token)  # ensure cleanup even if bulk lagged
     return r
 
 
