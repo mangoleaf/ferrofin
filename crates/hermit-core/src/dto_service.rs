@@ -787,7 +787,11 @@ impl HermitDtoService {
                 };
                 // Folder UserData carries UnplayedItemCount = unplayed leaf descendants
                 // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
+                // By-name kinds (Genre/Studio/Person/Year/…) are stored IsFolder=1 but
+                // have no ancestor closure, so the count is provably 0 — and Jellyfin,
+                // where they are `BaseItem`+`IItemByName` not `Folder`, never emits it.
                 if item.is_folder
+                    && kinds::supports_ancestors(kind)
                     && !matches!(
                         kind,
                         BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -1371,6 +1375,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             && options.contains_field(ItemFields::ChildCount)
             && dto.child_count.is_none()
             && item.is_folder
+            && kinds::supports_ancestors(row_kind(item))
         {
             let user_id = Uuid::parse_str(&user.id).ok();
             let counts = self
@@ -1499,6 +1504,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                     .iter()
                     .filter(|i| {
                         i.is_folder
+                            && kinds::supports_ancestors(row_kind(i))
                             && !matches!(
                                 row_kind(i),
                                 BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -1525,6 +1531,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                     .iter()
                     .filter(|i| {
                         i.is_folder
+                            && kinds::supports_ancestors(row_kind(i))
                             && !matches!(
                                 row_kind(i),
                                 BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -1889,9 +1896,18 @@ mod tests {
             .expect("mark folder");
         let leaf_id = Uuid::new_v4();
         seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
+        // A by-name row (Genre) stored IsFolder=1 but with no ancestor closure.
+        let genre_id = Uuid::new_v4();
+        seed_named_item(&db, genre_id, BaseItemKind::Genre, "Drama").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
+            .bind(genre_id.to_string())
+            .execute(db.pool())
+            .await
+            .expect("mark by-name folder");
         let user = seed_user(&db, Uuid::new_v4()).await;
         let folder = fetch_item(&db, folder_id).await;
         let leaf = fetch_item(&db, leaf_id).await;
+        let genre = fetch_item(&db, genre_id).await;
         let svc = service(db);
         let options = DtoOptions::default(); // enables user data
 
@@ -1927,6 +1943,36 @@ mod tests {
             .unwrap();
         assert_eq!(
             leaf_dto.user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+
+        // A by-name row (Genre) is stored IsFolder=1 but has no ancestor closure,
+        // so it must NOT carry UnplayedItemCount on either path — Jellyfin, where
+        // by-name items are `BaseItem`+`IItemByName`, never emits it.
+        let genre_single = svc
+            .get_base_item_dto(&genre, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            genre_single.user_data.as_ref().unwrap().unplayed_item_count,
+            None
+        );
+        let genre_batch = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&genre),
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            genre_batch[0]
+                .user_data
+                .as_ref()
+                .unwrap()
+                .unplayed_item_count,
             None
         );
     }
