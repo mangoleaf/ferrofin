@@ -405,8 +405,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: writes a backup archive to the host filesystem; heavy and instance-specific, no cross-server-stable effect to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Backup/Manifest",
@@ -417,8 +417,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: reads a backup archive's manifest from the host filesystem; no archive exists and the path is instance-specific (both servers 400).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Backup/Restore",
@@ -429,8 +429,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Branding/Configuration",
@@ -717,8 +717,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: lists the server host's filesystem, which differs per container instance.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Environment/Drives",
@@ -753,8 +753,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Environment/ValidatePath",
@@ -3621,8 +3621,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint; the provisioned server has already completed setup, so there is no wizard state to advance or diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Startup/Configuration",
@@ -3645,8 +3645,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Startup/FirstUser",
@@ -3669,8 +3669,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Startup/User",
@@ -3693,8 +3693,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Studios",
@@ -4221,8 +4221,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /System/Shutdown",
@@ -4233,8 +4233,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Tmdb/ClientConfiguration",
@@ -4257,8 +4257,8 @@
       "schema_valid": true,
       "note": "H=200 J=500",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Trailers/{itemId}/Similar",
@@ -4521,8 +4521,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /Users/ForgotPassword/Pin",
@@ -4533,8 +4533,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Users/Me",

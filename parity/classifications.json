@@ -1,866 +1,922 @@
 {
- "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
- "last_verified": "af3dda1 2026-08-01",
- "rows": {
-  "GET /IntroSkipper/SupportBundle": {
-   "category": "expected-extension",
-   "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design."
-  },
-  "GET /Items/Suggestions": {
-   "category": "instance",
-   "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."
-  },
-  "GET /Items/{itemId}/Ancestors": {
-   "category": "instance",
-   "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope)."
-  },
-  "GET /Items/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak)."
-  },
-  "GET /Movies/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar."
-  },
-  "GET /Movies/Recommendations": {
-   "category": "deferred",
-   "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."
-  },
-  "GET /Search/Hints": {
-   "category": "deferred",
-   "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>."
-  },
-  "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {
-   "category": "deferred",
-   "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision."
-  },
-  "GET /UserViews": {
-   "category": "instance",
-   "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."
-  },
-  "GET /Library/MediaFolders": {
-   "category": "instance",
-   "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
-  },
-  "GET /Albums/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: weighted similarity scorer not ported (same as Items/{id}/Similar)."
-  },
-  "GET /Artists/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: weighted similarity scorer not ported."
-  },
-  "GET /Shows/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: weighted similarity scorer not ported."
-  },
-  "GET /Trailers/{itemId}/Similar": {
-   "category": "deferred",
-   "classification": "deferred: weighted similarity scorer not ported."
-  },
-  "GET /Plugins": {
-   "category": "expected-extension",
-   "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins."
-  },
-  "GET /Packages": {
-   "category": "expected-extension",
-   "classification": "expected-extension: no external plugin package repository (compiled-in extensions)."
-  },
-  "GET /Repositories": {
-   "category": "expected-extension",
-   "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions)."
-  },
-  "GET /web/ConfigurationPages": {
-   "category": "expected-extension",
-   "classification": "expected-extension: plugin configuration pages come from external plugins Hermit doesn't host."
-  },
-  "GET /Items/{itemId}/ExternalIdInfos": {
-   "category": "deferred",
-   "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off."
-  },
-  "GET /Items/{itemId}/RemoteImages": {
-   "category": "deferred",
-   "classification": "deferred: remote image providers feature-gated off."
-  },
-  "GET /Items/{itemId}/RemoteImages/Providers": {
-   "category": "deferred",
-   "classification": "deferred: remote image providers feature-gated off."
-  },
-  "GET /Items/{itemId}": {
-   "category": "instance",
-   "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred)."
-  },
-  "GET /Items/{itemId}/PlaybackInfo": {
-   "category": "instance",
-   "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}."
-  },
-  "GET /Years": {
-   "category": "expected-extension",
-   "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope)."
-  },
-  "GET /ScheduledTasks": {
-   "category": "instance",
-   "classification": "instance: LastExecutionResult depends on whether/when a task last ran."
-  },
-  "GET /System/Info/Storage": {
-   "category": "instance",
-   "classification": "instance: per-host disk paths and free/used space."
-  },
-  "GET /System/Ping": {
-   "category": "instance",
-   "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name)."
-  },
-  "GET /Environment/Drives": {
-   "category": "instance",
-   "classification": "instance: per-host filesystem drives."
-  },
-  "GET /Library/PhysicalPaths": {
-   "category": "instance",
-   "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."
-  },
-  "GET /System/Logs": {
-   "category": "instance",
-   "classification": "instance: log-file set differs per instance/run."
-  },
-  "GET /System/ActivityLog/Entries": {
-   "category": "instance",
-   "classification": "instance: activity-log entries differ per instance/run."
-  },
-  "GET /LiveTv/GuideInfo": {
-   "category": "instance",
-   "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
-  },
-  "GET /System/Configuration": {
-   "category": "instance",
-   "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug."
-  },
-  "GET /LiveTv/TunerHosts/Types": {
-   "category": "deferred",
-   "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."
-  },
-  "POST /Items/{itemId}": {
-   "category": "instance",
-   "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect."
-  },
-  "GET /Items/{itemId}/MetadataEditor": {
-   "category": "deferred",
-   "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off."
-  },
-  "DELETE /Playlists/{playlistId}/Users/{userId}": {
-   "category": "instance",
-   "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect."
-  },
-  "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "DELETE /Audio/{itemId}/Lyrics": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "GET /Audio/{itemId}/Lyrics": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Audio/{itemId}/Lyrics": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "GET /Audio/{itemId}/RemoteSearch/Lyrics": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/main.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/master.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Audio/{itemId}/master.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/stream": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Audio/{itemId}/stream": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/stream.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Audio/{itemId}/stream.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Audio/{itemId}/universal": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Audio/{itemId}/universal": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Branding/Css": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Branding/Css.css": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "DELETE /Branding/Splashscreen": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Branding/Splashscreen": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Branding/Splashscreen": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Channels/{channelId}/Features": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /Channels/{channelId}/Items": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /Episode/{Id}/Timestamps": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Episode/{Id}/Timestamps": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Episode/{id}/IntroSkipperSegments": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /FallbackFont/Fonts/{name}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /FileTransformation/RegisterTransformation": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Genres/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Genres/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /IntroSkipper": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Intros/AnalyzerActions/UpdateSeason": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Intros/AnalyzerActions/{SeasonId}": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Intros/EraseTimestamps": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Intros/RebuildDatabase": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Intros/ScanStatus": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Intros/Show/{SeriesId}/{SeasonId}": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Items/RemoteSearch/Apply/{itemId}": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/Book": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/BoxSet": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/Movie": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/MusicAlbum": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/MusicArtist": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/MusicVideo": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/Person": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/Series": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/RemoteSearch/Trailer": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "GET /Items/{itemId}/Download": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "GET /Items/{itemId}/File": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "DELETE /Items/{itemId}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Items/{itemId}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Items/{itemId}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Items/{itemId}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Items/{itemId}/RemoteImages/Download": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /Library/Media/Updated": {
-   "category": "deferred-hollow",
-   "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
-  },
-  "POST /Library/Movies/Added": {
-   "category": "deferred-hollow",
-   "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
-  },
-  "POST /Library/Movies/Updated": {
-   "category": "deferred-hollow",
-   "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
-  },
-  "POST /Library/Series/Added": {
-   "category": "deferred-hollow",
-   "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
-  },
-  "POST /Library/Series/Updated": {
-   "category": "deferred-hollow",
-   "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
-  },
-  "GET /LiveTv/ChannelMappingOptions": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/ChannelMappings": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/Channels/{channelId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "DELETE /LiveTv/ListingProviders": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/ListingProviders": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/ListingProviders/Lineups": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "POST /LiveTv/Programs": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/Programs/{programId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/Recordings/Groups/{groupId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "DELETE /LiveTv/Recordings/{recordingId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/Recordings/{recordingId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/SeriesTimers": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "DELETE /LiveTv/SeriesTimers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/SeriesTimers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/SeriesTimers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/Timers": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "DELETE /LiveTv/Timers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /LiveTv/Timers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/Timers/{timerId}": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "DELETE /LiveTv/TunerHosts": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/TunerHosts": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "POST /LiveTv/Tuners/{tunerId}/Reset": {
-   "category": "requires-livetv-tuner",
-   "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-  },
-  "GET /MediaSegmentsApi": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "POST /MediaSegmentsApi/{itemId}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "DELETE /MediaSegmentsApi/{segmentId}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /MusicGenres/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /MusicGenres/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /Packages/Installed/{name}": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "DELETE /Packages/Installing/{packageId}": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "GET /Packages/{name}": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "GET /Persons/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Persons/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Playback/BitrateTest": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "DELETE /Plugins/{pluginId}": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "GET /Plugins/{pluginId}/Configuration": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "POST /Plugins/{pluginId}/Configuration": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "POST /Plugins/{pluginId}/Manifest": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "DELETE /Plugins/{pluginId}/{version}": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "POST /Plugins/{pluginId}/{version}/Disable": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "POST /Plugins/{pluginId}/{version}/Enable": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "GET /Plugins/{pluginId}/{version}/Image": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "GET /Providers/Lyrics/{lyricId}": {
-   "category": "deferred-remote-or-feature-gated",
-   "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-  },
-  "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "POST /Repositories": {
-   "category": "deferred-plugin-host",
-   "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-  },
-  "POST /SkipButtonCss/InjectCss": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /SkipButtonCss/UpdateSkipDuration": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "GET /Studios/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Studios/{name}/Images/{imageType}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /SyncPlay/Buffering": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Join": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Leave": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/MovePlaylistItem": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/New": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/NextItem": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Pause": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Ping": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/PreviousItem": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Queue": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Ready": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/RemoveFromPlaylist": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Seek": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/SetIgnoreWait": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/SetNewQueue": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/SetPlaylistItem": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/SetRepeatMode": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/SetShuffleMode": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Stop": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "POST /SyncPlay/Unpause": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "GET /SyncPlay/{id}": {
-   "category": "requires-syncplay-group",
-   "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
-  },
-  "GET /System/Logs/Log": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "DELETE /UserImage": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "GET /UserImage": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "HEAD /UserImage": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "POST /UserImage": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-  },
-  "DELETE /Videos/{itemId}/Subtitles/{index}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/live.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/main.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/master.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Videos/{itemId}/master.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/stream": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Videos/{itemId}/stream": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/stream.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "HEAD /Videos/{itemId}/stream.{container}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
-  },
-  "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-  },
-  "GET /web/ConfigurationPage": {
-   "category": "expected-extension",
-   "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-  },
-  "POST /LiveStreams/Open": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff."
-  },
-  "POST /LiveStreams/Close": {
-   "category": "not-testable-this-way",
-   "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
+  "_comment": "Curated ACCEPTED divergences (not bugs). Highest-precedence classification in gen-ledger: overrides the auto 'flagged: verify' from the Layer-2 read diff. deep_verified stays as the live layers report it (these do not diff clean vs Jellyfin by design). Sourced from the parity-triage workflow verdicts (parity/triage-findings.json) + the roadmap synthesis, minus the ops since fixed (Filters2 WI-2, Collections add/remove WI-6, Images Size WI-1).",
+  "last_verified": "af3dda1 2026-08-01",
+  "rows": {
+    "GET /IntroSkipper/SupportBundle": {
+      "category": "expected-extension",
+      "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design."
+    },
+    "GET /Items/Suggestions": {
+      "category": "instance",
+      "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."
+    },
+    "GET /Items/{itemId}/Ancestors": {
+      "category": "instance",
+      "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope)."
+    },
+    "GET /Items/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak)."
+    },
+    "GET /Movies/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar."
+    },
+    "GET /Movies/Recommendations": {
+      "category": "deferred",
+      "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."
+    },
+    "GET /Search/Hints": {
+      "category": "deferred",
+      "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>."
+    },
+    "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {
+      "category": "deferred",
+      "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision."
+    },
+    "GET /UserViews": {
+      "category": "instance",
+      "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."
+    },
+    "GET /Library/MediaFolders": {
+      "category": "instance",
+      "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
+    },
+    "GET /Albums/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: weighted similarity scorer not ported (same as Items/{id}/Similar)."
+    },
+    "GET /Artists/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: weighted similarity scorer not ported."
+    },
+    "GET /Shows/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: weighted similarity scorer not ported."
+    },
+    "GET /Trailers/{itemId}/Similar": {
+      "category": "deferred",
+      "classification": "deferred: weighted similarity scorer not ported."
+    },
+    "GET /Plugins": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins."
+    },
+    "GET /Packages": {
+      "category": "expected-extension",
+      "classification": "expected-extension: no external plugin package repository (compiled-in extensions)."
+    },
+    "GET /Repositories": {
+      "category": "expected-extension",
+      "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions)."
+    },
+    "GET /web/ConfigurationPages": {
+      "category": "expected-extension",
+      "classification": "expected-extension: plugin configuration pages come from external plugins Hermit doesn't host."
+    },
+    "GET /Items/{itemId}/ExternalIdInfos": {
+      "category": "deferred",
+      "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off."
+    },
+    "GET /Items/{itemId}/RemoteImages": {
+      "category": "deferred",
+      "classification": "deferred: remote image providers feature-gated off."
+    },
+    "GET /Items/{itemId}/RemoteImages/Providers": {
+      "category": "deferred",
+      "classification": "deferred: remote image providers feature-gated off."
+    },
+    "GET /Items/{itemId}": {
+      "category": "instance",
+      "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred)."
+    },
+    "GET /Items/{itemId}/PlaybackInfo": {
+      "category": "instance",
+      "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}."
+    },
+    "GET /Years": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope)."
+    },
+    "GET /ScheduledTasks": {
+      "category": "instance",
+      "classification": "instance: LastExecutionResult depends on whether/when a task last ran."
+    },
+    "GET /System/Info/Storage": {
+      "category": "instance",
+      "classification": "instance: per-host disk paths and free/used space."
+    },
+    "GET /System/Ping": {
+      "category": "instance",
+      "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name)."
+    },
+    "GET /Environment/Drives": {
+      "category": "instance",
+      "classification": "instance: per-host filesystem drives."
+    },
+    "GET /Library/PhysicalPaths": {
+      "category": "instance",
+      "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."
+    },
+    "GET /System/Logs": {
+      "category": "instance",
+      "classification": "instance: log-file set differs per instance/run."
+    },
+    "GET /System/ActivityLog/Entries": {
+      "category": "instance",
+      "classification": "instance: activity-log entries differ per instance/run."
+    },
+    "GET /LiveTv/GuideInfo": {
+      "category": "instance",
+      "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers."
+    },
+    "GET /System/Configuration": {
+      "category": "instance",
+      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug."
+    },
+    "GET /LiveTv/TunerHosts/Types": {
+      "category": "deferred",
+      "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."
+    },
+    "POST /Items/{itemId}": {
+      "category": "instance",
+      "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect."
+    },
+    "GET /Items/{itemId}/MetadataEditor": {
+      "category": "deferred",
+      "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off."
+    },
+    "DELETE /Playlists/{playlistId}/Users/{userId}": {
+      "category": "instance",
+      "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect."
+    },
+    "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "DELETE /Audio/{itemId}/Lyrics": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "GET /Audio/{itemId}/Lyrics": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Audio/{itemId}/Lyrics": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "GET /Audio/{itemId}/RemoteSearch/Lyrics": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/main.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/master.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Audio/{itemId}/master.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/stream": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Audio/{itemId}/stream": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/stream.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Audio/{itemId}/stream.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Audio/{itemId}/universal": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Audio/{itemId}/universal": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Branding/Css": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Branding/Css.css": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "DELETE /Branding/Splashscreen": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Branding/Splashscreen": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Branding/Splashscreen": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Channels/{channelId}/Features": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /Channels/{channelId}/Items": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /Episode/{Id}/Timestamps": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Episode/{Id}/Timestamps": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Episode/{id}/IntroSkipperSegments": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /FallbackFont/Fonts/{name}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /FileTransformation/RegisterTransformation": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Genres/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Genres/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /IntroSkipper": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Intros/AnalyzerActions/UpdateSeason": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Intros/AnalyzerActions/{SeasonId}": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Intros/EraseTimestamps": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Intros/RebuildDatabase": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Intros/ScanStatus": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "DELETE /Intros/Show/{SeriesId}/{SeasonId}": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Intros/Show/{SeriesId}/{SeasonId}": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Items/RemoteSearch/Apply/{itemId}": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/Book": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/BoxSet": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/Movie": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/MusicAlbum": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/MusicArtist": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/MusicVideo": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/Person": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/Series": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/RemoteSearch/Trailer": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "GET /Items/{itemId}/Download": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "GET /Items/{itemId}/File": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Items/{itemId}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Items/{itemId}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Items/{itemId}/RemoteImages/Download": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /Library/Media/Updated": {
+      "category": "deferred-hollow",
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
+    },
+    "POST /Library/Movies/Added": {
+      "category": "deferred-hollow",
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
+    },
+    "POST /Library/Movies/Updated": {
+      "category": "deferred-hollow",
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
+    },
+    "POST /Library/Series/Added": {
+      "category": "deferred-hollow",
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
+    },
+    "POST /Library/Series/Updated": {
+      "category": "deferred-hollow",
+      "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral."
+    },
+    "GET /LiveTv/ChannelMappingOptions": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/ChannelMappings": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/Channels/{channelId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "DELETE /LiveTv/ListingProviders": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/ListingProviders": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/ListingProviders/Lineups": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "POST /LiveTv/Programs": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/Programs/{programId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/Recordings/Groups/{groupId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "DELETE /LiveTv/Recordings/{recordingId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/Recordings/{recordingId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/SeriesTimers": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "DELETE /LiveTv/SeriesTimers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/SeriesTimers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/SeriesTimers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/Timers": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "DELETE /LiveTv/Timers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /LiveTv/Timers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/Timers/{timerId}": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "DELETE /LiveTv/TunerHosts": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/TunerHosts": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "POST /LiveTv/Tuners/{tunerId}/Reset": {
+      "category": "requires-livetv-tuner",
+      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+    },
+    "GET /MediaSegmentsApi": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "POST /MediaSegmentsApi/{itemId}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "DELETE /MediaSegmentsApi/{segmentId}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /Packages/Installed/{name}": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "DELETE /Packages/Installing/{packageId}": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "GET /Packages/{name}": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "GET /Persons/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Persons/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Playback/BitrateTest": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "DELETE /Plugins/{pluginId}": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "GET /Plugins/{pluginId}/Configuration": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "POST /Plugins/{pluginId}/Configuration": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "POST /Plugins/{pluginId}/Manifest": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "DELETE /Plugins/{pluginId}/{version}": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "POST /Plugins/{pluginId}/{version}/Disable": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "POST /Plugins/{pluginId}/{version}/Enable": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "GET /Plugins/{pluginId}/{version}/Image": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "GET /Providers/Lyrics/{lyricId}": {
+      "category": "deferred-remote-or-feature-gated",
+      "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
+    },
+    "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "POST /Repositories": {
+      "category": "deferred-plugin-host",
+      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+    },
+    "POST /SkipButtonCss/InjectCss": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /SkipButtonCss/UpdateSkipDuration": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "GET /Studios/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Studios/{name}/Images/{imageType}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /SyncPlay/Buffering": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Join": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Leave": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/MovePlaylistItem": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/New": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/NextItem": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Pause": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Ping": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/PreviousItem": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Queue": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Ready": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/RemoveFromPlaylist": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Seek": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/SetIgnoreWait": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/SetNewQueue": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/SetPlaylistItem": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/SetRepeatMode": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/SetShuffleMode": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Stop": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "POST /SyncPlay/Unpause": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "GET /SyncPlay/{id}": {
+      "category": "requires-syncplay-group",
+      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+    },
+    "GET /System/Logs/Log": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "DELETE /UserImage": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "GET /UserImage": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "HEAD /UserImage": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "POST /UserImage": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
+    },
+    "DELETE /Videos/{itemId}/Subtitles/{index}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/live.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/main.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/master.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Videos/{itemId}/master.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/stream": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Videos/{itemId}/stream": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/stream.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "HEAD /Videos/{itemId}/stream.{container}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+    },
+    "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+    },
+    "GET /web/ConfigurationPage": {
+      "category": "expected-extension",
+      "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
+    },
+    "POST /LiveStreams/Open": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff."
+    },
+    "POST /LiveStreams/Close": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
+    },
+    "POST /System/Restart": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff."
+    },
+    "POST /System/Shutdown": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff."
+    },
+    "POST /Startup/Complete": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint; the provisioned server has already completed setup, so there is no wizard state to advance or diff."
+    },
+    "POST /Startup/Configuration": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done."
+    },
+    "POST /Startup/RemoteAccess": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server."
+    },
+    "POST /Startup/User": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server."
+    },
+    "POST /Users/ForgotPassword": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host."
+    },
+    "POST /Users/ForgotPassword/Pin": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff."
+    },
+    "GET /Environment/DirectoryContents": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: lists the server host's filesystem, which differs per container instance."
+    },
+    "GET /Environment/ParentPath": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific."
+    },
+    "GET /Backup/Manifest": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: reads a backup archive's manifest from the host filesystem; no archive exists and the path is instance-specific (both servers 400)."
+    },
+    "POST /Backup/Create": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: writes a backup archive to the host filesystem; heavy and instance-specific, no cross-server-stable effect to diff."
+    },
+    "POST /Backup/Restore": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run."
+    },
+    "GET /Trailers": {
+      "category": "instance",
+      "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap."
+    }
   }
- }
 }
