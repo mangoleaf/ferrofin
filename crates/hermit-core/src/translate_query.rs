@@ -55,6 +55,9 @@ pub enum QueryShape {
     IdsOnly,
     /// Select `COUNT(*)` — no `ORDER BY` / paging is appended.
     Count,
+    /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
+    /// query, without materializing every matching row. No `ORDER BY` / paging.
+    TypeCounts,
 }
 
 /// Builds the full translated statement for `filter` in the requested shape.
@@ -72,14 +75,24 @@ pub fn build_query<'a>(
         QueryShape::FullRows => r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         QueryShape::IdsOnly => r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         QueryShape::Count => r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+        QueryShape::TypeCounts => {
+            r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#
+        }
     });
     qb.push_bind(PLACEHOLDER_ID);
 
     append_predicates(&mut qb, filter);
 
-    if shape != QueryShape::Count {
-        append_order_by(&mut qb, filter);
-        append_paging(&mut qb, filter);
+    match shape {
+        // Aggregate shapes take no ORDER BY / paging (they collapse the row set).
+        QueryShape::Count => {}
+        QueryShape::TypeCounts => {
+            qb.push(r#" GROUP BY bi."Type""#);
+        }
+        QueryShape::FullRows | QueryShape::IdsOnly => {
+            append_order_by(&mut qb, filter);
+            append_paging(&mut qb, filter);
+        }
     }
 
     qb
@@ -90,7 +103,10 @@ pub fn build_query<'a>(
 /// Each block mirrors one C# `if (filter.X …) baseQuery = baseQuery.Where(…)`.
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
-fn append_predicates<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+pub(crate) fn append_predicates<'a>(
+    qb: &mut QueryBuilder<'a, Sqlite>,
+    filter: &'a InternalItemsQuery,
+) {
     // --- resolution (own-row form; folder EXISTS roll-up is deferred) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
         append_resolution_predicate(qb, filter);

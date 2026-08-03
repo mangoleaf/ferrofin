@@ -32,7 +32,8 @@ use hermit_traits::persistence::{ItemRepository, ItemTypeLookup, ItemWithCounts}
 
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{PLACEHOLDER_ID, QueryShape, build_query};
+use crate::translate_query::{PLACEHOLDER_ID, QueryShape, append_predicates, build_query};
+use sqlx::{QueryBuilder, Sqlite};
 
 /// The concrete item repository.
 ///
@@ -672,19 +673,18 @@ impl ItemRepository for HermitItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
-        let ids = self.fetch_ids(filter).await?;
-        if ids.is_empty() {
-            return Ok(QueryFiltersLegacy::default());
-        }
-        let id_strings: Vec<String> = ids.iter().map(Uuid::to_string).collect();
-
-        let years = self.distinct_years(&id_strings).await?;
-        let official_ratings = self.distinct_official_ratings(&id_strings).await?;
+        // Each facet runs the filter once as its own WHERE (via `append_predicates`)
+        // instead of materializing the whole matching id set and binding it back as a
+        // giant `IN` per facet. The old "resolve every matching id in the app, then
+        // re-send them as a thousand-parameter IN, four times" round-trip dominated the
+        // Filters/Filters2/Years CPU under load.
+        let years = self.distinct_years(filter).await?;
+        let official_ratings = self.distinct_official_ratings(filter).await?;
         let genres = self
-            .distinct_item_values(&id_strings, ItemValueType::Genre)
+            .distinct_item_values(filter, ItemValueType::Genre)
             .await?;
         let tags = self
-            .distinct_item_values(&id_strings, ItemValueType::Tags)
+            .distinct_item_values(filter, ItemValueType::Tags)
             .await?;
 
         Ok(QueryFiltersLegacy {
@@ -738,59 +738,70 @@ impl ItemRepository for HermitItemRepository {
 }
 
 impl HermitItemRepository {
-    /// Distinct positive production years of the given item ids, ascending.
-    async fn distinct_years(&self, ids: &[String]) -> Result<Vec<i32>, ServiceError> {
-        let mut sql = String::from(
-            r#"SELECT DISTINCT "ProductionYear" FROM "BaseItems"
-               WHERE "ProductionYear" IS NOT NULL AND "ProductionYear" > 0 AND "Id" IN ("#,
+    /// Distinct positive production years of the filter's matching items, ascending —
+    /// the filter runs as this query's own WHERE, no app-side id materialization.
+    async fn distinct_years(&self, filter: &InternalItemsQuery) -> Result<Vec<i32>, ServiceError> {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT DISTINCT bi."ProductionYear" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         );
-        sql.push_str(&placeholders(ids.len()));
-        sql.push_str(r#") ORDER BY "ProductionYear""#);
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
-        for id in ids {
-            query = query.bind(id.clone());
-        }
-        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        qb.push_bind(PLACEHOLDER_ID);
+        append_predicates(&mut qb, filter);
+        qb.push(
+            r#" AND bi."ProductionYear" IS NOT NULL AND bi."ProductionYear" > 0
+                ORDER BY bi."ProductionYear""#,
+        );
+        let rows: Vec<i64> = qb
+            .build_query_scalar()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
         Ok(rows
             .into_iter()
             .map(|y| i32::try_from(y).unwrap_or(i32::MAX))
             .collect())
     }
 
-    /// Distinct non-empty official ratings of the given item ids, ascending.
-    async fn distinct_official_ratings(&self, ids: &[String]) -> Result<Vec<String>, ServiceError> {
-        let mut sql = String::from(
-            r#"SELECT DISTINCT "OfficialRating" FROM "BaseItems"
-               WHERE "OfficialRating" IS NOT NULL AND "OfficialRating" <> '' AND "Id" IN ("#,
+    /// Distinct non-empty official ratings of the filter's matching items, ascending.
+    async fn distinct_official_ratings(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT DISTINCT bi."OfficialRating" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         );
-        sql.push_str(&placeholders(ids.len()));
-        sql.push_str(r#") ORDER BY "OfficialRating""#);
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
-        for id in ids {
-            query = query.bind(id.clone());
-        }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        qb.push_bind(PLACEHOLDER_ID);
+        append_predicates(&mut qb, filter);
+        qb.push(
+            r#" AND bi."OfficialRating" IS NOT NULL AND bi."OfficialRating" <> ''
+                ORDER BY bi."OfficialRating""#,
+        );
+        qb.build_query_scalar()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 
-    /// Distinct display values of one `ItemValues` type over the given item ids.
+    /// Distinct display values of one `ItemValues` type over the filter's matching items.
     async fn distinct_item_values(
         &self,
-        ids: &[String],
+        filter: &InternalItemsQuery,
         value_type: ItemValueType,
     ) -> Result<Vec<String>, ServiceError> {
-        let mut sql = String::from(
-            r#"SELECT DISTINCT iv."Value" FROM "ItemValuesMap" ivm
-               JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               WHERE iv."Type" = ? AND ivm."ItemId" IN ("#,
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"SELECT DISTINCT iv."Value" FROM "ItemValues" AS iv
+               JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+               JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
+               WHERE iv."Type" = "#,
         );
-        sql.push_str(&placeholders(ids.len()));
-        sql.push_str(r#") ORDER BY iv."Value""#);
-        let mut query =
-            sqlx::query_scalar::<_, String>(&sql).bind(i64::from(i32::from(value_type)));
-        for id in ids {
-            query = query.bind(id.clone());
-        }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        qb.push_bind(i64::from(i32::from(value_type)));
+        qb.push(r#" AND bi."Id" <> "#);
+        qb.push_bind(PLACEHOLDER_ID);
+        append_predicates(&mut qb, filter);
+        qb.push(r#" ORDER BY iv."Value""#);
+        qb.build_query_scalar()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 }
 

@@ -120,20 +120,21 @@ impl ItemCountService for HermitItemCountService {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<ItemCounts, ServiceError> {
-        // Materialize the matching rows and group by their stored Type in Rust.
-        // Grouping in the app avoids re-binding the translated sub-select's
-        // parameters into a wrapping `GROUP BY` statement.
-        let mut qb = build_query(filter, QueryShape::FullRows);
+        // Group by stored Type in SQL — one aggregate query returning ~a dozen
+        // (type, count) rows — instead of materializing every matching full row
+        // (all ~60 columns) and counting them in Rust, which dominated this
+        // endpoint's CPU on a large library.
+        let mut qb = build_query(filter, QueryShape::TypeCounts);
         let rows = qb
-            .build_query_as::<hermit_db::entities::base_items::BaseItemEntity>()
+            .build_query_as::<(String, i64)>()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
 
-        let mut by_type: HashMap<String, i32> = HashMap::new();
-        for row in rows {
-            *by_type.entry(row.type_).or_insert(0) += 1;
-        }
+        let by_type: HashMap<String, i32> = rows
+            .into_iter()
+            .map(|(t, c)| (t, i32::try_from(c).unwrap_or(i32::MAX)))
+            .collect();
 
         // Jellyfin's LibraryController.GetItemCounts never assigns ItemCount, so
         // it serializes as 0 for the top-level endpoint. Match that: build the
@@ -163,31 +164,26 @@ impl ItemCountService for HermitItemCountService {
             return Ok(ItemCounts::default());
         };
 
-        let allowed = {
-            let mut qb = build_query(access_filter, QueryShape::IdsOnly);
-            qb.build_query_scalar::<String>()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?
-        };
-        if allowed.is_empty() {
-            return Ok(ItemCounts::default());
-        }
-
         let type_names: Vec<String> = related_item_kinds
             .iter()
             .filter_map(|k| stored_type_name(*k))
             .map(ToOwned::to_owned)
             .collect();
 
+        // Count the related items carrying this by-name item's clean value, grouped by type.
+        // ponytail: no access-scoping `bi."Id" IN (...)` clause — Hermit implements no per-user
+        // parental/library restriction yet, so `access_filter` (user-only) matches every item.
+        // The previous code materialized the *entire* accessible id set and bound it as a giant
+        // IN — run once PER name-item (N per page), each a full-library scan that filtered
+        // nothing. Re-introduce access scoping as a SQL predicate (subquery/join), not an
+        // app-materialized id list, when real access restrictions land.
+        let _ = access_filter;
         let mut sql = String::from(
             r#"SELECT bi."Type", COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
                JOIN "ItemValuesMap" ivm ON ivm."ItemId" = bi."Id"
                JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               WHERE iv."CleanValue" = ? AND bi."Id" IN ("#,
+               WHERE iv."CleanValue" = ?"#,
         );
-        sql.push_str(&placeholders(allowed.len()));
-        sql.push(')');
         if !type_names.is_empty() {
             sql.push_str(r#" AND bi."Type" IN ("#);
             sql.push_str(&placeholders(type_names.len()));
@@ -196,9 +192,6 @@ impl ItemCountService for HermitItemCountService {
         sql.push_str(r#" GROUP BY bi."Type""#);
 
         let mut query = sqlx::query_as::<_, (String, i64)>(&sql).bind(clean);
-        for a in &allowed {
-            query = query.bind(a.clone());
-        }
         for t in &type_names {
             query = query.bind(t.clone());
         }
