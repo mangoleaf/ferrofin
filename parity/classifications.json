@@ -150,14 +150,6 @@
       "category": "instance",
       "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect."
     },
-    "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
     "DELETE /Audio/{itemId}/Lyrics": {
       "category": "deferred-remote-or-feature-gated",
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
@@ -226,26 +218,6 @@
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
     },
-    "GET /Branding/Css": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Branding/Css.css": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "DELETE /Branding/Splashscreen": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Branding/Splashscreen": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "POST /Branding/Splashscreen": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
     "GET /Channels/{channelId}/Features": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
@@ -266,29 +238,9 @@
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
     },
-    "GET /FallbackFont/Fonts/{name}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
     "POST /FileTransformation/RegisterTransformation": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-    },
-    "GET /Genres/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Genres/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
     },
     "GET /IntroSkipper": {
       "category": "expected-extension",
@@ -373,50 +325,6 @@
     "GET /Items/{itemId}/File": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
-    "DELETE /Items/{itemId}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Items/{itemId}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Items/{itemId}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "POST /Items/{itemId}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
     },
     "POST /Items/{itemId}/RemoteImages/Download": {
       "category": "deferred-remote-or-feature-gated",
@@ -558,22 +466,6 @@
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
     },
-    "GET /MusicGenres/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /MusicGenres/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
     "POST /Packages/Installed/{name}": {
       "category": "deferred-plugin-host",
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
@@ -585,22 +477,6 @@
     "GET /Packages/{name}": {
       "category": "deferred-plugin-host",
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
-    },
-    "GET /Persons/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Persons/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
     },
     "GET /Playback/BitrateTest": {
       "category": "not-testable-this-way",
@@ -657,22 +533,6 @@
     "POST /SkipButtonCss/UpdateSkipDuration": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-    },
-    "GET /Studios/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Studios/{name}/Images/{imageType}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
     },
     "POST /SyncPlay/Buffering": {
       "category": "requires-syncplay-group",
@@ -761,22 +621,6 @@
     "GET /System/Logs/Log": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
-    },
-    "DELETE /UserImage": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "GET /UserImage": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "HEAD /UserImage": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
-    },
-    "POST /UserImage": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary image/font/css output — not a JSON body to diff."
     },
     "DELETE /Videos/{itemId}/Subtitles/{index}": {
       "category": "not-testable-this-way",
@@ -961,6 +805,22 @@
     "GET /Playlists/{itemId}/InstantMix": {
       "category": "expected-extension",
       "classification": "expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset."
+    },
+    "GET /Genres/{name}/Images/{imageType}": {
+      "category": "deferred",
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+    },
+    "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "deferred",
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+    },
+    "HEAD /Genres/{name}/Images/{imageType}": {
+      "category": "deferred",
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+    },
+    "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "category": "deferred",
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
     }
   }
 }

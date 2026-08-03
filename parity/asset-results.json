@@ -1,0 +1,201 @@
+{
+  "generated_by": "parity/assets.py",
+  "last_verified": "8423ee0 2026-08-02",
+  "rows": {
+    "DELETE /Branding/Splashscreen": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /UserImage": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /Branding/Css": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'css', False) J=(2, 'css', False)"
+    },
+    "GET /Branding/Css.css": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'css', False) J=(2, 'css', False)"
+    },
+    "GET /Branding/Splashscreen": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /FallbackFont/Fonts/{name}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'none', False) J=(2, 'none', False)"
+    },
+    "GET /Genres/{name}/Images/{imageType}": {
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image', 'png', 600, 600)"
+    },
+    "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image', 'png', 600, 600)"
+    },
+    "GET /Items/{itemId}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+    },
+    "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image', 'jpeg', 100, 75) J=(2, 'image', 'jpeg', 100, 75)"
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /Persons/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /Studios/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "GET /UserImage": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Genres/{name}/Images/{imageType}": {
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image')"
+    },
+    "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image')"
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image') J=(2, 'image')"
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image') J=(2, 'image')"
+    },
+    "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(2, 'image') J=(2, 'image')"
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Persons/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Studios/{name}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "HEAD /UserImage": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=(4, '') J=(4, '')"
+    },
+    "POST /Branding/Splashscreen": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/Images/{imageType}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /UserImage": {
+      "classification": "",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    }
+  }
+}

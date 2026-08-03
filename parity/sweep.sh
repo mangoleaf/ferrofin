@@ -39,5 +39,7 @@ echo ">> Layer-2 read depth (id-correlated)"
 python3 ../parity/reads.py
 echo ">> Layer-2 write journeys"
 python3 ../parity/journeys.py
+echo ">> Layer-3 binary/asset differential"
+python3 ../parity/assets.py
 echo ">> regenerating ledger"
 python3 ../parity/gen-ledger.py

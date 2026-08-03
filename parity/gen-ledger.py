@@ -201,6 +201,12 @@ def build_curated():
             curated[k] = {**v, "last_verified": r_stamp}
     for k, v in journeys.items():
         curated[k] = {**v, "last_verified": j_stamp}
+    # Layer-3 binary/asset differential (image/font/css): a live property/effect verdict for
+    # the ops that return non-JSON bodies, applied like the other live layers so a curated
+    # accepted-divergence classification can still override its auto-flag below.
+    assets, as_stamp = load_layer2("parity/asset-results.json")
+    for k, v in assets.items():
+        curated[k] = {**v, "last_verified": as_stamp}
     # Curated accepted-divergence classifications win the classification field over the auto
     # "flagged: verify" text (human decision > detector). deep_verified stays as the live layer
     # reported it (these diverge by design and are not deep-verified); a row not otherwise present
