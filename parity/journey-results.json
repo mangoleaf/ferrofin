@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "97ab7d0 2026-08-02",
+  "last_verified": "c26ece1 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -19,9 +19,9 @@
       "note": "H=True J=True"
     },
     "DELETE /Items": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
     },
     "DELETE /Items/{itemId}": {
       "classification": "ok",
@@ -174,9 +174,9 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}/ContentType": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "deep_verified": false,
-      "note": "H=False J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Items/{itemId}/PlaybackInfo": {
       "classification": "ok",
@@ -184,14 +184,14 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}/Refresh": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "deep_verified": false,
-      "note": "H=False J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Library/Refresh": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "deep_verified": false,
-      "note": "H=False J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "POST /Library/VirtualFolders": {
       "classification": "ok",

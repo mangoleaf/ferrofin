@@ -697,23 +697,43 @@ def j_merge_versions_controller(base, token, user, mid, m2):
 
 
 def j_quickconnect(base, token, user, _m, _m2):
-    """Full QuickConnect handshake: initiate → admin authorizes the code → the device polls
-    Connect (now authenticated) → exchange the secret for an access token. Requires
-    QuickConnect active on both servers (it is, by default)."""
+    """Full QuickConnect handshake: the device initiates → the admin authorizes the code →
+    the device polls Connect (now authenticated) → the device exchanges the secret for an
+    access token. The device runs under its OWN DeviceId so that exchanging the secret
+    issues a token for *its* session, not the harness's DeviceId='parity' session (which
+    the rest of the run still needs)."""
     r = {}
-    st, raw = http("POST", f"{base}/QuickConnect/Initiate", token, "")
+    dev_hdr = {
+        "Content-Type": "application/json",
+        "Authorization": f'MediaBrowser Token="{token}", Client="parityqc", '
+                         f'Device="parityqc", DeviceId="parity-qc", Version="1.0"',
+    }
+
+    def dev(method, path, body=None):
+        req = urllib.request.Request(base + path, data=(body.encode() if body else None),
+                                     method=method, headers=dev_hdr)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as rr:
+                return rr.status, rr.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            return 0, b""
+
+    st, raw = dev("POST", "/QuickConnect/Initiate")
     init = json.loads(raw) if st < 300 and raw else {}
     secret, code = init.get("Secret"), init.get("Code")
     r["POST /QuickConnect/Initiate"] = bool(secret and code)
     if not (secret and code):
         return r
+    # The admin authorizes the code with the harness token (an admin action).
     st, _ = http("POST", f"{base}/QuickConnect/Authorize?code={code}&userId={user}", token, "")
     r["POST /QuickConnect/Authorize"] = st < 300
     # The device polls Connect with its secret; after authorize it is Authenticated.
-    conn = get_json(base, f"/QuickConnect/Connect?secret={secret}", token) or {}
+    st, raw = dev("GET", f"/QuickConnect/Connect?secret={secret}")
+    conn = json.loads(raw) if st < 300 and raw else {}
     r["GET /QuickConnect/Connect"] = conn.get("Authenticated") is True
-    st, raw = http("POST", f"{base}/Users/AuthenticateWithQuickConnect", token,
-                   json.dumps({"Secret": secret}))
+    st, raw = dev("POST", "/Users/AuthenticateWithQuickConnect", json.dumps({"Secret": secret}))
     tok2 = json.loads(raw).get("AccessToken") if st < 300 and raw else None
     r["POST /Users/AuthenticateWithQuickConnect"] = bool(tok2)
     return r
@@ -743,8 +763,10 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
-            j_subtitles_upload, j_merge_versions_controller, j_quickconnect,
-            j_system_and_refresh]
+            j_subtitles_upload, j_quickconnect, j_system_and_refresh,
+            # Destructive: merges/splits the shared movies, so it must run LAST so its
+            # mutations can't corrupt the items other journeys read/refresh.
+            j_merge_versions_controller]
 
 # ---------------------------------------------------------------- run
 
