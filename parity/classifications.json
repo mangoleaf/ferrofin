@@ -917,6 +917,50 @@
     "GET /Trailers": {
       "category": "instance",
       "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap."
+    },
+    "POST /MergeVersions/MergeMovies": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+    },
+    "POST /MergeVersions/MergeEpisodes": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+    },
+    "POST /MergeVersions/SplitMovies": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+    },
+    "POST /MergeVersions/SplitEpisodes": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+    },
+    "GET /Items/Root": {
+      "category": "deferred",
+      "classification": "deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200)."
+    },
+    "GET /Years/{year}": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200)."
+    },
+    "GET /Artists/{name}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: by-name artist lookup needs a music library; the parity fixture is movies+TV only, so there is no artist corpus to diff (H=404 vs J=200)."
+    },
+    "GET /MusicGenres/{genreName}": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200)."
+    },
+    "GET /Artists/InstantMix": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: an artist instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid artist)."
+    },
+    "GET /MusicGenres/InstantMix": {
+      "category": "not-testable-this-way",
+      "classification": "not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre)."
+    },
+    "GET /Playlists/{itemId}/InstantMix": {
+      "category": "expected-extension",
+      "classification": "expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset."
     }
   }
 }

@@ -57,8 +57,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: an artist instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid artist).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Artists/{itemId}/InstantMix",
@@ -93,8 +93,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: by-name artist lookup needs a music library; the parity fixture is movies+TV only, so there is no artist corpus to diff (H=404 vs J=200).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Artists/{name}/Images/{imageType}/{imageIndex}",
@@ -1245,8 +1245,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope \u2014 see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Items/Suggestions",
@@ -2553,8 +2553,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "last_verified": "e77ec91 2026-08-02"
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /MergeVersions/MergeMovies",
@@ -2565,8 +2565,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "last_verified": "e77ec91 2026-08-02"
+      "classification": "expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /MergeVersions/SplitEpisodes",
@@ -2577,8 +2577,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "last_verified": "e77ec91 2026-08-02"
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "POST /MergeVersions/SplitMovies",
@@ -2589,8 +2589,8 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)",
-      "last_verified": "e77ec91 2026-08-02"
+      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Movies/Recommendations",
@@ -2637,8 +2637,8 @@
       "schema_valid": null,
       "note": "H=400 J=400",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /MusicGenres/{genreName}",
@@ -2649,8 +2649,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /MusicGenres/{name}/Images/{imageType}",
@@ -2901,8 +2901,8 @@
       "schema_valid": true,
       "note": "H=200 J=404",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /Playlists/{playlistId}",
@@ -4917,8 +4917,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": null,
-      "classification": "",
-      "last_verified": null
+      "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200).",
+      "last_verified": "af3dda1 2026-08-01"
     },
     {
       "operation": "GET /web/ConfigurationPage",
