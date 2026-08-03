@@ -11,6 +11,7 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -219,9 +220,11 @@ impl HermitItemRepository {
             })
             .collect();
 
-        // Total: only worth a COUNT(*) when paged (C# forces EnableTotalRecordCount
-        // off when there is no Limit — an unpaged request already returns the full
-        // set, so its length is the total).
+        // Total: C# `GetItemValues` forces EnableTotalRecordCount off when there is
+        // no Limit and then never assigns `TotalRecordCount` — a non-nullable int —
+        // so every unpaged (or count-disabled) by-name response carries
+        // `TotalRecordCount: 0` on the wire, even with a bare StartIndex. Match
+        // that exactly; the ledger's flagged /Genres//Studios read-diffs were this.
         let start_index = filter.start_index.unwrap_or(0);
         let total = if filter.enable_total_record_count && filter.limit.is_some() {
             let mut cqb: QueryBuilder<Sqlite> =
@@ -242,7 +245,7 @@ impl HermitItemRepository {
                 .map_err(db_err)?;
             i32::try_from(count).unwrap_or(i32::MAX)
         } else {
-            i32::try_from(items.len()).unwrap_or(i32::MAX)
+            0
         };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
@@ -297,31 +300,66 @@ fn push_value_aggregate<'a>(
     qb.push(r#" GROUP BY iv."ItemValueId") AS agg"#);
 }
 
+/// The characters C# `BaseItemRepository.SearchWildcardTerms` treats as "the
+/// caller is doing a wildcard search" — their presence routes `SearchTerm` to a
+/// raw (unescaped) `LIKE` instead of a literal contains-match.
+const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
+
 /// Appends the caller's name filters against the by-name `bi` row (C#
-/// `ApplyNameFilters` on the outer query). `SearchTerm` is a *contains* match on
-/// `CleanName`; `NameStartsWith*`/`NameLessThan` are prefix/range on the sort key.
-/// By-name rows leave `SortName` NULL, so range filters fall back to `Name` (their
-/// sort key equals the display name).
+/// `TranslateQuery`'s name predicates on the outer query).
+///
+/// - `SearchTerm` ports the C# two-branch shape: a term containing a wildcard
+///   character goes through `LIKE '%term%'` **unescaped** (client wildcards pass
+///   through, as upstream intends); a plain term is a literal contains-match.
+///   Deliberate divergence: the plain term is cleaned (`get_clean_value`) before
+///   matching `CleanName` — C# compares the raw lowered term against the cleaned
+///   column, which makes e.g. hyphenated searches miss; Hermit stays correct.
+/// - `NameStartsWith` is a prefix on the sort key. Deliberate divergence:
+///   `COALESCE(SortName, Name)` because Hermit leaves by-name `SortName` NULL
+///   (C# filters `SortName` alone, which would match nothing here).
+/// - `NameStartsWithOrGreater`/`NameLessThan` port C#'s **first-character**
+///   comparison (`SortName.FirstOrDefault() > x[0] || Name.FirstOrDefault() >
+///   x[0]`), not a full-string range: `substr(...,1,1)` on both columns, OR'd,
+///   binary collation — byte-identical to the C# char compare for ASCII.
 fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(term) = non_blank(&filter.search_term) {
-        let like = format!(
-            "%{}%",
-            crate::text_util::get_clean_value(term).trim_matches('%')
-        );
-        qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
+        let lowered = term.to_lowercase();
+        if lowered.contains(SEARCH_WILDCARD_TERMS) {
+            let like = format!("%{}%", lowered.trim_matches('%'));
+            qb.push(r#" AND lower(bi."CleanName") LIKE "#)
+                .push_bind(like);
+        } else {
+            let like = format!(
+                "%{}%",
+                crate::text_util::get_clean_value(term).trim_matches('%')
+            );
+            qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
+        }
     }
     if let Some(prefix) = non_blank(&filter.name_starts_with) {
         qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) LIKE "#)
             .push_bind(format!("{}%", prefix.to_lowercase()));
     }
-    if let Some(bound) = non_blank(&filter.name_starts_with_or_greater) {
-        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) >= "#)
-            .push_bind(bound.to_lowercase());
+    if let Some(first) = non_blank(&filter.name_starts_with_or_greater)
+        .and_then(|b| b.chars().next())
+        .map(String::from)
+    {
+        qb.push(r#" AND (substr(bi."SortName", 1, 1) > "#)
+            .push_bind(first.clone());
+        qb.push(r#" OR substr(bi."Name", 1, 1) > "#)
+            .push_bind(first);
+        qb.push(")");
     }
-    if let Some(bound) = non_blank(&filter.name_less_than) {
-        qb.push(r#" AND lower(COALESCE(bi."SortName", bi."Name")) < "#)
-            .push_bind(bound.to_lowercase());
+    if let Some(first) = non_blank(&filter.name_less_than)
+        .and_then(|b| b.chars().next())
+        .map(String::from)
+    {
+        qb.push(r#" AND (substr(bi."SortName", 1, 1) < "#)
+            .push_bind(first.clone());
+        qb.push(r#" OR substr(bi."Name", 1, 1) < "#)
+            .push_bind(first);
+        qb.push(")");
     }
 }
 
@@ -500,6 +538,37 @@ impl ItemRepository for HermitItemRepository {
         Ok(rows)
     }
 
+    async fn get_items_by_primary_version_batch(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+        let mut map: HashMap<Uuid, Vec<BaseItemEntity>> = HashMap::new();
+        // 500 stays far below SQLite's conservative 999-host-variable floor.
+        for chunk in primary_ids.chunks(500) {
+            let sql = format!(
+                r#"SELECT * FROM "BaseItems"
+                   WHERE "PrimaryVersionId" IN ({}) AND "Id" <> ?{}"#,
+                placeholders(chunk.len()),
+                chunk.len() + 1
+            );
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            query = query.bind(PLACEHOLDER_ID);
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Some(primary) = row
+                    .primary_version_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    map.entry(primary).or_default().push(row);
+                }
+            }
+        }
+        Ok(map)
+    }
+
     async fn get_items_with_provider_id(
         &self,
         provider_key: &str,
@@ -573,7 +642,7 @@ impl ItemRepository for HermitItemRepository {
         // (so the image previously at index1 now resolves at index2) and reset
         // Width/Height to the "unknown" sentinel, stamping DateModified.
         let now = Utc::now();
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "BaseItemImageInfos"
                 SET "Path" = ?2, "Width" = 0, "Height" = 0, "DateModified" = ?3
@@ -953,20 +1022,20 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
             .bind(series.to_string())
             .bind(library.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("series parent");
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
             .bind(episode.to_string())
             .bind(series.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("episode parent");
         for ancestor in [series, library] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
                 .bind(episode.to_string())
                 .bind(ancestor.to_string())
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("ancestor");
         }
@@ -1034,7 +1103,7 @@ mod tests {
         sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
             .bind(boxset.to_string())
             .bind(movie.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("remove_from_collection");
         assert!(
@@ -1060,7 +1129,7 @@ mod tests {
             r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,'Al Pacino','Actor')"#,
         )
         .bind(person.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("person");
         sqlx::query(
@@ -1069,7 +1138,7 @@ mod tests {
         )
         .bind(movie_a.to_string())
         .bind(person.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("credit");
 
@@ -1119,7 +1188,7 @@ mod tests {
             .bind(item.to_string())
             .bind(provider)
             .bind(value)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert provider");
         }
@@ -1180,7 +1249,7 @@ mod tests {
         .bind(Uuid::from_u128(0x9101).to_string())
         .bind("LKO2".as_bytes().to_vec())
         .bind(item.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert backdrop");
 
@@ -1191,7 +1260,7 @@ mod tests {
         )
         .bind(Uuid::from_u128(0x9102).to_string())
         .bind(item.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert primary");
 
@@ -1230,7 +1299,7 @@ mod tests {
             .bind(Uuid::from_u128(0x9210 + n).to_string())
             .bind(item.to_string())
             .bind(path)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert backdrop");
         }
@@ -1267,7 +1336,7 @@ mod tests {
         )
         .bind(Uuid::from_u128(0x9310).to_string())
         .bind(item.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert backdrop");
 
@@ -1376,8 +1445,9 @@ mod tests {
         assert_eq!(paged.start_index, 1);
         assert_eq!(paged.total_record_count, 5);
 
-        // nameStartsWith is a prefix filter on the by-name row; unpaged total is the
-        // filtered length.
+        // nameStartsWith is a prefix filter on the by-name row. Unpaged responses
+        // carry TotalRecordCount 0 — C# forces EnableTotalRecordCount off without
+        // a Limit and the non-nullable int is never assigned.
         let starts = InternalItemsQuery {
             name_starts_with: Some("A".to_owned()),
             ..Default::default()
@@ -1385,9 +1455,10 @@ mod tests {
         let a = repository.get_genres(&starts).await.expect("starts");
         let a_names: Vec<_> = a.items.iter().filter_map(|i| i.item.name.clone()).collect();
         assert_eq!(a_names, vec!["Action", "Adventure"]);
-        assert_eq!(a.total_record_count, 2);
+        assert_eq!(a.total_record_count, 0);
 
-        // nameLessThan is an exclusive range on the sort key.
+        // nameLessThan compares only the FIRST character (C# `FirstOrDefault() <`):
+        // "Comedy" itself is excluded ('C' < 'C' is false)…
         let less = InternalItemsQuery {
             name_less_than: Some("Comedy".to_owned()),
             ..Default::default()
@@ -1395,8 +1466,22 @@ mod tests {
         let l = repository.get_genres(&less).await.expect("less");
         let l_names: Vec<_> = l.items.iter().filter_map(|i| i.item.name.clone()).collect();
         assert_eq!(l_names, vec!["Action", "Adventure"]);
+        // …and so is everything else starting with 'C', even when the full string
+        // sorts below the bound ("Comedy" < "Cz" as strings, but 'C' < 'C' fails).
+        let less_cz = InternalItemsQuery {
+            name_less_than: Some("Cz".to_owned()),
+            ..Default::default()
+        };
+        let lcz = repository.get_genres(&less_cz).await.expect("less cz");
+        let lcz_names: Vec<_> = lcz
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(lcz_names, vec!["Action", "Adventure"]);
 
-        // searchTerm is a contains-match on CleanName, and the count survives it.
+        // A plain searchTerm is a literal contains-match on CleanName, and the
+        // count survives it.
         let search = InternalItemsQuery {
             search_term: Some("ram".to_owned()),
             ..Default::default()
@@ -1405,6 +1490,16 @@ mod tests {
         assert_eq!(s.items.len(), 1);
         assert_eq!(s.items[0].item.name.as_deref(), Some("Drama"));
         assert_eq!(s.items[0].counts.item_count, 2);
+
+        // A searchTerm carrying a wildcard character routes through raw LIKE —
+        // the `_` matches any one character (C# SearchWildcardTerms branch).
+        let wild = InternalItemsQuery {
+            search_term: Some("dr_ma".to_owned()),
+            ..Default::default()
+        };
+        let w = repository.get_genres(&wild).await.expect("wild");
+        assert_eq!(w.items.len(), 1);
+        assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
     }
 
     #[tokio::test]
@@ -1461,7 +1556,7 @@ mod tests {
                WHERE "Id" = ?1"#,
         )
         .bind(movie.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set year/rating");
 
@@ -1504,7 +1599,7 @@ mod tests {
             .bind(item.to_string())
             .bind(idx)
             .bind(lang)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert stream");
         }
@@ -1542,7 +1637,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
             .bind(child.to_string())
             .bind(parent.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set parent");
 
@@ -1554,7 +1649,7 @@ mod tests {
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(child.to_string())
             .bind(parent.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("ancestor");
         assert!(
@@ -1580,7 +1675,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
             .bind(unplayed.to_string())
             .bind(parent.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set parent of unplayed");
         assert!(
@@ -1634,7 +1729,7 @@ mod tests {
             .bind(id.to_string())
             .bind(owner.to_string())
             .bind(extra as i32)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set extra");
         }
@@ -1674,7 +1769,7 @@ mod tests {
         seed_user_data(&db, Uuid::from_u128(0xF00D), resumable, false, None).await;
         sqlx::query(r#"UPDATE "UserData" SET "PlaybackPositionTicks" = 5000 WHERE "ItemId" = ?1"#)
             .bind(resumable.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set position");
 
@@ -1702,7 +1797,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
             .bind(primary.to_string())
             .bind(alt.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("link alternate");
 
@@ -1721,5 +1816,16 @@ mod tests {
                 .expect("nil")
                 .is_empty()
         );
+
+        // The batch form groups alternates under their primary; primaries with
+        // no alternates are absent.
+        let batch = repository
+            .get_items_by_primary_version_batch(&[primary, unrelated])
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[&primary].len(), 1);
+        assert_eq!(batch[&primary][0].id, alt.to_string());
+        assert!(!batch.contains_key(&unrelated));
     }
 }

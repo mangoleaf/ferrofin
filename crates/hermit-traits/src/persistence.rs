@@ -152,6 +152,24 @@ pub trait ItemRepository: Send + Sync {
         primary_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Batch form of [`Self::get_items_by_primary_version`] for a page of
+    /// primary ids, keyed by primary id; primaries with no alternates are
+    /// absent. The default loops the single-item form; the concrete repository
+    /// overrides it with one query.
+    async fn get_items_by_primary_version_batch(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+        let mut map = HashMap::new();
+        for &id in primary_ids {
+            let alternates = self.get_items_by_primary_version(id).await?;
+            if !alternates.is_empty() {
+                map.insert(id, alternates);
+            }
+        }
+        Ok(map)
+    }
+
     /// Returns every `(item_id, value)` pair stored under `provider_key` in
     /// `BaseItemProviders`.
     ///
@@ -415,6 +433,28 @@ pub trait ItemCountService: Send + Sync {
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<ItemCounts, ServiceError>;
+
+    /// Batch form of [`Self::get_item_counts_for_name_item`] for a page of
+    /// by-name items of the same `kind`: one entry per id (missing rows count
+    /// as zeros). The default loops the per-item form; the concrete service
+    /// overrides it with a grouped query.
+    async fn get_item_counts_for_name_items(
+        &self,
+        kind: BaseItemKind,
+        ids: &[Uuid],
+        related_item_kinds: &[BaseItemKind],
+        access_filter: &InternalItemsQuery,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        let mut out = HashMap::with_capacity(ids.len());
+        for &id in ids {
+            out.insert(
+                id,
+                self.get_item_counts_for_name_item(kind, id, related_item_kinds, access_filter)
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
 
     /// Counts played descendants of `ancestor_id`.
     async fn get_played_count(

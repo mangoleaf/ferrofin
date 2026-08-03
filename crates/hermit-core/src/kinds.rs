@@ -158,6 +158,21 @@ pub fn is_audio(kind: BaseItemKind) -> bool {
     matches!(kind, BaseItemKind::Audio | BaseItemKind::AudioBook)
 }
 
+/// Whether this kind carries artist/album-artist DTO fields — the kinds whose
+/// C# classes implement `IHasArtist`/`IHasAlbumArtist` (`Audio`, `AudioBook`,
+/// `MusicAlbum`, `MusicVideo`). Jellyfin's `DtoService` only attaches
+/// `Artists`/`ArtistItems`/`AlbumArtists` behind those interface tests.
+#[must_use]
+pub fn has_artist_fields(kind: BaseItemKind) -> bool {
+    matches!(
+        kind,
+        BaseItemKind::Audio
+            | BaseItemKind::AudioBook
+            | BaseItemKind::MusicAlbum
+            | BaseItemKind::MusicVideo
+    )
+}
+
 /// Whether this kind is one of the music container/leaf kinds
 /// (`Audio`/`MusicAlbum`/`MusicArtist`/`MusicGenre`/`MusicVideo`).
 ///

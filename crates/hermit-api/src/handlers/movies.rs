@@ -83,12 +83,21 @@ async fn get_movie_recommendations(
         )
         .await?;
 
+    // Project every category's items in one pass (one page prefetch instead of
+    // one per category), then reassemble per category by position — order and
+    // cross-category duplicates are preserved.
+    let all_items: Vec<_> = recommendations
+        .iter()
+        .flat_map(|rec| rec.items.iter().cloned())
+        .collect();
+    let mut all_dtos = state
+        .dto
+        .get_base_item_dtos(&all_items, &options, user.as_ref(), None, true)
+        .await?
+        .into_iter();
     let mut dtos = Vec::with_capacity(recommendations.len());
     for rec in recommendations {
-        let items = state
-            .dto
-            .get_base_item_dtos(&rec.items, &options, user.as_ref(), None, true)
-            .await?;
+        let items: Vec<_> = all_dtos.by_ref().take(rec.items.len()).collect();
         dtos.push(RecommendationDto {
             items: Some(items),
             recommendation_type: rec.recommendation_type,

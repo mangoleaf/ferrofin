@@ -58,7 +58,7 @@ use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::{
-    BaseItemDto, BaseItemPerson, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
+    BaseItemDto, BaseItemPerson, ItemCounts, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
 };
 use hermit_model::entities::{ExtraType, ImageType, LocationType, VideoType};
 use hermit_model::querying::ItemFields;
@@ -115,6 +115,23 @@ struct Prefetched {
     /// Played/total leaf-descendant counts per folder item id (populated when
     /// user data is enabled and a user is present), for folder `UnplayedItemCount`.
     played_counts: HashMap<Uuid, hermit_traits::persistence::PlayedAndTotal>,
+    /// Merged alternate-version rows per primary item id (populated only when
+    /// the `MediaSources` field is requested), so a merged item reports its
+    /// extra selectable sources without a per-item query.
+    alternates: HashMap<Uuid, Vec<BaseItemEntity>>,
+}
+
+impl Prefetched {
+    /// A studio/genre/artist id from the prefetched `ItemValues` map — the nil
+    /// id when the name has no stored value row, exactly as the per-name lookup
+    /// resolved a missing row.
+    fn value_id(&self, value_type: i32, name: &str) -> Uuid {
+        let clean = crate::text_util::get_clean_value(name);
+        self.value_ids
+            .get(&(value_type, clean))
+            .copied()
+            .unwrap_or_else(Uuid::nil)
+    }
 }
 use crate::kinds;
 
@@ -179,6 +196,33 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
 /// unrecognized stored `Type` (the conservative default used across the crate).
 fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
+}
+
+/// Whether this row enters the C# `AttachUserSpecificInfo` folder branch — the
+/// *runtime* `BaseItem.IsFolder`, not just the stored column. Pure by-name kinds
+/// (`Genre`/`MusicGenre`/`Studio`/`Person`/`Year`) are `BaseItem` subclasses in
+/// C#, never folders, whatever the stored flag says (Hermit materializes their
+/// rows with `IsFolder = 1`). `MusicArtist` is the one by-name kind that *is* a
+/// C# `Folder`, but overrides `IsFolder => !IsAccessedByName`, and
+/// `IsAccessedByName => ParentId.IsEmpty()` — so only a physically-parented
+/// artist folder counts as a folder here.
+fn folder_emits_counts(item: &BaseItemEntity) -> bool {
+    if !item.is_folder {
+        return false;
+    }
+    match row_kind(item) {
+        BaseItemKind::Genre
+        | BaseItemKind::MusicGenre
+        | BaseItemKind::Studio
+        | BaseItemKind::Person
+        | BaseItemKind::Year => false,
+        BaseItemKind::MusicArtist => item
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            .is_some_and(|p| !p.is_nil()),
+        _ => true,
+    }
 }
 
 /// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
@@ -373,33 +417,14 @@ impl HermitDtoService {
         Ok(map)
     }
 
-    /// Resolves a by-name value (genre/studio/…) to its `ItemValues` id, or the
-    /// nil UUID when it has no stored value row.
+    /// Resolves many `(value type, name)` pairs to their `ItemValues` ids in one
+    /// query, keyed by `(type, clean value)` — the page's studios/genres/artists.
+    /// Pairs with no row are simply absent.
     ///
     /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
     /// hash-map a clean value to a stable id; here the stored `ItemValues` row
-    /// already carries that id, so a single lookup keyed by `(Type, CleanValue)`
+    /// already carries that id, so a lookup keyed by `(Type, CleanValue)`
     /// suffices.
-    async fn value_id(&self, value_type: i32, name: &str) -> Result<Uuid, ServiceError> {
-        let clean = crate::text_util::get_clean_value(name);
-        let stored: Option<String> = sqlx::query_scalar(
-            r#"SELECT "ItemValueId" FROM "ItemValues"
-               WHERE "Type" = ?1 AND "CleanValue" = ?2 LIMIT 1"#,
-        )
-        .bind(value_type)
-        .bind(&clean)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        Ok(stored
-            .and_then(|s| Uuid::parse_str(&s).ok())
-            .unwrap_or_else(Uuid::nil))
-    }
-
-    /// Resolves many `(value type, name)` pairs to their `ItemValues` ids in one
-    /// query, keyed by `(type, clean value)`. The batch form of [`Self::value_id`]
-    /// for a page's studios/genres/artists. Pairs with no row are simply absent.
     async fn resolve_value_ids(
         &self,
         pairs: &[(i32, String)],
@@ -434,26 +459,6 @@ impl HermitDtoService {
             }
         }
         Ok(map)
-    }
-
-    /// A studio/genre/artist id: from the prefetched map on a page projection
-    /// (absent ⇒ the nil id, as [`Self::value_id`] returns for a missing row),
-    /// else the per-item query for single-item callers.
-    async fn value_id_for(
-        &self,
-        prefetched: Option<&Prefetched>,
-        value_type: i32,
-        name: &str,
-    ) -> Result<Uuid, ServiceError> {
-        if let Some(p) = prefetched {
-            let clean = crate::text_util::get_clean_value(name);
-            return Ok(p
-                .value_ids
-                .get(&(value_type, clean))
-                .copied()
-                .unwrap_or_else(Uuid::nil));
-        }
-        self.value_id(value_type, name).await
     }
 
     /// Computes the primary-image aspect ratio for a set of already-loaded image
@@ -517,41 +522,17 @@ impl HermitDtoService {
         &self,
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
-        prefetched: Option<&Prefetched>,
+        prefetched: &Prefetched,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
-        // On a page projection the credits and their images were bulk-loaded once;
-        // otherwise fetch this item's people and, in one query, their image rows
-        // (the N+1 `load_images` per cast member is the cost of a large-cast item).
-        // Failure of the image load stays lenient (no tags), as before.
-        let owned_people;
-        let owned_images;
-        let (people, images_by_person): (
-            &[hermit_db::entities::base_items::PeopleEntity],
-            &HashMap<Uuid, Vec<ItemImageInfo>>,
-        ) = if let Some(p) = prefetched {
-            (
-                p.people.get(&item_id).map_or(&[][..], Vec::as_slice),
-                &p.person_images,
-            )
-        } else {
-            owned_people = self
-                .library
-                .get_people(&hermit_traits::options::InternalPeopleQuery {
-                    item_id,
-                    ..Default::default()
-                })
-                .await?;
-            let person_ids: Vec<Uuid> = owned_people
-                .iter()
-                .map(|p| Uuid::parse_str(&p.id).unwrap_or_else(|_| Uuid::nil()))
-                .collect();
-            owned_images = self
-                .load_images_batch(&person_ids)
-                .await
-                .unwrap_or_default();
-            (&owned_people, &owned_images)
-        };
+        // The page's credits and their images were bulk-loaded once by the
+        // prefetch (the per-item get_people + per-person load_images was the
+        // N+1 cost of a large-cast item).
+        let people = prefetched
+            .people
+            .get(&item_id)
+            .map_or(&[][..], Vec::as_slice);
+        let images_by_person = &prefetched.person_images;
 
         let mut list = Vec::with_capacity(people.len());
         for person in people {
@@ -584,71 +565,55 @@ impl HermitDtoService {
     }
 
     /// Attaches the item's studios as name/id pairs (port of `AttachStudios`).
-    async fn attach_studios(
-        &self,
-        dto: &mut BaseItemDto,
-        item: &BaseItemEntity,
-        prefetched: Option<&Prefetched>,
-    ) -> Result<(), ServiceError> {
+    fn attach_studios(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         let studios = split_multi(item.studios.as_deref());
-        let mut pairs = Vec::with_capacity(studios.len());
-        for name in studios {
-            let id = self.value_id_for(prefetched, 3, &name).await?; // 3 = Studios
-            pairs.push(NameGuidPair {
+        let pairs = studios
+            .into_iter()
+            .map(|name| NameGuidPair {
+                id: prefetched.value_id(3, &name), // 3 = Studios
                 name: Some(name),
-                id,
-            });
-        }
+            })
+            .collect();
         dto.studios = Some(pairs);
-        Ok(())
     }
 
     /// Attaches the item's genres as names and as name/id pairs (port of the
     /// `Genres`/`AttachGenreItems` block).
-    async fn attach_genres(
-        &self,
+    fn attach_genres(
         dto: &mut BaseItemDto,
         item: &BaseItemEntity,
         kind: BaseItemKind,
-        prefetched: Option<&Prefetched>,
-    ) -> Result<(), ServiceError> {
+        prefetched: &Prefetched,
+    ) {
         let genres = split_multi(item.genres.as_deref());
         // Music items resolve against the MusicGenre value space; everything else
         // against the plain Genre space. Both are stored as `ItemValueType::Genre`
         // (2) in this schema, so the id lookup is the same table.
         let _is_music_genres = kinds::is_music(kind);
-        let mut pairs = Vec::with_capacity(genres.len());
-        for name in &genres {
-            let id = self.value_id_for(prefetched, 2, name).await?; // 2 = Genre
-            pairs.push(NameGuidPair {
+        let pairs = genres
+            .iter()
+            .map(|name| NameGuidPair {
                 name: Some(name.clone()),
-                id,
-            });
-        }
+                id: prefetched.value_id(2, name), // 2 = Genre
+            })
+            .collect();
         dto.genre_items = Some(pairs);
         dto.genres = Some(genres);
-        Ok(())
     }
 
     /// Attaches artist / album-artist names and name-id pairs (port of the
     /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are resolved from
     /// the shared `ItemValues` table (`Artist`/`AlbumArtist` value types).
-    async fn attach_artists(
-        &self,
-        dto: &mut BaseItemDto,
-        item: &BaseItemEntity,
-        prefetched: Option<&Prefetched>,
-    ) -> Result<(), ServiceError> {
+    fn attach_artists(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
         let artists = split_multi(item.artists.as_deref());
         if !artists.is_empty() {
-            let mut items = Vec::with_capacity(artists.len());
-            for name in &artists {
-                let id = self.value_id_for(prefetched, 0, name).await?; // 0 = Artist
-                items.push(NameGuidPair {
+            let items = artists
+                .iter()
+                .map(|name| NameGuidPair {
                     name: Some(name.clone()),
-                    id,
-                });
-            }
+                    id: prefetched.value_id(0, name), // 0 = Artist
+                })
+                .collect();
             dto.artists = Some(artists);
             dto.artist_items = Some(items);
         }
@@ -656,17 +621,15 @@ impl HermitDtoService {
         let album_artists = split_multi(item.album_artists.as_deref());
         if !album_artists.is_empty() {
             dto.album_artist = album_artists.first().cloned();
-            let mut items = Vec::with_capacity(album_artists.len());
-            for name in &album_artists {
-                let id = self.value_id_for(prefetched, 1, name).await?; // 1 = AlbumArtist
-                items.push(NameGuidPair {
+            let items = album_artists
+                .iter()
+                .map(|name| NameGuidPair {
                     name: Some(name.clone()),
-                    id,
-                });
-            }
+                    id: prefetched.value_id(1, name), // 1 = AlbumArtist
+                })
+                .collect();
             dto.album_artists = Some(items);
         }
-        Ok(())
     }
 
     /// Applies the images (single-image tags + backdrops) to the DTO (port of
@@ -725,8 +688,9 @@ impl HermitDtoService {
     /// Builds the full DTO for one item row (port of `GetBaseItemDtoInternal` +
     /// `AttachBasicFields`), honoring every [`DtoOptions`] toggle.
     ///
-    /// `prefetched` carries relation rows bulk-loaded for a whole page (list
-    /// endpoints); `None` falls back to per-item queries (single-item callers).
+    /// `prefetched` carries the relation rows bulk-loaded for the page (a
+    /// single item is a page of one) — `build_dto` itself issues no per-item
+    /// relation queries, so the N+1 projection path no longer exists.
     #[allow(clippy::too_many_lines)]
     async fn build_dto(
         &self,
@@ -734,7 +698,7 @@ impl HermitDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        prefetched: Option<&Prefetched>,
+        prefetched: &Prefetched,
     ) -> Result<BaseItemDto, ServiceError> {
         let item_id = row_id(item);
         let kind = row_kind(item);
@@ -742,10 +706,7 @@ impl HermitDtoService {
         let images = if options.enable_images
             || options.contains_field(ItemFields::PrimaryImageAspectRatio)
         {
-            match prefetched {
-                Some(p) => p.images.get(&item_id).cloned().unwrap_or_default(),
-                None => self.load_images(item_id).await?,
-            }
+            prefetched.images.get(&item_id).cloned().unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -774,79 +735,66 @@ impl HermitDtoService {
         }
 
         // User-specific play-state.
-        if let Some(user) = user {
-            let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+        if user.is_some() {
             // C# `item.GetPlayAccess(user)` — Full unless parental control blocks it (not ported).
             if options.contains_field(ItemFields::PlayAccess) {
                 dto.play_access = Some(hermit_model::library::PlayAccess::Full);
             }
             if options.enable_user_data {
-                dto.user_data = match prefetched {
-                    Some(p) => p.user_data.get(&item_id).cloned(),
-                    None => self.user_data.get_user_data_dto(item_id, user_id).await?,
-                };
+                dto.user_data = prefetched.user_data.get(&item_id).cloned();
                 // Folder UserData carries UnplayedItemCount = unplayed leaf descendants
                 // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
-                // By-name kinds (Genre/Studio/Person/Year/…) are stored IsFolder=1 but
-                // have no ancestor closure, so the count is provably 0 — and Jellyfin,
-                // where they are `BaseItem`+`IItemByName` not `Folder`, never emits it.
-                if item.is_folder
-                    && kinds::supports_ancestors(kind)
+                // The branch keys on the runtime C# `IsFolder` (`folder_emits_counts`):
+                // pure by-name kinds never enter it, a MusicArtist only when
+                // physically parented.
+                if folder_emits_counts(item)
                     && !matches!(
                         kind,
                         BaseItemKind::CollectionFolder | BaseItemKind::UserView
                     )
+                    && let Some(c) = prefetched.played_counts.get(&item_id).copied()
                 {
-                    let counts = match prefetched {
-                        Some(p) => p.played_counts.get(&item_id).copied(),
-                        None => Some(
-                            self.item_counts
-                                .get_played_and_total_count_batch(
-                                    std::slice::from_ref(&item_id),
-                                    user,
-                                )
-                                .await?
-                                .get(&item_id)
-                                .copied()
-                                .unwrap_or_default(),
-                        ),
-                    };
-                    if let Some(c) = counts {
-                        let ud = dto
-                            .user_data
-                            .get_or_insert_with(|| empty_user_data_dto(item_id));
-                        ud.unplayed_item_count = Some(c.total - c.played);
-                    }
+                    let ud = dto
+                        .user_data
+                        .get_or_insert_with(|| empty_user_data_dto(item_id));
+                    ud.unplayed_item_count = Some(c.total - c.played);
                 }
             }
         }
 
         // Media sources.
         if options.contains_field(ItemFields::MediaSources) {
-            // On a page projection we hold the row and its streams already, so
-            // assemble the static source directly — no per-item retrieve_item +
-            // streams_dto. Falls back to the manager for single-item callers.
-            let sources = if let Some(p) = prefetched {
-                let streams = p.media_streams.get(&item_id).cloned().unwrap_or_default();
-                vec![
+            // The row and its streams are already prefetched, so assemble the
+            // static source directly — no per-item retrieve_item + streams_dto.
+            let streams = prefetched
+                .media_streams
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut sources = vec![
+                crate::media_source_manager::HermitMediaSourceManager::static_source(item, streams),
+            ];
+            // Merged alternate versions report as additional selectable sources
+            // (C# `GetStaticMediaSources` includes `LinkedAlternateVersions`).
+            for alt in prefetched.alternates.get(&item_id).into_iter().flatten() {
+                let alt_streams = prefetched
+                    .media_streams
+                    .get(&row_id(alt))
+                    .cloned()
+                    .unwrap_or_default();
+                sources.push(
                     crate::media_source_manager::HermitMediaSourceManager::static_source(
-                        item, streams,
+                        alt,
+                        alt_streams,
                     ),
-                ]
-            } else {
-                let user_id = user.and_then(|u| Uuid::parse_str(&u.id).ok());
-                self.media_sources
-                    .get_static_media_sources(item_id, true, user_id)
-                    .await?
-            };
-            if !sources.is_empty() {
-                dto.media_sources = Some(sources);
+                );
             }
+            dto.media_sources = Some(sources);
         }
 
         // Studios.
         if options.contains_field(ItemFields::Studios) {
-            self.attach_studios(&mut dto, item, prefetched).await?;
+            Self::attach_studios(&mut dto, item, prefetched);
         }
 
         self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id, prefetched)
@@ -880,7 +828,7 @@ impl HermitDtoService {
         images: &[ItemImageInfo],
         options: &DtoOptions,
         _owner_id: Option<Uuid>,
-        prefetched: Option<&Prefetched>,
+        prefetched: &Prefetched,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
 
@@ -943,7 +891,7 @@ impl HermitDtoService {
         }
 
         if options.contains_field(ItemFields::Genres) {
-            self.attach_genres(dto, item, kind, prefetched).await?;
+            Self::attach_genres(dto, item, kind, prefetched);
         }
 
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
@@ -997,10 +945,14 @@ impl HermitDtoService {
         dto.production_year = item.production_year.and_then(|y| i32::try_from(y).ok());
 
         if options.contains_field(ItemFields::ProviderIds) {
-            dto.provider_ids = Some(match prefetched {
-                Some(p) => p.provider_ids.get(&item_id).cloned().unwrap_or_default(),
-                None => self.load_provider_ids(item_id).await?, // {} when none
-            });
+            // {} when none (matches Jellyfin).
+            dto.provider_ids = Some(
+                prefetched
+                    .provider_ids
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
 
         dto.run_time_ticks = item.run_time_ticks;
@@ -1035,8 +987,12 @@ impl HermitDtoService {
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
         }
 
-        // Artists / album-artists.
-        self.attach_artists(dto, item, prefetched).await?;
+        // Artists / album-artists — only the kinds that implement C#
+        // `IHasArtist`/`IHasAlbumArtist` (Audio, AudioBook, MusicAlbum,
+        // MusicVideo) carry them; Jellyfin never emits artist fields elsewhere.
+        if kinds::has_artist_fields(kind) {
+            Self::attach_artists(dto, item, prefetched);
+        }
 
         // Video extras.
         if kinds::is_video(kind) {
@@ -1045,28 +1001,33 @@ impl HermitDtoService {
 
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
-                let manifest = match prefetched {
-                    Some(p) => p.trickplay.get(&item_id).cloned().unwrap_or_default(),
-                    None => self.trickplay.get_trickplay_manifest(item_id).await?,
-                };
+                let manifest = prefetched
+                    .trickplay
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_default();
                 dto.trickplay = Some(to_trickplay_manifest(&manifest));
             }
         }
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
         if options.contains_field(ItemFields::Chapters) {
-            dto.chapters = Some(match prefetched {
-                Some(p) => p.chapters.get(&item_id).cloned().unwrap_or_default(),
-                None => self.chapters.get_chapters(item_id).await?,
-            });
+            dto.chapters = Some(
+                prefetched
+                    .chapters
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
 
         // Media streams.
         if options.contains_field(ItemFields::MediaStreams) {
-            let streams = match prefetched {
-                Some(p) => p.media_streams.get(&item_id).cloned().unwrap_or_default(),
-                None => self.media_sources.get_media_streams(item_id).await?,
-            };
+            let streams = prefetched
+                .media_streams
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
             if !streams.is_empty() {
                 dto.media_streams = Some(streams);
             }
@@ -1133,26 +1094,9 @@ impl HermitDtoService {
         Ok(())
     }
 
-    /// Loads an item's `(key, value)` provider ids from `BaseItemProviders`.
-    async fn load_provider_ids(
-        &self,
-        item_id: Uuid,
-    ) -> Result<HashMap<String, String>, ServiceError> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
-               WHERE "ItemId" = ?1"#,
-        )
-        .bind(item_id.to_string())
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        Ok(rows.into_iter().collect())
-    }
-
-    /// Batch form of [`Self::load_provider_ids`]: all provider ids for `item_ids`
-    /// in one query per chunk, keyed by item id. Prefetched for list DTOs so the
-    /// per-item lookup does not fan out across the 2-connection pool.
+    /// All provider ids for `item_ids` in one query per chunk, keyed by item
+    /// id. Prefetched for the page so the per-item lookup does not fan out
+    /// across the 2-connection pool.
     async fn load_provider_ids_batch(
         &self,
         item_ids: &[Uuid],
@@ -1199,19 +1143,52 @@ impl HermitDtoService {
             .item_counts
             .get_item_counts_for_name_item(dto.type_, dto.id, related, &access_filter)
             .await?;
-
-        dto.album_count = Some(counts.album_count);
-        dto.artist_count = Some(counts.artist_count);
-        dto.episode_count = Some(counts.episode_count);
-        dto.movie_count = Some(counts.movie_count);
-        dto.music_video_count = Some(counts.music_video_count);
-        dto.program_count = Some(counts.program_count);
-        dto.series_count = Some(counts.series_count);
-        dto.song_count = Some(counts.song_count);
-        dto.trailer_count = Some(counts.trailer_count);
-        dto.child_count = Some(total_item_count(&counts));
+        apply_name_counts(dto, &counts);
         Ok(())
     }
+
+    /// Resolves by-name item counts for the whole page: groups the by-name rows
+    /// by kind and issues one batched count query per kind (instead of one per
+    /// row — the `ItemCounts` N+1 on an Artists/Genres/Persons page).
+    async fn name_counts_batch(
+        &self,
+        items: &[BaseItemEntity],
+        user: Option<&UserEntity>,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        let mut by_kind: HashMap<BaseItemKind, Vec<Uuid>> = HashMap::new();
+        for item in items {
+            let kind = row_kind(item);
+            if related_item_kinds(kind).is_some() {
+                by_kind.entry(kind).or_default().push(row_id(item));
+            }
+        }
+        let access_filter = access_filter_for(user);
+        let mut out = HashMap::new();
+        for (kind, ids) in by_kind {
+            let related = related_item_kinds(kind).unwrap_or(&[]);
+            out.extend(
+                self.item_counts
+                    .get_item_counts_for_name_items(kind, &ids, related, &access_filter)
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// Copies a by-name item's related counts onto its DTO (the count-assignment
+/// tail of C# `SetItemByNameInfo`); `ChildCount` is the per-kind total.
+fn apply_name_counts(dto: &mut BaseItemDto, counts: &ItemCounts) {
+    dto.album_count = Some(counts.album_count);
+    dto.artist_count = Some(counts.artist_count);
+    dto.episode_count = Some(counts.episode_count);
+    dto.movie_count = Some(counts.movie_count);
+    dto.music_video_count = Some(counts.music_video_count);
+    dto.program_count = Some(counts.program_count);
+    dto.series_count = Some(counts.series_count);
+    dto.song_count = Some(counts.song_count);
+    dto.trailer_count = Some(counts.trailer_count);
+    dto.child_count = Some(total_item_count(counts));
 }
 
 /// The related item kinds counted for a by-name item (port of the C#
@@ -1367,27 +1344,15 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
-        let mut dto = self.build_dto(item, options, user, owner_id, None).await?;
-        if options.contains_field(ItemFields::ItemCounts) {
-            self.set_item_by_name_info(&mut dto, user).await?;
-        }
-        if let Some(user) = user
-            && options.contains_field(ItemFields::ChildCount)
-            && dto.child_count.is_none()
-            && item.is_folder
-            && kinds::supports_ancestors(row_kind(item))
-        {
-            let user_id = Uuid::parse_str(&user.id).ok();
-            let counts = self
-                .item_counts
-                .get_child_count_batch(&[row_id(item)], user_id)
-                .await?;
-            attach_child_count(&mut dto, item, &counts);
-        }
-        Ok(dto)
+        // A single item is a batch of one: the same prefetched projection path
+        // as a page, so a per-item N+1 fallback no longer exists for new
+        // handlers to reach.
+        self.get_base_item_dtos(std::slice::from_ref(item), options, user, owner_id, true)
+            .await?
+            .pop()
+            .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
     }
 
-    #[allow(clippy::too_many_lines)] // a flat sequence of independent page prefetches
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
@@ -1399,10 +1364,75 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
+        let prefetched = self.prefetch(items, options, user).await?;
+        // By-name related counts for the page in one grouped query per kind
+        // (C# calls `SetItemByNameInfo` per item).
+        let name_counts = if options.contains_field(ItemFields::ItemCounts) {
+            self.name_counts_batch(items, user).await?
+        } else {
+            HashMap::new()
+        };
 
-        // Bulk-load the per-item relations for the whole page up front (2
-        // queries total) instead of 2 queries × N items inside `build_dto` —
-        // the N+1 convoyed the connection pool under concurrent list load.
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let mut dto = self
+                .build_dto(item, options, user, owner_id, &prefetched)
+                .await?;
+            if let Some(counts) = name_counts.get(&dto.id) {
+                apply_name_counts(&mut dto, counts);
+            }
+            // ChildCount only where the C# runtime `IsFolder` is true (see
+            // `folder_emits_counts`) — by-name rows are folders in storage only.
+            if user.is_some()
+                && options.contains_field(ItemFields::ChildCount)
+                && folder_emits_counts(item)
+            {
+                attach_child_count(&mut dto, item, &prefetched.child_counts);
+            }
+            out.push(dto);
+        }
+        Ok(out)
+    }
+
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        options: &DtoOptions,
+        tagged_item_ids: Option<&[Uuid]>,
+        user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        let prefetched = self
+            .prefetch(std::slice::from_ref(item), options, user)
+            .await?;
+        let mut dto = self
+            .build_dto(item, options, user, None, &prefetched)
+            .await?;
+
+        // When the caller pre-supplies the tagged items, count them by kind
+        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
+        // to the count-service path.
+        if options.contains_field(ItemFields::ItemCounts) {
+            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
+                self.set_tagged_counts(&mut dto, ids).await?;
+            } else {
+                self.set_item_by_name_info(&mut dto, user).await?;
+            }
+        }
+        Ok(dto)
+    }
+}
+
+impl HermitDtoService {
+    /// Bulk-loads every relation `build_dto` reads for `items` — one query per
+    /// relation family for the whole page instead of one (or more) per item.
+    /// The per-item N+1 convoyed the 2-connection pool under concurrent load.
+    #[allow(clippy::too_many_lines)] // a flat sequence of independent page prefetches
+    async fn prefetch(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
         let images = if options.enable_images
             || options.contains_field(ItemFields::PrimaryImageAspectRatio)
@@ -1418,13 +1448,30 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             }
             _ => HashMap::new(),
         };
+        // Merged alternate versions (rows pointing at a page item via
+        // `PrimaryVersionId`), so each item's extra selectable sources build
+        // without a per-item query; their streams join the stream batch below.
+        let alternates = if options.contains_field(ItemFields::MediaSources) {
+            self.media_sources
+                .get_alternate_versions_batch(&ids)
+                .await?
+        } else {
+            HashMap::new()
+        };
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
         let media_streams = if options.contains_field(ItemFields::MediaStreams)
             || options.contains_field(ItemFields::MediaSources)
         {
-            self.media_sources.get_media_streams_batch(&ids).await?
+            let stream_ids: Vec<Uuid> = ids
+                .iter()
+                .copied()
+                .chain(alternates.values().flatten().map(row_id))
+                .collect();
+            self.media_sources
+                .get_media_streams_batch(&stream_ids)
+                .await?
         } else {
             HashMap::new()
         };
@@ -1452,8 +1499,8 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
         };
         // Studio/genre/artist ids for every name on the page in one query. Collect
         // exactly what the attach steps resolve: studios/genres only when their
-        // field is requested, artists/album-artists always (attach_artists is
-        // unconditional) — so a prefetched miss never wrongly nils a real id.
+        // field is requested, artists/album-artists only for the kinds that carry
+        // artist fields — so a prefetched miss never wrongly nils a real id.
         let value_ids = {
             let mut pairs: Vec<(i32, String)> = Vec::new();
             let want_studios = options.contains_field(ItemFields::Studios);
@@ -1473,16 +1520,18 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                             .map(|n| (2, n)),
                     );
                 }
-                pairs.extend(
-                    split_multi(item.artists.as_deref())
-                        .into_iter()
-                        .map(|n| (0, n)),
-                );
-                pairs.extend(
-                    split_multi(item.album_artists.as_deref())
-                        .into_iter()
-                        .map(|n| (1, n)),
-                );
+                if kinds::has_artist_fields(row_kind(item)) {
+                    pairs.extend(
+                        split_multi(item.artists.as_deref())
+                            .into_iter()
+                            .map(|n| (0, n)),
+                    );
+                    pairs.extend(
+                        split_multi(item.album_artists.as_deref())
+                            .into_iter()
+                            .map(|n| (1, n)),
+                    );
+                }
             }
             self.resolve_value_ids(&pairs).await?
         };
@@ -1503,8 +1552,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                 let folder_ids: Vec<Uuid> = items
                     .iter()
                     .filter(|i| {
-                        i.is_folder
-                            && kinds::supports_ancestors(row_kind(i))
+                        folder_emits_counts(i)
                             && !matches!(
                                 row_kind(i),
                                 BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -1530,8 +1578,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
                 let folder_ids: Vec<Uuid> = items
                     .iter()
                     .filter(|i| {
-                        i.is_folder
-                            && kinds::supports_ancestors(row_kind(i))
+                        folder_emits_counts(i)
                             && !matches!(
                                 row_kind(i),
                                 BaseItemKind::CollectionFolder | BaseItemKind::UserView
@@ -1549,7 +1596,7 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             }
             _ => HashMap::new(),
         };
-        let prefetched = Prefetched {
+        Ok(Prefetched {
             images,
             user_data,
             media_streams,
@@ -1561,48 +1608,10 @@ impl hermit_traits::dto::DtoService for HermitDtoService {
             trickplay,
             child_counts,
             played_counts,
-        };
-
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            let mut dto = self
-                .build_dto(item, options, user, owner_id, Some(&prefetched))
-                .await?;
-            if options.contains_field(ItemFields::ItemCounts) {
-                self.set_item_by_name_info(&mut dto, user).await?;
-            }
-            if user.is_some() && options.contains_field(ItemFields::ChildCount) {
-                attach_child_count(&mut dto, item, &prefetched.child_counts);
-            }
-            out.push(dto);
-        }
-        Ok(out)
+            alternates,
+        })
     }
 
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        tagged_item_ids: Option<&[Uuid]>,
-        user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        let mut dto = self.build_dto(item, options, user, None, None).await?;
-
-        // When the caller pre-supplies the tagged items, count them by kind
-        // (port of the static `SetItemByNameInfo` overload); otherwise fall back
-        // to the count-service path.
-        if options.contains_field(ItemFields::ItemCounts) {
-            if let Some(ids) = tagged_item_ids.filter(|ids| !ids.is_empty()) {
-                self.set_tagged_counts(&mut dto, ids).await?;
-            } else {
-                self.set_item_by_name_info(&mut dto, user).await?;
-            }
-        }
-        Ok(dto)
-    }
-}
-
-impl HermitDtoService {
     /// Counts pre-supplied tagged items by kind onto a by-name DTO (port of the
     /// static `SetItemByNameInfo(item, dto, taggedItems)` overload). The kinds of
     /// the tagged items are read from their rows.
@@ -1885,13 +1894,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // a flat sequence of per-kind assertions
     async fn folder_user_data_carries_unplayed_item_count() {
         let db = test_db().await;
         let folder_id = Uuid::new_v4();
         seed_named_item(&db, folder_id, BaseItemKind::Season, "Season 1").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
             .bind(folder_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("mark folder");
         let leaf_id = Uuid::new_v4();
@@ -1901,13 +1911,35 @@ mod tests {
         seed_named_item(&db, genre_id, BaseItemKind::Genre, "Drama").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
             .bind(genre_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("mark by-name folder");
+        // Two MusicArtist rows: accessed-by-name (no parent — C# `IsFolder` false)
+        // and a physical artist folder (parented — C# `IsFolder` true).
+        let byname_artist_id = Uuid::new_v4();
+        seed_named_item(&db, byname_artist_id, BaseItemKind::MusicArtist, "ByName").await;
+        let physical_artist_id = Uuid::new_v4();
+        seed_named_item(&db, physical_artist_id, BaseItemKind::MusicArtist, "OnDisk").await;
+        // One statement marks both artists IsFolder=1 and parents only the
+        // physical one (the by-name artist keeps a NULL ParentId).
+        sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "IsFolder" = 1,
+                   "ParentId" = CASE "Id" WHEN ?2 THEN ?3 ELSE "ParentId" END
+               WHERE "Id" IN (?1, ?2)"#,
+        )
+        .bind(byname_artist_id.to_string())
+        .bind(physical_artist_id.to_string())
+        .bind(folder_id.to_string())
+        .execute(db.writer())
+        .await
+        .expect("mark artist folders");
         let user = seed_user(&db, Uuid::new_v4()).await;
         let folder = fetch_item(&db, folder_id).await;
         let leaf = fetch_item(&db, leaf_id).await;
         let genre = fetch_item(&db, genre_id).await;
+        let byname_artist = fetch_item(&db, byname_artist_id).await;
+        let physical_artist = fetch_item(&db, physical_artist_id).await;
         let svc = service(db);
         let options = DtoOptions::default(); // enables user data
 
@@ -1974,6 +2006,72 @@ mod tests {
                 .unwrap()
                 .unplayed_item_count,
             None
+        );
+
+        // A by-name MusicArtist (no parent) is not a folder at runtime in C#
+        // (`MusicArtist.IsFolder => !IsAccessedByName`) — no count on either path.
+        let byname_single = svc
+            .get_base_item_dto(&byname_artist, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            byname_single
+                .user_data
+                .as_ref()
+                .unwrap()
+                .unplayed_item_count,
+            None
+        );
+        let byname_batch = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&byname_artist),
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            byname_batch[0]
+                .user_data
+                .as_ref()
+                .unwrap()
+                .unplayed_item_count,
+            None
+        );
+
+        // A physically-parented MusicArtist IS a folder at runtime — it carries
+        // the count like any other folder (FakeCounts: 1/4 played → 3 unplayed).
+        let physical_single = svc
+            .get_base_item_dto(&physical_artist, &options, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            physical_single
+                .user_data
+                .as_ref()
+                .unwrap()
+                .unplayed_item_count,
+            Some(3)
+        );
+        let physical_batch = svc
+            .get_base_item_dtos(
+                std::slice::from_ref(&physical_artist),
+                &options,
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            physical_batch[0]
+                .user_data
+                .as_ref()
+                .unwrap()
+                .unplayed_item_count,
+            Some(3)
         );
     }
 
@@ -2171,6 +2269,28 @@ mod tests {
             _user_id: Option<Uuid>,
         ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
             Ok(vec![])
+        }
+        async fn get_alternate_versions_batch(
+            &self,
+            primary_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+            // Every requested primary reports one canned alternate version.
+            Ok(primary_ids
+                .iter()
+                .map(|&id| {
+                    (
+                        id,
+                        vec![BaseItemEntity {
+                            id: Uuid::from_u128(0xA17).to_string(),
+                            name: Some("Alt Cut".to_owned()),
+                            path: Some("/media/alt.mkv".to_owned()),
+                            media_type: Some("Video".to_owned()),
+                            primary_version_id: Some(id.to_string()),
+                            ..Default::default()
+                        }],
+                    )
+                })
+                .collect())
         }
         async fn open_live_stream(
             &self,
@@ -2416,7 +2536,7 @@ mod tests {
         .bind(image_type)
         .bind(path)
         .bind(blur.map(|b| b.as_bytes().to_vec()))
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert image");
     }
@@ -2440,7 +2560,7 @@ mod tests {
                "Overview" = 'A thief', "OfficialRating" = 'PG-13' WHERE "Id" = ?1"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .unwrap();
 
@@ -2468,7 +2588,7 @@ mod tests {
         seed_named_item(&db, id, BaseItemKind::Movie, "Inception").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "Overview" = 'A thief' WHERE "Id" = ?1"#)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .unwrap();
         let item = fetch_item(&db, id).await;
@@ -2495,7 +2615,7 @@ mod tests {
                WHERE "Id" = ?1"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .unwrap();
         let item = fetch_item(&db, id).await;
@@ -2538,7 +2658,7 @@ mod tests {
                VALUES (?1, 'Imdb', 'tt1375666')"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .unwrap();
         let item = fetch_item(&db, id).await;
@@ -2661,7 +2781,7 @@ mod tests {
         seed_named_item(&db, id, BaseItemKind::Season, "Season 1").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("mark folder");
         let user = seed_user(&db, Uuid::new_v4()).await;
@@ -2718,7 +2838,7 @@ mod tests {
         seed_named_item(&db, id, BaseItemKind::CollectionFolder, "Shows").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("mark folder");
         let user = seed_user(&db, Uuid::new_v4()).await;
@@ -2956,37 +3076,57 @@ mod tests {
         )
         .bind(vid.to_string())
         .bind(&clean)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .unwrap();
         let svc = service(db);
 
-        // The single-item lookup and the batch resolver agree on the id.
-        let single = svc.value_id(3, "Warner Bros.").await.unwrap();
+        // The batch resolver finds the stored id under its (type, clean) key.
         let map = svc
             .resolve_value_ids(&[(3, "Warner Bros.".to_string())])
             .await
             .unwrap();
-        assert_eq!(single, vid);
         assert_eq!(map.get(&(3, clean)).copied(), Some(vid));
 
-        // value_id_for reads the prefetched map without a query, and nil-s a name
-        // with no row (matching value_id's missing-row behaviour).
+        // Prefetched::value_id reads the map without a query, and nil-s a name
+        // with no row.
         let pf = Prefetched {
             value_ids: map,
             ..Prefetched::default()
         };
-        assert_eq!(
-            svc.value_id_for(Some(&pf), 3, "Warner Bros.")
-                .await
-                .unwrap(),
-            vid
-        );
-        assert!(
-            svc.value_id_for(Some(&pf), 3, "Nobody")
-                .await
-                .unwrap()
-                .is_nil()
-        );
+        assert_eq!(pf.value_id(3, "Warner Bros."), vid);
+        assert!(pf.value_id(3, "Nobody").is_nil());
+    }
+
+    #[tokio::test]
+    async fn media_sources_include_merged_alternate_versions() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0xA16);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Heat").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        // FakeSources reports one alternate version per primary: the DTO's
+        // sources are the primary's static source plus the alternate's, on the
+        // single-item path and the batch path alike.
+        let dto = svc
+            .get_base_item_dto(&item, &options, None, None)
+            .await
+            .unwrap();
+        let sources = dto.media_sources.expect("sources");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[1].path.as_deref(), Some("/media/alt.mkv"));
+
+        let batch = svc
+            .get_base_item_dtos(std::slice::from_ref(&item), &options, None, None, true)
+            .await
+            .unwrap();
+        let batch_sources = batch[0].media_sources.as_ref().expect("batch sources");
+        assert_eq!(batch_sources.len(), 2);
+        assert_eq!(batch_sources[1].path.as_deref(), Some("/media/alt.mkv"));
     }
 }

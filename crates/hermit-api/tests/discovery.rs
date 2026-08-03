@@ -548,12 +548,25 @@ impl SimilarItemsManager for StubSimilar {
         _item_limit: i32,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
-        Ok(vec![SimilarItemsRecommendation {
-            baseline_item_name: "Because you watched Alien".to_owned(),
-            category_id: Uuid::from_u128(0x41),
-            recommendation_type: RecommendationType::SimilarToRecentlyPlayed,
-            items: vec![item_entity(Uuid::from_u128(0x42), "Aliens")],
-        }])
+        Ok(vec![
+            SimilarItemsRecommendation {
+                baseline_item_name: "Because you watched Alien".to_owned(),
+                category_id: Uuid::from_u128(0x41),
+                recommendation_type: RecommendationType::SimilarToRecentlyPlayed,
+                items: vec![item_entity(Uuid::from_u128(0x42), "Aliens")],
+            },
+            SimilarItemsRecommendation {
+                baseline_item_name: "Because you liked Heat".to_owned(),
+                category_id: Uuid::from_u128(0x43),
+                recommendation_type: RecommendationType::SimilarToLikedItem,
+                items: vec![
+                    item_entity(Uuid::from_u128(0x44), "Ronin"),
+                    // The same item may recommend under several categories; the
+                    // single-pass projection must keep the duplicate in place.
+                    item_entity(Uuid::from_u128(0x42), "Aliens"),
+                ],
+            },
+        ])
     }
 }
 
@@ -679,12 +692,21 @@ async fn movie_recommendations_returns_categories() {
     let (status, body) = get("/Movies/Recommendations").await;
     assert_eq!(status, StatusCode::OK);
     let recs: Vec<RecommendationDto> = serde_json::from_slice(&body).expect("recommendations");
-    assert_eq!(recs.len(), 1);
+    assert_eq!(recs.len(), 2);
     assert_eq!(
         recs[0].baseline_item_name.as_deref(),
         Some("Because you watched Alien")
     );
-    assert_eq!(recs[0].items.as_ref().map(Vec::len), Some(1));
+    // The single-pass projection reassembles each category's items in order,
+    // keeping cross-category duplicates.
+    let names = |i: usize| {
+        recs[i]
+            .items
+            .as_ref()
+            .map(|items| items.iter().map(|d| d.name.as_deref()).collect::<Vec<_>>())
+    };
+    assert_eq!(names(0), Some(vec![Some("Aliens")]));
+    assert_eq!(names(1), Some(vec![Some("Ronin"), Some("Aliens")]));
 }
 
 #[tokio::test]

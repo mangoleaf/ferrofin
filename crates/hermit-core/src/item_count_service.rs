@@ -146,23 +146,59 @@ impl ItemCountService for HermitItemCountService {
 
     async fn get_item_counts_for_name_item(
         &self,
-        _kind: BaseItemKind,
+        kind: BaseItemKind,
         id: Uuid,
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<ItemCounts, ServiceError> {
-        // Count items of the related kinds that reference this by-name item's
-        // clean name, subject to the access filter's item set.
-        let clean: Option<String> =
-            sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?
-                .flatten();
-        let Some(clean) = clean else {
-            return Ok(ItemCounts::default());
-        };
+        // A single by-name item is a batch of one.
+        Ok(self
+            .get_item_counts_for_name_items(
+                kind,
+                std::slice::from_ref(&id),
+                related_item_kinds,
+                access_filter,
+            )
+            .await?
+            .remove(&id)
+            .unwrap_or_default())
+    }
+
+    async fn get_item_counts_for_name_items(
+        &self,
+        _kind: BaseItemKind,
+        ids: &[Uuid],
+        related_item_kinds: &[BaseItemKind],
+        access_filter: &InternalItemsQuery,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        // Every id reports counts (zeros when the row or its CleanName is
+        // missing), matching the per-item form's defaults.
+        let mut out: HashMap<Uuid, ItemCounts> =
+            ids.iter().map(|&id| (id, ItemCounts::default())).collect();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+
+        // Resolve every by-name row's CleanName in one query per chunk.
+        let mut clean_by_id: Vec<(Uuid, String)> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let sql = format!(
+                r#"SELECT "Id", "CleanName" FROM "BaseItems" WHERE "Id" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for (row_id, clean) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let (Ok(uuid), Some(clean)) = (Uuid::parse_str(&row_id), clean) {
+                    clean_by_id.push((uuid, clean));
+                }
+            }
+        }
+        if clean_by_id.is_empty() {
+            return Ok(out);
+        }
 
         let type_names: Vec<String> = related_item_kinds
             .iter()
@@ -170,7 +206,8 @@ impl ItemCountService for HermitItemCountService {
             .map(ToOwned::to_owned)
             .collect();
 
-        // Count the related items carrying this by-name item's clean value, grouped by type.
+        // Count the related items carrying each clean value, grouped by value
+        // and type — one query per chunk covers the whole page.
         // ponytail: no access-scoping `bi."Id" IN (...)` clause — Hermit implements no per-user
         // parental/library restriction yet, so `access_filter` (user-only) matches every item.
         // The previous code materialized the *entire* accessible id set and bound it as a giant
@@ -178,30 +215,49 @@ impl ItemCountService for HermitItemCountService {
         // nothing. Re-introduce access scoping as a SQL predicate (subquery/join), not an
         // app-materialized id list, when real access restrictions land.
         let _ = access_filter;
-        let mut sql = String::from(
-            r#"SELECT bi."Type", COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
-               JOIN "ItemValuesMap" ivm ON ivm."ItemId" = bi."Id"
-               JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               WHERE iv."CleanValue" = ?"#,
-        );
-        if !type_names.is_empty() {
-            sql.push_str(r#" AND bi."Type" IN ("#);
-            sql.push_str(&placeholders(type_names.len()));
-            sql.push(')');
-        }
-        sql.push_str(r#" GROUP BY bi."Type""#);
-
-        let mut query = sqlx::query_as::<_, (String, i64)>(&sql).bind(clean);
-        for t in &type_names {
-            query = query.bind(t.clone());
-        }
-        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-
-        let by_type: HashMap<String, i32> = rows
+        let distinct_cleans: Vec<String> = clean_by_id
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect::<std::collections::HashSet<_>>()
             .into_iter()
-            .map(|(t, c)| (t, i32::try_from(c).unwrap_or(i32::MAX)))
             .collect();
-        Ok(counts_from_type_map(&by_type))
+        let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
+        for chunk in distinct_cleans.chunks(500) {
+            let mut sql = format!(
+                r#"SELECT iv."CleanValue", bi."Type", COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
+                   JOIN "ItemValuesMap" ivm ON ivm."ItemId" = bi."Id"
+                   JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                   WHERE iv."CleanValue" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            if !type_names.is_empty() {
+                sql.push_str(r#" AND bi."Type" IN ("#);
+                sql.push_str(&placeholders(type_names.len()));
+                sql.push(')');
+            }
+            sql.push_str(r#" GROUP BY iv."CleanValue", bi."Type""#);
+
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            for clean in chunk {
+                query = query.bind(clean.clone());
+            }
+            for t in &type_names {
+                query = query.bind(t.clone());
+            }
+            for (clean, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                by_clean
+                    .entry(clean)
+                    .or_default()
+                    .insert(type_, i32::try_from(count).unwrap_or(i32::MAX));
+            }
+        }
+
+        for (id, clean) in clean_by_id {
+            if let Some(by_type) = by_clean.get(&clean) {
+                out.insert(id, counts_from_type_map(by_type));
+            }
+        }
+        Ok(out)
     }
 
     async fn get_played_count(
@@ -466,7 +522,7 @@ mod tests {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
                 .bind(child.to_string())
                 .bind(folder.to_string())
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("ancestor");
         }
@@ -545,7 +601,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
             .bind(kid.to_string())
             .bind(parent.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set parent");
 
@@ -583,14 +639,14 @@ mod tests {
                 )
                 .bind(boxset.to_string())
                 .bind(child.to_string())
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("link child");
             } else {
                 sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
                     .bind(child.to_string())
                     .bind(boxset.to_string())
-                    .execute(db.pool())
+                    .execute(db.writer())
                     .await
                     .expect("set parent");
             }
@@ -621,7 +677,7 @@ mod tests {
             )
             .bind(parent.to_string())
             .bind(child.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("linked child");
         }
@@ -716,6 +772,63 @@ mod tests {
             .await
             .expect("no clean");
         assert_eq!(zero.item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn item_counts_for_name_items_batches_a_page() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // Two genres with distinct related sets, plus one with no CleanName.
+        let drama = Uuid::from_u128(0xDD01);
+        seed_named_item(&db, drama, BaseItemKind::Genre, "Drama").await;
+        set_clean_name(&db, drama, "Drama").await;
+        let comedy = Uuid::from_u128(0xDD02);
+        seed_named_item(&db, comedy, BaseItemKind::Genre, "Comedy").await;
+        set_clean_name(&db, comedy, "Comedy").await;
+        let no_clean = Uuid::from_u128(0xDD03);
+        seed_named_item(&db, no_clean, BaseItemKind::Genre, "").await;
+
+        let m1 = Uuid::from_u128(0xDD11);
+        seed_named_item(&db, m1, BaseItemKind::Movie, "M1").await;
+        seed_item_genre(&db, m1, "Drama").await;
+        let m2 = Uuid::from_u128(0xDD12);
+        seed_named_item(&db, m2, BaseItemKind::Movie, "M2").await;
+        seed_item_genre(&db, m2, "Comedy").await;
+        let s1 = Uuid::from_u128(0xDD13);
+        seed_named_item(&db, s1, BaseItemKind::Series, "S1").await;
+        seed_item_genre(&db, s1, "Comedy").await;
+
+        let batch = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &[drama, comedy, no_clean],
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("batch counts");
+
+        assert_eq!(batch[&drama].movie_count, 1);
+        assert_eq!(batch[&drama].series_count, 0);
+        assert_eq!(batch[&comedy].movie_count, 1);
+        assert_eq!(batch[&comedy].series_count, 1);
+        // A row without a CleanName still reports (zeros), matching the
+        // per-item form's default.
+        assert_eq!(batch[&no_clean].item_count, 0);
+
+        // The per-item form (single = batch of one) agrees.
+        let single = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Genre,
+                comedy,
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("single counts");
+        assert_eq!(single.movie_count, batch[&comedy].movie_count);
+        assert_eq!(single.series_count, batch[&comedy].series_count);
     }
 
     #[tokio::test]

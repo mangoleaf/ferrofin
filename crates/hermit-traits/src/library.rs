@@ -913,6 +913,25 @@ pub trait MediaSourceManager: Send + Sync {
         Ok(map)
     }
 
+    /// The merged alternate-version rows for a page of primary item ids, keyed
+    /// by primary id; primaries with no alternates are absent.
+    ///
+    /// Lets a DTO projection include every merged item's extra selectable
+    /// sources (C# `GetStaticMediaSources` includes `LinkedAlternateVersions`)
+    /// without a per-item query. The default reports no alternates — correct
+    /// wherever version groups don't exist; the concrete manager overrides it
+    /// with the repository's batched lookup.
+    async fn get_alternate_versions_batch(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, Vec<hermit_db::entities::base_items::BaseItemEntity>>,
+        ServiceError,
+    > {
+        let _ = primary_ids;
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Gets the media attachments of an item as presentation DTOs.
     async fn get_media_attachments(
         &self,

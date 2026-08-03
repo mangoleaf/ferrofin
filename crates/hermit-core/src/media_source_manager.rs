@@ -445,6 +445,16 @@ impl MediaSourceManager for HermitMediaSourceManager {
             .await
     }
 
+    async fn get_alternate_versions_batch(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<hermit_db::entities::base_items::BaseItemEntity>>, ServiceError>
+    {
+        self.items
+            .get_items_by_primary_version_batch(primary_ids)
+            .await
+    }
+
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,
@@ -924,6 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_source_carries_path_and_streams() {
+        use hermit_traits::persistence::ItemPersistenceService as _;
         let db = test_db().await;
         // Avoid id 1 — it collides with the query translator's placeholder row.
         let id = Uuid::from_u128(0x101);
@@ -932,7 +943,7 @@ mod tests {
             r#"UPDATE "BaseItems" SET "Path" = '/media/m.mkv', "RunTimeTicks" = 100 WHERE "Id" = ?1"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set path");
         let mgr = manager(&db);
@@ -945,6 +956,29 @@ mod tests {
         assert_eq!(sources[0].path.as_deref(), Some("/media/m.mkv"));
         assert_eq!(sources[0].container.as_deref(), Some("mkv"));
         assert_eq!(sources[0].run_time_ticks, Some(100));
+
+        // Link a merged alternate version through the repository: the batch
+        // alternates lookup groups it under this primary.
+        let alt = BaseItemEntity {
+            id: Uuid::from_u128(0x102).to_string(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            name: Some("Alt".to_owned()),
+            path: Some("/media/alt.mkv".to_owned()),
+            media_type: Some("Video".to_owned()),
+            primary_version_id: Some(id.to_string()),
+            date_modified: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        crate::item_persistence_service::HermitItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&alt))
+            .await
+            .expect("save alternate");
+        let batch = mgr
+            .get_alternate_versions_batch(&[id])
+            .await
+            .expect("alternates");
+        assert_eq!(batch[&id].len(), 1);
+        assert_eq!(batch[&id][0].path.as_deref(), Some("/media/alt.mkv"));
     }
 
     #[test]
