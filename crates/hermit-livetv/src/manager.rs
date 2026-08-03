@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hermit_db::Database;
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
 use hermit_model::data::{BaseItemKind, MediaType};
@@ -31,6 +31,10 @@ use serde::de::DeserializeOwned;
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
 use crate::xmltv::parse_xmltv;
+
+/// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
+/// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
+const SQLITE_BIND_LIMIT: usize = 999;
 
 /// Namespace for deriving stable channel UUIDs (v5) from `tuner-host|tvg-id`.
 const CHANNEL_NS: Uuid = Uuid::from_u128(0x6c74_7663_6861_6e6e_656c_735f_6e73_3031);
@@ -76,27 +80,29 @@ impl HermitLiveTvManager {
             .await
             .map_err(db_err)?;
 
-        for (index, ch) in channels.iter().enumerate() {
-            let key = if ch.id.is_empty() { &ch.name } else { &ch.id };
-            let id = Uuid::new_v5(&CHANNEL_NS, format!("{tuner_id}|{key}").as_bytes());
-            let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
-            sqlx::query(
+        // 9 columns per row; chunked multi-row insert instead of one round-trip
+        // per channel.
+        for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 9).enumerate() {
+            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "LiveTvChannels"
-                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex")
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"#,
-            )
-            .bind(id.to_string())
-            .bind(tuner_id)
-            .bind(&ch.id)
-            .bind(&ch.name)
-            .bind(&ch.number)
-            .bind(&ch.logo)
-            .bind(channel_type)
-            .bind(&ch.url)
-            .bind(i64::try_from(index).unwrap_or(i64::MAX))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+                   ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex") "#,
+            );
+            let base = chunk_index * (SQLITE_BIND_LIMIT / 9);
+            qb.push_values(chunk.iter().enumerate(), |mut b, (offset, ch)| {
+                let key = if ch.id.is_empty() { &ch.name } else { &ch.id };
+                let id = Uuid::new_v5(&CHANNEL_NS, format!("{tuner_id}|{key}").as_bytes());
+                let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
+                b.push_bind(id.to_string())
+                    .push_bind(tuner_id)
+                    .push_bind(&ch.id)
+                    .push_bind(&ch.name)
+                    .push_bind(&ch.number)
+                    .push_bind(&ch.logo)
+                    .push_bind(channel_type)
+                    .push_bind(&ch.url)
+                    .push_bind(i64::try_from(base + offset).unwrap_or(i64::MAX));
+            });
+            qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
 
         tx.commit().await.map_err(db_err)
@@ -119,46 +125,64 @@ impl HermitLiveTvManager {
             by_tvg.entry(tvg).or_default().push(id);
         }
 
+        // Flatten to one (channel, programme) row per binding, then insert in
+        // chunked multi-row statements (15 columns per row) instead of one
+        // round-trip per programme.
+        let rows: Vec<_> = guide
+            .programmes
+            .iter()
+            .flat_map(|prog| {
+                let channel_ids = by_tvg.get(&prog.channel_id).map_or(&[][..], Vec::as_slice);
+                let start = prog.start.map(|s| s.to_rfc3339()).unwrap_or_default();
+                let end = prog.stop.map(|s| s.to_rfc3339());
+                let genres = if prog.categories.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&prog.categories).ok()
+                };
+                channel_ids.iter().map(move |channel_id| {
+                    let id = Uuid::new_v5(&PROGRAM_NS, format!("{channel_id}|{start}").as_bytes());
+                    (
+                        id.to_string(),
+                        channel_id,
+                        start.clone(),
+                        end.clone(),
+                        genres.clone(),
+                        prog,
+                    )
+                })
+            })
+            .collect();
+
         let mut tx = self.db.pool().begin().await.map_err(db_err)?;
-        for prog in &guide.programmes {
-            let Some(channel_ids) = by_tvg.get(&prog.channel_id) else {
-                continue;
-            };
-            let start = prog.start.map(|s| s.to_rfc3339()).unwrap_or_default();
-            let end = prog.stop.map(|s| s.to_rfc3339());
-            let genres = if prog.categories.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&prog.categories).ok()
-            };
-            for channel_id in channel_ids {
-                let id = Uuid::new_v5(&PROGRAM_NS, format!("{channel_id}|{start}").as_bytes());
-                sqlx::query(
-                    r#"INSERT OR REPLACE INTO "LiveTvPrograms"
-                       ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
-                        "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
-                        "IsRepeat","OfficialRating")
-                       VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"#,
-                )
-                .bind(id.to_string())
-                .bind(channel_id)
-                .bind(&start)
-                .bind(&end)
-                .bind(&prog.title)
-                .bind(&prog.sub_title)
-                .bind(&prog.desc)
-                .bind(&genres)
-                .bind(&prog.icon)
-                .bind(prog.year)
-                .bind(&prog.episode_num)
-                .bind(i32::from(prog.is_new))
-                .bind(i32::from(prog.is_premiere))
-                .bind(i32::from(prog.is_previously_shown))
-                .bind(&prog.rating)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            }
+        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 15) {
+            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+                r#"INSERT OR REPLACE INTO "LiveTvPrograms"
+                   ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
+                    "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
+                    "IsRepeat","OfficialRating") "#,
+            );
+            qb.push_values(
+                chunk,
+                |mut b, (id, channel_id, start, end, genres, prog)| {
+                    b.push_bind(id)
+                        .push_bind(*channel_id)
+                        .push_bind(start)
+                        .push_bind(end)
+                        .push_bind(&prog.title)
+                        .push_bind(&prog.sub_title)
+                        .push_bind(&prog.desc)
+                        .push_bind(genres)
+                        .push_bind(&prog.icon)
+                        .push_bind(prog.year)
+                        .push_bind(&prog.episode_num)
+                        .push_bind(i32::from(prog.is_new))
+                        .push_bind(i32::from(prog.is_premiere))
+                        .push_bind(i32::from(prog.is_previously_shown))
+                        .push_bind(&prog.rating);
+                },
+            );
+            qb.build().execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -942,6 +966,70 @@ mod tests {
                 .total_record_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn bulk_guide_sync_inserts_every_channel_and_program() {
+        // 150 channels and 5000 programmes exceed a single insert chunk in both
+        // paths, so this exercises the chunk boundaries and asserts no rows are
+        // lost. It also prints the sync wall-time for before/after comparison.
+        use std::fmt::Write as _;
+        let mut m3u = String::from("#EXTM3U\n");
+        for c in 0..150 {
+            let _ = write!(
+                m3u,
+                "#EXTINF:-1 tvg-id=\"ch{c}.tv\" tvg-chno=\"{c}\",Channel {c}\nhttp://tuner/{c}\n"
+            );
+        }
+        let mut xmltv = String::from("<tv>");
+        for p in 0..5000u32 {
+            let ch = p % 150;
+            let day = 20 + p / 24 / 60 % 8;
+            let hh = p / 60 % 24;
+            let mm = p % 60;
+            let _ = write!(
+                xmltv,
+                "<programme start=\"202607{day:02}{hh:02}{mm:02}00 +0000\" \
+                 stop=\"202607{day:02}{hh:02}{mm:02}30 +0000\" channel=\"ch{ch}.tv\">\
+                 <title>Show {p}</title></programme>"
+            );
+        }
+        xmltv.push_str("</tv>");
+
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u);
+        sources.insert("http://guide/xmltv.xml".to_owned(), xmltv);
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+
+        let started = std::time::Instant::now();
+        mgr.refresh_guide().await.expect("refresh");
+        eprintln!(
+            "bulk guide sync (150 ch / 5000 prog): {:?}",
+            started.elapsed()
+        );
+
+        let channels = mgr
+            .get_channels(&DtoOptions::default())
+            .await
+            .expect("chans");
+        assert_eq!(channels.total_record_count, 150);
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("progs");
+        assert_eq!(programs.total_record_count, 5000);
     }
 
     #[tokio::test]
