@@ -15,6 +15,10 @@ services:
       HERMIT_DATA_DIR: /data
       HERMIT_BIND_ADDR: 0.0.0.0
       HERMIT_PORT: "8096"
+      # Pool-sweep knob (benchmark/pool-sweep.sh): empty ⇒ Hermit's own default.
+      HERMIT_DB_POOL: ${HERMIT_DB_POOL:-}
+      # Lets the sweep surface the db_pool sampler (RUST_LOG=hermit_server=debug).
+      RUST_LOG: ${BENCH_RUST_LOG:-info}
     volumes:
       - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
       - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
