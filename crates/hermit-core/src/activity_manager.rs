@@ -246,7 +246,7 @@ impl ActivityManager for HermitActivityManager {
         .bind(item_id)
         .bind(severity_to_int(entry.severity))
         .bind(Utc::now().to_rfc3339())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -258,7 +258,7 @@ impl ActivityManager for HermitActivityManager {
         // lexicographically for UTC timestamps, so a text comparison is exact.
         let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" < ?1"#)
             .bind(before.to_rfc3339())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(result.rows_affected())
@@ -293,7 +293,7 @@ mod tests {
         .bind(name)
         .bind(type_)
         .bind(user_id)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert entry");
     }

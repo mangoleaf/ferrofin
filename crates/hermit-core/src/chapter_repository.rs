@@ -49,7 +49,7 @@ impl ChapterRepository for HermitChapterRepository {
     async fn delete_chapters(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "Chapters" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -60,7 +60,7 @@ impl ChapterRepository for HermitChapterRepository {
         item_id: Uuid,
         chapters: &[ChapterEntity],
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "Chapters" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
             .execute(&mut *tx)

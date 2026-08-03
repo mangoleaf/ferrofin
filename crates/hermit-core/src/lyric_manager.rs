@@ -549,7 +549,7 @@ mod tests {
         .bind("Borislav Slavov|Extra Artist")
         .bind("Borislav Slavov")
         .bind(233 * 10_000_000_i64)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("update audio row");
         id

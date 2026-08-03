@@ -79,6 +79,7 @@ fn test_config(root: &std::path::Path) -> Config {
         log_level: "info".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
+        db_pool: None,
     }
 }
 

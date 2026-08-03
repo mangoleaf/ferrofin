@@ -879,6 +879,7 @@ mod tests {
             log_level: "info".to_owned(),
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
+            db_pool: None,
         }
     }
 

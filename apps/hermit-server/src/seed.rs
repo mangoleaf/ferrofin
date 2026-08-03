@@ -158,6 +158,7 @@ mod tests {
             log_level: "info".to_owned(),
             admin_user: admin_user.to_owned(),
             admin_password: admin_password.to_owned(),
+            db_pool: None,
         }
     }
 

@@ -206,7 +206,7 @@ impl HermitUserManager {
         let internal_id = self.next_internal_id().await?;
         let normalized = name.to_uppercase();
 
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"INSERT INTO "Users"
                ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
@@ -386,7 +386,7 @@ impl UserManager for HermitUserManager {
         .bind(user_id.to_string())
         .bind(new_name)
         .bind(&normalized)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -451,7 +451,7 @@ impl UserManager for HermitUserManager {
         .bind(user.subtitle_mode)
         .bind(user.sync_play_access)
         .bind(&user.username)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -510,13 +510,13 @@ impl UserManager for HermitUserManager {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(&sql)
                 .bind(user_id.to_string())
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         }
         sqlx::query(r#"DELETE FROM "Users" WHERE "Id" = ?1"#)
             .bind(user_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -549,7 +549,7 @@ impl UserManager for HermitUserManager {
         )
         .bind(user_id.to_string())
         .bind(hash)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -620,12 +620,13 @@ impl UserManager for HermitUserManager {
                 .login_attempts_before_lockout
                 .is_some_and(|max| max > 0 && attempts >= max)
             {
-                set_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled, true).await?;
+                set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true)
+                    .await?;
             }
             sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
                 .bind(&user.id)
                 .bind(attempts)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             return Ok(None);
@@ -654,7 +655,7 @@ impl UserManager for HermitUserManager {
             )
             .bind(&user.id)
             .bind(now)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
             user.invalid_login_attempt_count = 0;
@@ -663,7 +664,7 @@ impl UserManager for HermitUserManager {
         } else {
             sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = 0 WHERE "Id" = ?1"#)
                 .bind(&user.id)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             user.invalid_login_attempt_count = 0;
@@ -794,7 +795,7 @@ impl UserManager for HermitUserManager {
         .bind(config.remember_subtitle_selections)
         .bind(config.enable_next_episode_auto_play)
         .bind(&config.cast_receiver_id)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
 
@@ -862,7 +863,7 @@ impl UserManager for HermitUserManager {
         .bind(&policy.authentication_provider_id)
         .bind(&policy.password_reset_provider_id)
         .bind(policy.sync_play_access as i32)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
 
@@ -918,7 +919,7 @@ impl UserManager for HermitUserManager {
         std::fs::write(&dest, content)
             .map_err(|e| ServiceError::backend(format!("write profile image: {e}")))?;
         // One image per user: replace any existing row (unique index on UserId).
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
             .bind(&user.id)
             .execute(&mut *tx)
@@ -940,7 +941,7 @@ impl UserManager for HermitUserManager {
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
             .bind(&user.id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -1392,7 +1393,7 @@ mod tests {
         // Lockout after 2 failures.
         sqlx::query(r#"UPDATE "Users" SET "LoginAttemptsBeforeLockout" = 2 WHERE "Id" = ?1"#)
             .bind(&user.id)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set threshold");
 

@@ -159,7 +159,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "Genres" = ?2 WHERE "Id" = ?1"#)
             .bind(id.to_string())
             .bind(genres)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set genres");
         for genre in genres.split('|').filter(|g| !g.is_empty()) {

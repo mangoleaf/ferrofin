@@ -148,7 +148,7 @@ mod tests {
         )
         .bind(id.to_string())
         .bind(genre)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set song fields");
         seed_item_genre(db, id, genre).await;

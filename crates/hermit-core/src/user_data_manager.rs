@@ -147,7 +147,7 @@ impl HermitUserDataManager {
         .bind(row.played)
         .bind(row.rating)
         .bind(row.subtitle_stream_index)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -465,7 +465,7 @@ impl UserDataManager for HermitUserDataManager {
         )
         .bind(item_id.to_string())
         .bind(user_id.to_string())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -527,7 +527,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2 WHERE "Id" = ?1"#)
             .bind(id.to_string())
             .bind(runtime_ticks)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set runtime");
     }

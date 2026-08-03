@@ -318,7 +318,7 @@ impl AudioNormalizationTask {
         sqlx::query(r#"UPDATE "BaseItems" SET "LUFS" = ?1 WHERE "Id" = ?2"#)
             .bind(lufs)
             .bind(item_id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -799,17 +799,17 @@ impl PeopleValidationTask {
                 )
                 .bind(keep)
                 .bind(dup)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
                 sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "PeopleId" = ?1"#)
                     .bind(dup)
-                    .execute(self.db.pool())
+                    .execute(self.db.writer())
                     .await
                     .map_err(db_err)?;
                 sqlx::query(r#"DELETE FROM "Peoples" WHERE "Id" = ?1"#)
                     .bind(dup)
-                    .execute(self.db.pool())
+                    .execute(self.db.writer())
                     .await
                     .map_err(db_err)?;
             }
@@ -818,7 +818,7 @@ impl PeopleValidationTask {
             r#"DELETE FROM "Peoples"
                WHERE "Id" NOT IN (SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap")"#,
         )
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         tracing::info!(removed = orphans.rows_affected(), "removed orphaned people");
@@ -833,7 +833,7 @@ impl PeopleValidationTask {
                  AND ("Name" IS NULL OR "Name" NOT IN (SELECT "Name" FROM "Peoples"))"#,
         )
         .bind(PERSON_TYPE)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         tracing::info!(
@@ -1720,7 +1720,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
             .bind(path)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set path");
     }
@@ -1729,7 +1729,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "MediaType" = ?1 WHERE "Id" = ?2"#)
             .bind(media_type)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set media type");
     }
@@ -1738,7 +1738,7 @@ mod tests {
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(item.to_string())
             .bind(ancestor.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("ancestor");
     }
@@ -1978,7 +1978,7 @@ mod tests {
                 )
                 .bind(id.to_string())
                 .bind(name)
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("person");
             }
@@ -1997,7 +1997,7 @@ mod tests {
         )
         .bind(item.to_string())
         .bind(dup.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("map");
 

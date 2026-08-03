@@ -74,7 +74,7 @@ mod tests {
             )"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert user");
     }
@@ -89,7 +89,7 @@ mod tests {
             ) VALUES (?1, 0, 0, 0, 0, 0, 0, 0, 'Movie')"#,
         )
         .bind(id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert base item");
     }
@@ -133,7 +133,7 @@ mod tests {
                 "DateLastActivity", "Name") VALUES (1, 'tok', ?1, ?1, 'cli')"#,
         )
         .bind(now)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert api key");
 
@@ -145,7 +145,7 @@ mod tests {
         )
         .bind(now)
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert device");
 
@@ -153,7 +153,7 @@ mod tests {
             r#"INSERT INTO "DeviceOptions" ("Id", "CustomName", "DeviceId")
                 VALUES (1, 'Kitchen', 'dev')"#,
         )
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert device options");
 
@@ -193,7 +193,7 @@ mod tests {
                 "StartHour", "UserId") VALUES (1, 3, 18.5, 8.0, ?1)"#,
         )
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert schedule");
 
@@ -202,7 +202,7 @@ mod tests {
                 "Value") VALUES (1, 4, 2, ?1, 1)"#,
         )
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert permission");
 
@@ -211,7 +211,7 @@ mod tests {
                 "Value") VALUES (1, 5, 2, ?1, 'a,b,c')"#,
         )
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert preference");
 
@@ -221,7 +221,7 @@ mod tests {
         )
         .bind(now)
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert image info");
 
@@ -232,7 +232,7 @@ mod tests {
         )
         .bind(now)
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert activity log");
 
@@ -297,7 +297,7 @@ mod tests {
         )
         .bind(item_id.to_string())
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert display preferences");
 
@@ -305,7 +305,7 @@ mod tests {
             r#"INSERT INTO "HomeSection" ("Id", "DisplayPreferencesId", "Order", "Type")
                 VALUES (1, 1, 3, 5)"#,
         )
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert home section");
 
@@ -317,7 +317,7 @@ mod tests {
         )
         .bind(item_id.to_string())
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert item display preferences");
 
@@ -328,7 +328,7 @@ mod tests {
         )
         .bind(item_id.to_string())
         .bind(user_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert custom item display preferences");
 
@@ -400,7 +400,7 @@ mod tests {
         .bind(id.to_string())
         .bind(owner.to_string())
         .bind(now)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert base item");
 
@@ -441,13 +441,13 @@ mod tests {
         .bind(vec![1u8, 2, 3])
         .bind(now)
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert image info");
 
         sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (3, ?1)"#)
             .bind(item_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert metadata field");
 
@@ -456,13 +456,13 @@ mod tests {
                 VALUES (?1, 'Imdb', 'tt0083658')"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert provider");
 
         sqlx::query(r#"INSERT INTO "BaseItemTrailerTypes" ("Id", "ItemId") VALUES (1, ?1)"#)
             .bind(item_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert trailer type");
 
@@ -471,14 +471,14 @@ mod tests {
                 "StartPositionTicks") VALUES (?1, 0, 'Opening', 0)"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert chapter");
 
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
             .bind(item_id.to_string())
             .bind(parent_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert ancestor id");
 
@@ -550,14 +550,14 @@ mod tests {
                 VALUES (?1, 'action', 2, 'Action')"#,
         )
         .bind(value_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert item value");
 
         sqlx::query(r#"INSERT INTO "ItemValuesMap" ("ItemValueId", "ItemId") VALUES (?1, ?2)"#)
             .bind(value_id.to_string())
             .bind(item_id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert item value map");
 
@@ -566,7 +566,7 @@ mod tests {
                 VALUES (?1, 'Harrison Ford', 'Actor')"#,
         )
         .bind(people_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert people");
 
@@ -576,7 +576,7 @@ mod tests {
         )
         .bind(item_id.to_string())
         .bind(people_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert people map");
 
@@ -632,7 +632,7 @@ mod tests {
         )
         .bind(item_id.to_string())
         .bind(child_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert linked child");
 
@@ -641,7 +641,7 @@ mod tests {
                 "Filename", "MimeType") VALUES (?1, 0, 'ttf', 'font.ttf', 'font/ttf')"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert attachment");
 
@@ -652,7 +652,7 @@ mod tests {
                 VALUES (?1, 0, 'h264', 1, 0, 0, 1, 1, 1920, 1080, 1, 23.976, 4.1)"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert media stream");
 
@@ -661,7 +661,7 @@ mod tests {
                 VALUES (?1, '[0,10000,20000]', 30000)"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert keyframe data");
 
@@ -732,7 +732,7 @@ mod tests {
         .bind(item_id.to_string())
         .bind(user_id.to_string())
         .bind(now)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert user data");
 
@@ -742,7 +742,7 @@ mod tests {
                 VALUES (?1, 320, 500000, 180, 10000, 240, 10, 10)"#,
         )
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert trickplay info");
 
@@ -753,7 +753,7 @@ mod tests {
         )
         .bind(segment_id.to_string())
         .bind(item_id.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert media segment");
 

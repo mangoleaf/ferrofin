@@ -563,7 +563,7 @@ impl ScheduledTask for OptimizeDatabaseTask {
             ("PRAGMA wal_checkpoint(TRUNCATE)", 100.0),
         ] {
             sqlx::query(statement)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             progress.report(pct);
@@ -628,7 +628,7 @@ impl ScheduledTask for CleanupUserDataTask {
         )
         .bind(PLACEHOLDER_ID)
         .bind(cutoff.to_rfc3339())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         tracing::info!(
@@ -1013,7 +1013,7 @@ mod tests {
                 sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
                     .bind(path)
                     .bind(id.to_string())
-                    .execute(db.pool())
+                    .execute(db.writer())
                     .await
                     .expect("set path");
             }
@@ -1028,7 +1028,7 @@ mod tests {
             )
             .bind(parent.to_string())
             .bind(child.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("link");
         }
@@ -1141,7 +1141,7 @@ mod tests {
                 .bind(user_id)
                 .bind(key)
                 .bind(retention)
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("insert userdata");
             }

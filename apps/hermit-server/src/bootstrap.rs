@@ -131,14 +131,39 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     })?;
 
     let url = config.database_url();
-    let db = Database::connect(&url)
+    let db = Database::connect_sized(&url, config.db_pool)
         .await
         .with_context(|| format!("failed to open database `{url}`"))?;
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
     tracing::info!(database = %config.database_path().display(), "database ready");
+    spawn_pool_sampler(&db);
     Ok(db)
+}
+
+/// Samples the connection pool every 5 s at `debug` level (`RUST_LOG=
+/// hermit_server=debug`): total connections, idle connections, and — the
+/// contention signal — how many are checked out. Under load, `in_use` pinned at
+/// the pool cap means requests are queueing on connection acquisition, not on
+/// query work (the diagnosis behind the pool-size default; see
+/// `benchmark/pool-sweep.sh`).
+fn spawn_pool_sampler(db: &Database) {
+    let pool = db.pool().clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let size = pool.size();
+            let idle = pool.num_idle();
+            tracing::debug!(
+                size,
+                idle,
+                in_use = size.saturating_sub(u32::try_from(idle).unwrap_or(u32::MAX)),
+                "db_pool"
+            );
+        }
+    });
 }
 
 /// Discovers and validates the ffmpeg / ffprobe executables. Port of
@@ -588,6 +613,7 @@ mod tests {
             log_level: "info".to_owned(),
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
+            db_pool: None,
         }
     }
 }

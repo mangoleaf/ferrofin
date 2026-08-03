@@ -141,7 +141,7 @@ impl HermitTrickplayManager {
         sqlx::query(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" = ?1 AND "Width" = ?2"#)
             .bind(item_id.to_string())
             .bind(width)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -655,7 +655,7 @@ impl TrickplayManager for HermitTrickplayManager {
         .bind(info.thumbnail_count)
         .bind(info.tile_height)
         .bind(info.tile_width)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -664,7 +664,7 @@ impl TrickplayManager for HermitTrickplayManager {
     async fn delete_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -1132,7 +1132,7 @@ mod tests {
         .bind(&path_str)
         .bind(runtime_ticks)
         .bind(video_width)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("update item media fields");
         path_str

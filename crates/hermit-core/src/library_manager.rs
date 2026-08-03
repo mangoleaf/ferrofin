@@ -647,7 +647,7 @@ mod tests {
             .bind(Uuid::from_u128(0xA110 + n).to_string())
             .bind(item.to_string())
             .bind(path)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert backdrop");
         }
@@ -792,7 +792,7 @@ mod tests {
             sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
                 .bind(id.to_string())
                 .bind(parent_id.to_string())
-                .execute(db.pool())
+                .execute(db.writer())
                 .await
                 .expect("set parent");
         }
@@ -885,7 +885,7 @@ mod tests {
             .bind(item.to_string())
             .bind(idx)
             .bind(lang)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("insert stream");
         }
@@ -913,13 +913,13 @@ mod tests {
                VALUES (?1, 1, 'Miles Davis', 'miles davis')"#,
         )
         .bind(&value_id)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("value");
         sqlx::query(r#"INSERT INTO "ItemValuesMap" ("ItemId","ItemValueId") VALUES (?1,?2)"#)
             .bind(song.to_string())
             .bind(&value_id)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("map");
         sqlx::query(
@@ -930,7 +930,7 @@ mod tests {
                        'Miles Davis','miles davis',1,0,0,0,0,0,0)"#,
         )
         .bind(&value_id)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("by-name row");
         let mgr = manager(&db);
@@ -972,7 +972,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "Width" = ?1 WHERE "Id" = ?2"#)
             .bind(width)
             .bind(id.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set width");
     }
@@ -1069,7 +1069,7 @@ mod tests {
         .bind(id.to_string())
         .bind(key)
         .bind(value)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set provider id");
     }
@@ -1096,7 +1096,7 @@ mod tests {
         .bind(name)
         .bind(index)
         .bind(year)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set episode fields");
     }

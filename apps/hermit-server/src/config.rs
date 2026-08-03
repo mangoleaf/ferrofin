@@ -113,6 +113,20 @@ struct FileConfig {
     log_level: Option<String>,
     admin_user: Option<String>,
     admin_password: Option<String>,
+    db_pool: Option<DbPoolFileValue>,
+}
+
+/// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
+/// or the literal string `"auto"` for the built-in sizing formula
+/// (`hermit_db`'s `default_pool_size`, derived from the mixed-load pool sweep —
+/// see `benchmark/pool-sweep.sh`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DbPoolFileValue {
+    /// An explicit connection count (`db_pool = 16`).
+    Count(u32),
+    /// A sizing mode by name — only `"auto"` is valid (`db_pool = "auto"`).
+    Mode(String),
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -190,6 +204,12 @@ pub struct Config {
     /// Administrator password seeded on a fresh install. Empty forces a
     /// password change on first login.
     pub admin_password: String,
+
+    /// SQLite connection-pool size override. `None` = `auto` (the sizing
+    /// formula in `hermit_db`). Resolved `HERMIT_DB_POOL` env > `db_pool` in
+    /// `config.toml` (integer or `"auto"`) > auto, matching the layering of
+    /// every other knob.
+    pub db_pool: Option<u32>,
 }
 
 impl Config {
@@ -308,6 +328,8 @@ impl Config {
             .or(file.admin_password)
             .unwrap_or_default();
 
+        let db_pool = resolve_db_pool(env, file.db_pool)?;
+
         Ok(Self {
             data_dir,
             config_dir,
@@ -326,6 +348,7 @@ impl Config {
             log_level,
             admin_user,
             admin_password,
+            db_pool,
         })
     }
 
@@ -340,6 +363,41 @@ impl Config {
     #[must_use]
     pub fn database_url(&self) -> String {
         format!("sqlite://{}", self.database_path().display())
+    }
+}
+
+/// Resolves the SQLite pool-size override: `HERMIT_DB_POOL` env (integer or
+/// `auto`) > `db_pool` in `config.toml` (integer or `"auto"`) > `None` (auto).
+///
+/// `Some(n)` pins the pool at exactly `n` connections; `None` selects the
+/// sizing formula in `hermit_db` (see `benchmark/pool-sweep.sh` for how that
+/// formula is derived). Zero and unrecognized values are errors — a silently
+/// ignored typo here would change performance, not correctness, and never be
+/// noticed.
+fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Result<Option<u32>> {
+    if let Some(raw) = env.var("HERMIT_DB_POOL").filter(|s| !s.is_empty()) {
+        if raw.eq_ignore_ascii_case("auto") {
+            return Ok(None);
+        }
+        let n: u32 = raw.parse().map_err(|_| {
+            anyhow::anyhow!("invalid HERMIT_DB_POOL `{raw}`: expected an integer or `auto`")
+        })?;
+        anyhow::ensure!(
+            n >= 1,
+            "invalid HERMIT_DB_POOL `0`: the pool needs at least one connection"
+        );
+        return Ok(Some(n));
+    }
+    match file {
+        None => Ok(None),
+        Some(DbPoolFileValue::Count(0)) => Err(anyhow::anyhow!(
+            "invalid db_pool `0` in config.toml: the pool needs at least one connection"
+        )),
+        Some(DbPoolFileValue::Count(n)) => Ok(Some(n)),
+        Some(DbPoolFileValue::Mode(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
+        Some(DbPoolFileValue::Mode(s)) => Err(anyhow::anyhow!(
+            "invalid db_pool `{s}` in config.toml: expected an integer or \"auto\""
+        )),
     }
 }
 
@@ -590,6 +648,78 @@ mod tests {
             "10.0.0.1",
             "file bind_addr applies"
         );
+    }
+
+    #[test]
+    fn db_pool_defaults_to_auto() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
+    }
+
+    #[test]
+    fn db_pool_env_beats_file_and_accepts_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "db_pool = 8\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+
+        // File alone applies.
+        let cfg = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.db_pool, Some(8));
+
+        // Env integer beats the file.
+        let env = FakeEnv::new().with("HERMIT_DB_POOL", "32");
+        assert_eq!(Config::load_from(cli(), &env).unwrap().db_pool, Some(32));
+
+        // Env `auto` explicitly restores the formula over a file pin.
+        let env = FakeEnv::new().with("HERMIT_DB_POOL", "auto");
+        assert_eq!(Config::load_from(cli(), &env).unwrap().db_pool, None);
+
+        // Empty env value is "unset", not an error (compose passes `${VAR:-}`).
+        let env = FakeEnv::new().with("HERMIT_DB_POOL", "");
+        assert_eq!(Config::load_from(cli(), &env).unwrap().db_pool, Some(8));
+    }
+
+    #[test]
+    fn db_pool_file_accepts_auto_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+
+        std::fs::write(&toml, "db_pool = \"auto\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli, &FakeEnv::new()).unwrap().db_pool,
+            None
+        );
+
+        std::fs::write(&toml, "db_pool = \"lots\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
+        assert!(err.to_string().contains("invalid db_pool"));
+
+        std::fs::write(&toml, "db_pool = 0\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
+        assert!(err.to_string().contains("at least one connection"));
+    }
+
+    #[test]
+    fn db_pool_env_rejects_garbage() {
+        let env = FakeEnv::new().with("HERMIT_DB_POOL", "many");
+        let err = Config::load_from(Cli::default(), &env).unwrap_err();
+        assert!(err.to_string().contains("invalid HERMIT_DB_POOL"));
     }
 
     #[test]

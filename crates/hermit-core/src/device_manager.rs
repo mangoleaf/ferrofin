@@ -218,7 +218,7 @@ impl DeviceManager for HermitDeviceManager {
         .bind(&device.device_name)
         .bind(device.is_active)
         .bind(&device.user_id)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
 
@@ -343,7 +343,7 @@ impl DeviceManager for HermitDeviceManager {
     async fn delete_device(&self, device: &DeviceEntity) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "Devices" WHERE "Id" = ?1"#)
             .bind(device.id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -368,7 +368,7 @@ impl DeviceManager for HermitDeviceManager {
         .bind(&device.device_name)
         .bind(device.is_active)
         .bind(&device.user_id)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -410,7 +410,7 @@ impl DeviceManager for HermitDeviceManager {
             sqlx::query(r#"UPDATE "DeviceOptions" SET "CustomName" = ?2 WHERE "DeviceId" = ?1"#)
                 .bind(device_id)
                 .bind(device_name)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         } else {
@@ -419,7 +419,7 @@ impl DeviceManager for HermitDeviceManager {
             )
             .bind(device_id)
             .bind(device_name)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         }

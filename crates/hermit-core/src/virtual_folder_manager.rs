@@ -687,7 +687,7 @@ mod tests {
         // on-disk folder remains but its BaseItems row is gone.
         sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(&item_id)
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("delete row");
 

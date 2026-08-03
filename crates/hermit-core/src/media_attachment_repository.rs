@@ -66,7 +66,7 @@ impl MediaAttachmentRepository for HermitMediaAttachmentRepository {
         item_id: Uuid,
         attachments: &[AttachmentStreamInfoEntity],
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "AttachmentStreamInfos" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
             .execute(&mut *tx)

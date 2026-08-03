@@ -379,7 +379,7 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::from_u128(1);
         seed_user(&db, id).await;
-        let mut tx = db.pool().begin().await.expect("begin");
+        let mut tx = db.writer().begin().await.expect("begin");
         seed_defaults(&mut tx, &id.to_string()).await.expect("seed");
         tx.commit().await.expect("commit");
 

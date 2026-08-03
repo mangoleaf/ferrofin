@@ -70,7 +70,7 @@ pub async fn seed_named_item(db: &Database, id: Uuid, kind: BaseItemKind, name: 
     .bind(id.to_string())
     .bind(type_name(kind))
     .bind(if name.is_empty() { None } else { Some(name) })
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("insert item");
 }
@@ -102,7 +102,7 @@ pub async fn seed_episode(
     .bind(episode)
     .bind(top_parent.map(|t| t.to_string()))
     .bind(format!("S{season}E{episode}"))
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("insert episode");
 }
@@ -115,7 +115,7 @@ pub async fn set_clean_name(db: &Database, id: Uuid, name: &str) {
     sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
         .bind(id.to_string())
         .bind(clean)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("set clean name");
 }
@@ -152,7 +152,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
         .bind(genre_type)
         .bind(genre)
         .bind(&clean)
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert item value");
         new_id
@@ -164,7 +164,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
     )
     .bind(item_id.to_string())
     .bind(&value_id)
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("map item value");
 
@@ -179,7 +179,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
     .bind(&value_id)
     .bind(genre)
     .bind(&clean)
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("materialize by-name genre");
 }
@@ -199,7 +199,7 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
            VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 'U', '', 1, 1, 1, 0, 0, 0, 'u')"#,
     )
     .bind(id.to_string())
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("insert user");
 
@@ -232,7 +232,7 @@ pub async fn seed_user_data(
     .bind(item.to_string())
     .bind(last_played)
     .bind(i64::from(played))
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("insert user data");
 }

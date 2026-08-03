@@ -151,7 +151,7 @@ impl HermitItemPersistenceService {
             .bind(&item.type_)
             .bind(&item.unrated_type)
             .bind(item.width)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -172,12 +172,12 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             // that belongs to one, trips a FOREIGN KEY constraint (787).
             sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
                 .bind(id.to_string())
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(id.to_string())
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         }
@@ -197,7 +197,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
         let id = item_id.to_string();
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Rewrite this item's links; the shared ItemValues rows are kept.
         sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
             .bind(&id)
@@ -283,7 +283,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         // otherwise the DELETE and INSERTs land on different pool connections and
         // can interleave with a concurrent rebuild, and `INSERT OR IGNORE` makes
         // a duplicate ancestor (or a lost race) a no-op instead of a UNIQUE 500.
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ItemId" = ?1"#)
             .bind(&id)
             .execute(&mut *tx)
@@ -325,7 +325,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
         let item = item_id.to_string();
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Replace the item's image set (idempotent re-scan).
         sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
             .bind(&item)
@@ -361,7 +361,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
     ) -> Result<(), ServiceError> {
         let item = item_id.to_string();
         let disc = image_type_to_disc(image.image_type);
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Replace any existing rows of this type (an uploaded image supersedes the
         // prior one of the same type).
         sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
@@ -409,7 +409,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
             .bind(&item)
             .bind(disc)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(paths)
@@ -429,7 +429,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         .bind(&item.id)
         .bind(PLACEHOLDER_ID)
         .bind(key)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())

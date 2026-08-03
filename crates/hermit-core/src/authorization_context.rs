@@ -280,7 +280,7 @@ impl HermitAuthorizationContext {
         .bind(&device.app_version)
         .bind(device.date_last_activity)
         .bind(device.date_modified)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -626,7 +626,7 @@ mod tests {
         .bind("key-tok")
         .bind(Utc::now())
         .bind("Automation")
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert api key");
 
@@ -667,7 +667,7 @@ mod tests {
         .bind("dev-1")
         .bind("Firefox")
         .bind(uid.to_string())
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert device");
 
@@ -707,7 +707,7 @@ mod tests {
         .bind("qtok")
         .bind(Utc::now())
         .bind("QueryKey")
-        .execute(db.pool())
+        .execute(db.writer())
         .await
         .expect("insert");
 

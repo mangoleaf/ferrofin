@@ -149,7 +149,7 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
                 ?, ?, ?, ?)"#
         );
 
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
             .execute(&mut *tx)

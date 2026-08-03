@@ -61,7 +61,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
         item_id: Uuid,
         data: &KeyframeDataEntity,
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
             .execute(&mut *tx)
@@ -84,7 +84,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
     async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
             .bind(item_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())

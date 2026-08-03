@@ -190,7 +190,7 @@ async fn seed_named_user(db: &Database, id: Uuid, username: &str) -> UserEntity 
     .bind(id.to_string())
     .bind(username.to_uppercase())
     .bind(username)
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .expect("insert user");
     sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
@@ -416,9 +416,14 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(db.pool(), &user.id, PermissionKind::EnableAllDevices, true)
-        .await
-        .unwrap();
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
 
     let request = AuthenticationRequest {
         user_id: Some(user_id),
@@ -472,9 +477,14 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "bob").await;
-    set_permission(db.pool(), &user.id, PermissionKind::EnableAllDevices, true)
-        .await
-        .unwrap();
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
 
     let request = AuthenticationRequest {
         username: Some("bob".to_owned()),
@@ -542,9 +552,14 @@ async fn logout_by_token_ends_the_session() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(db.pool(), &user.id, PermissionKind::EnableAllDevices, true)
-        .await
-        .unwrap();
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
     let request = AuthenticationRequest {
         user_id: Some(user_id),
         app: Some("Web".to_owned()),
@@ -604,9 +619,14 @@ async fn get_sessions_admin_sees_all() {
     let mgr = manager(&db);
     let admin_id = Uuid::new_v4();
     let admin = seed_named_user(&db, admin_id, "admin").await;
-    set_permission(db.pool(), &admin.id, PermissionKind::IsAdministrator, true)
-        .await
-        .unwrap();
+    set_permission(
+        db.writer(),
+        &admin.id,
+        PermissionKind::IsAdministrator,
+        true,
+    )
+    .await
+    .unwrap();
     let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
     mgr.log_session_activity("Web", "1.0", "a", "A", "e", &admin)
         .await

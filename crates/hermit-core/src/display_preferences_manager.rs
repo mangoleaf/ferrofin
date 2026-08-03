@@ -101,7 +101,7 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
         .bind(DEFAULT_SKIP_BACKWARD_LENGTH)
         .bind(DEFAULT_SKIP_FORWARD_LENGTH)
         .bind(user_id.to_string())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
 
@@ -157,7 +157,7 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
         .bind(DEFAULT_SORT_ORDER)
         .bind(user_id.to_string())
         .bind(DEFAULT_VIEW_TYPE)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
 
@@ -221,7 +221,7 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
     ) -> Result<(), ServiceError> {
         // C#: delete-all-then-insert inside one SaveChanges. Reproduced in a
         // transaction so the replacement is atomic.
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"DELETE FROM "CustomItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
@@ -279,7 +279,7 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
         .bind(&display_preferences.user_id)
         .bind(&display_preferences.item_id)
         .bind(&display_preferences.client)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -304,7 +304,7 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
         .bind(&item_display_preferences.user_id)
         .bind(&item_display_preferences.item_id)
         .bind(&item_display_preferences.client)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())

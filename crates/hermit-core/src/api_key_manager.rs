@@ -89,7 +89,7 @@ impl ApiKeyManager for HermitApiKeyManager {
         .bind(&access_token)
         .bind(now)
         .bind(name)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -98,7 +98,7 @@ impl ApiKeyManager for HermitApiKeyManager {
     async fn delete_api_key(&self, access_token: &str) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "ApiKeys" WHERE "AccessToken" = ?1"#)
             .bind(access_token)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())

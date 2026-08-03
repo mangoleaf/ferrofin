@@ -292,7 +292,7 @@ impl PeopleRepository for HermitPeopleRepository {
         people: &[PeopleEntity],
     ) -> Result<Vec<WrittenPerson>, ServiceError> {
         let deduped = dedupe_people(people);
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         // Clear this item's credit rows first. Doing a write as the transaction's
         // first statement takes SQLite's write lock upfront, so a concurrent writer
@@ -430,7 +430,7 @@ impl PeopleRepository for HermitPeopleRepository {
         .bind(metadata.premiere_date.map(|d| d.to_rfc3339()))
         .bind(metadata.end_date.map(|d| d.to_rfc3339()))
         .bind(metadata.birthplace)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())

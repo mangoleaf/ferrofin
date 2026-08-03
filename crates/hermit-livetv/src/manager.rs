@@ -72,7 +72,7 @@ impl HermitLiveTvManager {
     /// transaction (deleting the old channels cascades away their programmes).
     async fn replace_channels(&self, tuner_id: &str, m3u_body: &str) -> Result<(), ServiceError> {
         let channels = parse_m3u(m3u_body);
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         sqlx::query(r#"DELETE FROM "LiveTvChannels" WHERE "TunerHostId" = ?1"#)
             .bind(tuner_id)
@@ -154,7 +154,7 @@ impl HermitLiveTvManager {
             })
             .collect();
 
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for chunk in rows.chunks(SQLITE_BIND_LIMIT / 15) {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
                 r#"INSERT OR REPLACE INTO "LiveTvPrograms"
@@ -257,7 +257,7 @@ impl LiveTvManager for HermitLiveTvManager {
         .bind(&url)
         .bind(info.type_.as_deref().unwrap_or("m3u"))
         .bind(&data)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(info)
@@ -266,7 +266,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "LiveTvTunerHosts" WHERE "Id" = ?1"#)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -312,7 +312,7 @@ impl LiveTvManager for HermitLiveTvManager {
         .bind(info.type_.as_deref().unwrap_or("xmltv"))
         .bind(&path)
         .bind(&data)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(info)
@@ -321,7 +321,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "LiveTvListingProviders" WHERE "Id" = ?1"#)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -480,7 +480,7 @@ impl LiveTvManager for HermitLiveTvManager {
         .bind(timer.base.pre_padding_seconds)
         .bind(timer.base.post_padding_seconds)
         .bind(&data)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(id)
@@ -527,7 +527,7 @@ impl LiveTvManager for HermitLiveTvManager {
         .bind(&timer.base.program_id)
         .bind(timer.base.name.clone().unwrap_or_default())
         .bind(&data)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(id)
@@ -546,7 +546,7 @@ impl LiveTvManager for HermitLiveTvManager {
         // Drop the series timer and any timers it scheduled.
         sqlx::query(r#"DELETE FROM "LiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         self.delete_by_id(r#"DELETE FROM "LiveTvSeriesTimers" WHERE "Id" = ?1"#, id)
@@ -719,7 +719,7 @@ impl HermitLiveTvManager {
     async fn delete_by_id(&self, sql: &str, id: &str) -> Result<(), ServiceError> {
         sqlx::query(sql)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())

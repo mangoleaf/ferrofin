@@ -63,7 +63,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
         .bind(&decision.target_video_codec)
         .bind(&decision.target_audio_codec)
         .bind(Utc::now().to_rfc3339())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await;
         if let Err(err) = result {
             warn!(%err, "failed to record playback decision");
@@ -78,7 +78,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
         )
         .bind(play_session_id)
         .bind(Utc::now().to_rfc3339())
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await;
         if let Err(err) = result {
             warn!(%err, "failed to record playback start");
@@ -99,7 +99,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
         .bind(play_session_id)
         .bind(Utc::now().to_rfc3339())
         .bind(position_ticks)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await;
         if let Err(err) = result {
             warn!(%err, "failed to record playback stop");

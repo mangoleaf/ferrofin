@@ -277,7 +277,7 @@ impl SubtitleManager for HermitSubtitleManager {
         .bind(item_id.to_string())
         .bind(i64::from(index))
         .bind(subtitle_disc)
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -411,7 +411,7 @@ mod tests {
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
             .bind(media.to_str().unwrap())
             .bind(item.to_string())
-            .execute(db.pool())
+            .execute(db.writer())
             .await
             .expect("set path");
 

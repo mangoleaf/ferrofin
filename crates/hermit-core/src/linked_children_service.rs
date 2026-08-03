@@ -165,7 +165,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         from_child_id: Uuid,
         to_child_id: Uuid,
     ) -> Result<Vec<Uuid>, ServiceError> {
-        let mut tx = self.db.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
             r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
@@ -236,7 +236,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         .bind(parent_id.to_string())
         .bind(child_id.to_string())
         .bind(i64::from(child_type))
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())

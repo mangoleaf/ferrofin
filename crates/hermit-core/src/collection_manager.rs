@@ -84,7 +84,7 @@ async fn insert_named_item(
     .bind(type_name)
     .bind(i64::from(is_folder))
     .bind(name)
-    .execute(db.pool())
+    .execute(db.writer())
     .await
     .map_err(db_err)?;
 
@@ -168,7 +168,7 @@ impl CollectionManager for HermitCollectionManager {
             )
             .bind(collection_id.to_string())
             .bind(item_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         }
@@ -333,7 +333,7 @@ impl PlaylistManager for HermitPlaylistManager {
         .bind(id.to_string())
         .bind((!request.user_id.is_nil()).then(|| request.user_id.to_string()))
         .bind(i64::from(request.public.unwrap_or(false)))
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         // Seed the share list from the request (C# `Shares = options.Users`).
@@ -361,7 +361,7 @@ impl PlaylistManager for HermitPlaylistManager {
             sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2 WHERE "Id" = ?1"#)
                 .bind(request.id.to_string())
                 .bind(name)
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         }
@@ -370,7 +370,7 @@ impl PlaylistManager for HermitPlaylistManager {
             sqlx::query(r#"UPDATE "Playlists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#)
                 .bind(request.id.to_string())
                 .bind(i64::from(public))
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         }
@@ -378,7 +378,7 @@ impl PlaylistManager for HermitPlaylistManager {
             // C# replaces `Shares` wholesale on update.
             sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1"#)
                 .bind(request.id.to_string())
-                .execute(self.db.pool())
+                .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             for share in users {
@@ -459,7 +459,7 @@ impl PlaylistManager for HermitPlaylistManager {
         .bind(request.id.to_string())
         .bind(request.user_id.to_string())
         .bind(i64::from(request.can_edit.unwrap_or(false)))
-        .execute(self.db.pool())
+        .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -474,7 +474,7 @@ impl PlaylistManager for HermitPlaylistManager {
         sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#)
             .bind(playlist_id.to_string())
             .bind(user_id.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -542,7 +542,7 @@ impl PlaylistManager for HermitPlaylistManager {
             let at = (target + offset).min(order.len());
             order.insert(at, child.clone());
         }
-        write_sort_order(self.db.pool(), &pid, &order).await
+        write_sort_order(self.db.writer(), &pid, &order).await
     }
 
     async fn remove_item_from_playlist(
@@ -565,7 +565,7 @@ impl PlaylistManager for HermitPlaylistManager {
             )
             .bind(playlist_id)
             .bind(child.to_string())
-            .execute(self.db.pool())
+            .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         }
@@ -609,7 +609,7 @@ impl PlaylistManager for HermitPlaylistManager {
             .unwrap_or(usize::MAX)
             .min(order.len());
         order.insert(target, child);
-        write_sort_order(self.db.pool(), playlist_id, &order).await
+        write_sort_order(self.db.writer(), playlist_id, &order).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
