@@ -77,6 +77,11 @@ struct HlsQuery {
     /// The desired segment length in seconds.
     #[serde(default, alias = "SegmentLength")]
     segment_length: Option<i32>,
+    /// The resume offset in ticks; starts the fMP4 init transcode at the resume
+    /// segment so the cached init matches the seek-offset segments (avoids the
+    /// resume spinner). Baked into playlist init/segment URLs on a resume.
+    #[serde(default, alias = "StartTimeTicks")]
+    start_time_ticks: Option<i64>,
     /// The desired output audio codec.
     #[serde(default, alias = "AudioCodec")]
     audio_codec: Option<String>,
@@ -140,6 +145,7 @@ fn build_request(item_id: Uuid, query: HlsQuery, raw_query: Option<String>) -> H
         allow_video_stream_copy: query.allow_video_stream_copy.unwrap_or(true),
         allow_audio_stream_copy: query.allow_audio_stream_copy.unwrap_or(true),
         is_static: query.is_static.unwrap_or(false),
+        start_time_ticks: query.start_time_ticks,
         query_string,
     }
 }

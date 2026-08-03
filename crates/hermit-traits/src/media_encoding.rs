@@ -426,6 +426,15 @@ pub struct HlsStreamRequest {
     pub allow_audio_stream_copy: bool,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
+    /// The resume offset in ticks (`startTimeTicks`), when the client is resuming.
+    ///
+    /// Threaded from the PlaybackInfo transcode URL through the playlist into its
+    /// baked-in init/segment URLs. Only the fMP4 init serve consults it: it starts
+    /// the transcode at the segment containing this offset so the init header the
+    /// client caches carries the same moov edit list as the seek-offset segments
+    /// it then plays. Without this, a from-segment-0 init pairs with seek-offset
+    /// segments and the player maps the media back to t≈0 and stalls on a resume.
+    pub start_time_ticks: Option<i64>,
     /// The raw request query string (including the leading `?`), forwarded into
     /// the generated playlist's segment URLs (`Request.QueryString`).
     pub query_string: String,
@@ -453,6 +462,7 @@ impl Default for HlsStreamRequest {
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
             is_static: false,
+            start_time_ticks: None,
             query_string: String::new(),
         }
     }

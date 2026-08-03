@@ -46,7 +46,9 @@ use hermit_traits::media_encoding::{
 use hermit_traits::system::ServerApplicationPaths;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
-use crate::dynamic_hls_playlist_generator::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider};
+use crate::dynamic_hls_playlist_generator::{
+    DynamicHlsPlaylistGenerator, EncodingOptionsProvider, TICKS_PER_MILLISECOND,
+};
 
 /// A concrete transcode plan for one request: everything the runtime needs that
 /// [`HlsStreamRequest`] alone does not carry.
@@ -343,10 +345,17 @@ where
         let init_path = init_segment_file(&plan.playlist_path, &ext);
 
         if !init_path.exists() {
-            // Starting segment 0 writes the init header first; ignore the segment
-            // itself, we only need the header it produces alongside. Boxed to break
-            // the (never-taken beyond depth 1) init→segment-0 async recursion cycle.
-            Box::pin(self.resolve_dynamic_segment(request, 0, is_audio)).await?;
+            // Start the transcode at the RESUME segment, not segment 0. The fMP4
+            // init header (its moov edit list) encodes the job's start offset, so
+            // an init produced from segment 0 is incompatible with the seek-offset
+            // segments a resuming client actually plays — the player maps that
+            // media back to t≈0 and stalls on a black screen. Starting the job
+            // where the client is about to play makes the cached init match those
+            // segments. With no resume offset this is segment 0, as before.
+            // Producing the segment writes the header alongside; we only need the
+            // header. Boxed to break the (depth-1) init→segment async recursion.
+            let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
+            Box::pin(self.resolve_dynamic_segment(request, start, is_audio)).await?;
         }
 
         if init_path.exists() {
@@ -537,6 +546,20 @@ fn segment_file(playlist: &Path, index: i32, extension: &str) -> PathBuf {
 /// URI references.
 fn init_segment_file(playlist: &Path, extension: &str) -> PathBuf {
     segment_file(playlist, -1, extension)
+}
+
+/// The segment index containing a resume offset of `start_time_ticks`, given a
+/// segment length of `segment_length_ms`. Returns 0 (start) when the client is
+/// not resuming or on any degenerate input. Used to start the fMP4 init
+/// transcode where a resuming client will actually play, so the cached init
+/// matches the seek-offset segments.
+fn resume_segment_index(start_time_ticks: Option<i64>, segment_length_ms: i32) -> i32 {
+    let ticks = start_time_ticks.unwrap_or(0);
+    if ticks <= 0 || segment_length_ms <= 0 {
+        return 0;
+    }
+    let segment_ticks = i64::from(segment_length_ms) * TICKS_PER_MILLISECOND;
+    i32::try_from(ticks / segment_ticks).unwrap_or(0)
 }
 
 /// The highest segment index a transcode has written for `playlist` on disk.
@@ -813,6 +836,47 @@ mod tests {
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let served = mgr.dynamic_segment(&req(), 0, false).await.unwrap();
         assert!(served.path.ends_with("out0.ts"));
+    }
+
+    #[test]
+    fn resume_segment_index_maps_offset_to_segment() {
+        // 6s segments (6000 ms). 60s resume → segment 10.
+        assert_eq!(resume_segment_index(Some(60 * 10_000_000), 6000), 10);
+        // No resume / zero / negative / bad length → segment 0.
+        assert_eq!(resume_segment_index(None, 6000), 0);
+        assert_eq!(resume_segment_index(Some(0), 6000), 0);
+        assert_eq!(resume_segment_index(Some(-5), 6000), 0);
+        assert_eq!(resume_segment_index(Some(60 * 10_000_000), 0), 0);
+    }
+
+    #[tokio::test]
+    async fn init_segment_starts_transcode_at_resume_offset() {
+        // A resuming client fetches the fMP4 init first; it must start the
+        // transcode at the resume segment (not 0) so the cached init matches the
+        // seek-offset segments it then plays. 60s / 6s segments → segment 10.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            // The fake writes the init header + the resume segment on spawn.
+            segment_files: vec!["out10.mp4".to_owned()],
+            extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, recorded) = manager_with(tmp.path(), script, "mp4");
+        let resume_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            start_time_ticks: Some(60 * 10_000_000),
+            ..req()
+        };
+        // Segment id -1 routes to the init serve.
+        let served = mgr.dynamic_segment(&resume_req, -1, false).await.unwrap();
+        assert!(served.path.ends_with("out-1.mp4"));
+        // The init serve started the transcode at the resume segment (10), not 0.
+        let calls = recorded.lock().unwrap();
+        assert!(
+            calls.contains(&(false, Some(10))),
+            "expected a plan at resume segment 10, got {calls:?}"
+        );
     }
 
     #[tokio::test]

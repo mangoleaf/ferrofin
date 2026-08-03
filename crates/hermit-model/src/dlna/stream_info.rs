@@ -543,6 +543,14 @@ impl StreamInfo {
             sb.push_str(&v.to_string());
         }
 
+        // The resume offset is emitted for HLS too (Jellyfin omits it there):
+        // the fMP4 init serve needs it to start the transcode at the resume
+        // segment, so the init header the client caches matches the seek-offset
+        // segments it plays — otherwise a resuming client stalls on a spinner.
+        if self.start_position_ticks != 0 {
+            sb.push_str("&StartTimeTicks=");
+            sb.push_str(&self.start_position_ticks.to_string());
+        }
         if self.sub_protocol == MediaStreamProtocol::hls {
             if let Some(container) = self.container.as_deref().filter(|c| !c.is_empty()) {
                 sb.push_str("&SegmentContainer=");
@@ -556,9 +564,6 @@ impl StreamInfo {
                 sb.push_str("&MinSegments=");
                 sb.push_str(&v.to_string());
             }
-        } else if self.start_position_ticks != 0 {
-            sb.push_str("&StartTimeTicks=");
-            sb.push_str(&self.start_position_ticks.to_string());
         }
 
         if let Some(v) = self.play_session_id.as_deref().filter(|v| !v.is_empty()) {

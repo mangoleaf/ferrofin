@@ -127,8 +127,10 @@ fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>
 
     let start_position_ticks = item.start_position_ticks;
 
+    // StartTimeTicks is emitted for both protocols (a "0" value is dropped
+    // below); HLS also carries it now so a resume seeds the fMP4 init transcode.
+    list.push(("StartTimeTicks".into(), start_position_ticks.to_string()));
     if item.sub_protocol == MediaStreamProtocol::hls {
-        list.push(("StartTimeTicks".into(), String::new()));
         list.push((
             "SegmentContainer".into(),
             item.container.clone().unwrap_or_default(),
@@ -139,8 +141,6 @@ fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>
         if let Some(v) = item.min_segments {
             list.push(("MinSegments".into(), v.to_string()));
         }
-    } else {
-        list.push(("StartTimeTicks".into(), start_position_ticks.to_string()));
     }
 
     list.push((
