@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "cf00efc 2026-08-02",
+  "last_verified": "9b68017 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -43,6 +43,11 @@
       "deep_verified": false,
       "note": "H=True J=False"
     },
+    "DELETE /Sessions/{sessionId}/User/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "DELETE /UserFavoriteItems/{itemId}": {
       "classification": "ok",
       "deep_verified": true,
@@ -69,9 +74,9 @@
       "note": "H=True J=True"
     },
     "GET /Playlists/{playlistId}": {
-      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
-      "deep_verified": false,
-      "note": "H=False J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "GET /Playlists/{playlistId}/Items": {
       "classification": "ok",
@@ -218,7 +223,17 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /Sessions/Logout": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "POST /Sessions/Playing": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Sessions/Playing/Ping": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -232,6 +247,51 @@
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
+    },
+    "POST /Sessions/Viewing": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Sessions/{sessionId}/Command": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/Command/{command}": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/Message": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/Playing": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/Playing/{command}": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/System/{command}": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /Sessions/{sessionId}/User/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Sessions/{sessionId}/Viewing": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
     },
     "POST /System/Configuration": {
       "classification": "ok",

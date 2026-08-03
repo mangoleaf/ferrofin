@@ -23,6 +23,8 @@ import json
 import os
 import sys
 import urllib.parse
+import urllib.request
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sweep import http, get_json, bring_up, ROOT   # reuse HTTP + provisioning
@@ -440,6 +442,87 @@ def j_virtualfolder_crud(base, token, user, _m, _m2):
     return r
 
 
+def auth_device(base, username, pw, device):
+    """AuthenticateByName under a distinct DeviceId, returning the full result (which
+    carries SessionInfo.Id + AccessToken). A dedicated DeviceId avoids colliding with —
+    and destroying — the harness's own DeviceId='parity' session."""
+    hdr = {
+        "Content-Type": "application/json",
+        "Authorization": f'MediaBrowser Client="parityctl", Device="parityctl", '
+                         f'DeviceId="{device}", Version="1.0"',
+    }
+    req = urllib.request.Request(f"{base}/Users/AuthenticateByName",
+                                 data=json.dumps({"Username": username, "Pw": pw}).encode(),
+                                 method="POST", headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as rr:
+            return json.loads(rr.read())
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, TimeoutError):
+        return {}
+
+
+def j_sessions(base, token, user, mid, _m2):
+    """Session remote-control surface. Prior journeys authenticate throwaway users on the
+    shared DeviceId='parity', which destroys that session — so this journey stands up its
+    OWN session (a throwaway user under a dedicated DeviceId) and takes the session id from
+    the auth response, then drives every control against it with the admin token. Cleans up."""
+    r = {}
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "sessctl", "Password": "Parity!123"}))
+    ctl_uid = json.loads(uraw).get("Id") if uraw else None
+    if not ctl_uid:
+        return r
+    auth = auth_device(base, "sessctl", "Parity!123", "parity-sessctl")
+    sid = (auth.get("SessionInfo") or {}).get("Id")
+    ctl_tok = auth.get("AccessToken")
+    if not sid or not ctl_tok:
+        http("DELETE", f"{base}/Users/{ctl_uid}", token)
+        return r
+    # The controlled session advertises remote-control support so commands are accepted.
+    http("POST", f"{base}/Sessions/Capabilities/Full", ctl_tok, json.dumps({
+        "PlayableMediaTypes": ["Video", "Audio"],
+        "SupportedCommands": ["Mute", "Unmute", "DisplayMessage", "GoHome", "Play", "Pause", "Stop"],
+        "SupportsMediaControl": True,
+        "SupportsPersistentIdentifier": True,
+    }))
+
+    # Fire-and-accept controls (admin token → the controllable session): the server accepts
+    # the request even with no live receiver on the other end.
+    controls = [
+        ("POST /Sessions/Viewing", f"/Sessions/Viewing?sessionId={sid}&itemId={mid}", ""),
+        ("POST /Sessions/Playing/Ping", "/Sessions/Playing/Ping?playSessionId=parity", ""),
+        ("POST /Sessions/{sessionId}/Command/{command}", f"/Sessions/{sid}/Command/Mute", ""),
+        ("POST /Sessions/{sessionId}/Command", f"/Sessions/{sid}/Command",
+         json.dumps({"Name": "DisplayMessage", "Arguments": {"Header": "H", "Text": "T"}})),
+        ("POST /Sessions/{sessionId}/Message", f"/Sessions/{sid}/Message",
+         json.dumps({"Text": "hi", "Header": "H", "TimeoutMs": 500})),
+        ("POST /Sessions/{sessionId}/Playing", f"/Sessions/{sid}/Playing?playCommand=PlayNow&itemIds={mid}", ""),
+        ("POST /Sessions/{sessionId}/Playing/{command}", f"/Sessions/{sid}/Playing/Pause", ""),
+        ("POST /Sessions/{sessionId}/System/{command}", f"/Sessions/{sid}/System/GoHome", ""),
+        ("POST /Sessions/{sessionId}/Viewing", f"/Sessions/{sid}/Viewing?itemType=Movie&itemId={mid}&itemName=X", ""),
+    ]
+    for op, path, body in controls:
+        st, _ = http("POST", f"{base}{path}", token, body)
+        r[op] = st < 300
+
+    # Additional-user add/remove, observed on the session's AdditionalUsers.
+    def additional():
+        s = next((x for x in (get_json(base, "/Sessions", token) or []) if x.get("Id") == sid), {})
+        return [a.get("UserId") for a in (s.get("AdditionalUsers") or [])]
+    st, _ = http("POST", f"{base}/Sessions/{sid}/User/{user}", token, "")
+    r["POST /Sessions/{sessionId}/User/{userId}"] = st < 300 and user in additional()
+    st, _ = http("DELETE", f"{base}/Sessions/{sid}/User/{user}", token)
+    r["DELETE /Sessions/{sessionId}/User/{userId}"] = st < 300 and user not in additional()
+
+    # Logout revokes the calling token — do it to the throwaway token so the harness survives.
+    st, _ = http("POST", f"{base}/Sessions/Logout", ctl_tok, "")
+    dead = http("GET", f"{base}/Users/Me", ctl_tok)[0]
+    r["POST /Sessions/Logout"] = st < 300 and dead == 401
+
+    http("DELETE", f"{base}/Users/{ctl_uid}", token)   # cleanup
+    return r
+
+
 def j_system_and_refresh(base, token, user, mid, _m2):
     """Status-effect writes with no observable read-back: ping, item/library refresh
     triggers, and a content-type override. The differential still confirms both servers
@@ -479,7 +562,7 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
             j_merge_versions, j_playing_items, j_virtualfolder_rename,
-            j_users_password, j_virtualfolder_crud, j_system_and_refresh]
+            j_users_password, j_virtualfolder_crud, j_sessions, j_system_and_refresh]
 
 # ---------------------------------------------------------------- run
 
