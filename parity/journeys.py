@@ -94,6 +94,10 @@ def j_playlist(base, token, user, mid, m2):
         st, _ = http("DELETE", f"{base}/Playlists/{pid}/Items?entryIds={entry}&userId={user}", token)
         rem = q(base, f"/Playlists/{pid}/Items", token, user) or {}
         r["DELETE /Playlists/{playlistId}/Items"] = st < 300 and rem.get("TotalRecordCount", 99) < after.get("TotalRecordCount", 0)
+        # GET /Playlists/{playlistId} returns a PlaylistDto {ItemIds, OpenAccess, Shares};
+        # the playlist still holds its original movie, so ItemIds is non-empty.
+        got = get_json(base, f"/Playlists/{pid}", token) or {}
+        r["GET /Playlists/{playlistId}"] = len(got.get("ItemIds") or []) >= 1
         st, _ = http("POST", f"{base}/Playlists/{pid}?name=Renamed", token, "{}")
         r["POST /Playlists/{playlistId}"] = st < 300
         http("DELETE", f"{base}/Items/{pid}", token)   # cleanup
@@ -283,6 +287,10 @@ def j_playlist_share(base, token, user, mid, _m2):
                      json.dumps({"CanEdit": True}))
         shared = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
         r["POST /Playlists/{playlistId}/Users/{userId}"] = st < 300 and any(s.get("UserId") == uid for s in shared)
+        # Read the share back both as a list and by id (GET endpoints).
+        r["GET /Playlists/{playlistId}/Users"] = any(s.get("UserId") == uid for s in shared)
+        one = get_json(base, f"/Playlists/{pid}/Users/{uid}", token) or {}
+        r["GET /Playlists/{playlistId}/Users/{userId}"] = one.get("CanEdit") is True
         st, _ = http("DELETE", f"{base}/Playlists/{pid}/Users/{uid}", token)
         after = (get_json(base, f"/Playlists/{pid}/Users", token) or [])
         r["DELETE /Playlists/{playlistId}/Users/{userId}"] = st < 300 and not any(s.get("UserId") == uid for s in after)
@@ -432,6 +440,24 @@ def j_virtualfolder_crud(base, token, user, _m, _m2):
     return r
 
 
+def j_system_and_refresh(base, token, user, mid, _m2):
+    """Status-effect writes with no observable read-back: ping, item/library refresh
+    triggers, and a content-type override. The differential still confirms both servers
+    accept the identical request the same way. Runs last so a queued rescan can't perturb
+    the other journeys."""
+    r = {}
+    st, _ = http("POST", f"{base}/System/Ping", token, "")
+    r["POST /System/Ping"] = st < 300
+    st, _ = http("POST", f"{base}/Items/{mid}/ContentType?contentType=movies", token, "")
+    r["POST /Items/{itemId}/ContentType"] = st < 300
+    st, _ = http("POST", f"{base}/Items/{mid}/Refresh?metadataRefreshMode=Default"
+                         f"&imageRefreshMode=None", token, "")
+    r["POST /Items/{itemId}/Refresh"] = st < 300
+    st, _ = http("POST", f"{base}/Library/Refresh", token, "")
+    r["POST /Library/Refresh"] = st < 300
+    return r
+
+
 def j_users_password(base, token, user, _m, _m2):
     r = {}
     _, uraw = http("POST", f"{base}/Users/New", token,
@@ -453,7 +479,7 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
             j_merge_versions, j_playing_items, j_virtualfolder_rename,
-            j_users_password, j_virtualfolder_crud]
+            j_users_password, j_virtualfolder_crud, j_system_and_refresh]
 
 # ---------------------------------------------------------------- run
 

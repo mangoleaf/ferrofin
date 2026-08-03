@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "8451f23 2026-08-02",
+  "last_verified": "cf00efc 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -68,7 +68,22 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "GET /Playlists/{playlistId}": {
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
+      "deep_verified": false,
+      "note": "H=False J=False"
+    },
     "GET /Playlists/{playlistId}/Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Playlists/{playlistId}/Users": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "GET /Playlists/{playlistId}/Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -109,6 +124,21 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/ContentType": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/Refresh": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Library/Refresh": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -204,6 +234,11 @@
       "note": "H=True J=True"
     },
     "POST /System/Configuration": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /System/Ping": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
