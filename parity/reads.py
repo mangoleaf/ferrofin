@@ -96,6 +96,8 @@ READS = [
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
     user("GET /DisplayPreferences/{displayPreferencesId}",
          "/DisplayPreferences/usersettings?userId={u}&client=emby"),
+    user("GET /Devices/Info", "/Devices/Info?id={device}"),
+    user("GET /Devices/Options", "/Devices/Options?id={device}"),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -135,6 +137,10 @@ def resolve_named(base, token, user_id):
         tasks = get_json(base, "/ScheduledTasks", token) or []
         return tasks[0]["Id"] if tasks and tasks[0].get("Id") else ""
 
+    def first_device():
+        items = (get_json(base, "/Devices", token) or {}).get("Items") or []
+        return items[0]["Id"] if items and items[0].get("Id") else ""
+
     return {
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
@@ -143,6 +149,7 @@ def resolve_named(base, token, user_id):
         "person": first_name("/Persons"),
         "series": first_id("Series"),
         "task": first_task(),
+        "device": first_device(),
     }
 
 
@@ -258,7 +265,7 @@ def selfcheck():
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
-           "task": "T"}
+           "task": "T", "device": "D"}
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key

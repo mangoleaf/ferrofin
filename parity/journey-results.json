@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "parity/journeys.py",
-  "last_verified": "df97bef 2026-08-02",
+  "last_verified": "28c7b07 2026-08-02",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -9,6 +9,16 @@
       "note": "H=True J=True"
     },
     "DELETE /Collections/{collectionId}/Items": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Devices": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Items": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -43,6 +53,11 @@
       "deep_verified": false,
       "note": "H=True J=False"
     },
+    "DELETE /ScheduledTasks/Running/{taskId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
       "deep_verified": true,
@@ -64,6 +79,11 @@
       "note": "H=True J=True"
     },
     "DELETE /Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "DELETE /Videos/ActiveEncodings": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -93,12 +113,22 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "GET /System/Configuration/{key}": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
     "GET /Users/{userId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
     },
     "POST /Auth/Keys": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /ClientLog/Document": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -134,6 +164,11 @@
       "note": "H=True J=True"
     },
     "POST /Items/{itemId}/ContentType": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Items/{itemId}/PlaybackInfo": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -204,6 +239,11 @@
       "note": "H=True J=True"
     },
     "POST /Playlists/{playlistId}/Users/{userId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /ScheduledTasks/Running/{taskId}": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"
@@ -298,6 +338,16 @@
       "deep_verified": true,
       "note": "H=True J=True"
     },
+    "POST /System/Configuration/Branding": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
+    "POST /System/Configuration/{key}": {
+      "classification": "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)",
+      "deep_verified": false,
+      "note": "H=False J=True"
+    },
     "POST /System/Ping": {
       "classification": "ok",
       "deep_verified": true,
@@ -319,6 +369,16 @@
       "note": "H=True J=True"
     },
     "POST /UserPlayedItems/{itemId}": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users": {
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
+    },
+    "POST /Users/AuthenticateByName": {
       "classification": "ok",
       "deep_verified": true,
       "note": "H=True J=True"

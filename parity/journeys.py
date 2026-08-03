@@ -541,6 +541,130 @@ def j_system_and_refresh(base, token, user, mid, _m2):
     return r
 
 
+def j_config_writes(base, token, user, _m, _m2):
+    """Branding config round-trips through both the dedicated endpoint and the generic
+    keyed endpoint, read back via GET /System/Configuration/{key}. Restores it after."""
+    r = {}
+    disc = "Parity disclaimer"
+    st, _ = http("POST", f"{base}/System/Configuration/Branding", token,
+                 json.dumps({"LoginDisclaimer": disc, "CustomCss": "", "SplashscreenEnabled": False}))
+    got = get_json(base, "/System/Configuration/branding", token) or {}
+    r["POST /System/Configuration/Branding"] = st < 300 and got.get("LoginDisclaimer") == disc
+    r["GET /System/Configuration/{key}"] = got.get("LoginDisclaimer") == disc
+    disc2 = "Parity disclaimer 2"
+    st, _ = http("POST", f"{base}/System/Configuration/branding", token,
+                 json.dumps({"LoginDisclaimer": disc2, "CustomCss": "", "SplashscreenEnabled": False}))
+    got2 = get_json(base, "/System/Configuration/branding", token) or {}
+    r["POST /System/Configuration/{key}"] = st < 300 and got2.get("LoginDisclaimer") == disc2
+    http("POST", f"{base}/System/Configuration/Branding", token,   # restore
+         json.dumps({"LoginDisclaimer": "", "CustomCss": "", "SplashscreenEnabled": False}))
+    return r
+
+
+def j_scheduled_run(base, token, user, _m, _m2):
+    """Start then stop a scheduled task. Picks a task that is not a heavy library
+    scan/refresh so the immediate stop leaves nothing running."""
+    r = {}
+    tasks = get_json(base, "/ScheduledTasks", token) or []
+    heavy = ("scan", "refresh", "library", "metadata", "thumbnail", "trickplay")
+    task = next((t for t in tasks if not any(h in (t.get("Name", "").lower()) for h in heavy)), None)
+    task = task or (tasks[0] if tasks else None)
+    tid = task.get("Id") if task else None
+    if tid:
+        st, _ = http("POST", f"{base}/ScheduledTasks/Running/{tid}", token, "")
+        r["POST /ScheduledTasks/Running/{taskId}"] = st < 300
+        st, _ = http("DELETE", f"{base}/ScheduledTasks/Running/{tid}", token)
+        r["DELETE /ScheduledTasks/Running/{taskId}"] = st < 300
+    return r
+
+
+def j_playbackinfo_post(base, token, user, mid, _m2):
+    st, raw = http("POST", f"{base}/Items/{mid}/PlaybackInfo?userId={user}", token, "{}")
+    ok = False
+    if st < 300 and raw:
+        try:
+            ok = len(json.loads(raw).get("MediaSources") or []) >= 1
+        except ValueError:
+            ok = False
+    return {"POST /Items/{itemId}/PlaybackInfo": ok}
+
+
+def j_active_encodings(base, token, user, _m, _m2):
+    # No live transcode for this device/session → an idempotent 2xx no-op on both servers.
+    st, _ = http("DELETE", f"{base}/Videos/ActiveEncodings?deviceId=parity&playSessionId=none", token)
+    return {"DELETE /Videos/ActiveEncodings": st < 300}
+
+
+def j_clientlog(base, token, user, _m, _m2):
+    st, _ = http("POST", f"{base}/ClientLog/Document", token, "parity client log line")
+    return {"POST /ClientLog/Document": st < 300}
+
+
+def j_authenticate(base, token, user, _m, _m2):
+    """Authenticate a throwaway user by name and confirm an access token comes back."""
+    r = {}
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "authprobe", "Password": "Parity!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if uid:
+        _, araw = http("POST", f"{base}/Users/AuthenticateByName", None,
+                       json.dumps({"Username": "authprobe", "Pw": "Parity!123"}))
+        tok2 = json.loads(araw).get("AccessToken") if araw else None
+        r["POST /Users/AuthenticateByName"] = bool(tok2)
+        http("DELETE", f"{base}/Users/{uid}", token)
+    return r
+
+
+def j_user_update(base, token, user, _m, _m2):
+    """Update a throwaway user via POST /Users?userId= and read the change back."""
+    r = {}
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "updprobe", "Password": "Parity!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if uid:
+        u = get_json(base, f"/Users/{uid}", token) or {}
+        u["Name"] = "updprobe2"
+        st, _ = http("POST", f"{base}/Users?userId={uid}", token, json.dumps(u))
+        after = get_json(base, f"/Users/{uid}", token) or {}
+        r["POST /Users"] = st < 300 and after.get("Name") == "updprobe2"
+        http("DELETE", f"{base}/Users/{uid}", token)
+    return r
+
+
+def j_devices_delete(base, token, user, _m, _m2):
+    """Register a device via a throwaway login under a dedicated DeviceId, then delete it
+    and confirm it drops off GET /Devices — without touching the harness's own device."""
+    r = {}
+    _, uraw = http("POST", f"{base}/Users/New", token,
+                   json.dumps({"Name": "delprobe", "Password": "Parity!123"}))
+    uid = json.loads(uraw).get("Id") if uraw else None
+    if uid:
+        auth = auth_device(base, "delprobe", "Parity!123", "parity-deldev")
+        if auth.get("AccessToken"):
+            def has_dev():
+                items = (get_json(base, "/Devices", token) or {}).get("Items") or []
+                return any(d.get("Id") == "parity-deldev" for d in items)
+            present = has_dev()
+            st, _ = http("DELETE", f"{base}/Devices?id=parity-deldev", token)
+            r["DELETE /Devices"] = present and st < 300 and not has_dev()
+        http("DELETE", f"{base}/Users/{uid}", token)
+    return r
+
+
+def j_bulk_item_delete(base, token, user, mid, _m2):
+    """DELETE /Items (bulk, by ids query) — delete a throwaway playlist item and confirm
+    it is gone. Uses a created playlist so no fixture media is touched."""
+    r = {}
+    _, praw = http("POST", f"{base}/Playlists", token,
+                   json.dumps({"Name": "BulkDelPL", "Ids": [mid], "UserId": user}))
+    pid = json.loads(praw).get("Id") if praw else None
+    if pid:
+        st, _ = http("DELETE", f"{base}/Items?ids={pid}", token)
+        gone = http("GET", f"{base}/Items/{pid}?userId={user}", token)[0] in (404, 400)
+        r["DELETE /Items"] = st < 300 and gone
+    return r
+
+
 def j_users_password(base, token, user, _m, _m2):
     r = {}
     _, uraw = http("POST", f"{base}/Users/New", token,
@@ -562,7 +686,10 @@ JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, 
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,
             j_merge_versions, j_playing_items, j_virtualfolder_rename,
-            j_users_password, j_virtualfolder_crud, j_sessions, j_system_and_refresh]
+            j_users_password, j_virtualfolder_crud, j_sessions, j_config_writes,
+            j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
+            j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
+            j_system_and_refresh]
 
 # ---------------------------------------------------------------- run
 
