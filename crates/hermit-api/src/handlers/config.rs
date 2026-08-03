@@ -260,6 +260,27 @@ async fn update_named_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /System/Configuration/Branding` — the branding configuration.
+///
+/// Jellyfin serves branding through `GET /System/Configuration/{key}` (key
+/// `branding`), but our static `POST /System/Configuration/Branding` route shadows
+/// that exact path for *every* method — axum resolves the path first, then the
+/// method, so a GET here 405s without a handler while ASP.NET's method-aware routing
+/// falls through to the `{key}` action. Serving the same branding object here
+/// restores the Jellyfin behavior (a client's `GET .../branding` returns 200).
+async fn get_branding_configuration(
+    State(state): State<AppState>,
+    _auth: RequireAuth,
+) -> Result<Json<Value>, ApiError> {
+    serde_json::to_value(state.config.get_branding().await?)
+        .map(Json)
+        .map_err(|e| {
+            ApiError::from(hermit_traits::error::ServiceError::backend(format!(
+                "serialize branding configuration: {e}"
+            )))
+        })
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -273,7 +294,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/System/Configuration/Branding",
-            axum::routing::post(update_branding_configuration),
+            get(get_branding_configuration).post(update_branding_configuration),
         )
         .route(
             "/System/Configuration/{key}",

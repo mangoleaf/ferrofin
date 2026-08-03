@@ -447,6 +447,16 @@ async fn named_configuration_branding_and_unknown() {
 }
 
 #[tokio::test]
+async fn branding_configuration_path_serves_get() {
+    // The dedicated POST /System/Configuration/Branding route must also answer GET
+    // (the static route shadows the {key} route's GET for this exact path), so a
+    // client GETting the branding config gets 200 + the branding object, not 405.
+    let (status, body) = get(full_state(), "/System/Configuration/Branding").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json(&body).is_object());
+}
+
+#[tokio::test]
 async fn unauthenticated_system_configuration_is_401() {
     // No token header → RequireAuth rejects. Use the shared fake state (its
     // FakeAuthService rejects).
