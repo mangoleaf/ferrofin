@@ -244,10 +244,19 @@ impl LibraryScanner {
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
             let (streams, chapters) = self.probe(&mut entity).await;
-            // Enrich the row from TMDB (overview/tagline/genres/studios/ratings +
-            // cast/crew) before it's saved, so a bare file with no NFO shows the
-            // same detail page Jellyfin does. Best-effort: failures don't abort.
-            let people = self.fetch_remote_metadata(&mut entity).await;
+            // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
+            // metadata reader, which runs before any remote fetch. It fills
+            // genres/studios/tags/overview/ratings/year from `movie.nfo` /
+            // `tvshow.nfo` / `<episode>.nfo` and yields the credited cast/crew.
+            let mut people = self.fetch_local_nfo(&mut entity).await;
+            // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
+            // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
+            // shows the same detail page Jellyfin does. Best-effort: failures don't
+            // abort, and NFO-provided people take precedence.
+            let remote_people = self.fetch_remote_metadata(&mut entity).await;
+            if people.is_empty() {
+                people = remote_people;
+            }
             self.persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
@@ -383,6 +392,72 @@ impl LibraryScanner {
     ///
     /// Idempotent: an item whose artwork was already downloaded (its folder holds
     /// `primary.*`) is reused from disk with no network call. Returns empty when
+    /// Reads a local Kodi/XBMC `.nfo` sidecar for `entity` (if one exists) and
+    /// merges its genres/studios/tags/overview/ratings/year onto the row, returning
+    /// its credited people. This is Jellyfin's default local metadata reader — it
+    /// runs before any remote fetch, so a library of bare files with NFO sidecars
+    /// shows real detail pages, genres, studios and cast entirely offline.
+    ///
+    /// Best-effort: a missing/unreadable/malformed sidecar leaves the row untouched
+    /// and returns no people, so one bad file never aborts the scan.
+    async fn fetch_local_nfo(&self, entity: &mut BaseItemEntity) -> Vec<PeopleEntity> {
+        use hermit_providers::xbmc::{
+            self, base_parser::NoDirectoryService, config::NfoConfiguration, item::NfoItemKind,
+        };
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        let kind = match short {
+            "Movie" => NfoItemKind::Movie,
+            "Series" => NfoItemKind::Series,
+            "Season" => NfoItemKind::Season,
+            "Episode" => NfoItemKind::Episode,
+            _ => return Vec::new(),
+        };
+        let Some(path) = entity.path.as_deref() else {
+            return Vec::new();
+        };
+        let mut xml = None;
+        let mut nfo_path = String::new();
+        for cand in nfo_candidates(path, entity.is_folder, kind) {
+            if let Ok(contents) = tokio::fs::read_to_string(&cand).await {
+                nfo_path = cand.to_string_lossy().into_owned();
+                xml = Some(contents);
+                break;
+            }
+        }
+        let Some(xml) = xml else {
+            return Vec::new();
+        };
+        let config = NfoConfiguration::default();
+        let ext_ids = xbmc::StaticExternalIds::new(["Imdb", "Tmdb", "Tvdb"]);
+        let ds = NoDirectoryService;
+        let mut result = xbmc::new_result(kind);
+        let parsed = match kind {
+            NfoItemKind::Movie => {
+                xbmc::fetch_movie(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            NfoItemKind::Series => {
+                xbmc::fetch_series(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            NfoItemKind::Season => {
+                xbmc::fetch_season(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            NfoItemKind::Episode => {
+                xbmc::fetch_episode(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            _ => return Vec::new(),
+        };
+        if parsed.is_err() {
+            return Vec::new();
+        }
+        apply_nfo(entity, &result.item);
+        result
+            .people
+            .unwrap_or_default()
+            .into_iter()
+            .map(person_to_entity)
+            .collect()
+    }
+
     /// Enriches a movie/series row from TMDB (overview, tagline, genres, studios,
     /// community rating, US certification, premiere date) and returns its cast +
     /// key crew to persist. No-op when TMDB is unconfigured, the item already has
@@ -1017,6 +1092,94 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
 /// hasn't already set (so a probed runtime, a local NFO, or a prior scan wins).
 /// Genres/studios are stored pipe-delimited, matching the `BaseItems` columns the
 /// DTO service reads.
+/// Resolves the candidate `.nfo` sidecar paths for an item, in Jellyfin's search
+/// order. Movies/episodes (files) look next to the media (`<stem>.nfo`, then
+/// `movie.nfo` in the folder); series/seasons (folders) look for `tvshow.nfo` /
+/// `season.nfo` inside. `is_folder` disambiguates a single-folder movie.
+fn nfo_candidates(
+    path: &str,
+    is_folder: bool,
+    kind: hermit_providers::xbmc::item::NfoItemKind,
+) -> Vec<PathBuf> {
+    use hermit_providers::xbmc::item::NfoItemKind;
+    let p = Path::new(path);
+    match kind {
+        NfoItemKind::Series => vec![p.join("tvshow.nfo")],
+        NfoItemKind::Season => vec![p.join("season.nfo")],
+        NfoItemKind::Movie if is_folder => vec![p.join("movie.nfo")],
+        NfoItemKind::Movie => {
+            let mut c = vec![p.with_extension("nfo")];
+            if let Some(dir) = p.parent() {
+                c.push(dir.join("movie.nfo"));
+            }
+            c
+        }
+        _ => vec![p.with_extension("nfo")], // Episode + any leaf kind
+    }
+}
+
+/// Merges parsed NFO fields onto `entity`, filling only what the row still lacks
+/// (mirrors [`apply_details`]). Pipe-joins the multi-valued genre/studio/tag sets
+/// so [`item_values_of`] mirrors them into the browse/filter indexes.
+fn apply_nfo(entity: &mut BaseItemEntity, n: &hermit_providers::xbmc::item::NfoBaseItem) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&n.overview);
+    }
+    if entity.tagline.is_none() {
+        entity.tagline.clone_from(&n.tagline);
+    }
+    if entity.official_rating.is_none() {
+        entity.official_rating.clone_from(&n.official_rating);
+    }
+    if entity.custom_rating.is_none() {
+        entity.custom_rating.clone_from(&n.custom_rating);
+    }
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&n.original_title);
+    }
+    if entity.sort_name.is_none() {
+        entity.sort_name.clone_from(&n.sort_name);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = n.community_rating.map(f64::from);
+    }
+    if entity.critic_rating.is_none() {
+        entity.critic_rating = n.critic_rating.map(f64::from);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = n.production_year.map(i64::from);
+    }
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = n.premiere_date;
+    }
+    if entity.end_date.is_none() {
+        entity.end_date = n.end_date;
+    }
+    if entity.genres.as_deref().unwrap_or_default().is_empty() && !n.genres.is_empty() {
+        entity.genres = Some(n.genres.join("|"));
+    }
+    if entity.studios.as_deref().unwrap_or_default().is_empty() && !n.studios.is_empty() {
+        entity.studios = Some(n.studios.join("|"));
+    }
+    if entity.tags.as_deref().unwrap_or_default().is_empty() && !n.tags.is_empty() {
+        entity.tags = Some(n.tags.join("|"));
+    }
+}
+
+/// Maps an NFO-parsed [`PersonInfo`](hermit_providers::container_types::PersonInfo)
+/// to a persistable [`PeopleEntity`]. NFO people carry no remote id/image, so those
+/// are left empty; the person-type key is the Jellyfin `PersonType` name.
+fn person_to_entity(p: hermit_providers::container_types::PersonInfo) -> PeopleEntity {
+    PeopleEntity {
+        id: Uuid::new_v4().to_string(),
+        name: p.name,
+        person_type: Some(format!("{:?}", p.type_)),
+        role: p.role,
+        primary_image_url: None,
+        provider_id: None,
+    }
+}
+
 fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
@@ -1229,6 +1392,79 @@ mod tests {
         assert_eq!(super::create_sort_name("The Matrix"), "matrix");
         assert_eq!(super::create_sort_name("Se7en"), "se0000000007en");
     }
+
+    // NFO sidecar search order: files look next to the media then for movie.nfo;
+    // folders look inside for tvshow.nfo/season.nfo; a single-folder movie for movie.nfo.
+    #[test]
+    fn nfo_candidates_match_jellyfin_search_order() {
+        use hermit_providers::xbmc::item::NfoItemKind;
+        assert_eq!(
+            super::nfo_candidates("/m/Movie (2020)/Movie.mkv", false, NfoItemKind::Movie),
+            vec![
+                std::path::PathBuf::from("/m/Movie (2020)/Movie.nfo"),
+                std::path::PathBuf::from("/m/Movie (2020)/movie.nfo"),
+            ]
+        );
+        assert_eq!(
+            super::nfo_candidates("/m/Movie (2020)", true, NfoItemKind::Movie),
+            vec![std::path::PathBuf::from("/m/Movie (2020)/movie.nfo")]
+        );
+        assert_eq!(
+            super::nfo_candidates("/tv/Series", true, NfoItemKind::Series),
+            vec![std::path::PathBuf::from("/tv/Series/tvshow.nfo")]
+        );
+        assert_eq!(
+            super::nfo_candidates("/tv/Series/Season 01", true, NfoItemKind::Season),
+            vec![std::path::PathBuf::from("/tv/Series/Season 01/season.nfo")]
+        );
+        assert_eq!(
+            super::nfo_candidates("/tv/Series/S01E01.mkv", false, NfoItemKind::Episode),
+            vec![std::path::PathBuf::from("/tv/Series/S01E01.nfo")]
+        );
+    }
+
+    // apply_nfo fills only empty fields (mirrors apply_details) and pipe-joins the sets.
+    #[test]
+    fn apply_nfo_fills_only_empty_fields() {
+        use hermit_db::entities::base_items::BaseItemEntity;
+        use hermit_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Movie);
+        n.overview = Some("from nfo".into());
+        n.production_year = Some(1999);
+        n.genres = vec!["Action".into(), "Drama".into()];
+        n.studios = vec!["ACME".into()];
+        n.community_rating = Some(7.5);
+
+        let mut e = BaseItemEntity {
+            overview: Some("already set".into()),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut e, &n);
+        assert_eq!(e.overview.as_deref(), Some("already set")); // not overwritten
+        assert_eq!(e.production_year, Some(1999)); // filled
+        assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
+        assert_eq!(e.studios.as_deref(), Some("ACME"));
+        assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.
+    #[test]
+    fn person_to_entity_maps_type_name() {
+        use hermit_model::data::PersonKind;
+        use hermit_providers::container_types::PersonInfo;
+        let p = PersonInfo {
+            type_: PersonKind::Director,
+            role: Some("Self".into()),
+            ..PersonInfo::new("Jane Doe")
+        };
+        let e = super::person_to_entity(p);
+        assert_eq!(e.name, "Jane Doe");
+        assert_eq!(e.person_type.as_deref(), Some("Director"));
+        assert_eq!(e.role.as_deref(), Some("Self"));
+        assert!(e.provider_id.is_none());
+        assert!(e.primary_image_url.is_none());
+    }
+
     use crate::media_stream_repository::HermitMediaStreamRepository;
     use crate::virtual_folder_manager::HermitVirtualFolderManager;
     use async_trait::async_trait;
@@ -1656,6 +1892,93 @@ mod tests {
             .clone()
             .unwrap();
         (db, cf)
+    }
+
+    #[tokio::test]
+    async fn scan_reads_local_movie_nfo_into_row_and_people() {
+        // A bare movie with a Kodi `movie.nfo` sidecar — the scan must read it (Jellyfin's
+        // default local metadata reader) and persist genres/studio/overview + the cast.
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let dir = media.join("The Matrix (1999)");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::write(
+            dir.join("movie.nfo"),
+            r#"<?xml version="1.0"?>
+<movie><title>The Matrix</title><year>1999</year><plot>Neo wakes up.</plot>
+<genre>Action</genre><genre>SciFi</genre><studio>Warner</studio>
+<actor><name>Keanu Reeves</name><role>Neo</role><type>Actor</type></actor>
+<director>Lana Wachowski</director></movie>"#,
+        )
+        .unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join(".views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let people = Arc::new(crate::people_repository::HermitPeopleRepository::new(
+            db.clone(),
+        ));
+        LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+            .with_people(people)
+            .scan_all()
+            .await
+            .unwrap();
+
+        let (genres, studios, overview): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                r#"SELECT "Genres", "Studios", "Overview" FROM "BaseItems"
+                   WHERE "Type" LIKE '%Movies.Movie'"#,
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(genres.as_deref(), Some("Action|SciFi"));
+        assert_eq!(studios.as_deref(), Some("Warner"));
+        assert_eq!(overview.as_deref(), Some("Neo wakes up."));
+
+        // Genres mirrored into ItemValues (type 2) so genre browse/filter matches.
+        let genre_vals: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "ItemValues" iv
+               JOIN "ItemValuesMap" m ON m."ItemValueId" = iv."ItemValueId"
+               WHERE iv."Type" = 2"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or(0);
+        assert!(genre_vals >= 2, "both NFO genres indexed, got {genre_vals}");
+
+        // Cast + director persisted from the NFO.
+        let people: Vec<(String, Option<String>)> =
+            sqlx::query_as(r#"SELECT "Name", "PersonType" FROM "Peoples" ORDER BY "Name""#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let names: Vec<&str> = people.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"Keanu Reeves"),
+            "actor persisted: {names:?}"
+        );
+        assert!(
+            names.contains(&"Lana Wachowski"),
+            "director persisted: {names:?}"
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ Offline self-check:
 import json
 import os
 import re
+import urllib.parse
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,8 +45,10 @@ def plain(op, url):
 
 
 def user(op, url):
-    # url may contain {u}; filled with the server's user id. Path requested for stable array keys.
-    return {"op": op, "kind": "user", "url": lambda c: url.format(u=c["user"])}
+    # url may reference {u} (user id) plus resolved per-server context keys (genre/studio/person/
+    # year/series/season). By-name values are URL-encoded and identical across servers (same NFO);
+    # series/season ids are per-server (same title on both → clean diff).
+    return {"op": op, "kind": "user", "url": lambda c: url.format(**c)}
 
 
 def item(op, tmpl):
@@ -82,6 +85,13 @@ READS = [
     item("GET /Items/{itemId}/PlaybackInfo", "/Items/{i}/PlaybackInfo?userId={u}"),
     item("GET /Items/{itemId}/Images", "/Items/{i}/Images"),
     item("GET /Movies/{itemId}/Similar", "/Movies/{i}/Similar?userId={u}&limit=12"),
+    # by-name + shows (need the NFO metadata + shows fixture); {genre}/{studio}/{person} are
+    # URL-encoded names shared across servers, {series} is the per-server first-series id.
+    user("GET /Genres/{genreName}", "/Genres/{genre}?userId={u}"),
+    user("GET /Studios/{name}", "/Studios/{studio}?userId={u}"),
+    user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
+    user("GET /Shows/{seriesId}/Seasons", "/Shows/{series}/Seasons?userId={u}"),
+    user("GET /Shows/{seriesId}/Episodes", "/Shows/{series}/Episodes?userId={u}"),
 ]
 
 # ---------------------------------------------------------------- correlation
@@ -104,10 +114,33 @@ def correlate(hmap, jmap):
 
 # ---------------------------------------------------------------- run
 
+def resolve_named(base, token, user_id):
+    """Per-server context for the by-name/shows endpoints. Names are URL-encoded (shared across
+    servers via the same NFO); the series id is per-server (same title on both)."""
+    def first_name(path):
+        items = (get_json(base, f"{path}?userId={user_id}&limit=1", token) or {}).get("Items") or []
+        return urllib.parse.quote(items[0]["Name"]) if items and items[0].get("Name") else ""
+
+    def first_id(kind):
+        b = get_json(base, f"/Items?userId={user_id}&recursive=true&includeItemTypes={kind}"
+                           f"&limit=1&sortBy=SortName", token)
+        it = (b or {}).get("Items") or []
+        return it[0]["Id"] if it else ""
+
+    return {
+        "user": user_id,   # item() reads c["user"]
+        "u": user_id,       # user() URL templates use {u}
+        "genre": first_name("/Genres"),
+        "studio": first_name("/Studios"),
+        "person": first_name("/Persons"),
+        "series": first_id("Series"),
+    }
+
+
 def run(hermit_url, jellyfin_url):
     ht, hu = bring_up(hermit_url, "hermit")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
-    hc, jc = {"user": hu}, {"user": ju}
+    hc, jc = resolve_named(hermit_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
 
     pairs = correlate(path_id_map(hermit_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
     rows = {}
@@ -213,7 +246,13 @@ def selfcheck():
     valid = {f"GET {p}" for p in spec["paths"]}
     bad = [ep["op"] for ep in READS if ep["op"] not in valid]
     assert not bad, f"read op-keys not in spec: {bad}"
-    print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid")
+    # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
+    # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
+    ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE"}
+    for ep in READS:
+        if ep["kind"] == "user":
+            ep["url"](ctx)  # raises KeyError if a placeholder has no context key
+    print(f"ok: diff, Path-align, correlation, {len(READS)} read op-keys valid, user templates fillable")
 
 
 if __name__ == "__main__":
