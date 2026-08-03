@@ -293,17 +293,68 @@ impl ItemCountService for HermitItemCountService {
         user: &UserEntity,
     ) -> Result<HashMap<Uuid, PlayedAndTotal>, ServiceError> {
         let mut out = HashMap::with_capacity(folder_ids.len());
+        if folder_ids.is_empty() {
+            return Ok(out);
+        }
         // Jellyfin's `Folder.GetUnplayedCount`/`GetPlayedPercentage` count only leaf
         // (media) descendants — a series' unplayed count is its unplayed episodes,
-        // not its seasons — so constrain to non-folder items.
-        let base = InternalItemsQuery {
-            recursive: true,
-            is_folder: Some(false),
-            user: Some(user.clone()),
-            ..Default::default()
+        // not its seasons — so we constrain to non-folder items.
+        //
+        // Two grouped joins over the `AncestorIds` closure resolve the whole page in
+        // one pass each: total leaf descendants per folder, then the played subset.
+        // The prior path looped `descendant_counts` per folder, and each call
+        // re-scanned every leaf in the library (a folder-independent id set) before
+        // intersecting via a thousand-parameter `IN` — O(folders × library) with no
+        // batching, which dominated the by-name browse endpoints.
+        let ids: Vec<String> = folder_ids.iter().map(Uuid::to_string).collect();
+        let grouped = |extra_join: &str, extra_where: &str| {
+            let mut sql = format!(
+                r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
+                   FROM "AncestorIds" a
+                   JOIN "BaseItems" bi ON bi."Id" = a."ItemId"{extra_join}
+                   WHERE bi."IsFolder" = 0{extra_where} AND a."ParentItemId" IN ("#
+            );
+            sql.push_str(&placeholders(ids.len()));
+            sql.push_str(r#") GROUP BY a."ParentItemId""#);
+            sql
         };
-        for &folder in folder_ids {
-            out.insert(folder, self.descendant_counts(&base, folder).await?);
+
+        let total_sql = grouped("", "");
+        let mut total_q = sqlx::query_as::<_, (String, i64)>(&total_sql);
+        for id in &ids {
+            total_q = total_q.bind(id.clone());
+        }
+        let totals = total_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
+
+        // Played subset: the same closure, joined to this user's played `UserData`.
+        let played_sql = grouped(
+            r#" JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+            r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
+        );
+        // The `?` for UserId precedes the `ParentItemId` in-list, so bind it first.
+        let mut played_q = sqlx::query_as::<_, (String, i64)>(&played_sql).bind(user.id.clone());
+        for id in &ids {
+            played_q = played_q.bind(id.clone());
+        }
+        let played_rows = played_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let played_by_parent: HashMap<String, i64> = played_rows.into_iter().collect();
+
+        let mut by_parent: HashMap<String, PlayedAndTotal> = HashMap::with_capacity(totals.len());
+        for (parent, total) in totals {
+            let played = played_by_parent.get(&parent).copied().unwrap_or(0);
+            by_parent.insert(
+                parent,
+                PlayedAndTotal {
+                    played: i32::try_from(played).unwrap_or(i32::MAX),
+                    total: i32::try_from(total).unwrap_or(i32::MAX),
+                },
+            );
+        }
+        // Folders with no leaf descendants (e.g. by-name items, which have no
+        // `AncestorIds` closure) are absent from the grouped rows ⇒ default 0/0,
+        // exactly as the prior per-folder path returned.
+        for (&folder, key) in folder_ids.iter().zip(&ids) {
+            out.insert(folder, by_parent.get(key).copied().unwrap_or_default());
         }
         Ok(out)
     }
@@ -505,12 +556,18 @@ mod tests {
             .await
             .expect("set parent");
 
+        // Batch over the closure folder AND `parent` (which has a direct child via
+        // ParentId but no `AncestorIds` closure row — like a by-name item): the
+        // grouped query resolves both in one pass, closure folder = 2/1, the
+        // closure-less folder defaults to 0/0.
         let batch = service
-            .get_played_and_total_count_batch(&[folder], &user_entity)
+            .get_played_and_total_count_batch(&[folder, parent], &user_entity)
             .await
             .expect("batch");
         assert_eq!(batch[&folder].total, 2);
         assert_eq!(batch[&folder].played, 1);
+        assert_eq!(batch[&parent].total, 0);
+        assert_eq!(batch[&parent].played, 0);
 
         let counts = service
             .get_child_count_batch(&[parent, folder], None)
