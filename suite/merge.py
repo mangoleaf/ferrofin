@@ -7,12 +7,13 @@ Reads, all at a single Hermit SHA:
   - perf (per variant latencies), from EITHER
         benchmark/results/raw/{hermit,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
         or the latest entry of benchmark/bench-data.json       (fallback)
-  - suite/results/raw/{parity,perf}-fingerprints.json          (optional, mid-run honesty check)
+  - suite/results/raw/perf-fingerprints-{hermit,jellyfin}.json (optional, mid-run honesty check)
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
 viewer reads). Fairness rules baked in (not left to the reader):
   - a row is `comparable` only if the op is deep_verified, both servers answered 200 for it, and
-    its body fingerprint didn't drift since the parity pass;
+    Hermit's body SHAPE matched Jellyfin's when both were captured during the perf leg (same
+    library state — comparing across the parity/perf legs false-flags play-state fields);
   - the headline median-speedup / win-rate are computed over comparable rows ONLY;
   - a Hermit "win" requires beating Jellyfin on p50 AND p95 AND p99 — a p50 win with a tail loss
     is surfaced as a tail loss, never folded into "faster".
@@ -166,8 +167,8 @@ def main():
     v2op = variant_to_op()
     par = parity_by_op()
     perf, perf_src = perf_by_variant()
-    fp_par = load_json(RAW / "parity-fingerprints.json", {})
-    fp_perf = load_json(RAW / "perf-fingerprints.json", {})
+    fp_h = load_json(RAW / "perf-fingerprints-hermit.json", {})
+    fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
 
     operations, benched_ops, deep_ops = [], set(), set()
     for variant, p in perf.items():
@@ -180,12 +181,12 @@ def main():
         if deep:
             deep_ops.add(op)
 
-        drift = op in fp_par and op in fp_perf and fp_par[op] != fp_perf[op]
+        drift = op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
         both_ok = p.get("h_ok") == 100 and p.get("j_ok") == 100
         have_lat = p["h_p50"] is not None and p["j_p50"] is not None
         comparable = deep and both_ok and have_lat and not drift
         reason = (None if comparable else
-                  "body drifted since parity pass" if drift else
+                  "body shape diverges from Jellyfin at bench time" if drift else
                   "not deep-verified" if not deep else
                   "200-rate < 100%" if not both_ok else "missing latency")
 

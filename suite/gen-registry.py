@@ -20,11 +20,26 @@ OUT = Path(__file__).resolve().parent / "registry.json"
 
 # k6 template vars → OpenAPI path params. userId is always a query param in the bench set, so
 # it never appears here; item ids are the only path templating we do.
-PATH_VARS = {"c.itemId": "{itemId}", "c.imageItemId": "{itemId}"}
+PATH_VARS = {
+    "c.itemId": "{itemId}",
+    "c.imageItemId": "{itemId}",
+    "c.seriesId": "{seriesId}",
+    "c.playlistId": "{playlistId}",
+    "c.taskId": "{taskId}",
+    "c.userId": "{userId}",
+    "c.imageTag": "{tag}",
+}
 
 # Variants whose concrete path carries a literal where the spec has a param (e.g. the image
 # type "Primary" is the {imageType} path param). Map the derived op_path to the spec op_path.
-OP_OVERRIDES = {"/Items/{itemId}/Images/Primary": "/Items/{itemId}/Images/{imageType}"}
+OP_OVERRIDES = {
+    "/Items/{itemId}/Images/Primary": "/Items/{itemId}/Images/{imageType}",
+    "/Items/{itemId}/Images/Primary/0": "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+    "/Items/{itemId}/Images/Primary/0/{tag}/webp/300/450/0/0":
+        "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}"
+        "/{percentPlayed}/{unplayedCount}",
+    "/System/Configuration/encoding": "/System/Configuration/{key}",
+}
 
 
 def normalize(tmpl: str):

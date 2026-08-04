@@ -223,4 +223,72 @@ export const ENDPOINTS = [
 
   // Image serve + resize (hermit-drawing). Best-effort: N/A if no local poster is discovered.
   { name: 'image_primary', path: (c) => `/Items/${c.imageItemId}/Images/Primary?fillHeight=400&fillWidth=400` },
+
+  // ── Expanded surface (2026-08: 43/412 benched ops was ~10%) ──────────────
+  // Every entry is a ledger-certified GET whose params resolve from the
+  // enriched context (enrichContext below). Grouped by subsystem.
+
+  // TV browse — the Shows tab's two heavy queries.
+  { name: 'shows_episodes', path: (c) => `/Shows/${c.seriesId}/Episodes?userId=${c.userId}&limit=50` },
+  { name: 'shows_seasons', path: (c) => `/Shows/${c.seriesId}/Seasons?userId=${c.userId}` },
+
+  // Item detail sub-resources (continued).
+  { name: 'item_theme_songs', path: (c) => `/Items/${c.itemId}/ThemeSongs?userId=${c.userId}` },
+  { name: 'item_theme_videos', path: (c) => `/Items/${c.itemId}/ThemeVideos?userId=${c.userId}` },
+  { name: 'video_additional_parts', path: (c) => `/Videos/${c.itemId}/AdditionalParts?userId=${c.userId}` },
+
+  // Image routes: indexed and the fully-parametrized (path-baked transform) form.
+  { name: 'item_image_indexed', path: (c) => `/Items/${c.imageItemId}/Images/Primary/0` },
+  { name: 'item_image_parametrized', path: (c) => `/Items/${c.imageItemId}/Images/Primary/0/${c.imageTag}/webp/300/450/0/0` },
+
+  // Playlists (created once by enrichContext).
+  { name: 'playlist_detail', path: (c) => `/Playlists/${c.playlistId}` },
+  { name: 'playlist_items', path: (c) => `/Playlists/${c.playlistId}/Items?userId=${c.userId}` },
+  { name: 'playlist_users', path: (c) => `/Playlists/${c.playlistId}/Users` },
+
+  // Branding / fonts / startup / environment / system.
+  { name: 'branding_css', path: () => '/Branding/Css' },
+  { name: 'branding_css_ext', path: () => '/Branding/Css.css' },
+  { name: 'fallback_fonts', path: () => '/FallbackFont/Fonts' },
+  { name: 'startup_config', path: () => '/Startup/Configuration' },
+  { name: 'startup_first_user', path: () => '/Startup/FirstUser' },
+  { name: 'startup_user', path: () => '/Startup/User' },
+  { name: 'env_default_browser', path: () => '/Environment/DefaultDirectoryBrowser' },
+  { name: 'env_network_shares', path: () => '/Environment/NetworkShares' },
+  { name: 'system_config_key', path: () => '/System/Configuration/encoding' },
+  { name: 'backup_list', path: () => '/Backup' },
+  { name: 'tmdb_config', path: () => '/Tmdb/ClientConfiguration' },
+
+  // Devices / users / tasks (ids from the enriched context).
+  { name: 'devices_info', path: () => '/Devices/Info?id=bench' },
+  { name: 'user_by_id', path: (c) => `/Users/${c.userId}` },
+  { name: 'scheduled_task_detail', path: (c) => `/ScheduledTasks/${c.taskId}` },
+
+  // Channels + Live TV read surface (empty-but-real on the bench library).
+  { name: 'channels_features', path: () => '/Channels/Features' },
+  { name: 'channels_latest', path: (c) => `/Channels/Items/Latest?userId=${c.userId}` },
+  { name: 'livetv_programs_recommended', path: (c) => `/LiveTv/Programs/Recommended?userId=${c.userId}` },
+  { name: 'livetv_recording_folders', path: (c) => `/LiveTv/Recordings/Folders?userId=${c.userId}` },
+  { name: 'livetv_recordings_series', path: (c) => `/LiveTv/Recordings/Series?userId=${c.userId}` },
+  { name: 'livetv_recording_groups', path: () => '/LiveTv/Recordings/Groups' },
+  { name: 'livetv_listing_default', path: () => '/LiveTv/ListingProviders/Default' },
 ];
+
+// Resolves the extra context ids the expanded endpoint set needs, after auth +
+// scan: the first series (TV browse), a scheduled task id, the picked image
+// item's cache tag, and a bench playlist (created if absent — fresh DB per
+// run). Fields default to '' so a library without that shape yields 404s on
+// both servers identically rather than breaking the run.
+export function enrichContext(base, ctx) {
+  const h = tokenHeaders(ctx.token);
+  const series = http.get(`${base}/Items?userId=${ctx.userId}&recursive=true&includeItemTypes=Series&sortBy=SortName&limit=1`, h).json();
+  ctx.seriesId = (series.Items && series.Items[0]) ? series.Items[0].Id : '';
+  const tasks = http.get(`${base}/ScheduledTasks`, h).json();
+  ctx.taskId = (tasks && tasks[0]) ? (tasks[0].Id || tasks[0].Key) : '';
+  const img = http.get(`${base}/Items?userId=${ctx.userId}&recursive=true&includeItemTypes=Movie&sortBy=SortName&limit=200`, h).json();
+  const withImage = ((img.Items) || []).find((i) => i.ImageTags && i.ImageTags.Primary);
+  ctx.imageTag = withImage ? withImage.ImageTags.Primary : '0';
+  const created = http.post(`${base}/Playlists`, JSON.stringify({ Name: 'bench-playlist', UserId: ctx.userId, Ids: ctx.itemId ? [ctx.itemId] : [] }), h);
+  ctx.playlistId = created.status < 300 ? (created.json().Id || '') : '';
+  return ctx;
+}

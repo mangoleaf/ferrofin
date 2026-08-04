@@ -78,10 +78,13 @@ bench() {  # $1=service $2=port $3=TARGET
 
   [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" k6 run transcode.js || true
   suite_count_items "$base" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
-  # Perf-side body fingerprint (Hermit only) — merge.py compares it against the parity pass to
-  # flag any op whose body drifted since (fast-because-wrong). Best-effort; never fails the bench.
-  [ "$target" = hermit ] && { mkdir -p ../suite/results/raw; \
-    python3 ../suite/fingerprint.py capture "$base" ../suite/results/raw/perf-fingerprints.json || true; }
+  # Perf-side body fingerprint, BOTH servers — merge.py compares Hermit's shape
+  # against Jellyfin's from this same leg (same fresh-scan DB state), flagging
+  # "fast because the body went hollow/differently-shaped" at bench time.
+  # (Comparing against the parity pass false-flagged ~25 ops: parity's write
+  # journeys leave play-state fields the fresh perf scan legitimately lacks.)
+  mkdir -p ../suite/results/raw
+  python3 ../suite/fingerprint.py capture "$base" "../suite/results/raw/perf-fingerprints-$target.json" || true
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 

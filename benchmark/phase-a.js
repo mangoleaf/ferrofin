@@ -15,7 +15,7 @@
 // it can attribute CPU-seconds-per-request. This script only measures latency.
 import http from 'k6/http';
 import { Trend, Counter } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, authenticate } from './bench-lib.js';
+import { ENDPOINTS, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
 
 const TARGET = __ENV.TARGET;
 const BASE = __ENV.BASE_URL;
@@ -61,6 +61,7 @@ export function setup() {
   ctx.itemId = list[0] ? list[0].Id : '';
   const withImage = list.find((i) => i.ImageTags && i.ImageTags.Primary);
   ctx.imageItemId = withImage ? withImage.Id : ctx.itemId;
+  enrichContext(BASE, ctx);
   return ctx;
 }
 

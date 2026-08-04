@@ -6,7 +6,7 @@
 //   POOL=8 BASE_URL=http://localhost:18296 k6 run pool-sweep.js
 import http from 'k6/http';
 import { Trend, Rate } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, authenticate } from './bench-lib.js';
+import { ENDPOINTS, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
 
 const BASE = __ENV.BASE_URL;
 const POOL = __ENV.POOL || '?';
@@ -33,6 +33,7 @@ export function setup() {
   ctx.itemId = list[0].Id;
   const withImage = list.find((i) => i.ImageTags && i.ImageTags.Primary);
   ctx.imageItemId = withImage ? withImage.Id : ctx.itemId;
+  enrichContext(BASE, ctx);
 
   const warmUntil = Date.now() + (parseInt(__ENV.BENCH_WARMUP_SECONDS || '10', 10) * 1000);
   while (Date.now() < warmUntil)

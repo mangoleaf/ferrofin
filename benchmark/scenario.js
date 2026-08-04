@@ -6,7 +6,7 @@
 //   TARGET=hermit BASE_URL=http://localhost:8096 k6 run scenario.js
 import http from 'k6/http';
 import { Trend, Rate } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, bringUp } from './bench-lib.js';
+import { ENDPOINTS, tokenHeaders, bringUp, enrichContext } from './bench-lib.js';
 
 const TARGET = __ENV.TARGET;                 // 'hermit' | 'jellyfin'
 const BASE = __ENV.BASE_URL;
@@ -39,6 +39,7 @@ export function setup() {
   ctx.itemId = list[0] ? list[0].Id : '';
   const withImage = list.find((i) => i.ImageTags && i.ImageTags.Primary);
   ctx.imageItemId = withImage ? withImage.Id : ctx.itemId;
+  enrichContext(BASE, ctx);
 
   // Warm: repeated passes so we measure steady-state, not cold caches — and, for Jellyfin,
   // so .NET tiered-JIT recompilation happens before the window, not inside it.

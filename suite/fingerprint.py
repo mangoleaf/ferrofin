@@ -59,14 +59,25 @@ def capture(base, out):
     auth = json.loads(req(f"{base}/Users/AuthenticateByName",
                           body=json.dumps({"Username": "bench", "Pw": "benchpass123"})))
     token, uid = auth["AccessToken"], auth["User"]["Id"]
-    # Pick any movie for the {itemId} endpoints.
+    # Resolve the ids the expanded endpoint set templates on (mirror of
+    # bench-lib's enrichContext; missing shapes resolve to '' and those ops
+    # skip below rather than fingerprinting a 404).
     items = json.loads(req(f"{base}/Items?userId={uid}&recursive=true&includeItemTypes=Movie&limit=1", token))
     item_id = (items.get("Items") or [{}])[0].get("Id", "")
+    series = json.loads(req(f"{base}/Items?userId={uid}&recursive=true&includeItemTypes=Series&limit=1", token))
+    series_id = (series.get("Items") or [{}])[0].get("Id", "")
+    tasks = json.loads(req(f"{base}/ScheduledTasks", token))
+    task_id = (tasks or [{}])[0].get("Id", "") if isinstance(tasks, list) else ""
+    fills = {"{itemId}": item_id, "{seriesId}": series_id, "{taskId}": task_id,
+             "{userId}": uid, "{key}": "encoding"}
 
     fp = {}
     for entry in reg:
         op = entry["op"]
-        path = op.split(" ", 1)[1].replace("{itemId}", item_id)
+        path = op.split(" ", 1)[1]
+        for var, val in fills.items():
+            if val:
+                path = path.replace(var, val)
         if "{" in path or "Images" in path:      # unfillable param or binary asset — skip
             continue
         for v in entry["variants"]:

@@ -57,11 +57,44 @@
       ]
     },
     {
+      "op": "GET /Backup",
+      "tag": "Backup",
+      "variants": [
+        {
+          "id": "backup_list",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Branding/Configuration",
       "tag": "Branding",
       "variants": [
         {
           "id": "branding",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Branding/Css",
+      "tag": "Branding",
+      "variants": [
+        {
+          "id": "branding_css",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Branding/Css.css",
+      "tag": "Branding",
+      "variants": [
+        {
+          "id": "branding_css_ext",
           "params": "",
           "load": "default"
         }
@@ -79,11 +112,77 @@
       ]
     },
     {
+      "op": "GET /Channels/Features",
+      "tag": "Channels",
+      "variants": [
+        {
+          "id": "channels_features",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Channels/Items/Latest",
+      "tag": "Channels",
+      "variants": [
+        {
+          "id": "channels_latest",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Devices",
       "tag": "Devices",
       "variants": [
         {
           "id": "devices",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Devices/Info",
+      "tag": "Devices",
+      "variants": [
+        {
+          "id": "devices_info",
+          "params": "id=bench",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Environment/DefaultDirectoryBrowser",
+      "tag": "Environment",
+      "variants": [
+        {
+          "id": "env_default_browser",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Environment/NetworkShares",
+      "tag": "Environment",
+      "variants": [
+        {
+          "id": "env_network_shares",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /FallbackFont/Fonts",
+      "tag": "Subtitle",
+      "variants": [
+        {
+          "id": "fallback_fonts",
           "params": "",
           "load": "default"
         }
@@ -289,6 +388,28 @@
       ]
     },
     {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
+      "tag": "Image",
+      "variants": [
+        {
+          "id": "item_image_indexed",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+      "tag": "Image",
+      "variants": [
+        {
+          "id": "item_image_parametrized",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Items/{itemId}/InstantMix",
       "tag": "InstantMix",
       "variants": [
@@ -366,6 +487,28 @@
       ]
     },
     {
+      "op": "GET /Items/{itemId}/ThemeSongs",
+      "tag": "Library",
+      "variants": [
+        {
+          "id": "item_theme_songs",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeVideos",
+      "tag": "Library",
+      "variants": [
+        {
+          "id": "item_theme_videos",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Libraries/AvailableOptions",
       "tag": "Library",
       "variants": [
@@ -432,6 +575,17 @@
       ]
     },
     {
+      "op": "GET /LiveTv/ListingProviders/Default",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_listing_default",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /LiveTv/Programs",
       "tag": "LiveTv",
       "variants": [
@@ -443,12 +597,56 @@
       ]
     },
     {
+      "op": "GET /LiveTv/Programs/Recommended",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_programs_recommended",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /LiveTv/Recordings",
       "tag": "LiveTv",
       "variants": [
         {
           "id": "livetv_recordings",
           "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Folders",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_recording_folders",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Groups",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_recording_groups",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Series",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_recordings_series",
+          "params": "userId={userId}",
           "load": "default"
         }
       ]
@@ -575,6 +773,39 @@
       ]
     },
     {
+      "op": "GET /Playlists/{playlistId}",
+      "tag": "Playlists",
+      "variants": [
+        {
+          "id": "playlist_detail",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Items",
+      "tag": "Playlists",
+      "variants": [
+        {
+          "id": "playlist_items",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Users",
+      "tag": "Playlists",
+      "variants": [
+        {
+          "id": "playlist_users",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Plugins",
       "tag": "Plugins",
       "variants": [
@@ -602,6 +833,17 @@
       "variants": [
         {
           "id": "scheduled_tasks",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /ScheduledTasks/{taskId}",
+      "tag": "ScheduledTasks",
+      "variants": [
+        {
+          "id": "scheduled_task_detail",
           "params": "",
           "load": "default"
         }
@@ -647,6 +889,61 @@
         {
           "id": "upcoming",
           "params": "userId={userId}&limit=24",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Episodes",
+      "tag": "TvShows",
+      "variants": [
+        {
+          "id": "shows_episodes",
+          "params": "userId={userId}&limit=50",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Seasons",
+      "tag": "TvShows",
+      "variants": [
+        {
+          "id": "shows_seasons",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Startup/Configuration",
+      "tag": "Startup",
+      "variants": [
+        {
+          "id": "startup_config",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Startup/FirstUser",
+      "tag": "Startup",
+      "variants": [
+        {
+          "id": "startup_first_user",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Startup/User",
+      "tag": "Startup",
+      "variants": [
+        {
+          "id": "startup_user",
+          "params": "",
           "load": "default"
         }
       ]
@@ -701,6 +998,17 @@
       "variants": [
         {
           "id": "metadata_options",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /System/Configuration/{key}",
+      "tag": "Configuration",
+      "variants": [
+        {
+          "id": "system_config_key",
           "params": "",
           "load": "default"
         }
@@ -767,6 +1075,17 @@
       "variants": [
         {
           "id": "system_ping",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Tmdb/ClientConfiguration",
+      "tag": "Tmdb",
+      "variants": [
+        {
+          "id": "tmdb_config",
           "params": "",
           "load": "default"
         }
@@ -845,6 +1164,28 @@
         {
           "id": "users_public",
           "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Users/{userId}",
+      "tag": "User",
+      "variants": [
+        {
+          "id": "user_by_id",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Videos/{itemId}/AdditionalParts",
+      "tag": "Videos",
+      "variants": [
+        {
+          "id": "video_additional_parts",
+          "params": "userId={userId}",
           "load": "default"
         }
       ]
