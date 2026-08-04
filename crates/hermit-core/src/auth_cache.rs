@@ -15,6 +15,15 @@
 //! The TTL bounds staleness for anything that *isn't* hooked (e.g. a row
 //! edited by hand in the DB); it is deliberately short. A revoked token never
 //! waits for the TTL — the delete path clears synchronously before it returns.
+//!
+//! The cache also holds the assembled [`UserDto`] per user (the other half of
+//! Jellyfin's in-memory `UserManager`): building it costs two more round-trips
+//! (permissions/preferences union + access schedules) on every `/Users*`
+//! request, which convoy on the read pool under load. A hit is validated
+//! against the caller's [`UserEntity`] (`PartialEq`), so a DTO can never be
+//! served against a fresher user row than the one it was built from; the
+//! perms/prefs/schedule inputs are covered by the same [`AuthCache::clear`]
+//! contract (every mutating path clears) plus the TTL.
 
 use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock};
@@ -22,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use hermit_db::entities::security::DeviceEntity;
 use hermit_db::entities::users::UserEntity;
+use hermit_model::dto::UserDto;
 
 /// How long a cached token resolution may be served before the next request
 /// re-reads it from the database.
@@ -46,12 +56,22 @@ struct CachedAuth {
     cached_at: Instant,
 }
 
+/// One cached user-DTO assembly, keyed by user id and validated against the
+/// exact [`UserEntity`] it was built from.
+#[derive(Debug, Clone)]
+struct CachedUserDto {
+    entity: UserEntity,
+    dto: UserDto,
+    cached_at: Instant,
+}
+
 /// The shared token-resolution cache. See the module docs for the sharing and
 /// invalidation contract.
 #[derive(Debug)]
 pub struct AuthCache {
     ttl: Duration,
     entries: RwLock<HashMap<String, CachedAuth>>,
+    user_dtos: RwLock<HashMap<String, CachedUserDto>>,
 }
 
 impl Default for AuthCache {
@@ -67,6 +87,7 @@ impl AuthCache {
         Self {
             ttl,
             entries: RwLock::new(HashMap::new()),
+            user_dtos: RwLock::new(HashMap::new()),
         }
     }
 
@@ -97,10 +118,49 @@ impl AuthCache {
         );
     }
 
+    /// The cached [`UserDto`] for `entity`'s user, if present, fresher than the
+    /// TTL, and built from an identical entity (a row that changed since —
+    /// login stamp, rename, config column — misses and is rebuilt).
+    #[must_use]
+    pub fn get_user_dto(&self, entity: &UserEntity) -> Option<UserDto> {
+        let dtos = self
+            .user_dtos
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let hit = dtos.get(&entity.id)?;
+        if hit.cached_at.elapsed() > self.ttl || hit.entity != *entity {
+            return None;
+        }
+        Some(hit.dto.clone())
+    }
+
+    /// Caches a user's assembled DTO alongside the entity it was built from.
+    pub fn put_user_dto(&self, entity: &UserEntity, dto: UserDto) {
+        let mut dtos = self
+            .user_dtos
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if dtos.len() >= AUTH_CACHE_MAX_ENTRIES {
+            dtos.clear();
+        }
+        dtos.insert(
+            entity.id.clone(),
+            CachedUserDto {
+                entity: entity.clone(),
+                dto,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
     /// Drops every cached resolution. Called by the user/device managers on any
     /// auth-relevant mutation — revocation must be immediate, never TTL-bounded.
     pub fn clear(&self) {
         self.entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.user_dtos
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();

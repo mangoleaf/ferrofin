@@ -728,6 +728,16 @@ impl UserManager for HermitUserManager {
         let id = &user.id;
         let pool = self.db.pool();
 
+        // Read-through DTO cache (the other half of Jellyfin's in-memory
+        // UserManager): a hit skips both round-trips below. Validated against
+        // `user` itself and cleared on every mutation — see `auth_cache`.
+        if let Some(mut dto) = self.auth_cache.get_user_dto(user) {
+            if server_id.is_some() {
+                dto.server_id = server_id;
+            }
+            return Ok(dto);
+        }
+
         // Bulk-load this user's permissions and preferences up front — ONE
         // round-trip — instead of the ~40 per-kind lookups the policy/config
         // build otherwise fans out (an N+1 that convoyed the pool under
@@ -766,12 +776,13 @@ impl UserManager for HermitUserManager {
 
         let policy = build_user_policy(pool, user, &perms, &prefs).await?;
 
-        Ok(UserDto {
+        let mut dto = UserDto {
             name: Some(user.username.clone()),
             id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil()),
-            // Caller-supplied id wins; otherwise fall back to the manager's own
-            // (set by the composition root) so `UserDto.ServerId` is never null.
-            server_id: server_id.or_else(|| self.server_id.clone()),
+            // The manager's own id (set by the composition root) so
+            // `UserDto.ServerId` is never null; a caller-supplied id is applied
+            // after caching so the cached copy stays caller-independent.
+            server_id: self.server_id.clone(),
             enable_auto_login: Some(user.enable_auto_login),
             last_login_date: user.last_login_date,
             last_activity_date: user.last_activity_date,
@@ -780,7 +791,12 @@ impl UserManager for HermitUserManager {
             configuration: Some(configuration),
             policy: Some(policy),
             ..UserDto::default()
-        })
+        };
+        self.auth_cache.put_user_dto(user, dto.clone());
+        if server_id.is_some() {
+            dto.server_id = server_id;
+        }
+        Ok(dto)
     }
 
     async fn update_configuration(
@@ -1323,6 +1339,55 @@ mod tests {
         assert!(!dto_config.hide_played_in_latest);
         assert_eq!(dto_config.latest_items_excludes, vec![excluded]);
         assert_eq!(dto_config.subtitle_mode, SubtitlePlaybackMode::Always);
+    }
+
+    #[tokio::test]
+    async fn get_user_dto_cache_hits_and_invalidates() {
+        let db = test_db().await;
+        let mgr = HermitUserManager::new(db.clone());
+        let user = mgr.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+
+        // First build populates the cache; a repeat with the same entity hits it.
+        let first = mgr.get_user_dto(&user, None).await.expect("dto");
+        assert_eq!(mgr.auth_cache.get_user_dto(&user), Some(first.clone()));
+        let second = mgr.get_user_dto(&user, None).await.expect("dto again");
+        assert_eq!(second, first);
+
+        // A caller-supplied server id overrides the hit without poisoning the
+        // cached (caller-independent) copy.
+        let named = mgr
+            .get_user_dto(&user, Some("srv-9".to_owned()))
+            .await
+            .expect("dto srv");
+        assert_eq!(named.server_id.as_deref(), Some("srv-9"));
+        assert!(
+            mgr.auth_cache
+                .get_user_dto(&user)
+                .expect("cached")
+                .server_id
+                .is_none()
+        );
+
+        // A policy mutation clears the cache — the next DTO sees it immediately.
+        let policy = UserPolicy {
+            is_hidden: true,
+            ..UserPolicy::default()
+        };
+        mgr.update_policy(id, &policy).await.expect("policy");
+        assert!(
+            mgr.auth_cache.get_user_dto(&user).is_none(),
+            "mutation cleared the DTO cache"
+        );
+        let after = mgr.get_user_dto(&user, None).await.expect("dto after");
+        assert!(after.policy.expect("policy").is_hidden);
+
+        // An entity whose row changed since caching misses on equality.
+        let mut renamed = user.clone();
+        renamed.username = "erin2".to_owned();
+        assert!(mgr.auth_cache.get_user_dto(&renamed).is_none());
+        let fresh = mgr.get_user_dto(&renamed, None).await.expect("dto renamed");
+        assert_eq!(fresh.name.as_deref(), Some("erin2"));
     }
 
     #[tokio::test]
