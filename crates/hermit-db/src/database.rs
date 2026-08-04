@@ -58,14 +58,17 @@ impl Database {
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
     /// the pool cannot be opened.
     pub async fn connect_sized(url: &str, pool_size: Option<u32>) -> Result<Self> {
-        // Readers under WAL never block on a writer, so a stuck acquisition is
-        // a bug to surface fast; only the single writer keeps the long,
-        // Jellyfin-matching busy timeout to ride out checkpoint stalls.
+        // Readers keep the full 30s busy timeout: WAL readers normally never
+        // block on the writer, but VACUUM / wal_checkpoint(TRUNCATE) take
+        // EXCLUSIVE locks — a 5s reader timeout turned a long vacuum into hard
+        // SQLITE_BUSY failures for every in-flight request (a real
+        // mid-playback black-screen). The maintenance task now also skips the
+        // vacuum during playback; the long timeout is the second seatbelt.
         let read_options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(5))
+            .busy_timeout(std::time::Duration::from_secs(30))
             .foreign_keys(true);
         let write_options = read_options
             .clone()

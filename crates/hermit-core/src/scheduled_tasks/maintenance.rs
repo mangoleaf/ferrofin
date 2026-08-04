@@ -33,6 +33,7 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryManager;
 use hermit_traits::options::InternalItemsQuery;
 use hermit_traits::persistence::LinkedChildrenService;
+use hermit_traits::session::SessionManager;
 use hermit_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
 
@@ -346,13 +347,16 @@ impl ScheduledTask for DeleteLogFileTask {
 /// old. Port of `DeleteTranscodeFileTask`.
 pub struct DeleteTranscodeFileTask {
     paths: Arc<dyn ServerApplicationPaths>,
+    sessions: Arc<dyn SessionManager>,
 }
 
 impl DeleteTranscodeFileTask {
-    /// Builds the task over the application-paths seam.
+    /// Builds the task over the application-paths seam and the session manager
+    /// (the sweep is skipped while anything is playing — deleting a live
+    /// stream's segments mid-playback black-screens the client).
     #[must_use]
-    pub fn new(paths: Arc<dyn ServerApplicationPaths>) -> Self {
-        Self { paths }
+    pub fn new(paths: Arc<dyn ServerApplicationPaths>, sessions: Arc<dyn SessionManager>) -> Self {
+        Self { paths, sessions }
     }
 }
 
@@ -375,6 +379,14 @@ impl ScheduledTask for DeleteTranscodeFileTask {
         vec![startup(), interval_hours(24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // Playback guard: a session started >24h ago (paused overnight, a long
+        // binge) still owns files in this directory — sweeping now deletes its
+        // init/segment files mid-stream. Skip; the 24h interval (and the
+        // startup trigger) retries when nothing is playing.
+        if self.sessions.has_active_playback().await? {
+            tracing::info!("skipping transcode-directory sweep: playback is active");
+            return Ok(());
+        }
         let dir = PathBuf::from(self.paths.transcode_path());
         let progress = progress.clone();
         let deleted = run_sweep(move || {
@@ -525,13 +537,17 @@ impl ScheduledTask for CleanupCollectionAndPlaylistPathsTask {
 /// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation).
 pub struct OptimizeDatabaseTask {
     db: Database,
+    sessions: Arc<dyn SessionManager>,
 }
 
 impl OptimizeDatabaseTask {
-    /// Builds the task over the database handle.
+    /// Builds the task over the database handle and the session manager (the
+    /// vacuum is skipped while anything is playing — `VACUUM` and the
+    /// truncating checkpoint take exclusive locks that fail live requests; a
+    /// real mid-playback black-screen traced to exactly this window).
     #[must_use]
-    pub fn new(db: Database) -> Self {
-        Self { db }
+    pub fn new(db: Database, sessions: Arc<dyn SessionManager>) -> Self {
+        Self { db, sessions }
     }
 }
 
@@ -556,6 +572,14 @@ impl ScheduledTask for OptimizeDatabaseTask {
         vec![interval_hours(6)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // Playback guard: VACUUM + wal_checkpoint(TRUNCATE) take exclusive
+        // locks; concurrent requests (HLS auth, playstate) hard-fail once the
+        // reader busy-timeout elapses. Skip while anything is playing — the
+        // 6h interval retries soon enough.
+        if self.sessions.has_active_playback().await? {
+            tracing::info!("skipping database optimize/vacuum: playback is active");
+            return Ok(());
+        }
         tracing::info!("optimizing and vacuuming the database");
         for (statement, pct) in [
             ("PRAGMA optimize", 25.0),
@@ -727,6 +751,215 @@ mod tests {
     use super::*;
     use crate::scheduled_tasks::TaskProgress;
     use crate::test_support::test_db;
+    use hermit_db::entities::security::DeviceEntity;
+    use hermit_db::entities::users::UserEntity;
+    use hermit_model::dto::SessionInfoDto;
+    use hermit_model::session::{
+        ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
+        PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
+    };
+    use hermit_traits::session::{AuthenticationRequest, AuthenticationResultData};
+
+    /// A [`SessionManager`] fake for the playback-gated maintenance tasks:
+    /// reports a fixed `has_active_playback`; every other method is
+    /// unreachable (the tasks only consult the guard).
+    struct FakePlaybackSessions(bool);
+
+    #[allow(unused_variables)] // stub bodies are unreachable!(), params deliberately unused
+    #[async_trait]
+    impl hermit_traits::session::SessionManager for FakePlaybackSessions {
+        async fn has_active_playback(&self) -> Result<bool, ServiceError> {
+            Ok(self.0)
+        }
+        async fn log_session_activity(
+            &self,
+            app_name: &str,
+            app_version: &str,
+            device_id: &str,
+            device_name: &str,
+            remote_endpoint: &str,
+            user: &UserEntity,
+        ) -> Result<SessionInfoDto, ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn update_device_name(
+            &self,
+            session_id: &str,
+            reported_device_name: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn on_playback_progress(
+            &self,
+            info: &PlaybackProgressInfo,
+            is_automated: bool,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn on_playback_stopped(&self, info: &PlaybackStopInfo) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_general_command(
+            &self,
+            controlling_session_id: &str,
+            session_id: &str,
+            command: &GeneralCommand,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_message_command(
+            &self,
+            controlling_session_id: &str,
+            session_id: &str,
+            command: &MessageCommand,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_play_command(
+            &self,
+            controlling_session_id: &str,
+            session_id: &str,
+            command: &PlayRequest,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_playstate_command(
+            &self,
+            controlling_session_id: &str,
+            session_id: &str,
+            command: &PlaystateRequest,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_message_to_admin_sessions(
+            &self,
+            message_type: SessionMessageType,
+            data: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_message_to_user_sessions(
+            &self,
+            user_ids: &[Uuid],
+            message_type: SessionMessageType,
+            data: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_message_to_user_device_sessions(
+            &self,
+            device_id: &str,
+            message_type: SessionMessageType,
+            data: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn add_additional_user(
+            &self,
+            session_id: &str,
+            user_id: Uuid,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn remove_additional_user(
+            &self,
+            session_id: &str,
+            user_id: Uuid,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn report_now_viewing_item(
+            &self,
+            session_id: &str,
+            item_id: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn authenticate_new_session(
+            &self,
+            request: &AuthenticationRequest,
+        ) -> Result<AuthenticationResultData, ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn authenticate_direct(
+            &self,
+            request: &AuthenticationRequest,
+        ) -> Result<AuthenticationResultData, ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn report_capabilities(
+            &self,
+            session_id: &str,
+            capabilities: &ClientCapabilities,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn report_transcoding_info(
+            &self,
+            device_id: &str,
+            info: &TranscodingInfo,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn get_sessions(
+            &self,
+            user_id: Uuid,
+            device_id: Option<&str>,
+            active_within_seconds: Option<i32>,
+            controllable_user_to_check: Option<Uuid>,
+            is_api_key: bool,
+        ) -> Result<Vec<SessionInfoDto>, ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn get_session_by_authentication_token(
+            &self,
+            token: &str,
+            device_id: &str,
+            remote_endpoint: &str,
+        ) -> Result<SessionInfoDto, ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn logout(&self, access_token: &str) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn logout_device(&self, device: &DeviceEntity) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn revoke_user_tokens(
+            &self,
+            user_id: Uuid,
+            current_access_token: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+        async fn close_live_stream_if_needed(
+            &self,
+            live_stream_id: &str,
+            session_or_play_session_id: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("not used by maintenance tasks")
+        }
+    }
+
+    fn idle_sessions() -> Arc<dyn hermit_traits::session::SessionManager> {
+        Arc::new(FakePlaybackSessions(false))
+    }
+
+    fn playing_sessions() -> Arc<dyn hermit_traits::session::SessionManager> {
+        Arc::new(FakePlaybackSessions(true))
+    }
 
     // -- fakes ------------------------------------------------------------
 
@@ -936,7 +1169,7 @@ mod tests {
         backdate(&old, 2);
         let fresh = touch(&transcodes, "live/segment1.ts");
 
-        let task = DeleteTranscodeFileTask::new(paths);
+        let task = DeleteTranscodeFileTask::new(paths, idle_sessions());
         assert_eq!(task.key(), "DeleteTranscodeFiles");
         let trigger_types: Vec<TaskTriggerInfoType> =
             task.default_triggers().iter().map(|t| t.type_).collect();
@@ -958,7 +1191,7 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_runs_pragmas_and_vacuum() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db);
+        let task = OptimizeDatabaseTask::new(db, idle_sessions());
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
@@ -967,6 +1200,37 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn optimize_database_skips_while_playback_is_active() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(db, playing_sessions());
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "guarded run must not have executed the vacuum steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_sweep_skips_while_playback_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FakeConfig::over(dir.path(), |_| {});
+        let paths = config.application_paths();
+        let transcodes = std::path::PathBuf::from(paths.transcode_path());
+        let old = touch(&transcodes, "abc/segment0.ts");
+        backdate(&old, 2);
+
+        let task = DeleteTranscodeFileTask::new(paths, playing_sessions());
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("skip is Ok");
+        assert!(
+            old.exists(),
+            "a live playback session must protect even day-old transcode files"
+        );
     }
 
     // -- Collections/playlists cleanup --------------------------------------

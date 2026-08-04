@@ -596,9 +596,6 @@ pub async fn build_app_state(
             Arc::clone(&config_trait),
             server_config.log_file_retention_days,
         )));
-        task_manager.register(Arc::new(maint_tasks::DeleteTranscodeFileTask::new(
-            Arc::clone(&paths_dyn),
-        )));
         task_manager.register(Arc::new(
             maint_tasks::CleanupCollectionAndPlaylistPathsTask::new(
                 Arc::clone(&library),
@@ -607,7 +604,6 @@ pub async fn build_app_state(
                 Arc::clone(&linked_children_service),
             ),
         ));
-        task_manager.register(Arc::new(maint_tasks::OptimizeDatabaseTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::CleanupUserDataTask::new(db.clone())));
         task_manager.register(Arc::new(maint_tasks::MoveTrickplayImagesTask::new(
             Arc::clone(&trickplay_impl),
@@ -660,6 +656,22 @@ pub async fn build_app_state(
         )
         .with_session_bus(Arc::clone(&session_bus)),
     );
+
+    // These two maintenance tasks gate on active playback, so they register
+    // once the session manager exists (registration order is otherwise inert).
+    {
+        use hermit_core::scheduled_tasks::maintenance as maint_tasks;
+        let paths_dyn: Arc<dyn hermit_traits::system::ServerApplicationPaths> =
+            Arc::clone(&paths) as Arc<_>;
+        task_manager.register(Arc::new(maint_tasks::DeleteTranscodeFileTask::new(
+            paths_dyn,
+            Arc::clone(&sessions),
+        )));
+        task_manager.register(Arc::new(maint_tasks::OptimizeDatabaseTask::new(
+            db.clone(),
+            Arc::clone(&sessions),
+        )));
+    }
     let tv_series: Arc<dyn hermit_traits::tv::TvSeriesManager> =
         Arc::new(HermitTvSeriesManager::new(
             Arc::clone(&users),

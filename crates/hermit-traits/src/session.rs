@@ -286,6 +286,19 @@ pub trait SessionManager: Send + Sync {
         live_stream_id: &str,
         session_or_play_session_id: &str,
     ) -> Result<(), ServiceError>;
+
+    /// Whether any session is currently playing something (`NowPlayingItem`
+    /// set). Maintenance that would disrupt live playback — the database
+    /// `VACUUM`/checkpoint, the transcode-directory sweep — gates on this and
+    /// skips its run while it is `true` (a real black-screen incident traced
+    /// to exclusive locks / segment deletion during playback).
+    ///
+    /// The default is `false` so the many test fakes need no change; the
+    /// concrete session manager MUST override it — a real implementation
+    /// leaning on this default silently disables the playback guard.
+    async fn has_active_playback(&self) -> Result<bool, ServiceError> {
+        Ok(false)
+    }
 }
 
 fn _assert_object_safe_session_manager(_: &dyn SessionManager) {}

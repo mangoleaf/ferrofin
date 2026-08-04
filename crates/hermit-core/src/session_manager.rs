@@ -1129,6 +1129,11 @@ impl SessionManager for HermitSessionManager {
         // there is nothing to close. See the module docs.
         Ok(())
     }
+
+    async fn has_active_playback(&self) -> Result<bool, ServiceError> {
+        let sessions = self.sessions.lock().await;
+        Ok(sessions.values().any(|s| s.now_playing_item_id.is_some()))
+    }
 }
 
 impl HermitSessionManager {
