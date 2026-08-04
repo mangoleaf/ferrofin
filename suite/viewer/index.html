@@ -1,76 +1,138 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Hermit suite — parity × perf</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermit ⇄ Jellyfin — suite (parity × perf)</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.4 system-ui, sans-serif; margin: 1.5rem; background:#111; color:#ddd; }
-  h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin-top:1.5rem; }
-  select, label { font-size: 13px; } .muted { color:#888; }
-  table { border-collapse: collapse; width: 100%; margin-top:.5rem; }
-  th, td { padding: 3px 8px; text-align: right; border-bottom: 1px solid #262626; white-space: nowrap; }
+  /* The shared look of the two retired viewers (:8123 parity, :8124 bench),
+     carried forward onto the one merged page. */
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef; --muted: #8b93a7;
+    --accent: #58a6ff; --good: #3fb950; --bad: #f85149; --warn: #d29922;
+    --real: #3fb950; --partial: #d29922; --hollow: #db6d28; --stub: #f85149; --none: #6e7681;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 28px 24px 16px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 16px; min-width: 130px; }
+  .stat .n { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 16px 24px;
+    position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 5; }
+  label.pick { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .04em; }
+  input, select { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 12px; font: inherit; outline: none; }
+  input:focus, select:focus { border-color: var(--accent); }
+  input[type=search] { flex: 1 1 220px; }
+  .chk { flex-direction: row; align-items: center; gap: 6px; cursor: pointer; }
+  .chk input { accent-color: var(--accent); }
+  main { padding: 8px 24px 48px; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em;
+    margin: 28px 0 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
   th:first-child, td:first-child, th.l, td.l { text-align: left; }
-  th { position: sticky; top: 0; background:#1a1a1a; cursor: default; }
-  tr.incomparable td { color:#666; }          /* greyed: not deep-verified / drifted / errored */
-  tr.legacyrow td { color:#5a5a5a; font-style: italic; }
-  .win { color:#5cd65c; } .loss { color:#e06666; } .tail { color:#e0b000; }
-  .pill { padding:0 6px; border-radius:8px; font-size:11px; }
-  .REAL{background:#173d17;color:#9f9} .PARTIAL{background:#3d3417;color:#fd9}
-  .HOLLOW{background:#3d1717;color:#f99} .STUB{background:#222;color:#888}
-  .banner { padding:.5rem .75rem; border-radius:6px; margin:.5rem 0; }
-  .warn { background:#3d2a17; color:#fd9; } .ok { background:#173d17; color:#9f9; }
-  .head b { color:#fff; } .head span { margin-right:1.25rem; }
+  th { position: sticky; top: 61px; background: var(--bg); color: var(--muted); font-weight: 600;
+    font-size: 12px; text-transform: uppercase; letter-spacing: .04em; user-select: none; }
+  tbody tr:hover { background: #12151c; }
+  code { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .method { font-weight: 700; margin-right: 6px; }
+  .m-GET { color: #58a6ff; } .m-POST { color: #3fb950; } .m-PUT { color: #d29922; }
+  .m-DELETE { color: #f85149; } .m-PATCH { color: #bc8cff; } .m-HEAD { color: var(--muted); }
+  .good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .muted { color: var(--muted); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; border: 1px solid transparent; }
+  .pill.win  { color: var(--good); border-color: #204a2b; background: #10261699; }
+  .pill.loss { color: var(--bad);  border-color: #4a1c1c; background: #260f0f99; }
+  .pill.tail { color: var(--warn); border-color: #4a3a10; background: #26200f99; }
+  .d-REAL { color: var(--real); border-color: #204a2b; background: #10261699; }
+  .d-PARTIAL { color: var(--partial); border-color: #4a3a10; background: #26200f99; }
+  .d-HOLLOW { color: var(--hollow); border-color: #4a2e14; background: #26160f99; }
+  .d-STUB { color: var(--stub); border-color: #4a1c1c; background: #260f0f99; }
+  tr.incomparable td { color: #666; }
+  tr.legacyrow td { color: #5a5a5a; font-style: italic; }
+  .banner { padding: 10px 14px; border-radius: 10px; margin: 14px 0 0; border: 1px solid var(--line);
+    font-size: 13px; }
+  .banner.warnb { background: #26200f99; border-color: #4a3a10; color: #fd9; }
+  .banner.okb { background: #10261699; border-color: #204a2b; color: #9f9; }
+  .bar { height: 8px; border-radius: 6px; overflow: hidden; display: flex; margin: 10px 0 12px;
+    background: var(--line); }
+  .bar > span { display: block; height: 100%; }
+  .lctl { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 8px 0; }
 </style>
-<h1>Hermit suite — parity × perf <span class="muted">(fairness: speed shown for deep-verified ops only)</span></h1>
+</head>
+<body>
+<header>
+  <h1>Hermit ⇄ Jellyfin — suite <span class="sub">(parity × perf · speed shown for deep-verified ops only)</span></h1>
+  <div class="sub" id="subline">loading…</div>
+  <div class="stats" id="stats"></div>
+  <div class="sub" id="footline" style="margin-top:10px"></div>
+</header>
 
-<div>
-  Run: <select id="run"></select>
-  &nbsp; vs <select id="base"><option value="">— none —</option></select>
-  &nbsp; <label><input type="checkbox" id="compOnly" checked> comparable only</label>
+<div class="controls">
+  <label class="pick">Run<select id="run"></select></label>
+  <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
+  <label class="pick chk"><input type="checkbox" id="compOnly" checked> comparable only</label>
 </div>
-<div id="guard"></div>
-<div id="head" class="head"></div>
 
-<h2>Operations</h2>
-<table id="ops"><thead><tr>
-  <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
-  <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
-  <th title="Hermit p50 change vs the selected base run">Δ vs base</th>
-  <th>speedup</th><th>verdict</th><th class="l">note</th>
-</tr></thead><tbody></tbody></table>
+<main>
+  <div id="guard"></div>
 
-<h2>Trend <span class="muted">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
-<table id="trend"><thead><tr>
-  <th class="l">build</th><th class="l">when</th><th>comparable rows</th>
-  <th>median speedup</th><th>win-rate</th><th>parity coverage</th><th class="l">tail losses</th>
-</tr></thead><tbody></tbody></table>
+  <h2>Operations</h2>
+  <table id="ops"><thead><tr>
+    <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
+    <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
+    <th title="Hermit p50 change vs the selected base run">Δ vs base</th>
+    <th>speedup</th><th>verdict</th><th class="l">note</th>
+  </tr></thead><tbody></tbody></table>
 
-<h2>Full parity ledger <span class="muted">(all contract operations, benched or not — from parity/ledger.json)</span></h2>
-<div>
-  <input type="search" id="lq" placeholder="filter operation / classification…" style="width:280px">
-  <select id="ldepth"><option value="">depth: all</option></select>
-  <select id="ldeep">
-    <option value="">deep: all</option>
-    <option value="true">✓ verified</option>
-    <option value="class">⚠ classified</option>
-    <option value="untested">· untested</option>
-  </select>
-  <span id="lstats" class="muted"></span>
-</div>
-<table id="ledger"><thead><tr>
-  <th class="l">operation</th><th class="l">depth</th><th>status</th><th>schema</th>
-  <th>deep</th><th class="l">classification</th>
-</tr></thead><tbody></tbody></table>
+  <h2>Trend <span class="muted" style="text-transform:none">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
+  <table id="trend"><thead><tr>
+    <th class="l">build</th><th class="l">when</th><th>comparable rows</th>
+    <th>median speedup</th><th>win-rate</th><th>parity coverage</th><th class="l">tail losses</th>
+  </tr></thead><tbody></tbody></table>
+
+  <h2>Full parity ledger <span class="muted" style="text-transform:none">(all contract operations, benched or not)</span></h2>
+  <div class="lctl">
+    <input type="search" id="lq" placeholder="Filter by operation, classification…">
+    <select id="ldepth"><option value="">depth: all</option></select>
+    <select id="ldeep">
+      <option value="">deep: all</option>
+      <option value="true">✅ verified</option>
+      <option value="class">⚠️ classified</option>
+      <option value="untested">· untested</option>
+    </select>
+    <span id="lstats" class="muted"></span>
+  </div>
+  <div class="bar" id="lbar"></div>
+  <table id="ledger"><thead><tr>
+    <th class="l">operation</th><th class="l">depth</th><th>status</th><th>schema</th>
+    <th>deep</th><th class="l">classification</th>
+  </tr></thead><tbody></tbody></table>
+</main>
 
 <script>
 const CMP_KEYS = ["fixture_hash", "cpus", "mem", "jellyfin_image"];
 const num = (x) => x == null ? "—" : (+x).toFixed(x < 10 ? 2 : 0);
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
+const opCell = (op) => {
+  const [m, ...rest] = op.split(" ");
+  return `<code><span class="method m-${m}">${m}</span>${rest.join(" ")}</code>`;
+};
 let RUNS = [];
 
 function fillSelects() {
   const opt = (r, i) => `<option value="${i}">${r.meta.hermit}${r.meta.legacy ? " (legacy)" : ""}</option>`;
-  // newest first
-  const idx = RUNS.map((_, i) => i).reverse();
+  const idx = RUNS.map((_, i) => i).reverse();   // newest first
   run.innerHTML = idx.map(i => opt(RUNS[i], i)).join("");
   base.innerHTML = `<option value="">— none —</option>` + idx.map(i => opt(RUNS[i], i)).join("");
 }
@@ -81,9 +143,20 @@ function guardBanner(r, b) {
   const load = JSON.stringify(r.meta.load) !== JSON.stringify(b.meta.load) ? ["load"] : [];
   const bad = diffs.concat(load);
   guard.innerHTML = bad.length
-    ? `<div class="banner warn">⚠ Not directly comparable — differs on: <b>${bad.join(", ")}</b>.
+    ? `<div class="banner warnb">⚠ Not directly comparable — differs on: <b>${bad.join(", ")}</b>.
        Speed deltas between these runs are not meaningful.</div>`
-    : `<div class="banner ok">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`;
+    : `<div class="banner okb">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`;
+}
+
+function statCards(h) {
+  const card = (n, l, color) =>
+    `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
+  return card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup",
+              h.median_speedup >= 1 ? "var(--good)" : "var(--bad)")
+    + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
+    + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
+    + card(h.comparable_rows, "comparable rows")
+    + card(pct(h.parity_coverage), "parity coverage", "var(--accent)");
 }
 
 function render() {
@@ -92,48 +165,57 @@ function render() {
   guardBanner(r, b);
 
   const h = r.headline, m = r.meta;
+  subline.innerHTML = `<b style="color:var(--fg)">${m.hermit}</b> · ${m.when || ""} ·
+    Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
+    ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
+  stats.innerHTML = statCards(h);
   const fp = m.footprint;
   const ttfs = (t) => t ? `${t.med} ms (${t.min}–${t.max}, ${t.runs} runs)` : "?";
-  const fpLine = fp ? `<br><span class="muted">footprint: cold ${fp.h_cold_s ?? "?"}s vs ${fp.j_cold_s ?? "?"}s ·
+  footline.innerHTML = fp ? `footprint: cold ${fp.h_cold_s ?? "?"}s vs ${fp.j_cold_s ?? "?"}s ·
     peak anon ${fp.h_rss_peak_mib ?? "?"} MiB vs ${fp.j_rss_peak_mib ?? "?"} MiB ·
-    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)</span>
-    <br><span class="muted"><b style="color:#ddd">HLS play-start (TTFS)</b> —
+    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)<br>
+    <b style="color:var(--fg)">HLS play-start (TTFS)</b> —
     stream-copy remux: ${ttfs(fp.h_ttfs_copy)} vs ${ttfs(fp.j_ttfs_copy)} ·
-    forced 4K HEVC→H.264: ${ttfs(fp.h_ttfs_encode)} vs ${ttfs(fp.j_ttfs_encode)}</span>` : "";
-  head.innerHTML = `<span><b>${m.hermit}</b></span><span>${m.when || ""}</span>
-    <span>Jellyfin: ${m.jellyfin_image || "?"}</span>
-    <span>median speedup <b>${h.median_speedup ?? "—"}×</b></span>
-    <span>win-rate <b>${pct(h.win_rate)}</b></span>
-    <span>parity coverage <b>${pct(h.parity_coverage)}</b></span>
-    <span>comparable rows <b>${h.comparable_rows}</b></span>${fpLine}`;
+    forced 4K HEVC→H.264: ${ttfs(fp.h_ttfs_encode)} vs ${ttfs(fp.j_ttfs_encode)}` : "";
 
-  // Per-variant Hermit p50 deltas against the selected base run (the old
-  // benchmark viewer's version-vs-version compare, comparability-guarded above).
   const baseP50 = {};
   if (b) for (const o of b.operations) baseP50[o.perf.variant] = o.perf.h_p50;
 
   const rows = r.operations.filter(o => !compOnly.checked || o.perf.comparable);
   ops.tBodies[0].innerHTML = rows.map(o => {
     const p = o.perf, cls = m.legacy ? "legacyrow" : (p.comparable ? "" : "incomparable");
-    const verdict = p.win_all_three ? `<span class="win">win×3</span>`
-      : p.tail_loss ? `<span class="tail">tail loss</span>`
-      : p.comparable ? `<span class="loss">loss</span>` : "—";
+    const verdict = p.win_all_three ? `<span class="pill win">win×3</span>`
+      : p.tail_loss ? `<span class="pill tail">tail loss</span>`
+      : p.comparable ? `<span class="pill loss">loss</span>` : "—";
     const depth = o.parity.depth || "—";
     let delta = "—";
     if (b && baseP50[p.variant] != null && p.h_p50 != null && baseP50[p.variant] > 0) {
       const d = (p.h_p50 - baseP50[p.variant]) / baseP50[p.variant] * 100;
-      delta = `<span class="${d > 10 ? "loss" : d < -10 ? "win" : "muted"}">${d > 0 ? "+" : ""}${d.toFixed(0)}%</span>`;
+      delta = `<span class="${d > 10 ? "bad" : d < -10 ? "good" : "muted"}">${d > 0 ? "+" : ""}${d.toFixed(0)}%</span>`;
     }
+    const spd = p.speedup == null ? "—"
+      : `<span class="${p.speedup >= 1 ? "good" : "bad"}">${p.speedup}×</span>`;
     return `<tr class="${cls}">
-      <td class="l">${o.op}</td><td class="l">${p.variant}</td>
-      <td class="l"><span class="pill ${depth}">${depth}</span></td>
+      <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code></td>
+      <td class="l"><span class="pill d-${depth}">${depth}</span></td>
       <td>${o.parity.deep_verified ? "✓" : "·"}</td>
       <td>${num(p.h_p50)}</td><td>${num(p.h_p95)}</td><td>${num(p.h_p99)}</td>
       <td>${num(p.j_p50)}</td><td>${num(p.j_p95)}</td><td>${num(p.j_p99)}</td>
-      <td>${delta}</td>
-      <td>${p.speedup == null ? "—" : p.speedup + "×"}</td>
+      <td>${delta}</td><td>${spd}</td>
       <td>${verdict}</td><td class="l muted">${p.comparable ? "" : (p.reason || "")}</td>
     </tr>`;
+  }).join("");
+}
+
+function renderTrend() {
+  trend.tBodies[0].innerHTML = RUNS.slice().reverse().map(r => {
+    const h = r.headline, cls = r.meta.legacy ? "legacyrow" : "";
+    const spd = h.median_speedup == null ? "—"
+      : `<span class="${r.meta.legacy ? "" : (h.median_speedup >= 1 ? "good" : "bad")}">${h.median_speedup}×</span>`;
+    return `<tr class="${cls}"><td class="l">${r.meta.hermit}</td><td class="l">${r.meta.when || ""}</td>
+      <td>${h.comparable_rows}</td><td>${spd}</td>
+      <td>${pct(h.win_rate)}</td><td>${pct(h.parity_coverage)}</td>
+      <td class="l muted">${(h.tail_losses || []).join(", ")}</td></tr>`;
   }).join("");
 }
 
@@ -142,7 +224,7 @@ let LEDGER = [];
 function renderLedger() {
   const q = lq.value.trim().toLowerCase();
   const fd = ldepth.value, fv = ldeep.value;
-  const mark = (v) => v === true ? "✓" : v === false ? "⚠" : "·";
+  const mark = (v) => v === true ? "✅" : v === false ? "⚠️" : "·";
   const rows = LEDGER.filter(x => {
     if (fd && x.depth !== fd) return false;
     if (fv === "true" && x.deep_verified !== true) return false;
@@ -151,26 +233,19 @@ function renderLedger() {
     if (q && !(`${x.operation} ${x.classification || ""}`.toLowerCase().includes(q))) return false;
     return true;
   });
+  const total = LEDGER.length;
   const deep = LEDGER.filter(x => x.deep_verified === true).length;
   const cls = LEDGER.filter(x => x.classification && x.deep_verified !== true).length;
-  lstats.textContent = ` ${LEDGER.length} ops · ${deep} deep-verified · ${cls} classified · ${LEDGER.length - deep - cls} untested · showing ${rows.length}`;
+  lstats.textContent = `${total} ops · ${deep} deep-verified · ${cls} classified · ${total - deep - cls} untested · showing ${rows.length}`;
+  const seg = (n, c) => n ? `<span style="width:${100 * n / total}%;background:${c}"></span>` : "";
+  lbar.innerHTML = seg(deep, "var(--good)") + seg(cls, "var(--warn)") + seg(total - deep - cls, "var(--none)");
   ledger.tBodies[0].innerHTML = rows.map(x => `<tr>
-    <td class="l">${x.operation}</td>
-    <td class="l"><span class="pill ${x.depth}">${x.depth}</span></td>
+    <td class="l">${opCell(x.operation)}</td>
+    <td class="l"><span class="pill d-${x.depth}">${x.depth}</span></td>
     <td>${mark(x.status_conformant)}</td><td>${mark(x.schema_valid)}</td>
     <td title="${x.deep_verified === true ? "verified" : x.deep_verified === false ? "classified" : "untested"}">${mark(x.deep_verified)}</td>
     <td class="l muted">${x.classification || ""}</td>
   </tr>`).join("");
-}
-
-function renderTrend() {
-  trend.tBodies[0].innerHTML = RUNS.slice().reverse().map(r => {
-    const h = r.headline, cls = r.meta.legacy ? "legacyrow" : "";
-    return `<tr class="${cls}"><td class="l">${r.meta.hermit}</td><td class="l">${r.meta.when || ""}</td>
-      <td>${h.comparable_rows}</td><td>${h.median_speedup == null ? "—" : h.median_speedup + "×"}</td>
-      <td>${pct(h.win_rate)}</td><td>${pct(h.parity_coverage)}</td>
-      <td class="l muted">${(h.tail_losses || []).join(", ")}</td></tr>`;
-  }).join("");
 }
 
 fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => {
@@ -187,5 +262,7 @@ fetch("/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
     [...new Set(LEDGER.map(x => x.depth))].sort().map(v => `<option>${v}</option>`).join("");
   [lq, ldepth, ldeep].forEach(el => el.oninput = renderLedger);
   renderLedger();
-}).catch(() => { lstats.textContent = " ledger.json not found — run parity/sweep.sh + gen-ledger.py"; });
+}).catch(() => { lstats.textContent = "ledger.json not found — run parity/sweep.sh + gen-ledger.py"; });
 </script>
+</body>
+</html>
