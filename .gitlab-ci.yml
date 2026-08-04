@@ -187,6 +187,37 @@ web-image:
     - if: '$REBUILD_WEB_IMAGE'   # force a rebuild: run a pipeline with this var set
 
 # ---------------------------------------------------------------------------
+# runtime-image — prebuilds the debian-slim + jellyfin-ffmpeg7 runtime base
+# (ci/runtime.Dockerfile) once and pushes it to ci:runtime-bookworm-ffmpeg7, so
+# the service image build never re-runs the ~150-package apt install (it just
+# `FROM`s this via RUNTIME_IMAGE). Rebuilds when ci/runtime.Dockerfile changes or
+# on demand via REBUILD_RUNTIME_IMAGE. Lives in .pre.
+# ---------------------------------------------------------------------------
+runtime-image:
+  stage: .pre
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    RUNTIME_IMAGE: $CI_REGISTRY_IMAGE/ci:runtime-bookworm-ffmpeg7
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"${AUTH}\"}}}" > /kaniko/.docker/config.json
+  script:
+    - >-
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/ci/runtime.Dockerfile"
+      --destination "$RUNTIME_IMAGE"
+      --push-retry 5
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - ci/runtime.Dockerfile
+    - if: '$REBUILD_RUNTIME_IMAGE'   # force a rebuild: run a pipeline with this var set
+
+# ---------------------------------------------------------------------------
 # sccache — compile cache backed by Garage S3, replacing GitLab's cache: (which
 # zipped target/ + .cargo into one archive and timed out uploading to Garage).
 # sccache stores each object directly over S3 instead. Creds come from Vault;
@@ -368,6 +399,7 @@ docker-image:
       --dockerfile "$CI_PROJECT_DIR/Dockerfile"
       --build-arg SERVICE_VERSION="$IMAGE_VERSION"
       --build-arg WEB_IMAGE="$CI_REGISTRY_IMAGE/ci:web-$JELLYFIN_WEB_VERSION"
+      --build-arg RUNTIME_IMAGE="$CI_REGISTRY_IMAGE/ci:runtime-bookworm-ffmpeg7"
       $DESTS
       --push-retry 5
   rules:
