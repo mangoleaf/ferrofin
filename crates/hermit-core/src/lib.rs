@@ -152,6 +152,7 @@ pub mod activity_manager;
 pub mod api_key_manager;
 pub mod app_paths;
 pub mod application_host;
+pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;
 pub mod channel_manager;

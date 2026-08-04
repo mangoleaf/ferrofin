@@ -40,6 +40,10 @@ pub struct HermitDeviceManager {
     /// Transient per-device reported capabilities (device id → capabilities),
     /// mirroring the C# `_capabilitiesMap` `ConcurrentDictionary`.
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
+    /// The shared token-resolution cache — cleared on every device mutation so
+    /// a deleted/rewritten token can never be served from cache (revocation is
+    /// immediate, not TTL-bounded).
+    auth_cache: Arc<crate::auth_cache::AuthCache>,
 }
 
 impl std::fmt::Debug for HermitDeviceManager {
@@ -56,7 +60,16 @@ impl HermitDeviceManager {
         Self {
             db,
             capabilities: Arc::new(RwLock::new(HashMap::new())),
+            auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
+    /// only) — must be the instance the authorization context reads through.
+    #[must_use]
+    pub fn with_auth_cache(mut self, auth_cache: Arc<crate::auth_cache::AuthCache>) -> Self {
+        self.auth_cache = auth_cache;
+        self
     }
 
     /// Reads the capabilities snapshot for a device id (defaults when unknown).
@@ -346,6 +359,8 @@ impl DeviceManager for HermitDeviceManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        // Revocation: the deleted token must stop authenticating NOW.
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -371,6 +386,8 @@ impl DeviceManager for HermitDeviceManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // Token/user/name may have changed — drop cached resolutions.
+        self.auth_cache.clear();
         Ok(())
     }
 

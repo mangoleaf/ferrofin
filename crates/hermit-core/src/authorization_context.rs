@@ -42,6 +42,7 @@ use hermit_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use hermit_traits::options::AuthorizationInfo;
 use hermit_traits::system::ServerApplicationHost;
 
+use crate::auth_cache::AuthCache;
 use crate::db_error::db_err;
 
 /// How stale a device's `DateLastActivity` may be before a request touch
@@ -64,6 +65,12 @@ pub struct HermitAuthorizationContext {
     /// `IServerApplicationHost.ApplicationVersionString`), the api-key version
     /// fallback. Injected for the same reason.
     server_version: String,
+    /// The shared token-resolution cache (see [`AuthCache`]): drops the
+    /// two-query-per-request floor on the authenticated hot path. The
+    /// composition root installs the instance the user/device managers clear
+    /// on auth-relevant mutations; the default (private) instance is only for
+    /// tests and still TTL-correct.
+    auth_cache: Arc<AuthCache>,
 }
 
 impl std::fmt::Debug for HermitAuthorizationContext {
@@ -92,7 +99,17 @@ impl HermitAuthorizationContext {
             configuration_manager,
             system_id: system_id.into(),
             server_version: server_version.into(),
+            auth_cache: Arc::new(AuthCache::default()),
         }
+    }
+
+    /// Installs the shared [`AuthCache`] (composition root only) — the same
+    /// instance must be handed to the user/device managers so their mutations
+    /// invalidate what this context serves.
+    #[must_use]
+    pub fn with_auth_cache(mut self, auth_cache: Arc<AuthCache>) -> Self {
+        self.auth_cache = auth_cache;
+        self
     }
 
     /// Whether legacy (Emby-era) authorization is enabled in the current
@@ -157,6 +174,18 @@ impl HermitAuthorizationContext {
         info: &mut AuthorizationInfo,
         token: &str,
     ) -> Result<bool, ServiceError> {
+        // Read-through: a fresh cached resolution answers without touching the
+        // database (the two per-request queries this path otherwise costs).
+        // The row-refresh bookkeeping below is deliberately skipped on a hit —
+        // it re-runs on the next TTL expiry, the same cadence Jellyfin's
+        // in-memory device map effectively gives it.
+        if let Some((device, user)) = self.auth_cache.get(token) {
+            info.is_authenticated = true;
+            fill_blank_client_fields(info, &device);
+            info.user = user;
+            return Ok(true);
+        }
+
         let Some(mut device) = self.device_by_token(token).await? else {
             return Ok(false);
         };
@@ -212,6 +241,9 @@ impl HermitAuthorizationContext {
             device.date_modified = Utc::now();
             self.update_device(&device).await?;
         }
+        // Cache the row exactly as it now exists (post-refresh), so a hit
+        // serves what a re-read would.
+        self.auth_cache.put(token, device, info.user.clone());
         Ok(true)
     }
 
@@ -372,6 +404,27 @@ impl AuthService for HermitAuthService {
 
 /// Reads the first value of a query-string parameter, case-insensitively on the
 /// key. The `RequestContext` carries the raw query string (no leading `?`).
+/// Fills the auth info's blank client/device fields from a device row — the
+/// hit-path half of `resolve_device_token`'s defaults (the C# branch that only
+/// *reads* the row; the rename/refresh half runs on cache misses only).
+fn fill_blank_client_fields(
+    info: &mut AuthorizationInfo,
+    device: &hermit_db::entities::security::DeviceEntity,
+) {
+    if info.client.as_deref().unwrap_or("").trim().is_empty() {
+        info.client = Some(device.app_name.clone());
+    }
+    if info.device_id.as_deref().unwrap_or("").trim().is_empty() {
+        info.device_id = Some(device.device_id.clone());
+    }
+    if info.device.as_deref().unwrap_or("").trim().is_empty() {
+        info.device = Some(device.device_name.clone());
+    }
+    if info.version.as_deref().unwrap_or("").trim().is_empty() {
+        info.version = Some(device.app_version.clone());
+    }
+}
+
 fn query_value(request: &RequestContext, key: &str) -> Option<String> {
     let query = request.query_string.as_deref()?;
     for pair in query.split('&') {
@@ -619,16 +672,7 @@ mod tests {
     #[tokio::test]
     async fn api_key_token_authenticates_with_server_fallbacks() {
         let db = crate::test_support::test_db().await;
-        sqlx::query(
-            r#"INSERT INTO "ApiKeys" ("AccessToken", "DateCreated", "DateLastActivity", "Name")
-               VALUES (?1, ?2, ?2, ?3)"#,
-        )
-        .bind("key-tok")
-        .bind(Utc::now())
-        .bind("Automation")
-        .execute(db.writer())
-        .await
-        .expect("insert api key");
+        seed_api_key(&db, "key-tok", "Automation").await;
 
         let ctx = context(db);
         let request = RequestContext {
@@ -652,6 +696,37 @@ mod tests {
         let db = crate::test_support::test_db().await;
         let uid = Uuid::from_u128(7);
         crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let ctx = context(db);
+        let info = ctx
+            .get_authorization_info(&token_request())
+            .await
+            .expect("info");
+        assert!(info.is_authenticated);
+        assert!(!info.is_api_key);
+        assert_eq!(info.client.as_deref(), Some("Web"));
+        assert_eq!(info.device.as_deref(), Some("Firefox"));
+        assert_eq!(info.user_id(), uid);
+    }
+
+    /// Seeds an api-key row with the given token and key name (the name becomes
+    /// the api-key branch's client fallback, so tests assert on it).
+    async fn seed_api_key(db: &Database, token: &str, name: &str) {
+        sqlx::query(
+            r#"INSERT INTO "ApiKeys" ("AccessToken", "DateCreated", "DateLastActivity", "Name")
+               VALUES (?1, ?2, ?2, ?3)"#,
+        )
+        .bind(token)
+        .bind(Utc::now())
+        .bind(name)
+        .execute(db.writer())
+        .await
+        .expect("insert api key");
+    }
+
+    /// Seeds the standard device row (`dev-tok` → user `uid`).
+    async fn seed_device(db: &Database, uid: Uuid) {
         let now = Utc::now();
         sqlx::query(
             r#"INSERT INTO "Devices"
@@ -670,21 +745,112 @@ mod tests {
         .execute(db.writer())
         .await
         .expect("insert device");
+    }
 
-        let ctx = context(db);
-        let request = RequestContext {
+    fn token_request() -> RequestContext {
+        RequestContext {
             headers: vec![(
                 "Authorization".to_owned(),
                 r#"MediaBrowser Token="dev-tok""#.to_owned(),
             )],
             ..Default::default()
-        };
-        let info = ctx.get_authorization_info(&request).await.expect("info");
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_token_is_served_without_the_database_until_cleared() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(8);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+
+        // Miss → resolves from the DB and caches.
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
         assert!(info.is_authenticated);
-        assert!(!info.is_api_key);
-        assert_eq!(info.client.as_deref(), Some("Web"));
-        assert_eq!(info.device.as_deref(), Some("Firefox"));
-        assert_eq!(info.user_id(), uid);
+        assert_eq!(cache.len(), 1);
+
+        // Delete the row OUT-OF-BAND (no manager, no invalidation): within the
+        // TTL the cache still answers — proof the DB is not being consulted.
+        sqlx::query(r#"DELETE FROM "Devices""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(info.is_authenticated, "hit served from cache");
+        assert_eq!(info.user_id(), uid, "cached user rides along");
+
+        // After a clear the DB is authoritative again → token is gone.
+        cache.clear();
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(!info.is_authenticated, "cleared cache falls through to DB");
+    }
+
+    #[tokio::test]
+    async fn device_delete_revokes_cached_auth_immediately() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(9);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let devices = crate::device_manager::HermitDeviceManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+
+        assert!(
+            ctx.get_authorization_info(&token_request())
+                .await
+                .unwrap()
+                .is_authenticated
+        );
+
+        // Revoke through the manager — the shared cache must be dropped
+        // synchronously, never waiting out the TTL.
+        // The seeded row is Id=1; a literal entity avoids a fixture query.
+        let device = hermit_db::entities::security::DeviceEntity {
+            id: 1,
+            access_token: "dev-tok".into(),
+            app_name: "Web".into(),
+            app_version: "1.0".into(),
+            date_created: Utc::now(),
+            date_last_activity: Utc::now(),
+            date_modified: Utc::now(),
+            device_id: "dev-1".into(),
+            device_name: "Firefox".into(),
+            is_active: true,
+            user_id: uid.to_string(),
+        };
+        hermit_traits::devices::DeviceManager::delete_device(&devices, &device)
+            .await
+            .unwrap();
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(!info.is_authenticated, "revoked token rejected immediately");
+    }
+
+    #[tokio::test]
+    async fn password_change_clears_cached_auth() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(10);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let users = HermitUserManager::new(db.clone()).with_auth_cache(Arc::clone(&cache));
+
+        ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert_eq!(cache.len(), 1);
+
+        hermit_traits::library::UserManager::change_password(&users, uid, "new-password-1")
+            .await
+            .unwrap();
+        assert!(
+            cache.is_empty(),
+            "password change dropped every cached resolution"
+        );
     }
 
     #[tokio::test]
@@ -700,16 +866,7 @@ mod tests {
     #[tokio::test]
     async fn api_key_via_query_parameter() {
         let db = crate::test_support::test_db().await;
-        sqlx::query(
-            r#"INSERT INTO "ApiKeys" ("AccessToken", "DateCreated", "DateLastActivity", "Name")
-               VALUES (?1, ?2, ?2, ?3)"#,
-        )
-        .bind("qtok")
-        .bind(Utc::now())
-        .bind("QueryKey")
-        .execute(db.writer())
-        .await
-        .expect("insert");
+        seed_api_key(&db, "qtok", "QueryKey").await;
 
         let ctx = context(db);
         let request = RequestContext {

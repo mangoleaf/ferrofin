@@ -325,18 +325,23 @@ pub async fn build_app_state(
         Arc::clone(&config_mgr) as Arc<_>;
 
     // ---- managers over repositories/services ------------------------------
+    // ONE auth cache shared by the authorization context (read-through) and the
+    // user/device managers (invalidation on mutation) — the sharing is what
+    // makes cached auth revocation-correct. See hermit_core::auth_cache.
+    let auth_cache = Arc::new(hermit_core::auth_cache::AuthCache::default());
     let users: Arc<dyn hermit_traits::library::UserManager> = Arc::new(
         HermitUserManager::new(db.clone())
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
                 std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
-            ),
+            )
+            .with_auth_cache(Arc::clone(&auth_cache)),
     );
     let user_data: Arc<dyn hermit_traits::library::UserDataManager> = Arc::new(
         HermitUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );
     let devices: Arc<dyn hermit_traits::devices::DeviceManager> =
-        Arc::new(HermitDeviceManager::new(db.clone()));
+        Arc::new(HermitDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn hermit_traits::security::ApiKeyManager> =
         Arc::new(HermitApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn hermit_traits::configuration::DisplayPreferencesManager> =
@@ -717,7 +722,8 @@ pub async fn build_app_state(
         Arc::clone(&config_trait),
         server_id.clone(),
         crate::service_version(),
-    );
+    )
+    .with_auth_cache(Arc::clone(&auth_cache));
     let auth_service: Arc<dyn hermit_traits::net::AuthService> =
         Arc::new(HermitAuthService::new(auth_context_concrete.clone()));
     let auth_context: Arc<dyn hermit_traits::net::AuthorizationContext> =

@@ -84,6 +84,10 @@ pub struct HermitUserManager {
     /// composition root via [`with_server_id`](HermitUserManager::with_server_id);
     /// `None` in tests (which then omit `ServerId`, the prior behaviour).
     server_id: Option<String>,
+    /// The shared token-resolution cache — cleared on every user mutation
+    /// (update/delete, password, policy, configuration) so cached auth can
+    /// never outlive a change to what it authorizes.
+    auth_cache: Arc<crate::auth_cache::AuthCache>,
     /// The directory user profile images are written under
     /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
     /// leaves [`save_profile_image`](hermit_traits::library::UserManager::save_profile_image)
@@ -121,7 +125,16 @@ impl HermitUserManager {
             providers,
             server_id: None,
             profile_image_dir: None,
+            auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
+    /// only) — must be the instance the authorization context reads through.
+    #[must_use]
+    pub fn with_auth_cache(mut self, auth_cache: Arc<crate::auth_cache::AuthCache>) -> Self {
+        self.auth_cache = auth_cache;
+        self
     }
 
     /// Sets the directory user profile images are stored under, enabling
@@ -389,6 +402,7 @@ impl UserManager for HermitUserManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -454,6 +468,7 @@ impl UserManager for HermitUserManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -519,6 +534,7 @@ impl UserManager for HermitUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -552,6 +568,7 @@ impl UserManager for HermitUserManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -622,6 +639,8 @@ impl UserManager for HermitUserManager {
             {
                 set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true)
                     .await?;
+                // A locked-out account's cached auth must not outlive the lock.
+                self.auth_cache.clear();
             }
             sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
                 .bind(&user.id)
@@ -709,11 +728,12 @@ impl UserManager for HermitUserManager {
         let id = &user.id;
         let pool = self.db.pool();
 
-        // Bulk-load this user's permissions and preferences up front — two indexed
-        // queries — instead of the ~40 per-kind lookups the policy/config build
-        // otherwise fans out (an N+1 that convoyed the pool under concurrent load).
-        let perms = load_permission_map(pool, id).await?;
-        let prefs = load_preference_map(pool, id).await?;
+        // Bulk-load this user's permissions and preferences up front — ONE
+        // round-trip — instead of the ~40 per-kind lookups the policy/config
+        // build otherwise fans out (an N+1 that convoyed the pool under
+        // concurrent load; the pair of loads was then fused, this is a
+        // per-request hot path via /Users/Me and authenticate).
+        let (perms, prefs) = load_permission_and_preference_maps(pool, id).await?;
 
         // Config-only list-valued preferences → the DTO's Guid collections.
         let ordered_views = guid_pref(&prefs, PreferenceKind::OrderedViews);
@@ -828,6 +848,7 @@ impl UserManager for HermitUserManager {
             &config.my_media_excludes,
         )
         .await?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -895,6 +916,7 @@ impl UserManager for HermitUserManager {
             policy.enable_remote_control_of_other_users,
         )
         .await?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -977,37 +999,40 @@ impl UserManager for HermitUserManager {
 /// permission flags, and a single struct literal reads best (splitting it would
 /// only scatter the mapping), so the line-count lint is allowed here.
 #[allow(clippy::too_many_lines)]
-/// Loads all of a user's permission rows in one query, keyed by `Kind`.
+/// Loads all of a user's permission AND preference rows in **one** round-trip,
+/// keyed by `Kind` (permissions as bools, preferences as the raw stored string;
+/// list values are delimiter-joined and split by [`pref`]).
 ///
-/// Replaces the per-kind `has_permission` fan-out when building a `UserDto`: the
-/// `(UserId, Kind)` unique index makes this one indexed scan of the handful of
-/// rows a user owns.
-async fn load_permission_map(
+/// Replaces the per-kind `has_permission` fan-out — and the former
+/// two-queries-per-DTO pair — with a single `UNION ALL` over the two small
+/// indexed `(UserId, Kind)` tables: the DTO-building path is a per-request hot
+/// path (`/Users/Me`, authenticate), so round-trips matter more than rows.
+/// `Permissions.Value` is an INTEGER bool; `CAST(… AS TEXT)` unifies the value
+/// column ("0"/"1") across the union.
+async fn load_permission_and_preference_maps(
     pool: &sqlx::sqlite::SqlitePool,
     user_id: &str,
-) -> Result<HashMap<i32, bool>, ServiceError> {
-    let rows: Vec<(i32, bool)> =
-        sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?1"#)
-            .bind(user_id)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-    Ok(rows.into_iter().collect())
-}
-
-/// Loads all of a user's preference rows in one query, keyed by `Kind` (the raw
-/// stored string; list values are delimiter-joined and split by [`pref`]).
-async fn load_preference_map(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-) -> Result<HashMap<i32, String>, ServiceError> {
-    let rows: Vec<(i32, String)> =
-        sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?1"#)
-            .bind(user_id)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?;
-    Ok(rows.into_iter().collect())
+) -> Result<(HashMap<i32, bool>, HashMap<i32, String>), ServiceError> {
+    let rows: Vec<(i64, i32, String)> = sqlx::query_as(
+        r#"SELECT 0 AS "Src", "Kind", CAST("Value" AS TEXT) AS "Value"
+           FROM "Permissions" WHERE "UserId" = ?1
+           UNION ALL
+           SELECT 1, "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?1"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let mut perms = HashMap::new();
+    let mut prefs = HashMap::new();
+    for (src, kind, value) in rows {
+        if src == 0 {
+            perms.insert(kind, value == "1");
+        } else {
+            prefs.insert(kind, value);
+        }
+    }
+    Ok((perms, prefs))
 }
 
 /// A permission's value from a preloaded map, defaulting to `false` when absent

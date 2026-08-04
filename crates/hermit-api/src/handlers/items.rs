@@ -50,6 +50,13 @@ pub(crate) async fn resolve_user(
     if effective.is_nil() {
         return Err(ApiError::BadRequest("no user for request".to_owned()));
     }
+    // The auth layer already loaded the caller's row — reuse it instead of
+    // re-fetching the identical user on every user-scoped request.
+    if effective == auth.user_id()
+        && let Some(user) = &auth.user
+    {
+        return Ok(user.clone());
+    }
     state
         .users
         .get_user_by_id(effective)
@@ -70,6 +77,12 @@ pub(crate) async fn resolve_user_opt(
     let effective = user_id.unwrap_or_else(|| auth.user_id());
     if effective.is_nil() {
         return Ok(None);
+    }
+    // Same reuse as `resolve_user`: the auth layer already holds this row.
+    if effective == auth.user_id()
+        && let Some(user) = &auth.user
+    {
+        return Ok(Some(user.clone()));
     }
     Ok(state.users.get_user_by_id(effective).await?)
 }

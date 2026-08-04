@@ -858,16 +858,15 @@ async fn get_current_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<Json<UserDto>, ApiError> {
-    let user_id = auth.user_id();
-    if user_id.is_nil() {
+    if auth.user_id().is_nil() {
         return Err(ApiError::BadRequest("no user for token".to_owned()));
     }
-    let user = state
-        .users
-        .get_user_by_id(user_id)
-        .await?
+    // The auth layer already loaded this row — no re-fetch.
+    let user = auth
+        .user
+        .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no user for token".to_owned()))?;
-    Ok(Json(state.users.get_user_dto(&user, None).await?))
+    Ok(Json(state.users.get_user_dto(user, None).await?))
 }
 
 /// Loads a user by id, mapping the absent case to a `404`.
