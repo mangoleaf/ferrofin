@@ -123,6 +123,11 @@ pub(crate) struct ImageQuery {
     /// Gaussian blur radius.
     #[serde(default)]
     blur: Option<i32>,
+    /// The image's cache tag (`md5(path+dateModified)`): purely a cache key —
+    /// when present the URL is content-addressed, so the response is served
+    /// with Jellyfin's immutable caching contract (`Cache-Control`/`ETag`).
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 impl ImageQuery {
@@ -226,6 +231,36 @@ async fn serve_image_file(
         content_type = processed.mime_type;
     }
 
+    // ── Jellyfin's image caching contract (C# `GetImageResult`) ─────────────
+    // Posters are requested with `?tag=md5(path+dateModified)` — a content
+    // hash, so a tagged URL is immutable. Jellyfin answers `Cache-Control:
+    // public, max-age=31536000, immutable` + `ETag: "<tag>"`, which is what
+    // lets clients (Android TV image loaders especially) paint a library grid
+    // from their local disk cache with zero network. Without these headers
+    // every library visit re-fetches every poster — visible slow pop-in.
+    let no_cache = request
+        .headers()
+        .get(axum::http::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("no-cache"));
+    let tag = query.tag.as_deref().filter(|t| !t.is_empty());
+
+    // ETag validation first (C# prefers If-None-Match over If-Modified-Since):
+    // a matching tag short-circuits to an empty 304 before any file I/O.
+    if !no_cache
+        && let Some(tag) = tag
+        && let Some(if_none_match) = request
+            .headers()
+            .get(axum::http::header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+        && (if_none_match == format!("\"{tag}\"") || if_none_match == tag)
+    {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = axum::http::StatusCode::NOT_MODIFIED;
+        append_image_cache_headers(response.headers_mut(), no_cache, Some(tag), image);
+        return Ok(response);
+    }
+
     let mut response = ServeFile::new(&serve_path)
         .oneshot(request)
         .await
@@ -240,7 +275,64 @@ async fn serve_image_file(
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
+    append_image_cache_headers(response.headers_mut(), no_cache, tag, image);
     Ok(response)
+}
+
+/// Appends the caching/metadata headers of C# `GetImageResult` to an image
+/// response: `Cache-Control` (immutable year-long for tagged, content-addressed
+/// URLs; `public` otherwise; `no-cache` mirrored back when the client sent it),
+/// `ETag` from the tag, plus `Age` and `Vary: Accept`. `Last-Modified` /
+/// `If-Modified-Since` are handled by `ServeFile` itself.
+fn append_image_cache_headers(
+    headers: &mut axum::http::HeaderMap,
+    no_cache: bool,
+    tag: Option<&str>,
+    image: &ItemImageInfo,
+) {
+    use axum::http::HeaderValue;
+    use axum::http::header;
+
+    if no_cache {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        headers.insert(
+            header::PRAGMA,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        return;
+    }
+
+    // 31536000 = 365 days, the C# `TimeSpan.FromDays(365)` for tagged URLs —
+    // safe because the tag is a content hash: a changed image gets a new URL.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if tag.is_some() {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public"
+        }),
+    );
+    if let Some(tag) = tag
+        && let Ok(value) = HeaderValue::from_str(&format!("\"{tag}\""))
+    {
+        headers.insert(header::ETAG, value);
+    }
+    let age_secs = (chrono::Utc::now() - image.date_modified)
+        .num_seconds()
+        .max(0);
+    if let Ok(value) = HeaderValue::from_str(&age_secs.to_string()) {
+        headers.insert(header::AGE, value);
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+    // C# sends `attachment` on image responses; harmless to image loaders
+    // (they ignore disposition) and kept for header parity.
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
 }
 
 /// Resolves an item's images, selects the requested one, and serves it.
@@ -346,7 +438,7 @@ async fn get_item_image_parametrized(
         item_id,
         image_type,
         image_index,
-        _tag,
+        tag,
         format,
         max_width,
         max_height,
@@ -377,6 +469,7 @@ async fn get_item_image_parametrized(
         format: Some(format).filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("0")),
         max_width: max_width.parse().ok().filter(|w| *w > 0),
         max_height: max_height.parse().ok().filter(|h| *h > 0),
+        tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
         ..ImageQuery::default()
     };
     serve_item_image(&state, item_id, image_type, image_index, &query, request).await

@@ -736,6 +736,33 @@ fn state(s: &Stubs) -> AppState {
 
 /// Drives one authenticated request through the router, with an optional
 /// `(content_type, payload)` body.
+/// Like [`send`], but also returns the response headers (for the caching
+/// contract assertions) and accepts extra request headers.
+async fn send_with_headers(
+    s: &Stubs,
+    uri: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Authorization", "Bearer token");
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    let request = builder.body(Body::empty()).expect("request");
+    let response = create_router(state(s))
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, headers, bytes.to_vec())
+}
+
 async fn send(
     s: &Stubs,
     method: &str,
@@ -1167,4 +1194,82 @@ async fn item_image_bad_type_is_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── the image caching contract (C# GetImageResult; poster pop-in fix) ───────
+
+#[tokio::test]
+async fn tagged_image_serves_the_immutable_caching_contract() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let (status, headers, body) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123"),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"PNGDATA");
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable"),
+        "a tagged (content-addressed) URL is immutable for a year"
+    );
+    assert_eq!(
+        headers.get("etag").and_then(|v| v.to_str().ok()),
+        Some("\"abc123\""),
+        "the tag doubles as the ETag"
+    );
+    assert!(headers.contains_key("age"));
+    assert_eq!(
+        headers.get("vary").and_then(|v| v.to_str().ok()),
+        Some("Accept")
+    );
+}
+
+#[tokio::test]
+async fn matching_if_none_match_is_an_empty_304() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let (status, headers, body) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123"),
+        &[("If-None-Match", "\"abc123\"")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty(), "304 carries no body");
+    assert_eq!(
+        headers.get("etag").and_then(|v| v.to_str().ok()),
+        Some("\"abc123\""),
+        "304 revalidates the same ETag"
+    );
+}
+
+#[tokio::test]
+async fn untagged_image_is_public_and_client_no_cache_is_mirrored() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let (status, headers, _) =
+        send_with_headers(&s, &format!("/Items/{ITEM_ID}/Images/Primary"), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("public"),
+        "no tag => cacheable but revalidated"
+    );
+    assert!(headers.get("etag").is_none());
+
+    let (status, headers, _) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123"),
+        &[("Cache-Control", "no-cache")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-cache, no-store, must-revalidate"),
+        "client no-cache disables caching, as upstream does"
+    );
 }
