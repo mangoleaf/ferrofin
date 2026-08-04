@@ -72,11 +72,17 @@ suite_auth() {  # $1=base url
 }
 
 # Authoritative Movie,Episode item count — the fairness figure (folders resolve per-server).
-suite_count_items() {  # $1=base url
+suite_count_items() {  # $1=base url  [$2=token $3=userId]
   suite_guard_no_probe || { echo "?"; return; }
   local tok uid pair
-  pair=$(suite_auth "$1") || { echo "?"; return; }
-  tok=${pair%% *}; uid=${pair##* }
+  # Reuse a pre-minted token when given ($2/$3): the perf leg's auth_login scenario
+  # throttles the login endpoint, so a fresh auth here would 500 against Jellyfin.
+  if [ -n "${2:-}" ]; then
+    tok="$2"; uid="$3"
+  else
+    pair=$(suite_auth "$1") || { echo "?"; return; }
+    tok=${pair%% *}; uid=${pair##* }
+  fi
   curl -sf "$1/Items?userId=$uid&Recursive=true&IncludeItemTypes=Movie,Episode&Limit=0" \
     -H "Authorization: MediaBrowser Token=\"$tok\", $(suite_client_id)" \
     | jq -r '.TotalRecordCount // "?"'

@@ -48,6 +48,9 @@ const clientId = (dev) => `Client="bench", Device="${dev}", DeviceId="${dev}", V
 const mb = (token, dev) => ({ headers: { Authorization: `MediaBrowser Token="${token}", ${clientId(dev)}`, 'Content-Type': 'application/json' } });
 
 function auth(dev) {
+  // Reuse a token minted before the perf load if the runner passed one: the auth_login
+  // scenario throttles Jellyfin's login, so a fresh auth here would fail (500/429).
+  if (__ENV.CAP_TOKEN) return { token: __ENV.CAP_TOKEN, userId: __ENV.CAP_UID };
   const r = http.post(`${BASE}/Users/AuthenticateByName`, JSON.stringify({ Username: USER, Pw: PASS }),
     { headers: { 'Content-Type': 'application/json', Authorization: `MediaBrowser ${clientId(dev)}` } });
   if (r.status !== 200) throw new Error(`[${TARGET}] ttfs auth failed: ${r.status}`);

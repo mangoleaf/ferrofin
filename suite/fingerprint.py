@@ -54,11 +54,15 @@ def shape_hash(raw):
     return hashlib.sha256("\n".join(paths).encode()).hexdigest()[:16]
 
 
-def capture(base, out):
+def capture(base, out, token=None, uid=None):
     reg = json.loads(REGISTRY.read_text())["operations"]
-    auth = json.loads(req(f"{base}/Users/AuthenticateByName",
-                          body=json.dumps({"Username": "bench", "Pw": "benchpass123"})))
-    token, uid = auth["AccessToken"], auth["User"]["Id"]
+    # A pre-minted token lets the caller skip login here: the perf leg's auth_login
+    # scenario throttles Jellyfin's /Users/AuthenticateByName (drops to ~7% success),
+    # so a fresh login at post-leg capture time 500s. Reuse a token minted pre-load.
+    if not token:
+        auth = json.loads(req(f"{base}/Users/AuthenticateByName",
+                              body=json.dumps({"Username": "bench", "Pw": "benchpass123"})))
+        token, uid = auth["AccessToken"], auth["User"]["Id"]
     # Resolve the ids the expanded endpoint set templates on (mirror of
     # bench-lib's enrichContext; missing shapes resolve to '' and those ops
     # skip below rather than fingerprinting a 404).
@@ -111,7 +115,8 @@ def _selftest():
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
         _selftest()
-    elif len(sys.argv) == 4 and sys.argv[1] == "capture":
-        capture(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) in (4, 6) and sys.argv[1] == "capture":
+        # capture <base-url> <out.json> [<token> <userId>]
+        capture(*sys.argv[2:6])
     else:
-        sys.exit("usage: fingerprint.py capture <base-url> <out.json>  |  --selftest")
+        sys.exit("usage: fingerprint.py capture <base-url> <out.json> [<token> <userId>]  |  --selftest")

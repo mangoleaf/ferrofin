@@ -67,6 +67,14 @@ bench() {  # $1=service $2=port $3=TARGET
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
 
+  # Mint one capture token now, while auth is healthy. The auth_login scenario below hits
+  # /Users/AuthenticateByName at ${BENCH_VUS} VUs and throttles Jellyfin's login (drops to
+  # ~7% success); the post-leg captures (count, fingerprint, transcode) each need a fresh
+  # login and would then 500. Reuse this token everywhere instead of re-authenticating.
+  local cap ctok cuid
+  cap=$(suite_auth "$base") || cap=""
+  ctok=${cap%% *}; cuid=${cap##* }
+
   : > "results/raw/$target-rss.txt"   # sampler appends; clear stale samples from prior runs
   sample_rss "$svc" "results/raw/$target-rss.txt" & local rss_pid=$!
 
@@ -76,15 +84,15 @@ bench() {  # $1=service $2=port $3=TARGET
   # 4K encode and would drown the server-footprint number on both sides identically.
   kill "$rss_pid" 2>/dev/null || true
 
-  [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" k6 run transcode.js || true
-  suite_count_items "$base" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
+  [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" CAP_TOKEN="$ctok" CAP_UID="$cuid" k6 run transcode.js || true
+  suite_count_items "$base" "$ctok" "$cuid" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
   # Perf-side body fingerprint, BOTH servers — merge.py compares Hermit's shape
   # against Jellyfin's from this same leg (same fresh-scan DB state), flagging
   # "fast because the body went hollow/differently-shaped" at bench time.
   # (Comparing against the parity pass false-flagged ~25 ops: parity's write
   # journeys leave play-state fields the fresh perf scan legitimately lacks.)
   mkdir -p ../suite/results/raw
-  python3 ../suite/fingerprint.py capture "$base" "../suite/results/raw/perf-fingerprints-$target.json" || true
+  python3 ../suite/fingerprint.py capture "$base" "../suite/results/raw/perf-fingerprints-$target.json" "$ctok" "$cuid" || true
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
