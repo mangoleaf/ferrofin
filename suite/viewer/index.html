@@ -23,8 +23,7 @@
     padding: 12px 16px; min-width: 130px; }
   .stat .n { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 16px 24px;
-    position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 5; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 14px 0 4px; }
   label.pick { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted);
     text-transform: uppercase; letter-spacing: .04em; }
   input, select { background: var(--panel); color: var(--fg); border: 1px solid var(--line);
@@ -40,7 +39,7 @@
   th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line);
     font-variant-numeric: tabular-nums; white-space: nowrap; }
   th:first-child, td:first-child, th.l, td.l { text-align: left; }
-  th { position: sticky; top: 61px; background: var(--bg); color: var(--muted); font-weight: 600;
+  th { position: sticky; top: 0; background: var(--bg); color: var(--muted); font-weight: 600;
     font-size: 12px; text-transform: uppercase; letter-spacing: .04em; user-select: none; }
   tbody tr:hover { background: #12151c; }
   code { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -73,16 +72,15 @@
 <body>
 <header>
   <h1>Hermit ⇄ Jellyfin — suite <span class="sub">(parity × perf · speed shown for deep-verified ops only)</span></h1>
+  <div class="controls">
+    <label class="pick">Run<select id="run"></select></label>
+    <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
+    <label class="pick chk"><input type="checkbox" id="compOnly" checked> comparable only</label>
+  </div>
   <div class="sub" id="subline">loading…</div>
   <div class="stats" id="stats"></div>
-  <div class="sub" id="footline" style="margin-top:10px"></div>
+  <div class="stats" id="footline"></div>
 </header>
-
-<div class="controls">
-  <label class="pick">Run<select id="run"></select></label>
-  <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
-  <label class="pick chk"><input type="checkbox" id="compOnly" checked> comparable only</label>
-</div>
 
 <main>
   <div id="guard"></div>
@@ -170,13 +168,30 @@ function render() {
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
   stats.innerHTML = statCards(h);
   const fp = m.footprint;
-  const ttfs = (t) => t ? `${t.med} ms (${t.min}–${t.max}, ${t.runs} runs)` : "?";
-  footline.innerHTML = fp ? `footprint: cold ${fp.h_cold_s ?? "?"}s vs ${fp.j_cold_s ?? "?"}s ·
-    peak anon ${fp.h_rss_peak_mib ?? "?"} MiB vs ${fp.j_rss_peak_mib ?? "?"} MiB ·
-    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)<br>
-    <b style="color:var(--fg)">HLS play-start (TTFS)</b> —
-    stream-copy remux: ${ttfs(fp.h_ttfs_copy)} vs ${ttfs(fp.j_ttfs_copy)} ·
-    forced 4K HEVC→H.264: ${ttfs(fp.h_ttfs_encode)} vs ${ttfs(fp.j_ttfs_encode)}` : "";
+  // Footprint cards: Hermit vs Jellyfin per metric, Hermit green when it wins.
+  const fpCard = (label, hVal, jVal, hNum, jNum, hTitle, jTitle) => {
+    const color = hNum != null && jNum != null
+      ? (hNum < jNum ? "var(--good)" : hNum > jNum ? "var(--bad)" : "var(--fg)") : "var(--fg)";
+    return `<div class="stat"><div class="n" style="font-size:16px">
+      <span style="color:${color}" title="${hTitle || ""}">${hVal}</span>
+      <span class="muted" style="font-weight:400"> vs </span>
+      <span class="muted" title="${jTitle || ""}">${jVal}</span></div>
+      <div class="l">${label}</div></div>`;
+  };
+  const ttfsTitle = (t) => t ? `${t.min}–${t.max} ms over ${t.runs} runs` : "";
+  footline.innerHTML = fp ? [
+    fpCard("cold start", `${fp.h_cold_s ?? "?"}s`, `${fp.j_cold_s ?? "?"}s`,
+      parseFloat(fp.h_cold_s), parseFloat(fp.j_cold_s)),
+    fpCard("peak anon memory", `${fp.h_rss_peak_mib ?? "?"} MiB`, `${fp.j_rss_peak_mib ?? "?"} MiB`,
+      fp.h_rss_peak_mib, fp.j_rss_peak_mib),
+    fpCard("items scanned", fp.h_items ?? "?", fp.j_items ?? "?", null, null),
+    fpCard("TTFS · stream-copy remux",
+      fp.h_ttfs_copy ? `${fp.h_ttfs_copy.med} ms` : "?", fp.j_ttfs_copy ? `${fp.j_ttfs_copy.med} ms` : "?",
+      fp.h_ttfs_copy?.med, fp.j_ttfs_copy?.med, ttfsTitle(fp.h_ttfs_copy), ttfsTitle(fp.j_ttfs_copy)),
+    fpCard("TTFS · forced 4K HEVC→H.264",
+      fp.h_ttfs_encode ? `${fp.h_ttfs_encode.med} ms` : "?", fp.j_ttfs_encode ? `${fp.j_ttfs_encode.med} ms` : "?",
+      fp.h_ttfs_encode?.med, fp.j_ttfs_encode?.med, ttfsTitle(fp.h_ttfs_encode), ttfsTitle(fp.j_ttfs_encode)),
+  ].join("") : "";
 
   const baseP50 = {};
   if (b) for (const o of b.operations) baseP50[o.perf.variant] = o.perf.h_p50;
