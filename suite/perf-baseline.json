@@ -64,587 +64,804 @@
   },
   "merged": {
     "factor": 1.5,
-    "hermit": "v0.8.3-13-gf417814",
+    "hermit": "v0.8.5-2-gbfbd201",
     "variants": {
       "activity_log": {
         "op": "GET /System/ActivityLog/Entries",
-        "h_p50": 9.09,
-        "h_p95": 37.62,
-        "h_p99": 54.56,
+        "h_p50": 15.27,
+        "h_p95": 34.09,
+        "h_p99": 39.5,
         "deep_verified": false
       },
       "album_artists": {
         "op": "GET /Artists/AlbumArtists",
-        "h_p50": 21.38,
-        "h_p95": 55.62,
-        "h_p99": 83.5,
+        "h_p50": 11.28,
+        "h_p95": 24.11,
+        "h_p99": 30.47,
         "deep_verified": true
       },
       "artists": {
         "op": "GET /Artists",
-        "h_p50": 25.6,
-        "h_p95": 52.06,
-        "h_p99": 69.85,
+        "h_p50": 11.17,
+        "h_p95": 21.62,
+        "h_p99": 26.23,
         "deep_verified": true
       },
       "auth_keys": {
         "op": "GET /Auth/Keys",
-        "h_p50": 6.51,
-        "h_p95": 30.29,
-        "h_p99": 55.96,
+        "h_p50": 6.64,
+        "h_p95": 21.5,
+        "h_p99": 32.52,
         "deep_verified": true
       },
       "auth_providers": {
         "op": "GET /Auth/Providers",
-        "h_p50": 4.81,
-        "h_p95": 26.95,
-        "h_p99": 35.57,
+        "h_p50": 0.07,
+        "h_p95": 0.24,
+        "h_p99": 0.7,
         "deep_verified": true
       },
       "auth_pw_providers": {
         "op": "GET /Auth/PasswordResetProviders",
-        "h_p50": 4.77,
-        "h_p95": 25.24,
-        "h_p99": 35.75,
+        "h_p50": 0.06,
+        "h_p95": 0.37,
+        "h_p99": 0.62,
         "deep_verified": true
       },
       "available_options": {
         "op": "GET /Libraries/AvailableOptions",
-        "h_p50": 9.1,
-        "h_p95": 34.64,
-        "h_p99": 53.29,
+        "h_p50": 0.12,
+        "h_p95": 0.28,
+        "h_p99": 0.57,
         "deep_verified": false
+      },
+      "backup_list": {
+        "op": "GET /Backup",
+        "h_p50": 0.07,
+        "h_p95": 0.16,
+        "h_p99": 0.29,
+        "deep_verified": true
       },
       "branding": {
         "op": "GET /Branding/Configuration",
-        "h_p50": 2.23,
-        "h_p95": 14.72,
-        "h_p99": 22.14,
+        "h_p50": 0.07,
+        "h_p95": 0.38,
+        "h_p99": 0.63,
+        "deep_verified": true
+      },
+      "branding_css": {
+        "op": "GET /Branding/Css",
+        "h_p50": 0.08,
+        "h_p95": 0.17,
+        "h_p99": 0.29,
+        "deep_verified": true
+      },
+      "branding_css_ext": {
+        "op": "GET /Branding/Css.css",
+        "h_p50": 0.07,
+        "h_p95": 0.14,
+        "h_p99": 0.25,
         "deep_verified": true
       },
       "channels": {
         "op": "GET /Channels",
-        "h_p50": 7.28,
-        "h_p95": 23.08,
-        "h_p99": 56.49,
+        "h_p50": 0.08,
+        "h_p95": 0.14,
+        "h_p99": 0.25,
+        "deep_verified": true
+      },
+      "channels_features": {
+        "op": "GET /Channels/Features",
+        "h_p50": 0.08,
+        "h_p95": 0.16,
+        "h_p99": 0.27,
+        "deep_verified": true
+      },
+      "channels_latest": {
+        "op": "GET /Channels/Items/Latest",
+        "h_p50": 0.07,
+        "h_p95": 0.17,
+        "h_p99": 0.24,
         "deep_verified": true
       },
       "devices": {
         "op": "GET /Devices",
-        "h_p50": 13.97,
-        "h_p95": 58.24,
-        "h_p99": 84.66,
+        "h_p50": 39.31,
+        "h_p95": 79.98,
+        "h_p99": 96.54,
+        "deep_verified": true
+      },
+      "devices_info": {
+        "op": "GET /Devices/Info",
+        "h_p50": 7.61,
+        "h_p95": 49.62,
+        "h_p99": 119.22,
+        "deep_verified": true
+      },
+      "env_default_browser": {
+        "op": "GET /Environment/DefaultDirectoryBrowser",
+        "h_p50": 0.09,
+        "h_p95": 0.2,
+        "h_p99": 3.11,
+        "deep_verified": true
+      },
+      "env_network_shares": {
+        "op": "GET /Environment/NetworkShares",
+        "h_p50": 0.08,
+        "h_p95": 0.18,
+        "h_p99": 0.31,
+        "deep_verified": true
+      },
+      "fallback_fonts": {
+        "op": "GET /FallbackFont/Fonts",
+        "h_p50": 0.07,
+        "h_p95": 0.18,
+        "h_p99": 0.68,
         "deep_verified": true
       },
       "filters": {
         "op": "GET /Items/Filters",
-        "h_p50": 92.8,
-        "h_p95": 141.33,
-        "h_p99": 154.42,
+        "h_p50": 61.21,
+        "h_p95": 131.58,
+        "h_p99": 168.33,
         "deep_verified": true
       },
       "genres": {
         "op": "GET /Genres",
-        "h_p50": 107.37,
-        "h_p95": 210.41,
-        "h_p99": 234.5,
+        "h_p50": 72.56,
+        "h_p95": 193.25,
+        "h_p99": 445.93,
         "deep_verified": false
       },
       "grouping_options": {
         "op": "GET /UserViews/GroupingOptions",
-        "h_p50": 10.41,
-        "h_p95": 41.75,
-        "h_p99": 58.52,
+        "h_p50": 7.39,
+        "h_p95": 22.41,
+        "h_p99": 30.8,
         "deep_verified": true
       },
       "image_primary": {
         "op": "GET /Items/{itemId}/Images/{imageType}",
-        "h_p50": 5.51,
-        "h_p95": 40.9,
-        "h_p99": 95.74,
+        "h_p50": 15.27,
+        "h_p95": 54.5,
+        "h_p99": 77.1,
         "deep_verified": true
       },
       "info_public": {
         "op": "GET /System/Info/Public",
-        "h_p50": 0.1,
-        "h_p95": 48.16,
-        "h_p99": 48.62,
+        "h_p50": 0.08,
+        "h_p95": 27.86,
+        "h_p99": 28.04,
         "deep_verified": true
       },
       "item_ancestors": {
         "op": "GET /Items/{itemId}/Ancestors",
-        "h_p50": 40.65,
-        "h_p95": 105.68,
-        "h_p99": 130.87,
+        "h_p50": 78.95,
+        "h_p95": 132.71,
+        "h_p99": 171.26,
         "deep_verified": false
       },
       "item_critic_reviews": {
         "op": "GET /Items/{itemId}/CriticReviews",
-        "h_p50": 5.16,
-        "h_p95": 17.41,
-        "h_p99": 60.76,
+        "h_p50": 0.08,
+        "h_p95": 0.16,
+        "h_p99": 0.25,
         "deep_verified": true
       },
       "item_detail": {
         "op": "GET /Items/{itemId}",
-        "h_p50": 70.98,
-        "h_p95": 154.52,
-        "h_p99": 213.73,
+        "h_p50": 112.53,
+        "h_p95": 170.71,
+        "h_p99": 187.66,
         "deep_verified": false
       },
       "item_external_ids": {
         "op": "GET /Items/{itemId}/ExternalIdInfos",
-        "h_p50": 7.1,
-        "h_p95": 20.22,
-        "h_p99": 76.78,
+        "h_p50": 4.34,
+        "h_p95": 21.27,
+        "h_p99": 29.14,
         "deep_verified": false
+      },
+      "item_image_indexed": {
+        "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
+        "h_p50": 13.8,
+        "h_p95": 55.55,
+        "h_p99": 88.1,
+        "deep_verified": true
+      },
+      "item_image_parametrized": {
+        "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+        "h_p50": 12.3,
+        "h_p95": 47.65,
+        "h_p99": 99.18,
+        "deep_verified": true
       },
       "item_images": {
         "op": "GET /Items/{itemId}/Images",
-        "h_p50": 15.23,
-        "h_p95": 40.96,
-        "h_p99": 70.47,
+        "h_p50": 12.51,
+        "h_p95": 34.84,
+        "h_p99": 43.93,
         "deep_verified": true
       },
       "item_instant_mix": {
         "op": "GET /Items/{itemId}/InstantMix",
-        "h_p50": 8.35,
-        "h_p95": 55.66,
-        "h_p99": 126.91,
+        "h_p50": 16.11,
+        "h_p95": 60.47,
+        "h_p99": 85.69,
         "deep_verified": true
       },
       "item_intros": {
         "op": "GET /Items/{itemId}/Intros",
-        "h_p50": 7.55,
-        "h_p95": 23.25,
-        "h_p99": 121.09,
+        "h_p50": 4.1,
+        "h_p95": 18.65,
+        "h_p99": 32.43,
         "deep_verified": true
       },
       "item_local_trailers": {
         "op": "GET /Items/{itemId}/LocalTrailers",
-        "h_p50": 8.27,
-        "h_p95": 50.67,
-        "h_p99": 114.62,
+        "h_p50": 8.48,
+        "h_p95": 34.38,
+        "h_p99": 55.43,
         "deep_verified": true
       },
       "item_playbackinfo": {
         "op": "GET /Items/{itemId}/PlaybackInfo",
-        "h_p50": 15.28,
-        "h_p95": 35.88,
-        "h_p99": 135.97,
+        "h_p50": 19.54,
+        "h_p95": 60.43,
+        "h_p99": 97.23,
         "deep_verified": false
       },
       "item_similar": {
         "op": "GET /Items/{itemId}/Similar",
-        "h_p50": 29.07,
-        "h_p95": 60.66,
-        "h_p99": 76.25,
+        "h_p50": 31.94,
+        "h_p95": 67.76,
+        "h_p99": 75.01,
         "deep_verified": false
       },
       "item_similar_movie": {
         "op": "GET /Movies/{itemId}/Similar",
-        "h_p50": 19.04,
-        "h_p95": 107.76,
-        "h_p99": 205.73,
+        "h_p50": 32.13,
+        "h_p95": 90.01,
+        "h_p99": 116.11,
         "deep_verified": false
       },
       "item_special_features": {
         "op": "GET /Items/{itemId}/SpecialFeatures",
-        "h_p50": 8.26,
-        "h_p95": 57.04,
-        "h_p99": 138.29,
+        "h_p50": 7.77,
+        "h_p95": 37.52,
+        "h_p99": 71.47,
         "deep_verified": true
       },
       "item_theme_media": {
         "op": "GET /Items/{itemId}/ThemeMedia",
-        "h_p50": 11.06,
-        "h_p95": 60.96,
-        "h_p99": 185.75,
+        "h_p50": 17.83,
+        "h_p95": 62.5,
+        "h_p99": 106.07,
+        "deep_verified": true
+      },
+      "item_theme_songs": {
+        "op": "GET /Items/{itemId}/ThemeSongs",
+        "h_p50": 18.08,
+        "h_p95": 61.87,
+        "h_p99": 77.42,
+        "deep_verified": true
+      },
+      "item_theme_videos": {
+        "op": "GET /Items/{itemId}/ThemeVideos",
+        "h_p50": 16.55,
+        "h_p95": 64.74,
+        "h_p99": 78.23,
         "deep_verified": true
       },
       "item_userdata": {
         "op": "GET /UserItems/{itemId}/UserData",
-        "h_p50": 9.65,
-        "h_p95": 51.32,
-        "h_p99": 123.21,
+        "h_p50": 10.4,
+        "h_p95": 46.05,
+        "h_p99": 62.27,
         "deep_verified": true
       },
       "items_boxset": {
         "op": "GET /Items",
-        "h_p50": 26.83,
-        "h_p95": 74.13,
-        "h_p99": 87.61,
+        "h_p50": 15.21,
+        "h_p95": 42.32,
+        "h_p99": 52.62,
         "deep_verified": false
       },
       "items_counts": {
         "op": "GET /Items/Counts",
-        "h_p50": 21.9,
-        "h_p95": 57.3,
-        "h_p99": 71.08,
+        "h_p50": 11.05,
+        "h_p95": 28.9,
+        "h_p99": 36.09,
         "deep_verified": true
       },
       "items_datesort": {
         "op": "GET /Items",
-        "h_p50": 116.77,
-        "h_p95": 228.57,
-        "h_p99": 474.24,
+        "h_p50": 102.87,
+        "h_p95": 391.23,
+        "h_p99": 477.63,
         "deep_verified": false
       },
       "items_episodes": {
         "op": "GET /Items",
-        "h_p50": 117.41,
-        "h_p95": 302.34,
-        "h_p99": 424.76,
+        "h_p50": 112.44,
+        "h_p95": 302.77,
+        "h_p99": 447.02,
         "deep_verified": false
       },
       "items_favorite": {
         "op": "GET /Items",
-        "h_p50": 16.84,
-        "h_p95": 65.09,
-        "h_p99": 116.16,
+        "h_p50": 13.95,
+        "h_p95": 43.09,
+        "h_p99": 54.69,
         "deep_verified": false
       },
       "items_filters2": {
         "op": "GET /Items/Filters2",
-        "h_p50": 36.01,
-        "h_p95": 65.04,
-        "h_p99": 71.43,
+        "h_p50": 16.41,
+        "h_p95": 35.75,
+        "h_p99": 43.82,
         "deep_verified": true
       },
       "items_latest": {
         "op": "GET /Items/Latest",
-        "h_p50": 421.38,
-        "h_p95": 1098.66,
-        "h_p99": 1518.28,
+        "h_p50": 546.23,
+        "h_p95": 1606.73,
+        "h_p99": 2101.43,
         "deep_verified": false
       },
       "items_mixed": {
         "op": "GET /Items",
-        "h_p50": 204.27,
-        "h_p95": 595.95,
-        "h_p99": 682.19,
+        "h_p50": 141.21,
+        "h_p95": 285.66,
+        "h_p99": 476.94,
         "deep_verified": false
       },
       "items_paged": {
         "op": "GET /Items",
-        "h_p50": 56.8,
-        "h_p95": 116.58,
-        "h_p99": 143,
+        "h_p50": 45.43,
+        "h_p95": 83.55,
+        "h_p99": 111.06,
         "deep_verified": false
       },
       "items_random": {
         "op": "GET /Items",
-        "h_p50": 68.75,
-        "h_p95": 120.05,
-        "h_p99": 125.87,
+        "h_p50": 50.14,
+        "h_p95": 82.17,
+        "h_p99": 109.91,
         "deep_verified": false
       },
       "items_rating": {
         "op": "GET /Items",
-        "h_p50": 75.21,
-        "h_p95": 126.46,
-        "h_p99": 143.46,
+        "h_p50": 51.45,
+        "h_p95": 88.22,
+        "h_p99": 111.4,
         "deep_verified": false
       },
       "items_resume": {
         "op": "GET /UserItems/Resume",
-        "h_p50": 63.17,
-        "h_p95": 180.99,
-        "h_p99": 277.5,
+        "h_p50": 38.03,
+        "h_p95": 108.16,
+        "h_p99": 178.62,
         "deep_verified": true
       },
       "items_series": {
         "op": "GET /Items",
-        "h_p50": 305.82,
-        "h_p95": 944.85,
-        "h_p99": 1146.7,
+        "h_p50": 285.49,
+        "h_p95": 741.94,
+        "h_p99": 846.91,
         "deep_verified": false
       },
       "items_sortname": {
         "op": "GET /Items",
-        "h_p50": 113.63,
-        "h_p95": 205.59,
-        "h_p99": 360.65,
+        "h_p50": 97.45,
+        "h_p95": 237.34,
+        "h_p99": 313.18,
         "deep_verified": false
       },
       "livetv_channels": {
         "op": "GET /LiveTv/Channels",
-        "h_p50": 6.95,
-        "h_p95": 24.99,
-        "h_p99": 59.5,
+        "h_p50": 5.05,
+        "h_p95": 23.79,
+        "h_p99": 31.09,
         "deep_verified": true
       },
       "livetv_info": {
         "op": "GET /LiveTv/Info",
-        "h_p50": 7.38,
-        "h_p95": 23.87,
-        "h_p99": 49.71,
+        "h_p50": 5.35,
+        "h_p95": 21.67,
+        "h_p99": 44.59,
+        "deep_verified": true
+      },
+      "livetv_listing_default": {
+        "op": "GET /LiveTv/ListingProviders/Default",
+        "h_p50": 0.07,
+        "h_p95": 0.16,
+        "h_p99": 0.2,
         "deep_verified": true
       },
       "livetv_programs": {
         "op": "GET /LiveTv/Programs",
-        "h_p50": 6.02,
-        "h_p95": 19.21,
-        "h_p99": 69.59,
+        "h_p50": 4.93,
+        "h_p95": 26.13,
+        "h_p99": 44.07,
+        "deep_verified": true
+      },
+      "livetv_programs_recommended": {
+        "op": "GET /LiveTv/Programs/Recommended",
+        "h_p50": 2.16,
+        "h_p95": 21.79,
+        "h_p99": 46.11,
+        "deep_verified": true
+      },
+      "livetv_recording_folders": {
+        "op": "GET /LiveTv/Recordings/Folders",
+        "h_p50": 0.08,
+        "h_p95": 0.17,
+        "h_p99": 0.35,
+        "deep_verified": true
+      },
+      "livetv_recording_groups": {
+        "op": "GET /LiveTv/Recordings/Groups",
+        "h_p50": 0.07,
+        "h_p95": 0.14,
+        "h_p99": 0.23,
         "deep_verified": true
       },
       "livetv_recordings": {
         "op": "GET /LiveTv/Recordings",
-        "h_p50": 6.22,
-        "h_p95": 20.18,
-        "h_p99": 66.45,
+        "h_p50": 4.96,
+        "h_p95": 20.13,
+        "h_p99": 31.37,
+        "deep_verified": true
+      },
+      "livetv_recordings_series": {
+        "op": "GET /LiveTv/Recordings/Series",
+        "h_p50": 0.08,
+        "h_p95": 0.2,
+        "h_p99": 0.39,
         "deep_verified": true
       },
       "livetv_series_timers": {
         "op": "GET /LiveTv/SeriesTimers",
-        "h_p50": 6.03,
-        "h_p95": 18.38,
-        "h_p99": 95.64,
+        "h_p50": 4.44,
+        "h_p95": 15.43,
+        "h_p99": 24.92,
         "deep_verified": true
       },
       "livetv_timers": {
         "op": "GET /LiveTv/Timers",
-        "h_p50": 6.6,
-        "h_p95": 17.17,
-        "h_p99": 62.01,
+        "h_p50": 5.07,
+        "h_p95": 24.68,
+        "h_p99": 33.12,
         "deep_verified": true
       },
       "loc_countries": {
         "op": "GET /Localization/Countries",
-        "h_p50": 5.39,
-        "h_p95": 27.86,
-        "h_p99": 36.42,
+        "h_p50": 0.17,
+        "h_p95": 0.45,
+        "h_p99": 1.17,
         "deep_verified": true
       },
       "loc_options": {
         "op": "GET /Localization/Options",
-        "h_p50": 4.97,
-        "h_p95": 28.22,
-        "h_p99": 37.23,
+        "h_p50": 0.09,
+        "h_p95": 0.47,
+        "h_p99": 1.88,
         "deep_verified": true
       },
       "loc_parental": {
         "op": "GET /Localization/ParentalRatings",
-        "h_p50": 4.64,
-        "h_p95": 33.76,
-        "h_p99": 39.02,
+        "h_p50": 0.1,
+        "h_p95": 0.42,
+        "h_p99": 0.68,
         "deep_verified": true
       },
       "localization_cultures": {
         "op": "GET /Localization/Cultures",
-        "h_p50": 4.12,
-        "h_p95": 33.15,
-        "h_p99": 75.12,
+        "h_p50": 0.22,
+        "h_p95": 0.83,
+        "h_p99": 1.08,
         "deep_verified": true
       },
       "media_folders": {
         "op": "GET /Library/MediaFolders",
-        "h_p50": 24.87,
-        "h_p95": 230.34,
-        "h_p99": 354.18,
+        "h_p50": 39.75,
+        "h_p95": 310.82,
+        "h_p99": 528.78,
         "deep_verified": false
       },
       "media_segments": {
         "op": "GET /MediaSegments/{itemId}",
-        "h_p50": 10.4,
-        "h_p95": 60.42,
-        "h_p99": 133.15,
+        "h_p50": 14.97,
+        "h_p95": 54.15,
+        "h_p99": 88.83,
         "deep_verified": true
       },
       "metadata_options": {
         "op": "GET /System/Configuration/MetadataOptions/Default",
-        "h_p50": 7.37,
-        "h_p95": 29.51,
-        "h_p99": 35.45,
+        "h_p50": 0.08,
+        "h_p95": 0.21,
+        "h_p99": 0.58,
         "deep_verified": true
       },
       "movie_recommendations": {
         "op": "GET /Movies/Recommendations",
-        "h_p50": 146.23,
-        "h_p95": 248.67,
-        "h_p99": 259.42,
+        "h_p50": 196.63,
+        "h_p95": 248.93,
+        "h_p99": 273.24,
         "deep_verified": false
       },
       "music_genres": {
         "op": "GET /MusicGenres",
-        "h_p50": 24.44,
-        "h_p95": 60.14,
-        "h_p99": 89.12,
+        "h_p50": 13.83,
+        "h_p95": 27.93,
+        "h_p99": 35.69,
         "deep_verified": false
       },
       "nextup": {
         "op": "GET /Shows/NextUp",
-        "h_p50": 160.19,
-        "h_p95": 463.97,
-        "h_p99": 532.86,
+        "h_p50": 100.34,
+        "h_p95": 309.04,
+        "h_p99": 340.23,
         "deep_verified": true
       },
       "persons": {
         "op": "GET /Persons",
-        "h_p50": 179.15,
-        "h_p95": 324.06,
-        "h_p99": 391.45,
+        "h_p50": 118.22,
+        "h_p95": 267.71,
+        "h_p99": 793.29,
         "deep_verified": true
       },
       "physical_paths": {
         "op": "GET /Library/PhysicalPaths",
-        "h_p50": 11.12,
-        "h_p95": 54.69,
-        "h_p99": 74.47,
+        "h_p50": 26.53,
+        "h_p95": 62.3,
+        "h_p99": 77.23,
         "deep_verified": false
+      },
+      "playlist_detail": {
+        "op": "GET /Playlists/{playlistId}",
+        "h_p50": 29.27,
+        "h_p95": 89.54,
+        "h_p99": 122.84,
+        "deep_verified": true
+      },
+      "playlist_items": {
+        "op": "GET /Playlists/{playlistId}/Items",
+        "h_p50": 65.04,
+        "h_p95": 181.15,
+        "h_p99": 427.37,
+        "deep_verified": true
+      },
+      "playlist_users": {
+        "op": "GET /Playlists/{playlistId}/Users",
+        "h_p50": 5.37,
+        "h_p95": 29.57,
+        "h_p99": 62.06,
+        "deep_verified": true
       },
       "plugins": {
         "op": "GET /Plugins",
-        "h_p50": 4.25,
-        "h_p95": 34.5,
-        "h_p99": 94.08,
+        "h_p50": 0.09,
+        "h_p95": 0.28,
+        "h_p99": 0.45,
         "deep_verified": false
       },
       "quick_connect": {
         "op": "GET /QuickConnect/Enabled",
-        "h_p50": 2.26,
-        "h_p95": 13.71,
-        "h_p99": 21.47,
+        "h_p50": 0.09,
+        "h_p95": 0.23,
+        "h_p99": 0.55,
+        "deep_verified": true
+      },
+      "scheduled_task_detail": {
+        "op": "GET /ScheduledTasks/{taskId}",
+        "h_p50": 0.09,
+        "h_p95": 0.19,
+        "h_p99": 0.28,
         "deep_verified": true
       },
       "scheduled_tasks": {
         "op": "GET /ScheduledTasks",
-        "h_p50": 3.78,
-        "h_p95": 39.06,
-        "h_p99": 129.02,
+        "h_p50": 0.13,
+        "h_p95": 0.34,
+        "h_p99": 0.49,
         "deep_verified": false
       },
       "search_hints": {
         "op": "GET /Search/Hints",
-        "h_p50": 44.37,
-        "h_p95": 83.2,
-        "h_p99": 95.79,
+        "h_p50": 14.42,
+        "h_p95": 29.23,
+        "h_p99": 38.1,
         "deep_verified": false
       },
       "sessions": {
         "op": "GET /Sessions",
-        "h_p50": 6.17,
-        "h_p95": 79.96,
-        "h_p99": 147.4,
+        "h_p50": 6.19,
+        "h_p95": 70.4,
+        "h_p99": 118.2,
+        "deep_verified": true
+      },
+      "shows_episodes": {
+        "op": "GET /Shows/{seriesId}/Episodes",
+        "h_p50": 48.82,
+        "h_p95": 117.41,
+        "h_p99": 133.03,
+        "deep_verified": true
+      },
+      "shows_seasons": {
+        "op": "GET /Shows/{seriesId}/Seasons",
+        "h_p50": 96.09,
+        "h_p95": 172.41,
+        "h_p99": 209.58,
+        "deep_verified": true
+      },
+      "startup_config": {
+        "op": "GET /Startup/Configuration",
+        "h_p50": 0.06,
+        "h_p95": 0.16,
+        "h_p99": 0.31,
+        "deep_verified": true
+      },
+      "startup_first_user": {
+        "op": "GET /Startup/FirstUser",
+        "h_p50": 5.09,
+        "h_p95": 24.63,
+        "h_p99": 66.47,
+        "deep_verified": true
+      },
+      "startup_user": {
+        "op": "GET /Startup/User",
+        "h_p50": 4.94,
+        "h_p95": 32.39,
+        "h_p99": 75.36,
         "deep_verified": true
       },
       "studios": {
         "op": "GET /Studios",
-        "h_p50": 119.47,
-        "h_p95": 240.14,
-        "h_p99": 273.03,
+        "h_p50": 65.16,
+        "h_p95": 165.39,
+        "h_p99": 186.28,
         "deep_verified": false
       },
       "suggestions": {
         "op": "GET /Items/Suggestions",
-        "h_p50": 130.13,
-        "h_p95": 205.63,
-        "h_p99": 262.06,
+        "h_p50": 193.3,
+        "h_p95": 262.53,
+        "h_p99": 304.23,
         "deep_verified": false
       },
       "syncplay_list": {
         "op": "GET /SyncPlay/List",
-        "h_p50": 9.82,
-        "h_p95": 25.33,
-        "h_p99": 49.37,
+        "h_p50": 5.73,
+        "h_p95": 23.37,
+        "h_p99": 32.85,
         "deep_verified": true
       },
       "system_config": {
         "op": "GET /System/Configuration",
-        "h_p50": 7.86,
-        "h_p95": 27.24,
-        "h_p99": 36.6,
+        "h_p50": 0.11,
+        "h_p95": 0.22,
+        "h_p99": 0.55,
         "deep_verified": false
+      },
+      "system_config_key": {
+        "op": "GET /System/Configuration/{key}",
+        "h_p50": 0.12,
+        "h_p95": 0.26,
+        "h_p99": 0.57,
+        "deep_verified": true
       },
       "system_endpoint": {
         "op": "GET /System/Endpoint",
-        "h_p50": 4.23,
-        "h_p95": 47,
-        "h_p99": 73.76,
+        "h_p50": 0.07,
+        "h_p95": 0.3,
+        "h_p99": 0.56,
         "deep_verified": true
       },
       "system_info": {
         "op": "GET /System/Info",
-        "h_p50": 4.9,
-        "h_p95": 29.55,
-        "h_p99": 105,
+        "h_p50": 0.09,
+        "h_p95": 0.29,
+        "h_p99": 0.36,
         "deep_verified": true
       },
       "system_logs": {
         "op": "GET /System/Logs",
-        "h_p50": 5.03,
-        "h_p95": 25.7,
-        "h_p99": 35.26,
+        "h_p50": 0.12,
+        "h_p95": 0.34,
+        "h_p99": 0.85,
         "deep_verified": false
       },
       "system_ping": {
         "op": "GET /System/Ping",
-        "h_p50": 5.14,
-        "h_p95": 16.93,
-        "h_p99": 22.43,
+        "h_p50": 0.09,
+        "h_p95": 0.19,
+        "h_p99": 1.01,
         "deep_verified": false
       },
       "system_storage": {
         "op": "GET /System/Info/Storage",
-        "h_p50": 15.98,
-        "h_p95": 48.76,
-        "h_p99": 66.71,
+        "h_p50": 20.6,
+        "h_p95": 52.84,
+        "h_p99": 64.43,
         "deep_verified": false
+      },
+      "tmdb_config": {
+        "op": "GET /Tmdb/ClientConfiguration",
+        "h_p50": 0.07,
+        "h_p95": 0.16,
+        "h_p99": 0.28,
+        "deep_verified": true
       },
       "upcoming": {
         "op": "GET /Shows/Upcoming",
-        "h_p50": 99.47,
-        "h_p95": 262.05,
-        "h_p99": 449.53,
+        "h_p50": 21.96,
+        "h_p95": 67.07,
+        "h_p99": 113.45,
+        "deep_verified": true
+      },
+      "user_by_id": {
+        "op": "GET /Users/{userId}",
+        "h_p50": 7.6,
+        "h_p95": 59.38,
+        "h_p99": 117.08,
         "deep_verified": true
       },
       "user_me": {
         "op": "GET /Users/Me",
-        "h_p50": 7.55,
-        "h_p95": 91.95,
-        "h_p99": 160.15,
+        "h_p50": 5.18,
+        "h_p95": 44,
+        "h_p99": 74.65,
         "deep_verified": true
       },
       "user_views": {
         "op": "GET /UserViews",
-        "h_p50": 21.14,
-        "h_p95": 220.96,
-        "h_p99": 331.35,
+        "h_p50": 59.88,
+        "h_p95": 182.64,
+        "h_p99": 285.34,
         "deep_verified": false
       },
       "users_all": {
         "op": "GET /Users",
-        "h_p50": 10.32,
-        "h_p95": 52.64,
-        "h_p99": 74.24,
+        "h_p50": 22.29,
+        "h_p95": 49.78,
+        "h_p99": 70.52,
         "deep_verified": true
       },
       "users_public": {
         "op": "GET /Users/Public",
-        "h_p50": 7.76,
-        "h_p95": 36.34,
-        "h_p99": 69.6,
+        "h_p50": 21.72,
+        "h_p95": 49.64,
+        "h_p99": 60.27,
         "deep_verified": true
       },
       "utc_time": {
         "op": "GET /GetUtcTime",
-        "h_p50": 2.57,
-        "h_p95": 12.2,
-        "h_p99": 26.11,
+        "h_p50": 0.08,
+        "h_p95": 0.32,
+        "h_p99": 0.83,
+        "deep_verified": true
+      },
+      "video_additional_parts": {
+        "op": "GET /Videos/{itemId}/AdditionalParts",
+        "h_p50": 6.81,
+        "h_p95": 35.97,
+        "h_p99": 56.37,
         "deep_verified": true
       },
       "virtual_folders": {
         "op": "GET /Library/VirtualFolders",
-        "h_p50": 6.4,
-        "h_p95": 130.27,
-        "h_p99": 179.23,
+        "h_p50": 14.65,
+        "h_p95": 221.88,
+        "h_p99": 230.51,
         "deep_verified": true
       },
       "years": {
         "op": "GET /Years",
-        "h_p50": 103.71,
-        "h_p95": 162.73,
-        "h_p99": 205.29,
+        "h_p50": 81.96,
+        "h_p95": 178.65,
+        "h_p99": 202.92,
         "deep_verified": false
       }
     }
