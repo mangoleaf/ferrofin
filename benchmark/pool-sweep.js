@@ -6,7 +6,7 @@
 //   POOL=8 BASE_URL=http://localhost:18296 k6 run pool-sweep.js
 import http from 'k6/http';
 import { Trend, Rate } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
+import { ENDPOINTS, fire, okStatus, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
 
 const BASE = __ENV.BASE_URL;
 const POOL = __ENV.POOL || '?';
@@ -37,15 +37,16 @@ export function setup() {
 
   const warmUntil = Date.now() + (parseInt(__ENV.BENCH_WARMUP_SECONDS || '10', 10) * 1000);
   while (Date.now() < warmUntil)
-    for (const e of ENDPOINTS) http.get(`${BASE}${e.path(ctx)}`, e.auth === false ? {} : tokenHeaders(ctx.token));
+    for (const e of ENDPOINTS) { if (!e.scenario) fire(BASE, e, ctx); }
   return ctx;
 }
 
 export default function (ctx) {
   for (const e of ENDPOINTS) {
-    const r = http.get(`${BASE}${e.path(ctx)}`, e.auth === false ? {} : tokenHeaders(ctx.token));
-    okRates[e.name].add(r.status === 200);
-    if (r.status === 200) trends[e.name].add(r.timings.duration);
+    if (e.scenario) continue;                     // own-window rows (auth_login) skip the mixed loop
+    const r = fire(BASE, e, ctx);
+    okRates[e.name].add(r.status === okStatus(e));
+    if (r.status === okStatus(e)) trends[e.name].add(r.timings.duration);
   }
 }
 

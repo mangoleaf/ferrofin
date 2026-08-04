@@ -16,6 +16,20 @@ export function tokenHeaders(token) {
   return { headers: { Authorization: `MediaBrowser Token="${token}", ${CLIENT_ID}`, 'Content-Type': 'application/json' } };
 }
 
+// One request for any ENDPOINTS entry — method/body/header aware, so every script
+// (scenario, phases, pool-sweep, perf-gate) drives GET and write rows identically.
+export function fire(base, e, ctx) {
+  const params = e.auth === false
+    ? { headers: { 'Content-Type': 'application/json' } }
+    : tokenHeaders(ctx.token);
+  if (e.headers) Object.assign(params.headers, e.headers());
+  const body = e.body ? JSON.stringify(e.body(ctx)) : null;
+  return http.request(e.method || 'GET', `${base}${e.path(ctx)}`, body, params);
+}
+
+// A row's success status: 200 unless the entry says otherwise (204 for playstate writes).
+export function okStatus(e) { return e.ok || 200; }
+
 export function authenticate(base, target) {
   const r = http.post(`${base}/Users/AuthenticateByName`,
     JSON.stringify({ Username: USER, Pw: PASS }),
@@ -110,7 +124,30 @@ export function bringUp(base, target, expected) {
   return ctx;
 }
 
-// The read (GET) endpoints both scripts exercise. `path(ctx)` templates per-server ids.
+// The body item_playbackinfo_post sends: jellyfin-web's shape with its default 120 Mbps
+// streaming cap — a realistic client profile, small enough to keep the row about the server.
+const PLAYBACK_INFO_BODY = {
+  MaxStreamingBitrate: 120000000,
+  AutoOpenLiveStream: false,
+  DeviceProfile: {
+    MaxStreamingBitrate: 120000000,
+    DirectPlayProfiles: [
+      { Container: 'mp4,m4v', Type: 'Video', VideoCodec: 'h264,hevc', AudioCodec: 'aac,mp3,opus' },
+      { Container: 'mkv', Type: 'Video', VideoCodec: 'h264,hevc', AudioCodec: 'aac,mp3,opus' },
+    ],
+    TranscodingProfiles: [
+      { Container: 'ts', Type: 'Video', VideoCodec: 'h264', AudioCodec: 'aac', Context: 'Streaming', Protocol: 'hls', MinSegments: 1 },
+    ],
+    CodecProfiles: [],
+    SubtitleProfiles: [{ Format: 'vtt', Method: 'External' }],
+  },
+};
+
+// The endpoints both scripts exercise. `path(ctx)` templates per-server ids. Optional per
+// entry: `method` (default GET), `body(ctx)` (JSON-encoded), `ok` (expected status, default
+// 200), `headers()` (merged over the auth headers), `scenario` (run in a separate k6
+// scenario window instead of the mixed loop — see scenario.js). Keep entries ONE PER LINE:
+// suite/gen-registry.py parses this array line-wise.
 // image is best-effort in the load bench; parity skips it (binary — resize output differs by lib).
 export const ENDPOINTS = [
   // Framework floor — near-zero work, isolates routing/serialization overhead.
@@ -272,6 +309,23 @@ export const ENDPOINTS = [
   { name: 'livetv_recordings_series', path: (c) => `/LiveTv/Recordings/Series?userId=${c.userId}` },
   { name: 'livetv_recording_groups', path: () => '/LiveTv/Recordings/Groups' },
   { name: 'livetv_listing_default', path: () => '/LiveTv/ListingProviders/Default' },
+
+  // ── Write surface (2026-08, tiers 1–2: read-shaped POSTs + idempotent upserts).
+  // Rules that keep write rows honest in the mixed loop (see README "Write rows"):
+  //   - state writes target c.writeItemId (LAST movie by SortName), never the read
+  //     rows' c.itemId, so write traffic can't drift a read row's body mid-window;
+  //   - bodies are fixed and state-preserving (position 0, unplayed defaults) — each
+  //     request re-asserts the same state, so the row measures the steady-state upsert;
+  //   - merge.py exempts non-GET ops from the body-shape fingerprint; their honesty
+  //     gate is the parity write JOURNEY (deep_verified) + 100% expected-status.
+  { name: 'item_playbackinfo_post', method: 'POST', path: (c) => `/Items/${c.itemId}/PlaybackInfo?userId=${c.userId}`, body: () => PLAYBACK_INFO_BODY },
+  { name: 'playstate_progress', method: 'POST', ok: 204, path: () => '/Sessions/Playing/Progress', body: (c) => ({ ItemId: c.writeItemId, PositionTicks: 0, IsPaused: false, PlayMethod: 'DirectPlay' }) },
+  { name: 'item_userdata_post', method: 'POST', path: (c) => `/UserItems/${c.writeItemId}/UserData?userId=${c.userId}`, body: () => ({ PlaybackPositionTicks: 0, Played: false, IsFavorite: false }) },
+  // Login storm — runs in its OWN scenario window AFTER the mixed loop (scenario.js):
+  // PBKDF2 is CPU-bound and every login invalidates the server-side auth cache, so
+  // in-loop it would poison every other row on both servers. Per-VU DeviceId: reusing
+  // the main "bench" DeviceId would revoke the measurement token mid-run (suite/lib.sh M7).
+  { name: 'auth_login', method: 'POST', auth: false, scenario: 'login', path: () => '/Users/AuthenticateByName', body: () => ({ Username: USER, Pw: PASS }), headers: () => ({ Authorization: `MediaBrowser Client="bench", Device="bench", DeviceId="bench-login-${__VU}", Version="1.0"` }) },
 ];
 
 // Resolves the extra context ids the expanded endpoint set needs, after auth +
@@ -290,5 +344,12 @@ export function enrichContext(base, ctx) {
   ctx.imageTag = withImage ? withImage.ImageTags.Primary : '0';
   const created = http.post(`${base}/Playlists`, JSON.stringify({ Name: 'bench-playlist', UserId: ctx.userId, Ids: ctx.itemId ? [ctx.itemId] : [] }), h);
   ctx.playlistId = created.status < 300 ? (created.json().Id || '') : '';
+  // Write rows target the LAST movie by SortName — never ctx.itemId (the read rows'
+  // item), so write traffic can't drift a read row's body/fingerprint.
+  const movieList = img.Items || [];
+  ctx.writeItemId = movieList.length ? movieList[movieList.length - 1].Id : ctx.itemId;
+  // One playstate start so playstate_progress measures the steady-state upsert, not a
+  // first-report session create. Best-effort like the playlist (204 on both servers).
+  http.post(`${base}/Sessions/Playing`, JSON.stringify({ ItemId: ctx.writeItemId, PositionTicks: 0, CanSeek: true, PlayMethod: 'DirectPlay' }), h);
   return ctx;
 }

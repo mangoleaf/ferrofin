@@ -132,8 +132,9 @@ ${WARN}
 ${TABLE}
 
 > "speedup" = Jellyfin p50 ÷ Hermit p50 (>1 means Hermit is faster). Latency is recorded for
-> 200 responses only; a 200-rate below 100% means that endpoint partly errored on that server —
-> treat its row as a parity bug to chase, not a performance signal.
+> expected-status responses only (200, or 204 for the playstate write); a rate below 100% means
+> that endpoint partly errored on that server — treat its row as a parity bug to chase, not a
+> performance signal.
 
 ## Footprint
 

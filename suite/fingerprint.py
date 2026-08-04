@@ -74,6 +74,11 @@ def capture(base, out):
     fp = {}
     for entry in reg:
         op = entry["op"]
+        if not op.startswith("GET "):
+            # Write ops are fingerprint-exempt BY DESIGN (a probe would mutate state,
+            # and their bodies mint per-run tokens/timestamps); merge.py gates them on
+            # the parity write journey (deep_verified) + expected-status instead.
+            continue
         path = op.split(" ", 1)[1]
         for var, val in fills.items():
             if val:

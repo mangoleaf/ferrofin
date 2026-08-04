@@ -30,6 +30,10 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
   deep-verified that op, both servers answered 200, and the body didn't drift since the parity pass
   (`suite/fingerprint.py`). Median-speedup / win-rate are computed over comparable rows **only** —
   so "Hermit got slower" can't secretly mean "Hermit started doing the work correctly."
+- **Write (non-GET) rows are fingerprint-exempt by design** — a fingerprint probe would itself
+  mutate state, and write bodies mint per-run tokens/timestamps. Their honesty gate instead:
+  `deep_verified` must come from the parity **write journey**, and both servers must hit 100%
+  expected-status (204 for playstate) during the bench. See `benchmark/README.md` "Write rows".
 - **A win means p50 AND p95 AND p99.** A p50 win with a tail regression is surfaced as `tail_loss`,
   never folded into "faster" (median-only boards hid 2× p99 regressions before).
 - **`suite/run.sh gate`** fails on a >1.5× latency regression *or* when a previously deep-verified

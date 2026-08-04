@@ -23,6 +23,30 @@ vs C# actually differs):
 | `GET /Items` (Episode) | episode-shaped DTOs + the Series/Season/Episode resolver (needs `REAL_TV_DIR`) |
 | `GET /Items/{id}` | single-item DTO build |
 | `GET /Items/{id}/Images/Primary` | image serve + resize (`hermit-drawing`) — see caveat |
+| `POST /Items/{id}/PlaybackInfo` | the hottest real-client POST: play-decision + MediaSource build |
+| `POST /Sessions/Playing/Progress` | the media-server write path — clients report every ~10 s |
+| `POST /UserItems/{id}/UserData` | idempotent user-data upsert |
+| `POST /Users/AuthenticateByName` | login storm: PBKDF2 + token mint + the SQLite single-writer |
+
+### Write rows (the POST entries above)
+
+Writes in a 30 s constant load would normally mutate the fixture mid-measurement and corrupt
+every other row. The write rows dodge that by construction (rules enforced in `bench-lib.js`):
+
+- **State writes target the LAST movie by SortName** (`ctx.writeItemId`), never the first
+  (`ctx.itemId`) that all the read rows key on — write traffic can't drift a read row's body.
+- **Bodies are fixed and state-preserving** (position 0, unplayed defaults): every request
+  re-asserts the same state, so the row measures the steady-state upsert, and the library
+  looks the same after the run as before it.
+- **`auth_login` runs in its own scenario window after the mixed loop drains** (PBKDF2
+  saturates CPU and each login invalidates the server-side auth cache — in-loop it would
+  poison every other row). Knobs: `BENCH_LOGIN_VUS` (default 10 — 50 concurrent PBKDF2s on
+  4 cores would measure pure CPU queueing) × `BENCH_LOGIN_DURATION` (default 15s). It uses a
+  per-VU DeviceId: reusing the main `bench` DeviceId would revoke the measurement token.
+- **Success for a write row is its contract status** (204 for playstate progress), not 200.
+- In the merged suite record they are **fingerprint-exempt**: `suite/merge.py` gates them on
+  the parity **write journey** (`deep_verified`) + 100% expected-status instead of the
+  body-shape fingerprint (which a probe would itself mutate state to capture).
 
 Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 

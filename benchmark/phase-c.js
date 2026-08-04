@@ -5,7 +5,7 @@
 // scanned), so run-phase-c.sh can read cgroup memory.peak around the load window.
 import http from 'k6/http';
 import { Trend, Rate } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, authenticate } from './bench-lib.js';
+import { ENDPOINTS, fire, okStatus, tokenHeaders, authenticate } from './bench-lib.js';
 
 const TARGET = __ENV.TARGET;
 const BASE = __ENV.BASE_URL;
@@ -34,14 +34,17 @@ export function setup() {
   ctx.itemId = list[0] ? list[0].Id : '';
   const withImage = list.find((i) => i.ImageTags && i.ImageTags.Primary);
   ctx.imageItemId = withImage ? withImage.Id : ctx.itemId;
+  // Write rows' target (phase-c skips enrichContext): same last-movie pick as there.
+  ctx.writeItemId = list.length ? list[list.length - 1].Id : ctx.itemId;
   return ctx;
 }
 
 export default function (ctx) {
   for (const e of ENDPOINTS) {
-    const r = http.get(`${BASE}${e.path(ctx)}`, e.auth === false ? {} : tokenHeaders(ctx.token));
-    oks[e.name].add(r.status === 200);
-    if (r.status === 200) trends[e.name].add(r.timings.duration);
+    if (e.scenario) continue;                     // own-window rows (auth_login) skip the mixed loop
+    const r = fire(BASE, e, ctx);
+    oks[e.name].add(r.status === okStatus(e));
+    if (r.status === okStatus(e)) trends[e.name].add(r.timings.duration);
   }
 }
 

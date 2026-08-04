@@ -15,7 +15,7 @@
 // it can attribute CPU-seconds-per-request. This script only measures latency.
 import http from 'k6/http';
 import { Trend, Counter } from 'k6/metrics';
-import { ENDPOINTS, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
+import { ENDPOINTS, fire as fireEndpoint, okStatus, tokenHeaders, authenticate, enrichContext } from './bench-lib.js';
 
 const TARGET = __ENV.TARGET;
 const BASE = __ENV.BASE_URL;
@@ -67,12 +67,12 @@ export function setup() {
 
 function fire(ctx) {
   if (!ep) throw new Error(`unknown endpoint: ${NAME}`);
-  return http.get(`${BASE}${ep.path(ctx)}`, ep.auth === false ? {} : tokenHeaders(ctx.token));
+  return fireEndpoint(BASE, ep, ctx);
 }
 export function warm(ctx) { fire(ctx); }          // warm-up: not recorded
 export function hit(ctx) {
   const r = fire(ctx);
-  if (r.status === 200) { lat.add(r.timings.duration); ok.add(1); }
+  if (r.status === okStatus(ep)) { lat.add(r.timings.duration); ok.add(1); }
 }
 
 export function handleSummary(data) {

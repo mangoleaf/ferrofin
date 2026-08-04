@@ -23,6 +23,7 @@ OUT = Path(__file__).resolve().parent / "registry.json"
 PATH_VARS = {
     "c.itemId": "{itemId}",
     "c.imageItemId": "{itemId}",
+    "c.writeItemId": "{itemId}",
     "c.seriesId": "{seriesId}",
     "c.playlistId": "{playlistId}",
     "c.taskId": "{taskId}",
@@ -54,16 +55,23 @@ def normalize(tmpl: str):
 
 
 def parse_endpoints():
-    """Pull {name, path-template} out of the ENDPOINTS array in bench-lib.js."""
+    """Pull (name, method, path-template) out of the ENDPOINTS array in bench-lib.js.
+
+    Parsed LINE-WISE (entries are one per line by convention, stated in bench-lib):
+    a cross-entry regex with an optional `method:` group could otherwise swallow a
+    neighboring entry's fields. `method` defaults to GET when absent.
+    """
     text = BENCH_LIB.read_text()
     block = text[text.index("export const ENDPOINTS"):]
+    block = block[:block.index("\n];")]
     out = []
-    # name: 'x', ... path: () => '...' | (c) => `...`
-    for m in re.finditer(
-        r"name:\s*'(\w+)'.*?path:\s*\([^)]*\)\s*=>\s*(`[^`]*`|'[^']*')",
-        block, re.DOTALL):
-        name, raw = m.group(1), m.group(2)[1:-1]
-        out.append((name, raw))
+    for line in block.splitlines():
+        name = re.search(r"name:\s*'(\w+)'", line)
+        path = re.search(r"path:\s*\([^)]*\)\s*=>\s*(`[^`]*`|'[^']*')", line)
+        if not (name and path):
+            continue
+        method = re.search(r"method:\s*'(\w+)'", line)
+        out.append((name.group(1), method.group(1) if method else "GET", path.group(1)[1:-1]))
     return out
 
 
@@ -71,8 +79,8 @@ def main():
     spec = json.loads(SPEC.read_text())
     paths = spec["paths"]
 
-    def tag_for(op_path):
-        node = paths.get(op_path, {}).get("get", {})
+    def tag_for(op_path, method):
+        node = paths.get(op_path, {}).get(method.lower(), {})
         tags = node.get("tags") or []
         return tags[0] if tags else "_untagged"
 
@@ -84,17 +92,17 @@ def main():
                 existing[v["id"]] = v
 
     by_op, unmatched = {}, []
-    for name, tmpl in parse_endpoints():
+    for name, method, tmpl in parse_endpoints():
         op_path, query = normalize(tmpl)
         op_path = OP_OVERRIDES.get(op_path, op_path)
-        opkey = f"GET {op_path}"
-        if op_path not in paths or "get" not in paths[op_path]:
+        opkey = f"{method} {op_path}"
+        if op_path not in paths or method.lower() not in paths[op_path]:
             unmatched.append((name, opkey))
             continue
         variant = {"id": name, "params": query, "load": "default"}
         if name in existing and "was" in existing[name]:
             variant["was"] = existing[name]["was"]
-        by_op.setdefault(opkey, {"op": opkey, "tag": tag_for(op_path), "variants": []})
+        by_op.setdefault(opkey, {"op": opkey, "tag": tag_for(op_path, method), "variants": []})
         by_op[opkey]["variants"].append(variant)
 
     if unmatched:

@@ -1200,6 +1200,50 @@
           "load": "default"
         }
       ]
+    },
+    {
+      "op": "POST /Items/{itemId}/PlaybackInfo",
+      "tag": "MediaInfo",
+      "variants": [
+        {
+          "id": "item_playbackinfo_post",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "POST /Sessions/Playing/Progress",
+      "tag": "Playstate",
+      "variants": [
+        {
+          "id": "playstate_progress",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "POST /UserItems/{itemId}/UserData",
+      "tag": "Items",
+      "variants": [
+        {
+          "id": "item_userdata_post",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "POST /Users/AuthenticateByName",
+      "tag": "User",
+      "variants": [
+        {
+          "id": "auth_login",
+          "params": "",
+          "load": "default"
+        }
+      ]
     }
   ]
 }

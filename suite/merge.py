@@ -181,7 +181,11 @@ def main():
         if deep:
             deep_ops.add(op)
 
-        drift = op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
+        # Write (non-GET) rows are fingerprint-exempt: fingerprint.py never captures
+        # them (a probe would mutate state), so their honesty gate is deep_verified —
+        # the parity WRITE JOURNEY — plus the 100% expected-status check below.
+        is_write = not op.startswith("GET ")
+        drift = (not is_write) and op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
         both_ok = p.get("h_ok") == 100 and p.get("j_ok") == 100
         have_lat = p["h_p50"] is not None and p["j_p50"] is not None
         comparable = deep and both_ok and have_lat and not drift
