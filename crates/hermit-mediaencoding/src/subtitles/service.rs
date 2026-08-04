@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use crate::error::MediaEncodingError;
 use async_trait::async_trait;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::MediaStreamType;
@@ -121,7 +122,7 @@ where
                 preserve_original_timestamps,
             )
             .await
-            .map_err(ServiceError::backend)
+            .map_err(|e| MediaEncodingError::process(e).into())
     }
 
     async fn get_subtitle_file_character_set(
@@ -133,7 +134,7 @@ where
         self.encoder
             .get_subtitle_file_character_set(subtitle_stream)
             .await
-            .map_err(ServiceError::backend)
+            .map_err(|e| MediaEncodingError::process(e).into())
     }
 
     async fn get_subtitle_file_path(
@@ -144,7 +145,7 @@ where
         self.encoder
             .get_subtitle_file_path(media_source, subtitle_stream)
             .await
-            .map_err(ServiceError::backend)
+            .map_err(|e| MediaEncodingError::process(e).into())
     }
 
     async fn extract_all_extractable_subtitles(

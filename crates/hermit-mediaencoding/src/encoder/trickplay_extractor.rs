@@ -23,6 +23,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::error::MediaEncodingError;
 use async_trait::async_trait;
 use hermit_traits::error::ServiceError;
 use hermit_traits::media_encoding::TrickplayFrameExtractor;
@@ -85,10 +86,7 @@ pub fn build_trickplay_args(
 /// Lists the `.jpg` files directly inside `dir`, sorted by file name.
 fn jpg_files_sorted(dir: &Path) -> Result<Vec<String>, ServiceError> {
     let entries = std::fs::read_dir(dir).map_err(|e| {
-        ServiceError::backend(format!(
-            "cannot read frame directory {}: {e}",
-            dir.display()
-        ))
+        MediaEncodingError::io(format!("cannot read frame directory {}", dir.display()), e)
     })?;
     let mut frames: Vec<String> = entries
         .filter_map(Result::ok)
@@ -128,7 +126,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
 
         let dir = Path::new(output_dir);
         std::fs::create_dir_all(dir).map_err(|e| {
-            ServiceError::backend(format!("cannot create frame directory {output_dir}: {e}"))
+            MediaEncodingError::io(format!("cannot create frame directory {output_dir}"), e)
         })?;
 
         let output_pattern = dir.join("%08d.jpg");
@@ -148,7 +146,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
             .transcoder
             .get_process_output(&self.ffmpeg_path, &args, true, None)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
 
         let frames = jpg_files_sorted(dir)?;
         if frames.is_empty() {

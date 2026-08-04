@@ -47,6 +47,18 @@ pub enum ServiceError {
     /// transcode subprocess, …) that has no more specific variant.
     #[error("backend error: {0}")]
     Backend(String),
+
+    /// A backend/infrastructure failure that preserves the underlying error's
+    /// [`source`](std::error::Error::source) chain instead of flattening it to a
+    /// message like [`Backend`](Self::Backend).
+    ///
+    /// Subsystem crates (`hermit-drawing`, `hermit-mediaencoding`, …) define
+    /// their own typed `thiserror` error and convert it into this variant via
+    /// [`From`], so the original cause — an `io::Error`, an ffprobe parse
+    /// failure, an HTTP transport error — stays inspectable through
+    /// `Error::source()`. Maps to the same HTTP `500` as [`Backend`](Self::Backend).
+    #[error(transparent)]
+    BackendSource(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl ServiceError {
@@ -76,6 +88,12 @@ impl ServiceError {
     /// Constructs a [`ServiceError::Backend`] from anything string-like.
     pub fn backend(why: impl Into<String>) -> Self {
         Self::Backend(why.into())
+    }
+
+    /// Constructs a [`ServiceError::BackendSource`] that preserves `source` as
+    /// the error's [`source`](std::error::Error::source) chain.
+    pub fn backend_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::BackendSource(Box::new(source))
     }
 }
 
@@ -114,5 +132,26 @@ mod tests {
             "not found: item 42"
         );
         assert_eq!(ServiceError::backend("io").to_string(), "backend error: io");
+    }
+
+    #[test]
+    fn backend_source_preserves_the_source_chain() {
+        use std::error::Error as _;
+
+        // Stands in for a subsystem crate's typed error that wraps a lower-level
+        // cause via `#[source]` — the shape `From<XError> for ServiceError` feeds
+        // into `BackendSource`.
+        #[derive(Debug, thiserror::Error)]
+        #[error("decode failed")]
+        struct Subsystem(#[source] std::io::Error);
+
+        let cause = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
+        let err = ServiceError::backend_source(Subsystem(cause));
+
+        // `transparent` delegates Display to the wrapped subsystem error…
+        assert_eq!(err.to_string(), "decode failed");
+        // …and keeps its `#[source]` cause reachable through the chain.
+        assert_eq!(err.source().unwrap().to_string(), "missing file");
+        assert!(matches!(err, ServiceError::BackendSource(_)));
     }
 }

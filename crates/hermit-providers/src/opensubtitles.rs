@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use crate::error::ProvidersError;
 use async_trait::async_trait;
 use hermit_model::providers::RemoteSubtitleInfo;
 use hermit_traits::error::ServiceError;
@@ -23,6 +24,7 @@ use hermit_traits::plugins::PluginManager;
 use hermit_traits::subtitles::{
     SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -42,22 +44,22 @@ const USER_AGENT: &str = concat!("Hermit/", env!("CARGO_PKG_VERSION"));
 ///
 /// Serialized as the plugin's opaque config bytes; PascalCase mirrors the C#
 /// plugin's `PluginConfiguration` field names so a dashboard config page maps 1:1.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct OpenSubtitlesConfig {
     /// The consumer API key from the caller's opensubtitles.com registration.
-    pub api_key: String,
+    pub api_key: SecretString,
     /// The account username.
     pub username: String,
     /// The account password.
-    pub password: String,
+    pub password: SecretString,
 }
 
 impl OpenSubtitlesConfig {
     /// Whether enough is configured to talk to the API (an API key at minimum).
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        !self.api_key.is_empty()
+        !self.api_key.expose_secret().is_empty()
     }
 }
 
@@ -247,23 +249,23 @@ impl OpenSubtitlesProvider {
         let resp = self
             .http
             .post(format!("{API_BASE}/login"))
-            .header("Api-Key", &cfg.api_key)
+            .header("Api-Key", cfg.api_key.expose_secret())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&LoginRequest {
                 username: &cfg.username,
-                password: &cfg.password,
+                password: cfg.password.expose_secret(),
             })
             .send()
             .await
-            .map_err(|e| net_err(&e))?;
+            .map_err(net_err)?;
         if !resp.status().is_success() {
             return Err(ServiceError::unauthorized(format!(
                 "OpenSubtitles login failed: HTTP {}",
                 resp.status()
             )));
         }
-        let body: LoginResponse = resp.json().await.map_err(|e| net_err(&e))?;
+        let body: LoginResponse = resp.json().await.map_err(net_err)?;
         Ok(body.token)
     }
 
@@ -283,9 +285,10 @@ impl OpenSubtitlesProvider {
     }
 }
 
-/// Maps a transport error to a backend [`ServiceError`].
-fn net_err(e: &reqwest::Error) -> ServiceError {
-    ServiceError::backend(format!("OpenSubtitles request failed: {e}"))
+/// Maps a transport / response-decode error to a backend [`ServiceError`],
+/// preserving the underlying [`reqwest::Error`] as the source chain.
+fn net_err(e: reqwest::Error) -> ServiceError {
+    ProvidersError::http("OpenSubtitles request failed", e).into()
 }
 
 #[async_trait]
@@ -345,20 +348,20 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         let resp = self
             .http
             .get(format!("{API_BASE}/subtitles"))
-            .header("Api-Key", &cfg.api_key)
+            .header("Api-Key", cfg.api_key.expose_secret())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .query(&query)
             .send()
             .await
-            .map_err(|e| net_err(&e))?;
+            .map_err(net_err)?;
         if !resp.status().is_success() {
             return Err(ServiceError::backend(format!(
                 "OpenSubtitles search failed: HTTP {}",
                 resp.status()
             )));
         }
-        let body: SearchResponse = resp.json().await.map_err(|e| net_err(&e))?;
+        let body: SearchResponse = resp.json().await.map_err(net_err)?;
         Ok(map_search(&body))
     }
 
@@ -388,19 +391,19 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         let dl: DownloadResponse = self
             .http
             .post(format!("{API_BASE}/download"))
-            .header("Api-Key", &cfg.api_key)
+            .header("Api-Key", cfg.api_key.expose_secret())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .bearer_auth(&token)
             .json(&DownloadRequest { file_id })
             .send()
             .await
-            .map_err(|e| net_err(&e))?
+            .map_err(net_err)?
             .error_for_status()
-            .map_err(|e| net_err(&e))?
+            .map_err(net_err)?
             .json()
             .await
-            .map_err(|e| net_err(&e))?;
+            .map_err(net_err)?;
 
         // Fetch the subtitle bytes from the link.
         let content = self
@@ -409,12 +412,12 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .send()
             .await
-            .map_err(|e| net_err(&e))?
+            .map_err(net_err)?
             .error_for_status()
-            .map_err(|e| net_err(&e))?
+            .map_err(net_err)?
             .bytes()
             .await
-            .map_err(|e| net_err(&e))?
+            .map_err(net_err)?
             .to_vec();
 
         Ok(SubtitleResponse {
@@ -435,7 +438,7 @@ mod tests {
     fn config_parses_pascal_case_and_detects_configured() {
         let cfg: OpenSubtitlesConfig =
             serde_json::from_str(r#"{"ApiKey":"k","Username":"u","Password":"p"}"#).unwrap();
-        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.api_key.expose_secret(), "k");
         assert!(cfg.is_configured());
         assert!(!OpenSubtitlesConfig::default().is_configured());
     }

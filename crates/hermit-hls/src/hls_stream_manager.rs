@@ -214,9 +214,11 @@ where
             request.query_string.clone(),
             plan.is_remuxing_video,
         );
+        // `HlsError` converts into `ServiceError::BackendSource` (HTTP 500),
+        // preserving the typed playlist-generation failure as the cause.
         self.generator
             .create_main_playlist(&create)
-            .map_err(|e| ServiceError::backend(format!("playlist generation failed: {e}")))
+            .map_err(ServiceError::from)
     }
 
     /// Starts (or reuses) the transcode for `request` and resolves segment

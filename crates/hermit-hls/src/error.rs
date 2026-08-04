@@ -1,5 +1,6 @@
 //! Error type for the `hermit-hls` crate.
 
+use hermit_traits::error::ServiceError;
 use thiserror::Error;
 
 /// Errors returned by the HLS playlist generator.
@@ -21,4 +22,32 @@ pub enum HlsError {
         /// The rejected total runtime in ticks.
         total_runtime_ticks: i64,
     },
+}
+
+impl From<HlsError> for ServiceError {
+    fn from(err: HlsError) -> Self {
+        // A playlist-generation failure is an internal (HTTP 500) fault; box it
+        // so the typed `HlsError` stays reachable through the source chain.
+        Self::backend_source(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HlsError, ServiceError};
+    use std::error::Error as _;
+
+    #[test]
+    fn converts_to_backend_source_and_keeps_the_cause() {
+        let err = HlsError::InvalidOperation {
+            desired_segment_length_ms: 0,
+            total_runtime_ticks: 0,
+        };
+        let svc: ServiceError = err.into();
+        assert!(matches!(svc, ServiceError::BackendSource(_)));
+        // `transparent` surfaces the (leaf) HlsError's message; it has no deeper
+        // cause of its own, so the source chain ends here.
+        assert!(svc.to_string().contains("Invalid segment length"));
+        assert!(svc.source().is_none());
+    }
 }

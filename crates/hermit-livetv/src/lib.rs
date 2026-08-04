@@ -5,10 +5,12 @@
 //! (via a [`SourceFetcher`]), parses it ([`m3u`]/[`xmltv`]) and rewrites the
 //! cache; channels and programmes are then surfaced to clients as `BaseItemDto`s.
 
+pub mod error;
 pub mod fetch;
 pub mod m3u;
 pub mod manager;
 pub mod xmltv;
 
+pub use error::LiveTvError;
 pub use fetch::{ReqwestFetcher, SourceFetcher};
 pub use manager::HermitLiveTvManager;

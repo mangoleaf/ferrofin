@@ -4,11 +4,13 @@
 //! the `image` crate (resize/crop/format; no native Skia). Filled by the Wave 5
 //! PortJob. See `brain/PLAN_HERMIT_PORT.md`.
 
+pub mod error;
 pub mod image_encoder;
 pub mod null_encoder;
 pub mod photo_provider;
 pub mod processor;
 
+pub use error::DrawingError;
 pub use image_encoder::ImageCrateEncoder;
 pub use null_encoder::NullImageEncoder;
 pub use photo_provider::{DirectoryService, FileInfo, PhotoItem, PhotoProvider, is_exif_candidate};

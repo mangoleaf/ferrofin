@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::error::MediaEncodingError;
 use async_trait::async_trait;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::MediaStreamType;
@@ -191,7 +192,7 @@ where
                 .io
                 .run_ffmpeg(&self.media_encoder.encoder_path(), &args)
                 .await
-                .map_err(ServiceError::backend)?;
+                .map_err(MediaEncodingError::process)?;
 
             // Exit code 1 with no A/V stream is the expected/harmless
             // "no output" case (see the C# comment).
@@ -262,7 +263,7 @@ where
             .io
             .read_file(&attachment_path)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
 
         Ok(ExtractedAttachment { attachment, data })
     }
@@ -325,7 +326,7 @@ where
             .io
             .run_ffmpeg(&self.media_encoder.encoder_path(), &args)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
 
         if exit_code != 0 && (has_av || exit_code != 1) {
             return Err(ServiceError::backend(format!(

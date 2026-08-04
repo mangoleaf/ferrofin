@@ -8,6 +8,8 @@ use async_trait::async_trait;
 
 use hermit_traits::error::ServiceError;
 
+use crate::error::LiveTvError;
+
 /// Fetches the text body of a tuner/guide source URL (or local file path).
 #[async_trait]
 pub trait SourceFetcher: Send + Sync {
@@ -38,18 +40,18 @@ impl SourceFetcher for ReqwestFetcher {
                 .get(url)
                 .send()
                 .await
-                .map_err(|e| ServiceError::Backend(format!("fetch {url}: {e}")))?;
+                .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
             let resp = resp
                 .error_for_status()
-                .map_err(|e| ServiceError::Backend(format!("fetch {url}: {e}")))?;
+                .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
             resp.text()
                 .await
-                .map_err(|e| ServiceError::Backend(format!("read {url}: {e}")))
+                .map_err(|e| LiveTvError::http(format!("read {url}"), e).into())
         } else {
             let path = url.strip_prefix("file://").unwrap_or(url);
             tokio::fs::read_to_string(path)
                 .await
-                .map_err(|e| ServiceError::Backend(format!("read {path}: {e}")))
+                .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
         }
     }
 }

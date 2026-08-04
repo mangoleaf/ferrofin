@@ -32,6 +32,7 @@
 
 use std::path::Path;
 
+use crate::error::DrawingError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hermit_model::drawing::drawing_utils::{resize, resize_fill};
@@ -91,9 +92,9 @@ impl ImageCrateEncoder {
             )));
         }
         let reader = ImageReader::open(path)
-            .map_err(|e| ServiceError::backend(format!("open {path}: {e}")))?
+            .map_err(|e| DrawingError::io(format!("open {path}"), e))?
             .with_guessed_format()
-            .map_err(|e| ServiceError::backend(format!("probe {path}: {e}")))?;
+            .map_err(|e| DrawingError::io(format!("probe {path}"), e))?;
         reader
             .decode()
             .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))
@@ -137,7 +138,7 @@ impl ImageCrateEncoder {
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
-                .map_err(|e| ServiceError::backend(format!("mkdir {}: {e}", parent.display())))?;
+                .map_err(|e| DrawingError::io(format!("mkdir {}", parent.display()), e))?;
         }
 
         if format == CrateFormat::Jpeg {
@@ -146,17 +147,17 @@ impl ImageCrateEncoder {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let quality = quality as u8;
             let file = std::fs::File::create(output_path)
-                .map_err(|e| ServiceError::backend(format!("create {output_path}: {e}")))?;
+                .map_err(|e| DrawingError::io(format!("create {output_path}"), e))?;
             let mut writer = std::io::BufWriter::new(file);
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality);
             image
                 .to_rgb8()
                 .write_with_encoder(encoder)
-                .map_err(|e| ServiceError::backend(format!("encode {output_path}: {e}")))
+                .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
         } else {
             image
                 .save_with_format(output_path, format)
-                .map_err(|e| ServiceError::backend(format!("encode {output_path}: {e}")))
+                .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
         }
     }
 
@@ -227,7 +228,7 @@ impl ImageEncoder for ImageCrateEncoder {
         match std::fs::metadata(path) {
             Ok(meta) if meta.len() == 0 => return Ok(ImageDimensions::default()),
             Ok(_) => {}
-            Err(e) => return Err(ServiceError::backend(format!("stat {path}: {e}"))),
+            Err(e) => return Err(DrawingError::io(format!("stat {path}"), e).into()),
         }
 
         // Probe dimensions from the header only; undecodable → default (0×0).

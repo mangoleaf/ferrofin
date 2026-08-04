@@ -36,6 +36,7 @@ use hermit_traits::providers::{
 };
 use uuid::Uuid;
 
+use crate::error::ProvidersError;
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbKind};
 use hermit_db::entities::base_items::BaseItemEntity;
 
@@ -744,10 +745,11 @@ impl ProviderManager for LocalProviderManager {
         let item_dir = meta_root.join(item_id.to_string());
         let stem = image_file_stem(image_type, image_index);
         let dest = item_dir.join(format!("{stem}.{ext}"));
-        std::fs::create_dir_all(&item_dir)
-            .map_err(|e| ServiceError::backend(format!("create image dir: {e}")))?;
+        std::fs::create_dir_all(&item_dir).map_err(|e| {
+            ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
+        })?;
         std::fs::write(&dest, content)
-            .map_err(|e| ServiceError::backend(format!("write image: {e}")))?;
+            .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
         store
             .set_item_image(
                 item_id,

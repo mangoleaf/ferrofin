@@ -12,9 +12,12 @@ pub mod attachments;
 pub mod configuration;
 pub mod encoder;
 pub mod encoding_helper;
+pub mod error;
 pub mod probing;
 pub mod subtitles;
 pub mod transcoding;
+
+pub use error::MediaEncodingError;
 
 pub use attachments::{
     AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver, NoopAttachmentIo,

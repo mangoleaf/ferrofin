@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use crate::error::MediaEncodingError;
 use async_trait::async_trait;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{IsoType, MediaStreamType, Video3DFormat};
@@ -231,8 +232,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
 
     /// Parses ffprobe's captured JSON into an [`InternalMediaInfoResult`].
     fn parse_probe(output: &str) -> Result<InternalMediaInfoResult, ServiceError> {
-        serde_json::from_str(output)
-            .map_err(|e| ServiceError::backend(format!("failed to parse ffprobe output: {e}")))
+        serde_json::from_str(output).map_err(|e| MediaEncodingError::probe_parse(e).into())
     }
 }
 
@@ -293,7 +293,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .transcoder
             .get_process_output(&probe, &args, false, None)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
         let info = self.normalizer.get_media_info(
@@ -331,7 +331,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         self.transcoder
             .get_process_output(&ffmpeg, &args, true, None)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
         Ok(output_path)
     }
 
@@ -366,7 +366,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         self.transcoder
             .get_process_output(&ffmpeg, &args, true, None)
             .await
-            .map_err(ServiceError::backend)?;
+            .map_err(MediaEncodingError::process)?;
         Ok(output_path)
     }
 

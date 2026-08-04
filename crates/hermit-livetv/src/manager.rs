@@ -28,6 +28,7 @@ use hermit_traits::stubs::LiveTvManager;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::error::LiveTvError;
 use crate::fetch::SourceFetcher;
 use crate::m3u::parse_m3u;
 use crate::xmltv::parse_xmltv;
@@ -248,7 +249,7 @@ impl LiveTvManager for HermitLiveTvManager {
             ));
         }
         let data = serde_json::to_string(&info)
-            .map_err(|e| ServiceError::Backend(format!("serialize tuner host: {e}")))?;
+            .map_err(|e| LiveTvError::serialize("serialize tuner host", e))?;
         sqlx::query(
             r#"INSERT INTO "LiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
                ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
@@ -303,7 +304,7 @@ impl LiveTvManager for HermitLiveTvManager {
             ));
         }
         let data = serde_json::to_string(&info)
-            .map_err(|e| ServiceError::Backend(format!("serialize listing provider: {e}")))?;
+            .map_err(|e| LiveTvError::serialize("serialize listing provider", e))?;
         sqlx::query(
             r#"INSERT INTO "LiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
                ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
@@ -739,7 +740,7 @@ fn ensure_id(id: &mut Option<String>) -> String {
 
 /// Serializes a DVR DTO to its stored JSON.
 fn to_json<T: Serialize>(value: &T) -> Result<String, ServiceError> {
-    serde_json::to_string(value).map_err(|e| ServiceError::Backend(format!("serialize timer: {e}")))
+    serde_json::to_string(value).map_err(|e| LiveTvError::serialize("serialize timer", e).into())
 }
 
 /// The stored `Status` string for a [`RecordingStatus`].

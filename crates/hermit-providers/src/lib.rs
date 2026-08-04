@@ -8,6 +8,7 @@
 //! Filled by the Wave 5 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 
 pub mod container_types;
+pub mod error;
 pub mod library_options;
 pub mod local_images;
 #[cfg(feature = "lrclib")]
@@ -19,6 +20,8 @@ pub mod opensubtitles;
 pub mod provider_manager;
 pub mod tmdb;
 pub mod xbmc;
+
+pub use error::ProvidersError;
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};
