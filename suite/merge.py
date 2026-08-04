@@ -99,6 +99,17 @@ def footprint():
         out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
         out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
         out[f"{key}_items"] = first(f"{tgt}-count.txt")
+        # HLS play-start TTFS (transcode.js, RUN_TRANSCODE=1): median time to
+        # first segment for a stream-copy remux and a forced 4K HEVC->H.264
+        # encode — the closest thing to "how fast does play start" and a
+        # headline metric, never to be dropped from the record.
+        tj = load_json(raw / f"{tgt}-transcode.json")
+        for mode in ("copy", "encode"):
+            m = (tj or {}).get(mode)
+            out[f"{key}_ttfs_{mode}"] = (
+                {"med": m["med"], "min": m["min"], "max": m["max"], "runs": m["runs"]}
+                if m else None
+            )
     return out if any(v is not None for v in out.values()) else None
 
 

@@ -22520,11 +22520,35 @@
           "h_cold_s": "0.5",
           "h_rss_peak_mib": 262,
           "h_items": "2637",
+          "h_ttfs_copy": {
+            "med": 117,
+            "min": 116,
+            "max": 119,
+            "runs": 3
+          },
+          "h_ttfs_encode": {
+            "med": 2419,
+            "min": 2335,
+            "max": 2517,
+            "runs": 3
+          },
           "j_cold_s": "1.0",
           "j_rss_peak_mib": 928,
-          "j_items": "2637"
+          "j_items": "2637",
+          "j_ttfs_copy": {
+            "med": 163,
+            "min": 129,
+            "max": 297,
+            "runs": 3
+          },
+          "j_ttfs_encode": {
+            "med": 3523,
+            "min": 3494,
+            "max": 3848,
+            "runs": 3
+          }
         },
-        "when": "2026-08-04T00:37Z"
+        "when": "2026-08-04T00:54Z"
       },
       "headline": {
         "comparable_rows": 43,

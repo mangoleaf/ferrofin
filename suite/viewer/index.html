@@ -93,9 +93,13 @@ function render() {
 
   const h = r.headline, m = r.meta;
   const fp = m.footprint;
+  const ttfs = (t) => t ? `${t.med} ms (${t.min}–${t.max}, ${t.runs} runs)` : "?";
   const fpLine = fp ? `<br><span class="muted">footprint: cold ${fp.h_cold_s ?? "?"}s vs ${fp.j_cold_s ?? "?"}s ·
     peak anon ${fp.h_rss_peak_mib ?? "?"} MiB vs ${fp.j_rss_peak_mib ?? "?"} MiB ·
-    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)</span>` : "";
+    items ${fp.h_items ?? "?"} vs ${fp.j_items ?? "?"} (Hermit vs Jellyfin)</span>
+    <br><span class="muted"><b style="color:#ddd">HLS play-start (TTFS)</b> —
+    stream-copy remux: ${ttfs(fp.h_ttfs_copy)} vs ${ttfs(fp.j_ttfs_copy)} ·
+    forced 4K HEVC→H.264: ${ttfs(fp.h_ttfs_encode)} vs ${ttfs(fp.j_ttfs_encode)}</span>` : "";
   head.innerHTML = `<span><b>${m.hermit}</b></span><span>${m.when || ""}</span>
     <span>Jellyfin: ${m.jellyfin_image || "?"}</span>
     <span>median speedup <b>${h.median_speedup ?? "—"}×</b></span>
