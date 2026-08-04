@@ -225,6 +225,14 @@ fn folder_emits_counts(item: &BaseItemEntity) -> bool {
     }
 }
 
+/// `100 × position ÷ runtime` as the C# double division (both counts are tick
+/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact
+/// enough for a display percentage).
+#[allow(clippy::cast_precision_loss)]
+fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
+    100.0 * position as f64 / runtime as f64
+}
+
 /// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
 /// `UserDataManager` returns for an item with no stored row, used when a folder
 /// needs a UserData object solely to carry `UnplayedItemCount`.
@@ -742,6 +750,17 @@ impl HermitDtoService {
             }
             if options.enable_user_data {
                 dto.user_data = prefetched.user_data.get(&item_id).cloned();
+                // C# `BaseItem.FillUserDataDtoValues`: a positive resume position
+                // over a known runtime becomes `PlayedPercentage` — the value
+                // client progress bars render on posters and resume rows.
+                if !item.is_folder
+                    && let Some(ud) = dto.user_data.as_mut()
+                    && ud.playback_position_ticks > 0
+                    && let Some(runtime) = item.run_time_ticks.filter(|rt| *rt > 0)
+                {
+                    ud.played_percentage =
+                        Some(percent_of_ticks(ud.playback_position_ticks, runtime));
+                }
                 // Folder UserData carries UnplayedItemCount = unplayed leaf descendants
                 // (C# AttachUserSpecificInfo folder branch); leaf items leave it unset.
                 // The branch keys on the runtime C# `IsFolder` (`folder_emits_counts`):
@@ -1891,6 +1910,14 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn percent_of_ticks_is_the_played_percentage_division() {
+        // 50% of a 2 h runtime — the C# `100 * position / runtime` double math.
+        assert!((percent_of_ticks(36_000_000_000, 72_000_000_000) - 50.0).abs() < 1e-9);
+        // Tiny fractions stay positive and precise enough for display.
+        assert!(percent_of_ticks(1, 72_000_000_000) > 0.0);
     }
 
     #[tokio::test]
