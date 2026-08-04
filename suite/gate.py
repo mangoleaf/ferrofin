@@ -35,15 +35,26 @@ from pathlib import Path
 RESULTS = Path(__file__).resolve().parent / "results"
 BASELINE = Path(__file__).resolve().parent / "perf-baseline.json"
 FACTOR = float(os.environ.get("PERF_GATE_FACTOR", "1.5"))
+# Absolute jitter floor (ms): a percentile trip additionally needs this much
+# real worsening. 3 ms default — well under any regression a user feels, well
+# over the OS-noise band on sub-ms endpoints. Env knob, same owner rule as
+# FACTOR: ask before changing the default.
+MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS", "3"))
 PCTS = ("p50", "p95", "p99")
 
 
-def classify(base, cur, factor):
+def classify(base, cur, factor, min_delta_ms=0.0):
     """Which checks trip for one endpoint: [] = ok.
 
     `cur` needs {p50,p95,p99,ok,bad}; no result / no measured 200s ⇒
     ['nodata']. A percentile trips on strictly-greater than factor× (equal is
-    not a regression); a zero baseline with a nonzero current is Infinity.
+    not a regression) AND an absolute worsening above `min_delta_ms` — the
+    jitter floor: on sub-millisecond endpoints (image serving at ~1 ms p95)
+    the tail is OS/page-cache noise and a 2× "ratio regression" can be a 1 ms
+    delta, which no user can feel and no code change caused (observed on the
+    first clean-HEAD stability runs, plan 08 step 2). The floor never masks a
+    real regression: any human-visible slowdown clears a few ms easily. A
+    zero baseline with a current above the floor is treated as Infinity.
     Any non-200 ⇒ '200%'.
     """
     if not cur or not cur.get("ok"):
@@ -52,7 +63,7 @@ def classify(base, cur, factor):
     for p in PCTS:
         b, c = base[p], cur[p]
         ratio = (c / b) if b > 0 else (float("inf") if c > 0 else 1.0)
-        if ratio > factor:
+        if ratio > factor and (c - b) > min_delta_ms:
             tripped.append(p)
     if cur.get("bad", 0) > 0:
         tripped.append("200%")
@@ -117,7 +128,7 @@ def compare_raw(baseline_file, factor, names):
             print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   (no baseline — skipped)",
                   file=err)
             continue
-        tripped = classify(base, cur, factor)
+        tripped = classify(base, cur, factor, MIN_DELTA_MS)
         rate200 = f"{100 * cur['ok'] / (cur['ok'] + cur['bad']):.0f}%"
         cols = ""
         for p in PCTS:
@@ -170,7 +181,8 @@ def check_merged(run):
         if p["h_ok"] is not None and p["h_ok"] < 100:
             fails.append(f"{p['variant']}: Hermit 200-rate {p['h_ok']}% < 100%")
         for pct in ("h_p50", "h_p95", "h_p99"):
-            if p[pct] is not None and b[pct] and p[pct] > b[pct] * FACTOR:
+            if (p[pct] is not None and b[pct] and p[pct] > b[pct] * FACTOR
+                    and (p[pct] - b[pct]) > MIN_DELTA_MS):
                 fails.append(f"{p['variant']} {pct}: {p[pct]} > {b[pct]}×{FACTOR} (={round(b[pct] * FACTOR, 1)})")
         if b.get("deep_verified") and not par["deep_verified"]:
             fails.append(f"{op} ({p['variant']}): parity regressed — was deep_verified, now "

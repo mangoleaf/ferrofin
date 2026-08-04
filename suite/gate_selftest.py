@@ -35,4 +35,12 @@ assert classify(BASE, ok(p99=45), 1.5) == [], "p99 == 1.5× → not a regression
 # Zero-baseline percentile with a nonzero current is an infinite ratio → trips.
 assert classify({"p50": 0, "p95": 20, "p99": 30}, ok(), 1.5) == ["p50"], "0-baseline + nonzero cur → trips"
 
+# The absolute jitter floor: a 2× ratio on a sub-ms endpoint is OS noise, not a
+# regression — with min_delta_ms=3 a 1.2 ms worsening never trips (the exact
+# image_primary flake from the first clean-HEAD stability runs)…
+tiny = {"p50": 0.8, "p95": 1.3, "p99": 2.8}
+assert classify(tiny, ok(p50=0.9, p95=2.5, p99=5.1), 1.5, 3) == [], "sub-floor jitter → ok"
+# …while a real regression clears the floor and still trips all three.
+assert classify(BASE, ok(p50=60, p95=80, p99=99), 1.5, 3) == ["p50", "p95", "p99"], "real regression still trips"
+
 print("gate self-check: all assertions passed")
