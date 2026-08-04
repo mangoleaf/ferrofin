@@ -31,6 +31,22 @@ RESULTS = SUITE / "results"
 RAW = RESULTS / "raw"
 
 
+def bench_env(key):
+    """os.environ, else benchmark/.env — merge often runs without the bench env
+    sourced, and the comparability guard keys on cpus/mem/load, so a silent
+    None here would let incomparable runs look comparable."""
+    if os.environ.get(key):
+        return os.environ[key]
+    try:
+        for line in (ROOT / "benchmark" / ".env").read_text().splitlines():
+            line = line.strip()
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip() or None
+    except OSError:
+        pass
+    return None
+
+
 def sh(*cmd):
     try:
         return subprocess.check_output(cmd, cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
@@ -189,12 +205,12 @@ def main():
         "meta": {
             "hermit": sh("git", "describe", "--tags", "--always") or "dev",
             "hermit_sha": sha,
-            "jellyfin_image": os.environ.get("JELLYFIN_IMAGE", "jellyfin/jellyfin:10.11.8"),
+            "jellyfin_image": bench_env("JELLYFIN_IMAGE") or "jellyfin/jellyfin:10.11.8",
             "fixture_hash": fixture_hash(),
-            "cpus": int(os.environ["BENCH_CPUS"]) if os.environ.get("BENCH_CPUS") else None,
-            "mem": os.environ.get("BENCH_MEM"),
-            "load": {"vus": int(os.environ["BENCH_VUS"]) if os.environ.get("BENCH_VUS") else None,
-                     "duration": os.environ.get("BENCH_DURATION")},
+            "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
+            "mem": bench_env("BENCH_MEM"),
+            "load": {"vus": int(bench_env("BENCH_VUS")) if bench_env("BENCH_VUS") else None,
+                     "duration": bench_env("BENCH_DURATION")},
             "perf_source": perf_src,
             "footprint": footprint(),
             "when": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
