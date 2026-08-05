@@ -42,6 +42,12 @@ for (const e of ENDPOINTS) okRates[e.name] = new Rate(`ok_${e.name}`);
 
 export function setup() {
   const ctx = bringUp(BASE, TARGET, EXPECTED);   // wizard(jellyfin) -> auth -> provision -> wait scan
+  // Hand the provisioned, pre-throttle token to run.sh's post-load captures (count,
+  // fingerprint, transcode) — it greps this line from k6's output. A fresh post-load
+  // login would 500 against a throttled Jellyfin, and on Jellyfin the bench user only
+  // exists after the wizard above, so there's no earlier moment to mint it. setup() state
+  // doesn't reach handleSummary() in k6 (separate runtime), hence the console channel.
+  console.log(`CAPTURE_CREDS ${ctx.token} ${ctx.userId}`);
 
   // Deterministic item pick: first movie by SortName on BOTH servers (ids differ, item is the
   // same). For the image row, prefer the first of those with a discovered Primary image —

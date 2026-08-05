@@ -67,18 +67,20 @@ bench() {  # $1=service $2=port $3=TARGET
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
 
-  # Mint one capture token now, while auth is healthy. The auth_login scenario below hits
-  # /Users/AuthenticateByName at ${BENCH_VUS} VUs and throttles Jellyfin's login (drops to
-  # ~7% success); the post-leg captures (count, fingerprint, transcode) each need a fresh
-  # login and would then 500. Reuse this token everywhere instead of re-authenticating.
-  local cap ctok cuid
-  cap=$(suite_auth "$base") || cap=""
-  ctok=${cap%% *}; cuid=${cap##* }
+  local ctok cuid
 
   : > "results/raw/$target-rss.txt"   # sampler appends; clear stale samples from prior runs
   sample_rss "$svc" "results/raw/$target-rss.txt" & local rss_pid=$!
 
-  TARGET="$target" BASE_URL="$base" k6 run scenario.js
+  TARGET="$target" BASE_URL="$base" k6 run scenario.js 2>&1 | tee "results/raw/$target-k6.log"
+
+  # Reuse the token scenario.js minted in setup() — provisioned (Jellyfin's bench user is
+  # created there via the startup wizard) and unthrottled. Re-authenticating here instead
+  # would 500 against Jellyfin: the auth_login scenario hammers /Users/AuthenticateByName
+  # at ${BENCH_VUS} VUs (login drops to ~7% success) and a fresh post-load login fails.
+  # setup() console.logs "CAPTURE_CREDS <token> <userId>"; empty ⇒ consumers self-auth.
+  local creds; creds=$(grep -oE 'CAPTURE_CREDS [^ "]+ [^ "]+' "results/raw/$target-k6.log" | tail -1)
+  ctok=$(awk '{print $2}' <<<"$creds"); cuid=$(awk '{print $3}' <<<"$creds")
 
   # Stop RSS sampling BEFORE the transcode phase: its ffmpeg child peaks ~1 GB on a
   # 4K encode and would drown the server-footprint number on both sides identically.
