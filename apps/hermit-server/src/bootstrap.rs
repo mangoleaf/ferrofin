@@ -626,6 +626,70 @@ mod tests {
         );
     }
 
+    /// An in-memory `MakeWriter` capturing fmt-layer output for assertions.
+    #[derive(Clone, Default)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn json_stdout_line_carries_trace_id_for_in_span_events() {
+        // The headline correlation requirement: with the OTel layer active and the
+        // request span's trace_id recorded, every JSON log line emitted inside the
+        // span must carry a 32-hex trace_id (what the Grafana Loki→Tempo derived
+        // field keys on). Scoped subscriber + in-memory writer, never the global.
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buf = BufWriter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(InMemorySpanExporter::default())
+            .build();
+        let otel = tracing_opentelemetry::layer().with_tracer(provider.tracer("hermit"));
+        let json = tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(json).with(otel);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http_request", trace_id = tracing::field::Empty);
+            let _entered = span.enter();
+            let span_ctx = span.context().span().span_context().clone();
+            assert!(span_ctx.is_sampled(), "AlwaysOn → sampled");
+            span.record("trace_id", span_ctx.trace_id().to_string());
+            tracing::info!("inside the request");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("inside the request"))
+            .expect("event line present in JSON output");
+        let _: serde_json::Value =
+            serde_json::from_str(line).expect("stdout line is valid single-line JSON");
+        assert!(line.contains("trace_id"), "line carries the field: {line}");
+        let has_32_hex = line
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|tok| tok.len() == 32 && tok.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(has_32_hex, "line carries a 32-hex trace id: {line}");
+    }
+
     #[test]
     fn tracing_to_otel_bridge_exports_a_named_span() {
         // Proves the tracing→OTel version pairing actually bridges: compose the
