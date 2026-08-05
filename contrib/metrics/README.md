@@ -42,14 +42,24 @@ curl http://localhost:8096/metrics
 
 Content-Type: `text/plain; version=0.0.4; charset=utf-8`.
 
-## Scrape + dashboard
+## Scrape + dashboards
 
 ```bash
 prometheus --config.file=contrib/metrics/prometheus.yml     # scrapes localhost:8096, 15s
-# then import contrib/metrics/grafana-dashboard.json into Grafana (uid: hermit-overview)
 ```
 
-The dashboard's `http_*` / `process_*` panels also light up when pointed at a
+Then import into Grafana (both carry a `datasource` variable — pick your Prometheus):
+
+- **`grafana-golden-signals.json`** (uid `hermit-golden-signals`) — the at-a-glance
+  overview, organized by the four golden signals: **traffic** (request rate, in-flight,
+  sessions/streams), **latency** (p50/p95/p99), **errors** (5xx ratio, 4xx/5xx rate),
+  **saturation** (CPU %, memory, DB pool in-use). Start here.
+- **`grafana-deep-dive.json`** (uid `hermit-deep-dive`) — drill-down with a `controller`
+  filter variable: a latency heatmap, top endpoints by rate and by p95, status-code and
+  error breakdowns, full DB-pool detail, process/tokio-runtime internals, and
+  playback/library panels.
+
+The `http_*` / `process_*` panels also light up when a dashboard is pointed at a
 Jellyfin instance with metrics enabled (benchmark leg, port 18097) — that is the
 parity proof.
 
