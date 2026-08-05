@@ -19,6 +19,7 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -77,27 +78,56 @@ impl FfmpegPaths {
 /// directory `GET /System/Logs` serves, so server logs appear in the Jellyfin
 /// dashboard log viewer, matching Jellyfin's Serilog file sink. If the log
 /// directory can't be prepared, logging falls back to stdout only.
-pub fn init_tracing(config: &Config) {
+///
+/// Old log files are pruned to `LogFileRetentionDays` (read best-effort from
+/// `{config_dir}/system.json`; `0`/negative = keep forever), and the file writer
+/// is non-blocking so slow disk I/O never stalls a request thread.
+///
+/// Returns the [`WorkerGuard`] for the non-blocking file writer (`None` when no
+/// file sink was created). **The caller must hold it until after the server
+/// drains** — dropping it flushes the queue; dropping it early silently discards
+/// the last buffered log lines. Also installs a panic hook so panics reach the
+/// log stream instead of vanishing.
+#[must_use]
+pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     use tracing_subscriber::Layer as _;
-    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
+
+    install_panic_hook();
 
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Log dir mirrors the composition root's `{data_dir}/log` (state.rs). The
-    // rolling appender needs it to exist up front.
+    // rolling appender needs it to exist up front. Retention prunes old
+    // `log_*.log` files on rotation (the whole feature — no custom pruner).
+    let retention_days = read_retention_days(&config.config_dir);
     let log_dir = config.data_dir.join("log");
     let file_appender = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
-        tracing_appender::rolling::Builder::new()
+        let mut builder = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("log")
-            .filename_suffix("log")
-            .build(&log_dir)
-            .ok()
+            .filename_suffix("log");
+        if let Ok(keep) = usize::try_from(retention_days)
+            && keep > 0
+        {
+            builder = builder.max_log_files(keep);
+        }
+        builder.build(&log_dir).ok()
     });
+
+    // Non-blocking file writer: a background thread owns the disk I/O so a slow or
+    // full disk never blocks a logging call site. The returned guard flushes the
+    // queue on drop — the caller holds it until after `axum::serve` drains.
+    let (file_writer, guard) = match file_appender {
+        Some(appender) => {
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            (Some(writer), Some(guard))
+        }
+        None => (None, None),
+    };
 
     // JSON stdout by default (Alloy pod-log scrape → Loki, carrying the request
     // span's `trace_id` on every in-span line); `HERMIT_LOG_FORMAT=text` restores
@@ -106,58 +136,7 @@ pub fn init_tracing(config: &Config) {
     // dashboard log viewer, which renders raw lines (a parity surface).
     let text_mode =
         std::env::var("HERMIT_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("text"));
-
-    // ponytail: blocking file writes + no retention pruning. Fine at this log
-    // volume; add `.max_log_files(n)` (from `log_file_retention_days`) or a
-    // non-blocking `WorkerGuard` if the log dir grows unbounded or write
-    // latency shows up.
-    let mut layers: Vec<
-        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
-    > = Vec::new();
-    match (text_mode, file_appender) {
-        // Legacy path: one text layer tee'd to stdout + file. ANSI off so neither
-        // sink carries colour escapes (the dashboard renders raw text).
-        (true, Some(appender)) => layers.push(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_ansi(false)
-                .with_writer(std::io::stdout.and(appender))
-                .boxed(),
-        ),
-        // Legacy fallback when the log dir can't be prepared: stdout-only text,
-        // ANSI left at its auto default (matches the pre-refactor behaviour).
-        (true, None) => layers.push(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_writer(std::io::stdout)
-                .boxed(),
-        ),
-        // Default: JSON to stdout (structured, `trace_id`-carrying) + plain text
-        // to the file only.
-        (false, Some(appender)) => {
-            layers.push(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_target(true)
-                    .with_writer(std::io::stdout)
-                    .boxed(),
-            );
-            layers.push(
-                tracing_subscriber::fmt::layer()
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_writer(appender)
-                    .boxed(),
-            );
-        }
-        (false, None) => layers.push(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_target(true)
-                .with_writer(std::io::stdout)
-                .boxed(),
-        ),
-    }
+    let mut layers = build_fmt_layers(text_mode, file_writer);
 
     // Compose the OTLP layer in only when export is configured; `None` is a no-op
     // (`Option<Layer>` implements `Layer`), so tracing stays local-only otherwise.
@@ -177,6 +156,112 @@ pub fn init_tracing(config: &Config) {
         .with(layers)
         .with(filter)
         .try_init();
+
+    guard
+}
+
+/// Type alias for the boxed, subscriber-erased log layers `init_tracing` composes.
+type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// Builds the fmt sink layers for the chosen format + file writer.
+///
+/// Default (`text_mode = false`): JSON to stdout + plain text to the file. Text
+/// mode: a single human-readable layer tee'd to stdout + file. The file sink is
+/// always plain text (dashboard parity); when no file writer exists, only stdout
+/// is written.
+fn build_fmt_layers(
+    text_mode: bool,
+    file_writer: Option<tracing_appender::non_blocking::NonBlocking>,
+) -> Vec<BoxedLayer> {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+
+    let mut layers: Vec<BoxedLayer> = Vec::new();
+    match (text_mode, file_writer) {
+        // Legacy path: one text layer tee'd to stdout + file. ANSI off so neither
+        // sink carries colour escapes (the dashboard renders raw text).
+        (true, Some(writer)) => layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(writer))
+                .boxed(),
+        ),
+        // Legacy fallback when the log dir can't be prepared: stdout-only text,
+        // ANSI left at its auto default (matches the pre-refactor behaviour).
+        (true, None) => layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_writer(std::io::stdout)
+                .boxed(),
+        ),
+        // Default: JSON to stdout (structured, `trace_id`-carrying) + plain text
+        // to the file only.
+        (false, Some(writer)) => {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(true)
+                    .with_writer(std::io::stdout)
+                    .boxed(),
+            );
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .boxed(),
+            );
+        }
+        (false, None) => layers.push(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_writer(std::io::stdout)
+                .boxed(),
+        ),
+    }
+    layers
+}
+
+/// Reads `LogFileRetentionDays` from `{config_dir}/system.json`, best-effort.
+///
+/// The config manager isn't constructed this early, so this is a raw
+/// `serde_json::Value` read. A missing file, parse error, absent field, or
+/// out-of-range number all fall back to the Jellyfin default of `3`. A present
+/// value (including `0` or negative — "keep forever") is used verbatim; the
+/// caller treats `<= 0` as unlimited retention.
+fn read_retention_days(config_dir: &Path) -> i32 {
+    const DEFAULT_RETENTION_DAYS: i32 = 3;
+    std::fs::read_to_string(config_dir.join("system.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|cfg| {
+            cfg.get("LogFileRetentionDays")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(DEFAULT_RETENTION_DAYS)
+}
+
+/// Installs a panic hook (once) that logs the panic through `tracing` before
+/// delegating to the previous hook.
+///
+/// Without this, a panic bypasses tracing entirely — it never reaches the JSON
+/// stdout stream, the log file, or (with export on) the active span in Tempo.
+/// The previous hook is preserved so abort/backtrace behaviour is unchanged.
+fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map_or_else(String::new, ToString::to_string);
+            tracing::error!(panic = %info, location = %location, "panicked");
+            previous(info);
+        }));
+    });
 }
 
 /// Builds the OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
@@ -728,9 +813,98 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = config_with_ffmpeg(None);
         cfg.data_dir = tmp.path().to_path_buf();
-        init_tracing(&cfg);
-        init_tracing(&cfg);
+        // Hold the returned WorkerGuard(s) — dropping early would tear down the
+        // file writer's background thread. The second call is the idempotent no-op.
+        let _guard = init_tracing(&cfg);
+        let _guard2 = init_tracing(&cfg);
         assert!(tmp.path().join("log").is_dir(), "log directory created");
+    }
+
+    #[test]
+    fn read_retention_days_defaults_missing_garbage_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("system.json");
+        // Missing file → Jellyfin default 3.
+        assert_eq!(read_retention_days(tmp.path()), 3);
+        // Unparseable → default.
+        std::fs::write(&sys, b"not json at all").unwrap();
+        assert_eq!(read_retention_days(tmp.path()), 3);
+        // Field absent → default.
+        std::fs::write(&sys, br#"{"EnableMetrics":true}"#).unwrap();
+        assert_eq!(read_retention_days(tmp.path()), 3);
+    }
+
+    #[test]
+    fn read_retention_days_uses_present_value_including_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("system.json");
+        std::fs::write(&sys, br#"{"LogFileRetentionDays":7}"#).unwrap();
+        assert_eq!(read_retention_days(tmp.path()), 7, "positive used verbatim");
+        std::fs::write(&sys, br#"{"LogFileRetentionDays":0}"#).unwrap();
+        assert_eq!(read_retention_days(tmp.path()), 0, "0 = keep forever");
+        std::fs::write(&sys, br#"{"LogFileRetentionDays":-1}"#).unwrap();
+        assert_eq!(
+            read_retention_days(tmp.path()),
+            -1,
+            "negative = keep forever"
+        );
+    }
+
+    #[test]
+    fn non_blocking_file_writer_flushes_buffered_lines_on_guard_drop() {
+        // The Step-4 guarantee: a line logged through the non-blocking file writer
+        // lands on disk once the WorkerGuard is dropped (dropping early loses it).
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let appender = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::NEVER)
+            .filename_prefix("log")
+            .filename_suffix("log")
+            .build(tmp.path())
+            .unwrap();
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("flush_probe_line");
+        });
+        drop(guard); // flushes the background queue
+
+        let contents: String = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .collect();
+        assert!(
+            contents.contains("flush_probe_line"),
+            "buffered line flushed to file: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn panic_hook_logs_the_panic() {
+        // The hook must route panics through tracing (they otherwise bypass every
+        // sink). catch_unwind still fires the hook on this thread, where the scoped
+        // subscriber captures it.
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(buf.clone()),
+        );
+        install_panic_hook();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = std::panic::catch_unwind(|| panic!("kaboom"));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("panicked"),
+            "hook emitted the error line: {out}"
+        );
+        assert!(out.contains("kaboom"), "panic message captured: {out}");
     }
 
     #[tokio::test]

@@ -93,6 +93,23 @@ fn log_startup_banner(config: &Config) {
     );
 }
 
+/// Waits for the first shutdown trigger and reports why, for the shutdown log.
+///
+/// `"api"` — an API-initiated shutdown/restart (`POST /System/Shutdown|Restart`
+/// fires `shutdown_tx`); `"signal"` — ctrl-c / SIGINT. Before this the process
+/// hard-killed on ctrl-c (no drain, no log/trace flush); now both drain cleanly.
+async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> &'static str {
+    tokio::select! {
+        _ = shutdown_rx => "api",
+        result = tokio::signal::ctrl_c() => {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "ctrl-c listener failed");
+            }
+            "signal"
+        }
+    }
+}
+
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
 /// This is the whole composition root, in order: initialise logging, open +
@@ -111,7 +128,10 @@ fn log_startup_banner(config: &Config) {
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    init_tracing(&config);
+    // Hold the log-writer guard until after the server drains so the last
+    // buffered file-log lines flush rather than being discarded on exit.
+    let _log_guard = init_tracing(&config);
+    let started = std::time::Instant::now();
     log_startup_banner(&config);
 
     let db = open_database(&config).await?;
@@ -132,8 +152,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             paths
         }
         Err(e) => {
+            // `?e` prints the full anyhow context chain (which candidate was
+            // tried and how it was resolved — `--ffmpeg` flag vs $PATH), so
+            // "why no transcode" is answerable from this one line.
             tracing::warn!(
-                error = %e,
+                error = ?e,
                 "ffmpeg unavailable — transcoding/playback will be disabled until configured",
             );
             FfmpegPaths {
@@ -238,8 +261,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         ),
     )
     .with_graceful_shutdown(async move {
-        shutdown_rx.await.ok();
-        tracing::info!("graceful shutdown requested");
+        let reason = shutdown_signal(shutdown_rx).await;
+        tracing::info!(reason, "graceful shutdown requested");
     })
     .await
     .context("server error")?;
@@ -247,7 +270,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Flush the OTLP batch queue now that the server has drained; a restart that
     // loses the last spans is a bug. No-op when trace export is disabled.
     shutdown_tracing();
-    tracing::info!("hermit-server stopped");
+    tracing::info!(
+        uptime_s = started.elapsed().as_secs(),
+        "hermit-server stopped"
+    );
     Ok(())
 }
 

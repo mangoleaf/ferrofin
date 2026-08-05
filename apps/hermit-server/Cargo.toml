@@ -49,6 +49,7 @@ anyhow.workspace = true
 clap.workspace = true
 config.workspace = true
 serde.workspace = true
+serde_json.workspace = true   # best-effort system.json pre-read for log retention
 shlex = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -65,7 +66,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # First-Light integration test: drive the real router via tower oneshot and
 # assert JSON bodies.
 tower.workspace = true
-serde_json.workspace = true
 # `testing` unlocks the in-memory span exporter for the tracing→OTel bridge smoke test.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true
