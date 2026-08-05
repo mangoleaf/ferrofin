@@ -36,3 +36,8 @@ hermit-drawing.workspace = true
 image.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
+# Span-coverage smoke tests: in-memory OTel span exporter + a scoped subscriber.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true

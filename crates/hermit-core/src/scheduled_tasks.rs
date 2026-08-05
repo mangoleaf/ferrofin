@@ -28,6 +28,7 @@ use hermit_model::tasks::{
 };
 
 use hermit_traits::error::ServiceError;
+use tracing::Instrument as _;
 
 pub mod library;
 pub mod maintenance;
@@ -311,17 +312,48 @@ impl HermitTaskManager {
     /// Returns [`ServiceError::NotFound`] if no task has that key, or
     /// [`ServiceError::InvalidInput`] if it is already running.
     pub fn queue(&self, key: &str) -> Result<(), ServiceError> {
+        // The public entry is the API/StartTask path; internal callers
+        // (startup / scheduler) use `queue_with_trigger` with their own tag.
+        self.queue_with_trigger(key, "api")
+    }
+
+    /// [`queue`](Self::queue) with an explicit `trigger` tag recorded on the
+    /// run's root span (`api` / `schedule` / `startup`).
+    ///
+    /// The run gets its **own** root span (never parented under a request — a
+    /// background unit of work per RULES_LOGGING); `.instrument()` makes the
+    /// spawned future carry it, since a span created before `spawn` does not
+    /// follow the task by itself.
+    fn queue_with_trigger(&self, key: &str, trigger: &'static str) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key)?;
         let this = self.clone();
         let key_owned = key.to_owned();
         let start = Utc::now();
-        let handle = tokio::spawn(async move {
-            let outcome = task.execute(&progress).await;
-            if let Err(e) = &outcome {
-                tracing::warn!(task = key_owned, error = %e, "scheduled task failed");
+        let span = tracing::info_span!(
+            "scheduled_task",
+            task = %key_owned,
+            trigger,
+            outcome = tracing::field::Empty,
+        );
+        let handle = tokio::spawn(
+            async move {
+                let started = std::time::Instant::now();
+                tracing::info!("scheduled task started");
+                let outcome = task.execute(&progress).await;
+                let elapsed_ms = started.elapsed().as_millis();
+                let result = if outcome.is_ok() { "completed" } else { "failed" };
+                tracing::Span::current().record("outcome", result);
+                match &outcome {
+                    Ok(()) => tracing::info!(elapsed_ms, outcome = result, "scheduled task finished"),
+                    // Logged exactly once, here, at the background task's top level.
+                    Err(e) => {
+                        tracing::error!(elapsed_ms, outcome = result, error = %e, "scheduled task failed");
+                    }
+                }
+                this.finish(&key_owned, &task, start, &outcome);
             }
-            this.finish(&key_owned, &task, start, &outcome);
-        });
+            .instrument(span),
+        );
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             // The spawned run may already have finished (state back to Idle);
@@ -459,7 +491,7 @@ impl HermitTaskManager {
             let scheduler_start = Utc::now();
             // Startup triggers fire once, now.
             for key in this.keys_with_startup_trigger() {
-                if let Err(e) = this.queue(&key) {
+                if let Err(e) = this.queue_with_trigger(&key, "startup") {
                     tracing::warn!(task = key, error = %e, "startup trigger failed to queue");
                 }
             }
@@ -521,7 +553,7 @@ impl HermitTaskManager {
         }
         for key in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
-            if let Err(e) = self.queue(&key) {
+            if let Err(e) = self.queue_with_trigger(&key, "schedule") {
                 tracing::warn!(task = key, error = %e, "trigger failed to queue task");
             }
         }
@@ -838,6 +870,59 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "task never finished");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_exports_a_scheduled_task_span_with_trigger_and_outcome() {
+        // Span-coverage smoke: a queued run exports a `scheduled_task` root span
+        // carrying `task`, `trigger`, and `outcome`. A current-thread runtime +
+        // `set_default` keeps the spawned run on this thread/subscriber so the
+        // `.instrument()`ed span is captured (guards against orphan-span bugs).
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("hermit"));
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let mgr = HermitTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(CountingTask {
+            runs,
+            fail: false,
+            hidden: false,
+        }));
+        mgr.queue("counting").expect("queued");
+
+        // Drive the spawned run to completion so its span closes and exports.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if mgr.get("counting").expect("info").state == TaskState::Idle {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        provider.force_flush().expect("flush");
+
+        let spans = exporter.get_finished_spans().expect("spans");
+        let span = spans
+            .iter()
+            .find(|s| s.name == "scheduled_task")
+            .expect("scheduled_task span exported");
+        let attrs: std::collections::HashMap<String, String> = span
+            .attributes
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect();
+        assert_eq!(attrs.get("task").map(String::as_str), Some("counting"));
+        assert_eq!(attrs.get("trigger").map(String::as_str), Some("api"));
+        assert_eq!(attrs.get("outcome").map(String::as_str), Some("completed"));
     }
 
     #[tokio::test]

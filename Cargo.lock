@@ -1127,6 +1127,8 @@ dependencies = [
  "hermit-traits",
  "image",
  "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "rstest",
  "serde",
@@ -1136,6 +1138,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
