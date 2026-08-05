@@ -132,6 +132,13 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
   `brain/rules/RULES_METRICS.md` — parity-first names (Jellyfin's `http_*`/`process_*`),
   bounded labels, noop-when-disabled, sync observable callbacks. Docs live in
   `contrib/metrics/`.
+- **Traces** (OTLP → Tempo, opt-in via `OTEL_EXPORTER_OTLP_ENDPOINT`): all span work
+  follows `brain/rules/RULES_TRACING.md` — off by default, `skip_all` + typed fields,
+  sampling is the storage knob, flush on shutdown, no secrets in spans.
+- **Logging**: all log statements follow `brain/rules/RULES_LOGGING.md` — levels mean
+  things, errors logged once at the outermost layer with context, spans for units of
+  work with the standard field vocabulary (`item_id`/`user_id`/`task`/…), no level whose
+  volume scales with library size above `debug`, panics stay visible, no secrets.
 
 ---
 
