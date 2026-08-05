@@ -234,12 +234,26 @@ impl LibraryScanner {
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
     pub async fn scan_all(&self) -> Result<usize, ServiceError> {
+        // ponytail: fixed progress cadence. Keeps info-level output at O(items/100),
+        // not O(items) (RULES_LOGGING volume rule); per-item detail is at debug.
+        // Make it a knob only if operators want denser/sparser scan progress.
+        const PROGRESS_EVERY: usize = 100;
+
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
+        tracing::info!(
+            items = planned.len(),
+            folders = folders.len(),
+            "library scan planned"
+        );
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
         let mut art_cache = ArtworkCache::default();
-        for item in &planned {
+        for (scanned, item) in planned.iter().enumerate() {
+            tracing::debug!(item = %item.id, "scanning item");
+            if scanned > 0 && scanned.is_multiple_of(PROGRESS_EVERY) {
+                tracing::info!(scanned, total = planned.len(), "library scan progress");
+            }
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();

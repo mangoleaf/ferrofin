@@ -687,7 +687,11 @@ impl ScheduledTask for RefreshLibraryTask {
         }]
     }
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
-        self.library.queue_library_scan().await
+        // This runs inside a `scheduled_task` span already; tag the spawned scan
+        // as schedule-triggered so its own root trace records the origin.
+        self.library
+            .queue_library_scan_with_trigger("schedule")
+            .await
     }
 }
 

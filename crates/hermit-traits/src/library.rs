@@ -589,6 +589,18 @@ pub trait LibraryManager: Send + Sync {
 
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+
+    /// Queues a full library scan, tagging the run's root span with why it was
+    /// triggered (`api` / `schedule` / `startup` / `watcher`) for log↔trace
+    /// correlation. Defaults to the plain [`queue_library_scan`](Self::queue_library_scan)
+    /// so existing implementations need no change; the real manager overrides it
+    /// to record the `trigger`.
+    async fn queue_library_scan_with_trigger(
+        &self,
+        _trigger: &'static str,
+    ) -> Result<(), ServiceError> {
+        self.queue_library_scan().await
+    }
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}

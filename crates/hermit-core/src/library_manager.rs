@@ -27,6 +27,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use tracing::Instrument as _;
+
 use hermit_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use hermit_model::data::{BaseItemKind, CollectionType};
 use hermit_model::dto::ItemCounts;
@@ -131,7 +133,9 @@ impl HermitLibraryManager {
 #[async_trait]
 impl crate::library_monitor::LibraryScanTrigger for HermitLibraryManager {
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        LibraryManager::queue_library_scan(self).await
+        // Reached via the filesystem watcher / Radarr-Sonarr webhooks.
+        self.spawn_scan("watcher");
+        Ok(())
     }
 }
 
@@ -546,9 +550,28 @@ impl LibraryManager for HermitLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        self.spawn_scan("api");
+        Ok(())
+    }
+
+    async fn queue_library_scan_with_trigger(
+        &self,
+        trigger: &'static str,
+    ) -> Result<(), ServiceError> {
+        self.spawn_scan(trigger);
+        Ok(())
+    }
+}
+
+impl HermitLibraryManager {
+    /// Spawns the coalescing background library scan under a `library_scan` root
+    /// span tagged with `trigger`, returning immediately (Jellyfin's refresh is
+    /// fire-and-forget — it must not block the HTTP handler). Shared by every
+    /// entry point so the coalescing guard and the span are defined once.
+    fn spawn_scan(&self, trigger: &'static str) {
         let Some(scanner) = &self.scanner else {
-            tracing::debug!("library scan queued (no scanner attached — no-op)");
-            return Ok(());
+            tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
+            return;
         };
         // Coalesce: a full scan fetches remote metadata + artwork for every item,
         // so it can run for minutes. The library-monitor webhooks report one path
@@ -558,33 +581,51 @@ impl LibraryManager for HermitLibraryManager {
         // loops once more to pick up whatever changed mid-scan.
         if self.scan_in_flight.swap(true, Ordering::AcqRel) {
             self.scan_pending.store(true, Ordering::Release);
-            tracing::debug!("library scan already running; coalesced (rerun queued)");
-            return Ok(());
+            tracing::debug!(
+                trigger,
+                "library scan already running; coalesced (rerun queued)"
+            );
+            return;
         }
-        // Spawn so the request returns immediately (Jellyfin's refresh is
-        // fire-and-forget) and must not block the HTTP handler.
         let scanner = Arc::clone(scanner);
         let in_flight = Arc::clone(&self.scan_in_flight);
         let pending = Arc::clone(&self.scan_pending);
-        tokio::spawn(async move {
-            loop {
-                pending.store(false, Ordering::Release);
-                match scanner.scan_all().await {
-                    Ok(created) => tracing::info!(created, "library scan complete"),
-                    Err(err) => tracing::error!(%err, "library scan failed"),
+        // Its own root span — a scan is a background unit of work, never parented
+        // under the request span. `.instrument()` carries it onto the spawned task.
+        let span = tracing::info_span!("library_scan", trigger);
+        tokio::spawn(
+            async move {
+                let started = std::time::Instant::now();
+                tracing::info!("library scan started");
+                let mut total_created = 0usize;
+                loop {
+                    pending.store(false, Ordering::Release);
+                    match scanner.scan_all().await {
+                        Ok(created) => {
+                            total_created += created;
+                            tracing::info!(created, "library scan pass complete");
+                        }
+                        // Logged exactly once, here, at the scan task's top level.
+                        Err(err) => tracing::error!(%err, "library scan failed"),
+                    }
+                    // A request that arrived during the scan queued a rerun.
+                    if !pending.swap(false, Ordering::AcqRel) {
+                        break;
+                    }
                 }
-                // A request that arrived during the scan queued a rerun.
-                if !pending.swap(false, Ordering::AcqRel) {
-                    break;
-                }
+                in_flight.store(false, Ordering::Release);
+                tracing::info!(
+                    created = total_created,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "library scan complete"
+                );
+                // ponytail: a request landing in the gap between the pending re-check
+                // and clearing in_flight loses its rerun — harmless (the next webhook
+                // or a manual refresh re-triggers). Tighten only if webhook-driven
+                // scans start missing changes.
             }
-            in_flight.store(false, Ordering::Release);
-            // ponytail: a request landing in the gap between the pending re-check
-            // and clearing in_flight loses its rerun — harmless (the next webhook
-            // or a manual refresh re-triggers). Tighten only if webhook-driven
-            // scans start missing changes.
-        });
-        Ok(())
+            .instrument(span),
+        );
     }
 }
 
@@ -602,6 +643,61 @@ mod tests {
     use hermit_db::Database;
     use hermit_model::data::BaseItemKind;
     use hermit_model::entities::ImageType;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queue_library_scan_exports_a_library_scan_span_tagged_with_trigger() {
+        // End-to-end span-coverage smoke: an `api`-triggered scan (empty library,
+        // so it finishes fast) exports a `library_scan` root span carrying
+        // `trigger`. current-thread + set_default keeps the spawned scan on the
+        // scoped subscriber so the `.instrument()`ed span is captured.
+        use crate::file_system::HermitFileSystem;
+        use crate::library_scan::LibraryScanner;
+        use crate::virtual_folder_manager::HermitVirtualFolderManager;
+        use hermit_traits::library::VirtualFolderManager;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        // No virtual folders added → the scan plans zero items and returns fast.
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = Arc::new(LibraryScanner::new(
+            vf,
+            Arc::new(HermitFileSystem::new()),
+            persistence,
+        ));
+        let mgr = manager(&db).with_scanner(scanner);
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("hermit"));
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        mgr.queue_library_scan().await.expect("queued");
+        // Let the spawned (empty) scan run to completion so its span closes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        provider.force_flush().expect("flush");
+
+        let spans = exporter.get_finished_spans().expect("spans");
+        let span = spans
+            .iter()
+            .find(|s| s.name == "library_scan")
+            .expect("library_scan span exported");
+        let trigger = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "trigger")
+            .map(|kv| kv.value.to_string());
+        assert_eq!(trigger.as_deref(), Some("api"));
+    }
 
     /// Builds a manager backed by real repositories over the given database.
     fn manager(db: &Database) -> HermitLibraryManager {
