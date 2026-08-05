@@ -497,7 +497,7 @@ impl ScheduledTask for DetectSegmentsTask {
         "Intro Skipper"
     }
 
-    async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // Gate on the plugin being enabled (live toggle — no restart needed).
         if !self.enabled().await {
             tracing::debug!("intro skipper disabled; skipping analysis");
@@ -525,7 +525,7 @@ impl ScheduledTask for DetectSegmentsTask {
         // task, so this body's runtime IS the dashboard's Running state — a
         // fire-and-forget here would flip the task back to Idle in
         // milliseconds and the run button would appear to do nothing.
-        self.run_analysis(&fingerprinter, &config).await;
+        self.run_analysis(progress, &fingerprinter, &config).await;
         Ok(())
     }
 }
@@ -545,6 +545,7 @@ impl DetectSegmentsTask {
     /// write segments for each season with enough episodes to compare.
     async fn run_analysis(
         &self,
+        progress: &TaskProgress,
         fingerprinter: &Arc<dyn Fingerprinter>,
         config: &IntroSkipperConfig,
     ) {
@@ -555,16 +556,36 @@ impl DetectSegmentsTask {
                 return;
             }
         };
-        tracing::info!(seasons = seasons.len(), "intro skipper: analyzing");
+        // Only seasons with a comparable pair do work; drive progress off those
+        // so the percentage tracks the fingerprinting rather than the skipped
+        // singletons.
+        let analyzable: Vec<&Vec<Episode>> =
+            seasons.values().filter(|eps| eps.len() >= 2).collect();
+        let total = analyzable.len();
+        tracing::info!(
+            seasons = seasons.len(),
+            analyzable = total,
+            "intro skipper: analysis started"
+        );
         let mut written = 0usize;
-        for episodes in seasons.values() {
-            if episodes.len() < 2 {
-                continue; // need a pair to find a shared region
-            }
+        for (idx, episodes) in analyzable.into_iter().enumerate() {
+            // Log + report BEFORE the season's fingerprinting (the slow part), so
+            // a stall shows up as the last "analyzing season N" line with silence
+            // after — pinpointing which season's media reads wedged.
+            #[allow(clippy::cast_precision_loss)]
+            progress.report(100.0 * idx as f64 / total.max(1) as f64);
+            tracing::info!(
+                season = idx + 1,
+                of = total,
+                episodes = episodes.len(),
+                segments = written,
+                "intro skipper: analyzing season"
+            );
             written += self
                 .analyze_season(episodes, config, fingerprinter.as_ref())
                 .await;
         }
+        progress.report(100.0);
         tracing::info!(segments = written, "intro skipper: analysis complete");
     }
 
