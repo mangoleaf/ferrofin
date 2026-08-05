@@ -159,6 +159,7 @@ mod tests {
             admin_user: admin_user.to_owned(),
             admin_password: admin_password.to_owned(),
             db_pool: None,
+            enable_metrics: None,
             metrics_sample_interval: None,
         }
     }

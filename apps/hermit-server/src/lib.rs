@@ -187,12 +187,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Jellyfin semantics). Disabled ⇒ the route is never mounted (404), the global
     // meter stays the built-in noop, and no sampler task runs. The handle must
     // outlive the server (it owns the observable callbacks), so it is bound here.
-    let enable_metrics = wired
-        .state
-        .config
-        .configuration()
-        .await
-        .is_ok_and(|c| c.enable_metrics);
+    //
+    // The bootstrap `HERMIT_ENABLE_METRICS` env / `config.toml` override wins when
+    // set (declarative/GitOps deploys); otherwise defer to the persisted
+    // `ServerConfiguration.EnableMetrics` (dashboard/API toggle).
+    let enable_metrics = match config.enable_metrics {
+        Some(forced) => forced,
+        None => wired
+            .state
+            .config
+            .configuration()
+            .await
+            .is_ok_and(|c| c.enable_metrics),
+    };
     let _metrics_handle = enable_metrics
         .then(|| {
             // Sampler cadence is a bootstrap knob (env / config.toml), kept out of

@@ -14,7 +14,13 @@ Metrics are **off by default** and gated on the existing
 `ServerConfiguration.EnableMetrics` toggle (restart required — Jellyfin semantics):
 
 - Edit `{config_dir}/system.json`: set `"EnableMetrics": true`, or
-- `POST /System/Configuration` with the flag set,
+- `POST /System/Configuration` with the flag set, or
+- set the bootstrap override `HERMIT_ENABLE_METRICS=true` (env) / `enable_metrics = true`
+  (in `config.toml`) — for declarative/GitOps/container deploys where editing
+  `system.json` or calling the API is impractical. It wins over the persisted flag
+  when set (`false` force-disables); unset defers to `system.json`. Like the sampler
+  interval, it is a bootstrap knob only — NOT part of the API `ServerConfiguration`,
+  so `/System/Configuration` stays byte-identical to Jellyfin.
 
 then **restart** Hermit. Disabled ⇒ `/metrics` returns `404`, no recording
 overhead, no background sampler. The endpoint is unauthenticated when enabled

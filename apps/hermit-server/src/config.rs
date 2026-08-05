@@ -114,6 +114,7 @@ struct FileConfig {
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
+    enable_metrics: Option<bool>,
     metrics_sample_interval: Option<u32>,
 }
 
@@ -211,6 +212,16 @@ pub struct Config {
     /// `config.toml` (integer or `"auto"`) > auto, matching the layering of
     /// every other knob.
     pub db_pool: Option<u32>,
+
+    /// Bootstrap override for the metrics endpoint toggle. `Some(true)`/`Some(false)`
+    /// force it on/off regardless of the persisted `ServerConfiguration.EnableMetrics`;
+    /// `None` defers to `system.json`. Resolved `HERMIT_ENABLE_METRICS` env >
+    /// `enable_metrics` in `config.toml` > `None`. This exists for declarative
+    /// (GitOps/container) deploys where flipping a `system.json` field or calling the
+    /// API is impractical; the persisted toggle and dashboard still work when it is
+    /// unset. It is a bootstrap knob only — NOT added to the API `ServerConfiguration`,
+    /// so `/System/Configuration` stays byte-identical to Jellyfin.
+    pub enable_metrics: Option<bool>,
 
     /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
     /// (aligned with the Prometheus scrape interval). Resolved
@@ -361,6 +372,7 @@ impl Config {
             admin_user,
             admin_password,
             db_pool,
+            enable_metrics: parse_var(env, "HERMIT_ENABLE_METRICS").or(file.enable_metrics),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
         })
     }
@@ -677,6 +689,35 @@ mod tests {
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
+    }
+
+    #[test]
+    fn enable_metrics_override_env_beats_file_and_defers_when_unset() {
+        // Unset ⇒ None (defer to system.json).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.enable_metrics, None);
+
+        // config.toml sets it.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "enable_metrics = true\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .enable_metrics,
+            Some(true)
+        );
+
+        // HERMIT_ENABLE_METRICS env beats the file (can force off, too).
+        let env = FakeEnv::new().with("HERMIT_ENABLE_METRICS", "false");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().enable_metrics,
+            Some(false)
+        );
     }
 
     #[test]

@@ -614,6 +614,7 @@ mod tests {
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
+            enable_metrics: None,
             metrics_sample_interval: None,
         }
     }
