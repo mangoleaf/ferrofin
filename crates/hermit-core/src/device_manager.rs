@@ -136,7 +136,7 @@ impl HermitDeviceManager {
         Ok(DeviceInfo {
             name: Some(device.device_name.clone()),
             custom_name: options.and_then(|o| o.custom_name.clone()),
-            access_token: Some(device.access_token.clone()),
+            access_token: Some(device.access_token.clone().into()),
             id: Some(device.device_id.clone()),
             last_user_name: Some(last_user_name),
             app_name: Some(device.app_name.clone()),

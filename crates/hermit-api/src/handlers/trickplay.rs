@@ -17,6 +17,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use hermit_model::secret::Secret;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -62,7 +63,7 @@ async fn get_trickplay_hls_playlist(
     let source_id = query.media_source_id.unwrap_or(item_id);
     let playlist = state
         .trickplay
-        .get_hls_playlist(source_id, width, auth.token.as_deref())
+        .get_hls_playlist(source_id, width, auth.token.as_ref().map(Secret::expose))
         .await?;
     match playlist {
         Some(text) if !text.is_empty() => {

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::secret::Secret;
 use crate::session::ClientCapabilities;
 
 /// A class for device information.
@@ -21,7 +22,8 @@ pub struct DeviceInfo {
 
     /// Gets or sets the access token.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub access_token: Option<Secret>,
 
     /// Gets or sets the identifier.
     #[serde(skip_serializing_if = "Option::is_none")]

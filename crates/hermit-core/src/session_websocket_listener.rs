@@ -36,6 +36,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hermit_model::secret::Secret;
 use hermit_model::session::SessionMessageType;
 use tracing::warn;
 use uuid::Uuid;
@@ -111,10 +112,10 @@ impl WebSocketListener for HermitSessionWebSocketListener {
         // Resolve the session from the token the connection captured at upgrade
         // (C# `RequestHelpers.GetSession`).
         let auth = connection.authorization_info();
-        let token = auth
-            .token
-            .as_deref()
-            .ok_or_else(|| ServiceError::unauthorized("web socket connection carries no token"))?;
+        let token =
+            auth.token.as_ref().map(Secret::expose).ok_or_else(|| {
+                ServiceError::unauthorized("web socket connection carries no token")
+            })?;
         let device_id = auth.device_id.as_deref().unwrap_or("");
         let remote_endpoint = connection
             .remote_endpoint()

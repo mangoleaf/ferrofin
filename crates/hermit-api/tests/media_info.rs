@@ -559,7 +559,7 @@ impl SessionManager for OkSessions {
                 server_id: Some("server-1".to_owned()),
                 ..SessionInfoDto::default()
             },
-            access_token: "canned-token".to_owned(),
+            access_token: "canned-token".into(),
         })
     }
     async fn log_session_activity(

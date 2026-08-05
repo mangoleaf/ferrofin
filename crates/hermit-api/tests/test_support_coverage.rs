@@ -218,14 +218,14 @@ fn fake_sessions_methods_panic() {
         .block_on(f.authenticate_new_session(&AuthenticationRequest::default()))
         .expect("fake authenticate returns Ok");
     assert_eq!(
-        new_session.access_token,
+        new_session.access_token.expose(),
         hermit_api::test_support::FAKE_ACCESS_TOKEN
     );
     let direct = rt
         .block_on(f.authenticate_direct(&AuthenticationRequest::default()))
         .expect("fake authenticate returns Ok");
     assert_eq!(
-        direct.access_token,
+        direct.access_token.expose(),
         hermit_api::test_support::FAKE_ACCESS_TOKEN
     );
     assert_panics(

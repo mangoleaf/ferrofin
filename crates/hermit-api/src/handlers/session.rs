@@ -26,6 +26,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::{ClientCapabilitiesDto, NameIdPair, SessionInfoDto};
+use hermit_model::secret::Secret;
 use hermit_model::session::{
     BrowseRequest, ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand,
     PlayCommand, PlayRequest, PlaystateCommand, PlaystateRequest,
@@ -523,7 +524,8 @@ async fn report_session_ended(
 ) -> Result<StatusCode, ApiError> {
     let token = auth
         .token
-        .as_deref()
+        .as_ref()
+        .map(Secret::expose)
         .ok_or_else(|| ApiError::Unauthorized("no access token".to_owned()))?;
     state.sessions.logout(token).await?;
     Ok(StatusCode::NO_CONTENT)

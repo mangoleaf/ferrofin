@@ -11,6 +11,7 @@
 //! certification, premiere date, and cast + key crew) alongside the artwork.
 
 use hermit_model::entities::ImageType;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 /// The TMDB v3 REST base.
@@ -462,7 +463,7 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
 #[derive(Debug, Clone)]
 pub struct TmdbClient {
     http: reqwest::Client,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl Default for TmdbClient {
@@ -477,7 +478,7 @@ impl TmdbClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: DEFAULT_API_KEY.to_owned(),
+            api_key: SecretString::from(DEFAULT_API_KEY),
         }
     }
 
@@ -486,11 +487,11 @@ impl TmdbClient {
     pub fn with_api_key(key: String) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: if key.is_empty() {
+            api_key: SecretString::from(if key.is_empty() {
                 DEFAULT_API_KEY.to_owned()
             } else {
                 key
-            },
+            }),
         }
     }
 
@@ -517,7 +518,7 @@ impl TmdbClient {
         let mut req = self
             .http
             .get(format!("{API_BASE}/{path}"))
-            .query(&[("api_key", self.api_key.as_str()), ("query", name)]);
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
         }
@@ -560,7 +561,7 @@ impl TmdbClient {
         let mut req = self
             .http
             .get(format!("{API_BASE}/search/tv"))
-            .query(&[("api_key", self.api_key.as_str()), ("query", name)]);
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[("first_air_date_year", y.to_string())]);
         }
@@ -603,7 +604,7 @@ impl TmdbClient {
         let resp = self
             .http
             .get(url)
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
             .ok()?;
@@ -646,7 +647,7 @@ impl TmdbClient {
         let mut req = self
             .http
             .get(format!("{API_BASE}/{path}"))
-            .query(&[("api_key", self.api_key.as_str()), ("query", name)]);
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
         }
@@ -685,7 +686,7 @@ impl TmdbClient {
         let Ok(resp) = self
             .http
             .get(format!("{API_BASE}/{path}/{tmdb_id}/images"))
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
         else {
@@ -729,7 +730,7 @@ impl TmdbClient {
             .http
             .get(format!("{API_BASE}/{path}/{tmdb_id}"))
             .query(&[
-                ("api_key", self.api_key.as_str()),
+                ("api_key", self.api_key.expose_secret()),
                 ("append_to_response", append),
             ])
             .send()
@@ -832,7 +833,7 @@ impl TmdbClient {
         let resp = self
             .http
             .get(format!("{API_BASE}/person/{tmdb_id}"))
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
             .ok()?;
@@ -957,9 +958,9 @@ mod tests {
     #[test]
     fn empty_user_key_falls_back_to_builtin() {
         let c = TmdbClient::with_api_key(String::new());
-        assert_eq!(c.api_key, DEFAULT_API_KEY);
+        assert_eq!(c.api_key.expose_secret(), DEFAULT_API_KEY);
         let c = TmdbClient::with_api_key("mykey".to_owned());
-        assert_eq!(c.api_key, "mykey");
+        assert_eq!(c.api_key.expose_secret(), "mykey");
     }
 
     #[test]

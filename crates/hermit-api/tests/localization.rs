@@ -89,7 +89,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            token: Some("tok".to_owned()),
+            token: Some("tok".into()),
             user: Some(user()),
             is_authenticated: true,
             ..Default::default()
@@ -104,7 +104,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            token: Some("tok".to_owned()),
+            token: Some("tok".into()),
             user: Some(user()),
             is_authenticated: true,
             ..Default::default()

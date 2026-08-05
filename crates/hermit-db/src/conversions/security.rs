@@ -26,7 +26,7 @@ impl TryFrom<DeviceEntity> for DeviceInfo {
         Ok(Self {
             name: Some(entity.device_name),
             custom_name: None,
-            access_token: Some(entity.access_token),
+            access_token: Some(entity.access_token.into()),
             id: Some(entity.device_id),
             last_user_name: None,
             app_name: Some(entity.app_name),

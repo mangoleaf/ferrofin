@@ -11,6 +11,7 @@ use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::PermissionKind;
 use hermit_model::configuration::ServerConfiguration;
 use hermit_model::dto::{BaseItemDto, SessionInfoDto};
+use hermit_model::secret::Secret;
 use hermit_model::session::{ClientCapabilities, MessageCommand, SessionMessageType};
 use uuid::Uuid;
 
@@ -442,7 +443,7 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     // The result carries a non-empty minted access token (the bug: it used to be
     // dropped, leaving the API's `AccessToken` null).
     assert!(
-        !result.access_token.is_empty(),
+        !result.access_token.expose().is_empty(),
         "authenticate returns a non-empty access token"
     );
 
@@ -456,13 +457,14 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
             .unwrap();
     assert!(!persisted.is_empty());
     assert_eq!(
-        result.access_token, persisted,
+        result.access_token.expose(),
+        persisted.as_str(),
         "the returned token equals the persisted Devices.AccessToken"
     );
 
     // The freshly minted token resolves back to a session.
     let resolved = mgr
-        .get_session_by_authentication_token(&result.access_token, "dev-1", "1.2.3.4")
+        .get_session_by_authentication_token(result.access_token.expose(), "dev-1", "1.2.3.4")
         .await
         .unwrap();
     assert_eq!(resolved.user_id, user_id);
@@ -488,7 +490,7 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
 
     let request = AuthenticationRequest {
         username: Some("bob".to_owned()),
-        password: Some(String::new()),
+        password: Some(Secret::new("")),
         app: Some("Web".to_owned()),
         app_version: Some("1.0".to_owned()),
         device_id: Some("dev-9".to_owned()),
@@ -499,7 +501,7 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     let result = mgr.authenticate_new_session(&request).await.unwrap();
     assert_eq!(result.session.user_id, user_id);
     assert!(
-        !result.access_token.is_empty(),
+        !result.access_token.expose().is_empty(),
         "authenticate_new_session returns a non-empty token"
     );
 
@@ -509,11 +511,11 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(result.access_token, persisted);
+    assert_eq!(result.access_token.expose(), persisted.as_str());
 
     // The token authenticates future requests.
     let resolved = mgr
-        .get_session_by_authentication_token(&result.access_token, "dev-9", "1.2.3.4")
+        .get_session_by_authentication_token(result.access_token.expose(), "dev-9", "1.2.3.4")
         .await
         .unwrap();
     assert_eq!(resolved.user_id, user_id);
@@ -574,7 +576,7 @@ async fn logout_by_token_ends_the_session() {
         .unwrap()
         .access_token;
 
-    mgr.logout(&token).await.unwrap();
+    mgr.logout(token.expose()).await.unwrap();
 
     // The device row is gone and the token no longer resolves.
     let count: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Devices""#)
@@ -583,7 +585,7 @@ async fn logout_by_token_ends_the_session() {
         .unwrap();
     assert_eq!(count, 0);
     let err = mgr
-        .get_session_by_authentication_token(&token, "dev-1", "e")
+        .get_session_by_authentication_token(token.expose(), "dev-1", "e")
         .await
         .unwrap_err();
     assert!(matches!(err, ServiceError::Unauthorized(_)));

@@ -42,6 +42,7 @@ use axum::{Json, Router};
 use hermit_db::entities::users::UserEntity;
 use hermit_model::configuration::UserConfiguration;
 use hermit_model::dto::UserDto;
+use hermit_model::secret::Secret;
 use hermit_model::session::AuthenticationResult;
 use hermit_model::users::{
     ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
@@ -68,7 +69,7 @@ struct AuthenticateByNameRequest {
     username: Option<String>,
     /// The plaintext password (C# `Pw`).
     #[serde(default, rename = "Pw")]
-    pw: Option<String>,
+    pw: Option<Secret>,
 }
 
 /// The `AuthenticateWithQuickConnect` request body (a Quick Connect secret).
@@ -77,7 +78,7 @@ struct AuthenticateByNameRequest {
 struct QuickConnectDto {
     /// The Quick Connect secret returned by the initiate endpoint.
     #[serde(default)]
-    secret: String,
+    secret: Secret,
 }
 
 /// The `POST /Users/New` request body.
@@ -88,7 +89,7 @@ struct CreateUserByName {
     name: String,
     /// The optional initial password.
     #[serde(default)]
-    password: Option<String>,
+    password: Option<Secret>,
 }
 
 /// The `POST /Users/Password` request body.
@@ -97,10 +98,10 @@ struct CreateUserByName {
 struct UpdateUserPassword {
     /// The current plaintext password (C# `CurrentPw`).
     #[serde(default, rename = "CurrentPw")]
-    current_pw: Option<String>,
+    current_pw: Option<Secret>,
     /// The new plaintext password (C# `NewPw`).
     #[serde(default, rename = "NewPw")]
-    new_pw: Option<String>,
+    new_pw: Option<Secret>,
     /// Whether to reset (clear) the password instead of changing it.
     #[serde(default)]
     reset_password: bool,
@@ -368,7 +369,7 @@ async fn authenticate_with_quick_connect(
     // receives a real `AccessToken` instead of thinking it logged in with none.
     let session = state
         .quick_connect
-        .get_authorized_request(&body.secret)
+        .get_authorized_request(body.secret.expose())
         .await?;
     let auth = auth_info(&parts);
     let request = AuthenticationRequest {
@@ -418,7 +419,7 @@ async fn authentication_result(
     AuthenticationResult {
         user: Some(user),
         session_info: Some(session),
-        access_token: (!access_token.is_empty()).then_some(access_token),
+        access_token: (!access_token.expose().is_empty()).then_some(access_token),
         server_id,
     }
 }
@@ -557,7 +558,7 @@ async fn create_user_by_name(
     let new_user = state.users.create_user(&body.name).await?;
     if let Some(password) = &body.password {
         let id = Uuid::parse_str(&new_user.id).unwrap_or_else(|_| Uuid::nil());
-        state.users.change_password(id, password).await?;
+        state.users.change_password(id, password.expose()).await?;
     }
     // Reload so the DTO reflects the password just set.
     let id = Uuid::parse_str(&new_user.id).unwrap_or_else(|_| Uuid::nil());
@@ -740,7 +741,7 @@ async fn update_user_password(
             .users
             .authenticate_user(
                 &user.username,
-                body.current_pw.as_deref().unwrap_or_default(),
+                body.current_pw.as_ref().map_or("", Secret::expose),
                 "",
                 false,
             )
@@ -754,7 +755,7 @@ async fn update_user_password(
 
     state
         .users
-        .change_password(user_id, body.new_pw.as_deref().unwrap_or_default())
+        .change_password(user_id, body.new_pw.as_ref().map_or("", Secret::expose))
         .await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
     Ok(StatusCode::NO_CONTENT)

@@ -785,7 +785,7 @@ impl SessionManager for FakeSessions {
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
             session: SessionInfoDto::default(),
-            access_token: FAKE_ACCESS_TOKEN.to_owned(),
+            access_token: FAKE_ACCESS_TOKEN.into(),
         })
     }
     async fn authenticate_direct(
@@ -794,7 +794,7 @@ impl SessionManager for FakeSessions {
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
             session: SessionInfoDto::default(),
-            access_token: FAKE_ACCESS_TOKEN.to_owned(),
+            access_token: FAKE_ACCESS_TOKEN.into(),
         })
     }
     async fn report_capabilities(

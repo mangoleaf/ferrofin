@@ -111,7 +111,7 @@ fn authed_info() -> AuthorizationInfo {
         device: Some("Test Device".to_owned()),
         client: Some("TestClient".to_owned()),
         version: Some("1.0".to_owned()),
-        token: Some("token-abc".to_owned()),
+        token: Some("token-abc".into()),
         is_api_key: false,
         user: Some(user_entity(USER_ID, "alice")),
         is_authenticated: true,

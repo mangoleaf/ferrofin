@@ -260,7 +260,7 @@ impl HermitAuthorizationContext {
 
         info.is_authenticated = true;
         info.client = Some(key.name);
-        info.token = Some(key.access_token);
+        info.token = Some(key.access_token.into());
         if info.device_id.as_deref().unwrap_or("").trim().is_empty() {
             info.device_id = Some(self.system_id.clone());
         }
@@ -343,7 +343,10 @@ impl AuthorizationContext for HermitAuthorizationContext {
         let header_token = parts
             .as_ref()
             .and_then(|p| p.get("Token").map(String::as_str));
-        info.token = self.resolve_token(request, header_token).await?;
+        info.token = self
+            .resolve_token(request, header_token)
+            .await?
+            .map(Into::into);
 
         if !info.has_token() {
             return Ok(info);
@@ -351,8 +354,9 @@ impl AuthorizationContext for HermitAuthorizationContext {
         let token = info.token.clone().unwrap_or_default();
 
         // Device tokens take precedence over api keys (C# order).
-        if !self.resolve_device_token(&mut info, &token).await? {
-            self.resolve_api_key_token(&mut info, &token).await?;
+        if !self.resolve_device_token(&mut info, token.expose()).await? {
+            self.resolve_api_key_token(&mut info, token.expose())
+                .await?;
         }
         Ok(info)
     }

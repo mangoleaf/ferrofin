@@ -270,14 +270,14 @@ impl QuickConnect for OkQuickConnect {
         _authorization_info: &AuthorizationInfo,
     ) -> Result<QuickConnectResult, ServiceError> {
         Ok(QuickConnectResult {
-            secret: "sec".to_owned(),
+            secret: "sec".into(),
             code: "123456".to_owned(),
             ..QuickConnectResult::default()
         })
     }
     async fn check_request_status(&self, secret: &str) -> Result<QuickConnectResult, ServiceError> {
         Ok(QuickConnectResult {
-            secret: secret.to_owned(),
+            secret: secret.into(),
             authenticated: true,
             ..QuickConnectResult::default()
         })

@@ -51,6 +51,7 @@ use hermit_db::entities::security::DeviceEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::PermissionKind;
 use hermit_model::dto::SessionInfoDto;
+use hermit_model::secret::Secret;
 use hermit_model::session::{
     ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayRequest,
     PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
@@ -1163,7 +1164,7 @@ impl HermitSessionManager {
                 .user_manager
                 .authenticate_user(
                     request.username.as_deref().unwrap_or(""),
-                    request.password.as_deref().unwrap_or(""),
+                    request.password.as_ref().map_or("", Secret::expose),
                     remote_endpoint,
                     true,
                 )
@@ -1243,7 +1244,7 @@ impl HermitSessionManager {
         // assembled by the caller from this data; the freshly minted token
         // (persisted on the created `Device` row) is returned so the caller can
         // echo it back to the client.
-        let access_token = created.access_token;
+        let access_token = Secret::from(created.access_token);
 
         let _ = self
             .event_manager

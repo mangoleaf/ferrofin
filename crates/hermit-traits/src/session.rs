@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use hermit_db::entities::security::DeviceEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_model::dto::SessionInfoDto;
+use hermit_model::secret::Secret;
 use hermit_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
@@ -53,7 +54,7 @@ pub struct AuthenticationResultData {
 
     /// The minted access token backing the session's `Device` row. Clients
     /// present this on every subsequent authenticated request.
-    pub access_token: String,
+    pub access_token: Secret,
 }
 
 /// A request to authenticate and open a new session.
@@ -69,7 +70,7 @@ pub struct AuthenticationRequest {
     pub user_id: Option<Uuid>,
 
     /// The plaintext password.
-    pub password: Option<String>,
+    pub password: Option<Secret>,
 
     /// The client application name.
     pub app: Option<String>,
@@ -306,6 +307,7 @@ fn _assert_object_safe_session_manager(_: &dyn SessionManager) {}
 #[cfg(test)]
 mod tests {
     use super::AuthenticationRequest;
+    use hermit_model::secret::Secret;
     use uuid::Uuid;
 
     #[test]
@@ -322,7 +324,7 @@ mod tests {
         let req = AuthenticationRequest {
             username: Some("alice".to_owned()),
             user_id: Some(id),
-            password: Some("hunter2".to_owned()),
+            password: Some(Secret::new("hunter2")),
             ..Default::default()
         };
         assert_eq!(req.username.as_deref(), Some("alice"));

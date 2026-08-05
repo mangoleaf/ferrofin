@@ -38,6 +38,7 @@ pub mod providers;
 pub mod querying;
 pub mod quick_connect;
 pub mod search;
+pub mod secret;
 pub mod security;
 pub mod session;
 pub mod subtitles;

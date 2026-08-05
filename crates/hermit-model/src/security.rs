@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::secret::Secret;
+
 /// Information about an issued access token — a device session or an API key.
 ///
 /// Port of `MediaBrowser.Controller.Security.AuthenticationInfo`. Surfaced by
@@ -18,7 +20,8 @@ pub struct AuthenticationInfo {
 
     /// Gets or sets the access token.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub access_token: Option<Secret>,
 
     /// Gets or sets the device identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,12 +67,13 @@ pub struct AuthenticationInfo {
 #[cfg(test)]
 mod tests {
     use super::AuthenticationInfo;
+    use crate::secret::Secret;
 
     #[test]
     fn serializes_to_pascal_case_keys() {
         let info = AuthenticationInfo {
             app_name: Some("Test App".to_owned()),
-            access_token: Some("tok".to_owned()),
+            access_token: Some(Secret::new("tok")),
             ..Default::default()
         };
         let json = serde_json::to_value(&info).unwrap();

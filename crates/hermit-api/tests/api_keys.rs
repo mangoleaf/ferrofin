@@ -94,7 +94,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            token: Some("tok".to_owned()),
+            token: Some("tok".into()),
             client: Some("Test Client".to_owned()),
             version: Some("9.9.9".to_owned()),
             is_api_key: self.is_api_key,
@@ -112,7 +112,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            token: Some("tok".to_owned()),
+            token: Some("tok".into()),
             user: Some(user()),
             is_authenticated: true,
             ..Default::default()
@@ -390,7 +390,7 @@ async fn get_keys_wraps_in_query_result() {
     let keys = Arc::new(StubApiKeys::default());
     keys.keys.lock().unwrap().push(AuthenticationInfo {
         app_name: Some("cli".to_owned()),
-        access_token: Some("abc".to_owned()),
+        access_token: Some("abc".into()),
         ..Default::default()
     });
     let app = state(

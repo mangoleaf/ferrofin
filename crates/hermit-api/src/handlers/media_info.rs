@@ -18,6 +18,7 @@ use hermit_model::dlna::{
 };
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::media_info::{LiveStreamRequest, LiveStreamResponse, PlaybackInfoResponse};
+use hermit_model::secret::Secret;
 use hermit_model::session::PlayMethod;
 use uuid::Uuid;
 
@@ -187,7 +188,7 @@ async fn playback_info(
                 profile,
                 item_id,
                 max_streaming_bitrate,
-                auth.token.as_deref(),
+                auth.token.as_ref().map(Secret::expose),
                 auth.device_id.as_deref(),
                 stream_selection,
                 &play_session_id,

@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::secret::Secret;
+
 /// Stores the state of a quick connect request.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -13,7 +15,8 @@ pub struct QuickConnectResult {
 
     /// Gets the secret value used to uniquely identify this request. Can be
     /// used to retrieve authentication information.
-    pub secret: String,
+    #[schema(value_type = String)]
+    pub secret: Secret,
 
     /// Gets the user facing code used so the user can quickly differentiate
     /// this request from others.

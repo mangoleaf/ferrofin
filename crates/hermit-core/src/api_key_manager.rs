@@ -58,7 +58,7 @@ impl HermitApiKeyManager {
 fn to_authentication_info(key: ApiKeyEntity) -> AuthenticationInfo {
     AuthenticationInfo {
         app_name: Some(key.name),
-        access_token: Some(key.access_token),
+        access_token: Some(key.access_token.into()),
         date_created: key.date_created,
         device_id: Some(String::new()),
         device_name: Some(String::new()),
@@ -122,8 +122,8 @@ mod tests {
         assert_eq!(key.app_name.as_deref(), Some("my-cli"));
         // Token is a 32-char hyphen-free hex GUID.
         let token = key.access_token.clone().expect("token");
-        assert_eq!(token.len(), 32);
-        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(token.expose().len(), 32);
+        assert!(token.expose().chars().all(|c| c.is_ascii_hexdigit()));
         // Device fields are empty, not absent, per the C# projection.
         assert_eq!(key.device_id.as_deref(), Some(""));
         assert_eq!(key.device_name.as_deref(), Some(""));
@@ -141,7 +141,7 @@ mod tests {
         assert_eq!(keys.len(), 2);
         let token_a = keys[0].access_token.clone().expect("token a");
 
-        mgr.delete_api_key(&token_a).await.expect("delete");
+        mgr.delete_api_key(token_a.expose()).await.expect("delete");
         let remaining = mgr.get_api_keys().await.expect("list after delete");
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].access_token, Some(token_a));

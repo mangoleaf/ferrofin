@@ -6,6 +6,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::ClientCapabilitiesDto;
+use crate::secret::Secret;
 
 /// A DTO representing device information.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
@@ -21,7 +22,8 @@ pub struct DeviceInfoDto {
 
     /// Gets or sets the access token.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub access_token: Option<Secret>,
 
     /// Gets or sets the identifier.
     #[serde(skip_serializing_if = "Option::is_none")]

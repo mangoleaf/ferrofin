@@ -47,6 +47,7 @@ mod tests {
     };
     use hermit_model::entities::ImageType;
     use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+    use hermit_model::secret::Secret;
     use uuid::Uuid;
 
     use super::base_items::PersonCredit;
@@ -198,7 +199,7 @@ mod tests {
         let dto = DeviceInfo::try_from(entity).expect("convert");
         assert_eq!(dto.name.as_deref(), Some("Phone"));
         assert_eq!(dto.id.as_deref(), Some("dev"));
-        assert_eq!(dto.access_token.as_deref(), Some("atk"));
+        assert_eq!(dto.access_token.as_ref().map(Secret::expose), Some("atk"));
         assert_eq!(dto.app_name.as_deref(), Some("app"));
         assert_eq!(dto.last_user_id, Some(user));
         assert_eq!(dto.custom_name, None);

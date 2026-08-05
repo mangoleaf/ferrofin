@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::dto::{SessionInfoDto, UserDto};
+use crate::secret::Secret;
 
 /// A class representing an authentication result.
 ///
@@ -24,7 +25,8 @@ pub struct AuthenticationResult {
 
     /// Gets or sets the access token.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub access_token: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub access_token: Option<Secret>,
 
     /// Gets or sets the server id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,7 +42,7 @@ mod tests {
         let result = AuthenticationResult {
             user: Some(UserDto::default()),
             session_info: Some(SessionInfoDto::default()),
-            access_token: Some("token".to_owned()),
+            access_token: Some(Secret::new("token")),
             server_id: Some("srv".to_owned()),
         };
         let json = serde_json::to_value(&result).unwrap();
@@ -57,7 +59,7 @@ mod tests {
                 name: Some("Alice".to_owned()),
                 ..UserDto::default()
             }),
-            access_token: Some("abc".to_owned()),
+            access_token: Some(Secret::new("abc")),
             ..AuthenticationResult::default()
         };
         let back: AuthenticationResult =

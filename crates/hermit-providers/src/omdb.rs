@@ -7,6 +7,7 @@
 //! composition root supplies it from config, and an empty key disables the
 //! provider (RT ratings simply stay unpopulated).
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 /// The OMDb API base URL.
@@ -19,7 +20,7 @@ const ROTTEN_TOMATOES: &str = "Rotten Tomatoes";
 #[derive(Debug, Clone)]
 pub struct OmdbClient {
     http: reqwest::Client,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl OmdbClient {
@@ -29,14 +30,14 @@ impl OmdbClient {
     pub fn new(api_key: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: api_key.trim().to_owned(),
+            api_key: SecretString::from(api_key.trim()),
         }
     }
 
     /// Whether an API key is configured (RT lookups are attempted).
     #[must_use]
     pub fn is_enabled(&self) -> bool {
-        !self.api_key.is_empty()
+        !self.api_key.expose_secret().is_empty()
     }
 
     /// Fetches the Rotten Tomatoes critic rating (`0.0`–`100.0`) for an IMDb id,
@@ -49,7 +50,7 @@ impl OmdbClient {
         let resp = self
             .http
             .get(API_BASE)
-            .query(&[("apikey", self.api_key.as_str()), ("i", imdb_id)])
+            .query(&[("apikey", self.api_key.expose_secret()), ("i", imdb_id)])
             .send()
             .await
             .ok()?;

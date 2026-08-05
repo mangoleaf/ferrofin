@@ -32,6 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hermit_model::providers::RemoteSubtitleInfo;
+use hermit_model::secret::Secret;
 use hermit_model::subtitles::FontFile;
 use hermit_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use uuid::Uuid;
@@ -500,7 +501,7 @@ async fn get_subtitle_playlist(
         runtime,
         query.segment_length,
         segment_length_ticks,
-        auth.token.as_deref().unwrap_or_default(),
+        auth.token.as_ref().map_or("", Secret::expose),
     );
     Ok((
         [(header::CONTENT_TYPE, HLS_PLAYLIST_CONTENT_TYPE)],

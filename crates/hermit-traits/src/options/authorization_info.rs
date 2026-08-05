@@ -1,6 +1,7 @@
 //! Port of `MediaBrowser.Controller.Net.AuthorizationInfo`.
 
 use hermit_db::entities::users::UserEntity;
+use hermit_model::secret::Secret;
 use uuid::Uuid;
 
 /// The authorization context resolved for an incoming request.
@@ -24,7 +25,7 @@ pub struct AuthorizationInfo {
     pub version: Option<String>,
 
     /// The access token presented, if any.
-    pub token: Option<String>,
+    pub token: Option<Secret>,
 
     /// Whether the authorization came from an API key rather than a user token.
     pub is_api_key: bool,
@@ -53,7 +54,9 @@ impl AuthorizationInfo {
     /// Whether a non-empty token is present. Mirrors C# `HasToken`.
     #[must_use]
     pub fn has_token(&self) -> bool {
-        self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+        self.token
+            .as_ref()
+            .is_some_and(|t| !t.expose().trim().is_empty())
     }
 }
 

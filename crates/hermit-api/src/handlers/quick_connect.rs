@@ -16,6 +16,7 @@ use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hermit_model::quick_connect::QuickConnectResult;
+use hermit_model::secret::Secret;
 use hermit_traits::options::AuthorizationInfo;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -30,7 +31,7 @@ use crate::state::AppState;
 struct ConnectQuery {
     /// The secret returned by the initiate endpoint.
     #[serde(default)]
-    secret: String,
+    secret: Secret,
 }
 
 /// Query parameters for `POST /QuickConnect/Authorize` (code + optional user).
@@ -109,7 +110,7 @@ async fn connect(
     Ok(Json(
         state
             .quick_connect
-            .check_request_status(&query.secret)
+            .check_request_status(query.secret.expose())
             .await?,
     ))
 }

@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::dto::{BaseItemDto, DayOfWeek, NameIdPair, NameValuePair, SortOrder};
 use crate::entities::ImageType;
 use crate::querying::ItemFields;
+use crate::secret::Secret;
 
 /// The type of a live TV channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -636,7 +637,8 @@ pub struct ListingsProviderInfo {
 
     /// Gets or sets the password.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub password: Option<Secret>,
 
     /// Gets or sets the listings id.
     #[serde(skip_serializing_if = "Option::is_none")]

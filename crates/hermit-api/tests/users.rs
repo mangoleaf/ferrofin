@@ -279,14 +279,14 @@ impl QuickConnect for OkQuickConnect {
         _authorization_info: &AuthorizationInfo,
     ) -> Result<QuickConnectResult, ServiceError> {
         Ok(QuickConnectResult {
-            secret: "sec".to_owned(),
+            secret: "sec".into(),
             code: "123456".to_owned(),
             ..QuickConnectResult::default()
         })
     }
     async fn check_request_status(&self, secret: &str) -> Result<QuickConnectResult, ServiceError> {
         Ok(QuickConnectResult {
-            secret: secret.to_owned(),
+            secret: secret.into(),
             authenticated: true,
             ..QuickConnectResult::default()
         })
@@ -1083,7 +1083,7 @@ impl SessionManager for OkSessions {
                 server_id: Some("server-1".to_owned()),
                 ..SessionInfoDto::default()
             },
-            access_token: "canned-token".to_owned(),
+            access_token: "canned-token".into(),
         })
     }
     async fn log_session_activity(

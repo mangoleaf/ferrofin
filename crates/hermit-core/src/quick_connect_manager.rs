@@ -177,7 +177,7 @@ impl QuickConnect for HermitQuickConnect {
 
         let result = QuickConnectResult {
             authenticated: false,
-            secret: Self::generate_secret(),
+            secret: Self::generate_secret().into(),
             code: Self::generate_code(),
             device_id,
             device_name: device,
@@ -203,7 +203,7 @@ impl QuickConnect for HermitQuickConnect {
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
         requests
             .values()
-            .find(|r| r.secret == secret)
+            .find(|r| r.secret.expose() == secret)
             .cloned()
             .ok_or_else(|| ServiceError::not_found("unable to find request with provided secret"))
     }
@@ -251,7 +251,7 @@ impl QuickConnect for HermitQuickConnect {
             .lock()
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?
             .insert(
-                request.secret.clone(),
+                request.secret.expose().to_owned(),
                 AuthorizedSecret {
                     authorized_at: Utc::now(),
                     session,
@@ -357,7 +357,7 @@ mod tests {
                     device_id: request.device_id.clone(),
                     ..SessionInfoDto::default()
                 },
-                access_token: "quick-connect-token".to_owned(),
+                access_token: "quick-connect-token".into(),
             })
         }
         async fn authenticate_new_session(
@@ -564,7 +564,7 @@ mod tests {
 
         // Status by secret is visible and still unauthenticated.
         let status = mgr
-            .check_request_status(&request.secret)
+            .check_request_status(request.secret.expose())
             .await
             .expect("status");
         assert!(!status.authenticated);
@@ -578,7 +578,7 @@ mod tests {
 
         // The device exchanges its secret for the authenticated session.
         let session = mgr
-            .get_authorized_request(&request.secret)
+            .get_authorized_request(request.secret.expose())
             .await
             .expect("authorized");
         assert_eq!(session.user_id, user_id);
