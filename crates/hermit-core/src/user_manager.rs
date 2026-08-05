@@ -111,6 +111,42 @@ impl HermitUserManager {
         Self::with_providers(db, Vec::new())
     }
 
+    /// Records a failed login: increments the invalid-attempt counter, locks the
+    /// account out once the threshold is hit, and logs the security-audit `warn!`
+    /// lines (never the attempted password).
+    async fn record_login_failure(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        // Count the failure and lock the account out once the threshold is
+        // reached (C# increments then disables).
+        let attempts = user.invalid_login_attempt_count + 1;
+        if user
+            .login_attempts_before_lockout
+            .is_some_and(|max| max > 0 && attempts >= max)
+        {
+            set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true).await?;
+            // A locked-out account's cached auth must not outlive the lock.
+            self.auth_cache.clear();
+            tracing::warn!(
+                username = %user.username,
+                user_id = %user.id,
+                attempts,
+                "account locked out after repeated failed logins"
+            );
+        }
+        sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
+            .bind(&user.id)
+            .bind(attempts)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        tracing::warn!(
+            username = %user.username,
+            user_id = %user.id,
+            reason = "bad_password",
+            "login failed"
+        );
+        Ok(())
+    }
+
     /// Creates a user manager with additional pluggable authentication providers
     /// (e.g. LDAP), which are consulted after the built-in default.
     #[must_use]
@@ -623,35 +659,21 @@ impl UserManager for HermitUserManager {
         }
 
         let Some(mut user) = user else {
-            // No such user: an auth failure regardless of provider result.
+            // No such user: an auth failure regardless of provider result. Security
+            // audit trail — never log the attempted password.
+            tracing::warn!(username, reason = "unknown_user", "login failed");
             return Err(ServiceError::unauthorized(
                 "Invalid username or password entered.",
             ));
         };
 
         if !success {
-            // Count the failure and lock the account out once the threshold is
-            // reached (C# increments then disables).
-            let attempts = user.invalid_login_attempt_count + 1;
-            if user
-                .login_attempts_before_lockout
-                .is_some_and(|max| max > 0 && attempts >= max)
-            {
-                set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true)
-                    .await?;
-                // A locked-out account's cached auth must not outlive the lock.
-                self.auth_cache.clear();
-            }
-            sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
-                .bind(&user.id)
-                .bind(attempts)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
+            self.record_login_failure(&user).await?;
             return Ok(None);
         }
 
         if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
             return Err(ServiceError::unauthorized(format!(
                 "The {} account is currently disabled. Please consult with your administrator.",
                 user.username
@@ -659,6 +681,7 @@ impl UserManager for HermitUserManager {
         }
 
         if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
             return Err(ServiceError::unauthorized(
                 "User is not allowed access at this time.",
             ));
@@ -689,6 +712,7 @@ impl UserManager for HermitUserManager {
             user.invalid_login_attempt_count = 0;
         }
 
+        tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
         Ok(Some(user))
     }
 
