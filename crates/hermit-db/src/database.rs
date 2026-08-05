@@ -118,6 +118,14 @@ impl Database {
             .max_connections(1)
             .connect_with(write_options)
             .await?;
+        // One-time at startup: the reader pool size is the concurrent-read thread
+        // count (each sqlx SQLite connection owns a dedicated OS thread), the
+        // single operational knob behind read throughput.
+        tracing::info!(
+            reader_connections = max_connections,
+            writer_connections = 1,
+            "database pools opened"
+        );
         Ok(Self { pool, writer })
     }
 
@@ -129,7 +137,16 @@ impl Database {
     /// Returns [`DbError::Migrate`](crate::DbError::Migrate) if a migration
     /// fails to apply.
     pub async fn run_migrations(&self) -> Result<()> {
+        // One-time on the fresh/upgrade path: which schema head we brought the DB
+        // to. `MIGRATOR.run` is idempotent, so this logs the target head, not
+        // necessarily a newly-applied set.
+        let head = MIGRATOR.iter().last().map(|m| m.version);
         MIGRATOR.run(&self.writer).await?;
+        tracing::info!(
+            migrations = MIGRATOR.iter().count(),
+            head,
+            "database migrations applied"
+        );
         Ok(())
     }
 
