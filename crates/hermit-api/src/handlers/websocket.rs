@@ -131,7 +131,13 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
+#[tracing::instrument(
+    name = "ws_session",
+    skip_all,
+    fields(session_id = session_id.as_deref().unwrap_or("anonymous"))
+)]
 async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Option<String>) {
+    let started = std::time::Instant::now();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
@@ -152,6 +158,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
         }
         _ => None,
     };
+    tracing::info!(
+        authenticated = registration.is_some(),
+        "websocket connected"
+    );
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
     keepalive.tick().await; // consume the immediate first tick
@@ -187,6 +197,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
         bus.unregister(&sid);
     }
     drop(tx);
+    tracing::info!(
+        elapsed_s = started.elapsed().as_secs(),
+        "websocket disconnected"
+    );
 }
 
 /// The `ForceKeepAlive` message body Jellyfin's protocol uses.

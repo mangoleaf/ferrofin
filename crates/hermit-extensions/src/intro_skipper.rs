@@ -543,6 +543,7 @@ impl Drop for ReleaseOnDrop {
 impl DetectSegmentsTask {
     /// The background analysis pass: enumerate episodes by season, then detect +
     /// write segments for each season with enough episodes to compare.
+    #[tracing::instrument(name = "extension_run", skip_all, fields(extension = "intro_skipper"))]
     async fn run_analysis(
         &self,
         progress: &TaskProgress,
