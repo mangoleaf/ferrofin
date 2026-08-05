@@ -602,7 +602,12 @@ impl NetworkManager {
         let addresses =
             net_utils::try_parse_host(source, self.is_ipv4_enabled(), self.is_ipv6_enabled())
                 .unwrap_or_default();
-        self.get_bind_address_for_ip(addresses.first().copied(), false)
+        let resolved = self.get_bind_address_for_ip(addresses.first().copied(), false);
+        // Per-request published-URL resolution → debug (RULES_LOGGING volume rule);
+        // the startup banner already logs the configured result at info. This
+        // answers "why this address for this client" when a published URL looks off.
+        tracing::debug!(source, address = %resolved.0, port = ?resolved.1, "resolved bind address");
+        resolved
     }
 
     /// Resolves the bind address for an optional source IP

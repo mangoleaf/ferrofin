@@ -523,13 +523,21 @@ impl TmdbClient {
             req = req.query(&[(year_param, y.to_string())]);
         }
 
-        let Ok(resp) = req.send().await else {
-            return Vec::new();
+        tracing::debug!(provider = "tmdb", query = name, ?year, "tmdb image search");
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            // `without_url()` strips the query string — the URL carries the API key.
+            Err(e) => {
+                tracing::warn!(provider = "tmdb", error = %e.without_url(), "tmdb request failed");
+                return Vec::new();
+            }
         };
         if !resp.status().is_success() {
+            tracing::warn!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
             return Vec::new();
         }
         let Ok(parsed) = resp.json::<SearchResponse>().await else {
+            tracing::warn!(provider = "tmdb", "tmdb response parse failed");
             return Vec::new();
         };
         let Some(hit) = parsed.results.into_iter().next() else {

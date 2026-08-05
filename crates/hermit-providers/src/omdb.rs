@@ -47,14 +47,23 @@ impl OmdbClient {
         if !self.is_enabled() || imdb_id.is_empty() {
             return None;
         }
-        let resp = self
+        tracing::debug!(provider = "omdb", imdb_id, "fetching critic rating");
+        let resp = match self
             .http
             .get(API_BASE)
             .query(&[("apikey", self.api_key.expose_secret()), ("i", imdb_id)])
             .send()
             .await
-            .ok()?;
+        {
+            Ok(resp) => resp,
+            // `without_url()` strips the query string — the URL carries the API key.
+            Err(e) => {
+                tracing::warn!(provider = "omdb", imdb_id, error = %e.without_url(), "omdb request failed");
+                return None;
+            }
+        };
         if !resp.status().is_success() {
+            tracing::warn!(provider = "omdb", imdb_id, status = %resp.status(), "omdb returned non-success");
             return None;
         }
         let body = resp.json::<OmdbResponse>().await.ok()?;
