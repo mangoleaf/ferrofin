@@ -9,13 +9,24 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use hermit_db::Database;
 use hermit_mediaencoding::encoder::EncoderValidator;
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig as _;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+
+/// The OTLP tracer provider, kept alive for its background batch exporter and so
+/// [`shutdown_tracing`] can flush it on graceful shutdown. `None` (unset) unless
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` was present at startup.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// The resolved, validated media-encoding tool paths.
 ///
@@ -67,7 +78,10 @@ impl FfmpegPaths {
 /// dashboard log viewer, matching Jellyfin's Serilog file sink. If the log
 /// directory can't be prepared, logging falls back to stdout only.
 pub fn init_tracing(config: &Config) {
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
@@ -85,30 +99,151 @@ pub fn init_tracing(config: &Config) {
             .ok()
     });
 
-    // `try_init` returns Err if a subscriber is already set (e.g. in tests);
-    // that is fine — we only need one.
-    //
+    // JSON stdout by default (Alloy pod-log scrape → Loki, carrying the request
+    // span's `trace_id` on every in-span line); `HERMIT_LOG_FORMAT=text` restores
+    // the legacy tee'd human-readable output for interactive dev. The rotating
+    // FILE is ALWAYS plain text regardless — `GET /System/Logs` feeds the Jellyfin
+    // dashboard log viewer, which renders raw lines (a parity surface).
+    let text_mode =
+        std::env::var("HERMIT_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("text"));
+
     // ponytail: blocking file writes + no retention pruning. Fine at this log
     // volume; add `.max_log_files(n)` (from `log_file_retention_days`) or a
     // non-blocking `WorkerGuard` if the log dir grows unbounded or write
     // latency shows up.
-    match file_appender {
-        // ANSI off so the file (and stdout, tee'd through one writer) carry no
-        // colour escapes — the dashboard renders raw text.
-        Some(appender) => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
+    let mut layers: Vec<
+        Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+    > = Vec::new();
+    match (text_mode, file_appender) {
+        // Legacy path: one text layer tee'd to stdout + file. ANSI off so neither
+        // sink carries colour escapes (the dashboard renders raw text).
+        (true, Some(appender)) => layers.push(
+            tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_ansi(false)
                 .with_writer(std::io::stdout.and(appender))
-                .try_init();
-        }
-        None => {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
+                .boxed(),
+        ),
+        // Legacy fallback when the log dir can't be prepared: stdout-only text,
+        // ANSI left at its auto default (matches the pre-refactor behaviour).
+        (true, None) => layers.push(
+            tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .try_init();
+                .with_writer(std::io::stdout)
+                .boxed(),
+        ),
+        // Default: JSON to stdout (structured, `trace_id`-carrying) + plain text
+        // to the file only.
+        (false, Some(appender)) => {
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(true)
+                    .with_writer(std::io::stdout)
+                    .boxed(),
+            );
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_ansi(false)
+                    .with_writer(appender)
+                    .boxed(),
+            );
         }
+        (false, None) => layers.push(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_writer(std::io::stdout)
+                .boxed(),
+        ),
+    }
+
+    // Compose the OTLP layer in only when export is configured; `None` is a no-op
+    // (`Option<Layer>` implements `Layer`), so tracing stays local-only otherwise.
+    if let Some(otel_layer) = build_tracer_provider().map(|provider| {
+        let tracer = provider.tracer("hermit");
+        // Stash the provider so `shutdown_tracing` can flush the batch queue.
+        let _ = TRACER_PROVIDER.set(provider);
+        tracing_opentelemetry::layer().with_tracer(tracer)
+    }) {
+        layers.push(otel_layer.boxed());
+    }
+
+    // `try_init` returns Err if a subscriber is already set (e.g. in tests); that
+    // is fine — we only need one. The filter is applied as the outermost layer so
+    // it gates every sink at once.
+    let _ = tracing_subscriber::registry()
+        .with(layers)
+        .with(filter)
+        .try_init();
+}
+
+/// Builds the OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+///
+/// Returns `None` (tracing stays local-only) when the endpoint env var is unset
+/// or empty, or on any exporter-init error — the server must start regardless,
+/// the same posture as metrics init. Traces are the ONLY signal carried on OTLP;
+/// metrics stay on the Prometheus scrape and logs on stdout/file.
+fn build_tracer_provider() -> Option<SdkTracerProvider> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let ratio = sample_ratio(std::env::var("OTEL_TRACES_SAMPLER_ARG").ok().as_deref());
+
+    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint.clone())
+        .build()
+    {
+        Ok(exporter) => exporter,
+        Err(e) => {
+            tracing::warn!(error = %e, %endpoint, "OTLP exporter init failed; traces disabled");
+            return None;
+        }
+    };
+
+    let resource = Resource::builder()
+        .with_service_name("hermit")
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .build();
+
+    // ParentBased(TraceIdRatioBased): honour an upstream sampling decision when
+    // one arrives, else sample `ratio` of new roots. Batch (never simple) exporter
+    // so span export never blocks a request thread.
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            ratio,
+        ))))
+        .with_resource(resource)
+        .build();
+    tracing::info!(%endpoint, ratio, "OTLP trace export enabled");
+    Some(provider)
+}
+
+/// Parses `OTEL_TRACES_SAMPLER_ARG` into a sampling ratio in `0.0..=1.0`.
+///
+/// Unset, unparseable, non-finite, or out-of-range input falls back to the fleet
+/// default of `0.25`; in-range values are used as-is and anything outside is
+/// clamped. Sampling is the storage lever, so the default is conservative.
+fn sample_ratio(env_val: Option<&str>) -> f64 {
+    const DEFAULT_RATIO: f64 = 0.25;
+    env_val
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|r| r.is_finite())
+        .map_or(DEFAULT_RATIO, |r| r.clamp(0.0, 1.0))
+}
+
+/// Flushes and shuts down the OTLP tracer provider, if one was started.
+///
+/// Called after `axum::serve` drains so the last batch of spans is exported
+/// rather than silently dropped. A no-op when trace export is disabled.
+pub fn shutdown_tracing() {
+    if let Some(provider) = TRACER_PROVIDER.get()
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!(error = %e, "tracer provider shutdown failed");
     }
 }
 
@@ -453,6 +588,71 @@ mod tests {
     #[test]
     fn which_on_path_absolute_missing_is_none() {
         assert_eq!(which_on_path("/definitely/not/here/nope"), None);
+    }
+
+    #[test]
+    fn sample_ratio_parses_clamps_and_defaults() {
+        assert!(
+            (sample_ratio(None) - 0.25).abs() < f64::EPSILON,
+            "unset → default"
+        );
+        assert!(
+            (sample_ratio(Some("garbage")) - 0.25).abs() < f64::EPSILON,
+            "junk → default"
+        );
+        assert!(
+            (sample_ratio(Some("")) - 0.25).abs() < f64::EPSILON,
+            "empty → default"
+        );
+        assert!(
+            (sample_ratio(Some("nan")) - 0.25).abs() < f64::EPSILON,
+            "nan → default"
+        );
+        assert!(
+            (sample_ratio(Some(" 0.5 ")) - 0.5).abs() < f64::EPSILON,
+            "trimmed + parsed"
+        );
+        assert!(
+            (sample_ratio(Some("1.0")) - 1.0).abs() < f64::EPSILON,
+            "in range"
+        );
+        assert!(
+            sample_ratio(Some("-3")).abs() < f64::EPSILON,
+            "negative clamps to 0"
+        );
+        assert!(
+            (sample_ratio(Some("9")) - 1.0).abs() < f64::EPSILON,
+            ">1 clamps to 1"
+        );
+    }
+
+    #[test]
+    fn tracing_to_otel_bridge_exports_a_named_span() {
+        // Proves the tracing→OTel version pairing actually bridges: compose the
+        // OTel layer on a SCOPED subscriber (never the global set-once one), emit
+        // an instrumented span, flush, and assert the in-memory exporter saw it.
+        // This is the one runnable check that the feature works without a live
+        // collector.
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("hermit"));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("bridge_probe");
+            let _entered = span.enter();
+        });
+        provider.force_flush().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1, "exactly one span exported");
+        assert_eq!(spans[0].name, "bridge_probe");
     }
 
     #[test]

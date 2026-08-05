@@ -99,10 +99,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # ── openapi ────────────────────────────────────────────────────────
 utoipa = "5"
 
-# ── metrics: OpenTelemetry → prometheus exposition (hermit-metrics only) ─
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics"] }
+# ── metrics + traces: OpenTelemetry ────────────────────────────────
+# metrics → prometheus exposition (hermit-metrics only); traces → OTLP gRPC
+# (hermit-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
+# (the expected +1 offset); bump both together if otel ever moves.
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.33"
 # encode-only; hermit-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }

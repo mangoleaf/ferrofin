@@ -44,6 +44,10 @@ thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+# Read the OTel trace_id off the request span for log↔trace correlation. No
+# exporter here — that lives in hermit-server; these are API-only helpers.
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
 zip = { version = "2", default-features = false, features = ["deflate", "time"] }
 
 [dev-dependencies]
@@ -57,3 +61,6 @@ serde_urlencoded.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower.workspace = true
 tempfile.workspace = true
+# Trace-correlation test: an in-memory span exporter + a scoped OTel subscriber.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true

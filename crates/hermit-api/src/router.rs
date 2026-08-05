@@ -6,7 +6,7 @@
 //! matching entries. The router also mounts the health probes, the OpenAPI spec,
 //! the auth-context middleware, and permissive CORS + tracing.
 
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request};
 use axum::http::uri::{PathAndQuery, Uri};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -14,6 +14,7 @@ use axum::routing::{MethodRouter, delete, get, head, post};
 use axum::{Router, middleware};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Span;
 
 use crate::auth::auth_context_layer;
 use crate::handlers;
@@ -74,8 +75,53 @@ pub fn create_router(state: AppState) -> Router {
     .merge(hermit_health::health_router(Vec::new()))
     .merge(spec_router())
     .layer(middleware::from_fn(merge_repeated_query_params))
-    .layer(TraceLayer::new_for_http())
+    // Route-templated per-request span (traces group by endpoint, not raw URL);
+    // a sampled request's `trace_id` is stamped on for log↔trace correlation.
+    // With OTLP export off the OTel context is invalid, so no `trace_id` is
+    // recorded and the layer degrades to plain per-request spans as before.
+    .layer(
+        TraceLayer::new_for_http()
+            .make_span_with(make_request_span)
+            .on_request(record_trace_id)
+            .on_response(record_status),
+    )
     .layer(CorsLayer::permissive())
+}
+
+/// Builds the per-request span, named by the matched route template so
+/// `tracing-opentelemetry` groups spans by endpoint (via `otel.name`).
+fn make_request_span(req: &Request) -> Span {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str);
+    tracing::info_span!(
+        "http_request",
+        otel.name = %format!("{} {route}", req.method()),
+        http.request.method = %req.method(),
+        http.route = route,
+        url.path = %req.uri().path(),
+        http.response.status_code = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+    )
+}
+
+/// Stamps the sampled trace id onto the request span. Every `tracing` event
+/// inside the request inherits the field, so logs join to their span with no
+/// per-callsite work. Unsampled/unexported requests get no field.
+fn record_trace_id(_req: &Request, span: &Span) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let ctx = span.context();
+    let span_ctx = ctx.span().span_context().clone();
+    if span_ctx.is_valid() && span_ctx.is_sampled() {
+        span.record("trace_id", span_ctx.trace_id().to_string());
+    }
+}
+
+/// Records the final HTTP status code onto the request span.
+fn record_status(res: &Response, _latency: std::time::Duration, span: &Span) {
+    span.record("http.response.status_code", res.status().as_u16());
 }
 
 /// Rewrites `?a=1&a=2` to `?a=1,2` before the typed `Query` extractors run.
@@ -297,5 +343,59 @@ mod tests {
         // here. Also assert we actually registered the full table.
         let _ = create_router(fake_state());
         assert!(axum_routes().len() >= 400);
+    }
+
+    #[test]
+    fn request_span_gets_a_valid_sampled_trace_id_under_otel() {
+        // With an OTel layer active, the request span carries a valid, sampled
+        // context — the exact precondition `record_trace_id` keys on before
+        // stamping the log↔trace correlation field. Guards the correlation wiring
+        // against a version bump silently breaking context assignment.
+        use super::make_request_span;
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_simple_exporter(InMemorySpanExporter::default())
+            .build();
+        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("hermit"));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let req = Request::builder()
+                .uri("/Items")
+                .body(Body::empty())
+                .unwrap();
+            let span = make_request_span(&req);
+            let _entered = span.enter();
+            let span_ctx = span.context().span().span_context().clone();
+            assert!(span_ctx.is_valid(), "otel context assigned to the span");
+            assert!(span_ctx.is_sampled(), "AlwaysOn sampler → sampled");
+            assert_eq!(
+                span_ctx.trace_id().to_string().len(),
+                32,
+                "trace id renders as 32 hex chars"
+            );
+        });
+    }
+
+    #[test]
+    fn request_span_has_no_valid_trace_id_without_otel() {
+        // No OTel layer ⇒ invalid context ⇒ `record_trace_id` no-ops (no dead
+        // Tempo links when export is off).
+        use super::make_request_span;
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        let req = Request::builder()
+            .uri("/Items")
+            .body(Body::empty())
+            .unwrap();
+        let span = make_request_span(&req);
+        let _entered = span.enter();
+        assert!(!span.context().span().span_context().is_valid());
     }
 }

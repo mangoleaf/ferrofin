@@ -40,7 +40,9 @@ use axum::routing::get;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
-use crate::bootstrap::{FfmpegPaths, discover_ffmpeg, init_tracing, open_database};
+use crate::bootstrap::{
+    FfmpegPaths, discover_ffmpeg, init_tracing, open_database, shutdown_tracing,
+};
 use crate::config::Config;
 use crate::seed::{SeedOutcome, seed_default_admin};
 use crate::state::build_app_state;
@@ -242,6 +244,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     .await
     .context("server error")?;
 
+    // Flush the OTLP batch queue now that the server has drained; a restart that
+    // loses the last spans is a bug. No-op when trace export is disabled.
+    shutdown_tracing();
     tracing::info!("hermit-server stopped");
     Ok(())
 }
