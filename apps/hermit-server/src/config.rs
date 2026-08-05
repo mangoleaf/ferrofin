@@ -114,6 +114,7 @@ struct FileConfig {
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
+    metrics_sample_interval: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -210,6 +211,14 @@ pub struct Config {
     /// `config.toml` (integer or `"auto"`) > auto, matching the layering of
     /// every other knob.
     pub db_pool: Option<u32>,
+
+    /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
+    /// (aligned with the Prometheus scrape interval). Resolved
+    /// `HERMIT_METRICS_SAMPLE_INTERVAL` env > `metrics_sample_interval` in
+    /// `config.toml` > default. Only consulted when `EnableMetrics` is set; kept
+    /// out of the API `ServerConfiguration` so `/System/Configuration` stays
+    /// byte-identical to Jellyfin.
+    pub metrics_sample_interval: Option<u32>,
 }
 
 impl Config {
@@ -229,6 +238,9 @@ impl Config {
     }
 
     /// [`Config::load`] against an injectable environment provider (for tests).
+    // One linear layering of CLI > env > file > default per knob; it grows by a
+    // line per config field, so the length is inherent (cf. `build_app_state`).
+    #[allow(clippy::too_many_lines)]
     fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
         let file = load_file_config(cli.config_file.as_deref(), env)?;
 
@@ -349,6 +361,7 @@ impl Config {
             admin_user,
             admin_password,
             db_pool,
+            metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
         })
     }
 
@@ -364,6 +377,16 @@ impl Config {
     pub fn database_url(&self) -> String {
         format!("sqlite://{}", self.database_path().display())
     }
+}
+
+/// Resolves the metrics sampler interval (seconds): `HERMIT_METRICS_SAMPLE_INTERVAL`
+/// env > `metrics_sample_interval` in `config.toml` > `None` (the sampler's 15 s
+/// default). A zero or unparsable value falls back to the default — a mistuned
+/// scrape knob changes cadence, never correctness.
+fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
+    parse_var(env, "HERMIT_METRICS_SAMPLE_INTERVAL")
+        .or(file)
+        .filter(|&s| s > 0)
 }
 
 /// Resolves the SQLite pool-size override: `HERMIT_DB_POOL` env (integer or

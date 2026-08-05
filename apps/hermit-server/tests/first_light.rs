@@ -80,6 +80,7 @@ fn test_config(root: &std::path::Path) -> Config {
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         db_pool: None,
+        metrics_sample_interval: None,
     }
 }
 

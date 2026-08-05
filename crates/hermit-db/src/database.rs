@@ -143,6 +143,23 @@ impl Database {
         &self.pool
     }
 
+    /// Counts library items grouped by their stored (C#) `Type` name.
+    ///
+    /// Feeds the `hermit_library_items{type=…}` metric gauge. Runs on the read
+    /// pool over the `IX_BaseItems_Type_CleanName` index; the placeholder seed
+    /// row (`Type = 'PLACEHOLDER'`) is included as-is (the metric wiring maps the
+    /// stored name to its last `.`-segment, so callers filter as they see fit).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn item_counts_by_type(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as(r#"SELECT "Type", COUNT(*) FROM "BaseItems" GROUP BY "Type""#)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
     /// The single-connection **writer** pool, for `INSERT`/`UPDATE`/`DELETE`
     /// (`.execute(...)`) and write transactions (`.begin()`).
     ///
@@ -429,6 +446,43 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn item_counts_group_by_type() {
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        db.run_migrations().await.expect("migrations apply");
+
+        // Two movies + one episode on top of the seeded PLACEHOLDER row.
+        for (id, ty) in [
+            ("00000000-0000-0000-0000-0000000000a1", "Movie"),
+            ("00000000-0000-0000-0000-0000000000a2", "Movie"),
+            ("00000000-0000-0000-0000-0000000000b1", "Episode"),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItems"
+                   ("Id","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+                    "IsRepeat","IsSeries","IsVirtualItem","Name","Type")
+                   VALUES (?1,0,0,0,0,0,0,0,?2,?2)"#,
+            )
+            .bind(id)
+            .bind(ty)
+            .execute(db.writer())
+            .await
+            .expect("insert base item");
+        }
+
+        let counts: std::collections::HashMap<String, i64> = db
+            .item_counts_by_type()
+            .await
+            .expect("counts")
+            .into_iter()
+            .collect();
+        assert_eq!(counts.get("Movie"), Some(&2));
+        assert_eq!(counts.get("Episode"), Some(&1));
+        assert_eq!(counts.get("PLACEHOLDER"), Some(&1));
     }
 
     #[tokio::test]

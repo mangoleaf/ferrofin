@@ -18,6 +18,7 @@ members = [
     "crates/hermit-chromaprint",
     "crates/hermit-core",
     "crates/hermit-extensions",
+    "crates/hermit-metrics",
     "crates/hermit-api",
     "apps/hermit-server",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
@@ -68,6 +69,7 @@ hermit-livetv = { path = "crates/hermit-livetv" }
 hermit-chromaprint = { path = "crates/hermit-chromaprint" }
 hermit-core = { path = "crates/hermit-core" }
 hermit-extensions = { path = "crates/hermit-extensions" }
+hermit-metrics = { path = "crates/hermit-metrics" }
 hermit-api = { path = "crates/hermit-api" }
 
 # ── http / async ───────────────────────────────────────────────────
@@ -95,6 +97,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # ── openapi ────────────────────────────────────────────────────────
 utoipa = "5"
+
+# ── metrics: OpenTelemetry → prometheus exposition (hermit-metrics only) ─
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics"] }
+opentelemetry-prometheus = "0.32"
+# encode-only; hermit-metrics ONLY — the 0.32 exporter exposes no render helper,
+# so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
+prometheus = { version = "0.14", default-features = false }
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1", features = ["v4", "serde"] }

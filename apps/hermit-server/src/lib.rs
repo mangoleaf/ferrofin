@@ -22,6 +22,7 @@
 pub mod bootstrap;
 pub mod config;
 pub mod media_encoding;
+pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
 pub mod state;
@@ -176,11 +177,31 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    let router = mount_web(
+    let mut router = mount_web(
         hermit_api::create_router(wired.state.clone()),
         &config.web_dir,
         Arc::clone(&wired.file_transformations),
     );
+
+    // Optional Prometheus `/metrics` (gated on `EnableMetrics`, restart required —
+    // Jellyfin semantics). Disabled ⇒ the route is never mounted (404), the global
+    // meter stays the built-in noop, and no sampler task runs. The handle must
+    // outlive the server (it owns the observable callbacks), so it is bound here.
+    let enable_metrics = wired
+        .state
+        .config
+        .configuration()
+        .await
+        .is_ok_and(|c| c.enable_metrics);
+    let _metrics_handle = enable_metrics
+        .then(|| {
+            // Sampler cadence is a bootstrap knob (env / config.toml), kept out of
+            // the API `ServerConfiguration` so `/System/Configuration` stays
+            // byte-identical to Jellyfin. `None`/0 → the sampler's 15 s default.
+            let interval = config.metrics_sample_interval.unwrap_or(0);
+            enable_metrics_endpoint(&mut router, &wired.state, &db, interval)
+        })
+        .flatten();
 
     // Post-startup: flip the host's core-startup flag (mirrors `CoreAppHost`
     // marking itself ready once services are registered).
@@ -216,6 +237,46 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     tracing::info!("hermit-server stopped");
     Ok(())
+}
+
+/// The vendored Jellyfin OpenAPI spec, embedded so the metrics layer can label
+/// requests with their Jellyfin `controller`/`action` (from each operation's
+/// first tag + `operationId`) — prometheus-net parity. Only read when metrics
+/// are enabled.
+const OPENAPI_SPEC: &str = include_str!("../../../contracts/jellyfin-openapi-10.11.8.json");
+
+/// Initialises the metrics pipeline, mounts `/metrics` + the HTTP tracking layer
+/// onto `router`, and spawns the background gauge sampler. Returns the
+/// [`MetricsHandle`](hermit_metrics::MetricsHandle) to keep alive, or `None` if
+/// init fails (logged; the server continues without metrics).
+fn enable_metrics_endpoint(
+    router: &mut Router,
+    state: &hermit_api::AppState,
+    db: &hermit_db::Database,
+    sample_interval_seconds: u32,
+) -> Option<hermit_metrics::MetricsHandle> {
+    // `endpoint` labels are the axum route templates (`MatchedPath`), so key the
+    // controller/action lookup by the same normalization the router applies.
+    let route_labels = hermit_metrics::RouteLabels::from_openapi_spec(OPENAPI_SPEC, |p| {
+        hermit_api::routes::normalize_contract_path(p)
+    });
+    match hermit_metrics::init(route_labels, tokio::runtime::Handle::current()) {
+        Ok(metrics) => {
+            *router = metrics_wiring::mount(std::mem::take(router), &metrics);
+            metrics_wiring::spawn_sampler(
+                &metrics,
+                Arc::clone(&state.sessions),
+                db.clone(),
+                sample_interval_seconds,
+            );
+            tracing::info!("prometheus metrics enabled at /metrics");
+            Some(metrics)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics init failed — continuing without");
+            None
+        }
+    }
 }
 
 /// Rewrites a request's path to its canonical Jellyfin case before routing.

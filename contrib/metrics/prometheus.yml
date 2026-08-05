@@ -1,0 +1,16 @@
+# Prometheus scrape config for Hermit's /metrics endpoint.
+#
+# Enable metrics first: set "EnableMetrics": true in {config_dir}/system.json
+# (or via POST /System/Configuration) and restart Hermit. Then:
+#   prometheus --config.file=contrib/metrics/prometheus.yml
+#
+# The 15s scrape interval matches Hermit's sampler cadence (RULES_METRICS rule 10);
+# do not tighten one without the other.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: hermit
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:8096"]

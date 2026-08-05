@@ -128,6 +128,10 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
   from the upstream C# (github.com/jellyfin/jellyfin) — including regex tables copied verbatim.
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
+- **Metrics** (`/metrics`, `hermit-metrics`): all metric work follows
+  `brain/rules/RULES_METRICS.md` — parity-first names (Jellyfin's `http_*`/`process_*`),
+  bounded labels, noop-when-disabled, sync observable callbacks. Docs live in
+  `contrib/metrics/`.
 
 ---
 
