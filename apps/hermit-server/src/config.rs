@@ -116,6 +116,7 @@ struct FileConfig {
     db_pool: Option<DbPoolFileValue>,
     enable_metrics: Option<bool>,
     metrics_sample_interval: Option<u32>,
+    scan_progress_every: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -230,6 +231,13 @@ pub struct Config {
     /// out of the API `ServerConfiguration` so `/System/Configuration` stays
     /// byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
+
+    /// Library-scan progress cadence: emit a progress `info!` every N items.
+    /// `None` = the 100-item default; `0` disables progress logs. Resolved in
+    /// order: `HERMIT_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
+    /// `config.toml`, else the default. A logging knob only — mistuning it changes
+    /// log density, never scan correctness.
+    pub scan_progress_every: Option<u32>,
 }
 
 impl Config {
@@ -374,6 +382,8 @@ impl Config {
             db_pool,
             enable_metrics: parse_var(env, "HERMIT_ENABLE_METRICS").or(file.enable_metrics),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
+            scan_progress_every: parse_var(env, "HERMIT_SCAN_PROGRESS_EVERY")
+                .or(file.scan_progress_every),
         })
     }
 
@@ -795,5 +805,22 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn scan_progress_every_resolves_from_env_and_preserves_zero() {
+        // Env value is used verbatim.
+        let env = FakeEnv::new().with("HERMIT_SCAN_PROGRESS_EVERY", "250");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_progress_every, Some(250));
+
+        // Unset → None (the scanner applies its 100-item default).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.scan_progress_every, None);
+
+        // 0 is preserved (disables progress logs), not treated as unset.
+        let env = FakeEnv::new().with("HERMIT_SCAN_PROGRESS_EVERY", "0");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_progress_every, Some(0));
     }
 }

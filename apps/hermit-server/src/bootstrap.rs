@@ -1054,6 +1054,7 @@ mod tests {
             db_pool: None,
             enable_metrics: None,
             metrics_sample_interval: None,
+            scan_progress_every: None,
         }
     }
 }

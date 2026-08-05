@@ -82,6 +82,7 @@ fn test_config(root: &std::path::Path) -> Config {
         db_pool: None,
         enable_metrics: None,
         metrics_sample_interval: None,
+        scan_progress_every: None,
     }
 }
 

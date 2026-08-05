@@ -383,33 +383,36 @@ pub async fn build_app_state(
         hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service)),
     );
-    let library_scanner = Arc::new(
-        hermit_core::LibraryScanner::new(
-            Arc::clone(&virtual_folders),
-            Arc::clone(&file_system),
-            Arc::clone(&item_persistence_service),
-        )
-        // Probe each media file during the scan (duration/size + per-stream codecs)
-        // so the web client can pick direct play and the transcoder has stream info.
-        .with_probe(
-            Arc::clone(&media_encoder),
-            Arc::clone(&media_stream_repository),
-            Arc::clone(&chapter_repository),
-        )
-        // Fetch remote artwork (TMDB) for movies/series with no local images,
-        // using Jellyfin's built-in key so posters/backdrops appear with no setup.
-        .with_metadata(Arc::clone(&tmdb_client), metadata_library)
-        // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
-        // key is configured (HERMIT_OMDB_KEY / config.toml `omdb_api_key`).
-        .with_omdb(Arc::new(hermit_providers::OmdbClient::new(
-            &config.omdb_api_key,
-        )))
-        // Persist TMDB cast/crew credits fetched alongside the metadata.
-        .with_people(Arc::clone(&people_repository))
-        // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
-        // Width/Height + ImageBlurHashes).
-        .with_image_processor(Arc::clone(&image_processor)),
-    );
+    let mut scanner = hermit_core::LibraryScanner::new(
+        Arc::clone(&virtual_folders),
+        Arc::clone(&file_system),
+        Arc::clone(&item_persistence_service),
+    )
+    // Probe each media file during the scan (duration/size + per-stream codecs)
+    // so the web client can pick direct play and the transcoder has stream info.
+    .with_probe(
+        Arc::clone(&media_encoder),
+        Arc::clone(&media_stream_repository),
+        Arc::clone(&chapter_repository),
+    )
+    // Fetch remote artwork (TMDB) for movies/series with no local images,
+    // using Jellyfin's built-in key so posters/backdrops appear with no setup.
+    .with_metadata(Arc::clone(&tmdb_client), metadata_library)
+    // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
+    // key is configured (HERMIT_OMDB_KEY / config.toml `omdb_api_key`).
+    .with_omdb(Arc::new(hermit_providers::OmdbClient::new(
+        &config.omdb_api_key,
+    )))
+    // Persist TMDB cast/crew credits fetched alongside the metadata.
+    .with_people(Arc::clone(&people_repository))
+    // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
+    // Width/Height + ImageBlurHashes).
+    .with_image_processor(Arc::clone(&image_processor));
+    // Scan-progress log cadence (bootstrap knob); `None` keeps the 100-item default.
+    if let Some(every) = config.scan_progress_every {
+        scanner = scanner.with_progress_every(every as usize);
+    }
+    let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
     let library_impl = Arc::new(
@@ -900,6 +903,7 @@ mod tests {
             db_pool: None,
             enable_metrics: None,
             metrics_sample_interval: None,
+            scan_progress_every: None,
         }
     }
 

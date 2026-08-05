@@ -105,6 +105,11 @@ struct Planned {
     ancestors: Vec<Uuid>,
 }
 
+/// Default scan-progress cadence: emit an `info!` every this-many items so
+/// info-level volume stays O(items/N), not O(items). Overridable via the
+/// `HERMIT_SCAN_PROGRESS_EVERY` bootstrap knob.
+const DEFAULT_SCAN_PROGRESS_EVERY: usize = 100;
+
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -134,6 +139,11 @@ pub struct LibraryScanner {
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
     image_processor: Option<Arc<dyn hermit_traits::drawing::ImageProcessor>>,
+    /// Emit a scan-progress `info!` every N items (bootstrap knob
+    /// `HERMIT_SCAN_PROGRESS_EVERY`; default [`DEFAULT_SCAN_PROGRESS_EVERY`]). `0`
+    /// disables progress logging. Keeps info-level volume at O(items/N) per
+    /// RULES_LOGGING; per-item detail stays at `debug`.
+    progress_every: usize,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -162,7 +172,17 @@ impl LibraryScanner {
             people: None,
             chapters: None,
             image_processor: None,
+            progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
         }
+    }
+
+    /// Overrides the scan-progress cadence (items per `info!`); `0` disables
+    /// progress logging. Wired from the `HERMIT_SCAN_PROGRESS_EVERY` bootstrap
+    /// knob; unit tests keep the default.
+    #[must_use]
+    pub fn with_progress_every(mut self, every: usize) -> Self {
+        self.progress_every = every;
+        self
     }
 
     /// Attaches the image processor so discovered artwork gets its pixel dimensions and
@@ -234,11 +254,6 @@ impl LibraryScanner {
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
     pub async fn scan_all(&self) -> Result<usize, ServiceError> {
-        // ponytail: fixed progress cadence. Keeps info-level output at O(items/100),
-        // not O(items) (RULES_LOGGING volume rule); per-item detail is at debug.
-        // Make it a knob only if operators want denser/sparser scan progress.
-        const PROGRESS_EVERY: usize = 100;
-
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
         tracing::info!(
@@ -251,7 +266,9 @@ impl LibraryScanner {
         let mut art_cache = ArtworkCache::default();
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
-            if scanned > 0 && scanned.is_multiple_of(PROGRESS_EVERY) {
+            // Bounded progress cadence (RULES_LOGGING volume rule); `0` disables it.
+            if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every)
+            {
                 tracing::info!(scanned, total = planned.len(), "library scan progress");
             }
             // Probe first so the item row is saved already carrying its duration and
