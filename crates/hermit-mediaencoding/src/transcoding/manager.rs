@@ -270,6 +270,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// # Panics
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
+    #[tracing::instrument(
+        name = "transcode_job",
+        skip_all,
+        fields(play_session_id = tracing::field::Empty, device_id = tracing::field::Empty)
+    )]
     pub async fn start_ffmpeg(
         &self,
         transcoder: &dyn SegmentTranscoder,
@@ -283,6 +288,22 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             log_path,
             working_dir,
         } = request;
+
+        // Identify the job on its span (inherited by every event below) and log
+        // the start; the full ffmpeg arg vector is diagnostic but verbose → debug.
+        let job_span = tracing::Span::current();
+        job_span.record(
+            "play_session_id",
+            state.play_session_id.as_deref().unwrap_or(""),
+        );
+        job_span.record("device_id", state.device_id.as_deref().unwrap_or(""));
+        tracing::info!(
+            transcode_type = ?state.transcoding_type,
+            program = %program,
+            args = arguments.len(),
+            "transcode job starting"
+        );
+        tracing::debug!(ffmpeg_args = ?arguments, "ffmpeg arguments");
 
         // 1. Directory.CreateDirectory(Path.GetDirectoryName(outputPath)).
         let directory = output_path
@@ -357,25 +378,43 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }
 
         // 8. A finished job that failed is an error (mirror the FfmpegException).
-        let exited = self.with_running(&handle, |r| r.child.has_exited());
-        if exited == Some(true) {
-            let code = self
-                .with_running(&handle, |r| r.child.exit_code())
-                .flatten();
-            if code.unwrap_or(0) != 0 {
-                self.remove_job_by_path(&handle.path, handle.job_type);
-                // The bare exit code hides the actual cause (unreadable input,
-                // bad args); ffmpeg's stderr in the transcode log names it.
-                let tail = stderr_log_tail(&stderr_log);
-                return Err(format!(
-                    "FFmpeg exited with code {}{tail}",
-                    code.unwrap_or(-1)
-                ));
-            }
-        }
+        self.fail_if_exited_nonzero(&handle, &stderr_log)?;
 
         // 9. Throttler / segment-cleaner deferred. 10. Return the handle.
         Ok(handle)
+    }
+
+    /// After the first-segment wait, turns an already-exited-nonzero ffmpeg into
+    /// an error (and logs the silent death); a clean early exit logs at debug.
+    fn fail_if_exited_nonzero(
+        &self,
+        handle: &TranscodingJobHandle,
+        stderr_log: &Path,
+    ) -> Result<(), String> {
+        if self.with_running(handle, |r| r.child.has_exited()) != Some(true) {
+            return Ok(());
+        }
+        let code = self.with_running(handle, |r| r.child.exit_code()).flatten();
+        if code.unwrap_or(0) != 0 {
+            self.remove_job_by_path(&handle.path, handle.job_type);
+            // The bare exit code hides the actual cause (unreadable input, bad
+            // args); ffmpeg's stderr in the transcode log names it.
+            let tail = stderr_log_tail(stderr_log);
+            // A silent ffmpeg death is the #1 playback-debug pain: log the exit +
+            // where the full stderr lives. `warn!` (not `error!`) — the error
+            // propagates and is logged once at the request boundary.
+            tracing::warn!(
+                exit_code = code.unwrap_or(-1),
+                log = %stderr_log.display(),
+                "ffmpeg exited non-zero during transcode startup"
+            );
+            return Err(format!(
+                "FFmpeg exited with code {}{tail}",
+                code.unwrap_or(-1)
+            ));
+        }
+        tracing::debug!("ffmpeg exited 0 before the first segment appeared");
+        Ok(())
     }
 
     /// Waits until segment `index` is ready to serve for `playlist_path`.
@@ -435,6 +474,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             idx.and_then(|i| jobs.remove(i).running)
         };
         if let Some(running) = running {
+            tracing::info!(
+                play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                delete_files,
+                "transcode job killed"
+            );
             let _ = running.child.kill().await;
             if delete_files {
                 let stem = running

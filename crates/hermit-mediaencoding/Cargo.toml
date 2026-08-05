@@ -25,6 +25,7 @@ quick-xml.workspace = true
 encoding_rs = "0.8"
 chardetng = "0.1"
 shlex = "1"
+tracing.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
