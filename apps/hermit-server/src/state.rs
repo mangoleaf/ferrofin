@@ -503,6 +503,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&media_stream_repository),
             subtitle_providers,
+            paths.internal_metadata_path(),
         ));
     let media_segments: Arc<dyn hermit_traits::media_segments::MediaSegmentManager> = Arc::new(
         HermitMediaSegmentManager::new(db.clone(), Arc::clone(&library)),

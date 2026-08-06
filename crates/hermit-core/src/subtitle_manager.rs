@@ -17,7 +17,7 @@
 //! - [`Self::delete_subtitles`] removes the external stream row + sidecar file.
 //! - [`Self::get_supported_providers`] lists the registered providers for an item.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -42,6 +42,10 @@ pub struct HermitSubtitleManager {
     library_manager: Arc<dyn LibraryManager>,
     media_streams: Arc<dyn MediaStreamRepository>,
     providers: Vec<Arc<dyn SubtitleProvider>>,
+    /// Internal-metadata base (`{program-data}/metadata`). Uploaded subtitles fall
+    /// back here (`.../library/{id2}/{idN}/`) when the media folder is not writable
+    /// (e.g. a read-only library mount), mirroring Jellyfin's non-media-folder save.
+    metadata_path: PathBuf,
 }
 
 impl std::fmt::Debug for HermitSubtitleManager {
@@ -61,13 +65,25 @@ impl HermitSubtitleManager {
         library_manager: Arc<dyn LibraryManager>,
         media_streams: Arc<dyn MediaStreamRepository>,
         providers: Vec<Arc<dyn SubtitleProvider>>,
+        metadata_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
             db,
             library_manager,
             media_streams,
             providers,
+            metadata_path: metadata_path.into(),
         }
+    }
+
+    /// The item's internal-metadata folder (`{metadata}/library/{id2}/{idN}`),
+    /// the writable fallback for uploaded subtitle sidecars.
+    fn item_metadata_dir(&self, item_id: Uuid) -> PathBuf {
+        let dashless = item_id.simple().to_string();
+        self.metadata_path
+            .join("library")
+            .join(&dashless[..2])
+            .join(&dashless)
     }
 
     /// Fills the request's item-derived fields (name/year/series/season/episode/
@@ -111,16 +127,24 @@ impl HermitSubtitleManager {
             .filter(|p| !p.is_empty())
             .ok_or_else(|| ServiceError::invalid_input("item has no media path for a sidecar"))?;
 
+        // Prefer the sidecar next to the media file; if that folder is not
+        // writable (a read-only library mount ⇒ os error 30), fall back to the
+        // item's internal metadata folder — mirroring Jellyfin's non-media-folder
+        // subtitle save, so an upload succeeds instead of 500-ing.
         let sidecar = sidecar_path(&media_path, response);
-        let sidecar_str = sidecar.to_string_lossy().into_owned();
-        if let Some(parent) = sidecar.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ServiceError::backend(e.to_string()))?;
-        }
-        tokio::fs::write(&sidecar, &response.content)
-            .await
-            .map_err(|e| ServiceError::backend(e.to_string()))?;
+        let sidecar_str = match write_sidecar(&sidecar, &response.content).await {
+            Ok(()) => sidecar.to_string_lossy().into_owned(),
+            Err(_) => {
+                let file_name = sidecar
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("subtitle"));
+                let fallback = self.item_metadata_dir(item_id).join(file_name);
+                write_sidecar(&fallback, &response.content)
+                    .await
+                    .map_err(|e| ServiceError::backend(e.to_string()))?;
+                fallback.to_string_lossy().into_owned()
+            }
+        };
 
         // Append the new external subtitle to the item's stream set (the repo
         // save is a full replace, so re-save the existing streams alongside it).
@@ -156,6 +180,15 @@ impl HermitSubtitleManager {
 
 /// The sidecar path for attached subtitle content: sibling of the media file,
 /// `"{stem}.{lang}[.forced].{format}"` (Jellyfin's external-subtitle naming).
+/// Writes `content` to `path`, creating its parent directory first. Returns the
+/// I/O error (e.g. read-only filesystem) so the caller can fall back elsewhere.
+async fn write_sidecar(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, content).await
+}
+
 fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> std::path::PathBuf {
     let path = Path::new(media_path);
     let stem = path.file_stem().map_or_else(
@@ -366,6 +399,7 @@ mod tests {
             library_manager_over(db.clone()),
             Arc::new(HermitMediaStreamRepository::new(db)),
             providers,
+            std::env::temp_dir(),
         )
     }
 
@@ -434,6 +468,69 @@ mod tests {
             .expect("streams");
         assert_eq!(streams.len(), 1);
         assert!(streams[0].is_external);
+    }
+
+    #[tokio::test]
+    async fn upload_falls_back_to_metadata_when_media_folder_unwritable() {
+        // A read-only library mount makes the sidecar-next-to-media write fail;
+        // the upload must still succeed by falling back to the item's internal
+        // metadata folder (was a 500 before). Simulated uid-independently by making
+        // the media file's "folder" a regular file (create_dir_all → NotADirectory).
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = tmp.path().join("locked");
+        std::fs::write(&not_a_dir, b"x").expect("file");
+        let media = not_a_dir.join("Movie.mkv"); // parent is a file → unwritable
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
+            .bind(media.to_str().unwrap())
+            .bind(item.to_string())
+            .execute(db.writer())
+            .await
+            .expect("set path");
+
+        let meta = tempfile::tempdir().expect("meta tempdir");
+        let mgr = HermitSubtitleManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitMediaStreamRepository::new(db.clone())),
+            vec![],
+            meta.path().to_path_buf(),
+        );
+
+        let resp = SubtitleResponse {
+            language: "eng".to_owned(),
+            format: "srt".to_owned(),
+            is_forced: false,
+            is_hearing_impaired: false,
+            content: b"1\n00:00:00,000 --> 00:00:01,000\nParity\n".to_vec(),
+        };
+        mgr.upload_subtitle(item, &resp)
+            .await
+            .expect("upload should succeed via the metadata fallback");
+
+        let dashless = item.simple().to_string();
+        let expected = meta
+            .path()
+            .join("library")
+            .join(&dashless[..2])
+            .join(&dashless)
+            .join("Movie.eng.srt");
+        assert!(expected.exists(), "subtitle written to metadata fallback");
+
+        let repo = HermitMediaStreamRepository::new(db);
+        let streams = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: Some(MediaStreamType::Subtitle),
+                index: None,
+            })
+            .await
+            .expect("streams");
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].is_external);
+        assert_eq!(streams[0].path.as_deref(), expected.to_str());
     }
 
     #[tokio::test]
