@@ -357,8 +357,9 @@ pub async fn build_app_state(
     );
     let music: Arc<dyn hermit_traits::library::MusicManager> =
         Arc::new(HermitMusicManager::new(Arc::clone(&item_repository)));
-    let similar_items: Arc<dyn hermit_traits::library::SimilarItemsManager> =
-        Arc::new(HermitSimilarItemsManager::new(Arc::clone(&item_repository)));
+    let similar_items: Arc<dyn hermit_traits::library::SimilarItemsManager> = Arc::new(
+        HermitSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository)),
+    );
     let search: Arc<dyn hermit_traits::library::SearchManager> =
         Arc::new(HermitSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the

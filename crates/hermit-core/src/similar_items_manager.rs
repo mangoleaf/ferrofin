@@ -1,20 +1,23 @@
 //! [`HermitSimilarItemsManager`] — the concrete [`SimilarItemsManager`].
 //!
-//! Port of `Emby.Server.Implementations.Library` similar-items + movie-suggestion
-//! logic (the object-safe subset). The C# path registers per-type similarity
-//! providers and scores candidates with a weighted overlap of genres, tags,
-//! people, studios, and year proximity. The generic provider registry is dropped
-//! (a composition-root concern); at this seam "similar" is a genre-overlap query
-//! over the injected [`ItemRepository`], excluding the seed and the given
-//! artists, and "recommendations" are "because you watched"-style categories
-//! seeded from a parent's recent items.
+//! Port of `Emby.Server.Implementations.Library.SimilarItems` (the object-safe
+//! subset). The C# `MovieSimilarItemsProvider` scores every candidate by a
+//! **weighted overlap** with the seed and returns the top scorers; that scorer is
+//! ported here as a single SQL query over `ItemValuesMap`/`ItemValues` (genres,
+//! tags, studios) and `PeopleBaseItemMap`/`Peoples` (directors, actors), summing
+//! the C# per-dimension weights per candidate. "Recommendations" are
+//! "because you watched"-style categories seeded from a parent's recent items.
 //!
-//! The full weighted scorer (tag/person/studio/year terms) is noted deferred; the
-//! genre term it dominates is what this implementation applies.
+//! Accepted divergences from C#: the provider registry (local + remote providers,
+//! caching) is dropped — this is the local scorer only; candidates are restricted
+//! to the seed's own kind (C# also folds in `Trailer`/`LiveTvProgram` when
+//! `EnableExternalContentInSuggestions`); and ties are broken **deterministically**
+//! (`SortName`, then `Id`) rather than by C#'s `Random`, so results are stable.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::{RecommendationType, SortOrder};
@@ -26,12 +29,15 @@ use hermit_traits::library::{SimilarItemsManager, SimilarItemsRecommendation};
 use hermit_traits::options::{DtoOptions, InternalItemsQuery};
 use hermit_traits::persistence::ItemRepository;
 
+use crate::db_error::db_err;
+
 /// The default number of similar items returned when the caller gives no limit.
 const DEFAULT_SIMILAR_LIMIT: i32 = 10;
 
 /// The concrete similar-items manager.
 #[derive(Clone)]
 pub struct HermitSimilarItemsManager {
+    db: Database,
     items: Arc<dyn ItemRepository>,
 }
 
@@ -43,23 +49,78 @@ impl std::fmt::Debug for HermitSimilarItemsManager {
 }
 
 impl HermitSimilarItemsManager {
-    /// Creates a similar-items manager over the injected item repository.
+    /// Creates a similar-items manager over the database + injected item repository.
     #[must_use]
-    pub fn new(items: Arc<dyn ItemRepository>) -> Self {
-        Self { items }
+    pub fn new(db: Database, items: Arc<dyn ItemRepository>) -> Self {
+        Self { db, items }
     }
 
-    /// The display genres of an item row (its `Genres` column, pipe-split).
-    fn genres_of(item: &BaseItemEntity) -> Vec<String> {
-        item.genres
-            .as_deref()
-            .map(|g| {
-                g.split('|')
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// Weighted-overlap similar items to `seed_id`, restricted to `seed_type` and
+    /// excluding the seed + `exclude_ids`, ranked by score (stable tiebreak).
+    ///
+    /// Ports `MovieSimilarItemsProvider`'s per-dimension weights: each shared
+    /// genre +10, tag +5, studio +5 (`ItemValues` type 2/3/4); each shared
+    /// director +50, actor/guest-star +15 (`Peoples.PersonType`). `ItemValues`
+    /// rows are deduped per `(Type, CleanValue)`, so a shared value ⇒ a shared
+    /// `ItemValueId`, and people are deduped per `(Name, Type)` ⇒ a shared
+    /// `PeopleId` across credits — both join on the shared id.
+    async fn weighted_similar_items(
+        &self,
+        seed_id: Uuid,
+        seed_type: &str,
+        exclude_ids: &[Uuid],
+        limit: i32,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let seed = seed_id.to_string();
+        let mut sql = String::from(
+            r#"SELECT bi.* FROM (
+                   SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
+                       SELECT ivm2."ItemId" AS "cand",
+                              CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END AS "w"
+                       FROM "ItemValuesMap" ivm0
+                       JOIN "ItemValues" iv0 ON iv0."ItemValueId" = ivm0."ItemValueId"
+                       JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId"
+                       WHERE ivm0."ItemId" = ?1 AND iv0."Type" IN (2, 3, 4)
+                       UNION ALL
+                       SELECT pm2."ItemId" AS "cand",
+                              CASE p0."PersonType" WHEN 'Director' THEN 50 ELSE 15 END AS "w"
+                       FROM "PeopleBaseItemMap" pm0
+                       JOIN "Peoples" p0 ON p0."Id" = pm0."PeopleId"
+                       JOIN "PeopleBaseItemMap" pm2 ON pm2."PeopleId" = pm0."PeopleId"
+                       WHERE pm0."ItemId" = ?1
+                         AND p0."PersonType" IN ('Director', 'Actor', 'GuestStar')
+                   ) scored
+                   WHERE scored."cand" <> ?1
+                   GROUP BY scored."cand"
+               ) s
+               JOIN "BaseItems" bi ON bi."Id" = s.id
+               WHERE bi."Type" = ?2"#,
+        );
+        // Bind order: ?1 seed, ?2 seed_type, then the excludes, then the limit.
+        let mut next = 3;
+        if !exclude_ids.is_empty() {
+            sql.push_str(r#" AND bi."Id" NOT IN ("#);
+            for i in 0..exclude_ids.len() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                sql.push_str(&(next + i).to_string());
+            }
+            sql.push(')');
+            next += exclude_ids.len();
+        }
+        sql.push_str(r#" ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?"#);
+        sql.push_str(&next.to_string());
+
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql)
+            .bind(&seed)
+            .bind(seed_type);
+        for id in exclude_ids {
+            query = query.bind(id.to_string());
+        }
+        query = query.bind(i64::from(limit.max(0)));
+        query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 }
 
@@ -76,24 +137,16 @@ impl SimilarItemsManager for HermitSimilarItemsManager {
         let Some(seed) = self.items.retrieve_item(item_id).await? else {
             return Ok(Vec::new());
         };
-        let genres = Self::genres_of(&seed);
-        // Same kind as the seed, sharing at least one genre, excluding the seed
-        // itself and any excluded artist ids (C# passes these to skip an artist's
-        // own catalog).
-        let mut exclude_ids = vec![item_id];
-        exclude_ids.extend_from_slice(exclude_artist_ids);
-        let seed_kind = crate::item_type_lookup::kind_from_type_name(&seed.type_)
-            .unwrap_or(BaseItemKind::Movie);
-        let query = InternalItemsQuery {
-            include_item_types: vec![seed_kind],
-            genres,
-            exclude_item_ids: exclude_ids,
-            recursive: true,
-            limit: Some(limit.unwrap_or(DEFAULT_SIMILAR_LIMIT)),
-            order_by: vec![(ItemSortBy::CommunityRating, SortOrder::Descending)],
-            ..Default::default()
-        };
-        self.items.get_item_list(&query).await
+        // Weighted overlap over the seed's kind, excluding the seed itself and any
+        // excluded artist ids (C# passes these to skip an artist's own catalog).
+        let exclude_ids = exclude_artist_ids;
+        self.weighted_similar_items(
+            item_id,
+            &seed.type_,
+            exclude_ids,
+            limit.unwrap_or(DEFAULT_SIMILAR_LIMIT),
+        )
+        .await
     }
 
     async fn get_movie_recommendations(
@@ -141,27 +194,59 @@ impl SimilarItemsManager for HermitSimilarItemsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::item_persistence_service::HermitItemPersistenceService;
     use crate::item_repository::HermitItemRepository;
-    use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{seed_item_genre, seed_named_item, test_db};
+    use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+    use crate::people_repository::HermitPeopleRepository;
+    use crate::test_support::{seed_item_genre, test_db};
     use hermit_db::Database;
+    use hermit_db::entities::base_items::PeopleEntity;
+    use hermit_traits::persistence::{ItemPersistenceService, PeopleRepository};
 
     fn manager(db: &Database) -> HermitSimilarItemsManager {
         let lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
             Arc::new(ItemTypeLookup::new());
-        HermitSimilarItemsManager::new(Arc::new(HermitItemRepository::new(db.clone(), lookup)))
+        HermitSimilarItemsManager::new(
+            db.clone(),
+            Arc::new(HermitItemRepository::new(db.clone(), lookup)),
+        )
     }
 
-    /// Seeds a movie and attaches each pipe-separated genre through `ItemValues`
-    /// (the genre filter the similar-items query applies reads that join).
-    async fn seed_movie(db: &Database, id: Uuid, name: &str, genres: &str) {
-        seed_named_item(db, id, BaseItemKind::Movie, name).await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "Genres" = ?2 WHERE "Id" = ?1"#)
-            .bind(id.to_string())
-            .bind(genres)
-            .execute(db.writer())
+    /// Credits `name` (with `person_type`) on `item` through the people
+    /// repository — same name ⇒ the same person row across items, so two items
+    /// crediting "Chris Director" share a person.
+    async fn credit_person(db: &Database, item: Uuid, name: &str, person_type: &str) {
+        HermitPeopleRepository::new(db.clone())
+            .update_people(
+                item,
+                &[PeopleEntity {
+                    id: String::new(),
+                    name: name.to_owned(),
+                    person_type: Some(person_type.to_owned()),
+                    ..PeopleEntity::default()
+                }],
+            )
             .await
-            .expect("set genres");
+            .expect("credit person");
+    }
+
+    /// Seeds a movie (pipe-separated `genres` stored on the row) and attaches
+    /// each genre through `ItemValues` (the genre filter the similar-items
+    /// query applies reads that join).
+    async fn seed_movie(db: &Database, id: Uuid, name: &str, genres: &str) {
+        let movie = hermit_db::entities::base_items::BaseItemEntity {
+            id: id.to_string(),
+            type_: stored_type_name(BaseItemKind::Movie)
+                .expect("movie type name")
+                .to_owned(),
+            name: Some(name.to_owned()),
+            genres: Some(genres.to_owned()),
+            ..Default::default()
+        };
+        HermitItemPersistenceService::new(db.clone())
+            .save_items(&[movie])
+            .await
+            .expect("seed movie");
         for genre in genres.split('|').filter(|g| !g.is_empty()) {
             seed_item_genre(db, id, genre).await;
         }
@@ -186,6 +271,36 @@ mod tests {
         assert!(names.contains(&"Aliens".to_owned()));
         assert!(!names.contains(&"Alien".to_owned()));
         assert!(!names.contains(&"Amelie".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn weighted_score_ranks_shared_director_over_shared_genre() {
+        // Seed shares a director (weight 50) with A and a single genre (weight 10)
+        // with B. A must outrank B; C shares nothing and is absent.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x201);
+        let a = Uuid::from_u128(0x202);
+        let b = Uuid::from_u128(0x203);
+        let c = Uuid::from_u128(0x204);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        seed_movie(&db, a, "SharesDirector", "Drama").await; // no genre overlap
+        seed_movie(&db, b, "SharesGenre", "SciFi").await;
+        seed_movie(&db, c, "SharesNothing", "Romance").await;
+
+        credit_person(&db, seed, "Chris Director", "Director").await;
+        credit_person(&db, a, "Chris Director", "Director").await;
+
+        let mgr = manager(&db);
+        let similar = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar");
+        let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["SharesDirector".to_owned(), "SharesGenre".to_owned()],
+            "shared director (50) must outrank shared genre (10); non-sharer absent"
+        );
     }
 
     #[tokio::test]
