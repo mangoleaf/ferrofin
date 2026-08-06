@@ -481,7 +481,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_received_total[$__rate_interval])), 1)",
+          "expr": "100 * (sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(http_requests_received_total[$__rate_interval])), 1)",
           "legendFormat": "5xx %"
         }
       ]
@@ -532,7 +532,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_requests_received_total{code=~\"4..\"}[$__rate_interval]))",
+          "expr": "sum(rate(http_requests_received_total{code=~\"4..\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "4xx"
         },
         {
@@ -541,7 +541,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval]))",
+          "expr": "sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "5xx"
         }
       ]
