@@ -1742,6 +1742,18 @@ mod tests {
         assert_eq!(video_codec.as_deref(), Some("h264"));
     }
 
+    /// Reads back the scanned movies' `(Name, SortName, ProductionYear)` rows,
+    /// name-ordered — the one shared movie read-back, so each test doesn't add
+    /// its own raw query (the hermit-db sql_boundary ratchet counts them).
+    async fn movie_rows(db: &Database) -> Vec<(String, Option<String>, Option<i64>)> {
+        sqlx::query_as(
+            r#"SELECT "Name","SortName","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' ORDER BY "Name""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
     // Port of MovieResolver: a movie in its own folder is named from the FOLDER (raw, year
     // kept); a flat file in the library root keeps its clean_date_time-parsed name (year
     // stripped). Both populate ProductionYear. Matches Jellyfin (verified against a live server).
@@ -1778,12 +1790,11 @@ mod tests {
             LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
         scanner.scan_all().await.unwrap();
 
-        let names: Vec<(String, Option<i64>)> = sqlx::query_as(
-            r#"SELECT "Name","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' ORDER BY "Name""#,
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
+        let names: Vec<(String, Option<i64>)> = movie_rows(&db)
+            .await
+            .into_iter()
+            .map(|(name, _, year)| (name, year))
+            .collect();
 
         assert!(
             names
@@ -1841,12 +1852,11 @@ mod tests {
             LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
         scanner.scan_all().await.unwrap();
 
-        let (name, sort_name, year): (String, Option<String>, Option<i64>) = sqlx::query_as(
-            r#"SELECT "Name","SortName","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let (name, sort_name, year) = movie_rows(&db)
+            .await
+            .into_iter()
+            .next()
+            .expect("one scanned movie");
 
         assert_eq!(
             name, "Movie 0001",

@@ -402,6 +402,18 @@ mod tests {
         )
     }
 
+    /// Points a seeded item's `Path` at `media` — the one shared setup UPDATE,
+    /// so each test doesn't add its own raw query (the hermit-db sql_boundary
+    /// ratchet counts them).
+    async fn set_item_path(db: &Database, item: Uuid, media: &std::path::Path) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
+            .bind(media.to_str().unwrap())
+            .bind(item.to_string())
+            .execute(db.writer())
+            .await
+            .expect("set path");
+    }
+
     fn subtitle_stream(index: i64, external: bool, path: Option<&str>) -> MediaStreamInfoEntity {
         MediaStreamInfoEntity {
             stream_index: index,
@@ -441,12 +453,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let media = tmp.path().join("Movie.mkv");
         std::fs::write(&media, b"x").expect("media");
-        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
-            .bind(media.to_str().unwrap())
-            .bind(item.to_string())
-            .execute(db.writer())
-            .await
-            .expect("set path");
+        set_item_path(&db, item, &media).await;
 
         let mgr = manager(db.clone(), vec![Arc::new(FakeProvider)]);
         mgr.download_subtitles(item, "fake_42")
@@ -482,12 +489,7 @@ mod tests {
         let not_a_dir = tmp.path().join("locked");
         std::fs::write(&not_a_dir, b"x").expect("file");
         let media = not_a_dir.join("Movie.mkv"); // parent is a file → unwritable
-        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
-            .bind(media.to_str().unwrap())
-            .bind(item.to_string())
-            .execute(db.writer())
-            .await
-            .expect("set path");
+        set_item_path(&db, item, &media).await;
 
         let meta = tempfile::tempdir().expect("meta tempdir");
         let mgr = HermitSubtitleManager::new(
