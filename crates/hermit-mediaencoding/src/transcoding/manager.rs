@@ -451,7 +451,25 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 .with_running(handle, |r| r.child.has_exited())
                 .unwrap_or(true);
             if exited {
-                return seg.exists();
+                if seg.exists() {
+                    return true;
+                }
+                // The job is gone and the segment never appeared. An ffmpeg
+                // that exits *cleanly* without reaching the target — a
+                // truncated/unreadable source on flaky network storage, or a
+                // seek past the file's real end — is otherwise invisible at
+                // WARN: the client just sees failed segment requests. Name it
+                // here, with the stderr tail, so the operator has a trail.
+                let code = self.with_running(handle, |r| r.child.exit_code()).flatten();
+                let log = playlist_path.with_extension("log");
+                tracing::warn!(
+                    segment = index,
+                    exit_code = code.unwrap_or(-1),
+                    log = %log.display(),
+                    "transcode exited before producing segment{}",
+                    stderr_log_tail(&log)
+                );
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
         }
@@ -1107,6 +1125,28 @@ mod start_ffmpeg_tests {
             .unwrap();
         // Only segment 0 exists (no next), but the job exited → ready.
         assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_false_when_job_died_without_producing_it() {
+        // The ffmpeg exits cleanly but never writes the awaited segment (a
+        // truncated/unreadable source): the wait must report not-ready (and
+        // logs the exit + stderr tail) instead of spinning.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        assert!(!m.wait_for_segment(&handle, &playlist, 3).await);
     }
 
     /// A [`FileCleaner`] that records the deletions it was asked to perform, and

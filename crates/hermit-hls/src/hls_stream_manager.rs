@@ -123,6 +123,29 @@ const FFMPEG_PROGRAM: &str = "ffmpeg";
 /// behaviour needs tuning per deployment.
 const SEGMENT_WAIT_GAP: i32 = 2;
 
+/// How many consecutive (re)started transcodes may die without producing their
+/// requested segment before segment requests for that playlist fail fast
+/// instead of spawning yet another ffmpeg.
+///
+/// A source that keeps killing ffmpeg (a flaky NFS mount serving truncated
+/// reads, a file shorter than its metadata claims) otherwise turns every
+/// client segment request into a fresh spawn: observed in production as a
+/// kill/restart storm at ~2.4 ffmpeg spawns per second while the client
+/// skip-walked the playlist. Three strikes tolerates a transient blip without
+/// letting the storm run.
+///
+/// ponytail: tuning knob — candidate server setting alongside the cooldown.
+const RESTART_FAILURE_LIMIT: u32 = 3;
+
+/// How long segment requests for a playlist fail fast after
+/// [`RESTART_FAILURE_LIMIT`] consecutive dead transcodes, before one new
+/// attempt is allowed through (half-open). Long enough to stop a per-request
+/// spawn storm; short enough that playback recovers on its own once the
+/// storage heals.
+///
+/// ponytail: tuning knob — candidate server setting alongside the limit.
+const RESTART_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The concrete [`HlsStreamManager`]: playlist generation + segment transcode
 /// orchestration + legacy file resolution, over the injected runtime.
 ///
@@ -148,6 +171,16 @@ where
     /// per-playlist `TranscodingLock`.
     segment_locks:
         Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-playlist count of consecutive transcode (re)starts that died without
+    /// producing their requested segment, plus the last failure time — the
+    /// restart circuit breaker's state. Cleared the moment a started job
+    /// delivers a segment.
+    ///
+    /// ponytail: entries for permanently-failing playlists linger like
+    /// `segment_locks` entries do; add eviction only if either map ever
+    /// measurably matters.
+    restart_failures:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
@@ -178,6 +211,69 @@ where
             generator,
             paths,
             segment_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            restart_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Whether the restart circuit breaker is open for playlist `key`: at least
+    /// [`RESTART_FAILURE_LIMIT`] consecutive dead transcodes, the latest less
+    /// than [`RESTART_FAILURE_COOLDOWN`] ago. Once the cooldown elapses the
+    /// breaker lets one attempt through (half-open); a failure re-arms it, a
+    /// success clears it.
+    fn restart_breaker_open(&self, key: &str) -> bool {
+        let map = self
+            .restart_failures
+            .lock()
+            .expect("restart failures poisoned");
+        map.get(key).is_some_and(|(count, last)| {
+            *count >= RESTART_FAILURE_LIMIT && last.elapsed() < RESTART_FAILURE_COOLDOWN
+        })
+    }
+
+    /// Records a dead transcode for playlist `key`, returning the consecutive
+    /// failure count. Logs a warning when the count trips the breaker open.
+    fn record_restart_failure(&self, key: &str) -> u32 {
+        let mut map = self
+            .restart_failures
+            .lock()
+            .expect("restart failures poisoned");
+        let entry = map
+            .entry(key.to_owned())
+            .or_insert((0, std::time::Instant::now()));
+        entry.0 += 1;
+        entry.1 = std::time::Instant::now();
+        if entry.0 == RESTART_FAILURE_LIMIT {
+            tracing::warn!(
+                playlist = key,
+                failures = entry.0,
+                cooldown_secs = RESTART_FAILURE_COOLDOWN.as_secs(),
+                "transcode restart breaker open: segment requests will fail fast"
+            );
+        }
+        entry.0
+    }
+
+    /// Clears the restart-failure record for playlist `key` (a started job
+    /// delivered its segment).
+    fn clear_restart_failures(&self, key: &str) {
+        self.restart_failures
+            .lock()
+            .expect("restart failures poisoned")
+            .remove(key);
+    }
+
+    /// Rewinds the breaker's last-failure time for `key` so tests can observe
+    /// the half-open retry without waiting out the real cooldown.
+    #[cfg(test)]
+    fn force_cooldown_elapsed(&self, key: &str) {
+        let mut map = self
+            .restart_failures
+            .lock()
+            .expect("restart failures poisoned");
+        if let Some((_, last)) = map.get_mut(key) {
+            *last = std::time::Instant::now()
+                .checked_sub(RESTART_FAILURE_COOLDOWN)
+                .expect("cooldown rewind underflow");
         }
     }
 
@@ -292,6 +388,7 @@ where
                     .await
                 && segment_path.exists()
             {
+                self.clear_restart_failures(&playlist_key);
                 return Ok(served(&segment_path, &ext));
             }
             // A seek (or the running job died mid-wait): drop the stale job before
@@ -299,6 +396,18 @@ where
             // segments (delete_files = false) — a later backward seek serves them
             // straight from disk via the fast path.
             self.manager.kill_and_remove(&handle, false).await;
+        }
+
+        // A source that keeps killing ffmpeg (flaky network storage, a file
+        // shorter than its metadata claims) must not turn every client segment
+        // request into a fresh spawn. After RESTART_FAILURE_LIMIT consecutive
+        // dead transcodes, fail fast until the cooldown lets one retry through.
+        if self.restart_breaker_open(&playlist_key) {
+            return Err(ServiceError::backend(format!(
+                "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
+                 (source unreadable?); retrying after cooldown — see {}",
+                playlist_path.with_extension("log").display()
+            )));
         }
 
         // (Re)start the transcode from this segment and wait for it.
@@ -311,11 +420,15 @@ where
             log_path,
             working_dir: None,
         };
-        let handle = self
-            .manager
-            .start_ffmpeg(&self.transcoder, start)
-            .await
-            .map_err(|e| ServiceError::backend(format!("failed to start transcode: {e}")))?;
+        let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                self.record_restart_failure(&playlist_key);
+                return Err(ServiceError::backend(format!(
+                    "failed to start transcode: {e}"
+                )));
+            }
+        };
 
         if self
             .manager
@@ -323,10 +436,17 @@ where
             .await
             && segment_path.exists()
         {
+            self.clear_restart_failures(&playlist_key);
             Ok(served(&segment_path, &ext))
         } else {
-            Err(ServiceError::NotFound(format!(
-                "segment {segment_id} did not materialise"
+            // A 5xx, not a 404: HLS clients skip past a 404'd segment and walk
+            // the whole playlist (each request spawning another doomed ffmpeg);
+            // a server error makes them retry with backoff instead.
+            let failures = self.record_restart_failure(&playlist_key);
+            Err(ServiceError::backend(format!(
+                "transcode exited before producing segment {segment_id} \
+                 (consecutive failures: {failures}); see {}",
+                playlist_path.with_extension("log").display()
             )))
         }
     }
@@ -760,7 +880,11 @@ mod tests {
         NoopSessionReporter,
     >;
 
-    fn manager_with(dir: &Path, script: FakeScript, container: &str) -> (Mgr, PlanCalls) {
+    fn manager_full(
+        dir: &Path,
+        script: FakeScript,
+        container: &str,
+    ) -> (Mgr, PlanCalls, FakeSegmentTranscoder) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let planner = FakePlanner {
             dir: dir.to_path_buf(),
@@ -768,11 +892,17 @@ mod tests {
             requests: requests.clone(),
         };
         let transcoder = FakeSegmentTranscoder::new(script);
+        let spawns = transcoder.clone();
         let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
         let paths = Arc::new(FakePaths {
             transcode: dir.to_string_lossy().into_owned(),
         });
         let mgr = HlsStreamManagerImpl::new(planner, transcoder, manager, generator(), paths);
+        (mgr, requests, spawns)
+    }
+
+    fn manager_with(dir: &Path, script: FakeScript, container: &str) -> (Mgr, PlanCalls) {
+        let (mgr, requests, _) = manager_full(dir, script, container);
         (mgr, requests)
     }
 
@@ -828,6 +958,56 @@ mod tests {
         let served = mgr.dynamic_segment(&req(), 0, false).await.unwrap();
         assert!(served.path.ends_with("out0.ts"));
         assert_eq!(served.content_type, "video/mp2t");
+    }
+
+    #[tokio::test]
+    async fn dead_transcode_is_a_backend_error_not_a_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ffmpeg exits 0 without writing the requested segment — a truncated or
+        // unreadable source (e.g. a flaky NFS mount). The client must get a
+        // 5xx it retries, not a 404 it skips past.
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        let err = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn restart_breaker_stops_the_spawn_storm_and_half_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Every spawned "ffmpeg" dies without producing its segment.
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+
+        // Each request up to the limit spawns (and loses) one transcode.
+        for _ in 0..RESTART_FAILURE_LIMIT {
+            let err = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
+            assert!(matches!(err, ServiceError::Backend(_)));
+        }
+        let spawned = spawns.requests.lock().unwrap().len();
+        assert_eq!(spawned, RESTART_FAILURE_LIMIT as usize);
+
+        // Breaker open: the next request fails fast with NO new spawn.
+        let err = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)));
+        assert_eq!(spawns.requests.lock().unwrap().len(), spawned);
+
+        // After the cooldown, exactly one retry is let through (half-open);
+        // its failure re-arms the breaker.
+        let playlist_key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+        mgr.force_cooldown_elapsed(&playlist_key);
+        let _ = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
+        assert_eq!(spawns.requests.lock().unwrap().len(), spawned + 1);
+        let _ = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
+        assert_eq!(spawns.requests.lock().unwrap().len(), spawned + 1);
     }
 
     #[tokio::test]
