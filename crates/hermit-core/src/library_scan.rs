@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hermit_db::entities::base_items::{
     BaseItemEntity, ChapterEntity, MediaStreamInfoEntity, PeopleEntity,
 };
@@ -58,6 +58,21 @@ struct ArtworkCache {
     season_stills: std::collections::HashMap<(String, i32), std::collections::HashMap<i32, String>>,
 }
 
+/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
+/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
+/// `ItemImageInfo.DateModified`.
+///
+/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
+/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
+/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
+/// or every scan changes every poster URL (busting the clients' year-long
+/// immutable image caches) and invalidates the entire server-side resize cache.
+fn file_date_modified(path: &Path) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
+}
+
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
 /// the persisted-image rows.
 ///
@@ -87,7 +102,7 @@ async fn download_images(
         infos.push(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type: image.image_type,
-            date_modified: Utc::now(),
+            date_modified: file_date_modified(&dest),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -1458,9 +1473,9 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
     found
         .into_iter()
         .map(|local| ItemImageInfo {
+            date_modified: file_date_modified(Path::new(&local.file_info.full_name)),
             path: local.file_info.full_name,
             image_type: local.type_,
-            date_modified: Utc::now(),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -1473,6 +1488,30 @@ mod tests {
     use super::LibraryScanner;
     use crate::file_system::HermitFileSystem;
     use crate::item_persistence_service::HermitItemPersistenceService;
+
+    // date_modified must be the file's mtime (stable across rescans), never the
+    // scan time: it feeds ImageTags and the resize-cache key, so a churning value
+    // busts every client and server image cache on every scan.
+    #[test]
+    fn image_date_modified_is_file_mtime_and_stable() {
+        let dir = std::env::temp_dir().join(format!("hermit-scan-dm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("poster.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+
+        let first = super::file_date_modified(&file);
+        let again = super::file_date_modified(&file);
+        assert_eq!(first, again, "unchanged file must yield a stable timestamp");
+        let mtime = chrono::DateTime::<chrono::Utc>::from(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+        );
+        assert_eq!(first, mtime, "timestamp must be the file mtime");
+
+        // A missing file falls back to "now" rather than erroring the scan.
+        let missing = super::file_date_modified(&dir.join("nope.jpg"));
+        assert!((chrono::Utc::now() - missing).num_seconds().abs() < 60);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // Port of C# CreateSortName: lowercase, strip a leading article, zero-pad digit runs to 10.
     #[test]
