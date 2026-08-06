@@ -76,8 +76,38 @@ example must be a **de-identified generalization**, never a copy.
    python3 -c "import yaml; list(yaml.safe_load_all(open('charts/hermit/values.example.yaml')))"
    ```
 
-7. **Report** the drift you found and fixed (added/renamed/removed keys, stale
-   claims, any de-id leaks caught) so the change is reviewable.
+7. **Final review — prove the example is compatible with the chart itself.**
+   Schema key-matching is NOT sufficient: **Helm silently ignores unknown or
+   misspelled values keys**, so a typo'd `volumeMounts` or wrongly-nested
+   `hermit.config` renders fine and is dropped. The only real proof is rendering
+   the chart with the example and confirming the values land in the output.
+
+   a. **Render must succeed** (exit 0), and lint clean:
+      ```
+      helm template hermit charts/hermit -f charts/hermit/values.example.yaml > /tmp/rendered.yaml
+      helm lint charts/hermit -f charts/hermit/values.example.yaml
+      ```
+   b. **Round-trip every distinctive value** — each must appear in the rendered
+      manifests (a miss = a silently-ignored key to fix). At minimum:
+      ```
+      for pat in '/data/cache' 'nvidia.com/gpu' '<registry-pull-secret>' \
+                 'HERMIT_ENABLE_METRICS' '/media/TV' 'privileged: true' \
+                 '<storage-node>' '<hermit-cache-pvc>'; do
+        grep -q "$pat" /tmp/rendered.yaml || echo "MISSING IN RENDER: $pat"
+      done
+      grep -q 'kind: ServiceMonitor' /tmp/rendered.yaml || echo "MISSING: ServiceMonitor"
+      ```
+      Regenerate this list from whatever the example actually sets — every block
+      you added (volumes, mounts, env, resources, affinity, metrics, ingress) needs
+      one representative token checked. A key present in the example but absent from
+      the render is the exact bug this step exists to catch.
+   c. If `helm` is not installed, say so explicitly and fall back to the step-1
+      schema/template cross-check — but note the render check was skipped so the
+      reviewer knows compatibility is unverified.
+
+8. **Report** the drift you found and fixed (added/renamed/removed keys, stale
+   claims, any de-id leaks caught, render/round-trip result) so the change is
+   reviewable.
 
 ## Guardrails
 
