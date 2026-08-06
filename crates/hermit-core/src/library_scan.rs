@@ -1201,6 +1201,19 @@ fn nfo_candidates(
 /// (mirrors [`apply_details`]). Pipe-joins the multi-valued genre/studio/tag sets
 /// so [`item_values_of`] mirrors them into the browse/filter indexes.
 fn apply_nfo(entity: &mut BaseItemEntity, n: &hermit_providers::xbmc::item::NfoBaseItem) {
+    // The NFO `<title>` is authoritative for the display name: Jellyfin's local
+    // metadata provider overwrites the resolver's folder/file-derived name with
+    // it, so a `Movie 0001 (2020)/` folder resolves to the NFO's clean
+    // `Movie 0001` (not the raw, year-bearing folder name). The derived sort name
+    // follows — an explicit NFO `<sortname>` wins, else it is recomputed from the
+    // new title (otherwise SortName keeps the stale folder-derived value).
+    if let Some(title) = n.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = n
+            .sort_name
+            .clone()
+            .or_else(|| Some(create_sort_name(title)));
+    }
     if entity.overview.is_none() {
         entity.overview.clone_from(&n.overview);
     }
@@ -1745,6 +1758,67 @@ mod tests {
                 .any(|(n, y)| n == "The Matrix" && *y == Some(1999)),
             "flat file should be cleaned (year stripped); got {names:?}"
         );
+    }
+
+    // A movie.nfo `<title>` is authoritative for the item name (Jellyfin's local
+    // NFO provider overwrites the resolver's folder-derived name). A
+    // `Movie 0001 (2020)/` folder with a clean `<title>Movie 0001</title>` must
+    // surface as "Movie 0001" with the sort name recomputed to match — not the
+    // raw folder name. Regression guard for the parity Name/SortName diff.
+    #[tokio::test]
+    async fn nfo_title_overrides_the_folder_derived_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Movie 0001 (2020)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Movie 0001 (2020).mkv"), b"").unwrap();
+        std::fs::write(
+            folder.join("movie.nfo"),
+            b"<movie><title>Movie 0001</title><year>2020</year></movie>",
+        )
+        .unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
+        scanner.scan_all().await.unwrap();
+
+        let (name, sort_name, year): (String, Option<String>, Option<i64>) = sqlx::query_as(
+            r#"SELECT "Name","SortName","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            name, "Movie 0001",
+            "NFO <title> must win over the folder name"
+        );
+        assert_eq!(
+            sort_name.as_deref(),
+            Some("movie 0000000001"),
+            "sort name must be recomputed from the NFO title"
+        );
+        assert_eq!(year, Some(2020));
     }
 
     #[tokio::test]
