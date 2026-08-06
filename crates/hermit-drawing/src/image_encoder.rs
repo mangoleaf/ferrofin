@@ -31,6 +31,9 @@
 //!   already decides whether re-encoding is needed.
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+use tokio::sync::Semaphore;
 
 use crate::error::DrawingError;
 use async_trait::async_trait;
@@ -41,6 +44,26 @@ use hermit_traits::drawing::ImageEncoder;
 use hermit_traits::error::ServiceError;
 use hermit_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbaImage, imageops};
+
+/// Caps how many image encodes run concurrently on the blocking pool.
+///
+/// [`spawn_blocking`](tokio::task::spawn_blocking) keeps CPU-bound encodes off
+/// the async reactor, but its pool is effectively unbounded — a cold-cache storm
+/// (e.g. a fresh library grid right after a deploy/cache-flush) would launch one
+/// blocking thread per in-flight poster, all fighting the same cores and burning
+/// memory. Bound concurrent encodes to the machine's parallelism so the encoders
+/// saturate the CPUs without oversubscribing them.
+///
+/// ponytail: process-global limit — correct because the constraint (physical
+/// cores) is global. If a host ever needs to tune image throughput independently
+/// of core count, lift this into a config setting / per-encoder field.
+fn encode_permits() -> &'static Semaphore {
+    static PERMITS: OnceLock<Semaphore> = OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        Semaphore::new(cores)
+    })
+}
 
 /// A real image codec implementing [`ImageEncoder`] on the `image` crate.
 ///
@@ -351,7 +374,13 @@ impl ImageEncoder for ImageCrateEncoder {
         // whole encode (tens of ms per poster), starving every other request
         // sharing the worker — a cheap 3 ms endpoint's p99 balloons behind an
         // image derivation. Offload to the blocking pool so the reactor stays
-        // free (Jellyfin's Skia path runs off the request thread likewise).
+        // free (Jellyfin's Skia path runs off the request thread likewise). The
+        // permit bounds concurrent encodes to core count so a cold-cache storm
+        // can't oversubscribe the CPUs; it is held across the whole encode.
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let input_path = input_path.to_owned();
         let output_path = output_path.to_owned();
         let options = options.clone();
@@ -714,6 +743,46 @@ mod tests {
 
         let dims = enc.get_image_size(&output).await.expect("probe out");
         assert_eq!(dims, ImageDimensions::new(960, 540));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_encodes_all_complete_under_the_permit_bound() {
+        // More concurrent encodes than the semaphore allows must still all finish
+        // (the excess wait for a permit rather than deadlocking or being dropped).
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "src.png", 400, 300);
+        let enc = ImageCrateEncoder::new();
+        let options = ImageProcessingOptions {
+            width: Some(100),
+            height: Some(75),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let (e, inp, op) = (enc, input.clone(), options.clone());
+            let out = out_path(&dir, &format!("o{i}.png"));
+            handles.push(tokio::spawn(async move {
+                let written = e
+                    .encode_image(
+                        &inp,
+                        Utc::now(),
+                        &out,
+                        false,
+                        None,
+                        90,
+                        &op,
+                        ImageFormat::Png,
+                    )
+                    .await
+                    .expect("encode");
+                assert_eq!(written, out);
+            }));
+        }
+        for h in handles {
+            h.await.expect("task");
+        }
     }
 
     #[tokio::test]
