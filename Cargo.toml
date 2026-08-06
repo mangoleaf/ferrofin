@@ -122,6 +122,7 @@ pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898Derive
 sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = "0.15"
 clap = { version = "4.5", features = ["derive"] }

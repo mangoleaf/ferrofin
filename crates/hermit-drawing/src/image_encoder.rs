@@ -68,8 +68,9 @@ fn encode_permits() -> &'static Semaphore {
 /// A real image codec implementing [`ImageEncoder`] on the `image` crate.
 ///
 /// Handles the decodable subset of Jellyfin's Skia input set (`jpeg`/`jpg`/`png`/
-/// `webp`) and can write [`ImageFormat::Webp`], [`ImageFormat::Jpg`], and
-/// [`ImageFormat::Png`]. Resize/crop math is delegated to the shared
+/// `webp`) and can write [`ImageFormat::Webp`] (lossy, via libwebp),
+/// [`ImageFormat::Jpg`], and [`ImageFormat::Png`]. Resize/crop math is
+/// delegated to the shared
 /// `hermit-model` `drawing_utils`, so it matches the C# `DrawingUtils` /
 /// `ImageHelper.GetNewImageSize` exactly.
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,6 +178,21 @@ impl ImageCrateEncoder {
                 .to_rgb8()
                 .write_with_encoder(encoder)
                 .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
+        } else if format == CrateFormat::WebP {
+            // LOSSY WebP via libwebp (the `webp` crate), mirroring Skia's
+            // `bitmap.Encode(stream, Webp, quality)`. The `image` crate's own
+            // WebP encoder is lossless-only and ignores `quality`, which made
+            // every poster several times larger than Jellyfin's — so this branch
+            // routes around it.
+            let rgba = image.to_rgba8();
+            // Precision loss is irrelevant: quality is clamped to 0..=100.
+            #[allow(clippy::cast_precision_loss)]
+            let quality = quality.clamp(0, 100) as f32;
+            let bytes =
+                webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                    .encode(quality);
+            std::fs::write(output_path, &*bytes)
+                .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
         } else {
             image
                 .save_with_format(output_path, format)
@@ -264,7 +280,9 @@ impl ImageEncoder for ImageCrateEncoder {
 
     /// Port of `SupportedOutputFormats` — [`ImageFormat::Webp`],
     /// [`ImageFormat::Jpg`], [`ImageFormat::Png`] (Skia also lists `Svg`, which
-    /// this raster encoder cannot produce).
+    /// this raster encoder cannot produce). WebP output is real *lossy* WebP via
+    /// libwebp — the same encoder Skia links — so the prefer-WebP negotiation
+    /// yields Jellyfin-sized files, not the `image` crate's lossless-only blobs.
     fn supported_output_formats(&self) -> Vec<ImageFormat> {
         vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
     }
@@ -655,6 +673,23 @@ mod tests {
         dir.path().join(name).to_string_lossy().into_owned()
     }
 
+    /// A gradient fixture: lossy-vs-quality effects vanish on flat colors, so
+    /// the WebP quality test needs pixel variation to bite on.
+    fn gradient_fixture(dir: &TempDir, name: &str, w: u32, h: u32) -> String {
+        let mut img = RgbaImage::new(w, h);
+        for (col, row, px) in img.enumerate_pixels_mut() {
+            // Truncation is the point: wrap coordinates into channel space.
+            #[allow(clippy::cast_possible_truncation)]
+            let channels = [(col % 256) as u8, (row % 256) as u8, ((col + row) % 256) as u8];
+            *px = Rgba([channels[0], channels[1], channels[2], 0xFF]);
+        }
+        let path: PathBuf = dir.path().join(name);
+        DynamicImage::ImageRgba8(img)
+            .save(&path)
+            .expect("write fixture");
+        path.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn advertises_capabilities() {
         let enc = ImageCrateEncoder::new();
@@ -783,6 +818,52 @@ mod tests {
         for h in handles {
             h.await.expect("task");
         }
+    }
+
+    #[tokio::test]
+    async fn webp_output_is_lossy_and_honors_quality() {
+        // Regression: the `image` crate's WebP encoder is lossless-only and
+        // ignores quality; the libwebp branch must produce LOSSY output whose
+        // size tracks the quality parameter (Skia parity: Encode(..., quality)).
+        let dir = TempDir::new().expect("tempdir");
+        let input = gradient_fixture(&dir, "src.png", 400, 300);
+        let enc = ImageCrateEncoder::new();
+        let options = ImageProcessingOptions {
+            max_width: Some(200),
+            supported_output_formats: vec![ImageFormat::Webp],
+            ..Default::default()
+        };
+
+        let mut sizes = Vec::new();
+        for quality in [10, 90] {
+            let out = out_path(&dir, &format!("q{quality}.webp"));
+            let written = enc
+                .encode_image(
+                    &input,
+                    Utc::now(),
+                    &out,
+                    false,
+                    None,
+                    quality,
+                    &options,
+                    ImageFormat::Webp,
+                )
+                .await
+                .expect("encode");
+            assert_eq!(written, out);
+            // The output really is a decodable WebP at the resized dimensions.
+            assert_eq!(
+                enc.get_image_size(&out).await.expect("probe"),
+                ImageDimensions::new(200, 150)
+            );
+            sizes.push(std::fs::metadata(&out).expect("stat").len());
+        }
+        assert!(
+            sizes[0] < sizes[1],
+            "q10 ({}) must be smaller than q90 ({}): quality is ignored (lossless?)",
+            sizes[0],
+            sizes[1]
+        );
     }
 
     #[tokio::test]
