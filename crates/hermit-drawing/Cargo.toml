@@ -19,6 +19,7 @@ image.workspace = true
 blurhash.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 rstest.workspace = true

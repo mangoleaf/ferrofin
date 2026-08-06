@@ -171,6 +171,53 @@ impl ImageCrateEncoder {
         let height = u32::try_from(size.height.max(1)).unwrap_or(1);
         image.resize_exact(width, height, imageops::FilterType::Lanczos3)
     }
+
+    /// The synchronous decode → resize → encode body of
+    /// [`encode_image`](ImageEncoder::encode_image), split out so it can run on
+    /// the blocking pool via `spawn_blocking` (all CPU-bound, no `.await`).
+    fn encode_image_blocking(
+        input_path: &str,
+        output_path: &str,
+        auto_orient: bool,
+        quality: i32,
+        options: &ImageProcessingOptions,
+        output_format: ImageFormat,
+    ) -> Result<String, ServiceError> {
+        // Unsupported input: spit out the original path, like Skia does.
+        if !Self::is_supported_input(input_path) {
+            return Ok(input_path.to_owned());
+        }
+
+        let image = Self::decode(input_path)?;
+        let original = ImageDimensions::new(
+            i32::try_from(image.width()).unwrap_or(i32::MAX),
+            i32::try_from(image.height()).unwrap_or(i32::MAX),
+        );
+
+        // "Just spit out the original file if all the options are default."
+        if options.has_default_options(input_path, Some(original)) && !auto_orient {
+            return Ok(input_path.to_owned());
+        }
+
+        // GetNewImageSize: DrawingUtils.Resize then DrawingUtils.ResizeFill.
+        let sized = resize(
+            original,
+            options.width.unwrap_or(0),
+            options.height.unwrap_or(0),
+            options.max_width.unwrap_or(0),
+            options.max_height.unwrap_or(0),
+        );
+        let new_size = resize_fill(sized, options.fill_width, options.fill_height);
+
+        let resized = Self::resize_exact(&image, new_size);
+        Self::write(
+            &resized,
+            output_path,
+            Self::crate_format(output_format),
+            quality,
+        )?;
+        Ok(output_path.to_owned())
+    }
 }
 
 /// The decodable input extensions this encoder advertises.
@@ -299,40 +346,27 @@ impl ImageEncoder for ImageCrateEncoder {
             return Err(ServiceError::invalid_input("output_path is empty"));
         }
 
-        // Unsupported input: spit out the original path, like Skia does.
-        if !Self::is_supported_input(input_path) {
-            return Ok(input_path.to_owned());
-        }
-
-        let image = Self::decode(input_path)?;
-        let original = ImageDimensions::new(
-            i32::try_from(image.width()).unwrap_or(i32::MAX),
-            i32::try_from(image.height()).unwrap_or(i32::MAX),
-        );
-
-        // "Just spit out the original file if all the options are default."
-        if options.has_default_options(input_path, Some(original)) && !auto_orient {
-            return Ok(input_path.to_owned());
-        }
-
-        // GetNewImageSize: DrawingUtils.Resize then DrawingUtils.ResizeFill.
-        let sized = resize(
-            original,
-            options.width.unwrap_or(0),
-            options.height.unwrap_or(0),
-            options.max_width.unwrap_or(0),
-            options.max_height.unwrap_or(0),
-        );
-        let new_size = resize_fill(sized, options.fill_width, options.fill_height);
-
-        let resized = Self::resize_exact(&image, new_size);
-        Self::write(
-            &resized,
-            output_path,
-            Self::crate_format(output_format),
-            quality,
-        )?;
-        Ok(output_path.to_owned())
+        // Decode + Lanczos3 resize + re-encode is CPU-bound synchronous work.
+        // Running it directly on the async worker freezes that thread for the
+        // whole encode (tens of ms per poster), starving every other request
+        // sharing the worker — a cheap 3 ms endpoint's p99 balloons behind an
+        // image derivation. Offload to the blocking pool so the reactor stays
+        // free (Jellyfin's Skia path runs off the request thread likewise).
+        let input_path = input_path.to_owned();
+        let output_path = output_path.to_owned();
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::encode_image_blocking(
+                &input_path,
+                &output_path,
+                auto_orient,
+                quality,
+                &options,
+                output_format,
+            )
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("image encode task failed: {e}")))?
     }
 
     /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
