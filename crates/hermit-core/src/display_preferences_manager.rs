@@ -313,7 +313,9 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
 
 // Default column values for a freshly created preferences row, matching the C#
 // `DisplayPreferences`/`ItemDisplayPreferences` entity constructors.
-const DEFAULT_CHROMECAST_VERSION: i32 = 1;
+// Jellyfin's `DisplayPreferences` ctor defaults ChromecastVersion to `Stable` (0);
+// it serializes to "stable". (Was 1/"unstable" — a parity diff vs Jellyfin.)
+const DEFAULT_CHROMECAST_VERSION: i32 = 0;
 const DEFAULT_ENABLE_NEXT_VIDEO_INFO_OVERLAY: bool = true;
 const DEFAULT_SCROLL_DIRECTION: i32 = 0;
 const DEFAULT_SHOW_BACKDROP: bool = true;
@@ -344,7 +346,7 @@ mod tests {
             .await
             .expect("get");
         assert!(row.id > 0, "surrogate id assigned");
-        assert_eq!(row.chromecast_version, 1);
+        assert_eq!(row.chromecast_version, 0); // Jellyfin default: Stable
         assert!(row.enable_next_video_info_overlay);
         assert_eq!(row.skip_forward_length, 30_000);
 

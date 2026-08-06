@@ -171,16 +171,21 @@ async fn get_display_preferences(
     );
     custom_prefs.insert(
         "enableNextVideoInfoOverlay".to_owned(),
-        Some(prefs.enable_next_video_info_overlay.to_string()),
+        // C# `bool.ToString()` is capitalized ("True"/"False"), which Jellyfin
+        // writes verbatim into CustomPrefs — match it, not Rust's "true"/"false".
+        Some(
+            if prefs.enable_next_video_info_overlay {
+                "True"
+            } else {
+                "False"
+            }
+            .to_owned(),
+        ),
     );
-    custom_prefs.insert(
-        "tvhome".to_owned(),
-        Some(prefs.tv_home.clone().unwrap_or_default()),
-    );
-    custom_prefs.insert(
-        "dashboardTheme".to_owned(),
-        Some(prefs.dashboard_theme.clone().unwrap_or_default()),
-    );
+    // Jellyfin writes the raw (nullable) TvHome/DashboardTheme — unset ⇒ JSON null,
+    // not an empty string.
+    custom_prefs.insert("tvhome".to_owned(), prefs.tv_home.clone());
+    custom_prefs.insert("dashboardTheme".to_owned(), prefs.dashboard_theme.clone());
     // Stored custom preferences (do not overwrite the scalar keys above).
     for (key, value) in custom {
         custom_prefs.entry(key).or_insert(value);
@@ -251,7 +256,10 @@ async fn update_display_preferences(
         .unwrap_or(0);
     prefs.enable_next_video_info_overlay =
         take_pref(&mut dto.custom_prefs, "enableNextVideoInfoOverlay")
-            .is_none_or(|v| v.is_empty() || v.parse::<bool>().unwrap_or(true));
+            // Case-insensitive like C# `bool.Parse`: the client echoes back the
+            // "True"/"False" we send, which Rust's `parse::<bool>` rejects.
+            // Default true when absent/empty/garbage; only an explicit "false" is false.
+            .is_none_or(|v| v.is_empty() || !v.eq_ignore_ascii_case("false"));
     prefs.skip_backward_length = take_pref(&mut dto.custom_prefs, "skipBackLength")
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(DEFAULT_SKIP_LENGTH_MS);

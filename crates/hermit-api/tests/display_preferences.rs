@@ -439,7 +439,7 @@ async fn display_preferences_post_parses_scalars_back() {
             "chromecastVersion": "stable",
             "skipForwardLength": "5000",
             "skipBackLength": "5000",
-            "enableNextVideoInfoOverlay": "false",
+            "enableNextVideoInfoOverlay": "False",
             "dashboardTheme": "light",
             "tvhome": "grid",
             "homesection0": "resume",
