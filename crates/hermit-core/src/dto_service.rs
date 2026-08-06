@@ -781,8 +781,12 @@ impl HermitDtoService {
             }
         }
 
-        // Media sources.
-        if options.contains_field(ItemFields::MediaSources) {
+        // Media sources. Jellyfin only attaches these for `IHasMediaSources`
+        // (video/audio) — a Genre/Studio/Person/folder has no playable source, so
+        // it must not carry a spurious one (C# `DtoService` gates on the interface).
+        if options.contains_field(ItemFields::MediaSources)
+            && (kinds::is_video(kind) || kinds::is_audio(kind))
+        {
             // The row and its streams are already prefetched, so assemble the
             // static source directly — no per-item retrieve_item + streams_dto.
             let streams = prefetched
@@ -826,11 +830,15 @@ impl HermitDtoService {
             // file item when the user's policy grants deletion (globally or for the
             // item's library). The user policy is not plumbed into this DTO builder,
             // so we report the file-level fact only; full per-user-policy fidelity
-            // needs the policy threaded through here (a separate WI).
-            dto.can_delete = Some(!item.is_virtual_item);
+            // needs the policy threaded through here (a separate WI). By-name items
+            // (Genre/Studio/Person/…) have no file — C# `CanDelete()` returns false
+            // (default `IsFileProtocol`, plus explicit overrides on Genre/Studio/Person).
+            dto.can_delete = Some(!item.is_virtual_item && !kinds::is_item_by_name(kind));
         }
         if options.contains_field(ItemFields::CanDownload) {
-            dto.can_download = Some(!item.is_folder);
+            // C# `CanDownload()` is false by default and only true for playable media;
+            // a by-name item is not a folder but still isn't downloadable.
+            dto.can_download = Some(!item.is_folder && !kinds::is_item_by_name(kind));
         }
 
         Ok(dto)
@@ -916,7 +924,17 @@ impl HermitDtoService {
         dto.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
         dto.parent_index_number = item.parent_index_number.and_then(|n| i32::try_from(n).ok());
 
-        if item.is_folder {
+        // Jellyfin's `IsFolder` is a per-type property, not a stored flag: a
+        // Genre/Studio/Person is `BaseItem` (not a folder) even though Hermit stores
+        // `is_folder=true` for some of them. For by-name items use the kind-faithful
+        // value (`kinds::is_folder` — false for Genre/Studio/Person/Year/MusicGenre,
+        // true only for MusicArtist), matching the C# class hierarchy.
+        let item_is_folder = if kinds::is_item_by_name(kind) {
+            kinds::is_folder(kind)
+        } else {
+            item.is_folder
+        };
+        if item_is_folder {
             dto.is_folder = Some(true);
         } else if kinds::is_video(kind) || kinds::is_audio(kind) {
             dto.is_folder = Some(false);
@@ -2673,6 +2691,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dto.can_delete, Some(true));
+    }
+
+    #[tokio::test]
+    async fn by_name_item_shape_matches_jellyfin() {
+        // Genre/Studio/Person are `BaseItem` (not folders, not IHasMediaSources) in
+        // Jellyfin: IsFolder omitted, CanDelete/CanDownload false, no MediaSources.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Genre, "Drama").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.is_folder, None, "by-name item is not a folder");
+        assert_eq!(dto.can_delete, Some(false));
+        assert_eq!(dto.can_download, Some(false));
+        assert!(
+            dto.media_sources.is_none(),
+            "by-name item has no media source; got {:?}",
+            dto.media_sources
+        );
     }
 
     #[tokio::test]
