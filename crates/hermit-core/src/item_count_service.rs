@@ -102,6 +102,89 @@ impl HermitItemCountService {
             total,
         })
     }
+
+    /// Counts each person's credited items by type via `PeopleBaseItemMap`→`Peoples`,
+    /// keyed on the person row's `Name` (C# `ItemCountService` Person branch —
+    /// `m.People.Name == item.Name`). People are not in `ItemValues`, so the generic
+    /// CleanName/ItemValues count path returns zero for them.
+    async fn people_name_counts(
+        &self,
+        ids: &[Uuid],
+        related_item_kinds: &[BaseItemKind],
+        mut out: HashMap<Uuid, ItemCounts>,
+    ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        // Resolve each person row's Name.
+        let mut name_by_id: Vec<(Uuid, String)> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let sql = format!(
+                r#"SELECT "Id","Name" FROM "BaseItems" WHERE "Id" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
+            for id in chunk {
+                query = query.bind(id.to_string());
+            }
+            for (row_id, name) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let (Ok(uuid), Some(name)) = (Uuid::parse_str(&row_id), name) {
+                    name_by_id.push((uuid, name));
+                }
+            }
+        }
+        if name_by_id.is_empty() {
+            return Ok(out);
+        }
+
+        let type_names: Vec<String> = related_item_kinds
+            .iter()
+            .filter_map(|k| stored_type_name(*k))
+            .map(ToOwned::to_owned)
+            .collect();
+        let distinct_names: Vec<String> = name_by_id
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut by_name: HashMap<String, HashMap<String, i32>> = HashMap::new();
+        for chunk in distinct_names.chunks(500) {
+            let mut sql = format!(
+                r#"SELECT p."Name", bi."Type", COUNT(DISTINCT bi."Id")
+                   FROM "BaseItems" bi
+                   JOIN "PeopleBaseItemMap" pm ON pm."ItemId" = bi."Id"
+                   JOIN "Peoples" p ON p."Id" = pm."PeopleId"
+                   WHERE p."Name" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            if !type_names.is_empty() {
+                sql.push_str(r#" AND bi."Type" IN ("#);
+                sql.push_str(&placeholders(type_names.len()));
+                sql.push(')');
+            }
+            sql.push_str(r#" GROUP BY p."Name", bi."Type""#);
+
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            for name in chunk {
+                query = query.bind(name.clone());
+            }
+            for t in &type_names {
+                query = query.bind(t.clone());
+            }
+            for (name, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                by_name
+                    .entry(name)
+                    .or_default()
+                    .insert(type_, i32::try_from(count).unwrap_or(i32::MAX));
+            }
+        }
+
+        for (id, name) in name_by_id {
+            if let Some(by_type) = by_name.get(&name) {
+                out.insert(id, counts_from_type_map(by_type));
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -166,7 +249,7 @@ impl ItemCountService for HermitItemCountService {
 
     async fn get_item_counts_for_name_items(
         &self,
-        _kind: BaseItemKind,
+        kind: BaseItemKind,
         ids: &[Uuid],
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
@@ -177,6 +260,14 @@ impl ItemCountService for HermitItemCountService {
             ids.iter().map(|&id| (id, ItemCounts::default())).collect();
         if ids.is_empty() {
             return Ok(out);
+        }
+
+        // People live in `PeopleBaseItemMap`/`Peoples`, not `ItemValues`, so a Person's
+        // filmography is counted by joining the people map on the person's Name — the
+        // C# `ItemCountService` Person branch (`m.People.Name == item.Name`). The
+        // CleanName/ItemValues path below would count zero for a Person.
+        if kind == BaseItemKind::Person {
+            return self.people_name_counts(ids, related_item_kinds, out).await;
         }
 
         // Resolve every by-name row's CleanName in one query per chunk.
@@ -850,5 +941,62 @@ mod tests {
         assert_eq!(counts.movie_count, 2);
         assert_eq!(counts.series_count, 1);
         assert_eq!(counts.item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn person_counts_credited_items_via_people_map() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // A Person by-name item, credited on two movies + a series through the
+        // People map. People live outside ItemValues, so the CleanName path counts
+        // zero — the Person branch must join PeopleBaseItemMap → Peoples on Name.
+        let person = Uuid::from_u128(0xCC01);
+        seed_named_item(&db, person, BaseItemKind::Person, "Alice Parity").await;
+        let people_id = Uuid::from_u128(0xCC0A);
+        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,?2,?3)"#)
+            .bind(people_id.to_string())
+            .bind("Alice Parity")
+            .bind("Actor")
+            .execute(db.writer())
+            .await
+            .expect("seed people");
+
+        for (i, kind) in [
+            BaseItemKind::Movie,
+            BaseItemKind::Movie,
+            BaseItemKind::Series,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let item = Uuid::from_u128(0xCC10 + i as u128);
+            seed_named_item(&db, item, *kind, "credit").await;
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+                   VALUES (?1,?2,?3,?4,?5)"#,
+            )
+            .bind(item.to_string())
+            .bind(people_id.to_string())
+            .bind("Role")
+            .bind(0)
+            .bind(0)
+            .execute(db.writer())
+            .await
+            .expect("seed people map");
+        }
+
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Person,
+                person,
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("person counts");
+        assert_eq!(counts.movie_count, 2, "both movie credits counted");
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.item_count, 3);
     }
 }
