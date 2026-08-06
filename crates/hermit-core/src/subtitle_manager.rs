@@ -132,18 +132,17 @@ impl HermitSubtitleManager {
         // item's internal metadata folder — mirroring Jellyfin's non-media-folder
         // subtitle save, so an upload succeeds instead of 500-ing.
         let sidecar = sidecar_path(&media_path, response);
-        let sidecar_str = match write_sidecar(&sidecar, &response.content).await {
-            Ok(()) => sidecar.to_string_lossy().into_owned(),
-            Err(_) => {
-                let file_name = sidecar
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("subtitle"));
-                let fallback = self.item_metadata_dir(item_id).join(file_name);
-                write_sidecar(&fallback, &response.content)
-                    .await
-                    .map_err(|e| ServiceError::backend(e.to_string()))?;
-                fallback.to_string_lossy().into_owned()
-            }
+        let sidecar_str = if write_sidecar(&sidecar, &response.content).await.is_ok() {
+            sidecar.to_string_lossy().into_owned()
+        } else {
+            let file_name = sidecar
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("subtitle"));
+            let fallback = self.item_metadata_dir(item_id).join(file_name);
+            write_sidecar(&fallback, &response.content)
+                .await
+                .map_err(|e| ServiceError::backend(e.to_string()))?;
+            fallback.to_string_lossy().into_owned()
         };
 
         // Append the new external subtitle to the item's stream set (the repo
