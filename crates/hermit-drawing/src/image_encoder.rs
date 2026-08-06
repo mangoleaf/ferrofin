@@ -188,9 +188,8 @@ impl ImageCrateEncoder {
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
-            let bytes =
-                webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                    .encode(quality);
+            let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+                .encode(quality);
             std::fs::write(output_path, &*bytes)
                 .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
         } else {
@@ -680,7 +679,11 @@ mod tests {
         for (col, row, px) in img.enumerate_pixels_mut() {
             // Truncation is the point: wrap coordinates into channel space.
             #[allow(clippy::cast_possible_truncation)]
-            let channels = [(col % 256) as u8, (row % 256) as u8, ((col + row) % 256) as u8];
+            let channels = [
+                (col % 256) as u8,
+                (row % 256) as u8,
+                ((col + row) % 256) as u8,
+            ];
             *px = Rgba([channels[0], channels[1], channels[2], 0xFF]);
         }
         let path: PathBuf = dir.path().join(name);
