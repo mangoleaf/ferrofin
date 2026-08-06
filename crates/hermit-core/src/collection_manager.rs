@@ -891,6 +891,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_playlist_items_preserves_link_order() {
+        // Members must come back in link order, not id/insertion order — seed
+        // three tracks and add them out of sort order; the result must echo the
+        // added sequence. (No prior coverage guarded playlist ordering.)
+        let db = test_db().await;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        for id in [a, b, c] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = HermitPlaylistManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+        );
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Ordered".to_owned()),
+                item_id_list: vec![c, a, b],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        let ids: Vec<String> = mgr
+            .get_playlist_items(playlist_id, owner)
+            .await
+            .expect("items")
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        assert_eq!(ids, vec![c.to_string(), a.to_string(), b.to_string()]);
+    }
+
+    #[tokio::test]
     async fn remove_by_dashless_playlist_item_id_removes_member() {
         // `GetPlaylistItems` emits `PlaylistItemId` dashless (`Guid('N')`), but
         // `ChildId` is stored dashed. Removing by the dashless id the DTO exposes
