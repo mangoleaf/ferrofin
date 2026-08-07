@@ -21,6 +21,8 @@ default = ["opensubtitles", "lrclib"]
 tmdb = []
 musicbrainz = []
 omdb = []
+studios = []
+tvdb = []
 opensubtitles = []
 lrclib = []
 

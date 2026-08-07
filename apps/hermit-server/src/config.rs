@@ -106,6 +106,9 @@ struct FileConfig {
     published_url: Option<String>,
     base_url: Option<String>,
     omdb_api_key: Option<String>,
+    studios_repo_url: Option<String>,
+    tvdb_api_key: Option<String>,
+    tvdb_subscriber_pin: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     library_roots: Option<Vec<PathBuf>>,
@@ -182,6 +185,19 @@ pub struct Config {
     /// Empty = disabled (RT ratings stay unpopulated). From `HERMIT_OMDB_KEY` or
     /// `config.toml`.
     pub omdb_api_key: String,
+
+    /// Studio Images artwork repository base URL. Empty = the built-in Jellyfin
+    /// `emby-artwork` studios tree. From `HERMIT_STUDIOS_REPO_URL` or
+    /// `config.toml`.
+    pub studios_repo_url: String,
+
+    /// TheTVDB API key. Empty = the built-in Jellyfin project key (TV metadata
+    /// works with no configuration). From `HERMIT_TVDB_KEY` or `config.toml`.
+    pub tvdb_api_key: String,
+
+    /// TheTVDB subscriber PIN (for a user's paid subscription tier). Empty =
+    /// non-subscriber. From `HERMIT_TVDB_PIN` or `config.toml`.
+    pub tvdb_subscriber_pin: String,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -323,6 +339,21 @@ impl Config {
             .or(file.omdb_api_key)
             .unwrap_or_default();
 
+        let studios_repo_url = env
+            .var("HERMIT_STUDIOS_REPO_URL")
+            .or(file.studios_repo_url)
+            .unwrap_or_default();
+
+        let tvdb_api_key = env
+            .var("HERMIT_TVDB_KEY")
+            .or(file.tvdb_api_key)
+            .unwrap_or_default();
+
+        let tvdb_subscriber_pin = env
+            .var("HERMIT_TVDB_PIN")
+            .or(file.tvdb_subscriber_pin)
+            .unwrap_or_default();
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("HERMIT_FFMPEG_PATH").map(PathBuf::from))
@@ -372,6 +403,9 @@ impl Config {
             published_url,
             base_url,
             omdb_api_key,
+            studios_repo_url,
+            tvdb_api_key,
+            tvdb_subscriber_pin,
             ffmpeg_path,
             ffprobe_path,
             library_roots,

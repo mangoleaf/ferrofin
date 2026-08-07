@@ -102,6 +102,59 @@ impl RemoteSearchProvider for TmdbSearchProvider {
     }
 }
 
+/// A [`RemoteSearchProvider`] backed by TheTVDB — the "Identify" flow for TV
+/// series. Returns candidates carrying their `Tvdb` provider id.
+pub struct TvdbSearchProvider {
+    tvdb: Arc<crate::tvdb::TvdbClient>,
+}
+
+impl TvdbSearchProvider {
+    /// A TVDB series search provider.
+    #[must_use]
+    pub fn new(tvdb: Arc<crate::tvdb::TvdbClient>) -> Self {
+        Self { tvdb }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for TvdbSearchProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "TheTVDB"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == BaseItemKind::Series
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .tvdb
+            .search(name, search_info.year)
+            .await
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                name: Some(hit.name),
+                production_year: hit.year,
+                image_url: hit.image_url,
+                overview: hit.overview,
+                provider_ids: Some(std::collections::HashMap::from([(
+                    "Tvdb".to_owned(),
+                    hit.tvdb_id.to_string(),
+                )])),
+                search_provider_name: Some("TheTVDB".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
+
 /// A single remote metadata-search fetcher (e.g. a TMDb or MusicBrainz plugin).
 ///
 /// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced
@@ -148,6 +201,9 @@ pub struct LocalProviderManager {
     /// methods to resolve an item and list/download its TMDB artwork.
     tmdb: Option<Arc<TmdbClient>>,
     items: Option<Arc<dyn ItemRepository>>,
+    /// The Studio Images client, used to supply a `Studio` item's thumb from the
+    /// artwork repository. Absent → studios contribute no remote images.
+    studios: Option<Arc<crate::studios::StudiosClient>>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -162,6 +218,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("metadata_dir", &self.metadata_dir)
             .field("has_tmdb", &self.tmdb.is_some())
             .field("has_items", &self.items.is_some())
+            .field("has_studios", &self.studios.is_some())
             .finish()
     }
 }
@@ -182,7 +239,16 @@ impl LocalProviderManager {
             metadata_dir: None,
             tmdb: None,
             items: None,
+            studios: None,
         }
+    }
+
+    /// Attaches the Studio Images client, so a `Studio` item's remote images
+    /// include the artwork-repository thumb. Absent, studios contribute nothing.
+    #[must_use]
+    pub fn with_studios(mut self, studios: Arc<crate::studios::StudiosClient>) -> Self {
+        self.studios = Some(studios);
+        self
     }
 
     /// Attaches the TMDB client + item store used by the remote-image methods
@@ -225,20 +291,6 @@ impl LocalProviderManager {
         self.image_store = Some(image_store);
         self.metadata_dir = Some(metadata_dir);
         self
-    }
-
-    /// Resolves an item to `(TmdbKind, name, year)` for a TMDB lookup, or `None`
-    /// when the item is missing, pathless, or a kind TMDB does not serve here
-    /// (only movies/series).
-    async fn tmdb_lookup(
-        &self,
-        items: &Arc<dyn ItemRepository>,
-        item_id: Uuid,
-    ) -> Result<Option<(TmdbKind, String, Option<i32>)>, ServiceError> {
-        let Some(entity) = items.retrieve_item(item_id).await? else {
-            return Ok(None);
-        };
-        Ok(title_lookup(&entity))
     }
 
     /// Resolves what a refresh should fetch for `entity`: movies/series search
@@ -408,7 +460,8 @@ fn short_kind(entity: &BaseItemEntity) -> &str {
 }
 
 /// The pure `(kind, name, year)` extraction for a movie/series row, shared by
-/// [`LocalProviderManager::tmdb_lookup`] and the refresh-target resolver.
+/// [`LocalProviderManager::get_available_remote_images`] and the refresh-target
+/// resolver.
 fn title_lookup(entity: &BaseItemEntity) -> Option<(TmdbKind, String, Option<i32>)> {
     let kind = match short_kind(entity) {
         "Movie" => TmdbKind::Movie,
@@ -790,10 +843,38 @@ impl ProviderManager for LocalProviderManager {
         item_id: Uuid,
         query: &RemoteImageQuery,
     ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
-        let (Some(tmdb), Some(items)) = (&self.tmdb, &self.items) else {
+        let Some(items) = &self.items else {
             return Ok(Vec::new());
         };
-        let Some((kind, name, year)) = self.tmdb_lookup(items, item_id).await? else {
+        let Some(entity) = items.retrieve_item(item_id).await? else {
+            return Ok(Vec::new());
+        };
+        // Studio items get their thumb from the artwork repository (name-matched,
+        // no external id) — a distinct provider from the TMDB title path below.
+        if short_kind(&entity) == "Studio" {
+            let (Some(studios), Some(name)) = (
+                &self.studios,
+                entity.name.as_deref().filter(|n| !n.is_empty()),
+            ) else {
+                return Ok(Vec::new());
+            };
+            if !query.image_type.is_none_or(|t| t == ImageType::Thumb) {
+                return Ok(Vec::new());
+            }
+            let Some(url) = studios.thumb_url(name).await else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![RemoteImageInfo {
+                provider_name: Some(crate::studios::PROVIDER_NAME.to_owned()),
+                url: Some(url),
+                type_: ImageType::Thumb,
+                ..RemoteImageInfo::default()
+            }]);
+        }
+        let Some(tmdb) = &self.tmdb else {
+            return Ok(Vec::new());
+        };
+        let Some((kind, name, year)) = title_lookup(&entity) else {
             return Ok(Vec::new());
         };
         // Best-match the title, then list all of TMDB's images for it.
@@ -825,8 +906,21 @@ impl ProviderManager for LocalProviderManager {
         let Some(items) = &self.items else {
             return Ok(Vec::new());
         };
+        let Some(entity) = items.retrieve_item(item_id).await? else {
+            return Ok(Vec::new());
+        };
+        // Studios advertise a single Thumb from the artwork repository.
+        if short_kind(&entity) == "Studio" {
+            if self.studios.is_none() {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![ImageProviderInfo {
+                name: Some(crate::studios::PROVIDER_NAME.to_owned()),
+                supported_images: vec![ImageType::Thumb],
+            }]);
+        }
         // Advertise TMDB only for the kinds it serves.
-        if self.tmdb_lookup(items, item_id).await?.is_none() {
+        if title_lookup(&entity).is_none() {
             return Ok(Vec::new());
         }
         Ok(vec![ImageProviderInfo {
@@ -1097,6 +1191,21 @@ mod tests {
         );
         // The first provider that produced the surviving entry wins its name.
         assert_eq!(out[0].search_provider_name.as_deref(), Some("A"));
+    }
+
+    #[tokio::test]
+    async fn tvdb_search_provider_supports_series_and_guards_empty_name() {
+        use super::TvdbSearchProvider;
+        let p = TvdbSearchProvider::new(Arc::new(crate::tvdb::TvdbClient::new()));
+        assert_eq!(p.name(), "TheTVDB");
+        assert!(p.supports(BaseItemKind::Series));
+        assert!(!p.supports(BaseItemKind::Movie));
+        // An empty search name short-circuits before any network call.
+        let out = p
+            .get_search_results(&ItemLookupInfo::default())
+            .await
+            .expect("empty");
+        assert!(out.is_empty());
     }
 
     #[tokio::test]
@@ -1507,6 +1616,74 @@ mod tests {
             type_: format!("MediaBrowser.Controller.Entities.{kind}"),
             ..BaseItemEntity::default()
         }
+    }
+
+    #[tokio::test]
+    async fn studio_remote_images_return_the_repository_thumb() {
+        // A Studio item resolves its Thumb from the artwork repository, matched by
+        // normalized name; the studios client's manifest is seeded so no network
+        // is touched.
+        let item_id = Uuid::new_v4();
+        let mut studio = row("Studio", "Walt Disney Pictures");
+        studio.id = item_id.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, studio)]),
+            seen: tx,
+        });
+        let studios = Arc::new(crate::studios::StudiosClient::new());
+        studios.seed_manifest(vec!["Walt Disney Pictures".to_owned()]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_studios(studios);
+
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].type_, ImageType::Thumb);
+        assert_eq!(
+            images[0].provider_name.as_deref(),
+            Some("Artwork Repository")
+        );
+        assert!(
+            images[0]
+                .url
+                .as_deref()
+                .is_some_and(|u| u.ends_with("/images/Walt Disney Pictures/thumb.jpg"))
+        );
+
+        // The provider-info advertiser reports the Thumb-only studios provider.
+        let info = mgr
+            .get_remote_image_provider_info(item_id)
+            .await
+            .expect("info");
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].supported_images, vec![ImageType::Thumb]);
+    }
+
+    #[tokio::test]
+    async fn studio_without_a_manifest_match_yields_no_image() {
+        let item_id = Uuid::new_v4();
+        let mut studio = row("Studio", "An Unlisted Studio");
+        studio.id = item_id.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, studio)]),
+            seen: tx,
+        });
+        let studios = Arc::new(crate::studios::StudiosClient::new());
+        studios.seed_manifest(vec!["Netflix".to_owned()]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_studios(studios);
+
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .expect("images");
+        assert!(images.is_empty());
     }
 
     #[tokio::test]

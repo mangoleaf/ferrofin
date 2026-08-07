@@ -262,7 +262,13 @@ pub async fn build_app_state(
     // use Jellyfin's built-in key.
     let tmdb_client = Arc::new(hermit_providers::TmdbClient::new());
     let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
-    let tmdb_search: Vec<Arc<dyn hermit_providers::RemoteSearchProvider>> = vec![
+    // TheTVDB — the TV authority. Ships on with the built-in project key (like
+    // TMDB); a user key/PIN override enables their subscription tier.
+    let the_tvdb = Arc::new(hermit_providers::TvdbClient::with_config(
+        &config.tvdb_api_key,
+        &config.tvdb_subscriber_pin,
+    ));
+    let search_providers: Vec<Arc<dyn hermit_providers::RemoteSearchProvider>> = vec![
         Arc::new(hermit_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
             hermit_providers::TmdbKind::Movie,
@@ -271,7 +277,15 @@ pub async fn build_app_state(
             Arc::clone(&tmdb_client),
             hermit_providers::TmdbKind::Series,
         )),
+        Arc::new(hermit_providers::TvdbSearchProvider::new(Arc::clone(
+            &the_tvdb,
+        ))),
     ];
+    // Studio logos from the artwork repository (name-matched, keyless). The repo
+    // URL is overridable; empty falls back to the built-in emby-artwork tree.
+    let studios_client = Arc::new(hermit_providers::StudiosClient::with_repo_url(
+        &config.studios_repo_url,
+    ));
     let providers: Arc<dyn hermit_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_store(
@@ -279,7 +293,8 @@ pub async fn build_app_state(
                 metadata_library.clone(),
             )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
-            .with_remote_search_providers(tmdb_search),
+            .with_remote_search_providers(search_providers)
+            .with_studios(studios_client),
     );
     let file_system: Arc<dyn hermit_traits::filesystem::FileSystem> =
         Arc::new(HermitFileSystem::new());
@@ -399,6 +414,9 @@ pub async fn build_app_state(
     // Fetch remote artwork (TMDB) for movies/series with no local images,
     // using Jellyfin's built-in key so posters/backdrops appear with no setup.
     .with_metadata(Arc::clone(&tmdb_client), metadata_library)
+    // TheTVDB is the TV authority: series/episode metadata + artwork come from
+    // TVDB during the scan (TMDB stays the fallback for a series TVDB can't match).
+    .with_tvdb(Arc::clone(&the_tvdb))
     // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
     // key is configured (HERMIT_OMDB_KEY / config.toml `omdb_api_key`).
     .with_omdb(Arc::new(hermit_providers::OmdbClient::new(
@@ -909,6 +927,9 @@ mod tests {
             published_url: None,
             base_url: String::new(),
             omdb_api_key: String::new(),
+            studios_repo_url: String::new(),
+            tvdb_api_key: String::new(),
+            tvdb_subscriber_pin: String::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),

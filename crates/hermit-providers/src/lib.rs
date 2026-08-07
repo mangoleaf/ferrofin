@@ -18,7 +18,9 @@ pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod provider_manager;
+pub mod studios;
 pub mod tmdb;
+pub mod tvdb;
 pub mod xbmc;
 
 pub use error::ProvidersError;
@@ -30,9 +32,14 @@ pub use lrclib::{LrcLibConfig, LrcLibProvider};
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use omdb::OmdbClient;
+pub use studios::StudiosClient;
 pub use tmdb::{
     RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
     TmdbPerson, TmdbSearchHit, TmdbTrailer,
+};
+pub use tvdb::{
+    TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
+    TvdbSeasonDetails, TvdbSeriesDetails,
 };
 
 pub use container_types::{
@@ -45,5 +52,7 @@ pub use local_images::{
     LocalImageProvider,
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
-pub use provider_manager::{LocalProviderManager, RemoteSearchProvider, TmdbSearchProvider};
+pub use provider_manager::{
+    LocalProviderManager, RemoteSearchProvider, TmdbSearchProvider, TvdbSearchProvider,
+};
 pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};
