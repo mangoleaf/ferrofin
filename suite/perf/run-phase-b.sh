@@ -12,8 +12,8 @@
 #   BENCH_ONLY=hermit ./run-phase-b.sh
 set -euo pipefail
 cd "$(dirname "$0")"
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env .env
 suite_mint_device_id phase-b
 . ./_phase-common.sh

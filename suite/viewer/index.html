@@ -271,13 +271,13 @@ fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => 
   render(); renderTrend();
 });
 
-fetch("/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
+fetch("/suite/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
   LEDGER = d.operations;
   ldepth.innerHTML = `<option value="">depth: all</option>` +
     [...new Set(LEDGER.map(x => x.depth))].sort().map(v => `<option>${v}</option>`).join("");
   [lq, ldepth, ldeep].forEach(el => el.oninput = renderLedger);
   renderLedger();
-}).catch(() => { lstats.textContent = "ledger.json not found — run parity/sweep.sh + gen-ledger.py"; });
+}).catch(() => { lstats.textContent = "ledger.json not found — run suite/run.sh parity"; });
 </script>
 </body>
 </html>

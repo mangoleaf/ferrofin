@@ -302,9 +302,9 @@ def main():
     hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL", "http://localhost:18097")
     rows = run(hermit, jellyfin)
-    out = {"generated_by": "parity/assets.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
+    out = {"generated_by": "suite/parity/assets.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "rows": rows}
-    with open(os.path.join(ROOT, "parity/asset-results.json"), "w") as f:
+    with open(os.path.join(ROOT, "suite/parity/asset-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"])

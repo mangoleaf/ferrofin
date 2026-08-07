@@ -19,11 +19,11 @@ usage() { sed -n '2,15p' "$ROOT/suite/run.sh"; exit 1; }
 stage="$1"; shift || true
 
 case "$stage" in
-  parity)  exec "$ROOT/parity/sweep.sh" "$@" ;;
-  perf)    exec "$ROOT/benchmark/run.sh" "$@" ;;
+  parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
+  perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
   all)
-    "$ROOT/parity/sweep.sh"
-    "$ROOT/benchmark/run.sh"
+    "$ROOT/suite/parity/sweep.sh"
+    "$ROOT/suite/perf/run.sh"
     python3 "$ROOT/suite/merge.py"
     ;;
   merge)   exec python3 "$ROOT/suite/merge.py" "$@" ;;
@@ -33,7 +33,7 @@ case "$stage" in
       # both legs so run.sh's report step has both summaries; the gate itself only reads Hermit's.
       shift
       RUN_TRANSCODE=0 BENCH_VUS="${PERF_GATE_VUS:-10}" BENCH_DURATION="${PERF_GATE_SECONDS:-10}s" \
-        "$ROOT/benchmark/run.sh"
+        "$ROOT/suite/perf/run.sh"
       python3 "$ROOT/suite/merge.py"
     fi
     exec python3 "$ROOT/suite/gate.py" "$@"

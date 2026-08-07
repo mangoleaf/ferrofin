@@ -98,7 +98,7 @@ Prereqs on the host: `docker` + `docker compose`, `k6`, `jq`, and `ffmpeg` (only
 generation). Then:
 
 ```bash
-cd benchmark
+cd suite/perf
 cp .env.example .env
 #   set REAL_MEDIA_DIR to your movies dir (absolute path)
 #   set JELLYFIN_IMAGE to match your vendored spec version
@@ -133,7 +133,7 @@ drops below 100%. All three percentiles gate deliberately: median-only gating ha
 2× p99 tail regressions before, and tail latency is what users feel as stutter.
 
 ```bash
-cd benchmark
+cd suite/perf
 ./perf-gate.sh --rebaseline   # once: capture perf-baseline.json from current HEAD
 ./perf-gate.sh                # per change: gate the working tree against the baseline
 ```
@@ -180,9 +180,9 @@ jobs:
       - run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg jq
           curl -sL https://github.com/grafana/k6/releases/latest/download/k6-... -o /usr/local/bin/k6 && chmod +x /usr/local/bin/k6
-      - run: cd benchmark && ./run.sh
+      - run: cd suite/perf && ./run.sh
       - uses: actions/upload-artifact@v4
-        with: { name: benchmark, path: benchmark/results/latest.md }
+        with: { name: benchmark, path: suite/perf/results/latest.md }
 ```
 
 ## Files
@@ -195,6 +195,6 @@ jobs:
 | `scenario.js` | k6: provision → scan-wait → warm → per-endpoint load |
 | `transcode.js` | k6: experimental time-to-first-segment (opt-in) |
 | `run.sh` | orchestrate both, capture footprint, render the report |
-| `perf-gate.sh` | fast Hermit-only regression gate vs `../suite/perf-baseline.json` (p50/p95/p99) |
+| `perf-gate.sh` | fast Hermit-only regression gate vs `../perf-baseline.json` (p50/p95/p99) |
 | `perf-gate.js` | k6: closed-model per-endpoint load for the gate (emits the percentiles) |
 | `.env.example` | every tunable, with defaults |

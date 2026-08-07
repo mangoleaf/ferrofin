@@ -1,14 +1,15 @@
 # suite/ — merged parity + perf suite
 
 One harness, one join key, one fair scoreboard (Plan 6). Replaces the three stacks that grew
-separately: the k6 load bench (`benchmark/`), the retired k6 parity diff (`benchmark/parity.*`,
-deleted), and the Python parity suite (`parity/`, still the parity engine — this wraps it).
+separately: the k6 load bench (now `suite/perf/`), the retired k6 parity diff (deleted), and
+the Python parity suite (now `suite/parity/`). Everything lives under this one folder:
+the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 
 ## Entry points
 
 ```
-suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → parity/ledger.json (+fingerprints)
-suite/run.sh perf     # one at a time    → k6 load bench → benchmark/results/raw/*-summary.json (+fingerprints)
+suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → suite/parity/ledger.json (+fingerprints)
+suite/run.sh perf     # one at a time    → k6 load bench → suite/perf/results/raw/*-summary.json (+fingerprints)
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
 suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
 suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
@@ -33,7 +34,7 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
 - **Write (non-GET) rows are fingerprint-exempt by design** — a fingerprint probe would itself
   mutate state, and write bodies mint per-run tokens/timestamps. Their honesty gate instead:
   `deep_verified` must come from the parity **write journey**, and both servers must hit 100%
-  expected-status (204 for playstate) during the bench. See `benchmark/README.md` "Write rows".
+  expected-status (204 for playstate) during the bench. See `suite/perf/README.md` "Write rows".
 - **A win means p50 AND p95 AND p99.** A p50 win with a tail regression is surfaced as `tail_loss`,
   never folded into "faster" (median-only boards hid 2× p99 regressions before).
 - **`suite/run.sh gate`** fails on a >1.5× latency regression *or* when a previously deep-verified
@@ -71,4 +72,4 @@ greyed `legacy: true` / `comparable: false` entries — visible in the trend, ne
   shared runners are too noisy for a latency threshold to block on, and it never reads the
   repo's committed baseline (dev-host numbers aren't comparable to runner numbers — it
   rebaselines from the PR's merge-base on the same runner instead). The mandatory gate is the
-  local `benchmark/perf-gate.sh` per `CLAUDE.md`.
+  local `suite/perf/perf-gate.sh` per `CLAUDE.md`.

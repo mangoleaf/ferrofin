@@ -122,7 +122,7 @@ struct FileConfig {
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
 /// or the literal string `"auto"` for the built-in sizing formula
 /// (`hermit_db`'s `default_pool_size`, derived from the mixed-load pool sweep —
-/// see `benchmark/pool-sweep.sh`).
+/// see `suite/perf/pool-sweep.sh`).
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum DbPoolFileValue {
@@ -415,7 +415,7 @@ fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
 /// `auto`) > `db_pool` in `config.toml` (integer or `"auto"`) > `None` (auto).
 ///
 /// `Some(n)` pins the pool at exactly `n` connections; `None` selects the
-/// sizing formula in `hermit_db` (see `benchmark/pool-sweep.sh` for how that
+/// sizing formula in `hermit_db` (see `suite/perf/pool-sweep.sh` for how that
 /// formula is derived). Zero and unrecognized values are errors — a silently
 /// ignored typo here would change performance, not correctness, and never be
 /// noticed.

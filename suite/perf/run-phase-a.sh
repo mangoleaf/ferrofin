@@ -12,8 +12,8 @@
 #   BENCH_SKIP_BUILD=1 ...              reuse the existing hermit-bench:local image
 set -euo pipefail
 cd "$(dirname "$0")"
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env
 . ./_phase-common.sh
 mkdir -p results/raw

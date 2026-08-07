@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Bring up both servers (reusing the benchmark docker-compose) and run the Layer-1 sweep.
-# Mirrors benchmark/parity.sh's bring-up; hands off to sweep.py (the request-gen + validator).
-#   parity/sweep.sh                    build + sweep
-#   BENCH_SKIP_BUILD=1 parity/sweep.sh reuse the existing hermit-bench:local image (may lag HEAD)
+# Bring up both servers (reusing the perf-leg docker-compose) and run the Layer-1 sweep.
+# Hands off to sweep.py (the request-gen + validator).
+#   suite/parity/sweep.sh                    build + sweep
+#   BENCH_SKIP_BUILD=1 suite/parity/sweep.sh reuse the existing hermit-bench:local image (may lag HEAD)
 set -euo pipefail
-cd "$(dirname "$0")/../benchmark"
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+cd "$(dirname "$0")/../perf"
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env "${PARITY_ENV:-.env.loop}"
 suite_mint_device_id parity
 suite_build_libraries   # LIBRARIES is parsed by sweep.py
@@ -34,5 +34,5 @@ python3 ../parity/assets.py
 echo ">> regenerating ledger"
 python3 ../parity/gen-ledger.py
 echo ">> capturing Hermit body fingerprints (mid-run honesty baseline for merge.py)"
-mkdir -p ../suite/results/raw
-python3 ../suite/fingerprint.py capture http://localhost:18096 ../suite/results/raw/parity-fingerprints.json || true
+mkdir -p ../results/raw
+python3 ../fingerprint.py capture http://localhost:18096 ../results/raw/parity-fingerprints.json || true

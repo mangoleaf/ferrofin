@@ -22,7 +22,7 @@ def variant_to_op():
 
 def main():
     v2op = variant_to_op()
-    bench = json.loads((ROOT / "benchmark" / "bench-data.json").read_text())
+    bench = json.loads((ROOT / "suite" / "perf" / "bench-data.json").read_text())
 
     legacy = []
     for ver in bench.get("versions", []):

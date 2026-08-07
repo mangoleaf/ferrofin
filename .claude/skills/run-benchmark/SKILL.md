@@ -15,13 +15,13 @@ comparison to answer a regression question.
 
 | Intent | Command | Time | Servers |
 |---|---|---|---|
-| "Did my change regress perf?" | `cd benchmark && ./perf-gate.sh` | ~5 min | Hermit only (working tree) |
-| Full Hermit-vs-Jellyfin numbers | `cd benchmark && ./run.sh` (= `suite/run.sh perf`) | ~30+ min | both, one at a time |
+| "Did my change regress perf?" | `cd suite/perf && ./perf-gate.sh` | ~5 min | Hermit only (working tree) |
+| Full Hermit-vs-Jellyfin numbers | `cd suite/perf && ./run.sh` (= `suite/run.sh perf`) | ~30+ min | both, one at a time |
 | Release record (parity + perf, merged) | `suite/run.sh all` | ~45+ min | both |
 | Re-join existing artifacts, no measurement | `suite/run.sh merge` | seconds | none |
 
 Prereqs on the host: `docker` + `docker compose`, `k6`, `jq` (`ffmpeg` only for
-first-time fixture generation). `benchmark/.env` must exist (`cp .env.example .env`;
+first-time fixture generation). `suite/perf/.env` must exist (`cp .env.example .env`;
 `REAL_MEDIA_DIR` set, `JELLYFIN_IMAGE` matching the vendored OpenAPI spec version).
 
 ## Hard rules during a run
@@ -37,14 +37,14 @@ first-time fixture generation). `benchmark/.env` must exist (`cp .env.example .e
   "save time" by reusing state. `BENCH_ONLY=hermit|jellyfin ./run.sh` re-runs
   one leg while keeping the other's raw results, and skips the wipe of the
   other leg's summary only.
-- The full run **overwrites `benchmark/results/raw/*.json`** — if the current
+- The full run **overwrites `suite/perf/results/raw/*.json`** — if the current
   raw summaries matter (e.g. they back an unmerged run record), run
   `suite/run.sh merge` first.
 
 ## The perf gate (the one you'll run most)
 
 ```bash
-cd benchmark
+cd suite/perf
 ./perf-gate.sh                # gate the working tree against suite/perf-baseline.json
 ./perf-gate.sh --rebaseline   # capture a new baseline (see rules below)
 ```
@@ -61,7 +61,7 @@ cd benchmark
 
 ## Reading the results
 
-- Full run: `benchmark/results/latest.md` (+ raw per-leg
+- Full run: `suite/perf/results/latest.md` (+ raw per-leg
   `results/raw/{hermit,jellyfin}-summary.json`). Merged suite record:
   `suite/results/run-<sha>.json`. Dashboard: `suite/viewer/serve.sh` →
   http://127.0.0.1:8125/suite/viewer/.

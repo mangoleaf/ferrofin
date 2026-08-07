@@ -1,6 +1,6 @@
 {
-  "generated_by": "parity/assets.py",
-  "last_verified": "553252f 2026-08-05",
+  "generated_by": "suite/parity/assets.py",
+  "last_verified": "335c474 2026-08-06",
   "rows": {
     "DELETE /Branding/Splashscreen": {
       "classification": "",

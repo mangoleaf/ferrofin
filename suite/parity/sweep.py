@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 import warnings
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 METHODS = ("get", "post", "put", "delete", "patch", "head")
 USER = os.environ.get("BENCH_ADMIN_USER", "bench")
 PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
@@ -330,9 +330,9 @@ def write_results(results):
     skipped = sum(1 for r in results.values() if "unresolved" in (r.get("note") or ""))
     deep_ok = sum(1 for r in results.values() if r.get("deep_verified") is True)
     deep_run = sum(1 for r in results.values() if "deep_verified" in r)
-    out = {"generated_by": "parity/sweep.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
+    out = {"generated_by": "suite/parity/sweep.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "rows": results}
-    with open(os.path.join(ROOT, "parity/sweep-results.json"), "w") as f:
+    with open(os.path.join(ROOT, "suite/parity/sweep-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     print(f"wrote parity/sweep-results.json — {len(results)} ops, "

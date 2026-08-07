@@ -199,7 +199,7 @@ change touching `hermit-core`, `hermit-db`, `hermit-api`, or the query/repositor
 paths (`translate_query`, `item_repository`, `dto_service`) **must pass the perf gate**:
 
 ```bash
-cd benchmark && ./perf-gate.sh          # Hermit-only; fails if any sentinel endpoint
+cd suite/perf && ./perf-gate.sh          # Hermit-only; fails if any sentinel endpoint
                                         # exceeds 1.5× baseline on p50, p95, or p99
 ```
 
@@ -207,7 +207,7 @@ cd benchmark && ./perf-gate.sh          # Hermit-only; fails if any sentinel end
 baseline file, with `suite/gate.py` as the ONE comparator (also driven by
 `suite/run.sh gate` over the merged parity+perf record). Re-`./perf-gate.sh --rebaseline`
 at each release and after any *intended* perf change so only unintended slowdowns trip it.
-All three percentiles gate (tail regressions are what users feel). See `benchmark/README.md`.
+All three percentiles gate (tail regressions are what users feel). See `suite/README.md` + `suite/perf/README.md`.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

@@ -16,8 +16,8 @@
 # each extra size costs ~1 min, not a rescan.
 set -euo pipefail
 cd "$(dirname "$0")"
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env
 
 POOL_SIZES=${POOL_SIZES:-"4 8 16 32 64"}

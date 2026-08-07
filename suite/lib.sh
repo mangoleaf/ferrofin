@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # suite/lib.sh — the ONE copy of the Hermit↔Jellyfin bring-up (Plan 6, fixes M6 + M7).
-# Sourced, never executed. Every caller cd's into benchmark/ first (fixtures/, gen-fixtures.sh,
+# Sourced, never executed. Every caller cd's into suite/perf/ first (fixtures/, gen-fixtures.sh,
 # docker-compose.yml all live there); these functions assume that cwd.
 #
 # M7 gotchas encoded here so they can't rot back into tribal knowledge:
@@ -11,7 +11,7 @@
 #   - suite_guard_no_probe refuses a probe while a measured k6 phase is running (would perturb it).
 
 # Load an env file (default .env), auto-exporting every value, seeding from .env.example once.
-suite_load_env() {  # $1=env file (relative to benchmark/), default .env
+suite_load_env() {  # $1=env file (relative to suite/perf/), default .env
   local envf="${1:-.env}"
   [ -f "$envf" ] || cp .env.example "$envf"
   set -a

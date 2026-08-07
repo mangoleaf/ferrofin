@@ -1,5 +1,5 @@
 """JSON deep-diff for the Layer-2 read differential — a faithful port of
-benchmark/parity-diff.js (kept in sync so the k6 and Python engines agree).
+the retired k6 diff engine (benchmark/parity-diff.js), now the single diff implementation.
 
 diff() walks two trees and buckets differences into mismatch/missing/extra.
 Arrays are matched by a stable key (Path > Name > Id), not index, so two

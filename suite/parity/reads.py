@@ -228,10 +228,10 @@ def main():
     hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL", "http://localhost:18097")
     rows, npairs = run(hermit, jellyfin)
-    out = {"generated_by": "parity/reads.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
+    out = {"generated_by": "suite/parity/reads.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "correlated_items": npairs, "rows": rows}
-    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "parity/reads-results.json"), "w") as f:
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                          "suite/parity/reads-results.json"), "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
         f.write("\n")
     ok = sum(1 for v in rows.values() if v["deep_verified"] is True)
@@ -257,7 +257,7 @@ def selfcheck():
     # every op key is a canonical METHOD /path
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
         "contracts/jellyfin-openapi-*.json")))[-1]))
     valid = {f"GET {p}" for p in spec["paths"]}
     bad = [ep["op"] for ep in READS if ep["op"] not in valid]

@@ -14,8 +14,8 @@ peak() { awk '{if($1+0>m)m=$1+0} END{printf "%.0f", m}' "$1" 2>/dev/null || echo
 # Tests source this file to get the helpers, then stop here before running a benchmark.
 if [ -n "${BENCH_TEST_SOURCE:-}" ]; then return 0; fi
 
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env .env
 suite_mint_device_id run
 
@@ -93,8 +93,8 @@ bench() {  # $1=service $2=port $3=TARGET
   # "fast because the body went hollow/differently-shaped" at bench time.
   # (Comparing against the parity pass false-flagged ~25 ops: parity's write
   # journeys leave play-state fields the fresh perf scan legitimately lacks.)
-  mkdir -p ../suite/results/raw
-  python3 ../suite/fingerprint.py capture "$base" "../suite/results/raw/perf-fingerprints-$target.json" "$ctok" "$cuid" || true
+  mkdir -p ../results/raw
+  python3 ../fingerprint.py capture "$base" "../results/raw/perf-fingerprints-$target.json" "$ctok" "$cuid" || true
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 

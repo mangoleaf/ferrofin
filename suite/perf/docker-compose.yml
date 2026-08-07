@@ -1,10 +1,13 @@
 # Both servers, identical resource caps, same read-only fixture library.
 # run.sh brings them up ONE AT A TIME (never concurrently — contention corrupts both).
+# Explicit project name: the folder moved once already (benchmark/ → suite/perf/) and the
+# directory-derived default orphans old containers/volumes on rename.
+name: hermit-bench
 services:
   hermit:
     build:
-      context: ..
-      dockerfile: benchmark/Dockerfile.hermit
+      context: ../..
+      dockerfile: suite/perf/Dockerfile.hermit
     image: hermit-bench:local
     cpus: ${BENCH_CPUS}
     mem_limit: ${BENCH_MEM}

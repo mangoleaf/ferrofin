@@ -367,7 +367,7 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
 /// contention signal — how many are checked out. Under load, `in_use` pinned at
 /// the pool cap means requests are queueing on connection acquisition, not on
 /// query work (the diagnosis behind the pool-size default; see
-/// `benchmark/pool-sweep.sh`).
+/// `suite/perf/pool-sweep.sh`).
 fn spawn_pool_sampler(db: &Database) {
     let pool = db.pool().clone();
     tokio::spawn(async move {

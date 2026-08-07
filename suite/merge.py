@@ -3,10 +3,10 @@
 
 Reads, all at a single Hermit SHA:
   - suite/registry.json          variant id → contract operation (the join key, M1)
-  - parity/ledger.json           per-op parity depth + deep_verified + classification
+  - suite/parity/ledger.json           per-op parity depth + deep_verified + classification
   - perf (per variant latencies), from EITHER
-        benchmark/results/raw/{hermit,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
-        or the latest entry of benchmark/bench-data.json       (fallback)
+        suite/perf/results/raw/{hermit,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
+        or the latest entry of suite/perf/bench-data.json       (fallback)
   - suite/results/raw/perf-fingerprints-{hermit,jellyfin}.json (optional, mid-run honesty check)
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
@@ -33,13 +33,13 @@ RAW = RESULTS / "raw"
 
 
 def bench_env(key):
-    """os.environ, else benchmark/.env — merge often runs without the bench env
+    """os.environ, else suite/perf/.env — merge often runs without the bench env
     sourced, and the comparability guard keys on cpus/mem/load, so a silent
     None here would let incomparable runs look comparable."""
     if os.environ.get(key):
         return os.environ[key]
     try:
-        for line in (ROOT / "benchmark" / ".env").read_text().splitlines():
+        for line in (SUITE / "perf" / ".env").read_text().splitlines():
             line = line.strip()
             if line.startswith(f"{key}="):
                 return line.split("=", 1)[1].strip() or None
@@ -65,7 +65,7 @@ def variant_to_op():
 
 
 def parity_by_op():
-    led = load_json(ROOT / "parity" / "ledger.json", {"operations": []})
+    led = load_json(SUITE / "parity" / "ledger.json", {"operations": []})
     return {r["operation"]: r for r in led["operations"]}
 
 
@@ -73,7 +73,7 @@ def footprint():
     """Cold-start / peak-RSS / item-count per server from run.sh's raw files,
     when the perf leg was a full `run.sh` (the phase scripts don't write them).
     All-None when absent — the viewer just omits the footprint line."""
-    raw = ROOT / "benchmark" / "results" / "raw"
+    raw = SUITE / "perf" / "results" / "raw"
 
     def read1(name):
         p = raw / name
@@ -116,8 +116,8 @@ def footprint():
 
 def perf_by_variant():
     """{variant: {h_p50,h_p95,h_p99,h_rps,h_ok, j_*}} from raw summaries, else bench-data latest."""
-    h = load_json(RAW.parent.parent.parent / "benchmark/results/raw/hermit-summary.json")
-    j = load_json(RAW.parent.parent.parent / "benchmark/results/raw/jellyfin-summary.json")
+    h = load_json(SUITE / "perf/results/raw/hermit-summary.json")
+    j = load_json(SUITE / "perf/results/raw/jellyfin-summary.json")
     if h and j:
         out = {}
         for name, hv in h.get("endpoints", {}).items():
@@ -129,7 +129,7 @@ def perf_by_variant():
                 "j_rps": jv.get("rps"), "j_ok": jv.get("okPct"),
             }
         return out, "raw-summary"
-    bd = load_json(ROOT / "benchmark" / "bench-data.json")
+    bd = load_json(SUITE / "perf" / "bench-data.json")
     if bd and bd.get("versions"):
         latest = bd["versions"][-1]
         out = {e["name"]: {
@@ -148,7 +148,7 @@ def fixture_hash():
     (unreachable from here). Upgrade: hash a manifest emitted by gen-fixtures.sh for real dirs too."""
     h = hashlib.sha256()
     h.update((os.environ.get("LIBRARIES", "") + "\n").encode())
-    media = ROOT / "benchmark" / "fixtures" / "media"
+    media = SUITE / "perf" / "fixtures" / "media"
     if media.is_dir():
         for f in sorted(media.rglob("*")):
             if f.is_file():

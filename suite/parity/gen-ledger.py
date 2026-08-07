@@ -25,7 +25,7 @@ import sys
 from collections import defaultdict
 
 METHODS = ("get", "post", "put", "delete", "patch", "head")
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def norm(method, path):
@@ -66,7 +66,7 @@ def load_overlay(path):
 
 
 def load_seed():
-    seed_path = os.path.join(ROOT, "parity/seed.json")
+    seed_path = os.path.join(ROOT, "suite/parity/seed.json")
     if not os.path.exists(seed_path):
         return {}, None
     seed = json.load(open(seed_path))
@@ -88,7 +88,7 @@ def load_layer2(filename):
 
 
 def load_sweep():
-    path = os.path.join(ROOT, "parity/sweep-results.json")
+    path = os.path.join(ROOT, "suite/parity/sweep-results.json")
     if not os.path.exists(path):
         return {}
     rows = json.load(open(path))["rows"]
@@ -180,12 +180,12 @@ def build_curated():
     """Merge curated deep-verification: seed.json (reads) + journey-results.json (writes),
     each row carrying its own last_verified stamp."""
     seed, seed_stamp = load_seed()
-    reads, r_stamp = load_layer2("parity/reads-results.json")
-    journeys, j_stamp = load_layer2("parity/journey-results.json")
-    accepted, a_stamp = load_layer2("parity/classifications.json")
+    reads, r_stamp = load_layer2("suite/parity/reads-results.json")
+    journeys, j_stamp = load_layer2("suite/parity/journey-results.json")
+    accepted, a_stamp = load_layer2("suite/parity/classifications.json")
     sweep = load_sweep()
     sweep_stamp = None
-    sp = os.path.join(ROOT, "parity/sweep-results.json")
+    sp = os.path.join(ROOT, "suite/parity/sweep-results.json")
     if os.path.exists(sp):
         sweep_stamp = json.load(open(sp)).get("last_verified")
     # Precedence: static seed < sweep single-item diff < live curated read diff < write journeys
@@ -204,7 +204,7 @@ def build_curated():
     # Layer-3 binary/asset differential (image/font/css): a live property/effect verdict for
     # the ops that return non-JSON bodies, applied like the other live layers so a curated
     # accepted-divergence classification can still override its auto-flag below.
-    assets, as_stamp = load_layer2("parity/asset-results.json")
+    assets, as_stamp = load_layer2("suite/parity/asset-results.json")
     for k, v in assets.items():
         curated[k] = {**v, "last_verified": as_stamp}
     # Curated accepted-divergence classifications win the classification field over the auto
@@ -243,10 +243,10 @@ def main():
     overlay = load_overlay(classify_path)
     rows = build_rows(spec, real, overlay, curated, sweep)
 
-    with open(os.path.join(ROOT, "parity/ledger.json"), "w") as f:
+    with open(os.path.join(ROOT, "suite/parity/ledger.json"), "w") as f:
         json.dump({"operations": rows}, f, indent=2)
         f.write("\n")
-    with open(os.path.join(ROOT, "parity/LEDGER.md"), "w") as f:
+    with open(os.path.join(ROOT, "suite/parity/LEDGER.md"), "w") as f:
         f.write(render_md(rows))
 
     deep = sum(1 for r in rows if r["deep_verified"] is True)

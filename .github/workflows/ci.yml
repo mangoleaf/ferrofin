@@ -44,7 +44,7 @@ jobs:
         run: |
           base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           if git diff --name-only "$base" HEAD | grep -qE \
-            '^(crates/hermit-(core|db|api)/|benchmark/|suite/)'; then
+            '^(crates/hermit-(core|db|api)/|suite/)'; then
             echo "relevant=1" >> "$GITHUB_OUTPUT"
           else
             echo "perf-gate: no perf-relevant paths touched — skipping"
@@ -64,17 +64,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Perf leg dir: suite/perf today; the merge-base tree may predate the consolidation.
+          legdir() { if [ -d "$1/suite/perf" ]; then echo "$1/suite/perf"; else echo "$1/benchmark"; fi; }
           # Synthetic-only fixture env, identical for both legs.
-          mk_env() { printf 'JELLYFIN_IMAGE=jellyfin/jellyfin:10.11.8\nBENCH_CPUS=2\nBENCH_MEM=3g\nREAL_MEDIA_DIR=\nREAL_TV_DIR=\nFIXTURE_MOVIES=300\nFIXTURE_SERIES=0\nFIXTURE_EPISODES_PER_SERIES=10\nBENCH_VUS=50\nBENCH_DURATION=30s\nBENCH_WARMUP_SECONDS=10\nBENCH_ADMIN_USER=bench\nBENCH_ADMIN_PASSWORD=benchpass123\nRUN_TRANSCODE=0\n' > "$1/benchmark/.env"; }
+          mk_env() { printf 'JELLYFIN_IMAGE=jellyfin/jellyfin:10.11.8\nBENCH_CPUS=2\nBENCH_MEM=3g\nREAL_MEDIA_DIR=\nREAL_TV_DIR=\nFIXTURE_MOVIES=300\nFIXTURE_SERIES=0\nFIXTURE_EPISODES_PER_SERIES=10\nBENCH_VUS=50\nBENCH_DURATION=30s\nBENCH_WARMUP_SECONDS=10\nBENCH_ADMIN_USER=bench\nBENCH_ADMIN_PASSWORD=benchpass123\nRUN_TRANSCODE=0\n' > "$(legdir "$1")/.env"; }
           base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           git worktree add /tmp/base-tree "$base"
           mk_env /tmp/base-tree
           # Reuse the PR tree's generated fixtures for both legs (identical library).
-          (cd /tmp/base-tree/benchmark && ln -sfn "$GITHUB_WORKSPACE/benchmark/fixtures" fixtures || true)
-          (cd /tmp/base-tree/benchmark && ./perf-gate.sh --rebaseline)
+          (cd "$(legdir /tmp/base-tree)" && ln -sfn "$GITHUB_WORKSPACE/suite/perf/fixtures" fixtures || true)
+          (cd "$(legdir /tmp/base-tree)" && ./perf-gate.sh --rebaseline)
           mk_env "$GITHUB_WORKSPACE"
           cp /tmp/base-tree/suite/perf-baseline.json suite/perf-baseline.json
-          (cd benchmark && ./perf-gate.sh)
+          (cd suite/perf && ./perf-gate.sh)
 
   coverage:
     runs-on: ubuntu-latest

@@ -8,8 +8,8 @@
 #   PHASE_D_VUS=8 PHASE_D_DUR=120s     knobs (defaults shown)
 set -euo pipefail
 cd "$(dirname "$0")"
-# shellcheck source=../suite/lib.sh
-source ../suite/lib.sh
+# shellcheck source=../lib.sh
+source ../lib.sh
 suite_load_env
 . ./_phase-common.sh
 mkdir -p results/raw

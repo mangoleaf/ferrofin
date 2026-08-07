@@ -7,12 +7,12 @@ requirement — median-only gating hides tail regressions). Two input shapes,
 one baseline file (this directory's perf-baseline.json, sections `raw` and
 `merged`):
 
-Raw capture mode — driven by benchmark/perf-gate.sh, which runs k6 per
+Raw capture mode — driven by suite/perf/perf-gate.sh, which runs k6 per
 sentinel endpoint into results/raw/perfgate-hermit-<name>.json (CWD-relative,
-the runner cd's into benchmark/):
+the runner cd's into suite/perf/):
 
-  python3 ../suite/gate.py compare-raw    <baselineFile> <factor> <name...>
-  python3 ../suite/gate.py rebaseline-raw <baselineFile> <vus> <secs> <name...>
+  python3 ../gate.py compare-raw    <baselineFile> <factor> <name...>
+  python3 ../gate.py rebaseline-raw <baselineFile> <vus> <secs> <name...>
 
 compare-raw prints a before/after table (all three percentiles) to STDERR and
 the space-separated regressed endpoint names to STDOUT — the runner re-runs
@@ -70,7 +70,7 @@ def classify(base, cur, factor, min_delta_ms=0.0):
     return tripped
 
 
-# ── raw capture mode (benchmark/perf-gate.sh) ────────────────────────────────
+# ── raw capture mode (suite/perf/perf-gate.sh) ────────────────────────────────
 
 def _load_raw(name):
     try:

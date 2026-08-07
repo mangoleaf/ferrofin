@@ -201,7 +201,7 @@ impl Database {
 /// ## Why pool ≈ cores is right in BOTH load regimes (measured, 2026-08-03)
 ///
 /// SQLite reads on a page-cached library are CPU-bound, so the two candidate
-/// regimes were measured with `benchmark/pool-sweep.sh` (50-VU mixed lockstep
+/// regimes were measured with `suite/perf/pool-sweep.sh` (50-VU mixed lockstep
 /// over all 83 read endpoints, 4-CPU container, sizes 4→64, order-reversed
 /// control run to exclude cumulative-state confounds):
 ///
@@ -219,9 +219,9 @@ impl Database {
 ///   seconds each convoyed the 4-slot queue into 19 s p50s). Fix the slow
 ///   queries, not the pool: with uniform-ish job sizes, pool = cores wins.
 ///
-/// Re-derive with `benchmark/pool-sweep.sh` before changing this; do not
+/// Re-derive with `suite/perf/pool-sweep.sh` before changing this; do not
 /// resize from single-endpoint (or polluted-host) evidence. Raw curves:
-/// `benchmark/results/pool-sweep-c11f1ce.json`.
+/// `suite/perf/results/pool-sweep-c11f1ce.json`.
 fn default_pool_size() -> u32 {
     let affinity = std::thread::available_parallelism()
         .ok()

@@ -2,7 +2,7 @@
 """Generate suite/registry.json — the single join key between parity and perf (Plan 6, M1/M3).
 
 Every benchmark variant is a parameterization of one contract operation. This reads the
-existing bench endpoint list (benchmark/bench-lib.js `ENDPOINTS`) and the vendored OpenAPI
+existing bench endpoint list (suite/perf/bench-lib.js `ENDPOINTS`) and the vendored OpenAPI
 spec, and emits a registry keyed by operation ("GET /Items/Filters2") with bench variants
 under it. Run once to (re)generate; the committed registry.json is the source of truth after
 that (variant ids are permanent trend keys — see registry_selftest.py). Re-running only adds
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCH_LIB = ROOT / "benchmark" / "bench-lib.js"
+BENCH_LIB = ROOT / "suite" / "perf" / "bench-lib.js"
 SPEC = next((ROOT / "contracts").glob("jellyfin-openapi-*.json"))
 OUT = Path(__file__).resolve().parent / "registry.json"
 
