@@ -19,6 +19,7 @@ use std::sync::Arc;
 use hermit_core::{HermitTaskManager, PluginConfigPage, RegisteredPlugin, ScheduledTask};
 use hermit_traits::library::LibraryManager;
 use hermit_traits::media_segments::MediaSegmentManager;
+use hermit_traits::merge_versions::MergeVersionsManager;
 use hermit_traits::plugins::{PluginDescriptor, PluginManager};
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ use crate::fingerprint::Fingerprinter;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
+pub mod merge_versions;
 
 /// The collaborators an extension's tasks are allowed to touch (trait objects
 /// only, so extensions stay decoupled from the concrete managers).
@@ -43,6 +45,9 @@ pub struct ExtensionContext {
     pub fingerprinter: Option<Arc<dyn Fingerprinter>>,
     /// Root for per-extension caches (fingerprints): `{cache}/extensions`.
     pub cache_dir: PathBuf,
+    /// Bulk merge/split of duplicate versions — the Merge Versions extension's
+    /// service, shared by its scheduled tasks and the `/MergeVersions/*` routes.
+    pub merge_versions: Arc<dyn MergeVersionsManager>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -72,6 +77,7 @@ pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
     vec![
         Arc::new(intro_skipper::IntroSkipperExtension::new()),
         Arc::new(file_transformation::FileTransformationExtension),
+        Arc::new(merge_versions::MergeVersionsExtension),
     ]
 }
 

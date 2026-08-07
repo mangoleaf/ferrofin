@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>TMDb Box Sets</title>
+</head>
+
+<body>
+    <div data-role="page" class="page type-interior pluginConfigurationPage tbsConfigurationPage"
+        data-require="emby-input,emby-button">
+        <div data-role="content">
+            <div class="content-primary">
+                <form class="tbsConfigurationPage">
+                    <div class="sectionTitleContainer flex align-items-center">
+                        <h2 class="sectionTitle">Merge Versions</h2>
+                        <a is="emby-linkbutton" class="raised button-alt headerHelpButton emby-button" target="_blank"
+                            href="https://github.com/danieladov/jellyfin-plugin-mergeversions">Help</a>
+                    </div>
+                    <div class="verticalSection">
+                        <p>This plugin relies on the TMDb provider
+                            Please make sure it is enabled!</p>
+                        <br />
+                    </div>
+                    <br />
+                    <div>
+                        <h3 class="checkboxListLabel">Select paths to exclude from merging:</h3>
+                        <div id="divTraktLocations" class="paperList checkboxList checkboxList-paperList">
+                        </div>
+                    </div>
+
+
+                    <button is="emby-button" type="button" class="raised button-submit block emby-button"
+                        id="refresh-library" onclick=save()><span>Save</span></button>
+
+                    <button is="emby-button" type="button" class="raised block" id="refresh-library"
+                        onclick=mergeMovies()><span>Merge All Movies</span></button>
+                    <button is="emby-button" type="button" class="raised block" id="split-library"
+                        onclick=splitMovies()><span>Split All Movies</span></button>
+                    <button is="emby-button" type="button" class="raised block" id="split-library"
+                        onclick=mergeEpisodes()><span>Merge All Episodes</span></button>
+                    <button is="emby-button" type="button" class="raised block" id="split-library"
+                        onclick=splitEpisodes()><span>Split All Episodes</span></button>
+                </form>
+            </div>
+        </div>
+
+
+        <script type="text/javascript">
+
+
+
+
+            var pluginId = "f21bbed8-3a97-4d8b-88b2-48aaa65427cb";
+
+
+            function mergeMovies() {
+                var request = {
+                    url: ApiClient.getUrl('MergeVersions/MergeMovies'),
+                    type: 'POST'
+                };
+
+                ApiClient.fetch(request).then(function () {
+                    Dashboard.alert("Merging Movies...");
+                }).catch(function () {
+                    Dashboard.alert({
+                        message: "Unexpected error occurred!"
+                    });
+                });
+            }
+
+            function mergeEpisodes() {
+                var request = {
+                    url: ApiClient.getUrl('MergeVersions/MergeEpisodes'),
+                    type: 'POST'
+                };
+
+                ApiClient.fetch(request).then(function () {
+                    Dashboard.alert("Merging Episodes...");
+                }).catch(function () {
+                    Dashboard.alert({
+                        message: "Unexpected error occurred!"
+                    });
+                });
+            }
+
+
+            function splitMovies() {
+                var request = {
+                    url: ApiClient.getUrl('MergeVersions/SplitMovies'),
+                    type: 'POST'
+                };
+                ApiClient.fetch(request).then(function () {
+                    Dashboard.alert("Splitting Movies");
+                }).catch(function () {
+                    Dashboard.alert({
+                        message: "Unexpected error occurred!"
+                    });
+                });
+            }
+
+            function splitEpisodes() {
+                var request = {
+                    url: ApiClient.getUrl('MergeVersions/SplitEpisodes'),
+                    type: 'POST'
+                };
+                ApiClient.fetch(request).then(function () {
+                    Dashboard.alert("Splitting Episodes");
+                }).catch(function () {
+                    Dashboard.alert({
+                        message: "Unexpected error occurred!"
+                    });
+                });
+            }
+            var config = undefined;
+
+            ApiClient.getPluginConfiguration(pluginId).then(function (savedConfig) {
+                config = savedConfig;
+
+                if (!config) {
+                    config.LocationsExcluded = [];
+                }
+
+                ApiClient.getVirtualFolders().then(function (virtualFolders) {
+                    loadVirtualFolders(config, virtualFolders);
+                });
+
+
+            });
+
+
+
+
+
+
+
+
+            function loadVirtualFolders(config, virtualFolders) {
+                var page = $.mobile.activePage;
+                var html = "";
+                html += '<div data-role="controlgroup">';
+                for (var i = 0, length = virtualFolders.length; i < length; i++) {
+                    var virtualFolder = virtualFolders[i];
+                    html += getFolderHtml(config, virtualFolder, i);
+                }
+                html += '</div>';
+                $('#divTraktLocations', page).html(html).trigger('create');
+
+            }
+
+            function getFolderHtml(currentUserConfig, virtualFolder, index) {
+                var html = "";
+                for (var i = 0, length = virtualFolder.Locations.length; i < length; i++) {
+                    var id = "chkFolder" + index + "_" + i;
+                    var location = virtualFolder.Locations[i];
+                    var isChecked = currentUserConfig.LocationsExcluded.filter(function (current) {
+                        return current.toLowerCase() == location.toLowerCase();
+                    }).length;
+                    var checkedAttribute = isChecked ? 'checked="checked"' : "";
+                    html += '<label><input is="emby-checkbox" class="chkLibrary" type="checkbox" data-mini="true" id="' + id + '" name="' + id + '" data-location="' + location + '" ' + checkedAttribute + ' /><span>' + location + " - " + virtualFolder.Name + '</span></label>';
+                }
+                return html;
+            }
+
+
+            function save() {
+                var folders = $('.chkLibrary:checked').map(function () {
+                    return this.getAttribute('data-location');
+                }).get();
+
+
+
+                ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                    config.LocationsExcluded = folders;
+                    ApiClient.updatePluginConfiguration(pluginId, config).then(function (res) {
+                        Dashboard.processPluginConfigurationUpdateResult(res);
+                    });
+                });
+
+
+            }
+
+            $('.traktConfigurationPage').on('pageinit', function () {
+                var page = this;
+                $('#traktConfigurationForm', page).on('submit', function () {
+                    save();
+                    return false;
+                });
+            });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        </script>
+    </div>
+</body>
+
+</html>

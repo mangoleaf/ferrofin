@@ -39,6 +39,13 @@ const FILE_TRANSFORMATION_REV: &str = "f4f01c361343c63b51fe7a69c6ea0625c4ad1852"
 /// Its dashboard assets — one static page, no web build step.
 const FILE_TRANSFORMATION_ASSETS: &[&str] = &["config.html"];
 
+/// The Merge Versions plugin repository.
+const MERGE_VERSIONS_REPO: &str = "https://github.com/danieladov/jellyfin-plugin-mergeversions.git";
+/// The pinned revision its vendored settings page is copied from (tag 12.0.0).
+const MERGE_VERSIONS_REV: &str = "e6f58d63eb600ba57a4b578e2a29cd745d7c6834";
+/// Its dashboard assets — one static page, no web build step.
+const MERGE_VERSIONS_ASSETS: &[&str] = &["configurationpage.html"];
+
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_REFRESH_PLUGIN_ASSETS");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -60,6 +67,14 @@ fn main() {
         "filetransformation",
         FILE_TRANSFORMATION_ASSETS,
         build_file_transformation_assets,
+    );
+    vendor_plugin_assets(
+        &manifest,
+        &out_dir,
+        refresh,
+        "mergeversions",
+        MERGE_VERSIONS_ASSETS,
+        build_merge_versions_assets,
     );
 }
 
@@ -171,6 +186,45 @@ fn build_file_transformation_assets(out_dir: &Path, staged: &Path, vendored: &Pa
         .join("Configuration");
     fs::create_dir_all(vendored).expect("create vendored asset dir");
     for asset in FILE_TRANSFORMATION_ASSETS {
+        let src = built.join(asset);
+        assert!(src.is_file(), "plugin repo is missing {}", src.display());
+        fs::copy(&src, staged.join(asset))
+            .unwrap_or_else(|e| panic!("stage plugin asset {asset}: {e}"));
+        fs::copy(&src, vendored.join(asset))
+            .unwrap_or_else(|e| panic!("vendor plugin asset {asset}: {e}"));
+    }
+}
+
+/// Clones the Merge Versions repo at the pinned rev and installs its static
+/// settings page into the staged (`OUT_DIR`) and vendored (`assets/`) dirs — a
+/// fetch + copy, since the page has no web build step.
+fn build_merge_versions_assets(out_dir: &Path, staged: &Path, vendored: &Path) {
+    let clone = out_dir.join("merge-versions-src");
+    if clone.exists() {
+        fs::remove_dir_all(&clone).expect("clear stale plugin clone");
+    }
+    fs::create_dir_all(&clone).expect("create plugin clone dir");
+
+    run("git", &["init", "-q"], &clone);
+    run(
+        "git",
+        &[
+            "fetch",
+            "-q",
+            "--depth",
+            "1",
+            MERGE_VERSIONS_REPO,
+            MERGE_VERSIONS_REV,
+        ],
+        &clone,
+    );
+    run("git", &["checkout", "-q", "FETCH_HEAD"], &clone);
+
+    let built = clone
+        .join("Jellyfin.Plugin.MergeVersions")
+        .join("Configuration");
+    fs::create_dir_all(vendored).expect("create vendored asset dir");
+    for asset in MERGE_VERSIONS_ASSETS {
         let src = built.join(asset);
         assert!(src.is_file(), "plugin repo is missing {}", src.display());
         fs::copy(&src, staged.join(asset))

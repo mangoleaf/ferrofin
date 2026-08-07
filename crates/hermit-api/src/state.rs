@@ -176,6 +176,13 @@ pub struct Inner {
     /// [`AppState::with_playback_metrics`]; while unset decisions are simply
     /// not recorded (recording is observability, never load-bearing).
     pub playback_metrics: Option<Arc<dyn hermit_traits::metrics::PlaybackMetrics>>,
+
+    /// The Merge Versions extension's bulk merge/split service backing the
+    /// `/MergeVersions/*` routes. `None` until the composition root wires it
+    /// via [`AppState::with_merge_versions`]; while unset those routes report
+    /// the plugin unavailable (`404`, like a Jellyfin server without the
+    /// plugin's controller).
+    pub merge_versions: Option<Arc<dyn hermit_traits::merge_versions::MergeVersionsManager>>,
 }
 
 /// The shared application state passed to every axum handler as
@@ -256,6 +263,7 @@ impl AppState {
             live_tv: None,
             file_transformations: None,
             playback_metrics: None,
+            merge_versions: None,
             music,
             similar_items,
             search,
@@ -504,6 +512,26 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_playback_metrics must be called before the state is shared");
         inner.playback_metrics = Some(playback_metrics);
+        self
+    }
+
+    /// Wires the Merge Versions extension's bulk merge/split service.
+    ///
+    /// [`new`](Self::new) leaves it unset (the `/MergeVersions/*` routes report
+    /// the plugin unavailable); the composition root calls this with the
+    /// `hermit-extensions` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_merge_versions(
+        mut self,
+        merge_versions: Arc<dyn hermit_traits::merge_versions::MergeVersionsManager>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_merge_versions must be called before the state is shared");
+        inner.merge_versions = Some(merge_versions);
         self
     }
 

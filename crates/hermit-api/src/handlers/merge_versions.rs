@@ -1,36 +1,54 @@
 //! `MergeVersionsController` — bulk merge/split of duplicate video versions.
 //!
-//! Ports the `MergeVersions` plugin's library-wide operations onto the core
-//! [`LibraryManager`](hermit_traits::library::LibraryManager) version-group seam
-//! (`PrimaryVersionId` pointer) that already backs `POST /Videos/MergeVersions`:
+//! The HTTP seam of the **Merge Versions extension**
+//! (`hermit-extensions::merge_versions`, upstream
+//! `jellyfin-plugin-mergeversions` 12.0). Everything else — the scans, the
+//! eligibility filters, the config, the scheduled tasks, the settings page —
+//! lives with the extension; these handlers are the thin `[Authorize]` seam
+//! over the [`MergeVersionsManager`] trait:
 //! - `POST /MergeVersions/MergeMovies` — merge every duplicate movie (by `Tmdb` id)
 //! - `POST /MergeVersions/SplitMovies` — split every merged movie apart
 //! - `POST /MergeVersions/MergeEpisodes` — merge every duplicate episode
 //! - `POST /MergeVersions/SplitEpisodes` — split every merged episode apart
 //!
-//! The plugin's routes take no parameters: each scans the whole library. The
-//! grouping/merge logic lives in the manager (see its `merge_all_*` /
-//! `split_all_*` methods); these handlers are the thin `[Authorize]` seam and
-//! return `204 No Content` on success.
+//! The plugin's routes take no parameters (each scans the whole library) and
+//! return `204 No Content`. While the plugin is disabled — or the extension is
+//! not wired — they return `404`, the observable behavior of a Jellyfin server
+//! whose disabled plugin's controller is not registered.
+
+use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Router, extract::State};
 
+use hermit_traits::error::ServiceError;
+use hermit_traits::merge_versions::MergeVersionsManager;
+
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// Resolves the wired Merge Versions service, or the `404` an absent plugin
+/// controller produces.
+fn service(state: &AppState) -> Result<Arc<dyn MergeVersionsManager>, ApiError> {
+    state
+        .merge_versions
+        .clone()
+        .ok_or_else(|| ServiceError::not_found("the Merge Versions plugin is not available").into())
+}
+
 /// `POST /MergeVersions/MergeMovies` — merge every duplicate movie version.
 ///
 /// Port of `MergeVersionsController.MergeMoviesRequest`: delegates to
-/// [`LibraryManager::merge_all_movie_versions`](hermit_traits::library::LibraryManager::merge_all_movie_versions).
+/// [`MergeVersionsManager::merge_movies`].
 #[utoipa::path(
     post,
     path = "/MergeVersions/MergeMovies",
     responses(
         (status = 204, description = "Library scan and merge completed"),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Plugin disabled or not available")
     ),
     tag = "hermit"
 )]
@@ -38,20 +56,21 @@ async fn merge_movies(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
 ) -> Result<StatusCode, ApiError> {
-    state.library.merge_all_movie_versions().await?;
+    service(&state)?.merge_movies(None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /MergeVersions/SplitMovies` — split every merged movie apart.
 ///
 /// Port of `MergeVersionsController.SplitMoviesRequest`: delegates to
-/// [`LibraryManager::split_all_movie_versions`](hermit_traits::library::LibraryManager::split_all_movie_versions).
+/// [`MergeVersionsManager::split_movies`].
 #[utoipa::path(
     post,
     path = "/MergeVersions/SplitMovies",
     responses(
         (status = 204, description = "Library scan and split completed"),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Plugin disabled or not available")
     ),
     tag = "hermit"
 )]
@@ -59,20 +78,21 @@ async fn split_movies(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
 ) -> Result<StatusCode, ApiError> {
-    state.library.split_all_movie_versions().await?;
+    service(&state)?.split_movies(None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /MergeVersions/MergeEpisodes` — merge every duplicate episode version.
 ///
 /// Port of `MergeVersionsController.MergeEpisodesRequestAsync`: delegates to
-/// [`LibraryManager::merge_all_episode_versions`](hermit_traits::library::LibraryManager::merge_all_episode_versions).
+/// [`MergeVersionsManager::merge_episodes`].
 #[utoipa::path(
     post,
     path = "/MergeVersions/MergeEpisodes",
     responses(
         (status = 204, description = "Library scan and merge completed"),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Plugin disabled or not available")
     ),
     tag = "hermit"
 )]
@@ -80,20 +100,21 @@ async fn merge_episodes(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
 ) -> Result<StatusCode, ApiError> {
-    state.library.merge_all_episode_versions().await?;
+    service(&state)?.merge_episodes(None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /MergeVersions/SplitEpisodes` — split every merged episode apart.
 ///
 /// Port of `MergeVersionsController.SplitEpisodesRequestAsync`: delegates to
-/// [`LibraryManager::split_all_episode_versions`](hermit_traits::library::LibraryManager::split_all_episode_versions).
+/// [`MergeVersionsManager::split_episodes`].
 #[utoipa::path(
     post,
     path = "/MergeVersions/SplitEpisodes",
     responses(
         (status = 204, description = "Library scan and split completed"),
-        (status = 401, description = "Unauthorized")
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Plugin disabled or not available")
     ),
     tag = "hermit"
 )]
@@ -101,7 +122,7 @@ async fn split_episodes(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
 ) -> Result<StatusCode, ApiError> {
-    state.library.split_all_episode_versions().await?;
+    service(&state)?.split_episodes(None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

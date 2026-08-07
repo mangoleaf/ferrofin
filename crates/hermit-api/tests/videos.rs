@@ -271,8 +271,44 @@ impl MediaSourceManager for StreamSources {
 struct StreamLibrary {
     merged: Arc<Mutex<Vec<Vec<Uuid>>>>,
     removed: Arc<Mutex<Vec<Uuid>>>,
-    /// Names of the bulk `MergeVersions`-plugin ops invoked, in order.
+}
+
+/// A [`MergeVersionsManager`] recording which bulk op each route invoked.
+struct FakeMergeVersions {
+    /// Bulk `MergeVersions`-plugin ops invoked, in order.
     bulk: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl hermit_traits::merge_versions::MergeVersionsManager for FakeMergeVersions {
+    async fn merge_movies(
+        &self,
+        _progress: Option<hermit_traits::merge_versions::MergeProgress<'_>>,
+    ) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("merge_movies");
+        Ok(())
+    }
+    async fn split_movies(
+        &self,
+        _progress: Option<hermit_traits::merge_versions::MergeProgress<'_>>,
+    ) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("split_movies");
+        Ok(())
+    }
+    async fn merge_episodes(
+        &self,
+        _progress: Option<hermit_traits::merge_versions::MergeProgress<'_>>,
+    ) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("merge_episodes");
+        Ok(())
+    }
+    async fn split_episodes(
+        &self,
+        _progress: Option<hermit_traits::merge_versions::MergeProgress<'_>>,
+    ) -> Result<(), ServiceError> {
+        self.bulk.lock().unwrap().push("split_episodes");
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -286,22 +322,6 @@ impl LibraryManager for StreamLibrary {
     }
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.removed.lock().unwrap().push(item_id);
-        Ok(())
-    }
-    async fn merge_all_movie_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("merge_movies");
-        Ok(())
-    }
-    async fn split_all_movie_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("split_movies");
-        Ok(())
-    }
-    async fn merge_all_episode_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("merge_episodes");
-        Ok(())
-    }
-    async fn split_all_episode_versions(&self) -> Result<(), ServiceError> {
-        self.bulk.lock().unwrap().push("split_episodes");
         Ok(())
     }
     async fn query_items(
@@ -475,7 +495,6 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
     let library = StreamLibrary {
         merged: merged.clone(),
         removed: removed.clone(),
-        bulk: bulk.clone(),
     };
     let app = AppState::new(
         Arc::new(library),
@@ -512,7 +531,8 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
         Arc::new(hermit_api::test_support::FakeActivity),
         Arc::new(hermit_api::test_support::FakeFileSystem),
         Arc::new(hermit_api::test_support::FakeTasks),
-    );
+    )
+    .with_merge_versions(Arc::new(FakeMergeVersions { bulk: bulk.clone() }));
     Harness {
         app,
         merged,

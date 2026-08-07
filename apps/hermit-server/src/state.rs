@@ -521,12 +521,25 @@ pub async fn build_app_state(
                 ffmpeg.ffmpeg.to_string_lossy().into_owned(),
             )) as Arc<dyn hermit_extensions::fingerprint::Fingerprinter>
         });
+    // The Merge Versions extension's bulk merge/split service — shared by its
+    // scheduled tasks (via the context below) and the `/MergeVersions/*` routes
+    // (via `with_merge_versions` on the app state).
+    let merge_versions: Arc<dyn hermit_traits::merge_versions::MergeVersionsManager> = Arc::new(
+        hermit_extensions::merge_versions::MergeVersionsService::new(
+            Arc::clone(&item_repository) as Arc<_>,
+            Arc::clone(&item_persistence_service) as Arc<_>,
+            Arc::clone(&library),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&plugins),
+        ),
+    );
     let extension_cx = hermit_extensions::ExtensionContext {
         library: Arc::clone(&library),
         media_segments: Arc::clone(&media_segments),
         plugins: Arc::clone(&plugins),
         fingerprinter,
         cache_dir: config.cache_dir.join("extensions"),
+        merge_versions: Arc::clone(&merge_versions),
     };
     hermit_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
     let collections: Arc<dyn hermit_traits::collections::CollectionManager> =
@@ -868,6 +881,7 @@ pub async fn build_app_state(
         .with_sync_play(sync_play)
         .with_live_tv(live_tv)
         .with_file_transformations(Arc::clone(&file_transformations))
+        .with_merge_versions(merge_versions)
         .with_playback_metrics(playback_metrics);
 
     Ok(WiredApp {

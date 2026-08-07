@@ -401,6 +401,26 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Upserts one `(ProviderId, ProviderValue)` external-id row for an item
+    /// (`BaseItemProviders`) — the write path behind provider-id lookups such
+    /// as [`ItemRepository::get_items_with_provider_id`].
+    ///
+    /// The default is a no-op (for stub/fake services); the real service
+    /// replaces the item's existing row of the same provider key.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn save_provider_id(
+        &self,
+        item_id: Uuid,
+        provider: &str,
+        value: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, provider, value);
+        Ok(())
+    }
+
     /// Reattaches user-data rows to the correct item after an id change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 

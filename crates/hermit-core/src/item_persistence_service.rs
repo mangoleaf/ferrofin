@@ -191,6 +191,27 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         Ok(())
     }
 
+    async fn save_provider_id(
+        &self,
+        item_id: Uuid,
+        provider: &str,
+        value: &str,
+    ) -> Result<(), ServiceError> {
+        // One row per (item, provider key) — the table's primary key — so a
+        // re-save replaces the value (the C# `ProviderIds[key] = value` write).
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "BaseItemProviders"
+               ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(item_id.to_string())
+        .bind(provider)
+        .bind(value)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn save_item_values(
         &self,
         item_id: Uuid,
@@ -564,6 +585,36 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(remaining, 0, "all links should be cleared");
+    }
+
+    // A provider id round-trips through the repository's by-provider lookup,
+    // and a re-save for the same (item, key) replaces the value instead of
+    // stacking rows (the table's composite primary key).
+    #[tokio::test]
+    async fn save_provider_id_upserts_the_row() {
+        use hermit_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let svc = HermitItemPersistenceService::new(db.clone());
+        let repo = crate::item_repository::HermitItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+
+        svc.save_provider_id(movie, "Tmdb", "603")
+            .await
+            .expect("save");
+        svc.save_provider_id(movie, "Tmdb", "604")
+            .await
+            .expect("replace");
+
+        let rows = repo
+            .get_items_with_provider_id("Tmdb")
+            .await
+            .expect("lookup");
+        assert_eq!(rows, vec![(movie, "604".to_owned())]);
     }
 
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes

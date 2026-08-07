@@ -30,7 +30,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/hermit-core/src/device_manager.rs", 13),
     ("crates/hermit-core/src/display_preferences_manager.rs", 12),
     ("crates/hermit-core/src/dto_service.rs", 17),
-    ("crates/hermit-core/src/library_manager.rs", 9),
+    ("crates/hermit-core/src/library_manager.rs", 7),
     ("crates/hermit-core/src/library_scan.rs", 24),
     ("crates/hermit-core/src/linked_children_service.rs", 8),
     ("crates/hermit-core/src/lyric_manager.rs", 1),
