@@ -995,7 +995,14 @@ impl HermitDtoService {
         dto.run_time_ticks = item.run_time_ticks;
 
         if options.contains_field(ItemFields::SortName) {
-            dto.sort_name = item.sort_name.clone();
+            // C# `BaseItem.SortName` always derives from the name when no sort name
+            // is stored/forced. Hermit stores it for scanned items but not for
+            // by-name items (Genre/Studio/Person), so derive it here when empty.
+            dto.sort_name = item
+                .sort_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| item.name.as_deref().map(crate::resolvers::sort_name));
         }
         if options.contains_field(ItemFields::CustomRating) {
             dto.custom_rating = item.custom_rating.clone();
@@ -2709,6 +2716,11 @@ mod tests {
         assert_eq!(dto.is_folder, None, "by-name item is not a folder");
         assert_eq!(dto.can_delete, Some(false));
         assert_eq!(dto.can_download, Some(false));
+        assert_eq!(
+            dto.sort_name.as_deref(),
+            Some("drama"),
+            "SortName derives from the name when unstored (like C#)"
+        );
         assert!(
             dto.media_sources.is_none(),
             "by-name item has no media source; got {:?}",
