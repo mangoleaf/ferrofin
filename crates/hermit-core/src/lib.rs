@@ -198,6 +198,7 @@ pub mod session_bus;
 pub mod session_manager;
 pub mod session_websocket_listener;
 pub mod similar_items_manager;
+mod similar_items_repository;
 pub mod subtitle_manager;
 pub mod sync_play_manager;
 pub mod system_manager;

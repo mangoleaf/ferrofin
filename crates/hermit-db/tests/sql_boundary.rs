@@ -43,7 +43,6 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/hermit-core/src/scheduled_tasks/maintenance.rs", 7),
     ("crates/hermit-core/src/session_manager.rs", 1),
     ("crates/hermit-core/src/session_manager/tests.rs", 5),
-    ("crates/hermit-core/src/similar_items_manager.rs", 1),
     ("crates/hermit-core/src/subtitle_manager.rs", 3),
     ("crates/hermit-core/src/test_support.rs", 10),
     ("crates/hermit-core/src/trickplay_manager.rs", 7),
