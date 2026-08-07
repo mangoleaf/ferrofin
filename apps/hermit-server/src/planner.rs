@@ -673,8 +673,12 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
         // to the source's channel count and, when re-encoding, to the transcoding
         // profile's hard cap. `None` → no `-ac`, so the source channels pass
         // through (unchanged from before this resolution existed).
-        probe_state.output_audio_channels =
-            resolve_output_audio_channels(&probe_state, output_audio_codec.as_deref());
+        let audio_encoder = self.encoding_helper.audio_encoder(&probe_state);
+        probe_state.output_audio_channels = resolve_output_audio_channels(
+            &probe_state,
+            output_audio_codec.as_deref(),
+            &audio_encoder,
+        );
         probe_state.output_file_path = playlist_path.to_string_lossy().into_owned();
         probe_state.wait_for_path = Some(wait_for_path);
         let state = probe_state;
@@ -1182,11 +1186,23 @@ impl HermitStreamStatePlanner {
 /// The full C# method additionally imposes the encoder's 8-channel ceiling and a
 /// 3/5/7-channel HLS layout fix (adding an LFE channel); those are omitted —
 /// web/TV profiles cap at 2 or 6 channels, where neither branch fires.
-// ponytail: transcoder-8 ceiling + 3/5/7ch LFE HLS-layout normalization not
-// ported; add if a >8ch source or an odd explicit channel request surfaces.
+/// The per-encoder transcode channel ceiling. Port of Jellyfin's
+/// `_audioTranscodeChannelLookup`: lossy stereo-only encoders cap at 2, the
+/// surround codecs cap at 6 (5.1), and anything unlisted defaults to 8 to avoid
+/// asking ffmpeg for more channels than the encoder can emit. `libfdk_aac` at 6
+/// is why a 7.1 source lands at 5.1 rather than a raw `-ac 8`.
+fn audio_transcode_channel_limit(encoder: &str) -> i32 {
+    match encoder.to_ascii_lowercase().as_str() {
+        "libmp3lame" => 2,
+        "libfdk_aac" | "ac3" | "eac3" | "dca" | "mlp" | "truehd" => 6,
+        _ => 8,
+    }
+}
+
 fn resolve_output_audio_channels(
     state: &EncodingJobInfo,
     output_audio_codec: Option<&str>,
+    audio_encoder: &str,
 ) -> Option<i32> {
     let codec = output_audio_codec.unwrap_or_default();
     let mut result = state.requested_audio_channels(codec);
@@ -1198,10 +1214,30 @@ fn resolve_output_audio_channels(
     {
         result = Some(result.map_or(input, |r| r.min(input)));
     }
-    if !EncodingJobInfo::is_copy_codec(Some(codec))
-        && let Some(cap) = state.base_request.transcoding_max_audio_channels
-    {
-        result = Some(result.map_or(cap, |r| r.min(cap)));
+    if !EncodingJobInfo::is_copy_codec(Some(codec)) {
+        // Encoder ceiling (e.g. libfdk_aac → 6), then the client's explicit
+        // `TranscodingMaxAudioChannels` cap. Port of `GetNumAudioChannelsParam`.
+        let encoder_limit = audio_transcode_channel_limit(audio_encoder);
+        result = Some(result.map_or(encoder_limit, |r| r.min(encoder_limit)));
+        if let Some(cap) = state.base_request.transcoding_max_audio_channels
+            && cap < result.unwrap_or(i32::MAX)
+        {
+            result = Some(cap);
+        }
+
+        // HLS only carries 1/2/6(5.1)/8(7.1)ch layouts: ffmpeg can synthesize the
+        // LFE for 5→5.1 and 7→7.1; other odd layouts downmix to stereo (Apple HLS
+        // authoring spec). Progressive delivery is exempt.
+        if state.transcoding_type != TranscodingJobType::Progressive
+            && let Some(ch) = result
+            && ((ch > 2 && ch < 6) || ch == 7)
+        {
+            result = Some(match ch {
+                5 => 6,
+                7 => 8,
+                _ => 2,
+            });
+        }
     }
     result
 }
@@ -1524,6 +1560,31 @@ mod tests {
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
         assert_eq!(plan.segment_length_ms, 3000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    #[tokio::test]
+    async fn plan_caps_transcoded_audio_channels_to_encoder_ceiling() {
+        // A 7.1 (8ch) EAC3 the client can't take is re-encoded to AAC. libfdk_aac
+        // caps at 6ch (Jellyfin's `_audioTranscodeChannelLookup`), so the downmix
+        // lands at 5.1 (`-ac 6`) rather than a raw `-ac 8` passthrough.
+        let mut eac3 = audio_stream("eac3");
+        eac3.channels = Some(8);
+        let src = source("abc", vec![video_stream("h264"), eac3]);
+        let p = planner_full(vec![src], false, &["libfdk_aac"]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned()); // copy video, isolate the audio path
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ac", "6"]),
+            "7.1 must cap to the libfdk_aac ceiling of 6: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.windows(2).any(|w| w == ["-ac", "8"]),
+            "must not pass 8 channels through to a stereo-ish endpoint: {:?}",
+            plan.arguments
+        );
     }
 
     #[test]
