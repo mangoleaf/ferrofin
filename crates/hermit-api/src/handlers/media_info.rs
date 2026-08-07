@@ -386,6 +386,38 @@ fn apply_stream_decision(
     let container = hls_segment_container(stream.container.as_deref(), source);
     stream.container = Some(container.clone());
 
+    // The pin above invalidates a subtitle delivery method decided under the
+    // builder's DirectStream context (e.g. `Embed` — impossible in an HLS ts
+    // segment). Recompute it for the pinned Transcode+HLS state, exactly as the
+    // builder's own transcode branch would, so the `SubtitleMethod` baked into
+    // the transcoding URL agrees with the per-stream `DeliveryMethod` DTOs from
+    // `apply_subtitle_delivery`. When they disagreed the transcode burned the
+    // track in while the client also rendered the external VTT it was promised
+    // — the same subtitle twice on screen.
+    if let Some(index) = stream.subtitle_stream_index
+        && let Some(sub) = source
+            .media_streams
+            .iter()
+            .find(|s| {
+                s.stream_type == hermit_model::entities::MediaStreamType::Subtitle
+                    && s.index == index
+            })
+            .cloned()
+    {
+        let subtitle_profile = StreamBuilder::get_subtitle_profile(
+            source,
+            &sub,
+            &profile.subtitle_profiles,
+            PlayMethod::Transcode,
+            &support,
+            Some(container.as_str()),
+            Some(MediaStreamProtocol::hls),
+        );
+        stream.subtitle_delivery_method = subtitle_profile.method;
+        stream.subtitle_format.clone_from(&subtitle_profile.format);
+        stream.subtitle_codecs = subtitle_profile.format.clone().into_iter().collect();
+    }
+
     // Adopt the HLS transcoding profile's audio-channel cap. The builder can
     // label this a raw-copy DirectStream (video copied, incompatible audio left
     // to a container remux); Jellyfin would deliver that progressively over HTTP,
@@ -870,6 +902,131 @@ mod tests {
         assert_eq!(hls_segment_container(Some("ts"), &h264), "ts");
         assert_eq!(hls_segment_container(Some("mkv"), &h264), "ts");
         assert_eq!(hls_segment_container(None, &h264), "ts");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // one long fixture, one scenario
+    fn pinned_transcode_subtitle_method_agrees_between_url_and_dto() {
+        // The double-subtitle regression: the builder decides DirectStream and,
+        // in that context, an Embed subtitle delivery. `apply_stream_decision`
+        // pins the result to Transcode+HLS — where embedding in a ts segment is
+        // impossible — so it must recompute the delivery. With the stale Embed
+        // the transcoding URL carried `SubtitleStreamIndex&SubtitleMethod=Embed`
+        // (→ the planner burned the track in) while the per-stream DTO promised
+        // External with a DeliveryUrl (→ the client overlaid the VTT): the same
+        // subtitle rendered twice on screen.
+        use hermit_model::dlna::{DirectPlayProfile, SubtitleDeliveryMethod, SubtitleProfile};
+        use uuid::Uuid;
+
+        let mut source = MediaSourceInfo {
+            id: Some("src1".to_owned()),
+            path: Some("/media/movie.mkv".to_owned()),
+            container: Some("mkv".to_owned()),
+            bitrate: Some(5_000_000),
+            media_streams: vec![
+                MediaStream {
+                    codec: Some("h264".to_owned()),
+                    stream_type: MediaStreamType::Video,
+                    index: 0,
+                    ..MediaStream::default()
+                },
+                MediaStream {
+                    codec: Some("aac".to_owned()),
+                    stream_type: MediaStreamType::Audio,
+                    index: 1,
+                    ..MediaStream::default()
+                },
+                MediaStream {
+                    codec: Some("subrip".to_owned()),
+                    stream_type: MediaStreamType::Subtitle,
+                    index: 2,
+                    // As probing sets it for text subs — required for the
+                    // External srt→vtt conversion match.
+                    supports_external_stream: true,
+                    ..MediaStream::default()
+                },
+            ],
+            ..MediaSourceInfo::default()
+        };
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mkv".to_owned(),
+                video_codec: Some("h264".to_owned()),
+                audio_codec: Some("aac".to_owned()),
+                profile_type: DlnaProfileType::Video,
+            }],
+            transcoding_profiles: vec![TranscodingProfile {
+                container: "ts".to_owned(),
+                profile_type: DlnaProfileType::Video,
+                protocol: MediaStreamProtocol::hls,
+                video_codec: "h264".to_owned(),
+                audio_codec: "aac".to_owned(),
+                ..TranscodingProfile::default()
+            }],
+            subtitle_profiles: vec![
+                // Matches under the DirectStream context (embedded subrip in mkv)…
+                SubtitleProfile {
+                    format: Some("subrip".to_owned()),
+                    method: SubtitleDeliveryMethod::Embed,
+                    container: Some("mkv".to_owned()),
+                    ..SubtitleProfile::default()
+                },
+                // …but a ts HLS transcode can only deliver it externally.
+                SubtitleProfile {
+                    format: Some("vtt".to_owned()),
+                    method: SubtitleDeliveryMethod::External,
+                    ..SubtitleProfile::default()
+                },
+            ],
+            ..DeviceProfile::default()
+        };
+        // DirectPlay vetoed so the builder lands on DirectStream, which the
+        // handler pins to Transcode.
+        let flags = super::PlaybackFlags {
+            enable_direct_play: false,
+            ..super::PlaybackFlags::default()
+        };
+        let decision = super::apply_stream_decision(
+            &mut source,
+            &profile,
+            Uuid::from_u128(0xBEEF),
+            Some(20_000_000),
+            None,
+            None,
+            super::StreamSelection {
+                audio_stream_index: None,
+                subtitle_stream_index: Some(2),
+            },
+            "ps1",
+            flags,
+        )
+        .expect("a decision");
+        assert_eq!(decision.play_method, "Transcode");
+
+        let url = source.transcoding_url.as_deref().expect("a transcode URL");
+        let sub = source
+            .media_streams
+            .iter()
+            .find(|s| s.index == 2)
+            .expect("subtitle stream");
+        assert_eq!(
+            sub.delivery_method,
+            Some(SubtitleDeliveryMethod::External),
+            "ts HLS transcode delivers text subs externally"
+        );
+        assert!(
+            sub.delivery_url.is_some(),
+            "External delivery needs a DeliveryUrl"
+        );
+        // External delivery ⇒ the transcode must NOT be asked to burn it in.
+        assert!(
+            !url.contains("SubtitleStreamIndex"),
+            "URL must not carry the subtitle index when the client renders it: {url}"
+        );
+        assert!(
+            !url.contains("SubtitleMethod"),
+            "no stale SubtitleMethod on the URL: {url}"
+        );
     }
 
     #[test]

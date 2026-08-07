@@ -359,12 +359,35 @@ fn subtitle_stream(streams: &[MediaStream], index: Option<i32>) -> Option<MediaS
 /// The subtitle index rides in the transcode URL's query rather than a typed
 /// field on the request, so the planner parses it here.
 fn query_param_i32(query_string: &str, key: &str) -> Option<i32> {
+    query_param(query_string, key).and_then(|v| v.parse().ok())
+}
+
+/// Reads a raw query param value (case-insensitive key) from a `?a=b&c=d` string.
+fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
     query_string
         .trim_start_matches('?')
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .and_then(|(_, v)| v.parse().ok())
+        .map(|(_, v)| v)
+}
+
+/// Parses a `SubtitleMethod` query value (the names `StreamInfo::to_url` emits).
+fn parse_subtitle_method(value: &str) -> Option<SubtitleDeliveryMethod> {
+    let method = if value.eq_ignore_ascii_case("Encode") {
+        SubtitleDeliveryMethod::Encode
+    } else if value.eq_ignore_ascii_case("Embed") {
+        SubtitleDeliveryMethod::Embed
+    } else if value.eq_ignore_ascii_case("External") {
+        SubtitleDeliveryMethod::External
+    } else if value.eq_ignore_ascii_case("Hls") {
+        SubtitleDeliveryMethod::Hls
+    } else if value.eq_ignore_ascii_case("Drop") {
+        SubtitleDeliveryMethod::Drop
+    } else {
+        return None;
+    };
+    Some(method)
 }
 
 /// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `mp4`).
@@ -425,13 +448,19 @@ impl StreamStatePlanner for HermitStreamStatePlanner {
             default_stream(&media_source.media_streams, MediaStreamType::Video)
         };
         let audio_stream = default_stream(&media_source.media_streams, MediaStreamType::Audio);
-        // A subtitle named in the transcode URL is one the client wants delivered
-        // *by* the transcode (burned in) — text tracks it can fetch externally are
-        // not put here — so selecting one means Encode/burn-in.
+        // The transcode URL carries both the subtitle index and the negotiated
+        // delivery (`SubtitleMethod`, written by `StreamInfo::to_url`). Honour
+        // the method: only `Encode` burns the track into the video. Treating a
+        // bare index as burn-in doubled subtitles — the client rendered the
+        // external/embedded track the PlaybackInfo DTO promised it, on top of
+        // the burn-in. An absent method with an index means Encode (the C#
+        // enum default).
         let subtitle_index = query_param_i32(&request.query_string, "SubtitleStreamIndex");
         let subtitle_stream = subtitle_stream(&media_source.media_streams, subtitle_index);
         let subtitle_delivery_method = if subtitle_stream.is_some() {
-            SubtitleDeliveryMethod::Encode
+            query_param(&request.query_string, "SubtitleMethod")
+                .and_then(parse_subtitle_method)
+                .unwrap_or(SubtitleDeliveryMethod::Encode)
         } else {
             SubtitleDeliveryMethod::Hls
         };
@@ -1225,8 +1254,11 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
-    // subtitled and non-subtitled transcode of the same item would collide.
+    // subtitled and non-subtitled transcode of the same item would collide. The
+    // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
+    // produces different video.
     query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
+    query_param(&request.query_string, "SubtitleMethod").hash(&mut hasher);
     segment_container.hash(&mut hasher);
     is_audio.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -1741,6 +1773,63 @@ mod tests {
             "no subtitle selected → no burn filter: {:?}",
             plan.arguments
         );
+    }
+
+    #[tokio::test]
+    async fn plan_honors_non_encode_subtitle_method_no_burn() {
+        // A `SubtitleMethod` other than Encode on the URL means the client
+        // renders the track itself (external VTT / embedded); burning it in
+        // anyway put the same subtitle on screen twice.
+        for method in ["Embed", "External", "Hls", "Drop"] {
+            let src = source(
+                "abc",
+                vec![
+                    video_stream("hevc"),
+                    audio_stream("aac"),
+                    subtitle_stream("subrip", 2),
+                ],
+            );
+            let p = planner(vec![src]);
+            let mut req = request("abc");
+            req.query_string = format!("?SubtitleStreamIndex=2&SubtitleMethod={method}");
+            let plan = p.plan(&req, false, Some(0)).await.unwrap();
+            assert!(
+                !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+                "SubtitleMethod={method} must not burn: {:?}",
+                plan.arguments
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_explicit_subtitle_method_encode_burns() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Encode".to_owned();
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("subtitles=f='/media/movie.mkv':si=0"),
+            "explicit Encode must burn: {args}"
+        );
+    }
+
+    #[test]
+    fn output_id_keys_on_subtitle_method() {
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Encode".to_owned();
+        let encode = output_id(&req, "ts", false);
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Embed".to_owned();
+        let embed = output_id(&req, "ts", false);
+        assert_ne!(encode, embed, "burn vs no-burn must not share cache files");
     }
 
     #[test]
