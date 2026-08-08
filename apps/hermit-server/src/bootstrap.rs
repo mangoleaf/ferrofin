@@ -1048,6 +1048,7 @@ mod tests {
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
             fanart_personal_api_key: String::new(),
+            musicbrainz_base_url: String::new(),
             ffmpeg_path: ffmpeg.map(PathBuf::from),
             ffprobe_path: None,
             library_roots: Vec::new(),

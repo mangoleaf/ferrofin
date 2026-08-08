@@ -42,8 +42,9 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::filesystem::FileSystem;
 use hermit_traits::library::VirtualFolderManager;
 use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
-use hermit_traits::options::ItemImageInfo;
-use hermit_traits::persistence::{ItemPersistenceService, MediaStreamRepository};
+use hermit_traits::options::{InternalItemsQuery, ItemImageInfo};
+use hermit_traits::persistence::{ItemPersistenceService, ItemRepository, MediaStreamRepository};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::item_type_lookup;
@@ -182,6 +183,12 @@ pub struct LibraryScanner {
     /// Tmdb/Imdb id) and series (by Tvdb id) on top of the primary provider's
     /// images. Keys off the ids persisted during this scan.
     fanart: Option<Arc<hermit_providers::FanartClient>>,
+    /// Optional MusicBrainz client — resolves `MusicBrainz*` ids for music items
+    /// in the post-scan enrichment pass. Paired with [`item_repository`](Self::item_repository).
+    musicbrainz: Option<Arc<hermit_providers::MusicBrainzClient>>,
+    /// Item repository for the post-scan music-enrichment pass (querying the
+    /// MusicAlbum/MusicArtist rows + tracks it created). Absent → no music pass.
+    item_repository: Option<Arc<dyn ItemRepository>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
     metadata_dir: Option<PathBuf>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
@@ -224,6 +231,8 @@ impl LibraryScanner {
             omdb: None,
             tvdb: None,
             fanart: None,
+            musicbrainz: None,
+            item_repository: None,
             metadata_dir: None,
             people: None,
             chapters: None,
@@ -268,6 +277,21 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_fanart(mut self, fanart: Arc<hermit_providers::FanartClient>) -> Self {
         self.fanart = Some(fanart);
+        self
+    }
+
+    /// Attaches the MusicBrainz client + the item repository the post-scan
+    /// music-enrichment pass needs, so music items get their `MusicBrainz*` ids
+    /// resolved (and, once wired, AudioDb/fanart artwork). Both are required for
+    /// the pass to run.
+    #[must_use]
+    pub fn with_music(
+        mut self,
+        musicbrainz: Arc<hermit_providers::MusicBrainzClient>,
+        item_repository: Arc<dyn ItemRepository>,
+    ) -> Self {
+        self.musicbrainz = Some(musicbrainz);
+        self.item_repository = Some(item_repository);
         self
     }
 
@@ -434,7 +458,198 @@ impl LibraryScanner {
                 tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
             }
         }
+        // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
+        // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
+        // above. Best-effort — a failure here must not fail the whole scan.
+        if let Err(err) = self.enrich_music().await {
+            tracing::warn!(%err, "music enrichment pass failed");
+        }
         Ok(planned.len())
+    }
+
+    /// The post-scan music-enrichment pass. Resolves each `MusicAlbum`'s and
+    /// `MusicArtist`'s `MusicBrainz*` ids: preferring the ids embedded in the
+    /// tracks' tags (persisted during the main loop), else querying MusicBrainz
+    /// by name. Also aggregates album-artist/year from an album's tracks onto the
+    /// album row. No-op unless both the item repository and MusicBrainz client
+    /// are wired.
+    async fn enrich_music(&self) -> Result<(), ServiceError> {
+        let (Some(items), Some(mb)) = (&self.item_repository, &self.musicbrainz) else {
+            return Ok(());
+        };
+
+        // Pre-fetch the embedded MusicBrainz ids by track (persisted from tags),
+        // so each album/artist can adopt its tracks' ids without a per-item read.
+        let by_provider = |key: &'static str| async move {
+            items
+                .get_items_with_provider_id(key)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<HashMap<Uuid, String>>()
+        };
+        let track_album = by_provider("MusicBrainzAlbum").await;
+        let track_rg = by_provider("MusicBrainzReleaseGroup").await;
+        let track_albumartist = by_provider("MusicBrainzAlbumArtist").await;
+
+        // Map album-artist name → its embedded MusicBrainzAlbumArtist id, and
+        // gather each album's aggregate from its tracks, in one pass over Audio.
+        let audio = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Audio],
+                recursive: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut artist_mbid: HashMap<String, String> = HashMap::new();
+        for track in &audio {
+            let Ok(tid) = Uuid::parse_str(&track.id) else {
+                continue;
+            };
+            if let Some(mbid) = track_albumartist.get(&tid) {
+                for name in split_pipe(track.album_artists.as_deref()) {
+                    artist_mbid.entry(name).or_insert_with(|| mbid.clone());
+                }
+            }
+        }
+
+        self.enrich_albums(items.as_ref(), mb.as_ref(), &track_album, &track_rg)
+            .await?;
+        self.enrich_artists(items.as_ref(), mb.as_ref(), &artist_mbid)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolves and persists each `MusicAlbum`'s `MusicBrainzAlbum` +
+    /// `MusicBrainzReleaseGroup` ids, aggregating album-artist/year from its
+    /// tracks first (so a folder-named album gains its artist + release ids).
+    async fn enrich_albums(
+        &self,
+        items: &dyn ItemRepository,
+        mb: &hermit_providers::MusicBrainzClient,
+        track_album: &HashMap<Uuid, String>,
+        track_rg: &HashMap<Uuid, String>,
+    ) -> Result<(), ServiceError> {
+        let albums = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicAlbum],
+                recursive: true,
+                ..Default::default()
+            })
+            .await?;
+        for album in albums {
+            let Ok(album_uuid) = Uuid::parse_str(&album.id) else {
+                continue;
+            };
+            let tracks = items
+                .get_item_list(&InternalItemsQuery {
+                    parent_id: album_uuid,
+                    include_item_types: vec![BaseItemKind::Audio],
+                    ..Default::default()
+                })
+                .await?;
+
+            // Aggregate album-artist + year from the tracks onto the album row.
+            let mut updated = album.clone();
+            let mut changed = false;
+            if updated
+                .album_artists
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                && let Some(aa) = tracks
+                    .iter()
+                    .find_map(|t| t.album_artists.clone().filter(|s| !s.is_empty()))
+            {
+                updated.album_artists = Some(aa);
+                changed = true;
+            }
+            if updated.production_year.is_none()
+                && let Some(year) = tracks.iter().filter_map(|t| t.production_year).min()
+            {
+                updated.production_year = Some(year);
+                changed = true;
+            }
+            if changed {
+                self.persistence
+                    .save_items(std::slice::from_ref(&updated))
+                    .await?;
+                let values = item_values_of(&updated);
+                if !values.is_empty() {
+                    self.persistence
+                        .save_item_values(album_uuid, &values)
+                        .await?;
+                }
+            }
+
+            // The embedded ids from any track (they share an album's release).
+            let embedded = hermit_providers::AlbumIds {
+                release_id: tracks
+                    .iter()
+                    .find_map(|t| track_album.get(&parse_id(&t.id)?).cloned()),
+                release_group_id: tracks
+                    .iter()
+                    .find_map(|t| track_rg.get(&parse_id(&t.id)?).cloned()),
+            };
+            let album_name = updated.name.as_deref().unwrap_or_default();
+            let album_artist = updated
+                .album_artists
+                .as_deref()
+                .and_then(|s| s.split('|').next())
+                .filter(|s| !s.is_empty());
+            let resolved = mb
+                .resolve_album(album_name, embedded, None, album_artist)
+                .await;
+            if let Some(id) = &resolved.release_id {
+                let _ = self
+                    .persistence
+                    .save_provider_id(album_uuid, "MusicBrainzAlbum", id)
+                    .await;
+            }
+            if let Some(id) = &resolved.release_group_id {
+                let _ = self
+                    .persistence
+                    .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves and persists each `MusicArtist`'s `MusicBrainzArtist` id — the
+    /// embedded album-artist id from its tracks, else a MusicBrainz name search.
+    async fn enrich_artists(
+        &self,
+        items: &dyn ItemRepository,
+        mb: &hermit_providers::MusicBrainzClient,
+        artist_mbid: &HashMap<String, String>,
+    ) -> Result<(), ServiceError> {
+        let artists = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicArtist],
+                recursive: true,
+                ..Default::default()
+            })
+            .await?;
+        for artist in artists {
+            let Ok(artist_uuid) = Uuid::parse_str(&artist.id) else {
+                continue;
+            };
+            let Some(name) = artist.name.as_deref().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let mbid = match artist_mbid.get(name) {
+                Some(id) => Some(id.clone()),
+                None => mb.search_artist(name).await,
+            };
+            if let Some(id) = mbid {
+                let _ = self
+                    .persistence
+                    .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
@@ -1669,6 +1884,23 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
         .collect()
 }
 
+/// Splits a pipe-joined multi-value field (artists/album_artists) into trimmed,
+/// non-empty names.
+fn split_pipe(field: Option<&str>) -> Vec<String> {
+    field
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Parses a stored hyphenated id string to a [`Uuid`], or `None`.
+fn parse_id(id: &str) -> Option<Uuid> {
+    Uuid::parse_str(id).ok()
+}
+
 /// The fanart movie id from the persisted provider ids: TMDb preferred (fanart
 /// keys on it), else IMDb.
 fn fanart_movie_id(ids: &[(String, String)]) -> Option<String> {
@@ -1984,6 +2216,102 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    // The post-scan music pass resolves each album's + artist's MusicBrainz ids
+    // from the embedded ids on its tracks (no network when they're all present),
+    // and aggregates the album-artist onto the album. Seeds through the seams.
+    #[tokio::test]
+    async fn enrich_music_resolves_ids_from_embedded_track_tags() {
+        use crate::item_persistence_service::HermitItemPersistenceService;
+        use crate::item_repository::HermitItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use hermit_db::entities::base_items::BaseItemEntity;
+        use hermit_model::data::BaseItemKind;
+        use hermit_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(HermitItemRepository::new(db.clone(), lookup));
+
+        let album_id = uuid::Uuid::new_v4();
+        let track_id = uuid::Uuid::new_v4();
+        let stored = |k| stored_type_name(k).unwrap().to_owned();
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: album_id.to_string(),
+                    type_: stored(BaseItemKind::MusicAlbum),
+                    name: Some("Kind of Blue".into()),
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: track_id.to_string(),
+                    type_: stored(BaseItemKind::Audio),
+                    name: Some("So What".into()),
+                    parent_id: Some(album_id.to_string()),
+                    album_artists: Some("Miles Davis".into()),
+                    production_year: Some(1959),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("seed");
+        // Embedded MusicBrainz ids on the track, and the MusicArtist item.
+        for (k, v) in [
+            ("MusicBrainzAlbum", "rel-x"),
+            ("MusicBrainzReleaseGroup", "rg-x"),
+            ("MusicBrainzAlbumArtist", "aa-x"),
+        ] {
+            persistence.save_provider_id(track_id, k, v).await.unwrap();
+        }
+        persistence
+            .save_item_values(track_id, &[(1, "Miles Davis".into())])
+            .await
+            .expect("materialize artist");
+
+        // A minimal scanner with the music pass wired (MB client never hits the
+        // network because every id is already embedded).
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(HermitFileSystem::new()), persistence)
+            .with_music(
+                Arc::new(hermit_providers::MusicBrainzClient::new("", "test")),
+                Arc::clone(&items),
+            );
+
+        scanner.enrich_music().await.expect("enrich");
+
+        // The album adopted its tracks' release + release-group ids...
+        let album_rel = items
+            .get_items_with_provider_id("MusicBrainzAlbum")
+            .await
+            .unwrap();
+        assert!(album_rel.contains(&(album_id, "rel-x".to_owned())));
+        let album_rg = items
+            .get_items_with_provider_id("MusicBrainzReleaseGroup")
+            .await
+            .unwrap();
+        assert!(album_rg.contains(&(album_id, "rg-x".to_owned())));
+        // ...and its album-artist aggregated from the track.
+        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        assert_eq!(album.album_artists.as_deref(), Some("Miles Davis"));
+        // The MusicArtist got the embedded album-artist mbid.
+        let artist_ids = items
+            .get_items_with_provider_id("MusicBrainzArtist")
+            .await
+            .unwrap();
+        assert!(
+            artist_ids.iter().any(|(_, v)| v == "aa-x"),
+            "artist resolved to embedded mbid: {artist_ids:?}"
+        );
     }
 
     // apply_audio_metadata fills empty music fields from probed tags (pipe-joined

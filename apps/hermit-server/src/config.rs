@@ -110,6 +110,7 @@ struct FileConfig {
     tvdb_api_key: Option<String>,
     tvdb_subscriber_pin: Option<String>,
     fanart_personal_api_key: Option<String>,
+    musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     library_roots: Option<Vec<PathBuf>>,
@@ -204,6 +205,11 @@ pub struct Config {
     /// unlocking fresher artwork. Empty = the built-in key only. From
     /// `HERMIT_FANART_KEY` or `config.toml`.
     pub fanart_personal_api_key: String,
+
+    /// MusicBrainz web-service base URL. Empty = `https://musicbrainz.org`. From
+    /// `HERMIT_MUSICBRAINZ_URL` or `config.toml` (point at a mirror to lift the
+    /// 1 req/sec limit).
+    pub musicbrainz_base_url: String,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -365,6 +371,11 @@ impl Config {
             .or(file.fanart_personal_api_key)
             .unwrap_or_default();
 
+        let musicbrainz_base_url = env
+            .var("HERMIT_MUSICBRAINZ_URL")
+            .or(file.musicbrainz_base_url)
+            .unwrap_or_default();
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("HERMIT_FFMPEG_PATH").map(PathBuf::from))
@@ -418,6 +429,7 @@ impl Config {
             tvdb_api_key,
             tvdb_subscriber_pin,
             fanart_personal_api_key,
+            musicbrainz_base_url,
             ffmpeg_path,
             ffprobe_path,
             library_roots,

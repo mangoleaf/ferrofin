@@ -431,6 +431,16 @@ pub async fn build_app_state(
     )))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
+    // Resolve MusicBrainz ids for music items in the post-scan enrichment pass
+    // (the item repository lets it query the MusicAlbum/MusicArtist rows + tracks
+    // it created). Keyless; a mirror URL lifts the 1 req/sec limit.
+    .with_music(
+        Arc::new(hermit_providers::MusicBrainzClient::new(
+            &config.musicbrainz_base_url,
+            env!("CARGO_PKG_VERSION"),
+        )),
+        Arc::clone(&item_repository),
+    )
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
     .with_image_processor(Arc::clone(&image_processor));
@@ -938,6 +948,7 @@ mod tests {
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
             fanart_personal_api_key: String::new(),
+            musicbrainz_base_url: String::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),
