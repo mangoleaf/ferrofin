@@ -15,6 +15,7 @@ pub mod local_images;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
+pub mod musicbrainz;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
@@ -33,6 +34,7 @@ pub use lrclib::{LrcLibConfig, LrcLibProvider};
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use fanart::FanartClient;
+pub use musicbrainz::{AlbumIds, MusicBrainzClient};
 pub use omdb::OmdbClient;
 pub use studios::StudiosClient;
 pub use tmdb::{
