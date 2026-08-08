@@ -38,6 +38,12 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// would want its own mapping; add when a music library needs it.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
+        // AlbumArtist (1) is the canonical artist identity — it materializes the
+        // browsable MusicArtist item (so /Artists + /Artists/AlbumArtists resolve
+        // real rows and artist bio/artwork attaches, keyed on MusicBrainzAlbumArtist).
+        // Artist (0, track performer) stays an ItemValue for filtering only, so a
+        // name that is both doesn't produce two MusicArtist rows.
+        1 => stored_type_name(BaseItemKind::MusicArtist),
         2 => stored_type_name(BaseItemKind::Genre),
         3 => stored_type_name(BaseItemKind::Studio),
         _ => None,
@@ -695,5 +701,60 @@ mod tests {
         .await
         .expect("tag count");
         assert_eq!(tags, 0, "tags are not browsable by-name items");
+    }
+
+    // AlbumArtist (1) materializes a browsable MusicArtist row sharing the
+    // ItemValueId; Artist (0) stays a filter-only value (no MusicArtist row), so
+    // a name that is both does not produce a duplicate artist item.
+    #[tokio::test]
+    async fn save_item_values_materializes_music_artist_items() {
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let svc = HermitItemPersistenceService::new(db.clone());
+
+        svc.save_item_values(
+            track,
+            &[
+                (0, "John Coltrane".to_owned()), // Artist (track performer) only
+                (0, "Miles Davis".to_owned()),   // Artist too
+                (1, "Miles Davis".to_owned()),   // AlbumArtist (same name)
+                (1, "Various Artists".to_owned()),
+            ],
+        )
+        .await
+        .expect("save values");
+
+        // Exactly one MusicArtist row per distinct album-artist name, each id
+        // equal to its AlbumArtist ItemValueId. No row for the Artist-only name.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT bi."Name", bi."Id"
+               FROM "BaseItems" bi
+               WHERE bi."Type" LIKE '%.MusicArtist'
+               ORDER BY bi."Name""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("query artists");
+        let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Miles Davis", "Various Artists"]);
+        for (name, id) in &rows {
+            let value_id: String = sqlx::query_scalar(
+                r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = 1 AND "Value" = ?1"#,
+            )
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .expect("value id");
+            assert_eq!(id, &value_id, "artist item id is the AlbumArtist value id");
+        }
+        // The Artist-only performer got an ItemValue but no MusicArtist row.
+        let coltrane: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'John Coltrane'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(coltrane, 0);
     }
 }

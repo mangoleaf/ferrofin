@@ -1727,6 +1727,14 @@ fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
             .collect()
     };
     let mut out = Vec::new();
+    // Artist (0) / AlbumArtist (1) materialize browsable MusicArtist items and
+    // back the artist filters; genres (2), studios (3), tags (4) as before.
+    out.extend(split(entity.artists.as_deref()).into_iter().map(|a| (0, a)));
+    out.extend(
+        split(entity.album_artists.as_deref())
+            .into_iter()
+            .map(|a| (1, a)),
+    );
     out.extend(split(entity.genres.as_deref()).into_iter().map(|g| (2, g)));
     out.extend(split(entity.studios.as_deref()).into_iter().map(|s| (3, s)));
     out.extend(split(entity.tags.as_deref()).into_iter().map(|t| (4, t)));
