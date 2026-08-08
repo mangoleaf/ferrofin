@@ -551,6 +551,16 @@ pub trait LibraryManager: Send + Sync {
     ) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
+
+    /// Queues a scan restricted to one library. `library_id` is the library's
+    /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
+    /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
+    /// [`queue_library_scan`](Self::queue_library_scan) so existing
+    /// implementations need no change; the real manager narrows the filesystem
+    /// walk to that library's folders.
+    async fn queue_library_scan_scoped(&self, _library_id: Uuid) -> Result<(), ServiceError> {
+        self.queue_library_scan().await
+    }
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}

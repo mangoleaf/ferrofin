@@ -284,15 +284,29 @@ impl UserManager for OkUsers {
 }
 
 /// A [`LibraryManager`] resolving a single known item id (any other is `None`);
-/// `update_items` succeeds so the edit handler runs end-to-end.
+/// `update_items` succeeds so the edit handler runs end-to-end. The folder
+/// fields shape the resolved entity for the folder-refresh (scoped scan) tests,
+/// which assert against `scoped_scans`.
 struct OkLibrary {
     item_id: Uuid,
+    is_folder: bool,
+    top_parent_id: Option<Uuid>,
+    scoped_scans: Arc<Mutex<Vec<Uuid>>>,
 }
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == self.item_id).then(|| base_item_entity(self.item_id)))
+        Ok((id == self.item_id).then(|| {
+            let mut entity = base_item_entity(self.item_id);
+            entity.is_folder = self.is_folder;
+            entity.top_parent_id = self.top_parent_id.map(|id| id.to_string());
+            entity
+        }))
+    }
+    async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
+        self.scoped_scans.lock().unwrap().push(library_id);
+        Ok(())
     }
     async fn update_items(
         &self,
@@ -602,8 +616,21 @@ impl hermit_traits::localization::LocalizationManager for StubLocalization {
 /// Assembles an [`AppState`] wired for the item-update paths. `queued` records
 /// refresh requests; pass a throwaway when they are not asserted.
 fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
+    state_with_library(
+        Arc::new(OkLibrary {
+            item_id,
+            is_folder: false,
+            top_parent_id: None,
+            scoped_scans: Arc::default(),
+        }),
+        queued,
+    )
+}
+
+/// [`state`] with a caller-shaped [`OkLibrary`] (the folder-refresh tests).
+fn state_with_library(library: Arc<OkLibrary>, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
     AppState::new(
-        Arc::new(OkLibrary { item_id }),
+        library,
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -732,6 +759,74 @@ async fn refresh_item_queues_and_returns_204() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(queued.lock().unwrap().as_slice(), &[item_id]);
+}
+
+/// `POST /Items/{itemId}/Refresh` on a library's CollectionFolder queues a scan
+/// scoped to that library — never a full all-libraries scan (the stub's
+/// unscoped `queue_library_scan` is `unimplemented!`, so a regression to the
+/// old behavior fails loudly here).
+#[tokio::test]
+async fn refresh_library_folder_queues_scoped_scan() {
+    let folder_id = Uuid::from_u128(0x11B);
+    let scans = Arc::new(Mutex::new(Vec::new()));
+    let queued = Arc::new(Mutex::new(Vec::new()));
+    let router = create_router(state_with_library(
+        Arc::new(OkLibrary {
+            item_id: folder_id,
+            is_folder: true,
+            top_parent_id: None, // a CollectionFolder is its own library root
+            scoped_scans: scans.clone(),
+        }),
+        queued.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{folder_id}/Refresh"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(scans.lock().unwrap().as_slice(), &[folder_id]);
+    assert!(
+        queued.lock().unwrap().is_empty(),
+        "a folder refresh drives the scan, not the provider queue"
+    );
+}
+
+/// Refreshing a folder nested inside a library (a series/season) scopes the
+/// scan to the owning library via `TopParentId`, not the folder's own id.
+#[tokio::test]
+async fn refresh_nested_folder_scopes_to_owning_library() {
+    let series_id = Uuid::from_u128(0x5E1);
+    let library_id = Uuid::from_u128(0x11B2);
+    let scans = Arc::new(Mutex::new(Vec::new()));
+    let router = create_router(state_with_library(
+        Arc::new(OkLibrary {
+            item_id: series_id,
+            is_folder: true,
+            top_parent_id: Some(library_id),
+            scoped_scans: scans.clone(),
+        }),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{series_id}/Refresh"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(scans.lock().unwrap().as_slice(), &[library_id]);
 }
 
 /// `POST /Items/{itemId}/Refresh` for a missing item is a `404` (never queues).

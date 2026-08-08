@@ -107,7 +107,7 @@ impl HermitLibraryManager {
 impl crate::library_monitor::LibraryScanTrigger for HermitLibraryManager {
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         // Reached via the filesystem watcher / Radarr-Sonarr webhooks.
-        self.spawn_scan("watcher");
+        self.spawn_scan("watcher", None);
         Ok(())
     }
 }
@@ -454,7 +454,7 @@ impl LibraryManager for HermitLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        self.spawn_scan("api");
+        self.spawn_scan("api", None);
         Ok(())
     }
 
@@ -462,7 +462,12 @@ impl LibraryManager for HermitLibraryManager {
         &self,
         trigger: &'static str,
     ) -> Result<(), ServiceError> {
-        self.spawn_scan(trigger);
+        self.spawn_scan(trigger, None);
+        Ok(())
+    }
+
+    async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
+        self.spawn_scan("api", Some(library_id));
         Ok(())
     }
 }
@@ -472,7 +477,9 @@ impl HermitLibraryManager {
     /// span tagged with `trigger`, returning immediately (Jellyfin's refresh is
     /// fire-and-forget — it must not block the HTTP handler). Shared by every
     /// entry point so the coalescing guard and the span are defined once.
-    fn spawn_scan(&self, trigger: &'static str) {
+    /// `scope` restricts the scan to one library (CollectionFolder id); `None`
+    /// scans everything.
+    fn spawn_scan(&self, trigger: &'static str, scope: Option<Uuid>) {
         let Some(scanner) = &self.scanner else {
             tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
             return;
@@ -502,9 +509,13 @@ impl HermitLibraryManager {
                 let started = std::time::Instant::now();
                 tracing::info!("library scan started");
                 let mut total_created = 0usize;
+                let mut scope = scope;
                 loop {
                     pending.store(false, Ordering::Release);
-                    match scanner.scan_all().await {
+                    // `take()`: only the first pass is scoped. Coalesced reruns
+                    // fold requests whose scopes are unknown here, so they run
+                    // full — over-scanning is the safe direction.
+                    match scanner.scan(scope.take()).await {
                         Ok(created) => {
                             total_created += created;
                             tracing::info!(created, "library scan pass complete");
@@ -601,6 +612,98 @@ mod tests {
             .find(|kv| kv.key.as_str() == "trigger")
             .map(|kv| kv.value.to_string());
         assert_eq!(trigger.as_deref(), Some("api"));
+    }
+
+    #[tokio::test]
+    async fn queue_library_scan_scoped_walks_only_that_library() {
+        use crate::file_system::HermitFileSystem;
+        use crate::library_scan::LibraryScanner;
+        use crate::virtual_folder_manager::HermitVirtualFolderManager;
+        use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
+        use hermit_model::entities::CollectionTypeOptions;
+        use hermit_traits::library::VirtualFolderManager;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let movies = tmp.path().join("movies");
+        let tv = tmp.path().join("tv");
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::write(movies.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::create_dir_all(tv.join("Firefly/Season 01")).unwrap();
+        std::fs::write(tv.join("Firefly/Season 01/Firefly S01E01.mkv"), b"").unwrap();
+
+        let db = test_db().await;
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        for (name, ct, media) in [
+            ("Movies", CollectionTypeOptions::movies, &movies),
+            ("TV", CollectionTypeOptions::tvshows, &tv),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(ct),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: media.to_string_lossy().into_owned(),
+                    }],
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let tv_cf = vf
+            .get_virtual_folders()
+            .await
+            .unwrap()
+            .iter()
+            .find(|f| f.name.as_deref() == Some("TV"))
+            .and_then(|f| f.item_id.as_deref())
+            .map(|s| Uuid::parse_str(s).unwrap())
+            .unwrap();
+        let scanner = Arc::new(LibraryScanner::new(
+            vf,
+            Arc::new(HermitFileSystem::new()),
+            persistence,
+        ));
+        let mgr = manager(&db).with_scanner(scanner);
+
+        mgr.queue_library_scan_scoped(tv_cf).await.expect("queued");
+        // The scan runs on a spawned task; poll (through the manager's own query
+        // API, not raw SQL — the SQL-boundary ratchet) until it lands the episode.
+        let count = |kind| {
+            let mgr = &mgr;
+            async move {
+                mgr.query_items(&InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+                .items
+                .len()
+            }
+        };
+        for _ in 0..200 {
+            if count(BaseItemKind::Episode).await == 1
+                && !mgr.scan_in_flight.load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count(BaseItemKind::Episode).await,
+            1,
+            "the scoped TV library was scanned"
+        );
+        assert_eq!(
+            count(BaseItemKind::Movie).await,
+            0,
+            "the movie library must not be scanned"
+        );
     }
 
     /// Builds a manager backed by real repositories over the given database.

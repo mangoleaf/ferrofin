@@ -434,9 +434,17 @@ async fn refresh_item(
 
     // Refreshing a folder (a library's CollectionFolder, or any container) means
     // "scan its media" — the C# `ValidateChildren` path — so drive the filesystem
-    // scan. This is what jellyfin-web's per-library "Scan library" button calls.
+    // scan, scoped to the owning library. The folder is either a CollectionFolder
+    // itself (jellyfin-web's per-library "Scan library" button; no TopParentId)
+    // or nested inside one (series/season), whose TopParentId is that
+    // CollectionFolder. A scope matching no library falls back to a full scan.
     if item.is_folder {
-        state.library.queue_library_scan().await?;
+        let library_id = item
+            .top_parent_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or(item_id);
+        state.library.queue_library_scan_scoped(library_id).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
 

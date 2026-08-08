@@ -345,6 +345,18 @@ impl LibraryScanner {
 
     /// Scans every configured library; returns the number of items created.
     ///
+    /// # Errors
+    /// See [`scan`](Self::scan).
+    pub async fn scan_all(&self) -> Result<usize, ServiceError> {
+        self.scan(None).await
+    }
+
+    /// Scans the configured libraries — restricted to the one whose
+    /// CollectionFolder id is `only` (all of them when `None`) — and returns
+    /// the number of items created. An `only` matching no library falls back
+    /// to a full scan rather than silently scanning nothing (the id may come
+    /// from a nested folder or a library removed mid-flight).
+    ///
     /// Idempotent: item ids are deterministic
     /// ([`derive_item_id`](item_type_lookup::derive_item_id)), so re-scanning
     /// upserts rather than duplicates.
@@ -352,8 +364,18 @@ impl LibraryScanner {
     /// # Errors
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
-    pub async fn scan_all(&self) -> Result<usize, ServiceError> {
-        let folders = self.virtual_folders.get_virtual_folders().await?;
+    pub async fn scan(&self, only: Option<Uuid>) -> Result<usize, ServiceError> {
+        let mut folders = self.virtual_folders.get_virtual_folders().await?;
+        if let Some(only) = only {
+            if folders
+                .iter()
+                .any(|f| collection_folder_id(f) == Some(only))
+            {
+                folders.retain(|f| collection_folder_id(f) == Some(only));
+            } else {
+                tracing::warn!(library = %only, "scoped scan matched no library; scanning all");
+            }
+        }
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
         tracing::info!(
             items = planned.len(),
@@ -1202,13 +1224,7 @@ impl LibraryScanner {
         let naming = NamingOptions::new();
         let mut out = Vec::new();
         for folder in folders {
-            // `item_id` is the library's CollectionFolder id (projected by the
-            // virtual-folder manager); items hang beneath it.
-            let Some(cf) = folder
-                .item_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok())
-            else {
+            let Some(cf) = collection_folder_id(folder) else {
                 continue;
             };
             for location in &folder.locations {
@@ -1899,6 +1915,12 @@ fn split_pipe(field: Option<&str>) -> Vec<String> {
 /// Parses a stored hyphenated id string to a [`Uuid`], or `None`.
 fn parse_id(id: &str) -> Option<Uuid> {
     Uuid::parse_str(id).ok()
+}
+
+/// The library's CollectionFolder id (`VirtualFolderInfo::item_id`, projected
+/// by the virtual-folder manager), parsed; items hang beneath it.
+fn collection_folder_id(folder: &VirtualFolderInfo) -> Option<Uuid> {
+    folder.item_id.as_deref().and_then(parse_id)
 }
 
 /// The fanart movie id from the persisted provider ids: TMDb preferred (fanart
@@ -3014,13 +3036,95 @@ mod tests {
 
         // Deterministic ids → re-scan upserts, does not duplicate.
         assert_eq!(scanner.scan_all().await.unwrap(), 2);
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(total, 2, "re-scan did not duplicate");
+        assert_eq!(
+            count_type_like(&db, "%Movies.Movie").await,
+            2,
+            "re-scan did not duplicate"
+        );
+    }
+
+    // `POST /Items/{id}/Refresh` on one library must not scan the other three:
+    // a scan scoped to a CollectionFolder id walks only that library, and an
+    // unknown scope falls back to a full scan (never a silent no-op).
+    #[tokio::test]
+    async fn scoped_scan_only_walks_the_matching_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movies = tmp.path().join("movies");
+        let tv = tmp.path().join("tv");
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::write(movies.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::create_dir_all(tv.join("Firefly/Season 01")).unwrap();
+        std::fs::write(tv.join("Firefly/Season 01/Firefly S01E01.mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        for (name, ct, media) in [
+            ("Movies", CollectionTypeOptions::movies, &movies),
+            ("TV", CollectionTypeOptions::tvshows, &tv),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(ct),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: media.to_string_lossy().into_owned(),
+                    }],
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let tv_cf = vf
+            .get_virtual_folders()
+            .await
+            .unwrap()
+            .iter()
+            .find(|f| f.name.as_deref() == Some("TV"))
+            .and_then(super::collection_folder_id)
+            .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
+        let created = scanner.scan(Some(tv_cf)).await.unwrap();
+        assert!(created > 0, "the TV library itself must still be scanned");
+        assert_eq!(
+            count_type_like(&db, "%Movies.Movie").await,
+            0,
+            "scoped scan must not touch the movie library"
+        );
+        assert_eq!(
+            count_type_like(&db, "%TV.Episode").await,
+            1,
+            "the scoped TV library was scanned"
+        );
+
+        // A scope matching no library scans everything.
+        scanner
+            .scan(Some(uuid::Uuid::from_u128(0xBAD)))
+            .await
+            .unwrap();
+        assert_eq!(
+            count_type_like(&db, "%Movies.Movie").await,
+            1,
+            "unknown scope falls back to a full scan"
+        );
+    }
+
+    /// Counts `BaseItems` whose stored `Type` matches a `LIKE` pattern. Routes
+    /// the repeated row-count assertions through one query so the SQL-boundary
+    /// ratchet (`hermit-db` `sql_boundary`) stays honest as tests are added.
+    async fn count_type_like(db: &Database, like: &str) -> i64 {
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE ?1"#)
+            .bind(like)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
     }
 
     /// Creates a library of `ct` over `media`, scans it, and returns the DB handle
