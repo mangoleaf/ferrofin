@@ -755,6 +755,27 @@ async fn merge_versions_plugin_routes_drive_bulk_ops() {
     }
 }
 
+/// When the Merge Versions extension is not wired (`AppState::merge_versions`
+/// unset), every route reports `404` — the `service()` resolver's absent-plugin
+/// branch, matching a Jellyfin server with the plugin's controller unregistered.
+#[tokio::test]
+async fn merge_versions_routes_404_when_plugin_unavailable() {
+    for route in [
+        "/MergeVersions/MergeMovies",
+        "/MergeVersions/SplitMovies",
+        "/MergeVersions/MergeEpisodes",
+        "/MergeVersions/SplitEpisodes",
+    ] {
+        // A fake state with no `with_merge_versions` — merge_versions stays None.
+        let router = create_router(hermit_api::test_support::authed_fake_state());
+        let resp = router
+            .oneshot(authed("POST", route))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{route}");
+    }
+}
+
 // ---- Additional parts ------------------------------------------------------
 
 #[tokio::test]
