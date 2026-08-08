@@ -109,6 +109,7 @@ struct FileConfig {
     studios_repo_url: Option<String>,
     tvdb_api_key: Option<String>,
     tvdb_subscriber_pin: Option<String>,
+    fanart_personal_api_key: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     library_roots: Option<Vec<PathBuf>>,
@@ -198,6 +199,11 @@ pub struct Config {
     /// TheTVDB subscriber PIN (for a user's paid subscription tier). Empty =
     /// non-subscriber. From `HERMIT_TVDB_PIN` or `config.toml`.
     pub tvdb_subscriber_pin: String,
+
+    /// fanart.tv personal API key (`client_key`), raising rate limits and
+    /// unlocking fresher artwork. Empty = the built-in key only. From
+    /// `HERMIT_FANART_KEY` or `config.toml`.
+    pub fanart_personal_api_key: String,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -354,6 +360,11 @@ impl Config {
             .or(file.tvdb_subscriber_pin)
             .unwrap_or_default();
 
+        let fanart_personal_api_key = env
+            .var("HERMIT_FANART_KEY")
+            .or(file.fanart_personal_api_key)
+            .unwrap_or_default();
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("HERMIT_FFMPEG_PATH").map(PathBuf::from))
@@ -406,6 +417,7 @@ impl Config {
             studios_repo_url,
             tvdb_api_key,
             tvdb_subscriber_pin,
+            fanart_personal_api_key,
             ffmpeg_path,
             ffprobe_path,
             library_roots,

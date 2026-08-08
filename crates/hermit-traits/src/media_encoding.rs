@@ -24,15 +24,17 @@
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 //!
 //! Port note: `IMediaEncoder.GetMediaInfo` returns a rich `MediaInfo` probe
-//! result that is **not yet defined in `hermit-model`** (only the narrower
-//! `MediaSourceInfo` is). Until it is ported, [`MediaEncoder::get_media_info`]
-//! returns [`MediaSourceInfo`], which carries the probed streams/container the
-//! callers in this wave need; the report flags `MediaInfo` as belongs-in-model.
+//! result. [`MediaEncoder::get_media_info`] returns the narrower
+//! [`MediaSourceInfo`] (streams/container) most callers need;
+//! [`MediaEncoder::get_media_info_full`] returns the full
+//! [`MediaInfo`](hermit_model::media_info::MediaInfo) including the embedded
+//! metadata the library scan reads from audio tags.
 
 use async_trait::async_trait;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::Video3DFormat;
 use hermit_model::entities_media::{MediaAttachment, MediaStream};
+use hermit_model::media_info::MediaInfo;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -128,6 +130,24 @@ pub trait MediaEncoder: Send + Sync {
         &self,
         request: &MediaInfoRequest,
     ) -> Result<MediaSourceInfo, ServiceError>;
+
+    /// Probes a media source and returns the **full** [`MediaInfo`] — the
+    /// container/streams *plus* the embedded metadata the normalizer extracts
+    /// (album/artists/album-artists/genres/track/disc/year + MusicBrainz ids for
+    /// audio). The scanner uses this to enrich music items from their tags.
+    ///
+    /// The default wraps [`get_media_info`](Self::get_media_info) with no
+    /// embedded metadata (so fakes keep working); the ffmpeg-backed encoder
+    /// overrides it to return the normalizer's full result.
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<MediaInfo, ServiceError> {
+        Ok(MediaInfo {
+            media_source: self.get_media_info(request).await?,
+            ..MediaInfo::default()
+        })
+    }
 
     /// Extracts an embedded cover image from an audio file, returning the path
     /// to the written image. Port of `ExtractAudioImage(path, imageStreamIndex,

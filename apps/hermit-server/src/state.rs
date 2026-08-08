@@ -417,6 +417,13 @@ pub async fn build_app_state(
     // TheTVDB is the TV authority: series/episode metadata + artwork come from
     // TVDB during the scan (TMDB stays the fallback for a series TVDB can't match).
     .with_tvdb(Arc::clone(&the_tvdb))
+    // fanart.tv artwork (logos/clear-art/disc/banners on top of TMDB's
+    // poster/backdrop), keyed off the Tmdb/Imdb/Tvdb ids persisted during scan.
+    // Built-in key works keyless; HERMIT_FANART_KEY adds a personal client_key.
+    .with_fanart(Arc::new(hermit_providers::FanartClient::new(
+        (!config.fanart_personal_api_key.is_empty())
+            .then(|| config.fanart_personal_api_key.clone()),
+    )))
     // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
     // key is configured (HERMIT_OMDB_KEY / config.toml `omdb_api_key`).
     .with_omdb(Arc::new(hermit_providers::OmdbClient::new(
@@ -930,6 +937,7 @@ mod tests {
             studios_repo_url: String::new(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
+            fanart_personal_api_key: String::new(),
             ffmpeg_path: None,
             ffprobe_path: None,
             library_roots: Vec::new(),

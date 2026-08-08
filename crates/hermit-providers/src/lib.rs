@@ -9,6 +9,7 @@
 
 pub mod container_types;
 pub mod error;
+pub mod fanart;
 pub mod library_options;
 pub mod local_images;
 #[cfg(feature = "lrclib")]
@@ -31,6 +32,7 @@ pub use lrclib::{LrcLibConfig, LrcLibProvider};
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
+pub use fanart::FanartClient;
 pub use omdb::OmdbClient;
 pub use studios::StudiosClient;
 pub use tmdb::{

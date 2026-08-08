@@ -23,6 +23,7 @@ musicbrainz = []
 omdb = []
 studios = []
 tvdb = []
+fanart = []
 opensubtitles = []
 lrclib = []
 

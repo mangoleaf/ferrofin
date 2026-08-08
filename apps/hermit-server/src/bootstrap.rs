@@ -1047,6 +1047,7 @@ mod tests {
             studios_repo_url: String::new(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
+            fanart_personal_api_key: String::new(),
             ffmpeg_path: ffmpeg.map(PathBuf::from),
             ffprobe_path: None,
             library_roots: Vec::new(),

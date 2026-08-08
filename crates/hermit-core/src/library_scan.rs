@@ -29,6 +29,7 @@ use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{CollectionTypeOptions, ImageType};
 use hermit_model::entities_media::VirtualFolderInfo;
 use hermit_model::io::FileSystemEntryType;
+use hermit_model::media_info::MediaInfo;
 use hermit_naming::audio::is_audio_file;
 use hermit_naming::common::NamingOptions;
 use hermit_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
@@ -63,6 +64,29 @@ struct ArtworkCache {
     /// Episode item id → its TVDB still URL, cached during the metadata pass so
     /// the image pass downloads it without a second episode fetch.
     episode_tvdb_still: std::collections::HashMap<String, String>,
+    /// Item id → the external ids the metadata match yielded, so the image pass
+    /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
+    item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
+}
+
+/// What a remote metadata fetch yields for one item: the cast/crew to persist
+/// and the external provider ids (`Tmdb`/`Imdb`/`Tvdb`) to write once the row
+/// exists. Ids are persisted after `save_items` so id-dependent providers
+/// (fanart) can key off them on later passes and re-scans.
+#[derive(Default)]
+struct RemoteMetadata {
+    people: Vec<PeopleEntity>,
+    provider_ids: Vec<(String, String)>,
+}
+
+impl RemoteMetadata {
+    /// People only (no external ids to persist).
+    fn just_people(people: Vec<PeopleEntity>) -> Self {
+        Self {
+            people,
+            provider_ids: Vec::new(),
+        }
+    }
 }
 
 /// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
@@ -154,6 +178,10 @@ pub struct LibraryScanner {
     /// metadata + artwork come from TVDB (falling back to TMDB when TVDB has no
     /// match). Paired with [`metadata_dir`](Self::metadata_dir).
     tvdb: Option<Arc<hermit_providers::TvdbClient>>,
+    /// Optional fanart.tv client — appends high-quality artwork for movies (by
+    /// Tmdb/Imdb id) and series (by Tvdb id) on top of the primary provider's
+    /// images. Keys off the ids persisted during this scan.
+    fanart: Option<Arc<hermit_providers::FanartClient>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
     metadata_dir: Option<PathBuf>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
@@ -195,6 +223,7 @@ impl LibraryScanner {
             tmdb: None,
             omdb: None,
             tvdb: None,
+            fanart: None,
             metadata_dir: None,
             people: None,
             chapters: None,
@@ -230,6 +259,15 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_omdb(mut self, omdb: Arc<hermit_providers::OmdbClient>) -> Self {
         self.omdb = Some(omdb);
+        self
+    }
+
+    /// Attaches the fanart.tv client so movies/series get fanart artwork
+    /// (posters/logos/clear-art/backgrounds/…) appended during the scan, keyed
+    /// off the Tmdb/Imdb/Tvdb ids resolved earlier in the same pass.
+    #[must_use]
+    pub fn with_fanart(mut self, fanart: Arc<hermit_providers::FanartClient>) -> Self {
+        self.fanart = Some(fanart);
         self
     }
 
@@ -311,7 +349,7 @@ impl LibraryScanner {
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
-            let (streams, chapters) = self.probe(&mut entity).await;
+            let (streams, chapters, tag_provider_ids) = self.probe(&mut entity).await;
             // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
@@ -321,15 +359,39 @@ impl LibraryScanner {
             // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
             // shows the same detail page Jellyfin does. Best-effort: failures don't
             // abort, and NFO-provided people take precedence.
-            let remote_people = self
+            let remote = self
                 .fetch_remote_metadata(&mut entity, &mut art_cache)
                 .await;
             if people.is_empty() {
-                people = remote_people;
+                people = remote.people;
             }
             self.persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
+            // Persist the external provider ids now the item row exists to FK
+            // against: the remote match's (Tmdb/Imdb/Tvdb) plus the embedded
+            // MusicBrainz ids read from the audio tags. These key the
+            // id-dependent providers (fanart, AudioDb, MusicBrainz) and make
+            // re-scans/cross-provider lookups stable. Best-effort: a write
+            // failure is logged, not fatal.
+            let all_provider_ids: Vec<(String, String)> = remote
+                .provider_ids
+                .iter()
+                .cloned()
+                .chain(tag_provider_ids)
+                .collect();
+            for (key, value) in &all_provider_ids {
+                if let Err(err) = self.persistence.save_provider_id(item.id, key, value).await {
+                    tracing::warn!(%err, item = %item.id, provider = key, "failed to persist provider id");
+                }
+            }
+            // Keep the ids in the scan cache so the image pass can key fanart off
+            // them (movies) without a DB round-trip.
+            if !all_provider_ids.is_empty() {
+                art_cache
+                    .item_provider_ids
+                    .insert(entity.id.clone(), all_provider_ids);
+            }
             // Mirror the item's genres/studios/tags into ItemValues so the
             // genre/studio/tag *filters* (More Like This, genre browse) match.
             let item_values = item_values_of(&entity);
@@ -405,8 +467,12 @@ impl LibraryScanner {
     async fn probe(
         &self,
         entity: &mut BaseItemEntity,
-    ) -> (Vec<MediaStreamInfoEntity>, Vec<ChapterEntity>) {
-        let empty = (Vec::new(), Vec::new());
+    ) -> (
+        Vec<MediaStreamInfoEntity>,
+        Vec<ChapterEntity>,
+        Vec<(String, String)>,
+    ) {
+        let empty = (Vec::new(), Vec::new(), Vec::new());
         let Some(encoder) = &self.media_encoder else {
             return empty;
         };
@@ -428,27 +494,36 @@ impl LibraryScanner {
             extract_chapters: true,
             media_is_audio: is_audio,
         };
-        let probed = match encoder.get_media_info(&request).await {
+        let probed = match encoder.get_media_info_full(&request).await {
             Ok(probed) => probed,
             Err(e) => {
                 tracing::warn!(error = %e, path = ?entity.path, "media probe failed; item left unprobed");
                 return empty;
             }
         };
-        entity.run_time_ticks = probed.run_time_ticks.or(entity.run_time_ticks);
-        entity.size = probed.size.or(entity.size);
-        let streams = probed
+        let source = &probed.media_source;
+        entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
+        entity.size = source.size.or(entity.size);
+        // Embedded audio tags (album/artists/track/disc/year/genres + the
+        // MusicBrainz ids) — the port of `AudioFileProber`. Fill-if-empty so an
+        // NFO/prior scan wins; the ids are returned for persistence.
+        let provider_ids = if is_audio {
+            apply_audio_metadata(entity, &probed)
+        } else {
+            Vec::new()
+        };
+        let streams = source
             .media_streams
             .iter()
             .map(|s| stream_dto_to_entity(&entity.id, s))
             .collect();
-        let chapters = probed
+        let chapters = source
             .chapters
             .iter()
             .enumerate()
             .map(|(index, c)| chapter_to_entity(&entity.id, index, c))
             .collect();
-        (streams, chapters)
+        (streams, chapters, provider_ids)
     }
 
     /// Fetches remote artwork (TMDB) for an item that has no local images,
@@ -537,7 +612,7 @@ impl LibraryScanner {
         &self,
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
-    ) -> Vec<PeopleEntity> {
+    ) -> RemoteMetadata {
         let short = entity
             .type_
             .rsplit('.')
@@ -548,20 +623,20 @@ impl LibraryScanner {
         // episode metadata (TMDB stays the fallback for a series TVDB can't
         // match). Movies are TMDB-only.
         if self.tvdb.is_some() && matches!(short.as_str(), "Series" | "Episode") {
-            let people = self.fetch_tvdb_metadata(entity, &short, cache).await;
+            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
             // A TVDB hit (series cached, or episode text applied) is authoritative;
             // only fall through to TMDB for a series TVDB could not resolve.
             if short == "Episode" || cache.series_tvdb.contains_key(&entity.id) {
-                return people;
+                return result;
             }
         }
         let Some(tmdb) = &self.tmdb else {
-            return Vec::new();
+            return RemoteMetadata::default();
         };
         let kind = match short.as_str() {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
-            _ => return Vec::new(),
+            _ => return RemoteMetadata::default(),
         };
         // Fetch when the row still lacks core metadata OR still lacks a Rotten
         // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
@@ -571,10 +646,10 @@ impl LibraryScanner {
         let wants_rating =
             self.omdb.as_ref().is_some_and(|o| o.is_enabled()) && entity.critic_rating.is_none();
         if has_overview && !wants_rating {
-            return Vec::new();
+            return RemoteMetadata::default();
         }
         let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-            return Vec::new();
+            return RemoteMetadata::default();
         };
         let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         let Some(tmdb_id) = tmdb
@@ -584,10 +659,10 @@ impl LibraryScanner {
             .next()
             .map(|h| h.tmdb_id)
         else {
-            return Vec::new();
+            return RemoteMetadata::default();
         };
         let Some(details) = tmdb.details(kind, tmdb_id).await else {
-            return Vec::new();
+            return RemoteMetadata::default();
         };
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
@@ -597,7 +672,13 @@ impl LibraryScanner {
         {
             entity.critic_rating = Some(f64::from(rating));
         }
-        details
+        // The external ids to persist: the matched TMDB id, plus the IMDb id TMDB
+        // carries (keys OMDb + fanart's IMDb fallback).
+        let mut provider_ids = vec![("Tmdb".to_owned(), tmdb_id.to_string())];
+        if let Some(imdb) = details.imdb_id.as_deref().filter(|s| !s.is_empty()) {
+            provider_ids.push(("Imdb".to_owned(), imdb.to_owned()));
+        }
+        let people = details
             .people
             .iter()
             .map(|p| PeopleEntity {
@@ -608,7 +689,11 @@ impl LibraryScanner {
                 primary_image_url: p.profile_url.clone(),
                 provider_id: Some(p.tmdb_id),
             })
-            .collect()
+            .collect();
+        RemoteMetadata {
+            people,
+            provider_ids,
+        }
     }
 
     /// The TheTVDB metadata pass — the TV authority. For a **series** it searches
@@ -623,26 +708,38 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         short: &str,
         cache: &mut ArtworkCache,
-    ) -> Vec<PeopleEntity> {
+    ) -> RemoteMetadata {
         let Some(tvdb) = &self.tvdb else {
-            return Vec::new();
+            return RemoteMetadata::default();
         };
         match short {
             "Series" => {
                 let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
                 let Some(hit) = tvdb.search(name, year).await.into_iter().next() else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 let Some(details) = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 apply_tvdb_series(entity, &details);
                 let people = tvdb_people(&details.people);
+                // Persist the Tvdb id + the cross-provider ids TVDB carries (Imdb
+                // keys fanart's fallback; Tmdb links the two databases).
+                let mut provider_ids = vec![("Tvdb".to_owned(), details.tvdb_id.to_string())];
+                if let Some(imdb) = details.imdb_id.as_deref().filter(|s| !s.is_empty()) {
+                    provider_ids.push(("Imdb".to_owned(), imdb.to_owned()));
+                }
+                if let Some(tmdb) = details.tmdb_id.as_deref().filter(|s| !s.is_empty()) {
+                    provider_ids.push(("Tmdb".to_owned(), tmdb.to_owned()));
+                }
                 cache.series_tvdb.insert(entity.id.clone(), details);
-                people
+                RemoteMetadata {
+                    people,
+                    provider_ids,
+                }
             }
             "Episode" => {
                 let (Some(series_id), Some(season), Some(number)) = (
@@ -652,11 +749,11 @@ impl LibraryScanner {
                         .and_then(|n| i32::try_from(n).ok()),
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
                 ) else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 // The parent series must have matched TVDB earlier this scan.
                 let Some(tvdb_id) = cache.series_tvdb.get(&series_id).map(|d| d.tvdb_id) else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 let Some(ep) = tvdb
                     .episode_by_number(
@@ -667,7 +764,7 @@ impl LibraryScanner {
                     )
                     .await
                 else {
-                    return Vec::new();
+                    return RemoteMetadata::default();
                 };
                 apply_tvdb_episode(entity, &ep);
                 if let Some(url) = &ep.image_url {
@@ -675,9 +772,9 @@ impl LibraryScanner {
                         .episode_tvdb_still
                         .insert(entity.id.clone(), url.clone());
                 }
-                tvdb_people(&ep.people)
+                RemoteMetadata::just_people(tvdb_people(&ep.people))
             }
-            _ => Vec::new(),
+            _ => RemoteMetadata::default(),
         }
     }
 
@@ -758,86 +855,124 @@ impl LibraryScanner {
                 let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
                     return Vec::new();
                 };
-                let images = tmdb.images_for(TmdbKind::Movie, name, year).await;
-                download_images(tmdb, &item_dir, &entity.id, images).await
+                let mut images = tmdb.images_for(TmdbKind::Movie, name, year).await;
+                // fanart.tv supplements TMDB's poster/backdrop with the types it
+                // lacks (logo/clear-art/disc/banner), keyed off the movie's
+                // Tmdb/Imdb id persisted earlier this scan.
+                if let Some(fanart) = &self.fanart
+                    && let Some(id) = cache
+                        .item_provider_ids
+                        .get(&entity.id)
+                        .and_then(|ids| fanart_movie_id(ids))
+                {
+                    append_fanart(&mut images, fanart.movie_images(&id).await);
+                }
+                download_images(tmdb, &item_dir, &entity.id, dedup_images_by_type(images)).await
             }
             "Series" => {
-                // TVDB is the TV authority: if it matched this series during the
-                // metadata pass, reuse its artwork (no second fetch).
-                if let Some(details) = cache.series_tvdb.get(&entity.id) {
-                    return download_images(tmdb, &item_dir, &entity.id, details.download_images())
-                        .await;
+                // TVDB is the TV authority: when it matched this series during the
+                // metadata pass, reuse its artwork (no second fetch); else fall
+                // back to a TMDB series match. The Tvdb id (when present) also
+                // keys fanart's series artwork.
+                let tvdb_id = cache.series_tvdb.get(&entity.id).map(|d| d.tvdb_id);
+                let mut images = if let Some(details) = cache.series_tvdb.get(&entity.id) {
+                    details.download_images()
+                } else {
+                    let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                        return Vec::new();
+                    };
+                    let Some(matched) = tmdb.series_match(name, year).await else {
+                        return Vec::new();
+                    };
+                    // Remember the TMDB id so this series' seasons/episodes resolve.
+                    cache.series_tmdb.insert(entity.id.clone(), matched.tmdb_id);
+                    matched.images
+                };
+                if let (Some(fanart), Some(tvdb_id)) = (&self.fanart, tvdb_id) {
+                    append_fanart(
+                        &mut images,
+                        fanart.series_images(&tvdb_id.to_string()).await,
+                    );
                 }
-                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                    return Vec::new();
-                };
-                let Some(matched) = tmdb.series_match(name, year).await else {
-                    return Vec::new();
-                };
-                // Remember the TMDB id so this series' seasons/episodes resolve.
-                cache.series_tmdb.insert(entity.id.clone(), matched.tmdb_id);
-                download_images(tmdb, &item_dir, &entity.id, matched.images).await
+                download_images(tmdb, &item_dir, &entity.id, dedup_images_by_type(images)).await
             }
-            "Season" => {
-                let (Some(series_id), Some(season_num)) = (
-                    entity.series_id.as_deref(),
-                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
-                ) else {
-                    return Vec::new();
-                };
-                let Some(&tmdb_id) = cache.series_tmdb.get(series_id) else {
-                    return Vec::new(); // series didn't match TMDB
-                };
-                // One request yields the season poster + every episode still.
-                let season = tmdb.season_images(tmdb_id, season_num).await;
-                cache
-                    .season_stills
-                    .insert((series_id.to_owned(), season_num), season.episode_stills);
-                let images = season
-                    .poster
-                    .map(|url| {
-                        vec![RemoteImage {
-                            image_type: ImageType::Primary,
-                            url,
-                        }]
-                    })
-                    .unwrap_or_default();
-                download_images(tmdb, &item_dir, &entity.id, images).await
-            }
-            "Episode" => {
-                // Prefer the TVDB still cached during the metadata pass; else fall
-                // back to the TMDB season-stills cache.
-                let url = cache
-                    .episode_tvdb_still
-                    .get(&entity.id)
-                    .cloned()
-                    .or_else(|| {
-                        let (Some(series_id), Some(season_num), Some(ep_num)) = (
-                            entity.series_id.as_deref(),
-                            entity
-                                .parent_index_number
-                                .and_then(|n| i32::try_from(n).ok()),
-                            entity.index_number.and_then(|n| i32::try_from(n).ok()),
-                        ) else {
-                            return None;
-                        };
-                        cache
-                            .season_stills
-                            .get(&(series_id.to_owned(), season_num))
-                            .and_then(|stills| stills.get(&ep_num))
-                            .cloned()
-                    });
-                let Some(url) = url else {
-                    return Vec::new();
-                };
-                let images = vec![RemoteImage {
-                    image_type: ImageType::Primary,
-                    url,
-                }];
-                download_images(tmdb, &item_dir, &entity.id, images).await
+            "Season" | "Episode" => {
+                self.fetch_tv_still_images(entity, short, cache, tmdb, &item_dir)
+                    .await
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The season-poster / episode-still image pass, split out of
+    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** fetches
+    /// its poster + every episode still from TMDB in one request (caching the
+    /// stills); an **episode** downloads the still cached earlier this scan
+    /// (TVDB's, else TMDB's season-stills map).
+    async fn fetch_tv_still_images(
+        &self,
+        entity: &BaseItemEntity,
+        short: &str,
+        cache: &mut ArtworkCache,
+        tmdb: &TmdbClient,
+        item_dir: &Path,
+    ) -> Vec<ItemImageInfo> {
+        if short == "Season" {
+            let (Some(series_id), Some(season_num)) = (
+                entity.series_id.as_deref(),
+                entity.index_number.and_then(|n| i32::try_from(n).ok()),
+            ) else {
+                return Vec::new();
+            };
+            let Some(&tmdb_id) = cache.series_tmdb.get(series_id) else {
+                return Vec::new(); // series didn't match TMDB
+            };
+            // One request yields the season poster + every episode still.
+            let season = tmdb.season_images(tmdb_id, season_num).await;
+            cache
+                .season_stills
+                .insert((series_id.to_owned(), season_num), season.episode_stills);
+            let images = season
+                .poster
+                .map(|url| {
+                    vec![RemoteImage {
+                        image_type: ImageType::Primary,
+                        url,
+                    }]
+                })
+                .unwrap_or_default();
+            return download_images(tmdb, item_dir, &entity.id, images).await;
+        }
+        // Episode: prefer the TVDB still cached during the metadata pass; else
+        // fall back to the TMDB season-stills cache.
+        let url = cache
+            .episode_tvdb_still
+            .get(&entity.id)
+            .cloned()
+            .or_else(|| {
+                let (Some(series_id), Some(season_num), Some(ep_num)) = (
+                    entity.series_id.as_deref(),
+                    entity
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) else {
+                    return None;
+                };
+                cache
+                    .season_stills
+                    .get(&(series_id.to_owned(), season_num))
+                    .and_then(|stills| stills.get(&ep_num))
+                    .cloned()
+            });
+        let Some(url) = url else {
+            return Vec::new();
+        };
+        let images = vec![RemoteImage {
+            image_type: ImageType::Primary,
+            url,
+        }];
+        download_images(tmdb, item_dir, &entity.id, images).await
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -1493,6 +1628,75 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &hermit_providers::TvdbEpi
     }
 }
 
+/// Applies embedded audio-tag metadata to a music row (fill-if-empty, so an NFO
+/// or prior scan wins), and returns the embedded MusicBrainz ids to persist.
+/// The port of `AudioFileProber`'s tag→item mapping (multi-values pipe-joined,
+/// matching Hermit's `Artists`/`AlbumArtists`/`Genres` column convention).
+fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(String, String)> {
+    if entity.album.is_none() {
+        entity.album.clone_from(&info.album);
+    }
+    if entity.artists.as_deref().unwrap_or_default().is_empty() && !info.artists.is_empty() {
+        entity.artists = Some(info.artists.join("|"));
+    }
+    if entity
+        .album_artists
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+        && !info.album_artists.is_empty()
+    {
+        entity.album_artists = Some(info.album_artists.join("|"));
+    }
+    if entity.genres.as_deref().unwrap_or_default().is_empty() && !info.genres.is_empty() {
+        entity.genres = Some(info.genres.join("|"));
+    }
+    if entity.index_number.is_none() {
+        entity.index_number = info.index_number.map(i64::from);
+    }
+    if entity.parent_index_number.is_none() {
+        entity.parent_index_number = info.parent_index_number.map(i64::from);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = info.production_year.map(i64::from);
+    }
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = info.premiere_date;
+    }
+    info.provider_ids
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The fanart movie id from the persisted provider ids: TMDb preferred (fanart
+/// keys on it), else IMDb.
+fn fanart_movie_id(ids: &[(String, String)]) -> Option<String> {
+    ids.iter()
+        .find(|(k, _)| k == "Tmdb")
+        .or_else(|| ids.iter().find(|(k, _)| k == "Imdb"))
+        .map(|(_, v)| v.clone())
+}
+
+/// Appends fanart rich images to a download list as type+URL [`RemoteImage`]s.
+fn append_fanart(images: &mut Vec<RemoteImage>, fanart: Vec<hermit_providers::TmdbImage>) {
+    images.extend(fanart.into_iter().map(|img| RemoteImage {
+        image_type: img.image_type,
+        url: img.url,
+    }));
+}
+
+/// Keeps the first image of each type (the primary provider's, then fanart's
+/// best per type after its sort), so the one-file-per-type downloader emits no
+/// duplicate rows.
+fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
+    let mut seen = std::collections::HashSet::new();
+    images
+        .into_iter()
+        .filter(|i| seen.insert(i.image_type))
+        .collect()
+}
+
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
@@ -1774,6 +1978,111 @@ mod tests {
         assert_eq!(e.community_rating, Some(7.5));
     }
 
+    // apply_audio_metadata fills empty music fields from probed tags (pipe-joined
+    // multi-values) and returns the embedded MusicBrainz ids to persist.
+    #[test]
+    fn apply_audio_metadata_fills_music_fields_and_returns_mb_ids() {
+        use hermit_db::entities::base_items::BaseItemEntity;
+        use hermit_model::media_info::MediaInfo;
+
+        let mut info = MediaInfo {
+            album: Some("Kind of Blue".into()),
+            artists: vec!["Miles Davis".into()],
+            album_artists: vec!["Miles Davis".into()],
+            genres: vec!["Jazz".into(), "Modal".into()],
+            index_number: Some(3),
+            parent_index_number: Some(1),
+            production_year: Some(1959),
+            ..MediaInfo::default()
+        };
+        info.provider_ids
+            .insert("MusicBrainzAlbum".into(), "album-mbid".into());
+        info.provider_ids
+            .insert("MusicBrainzArtist".into(), "artist-mbid".into());
+
+        // Empty entity (a bare Audio row) → filled.
+        let mut e = BaseItemEntity {
+            media_type: Some("Audio".into()),
+            ..Default::default()
+        };
+        let ids = super::apply_audio_metadata(&mut e, &info);
+        assert_eq!(e.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(e.artists.as_deref(), Some("Miles Davis"));
+        assert_eq!(e.album_artists.as_deref(), Some("Miles Davis"));
+        assert_eq!(e.genres.as_deref(), Some("Jazz|Modal"));
+        assert_eq!(e.index_number, Some(3));
+        assert_eq!(e.parent_index_number, Some(1));
+        assert_eq!(e.production_year, Some(1959));
+        // MB ids returned for persistence.
+        let mut keys: Vec<&str> = ids.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["MusicBrainzAlbum", "MusicBrainzArtist"]);
+
+        // A field already set (e.g. an NFO year) is not overwritten.
+        let mut pre = BaseItemEntity {
+            production_year: Some(2000),
+            album: Some("Existing".into()),
+            ..Default::default()
+        };
+        super::apply_audio_metadata(&mut pre, &info);
+        assert_eq!(pre.production_year, Some(2000));
+        assert_eq!(pre.album.as_deref(), Some("Existing"));
+    }
+
+    // fanart id selection prefers Tmdb over Imdb; dedup keeps the first image of
+    // each type so the one-file-per-type downloader emits no duplicate rows.
+    #[test]
+    fn fanart_id_selection_and_type_dedup() {
+        use hermit_model::entities::ImageType;
+
+        // Tmdb preferred.
+        let ids = vec![
+            ("Imdb".to_owned(), "tt0137523".to_owned()),
+            ("Tmdb".to_owned(), "550".to_owned()),
+        ];
+        assert_eq!(super::fanart_movie_id(&ids).as_deref(), Some("550"));
+        // Imdb fallback when no Tmdb.
+        let ids = vec![("Imdb".to_owned(), "tt1".to_owned())];
+        assert_eq!(super::fanart_movie_id(&ids).as_deref(), Some("tt1"));
+        // Neither → None.
+        assert!(super::fanart_movie_id(&[("Tvdb".to_owned(), "1".to_owned())]).is_none());
+
+        let img = |t, u: &str| super::RemoteImage {
+            image_type: t,
+            url: u.to_owned(),
+        };
+        // append_fanart converts fanart's rich images to type+URL and appends
+        // them after the primary provider's; dedup then keeps the first per type.
+        let mut images = vec![img(ImageType::Primary, "tmdb-poster")];
+        super::append_fanart(
+            &mut images,
+            vec![
+                hermit_providers::TmdbImage {
+                    image_type: ImageType::Primary,
+                    url: "fanart-poster".into(),
+                    width: Some(1000),
+                    height: None,
+                    community_rating: None,
+                    vote_count: None,
+                    language: None,
+                },
+                hermit_providers::TmdbImage {
+                    image_type: ImageType::Logo,
+                    url: "fanart-logo".into(),
+                    width: Some(800),
+                    height: None,
+                    community_rating: None,
+                    vote_count: None,
+                    language: None,
+                },
+            ],
+        );
+        let deduped = super::dedup_images_by_type(images);
+        let urls: Vec<&str> = deduped.iter().map(|i| i.url.as_str()).collect();
+        // TMDB poster keeps Primary; fanart contributes the Logo it lacks.
+        assert_eq!(urls, vec!["tmdb-poster", "fanart-logo"]);
+    }
+
     // apply_tvdb_series fills only empty fields and sets the end date for ended
     // series; TVDB people carry no numeric provider id.
     #[test]
@@ -1877,10 +2186,10 @@ mod tests {
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
             ..Default::default()
         };
-        let people = scanner
+        let result = scanner
             .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
             .await;
-        assert!(people.is_empty());
+        assert!(result.people.is_empty() && result.provider_ids.is_empty());
         assert!(cache.series_tvdb.is_empty());
 
         // Episode whose series isn't in the TVDB cache → skipped (no network).
@@ -1891,10 +2200,10 @@ mod tests {
             index_number: Some(1),
             ..Default::default()
         };
-        let people = scanner
+        let result = scanner
             .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
             .await;
-        assert!(people.is_empty());
+        assert!(result.people.is_empty());
     }
 
     // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.

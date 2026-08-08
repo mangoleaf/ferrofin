@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{IsoType, MediaStreamType, Video3DFormat};
 use hermit_model::entities_media::MediaStream;
-use hermit_model::media_info::MediaProtocol;
+use hermit_model::media_info::{MediaInfo, MediaProtocol};
 use hermit_traits::error::ServiceError;
 use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
@@ -273,6 +273,14 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         &self,
         request: &MediaInfoRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
+        // The source (with chapters) is the media_source slice of the full probe.
+        Ok(self.get_media_info_full(request).await?.media_source)
+    }
+
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<MediaInfo, ServiceError> {
         let source = &request.media_source;
         let input_file = source
             .path
@@ -296,7 +304,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
-        let info = self.normalizer.get_media_info(
+        let mut info = self.normalizer.get_media_info(
             data,
             source.video_type,
             request.media_is_audio,
@@ -305,9 +313,8 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         );
         // Carry the probed chapters on the source (internal-only field) so the
         // scan can persist them; they were requested via `extract_chapters`.
-        let mut media_source = info.media_source;
-        media_source.chapters = info.chapters;
-        Ok(media_source)
+        info.media_source.chapters = info.chapters.clone();
+        Ok(info)
     }
 
     async fn extract_audio_image(

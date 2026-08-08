@@ -656,6 +656,82 @@ fn set_audio_info_from_tags(audio: &mut MediaInfo, tags: &CaseInsensitiveTags) {
     fetch_studios(audio, tags, "ensemble");
     fetch_studios(audio, tags, "publisher");
     fetch_studios(audio, tags, "label");
+
+    set_musicbrainz_ids(audio, tags);
+}
+
+/// The MusicBrainz provider id ← its embedded-tag key variants (underscore,
+/// spaced, and mka `track.*` forms), a verbatim port of `AudioFileProber`'s tag
+/// reads. The tag map is case-insensitive, so one case per spelling suffices.
+const MUSICBRAINZ_TAGS: &[(&str, &[&str])] = &[
+    (
+        "MusicBrainzAlbumArtist",
+        &[
+            "MUSICBRAINZ_ALBUMARTISTID",
+            "MusicBrainz Album Artist Id",
+            "track.musicbrainz_album_artist_id",
+        ],
+    ),
+    (
+        "MusicBrainzArtist",
+        &[
+            "MUSICBRAINZ_ARTISTID",
+            "MusicBrainz Artist Id",
+            "track.musicbrainz_artist_id",
+        ],
+    ),
+    (
+        "MusicBrainzAlbum",
+        &[
+            "MUSICBRAINZ_ALBUMID",
+            "MusicBrainz Album Id",
+            "track.musicbrainz_album_id",
+        ],
+    ),
+    (
+        "MusicBrainzReleaseGroup",
+        &[
+            "MUSICBRAINZ_RELEASEGROUPID",
+            "MusicBrainz Release Group Id",
+            "track.musicbrainz_release_group_id",
+        ],
+    ),
+    (
+        "MusicBrainzTrack",
+        &[
+            "MUSICBRAINZ_RELEASETRACKID",
+            "MusicBrainz Release Track Id",
+            "track.musicbrainz_release_track_id",
+        ],
+    ),
+    (
+        "MusicBrainzRecording",
+        &[
+            "MUSICBRAINZ_TRACKID",
+            "MusicBrainz Track Id",
+            "track.musicbrainz_track_id",
+        ],
+    ),
+];
+
+/// Reads the six embedded MusicBrainz ids into `provider_ids`. When a tag is
+/// multi-valued (separated by the internal unit separator), the **first** id is
+/// kept — Jellyfin's behavior.
+fn set_musicbrainz_ids(audio: &mut MediaInfo, tags: &CaseInsensitiveTags) {
+    for (provider, keys) in MUSICBRAINZ_TAGS {
+        if let Some(raw) = get_first_not_blank(tags, keys) {
+            let first = raw
+                .split(['\u{001F}', ';', '/'])
+                .map(str::trim)
+                .find(|s| !s.is_empty());
+            if let Some(id) = first {
+                audio
+                    .provider_ids
+                    .entry((*provider).to_owned())
+                    .or_insert_with(|| id.to_owned());
+            }
+        }
+    }
 }
 
 /// Estimates the missing single-video-stream bitrate as the container bitrate
@@ -1380,4 +1456,54 @@ fn title_case(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod musicbrainz_tests {
+    use super::{MediaInfo, set_musicbrainz_ids};
+    use crate::probing::ff_probe_helpers::CaseInsensitiveTags;
+
+    /// The tag map stores keys lowercased (as `flatten_tags` produces them).
+    fn tags(pairs: &[(&str, &str)]) -> CaseInsensitiveTags {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn reads_all_six_ids_across_key_spellings() {
+        // underscore, spaced, and mka `track.*` spellings all resolve.
+        let t = tags(&[
+            ("MUSICBRAINZ_ARTISTID", "artist-mbid"),
+            ("MusicBrainz Album Artist Id", "albumartist-mbid"),
+            ("track.musicbrainz_album_id", "album-mbid"),
+            ("MUSICBRAINZ_RELEASEGROUPID", "rg-mbid"),
+            ("MUSICBRAINZ_RELEASETRACKID", "reltrack-mbid"),
+            ("MUSICBRAINZ_TRACKID", "recording-mbid"),
+        ]);
+        let mut info = MediaInfo::default();
+        set_musicbrainz_ids(&mut info, &t);
+        assert_eq!(info.provider_ids["MusicBrainzArtist"], "artist-mbid");
+        assert_eq!(
+            info.provider_ids["MusicBrainzAlbumArtist"],
+            "albumartist-mbid"
+        );
+        assert_eq!(info.provider_ids["MusicBrainzAlbum"], "album-mbid");
+        assert_eq!(info.provider_ids["MusicBrainzReleaseGroup"], "rg-mbid");
+        assert_eq!(info.provider_ids["MusicBrainzTrack"], "reltrack-mbid");
+        assert_eq!(info.provider_ids["MusicBrainzRecording"], "recording-mbid");
+    }
+
+    #[test]
+    fn takes_first_of_a_multivalue_id_and_skips_blanks() {
+        let t = tags(&[
+            ("MUSICBRAINZ_ARTISTID", "first-mbid\u{001F}second-mbid"),
+            ("MUSICBRAINZ_ALBUMID", "   "),
+        ]);
+        let mut info = MediaInfo::default();
+        set_musicbrainz_ids(&mut info, &t);
+        assert_eq!(info.provider_ids["MusicBrainzArtist"], "first-mbid");
+        assert!(!info.provider_ids.contains_key("MusicBrainzAlbum"));
+    }
 }
