@@ -352,6 +352,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolution_paths_over_mock_server() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/artist",
+                r#"{"artists":[{"id":"artist-mbid","name":"Miles Davis"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/release-group/",
+                r#"{"releases":[{"id":"rel-from-rg"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/release/",
+                r#"{"id":"rel-1","release-group":{"id":"rg-looked-up"}}"#.to_owned(),
+            ),
+            (
+                "/ws/2/release?",
+                r#"{"releases":[{"id":"rel-searched","release-group":{"id":"rg-searched"}}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+
+        assert_eq!(
+            c.search_artist("Miles Davis").await.as_deref(),
+            Some("artist-mbid")
+        );
+
+        // Neither id known → search by name populates both.
+        let ids = c
+            .resolve_album(
+                "Kind of Blue",
+                AlbumIds::default(),
+                Some("artist-mbid"),
+                None,
+            )
+            .await;
+        assert_eq!(ids.release_id.as_deref(), Some("rel-searched"));
+        assert_eq!(ids.release_group_id.as_deref(), Some("rg-searched"));
+
+        // Release-group known, release missing → first_release_of fills the release.
+        let ids = c
+            .resolve_album(
+                "X",
+                AlbumIds {
+                    release_group_id: Some("rg-x".to_owned()),
+                    ..AlbumIds::default()
+                },
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(ids.release_id.as_deref(), Some("rel-from-rg"));
+
+        // Release known, group missing → release_group_of fills the group.
+        let ids = c
+            .resolve_album(
+                "X",
+                AlbumIds {
+                    release_id: Some("rel-y".to_owned()),
+                    ..AlbumIds::default()
+                },
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(ids.release_group_id.as_deref(), Some("rg-looked-up"));
+    }
+
+    #[tokio::test]
     #[ignore = "hits the live MusicBrainz API; run with --ignored"]
     async fn live_resolves_kind_of_blue() {
         let c = MusicBrainzClient::new("", "test");

@@ -186,6 +186,9 @@ pub struct LibraryScanner {
     /// Optional MusicBrainz client — resolves `MusicBrainz*` ids for music items
     /// in the post-scan enrichment pass. Paired with [`item_repository`](Self::item_repository).
     musicbrainz: Option<Arc<hermit_providers::MusicBrainzClient>>,
+    /// Optional AudioDb client — artist bio/genre + album artwork by MusicBrainz
+    /// id, in the post-scan music-enrichment pass.
+    audiodb: Option<Arc<hermit_providers::AudioDbClient>>,
     /// Item repository for the post-scan music-enrichment pass (querying the
     /// MusicAlbum/MusicArtist rows + tracks it created). Absent → no music pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
@@ -232,6 +235,7 @@ impl LibraryScanner {
             tvdb: None,
             fanart: None,
             musicbrainz: None,
+            audiodb: None,
             item_repository: None,
             metadata_dir: None,
             people: None,
@@ -292,6 +296,14 @@ impl LibraryScanner {
     ) -> Self {
         self.musicbrainz = Some(musicbrainz);
         self.item_repository = Some(item_repository);
+        self
+    }
+
+    /// Attaches the AudioDb client so music artists/albums get bio + artwork
+    /// during the post-scan music pass (keyed off the resolved MusicBrainz ids).
+    #[must_use]
+    pub fn with_audiodb(mut self, audiodb: Arc<hermit_providers::AudioDbClient>) -> Self {
+        self.audiodb = Some(audiodb);
         self
     }
 
@@ -535,11 +547,45 @@ impl LibraryScanner {
             }
         }
 
-        self.enrich_albums(items.as_ref(), mb.as_ref(), &track_album, &track_rg)
-            .await?;
+        self.enrich_albums(
+            items.as_ref(),
+            mb.as_ref(),
+            &track_album,
+            &track_rg,
+            &artist_mbid,
+        )
+        .await?;
         self.enrich_artists(items.as_ref(), mb.as_ref(), &artist_mbid)
             .await?;
         Ok(())
+    }
+
+    /// Downloads music artwork (AudioDb/fanart) into `{meta}/library/{id}` and
+    /// persists the rows, deduped one-file-per-type. No-op without a download
+    /// client + metadata dir. Best-effort.
+    async fn persist_music_images(&self, item_id: Uuid, images: Vec<hermit_providers::TmdbImage>) {
+        if images.is_empty() {
+            return;
+        }
+        let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
+            return;
+        };
+        let id = item_id.to_string();
+        let mut remote: Vec<RemoteImage> = Vec::new();
+        append_fanart(&mut remote, images);
+        let mut infos = download_images(
+            tmdb,
+            &meta_root.join(&id),
+            &id,
+            dedup_images_by_type(remote),
+        )
+        .await;
+        self.fill_image_metadata(&mut infos).await;
+        if !infos.is_empty()
+            && let Err(err) = self.persistence.save_item_images(item_id, &infos).await
+        {
+            tracing::warn!(%err, item = %id, "failed to persist music artwork");
+        }
     }
 
     /// Resolves and persists each `MusicAlbum`'s `MusicBrainzAlbum` +
@@ -551,6 +597,7 @@ impl LibraryScanner {
         mb: &hermit_providers::MusicBrainzClient,
         track_album: &HashMap<Uuid, String>,
         track_rg: &HashMap<Uuid, String>,
+        artist_mbid: &HashMap<String, String>,
     ) -> Result<(), ServiceError> {
         let albums = items
             .get_item_list(&InternalItemsQuery {
@@ -560,9 +607,28 @@ impl LibraryScanner {
             })
             .await?;
         for album in albums {
-            let Ok(album_uuid) = Uuid::parse_str(&album.id) else {
-                continue;
-            };
+            self.enrich_one_album(&album, items, mb, track_album, track_rg, artist_mbid)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Enriches one `MusicAlbum`: aggregate album-artist/year from its tracks,
+    /// resolve + persist its MusicBrainz ids, then AudioDb metadata + AudioDb/
+    /// fanart artwork.
+    async fn enrich_one_album(
+        &self,
+        album: &BaseItemEntity,
+        items: &dyn ItemRepository,
+        mb: &hermit_providers::MusicBrainzClient,
+        track_album: &HashMap<Uuid, String>,
+        track_rg: &HashMap<Uuid, String>,
+        artist_mbid: &HashMap<String, String>,
+    ) -> Result<(), ServiceError> {
+        let Ok(album_uuid) = Uuid::parse_str(&album.id) else {
+            return Ok(());
+        };
+        {
             let tracks = items
                 .get_item_list(&InternalItemsQuery {
                     parent_id: album_uuid,
@@ -613,14 +679,15 @@ impl LibraryScanner {
                     .iter()
                     .find_map(|t| track_rg.get(&parse_id(&t.id)?).cloned()),
             };
-            let album_name = updated.name.as_deref().unwrap_or_default();
-            let album_artist = updated
+            let album_name = updated.name.clone().unwrap_or_default();
+            let album_artist: Option<String> = updated
                 .album_artists
                 .as_deref()
                 .and_then(|s| s.split('|').next())
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
             let resolved = mb
-                .resolve_album(album_name, embedded, None, album_artist)
+                .resolve_album(&album_name, embedded, None, album_artist.as_deref())
                 .await;
             if let Some(id) = &resolved.release_id {
                 let _ = self
@@ -634,12 +701,61 @@ impl LibraryScanner {
                     .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
                     .await;
             }
+
+            self.enrich_album_artwork(
+                album_uuid,
+                &mut updated,
+                resolved.release_group_id.as_deref(),
+                album_artist.as_deref(),
+                artist_mbid,
+            )
+            .await?;
         }
         Ok(())
     }
 
+    /// AudioDb album metadata (description/year) + AudioDb/fanart album artwork,
+    /// keyed by the release-group id (fanart also needs the album-artist's mbid).
+    async fn enrich_album_artwork(
+        &self,
+        album_uuid: Uuid,
+        updated: &mut BaseItemEntity,
+        release_group_id: Option<&str>,
+        album_artist: Option<&str>,
+        artist_mbid: &HashMap<String, String>,
+    ) -> Result<(), ServiceError> {
+        let mut changed = false;
+        let mut images: Vec<hermit_providers::TmdbImage> = Vec::new();
+        if let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
+            && let Some(a) = adb.album(rg).await
+        {
+            if updated.overview.is_none() && a.description.is_some() {
+                updated.overview = a.description;
+                changed = true;
+            }
+            if updated.production_year.is_none() && a.year.is_some() {
+                updated.production_year = a.year.map(i64::from);
+                changed = true;
+            }
+            images.extend(a.images);
+        }
+        if let (Some(fanart), Some(rg), Some(name)) = (&self.fanart, release_group_id, album_artist)
+            && let Some(aa_mbid) = artist_mbid.get(name)
+        {
+            images.extend(fanart.album_images(aa_mbid, rg).await);
+        }
+        if changed {
+            self.persistence
+                .save_items(std::slice::from_ref(updated))
+                .await?;
+        }
+        self.persist_music_images(album_uuid, images).await;
+        Ok(())
+    }
+
     /// Resolves and persists each `MusicArtist`'s `MusicBrainzArtist` id — the
-    /// embedded album-artist id from its tracks, else a MusicBrainz name search.
+    /// embedded album-artist id from its tracks, else a MusicBrainz name search —
+    /// then its AudioDb bio/genre + AudioDb/fanart artwork.
     async fn enrich_artists(
         &self,
         items: &dyn ItemRepository,
@@ -664,12 +780,43 @@ impl LibraryScanner {
                 Some(id) => Some(id.clone()),
                 None => mb.search_artist(name).await,
             };
-            if let Some(id) = mbid {
-                let _ = self
-                    .persistence
-                    .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
-                    .await;
+            let Some(id) = mbid else {
+                continue;
+            };
+            let _ = self
+                .persistence
+                .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
+                .await;
+
+            // AudioDb bio/genre + AudioDb/fanart artist artwork, keyed by the
+            // resolved MusicBrainz artist id.
+            let mut updated = artist.clone();
+            let mut changed = false;
+            let mut images: Vec<hermit_providers::TmdbImage> = Vec::new();
+            if let Some(adb) = &self.audiodb
+                && let Some(a) = adb.artist(&id).await
+            {
+                if updated.overview.is_none() && a.biography.is_some() {
+                    updated.overview = a.biography;
+                    changed = true;
+                }
+                if updated.genres.as_deref().unwrap_or_default().is_empty()
+                    && let Some(genre) = a.genre.filter(|g| !g.is_empty())
+                {
+                    updated.genres = Some(genre);
+                    changed = true;
+                }
+                images.extend(a.images);
             }
+            if let Some(fanart) = &self.fanart {
+                images.extend(fanart.artist_images(&id).await);
+            }
+            if changed {
+                self.persistence
+                    .save_items(std::slice::from_ref(&updated))
+                    .await?;
+            }
+            self.persist_music_images(artist_uuid, images).await;
         }
         Ok(())
     }

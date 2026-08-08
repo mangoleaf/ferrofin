@@ -441,6 +441,9 @@ pub async fn build_app_state(
         )),
         Arc::clone(&item_repository),
     )
+    // AudioDb artist bio/genre + artist/album artwork (by MusicBrainz id),
+    // fetched in the post-scan music pass. Built-in free key.
+    .with_audiodb(Arc::new(hermit_providers::AudioDbClient::new()))
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
     .with_image_processor(Arc::clone(&image_processor));

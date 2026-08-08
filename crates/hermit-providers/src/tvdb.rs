@@ -286,6 +286,7 @@ pub struct TvdbClient {
     api_key: SecretString,
     pin: Option<String>,
     token: Mutex<Option<String>>,
+    base_url: String,
 }
 
 impl std::fmt::Debug for TvdbClient {
@@ -324,7 +325,15 @@ impl TvdbClient {
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
             token: Mutex::new(None),
+            base_url: API_BASE.to_owned(),
         }
+    }
+
+    /// Points the client at `base_url` (a mock server) for tests.
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.to_owned();
+        self
     }
 
     /// The cached bearer token, logging in on first use. Returns `None` if login
@@ -345,7 +354,7 @@ impl TvdbClient {
         }
         let resp = self
             .http
-            .post(format!("{API_BASE}/login"))
+            .post(format!("{}/login", self.base_url))
             .json(&body)
             .send()
             .await
@@ -368,7 +377,7 @@ impl TvdbClient {
         let token = self.token().await?;
         let resp = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{}{path}", self.base_url))
             .bearer_auth(token)
             .query(query)
             .send()
@@ -802,6 +811,87 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tvdb_id, 121_361);
         assert_eq!(hits[0].year, Some(2011));
+    }
+
+    #[tokio::test]
+    async fn client_methods_over_mock_server() {
+        use crate::mock_http::MockServer;
+
+        let series = r#"{"data":{"name":"Game of Thrones","slug":"got",
+          "firstAired":"2011-04-17","lastAired":"2019-05-19","averageRuntime":60,
+          "status":{"name":"Ended"},"genres":[{"name":"Drama"}],
+          "contentRatings":[{"name":"TV-MA","country":"usa"}],
+          "remoteIds":[{"id":"tt0944947","sourceName":"IMDB"},{"id":1399,"sourceName":"TheMovieDB.com"}],
+          "latestNetwork":{"name":"HBO"},
+          "characters":[{"personName":"Emilia Clarke","name":"Daenerys","peopleType":"Actor"}],
+          "artworks":[{"image":"/p.jpg","type":2,"language":"eng"}]}}"#;
+        let server = MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            (
+                "/search",
+                r#"{"data":[{"tvdb_id":"121361","name":"Game of Thrones","year":"2011","image_url":"/g.jpg"}]}"#.to_owned(),
+            ),
+            (
+                "/episodes/official",
+                r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":1}]}}"#.to_owned(),
+            ),
+            (
+                "/episodes/",
+                r#"{"data":{"name":"Winter Is Coming","overview":"Ned is summoned.","aired":"2011-04-17","image":"/s.jpg","characters":[{"personName":"Sean Bean","peopleType":"Actor"}]}}"#.to_owned(),
+            ),
+            ("/series/", series.to_owned()),
+            (
+                "/seasons/",
+                r#"{"data":{"name":"Season 1","overview":"first","image":"/se.jpg"}}"#.to_owned(),
+            ),
+            (
+                "/people/",
+                r#"{"data":{"biography":"An actress.","birthDate":"1986-10-23","birthPlace":"London"}}"#.to_owned(),
+            ),
+            ("/img.jpg", "IMAGEBYTES".to_owned()),
+        ])
+        .await;
+        let c = TvdbClient::new().with_base_url(&server.base_url);
+
+        let hits = c.search("Game of Thrones", Some(2011)).await;
+        assert_eq!(hits.first().map(|h| h.tvdb_id), Some(121_361));
+
+        let d = c.series_details(121_361, "usa").await.expect("series");
+        assert_eq!(d.name.as_deref(), Some("Game of Thrones"));
+        assert_eq!(d.imdb_id.as_deref(), Some("tt0944947"));
+        assert_eq!(d.tmdb_id.as_deref(), Some("1399"));
+        assert_eq!(d.images.len(), 1);
+        assert_eq!(d.people.len(), 1);
+
+        let ep = c
+            .episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 1)
+            .await
+            .expect("episode");
+        assert_eq!(ep.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(ep.image_url.as_deref(), Some("/s.jpg"));
+
+        let season = c.season_details(1).await.expect("season");
+        assert_eq!(season.name.as_deref(), Some("Season 1"));
+
+        let person = c.person_details(1).await.expect("person");
+        assert_eq!(person.biography.as_deref(), Some("An actress."));
+        assert_eq!(person.birthplace.as_deref(), Some("London"));
+
+        let bytes = c
+            .download(&format!("{}/img.jpg", server.base_url))
+            .await
+            .expect("download");
+        assert_eq!(bytes, b"IMAGEBYTES");
+    }
+
+    #[tokio::test]
+    async fn login_failure_yields_no_data() {
+        use crate::mock_http::MockServer;
+        // No /login route → token() fails → every call returns None/empty.
+        let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
+        let c = TvdbClient::new().with_base_url(&server.base_url);
+        assert!(c.search("x", None).await.is_empty());
+        assert!(c.series_details(1, "usa").await.is_none());
     }
 
     #[tokio::test]

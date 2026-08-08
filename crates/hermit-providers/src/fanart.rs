@@ -83,6 +83,38 @@ struct SeriesRoot {
     tvposter: Vec<FanartImage>,
 }
 
+/// The music (artist) response (`/music/{mbid}`).
+#[derive(Debug, Default, Deserialize)]
+struct MusicRoot {
+    #[serde(default)]
+    artistthumb: Vec<FanartImage>,
+    #[serde(default)]
+    artistbackground: Vec<FanartImage>,
+    #[serde(default)]
+    hdmusiclogo: Vec<FanartImage>,
+    #[serde(default)]
+    musiclogo: Vec<FanartImage>,
+    #[serde(default)]
+    hdmusicarts: Vec<FanartImage>,
+    #[serde(default)]
+    musicarts: Vec<FanartImage>,
+    #[serde(default)]
+    musicbanner: Vec<FanartImage>,
+    #[serde(default)]
+    albums: Vec<FanartAlbum>,
+}
+
+/// One album entry inside a music response, keyed by its release-group id.
+#[derive(Debug, Default, Deserialize)]
+struct FanartAlbum {
+    #[serde(default)]
+    release_group_id: Option<String>,
+    #[serde(default)]
+    albumcover: Vec<FanartImage>,
+    #[serde(default)]
+    cdart: Vec<FanartImage>,
+}
+
 /// A fanart.tv client. Cheap to clone (wraps a [`reqwest::Client`]).
 #[derive(Debug, Clone)]
 pub struct FanartClient {
@@ -94,6 +126,8 @@ pub struct FanartClient {
     // ponytail: fixed language — thread the library's metadata language through
     // if per-library artwork language selection is wanted.
     language: String,
+    /// The web-service base (const in production; overridable in tests).
+    base_url: String,
 }
 
 impl Default for FanartClient {
@@ -111,13 +145,21 @@ impl FanartClient {
             http: reqwest::Client::new(),
             personal_key: personal_key.filter(|k| !k.is_empty()),
             language: "en".to_owned(),
+            base_url: API_BASE.to_owned(),
         }
+    }
+
+    /// Points the client at `base_url` (a mock server) for tests.
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.to_owned();
+        self
     }
 
     /// Builds the `{type}/{id}` request URL with the api key (+ optional
     /// client_key).
     fn url(&self, media_type: &str, id: &str) -> String {
-        let mut url = format!("{API_BASE}/{media_type}/{id}?api_key={API_KEY}");
+        let mut url = format!("{}/{media_type}/{id}?api_key={API_KEY}", self.base_url);
         if let Some(key) = &self.personal_key {
             url.push_str("&client_key=");
             url.push_str(key);
@@ -182,6 +224,54 @@ impl FanartClient {
         populate(&mut out, &root.tvthumb, ImageType::Thumb, 1000, false);
         populate(&mut out, &root.tvbanner, ImageType::Banner, 1000, false);
         populate(&mut out, &root.tvposter, ImageType::Primary, 1000, false);
+        self.sort(&mut out);
+        out
+    }
+
+    /// Artist artwork by MusicBrainz artist id, ranked. Port of `ArtistProvider`.
+    pub async fn artist_images(&self, mb_artist_id: &str) -> Vec<TmdbImage> {
+        let Some(root): Option<MusicRoot> = self.fetch("music", mb_artist_id).await else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        populate(&mut out, &root.artistthumb, ImageType::Primary, 1000, false);
+        populate(&mut out, &root.hdmusiclogo, ImageType::Logo, 800, false);
+        populate(&mut out, &root.musiclogo, ImageType::Logo, 400, false);
+        populate(&mut out, &root.hdmusicarts, ImageType::Art, 1000, false);
+        populate(&mut out, &root.musicarts, ImageType::Art, 500, false);
+        populate(&mut out, &root.musicbanner, ImageType::Banner, 1000, false);
+        populate(
+            &mut out,
+            &root.artistbackground,
+            ImageType::Backdrop,
+            1920,
+            false,
+        );
+        self.sort(&mut out);
+        out
+    }
+
+    /// Album artwork by the album-artist's MusicBrainz id + the album's
+    /// release-group id (fanart nests albums under the artist). Port of
+    /// `AlbumProvider`: the matching album's `albumcover`→Primary, `cdart`→Disc.
+    pub async fn album_images(
+        &self,
+        mb_album_artist_id: &str,
+        release_group_id: &str,
+    ) -> Vec<TmdbImage> {
+        let Some(root): Option<MusicRoot> = self.fetch("music", mb_album_artist_id).await else {
+            return Vec::new();
+        };
+        let Some(album) = root.albums.into_iter().find(|a| {
+            a.release_group_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(release_group_id))
+        }) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        populate(&mut out, &album.albumcover, ImageType::Primary, 1000, false);
+        populate(&mut out, &album.cdart, ImageType::Disc, 1000, false);
         self.sort(&mut out);
         out
     }
@@ -415,6 +505,55 @@ mod tests {
         );
         let c = FanartClient::new(Some("mykey".to_owned()));
         assert!(c.url("tv", "121361").ends_with("&client_key=mykey"));
+    }
+
+    #[tokio::test]
+    async fn image_legs_over_mock_server() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/movies/",
+                r#"{"movieposter":[{"id":"1","url":"/p.jpg","lang":"en","likes":"9"}],
+                    "hdmovielogo":[{"id":"2","url":"/l.jpg","lang":"en","likes":"3"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/tv/",
+                r#"{"tvposter":[{"id":"1","url":"/tp.jpg","lang":"en","likes":"5"}],
+                    "seasonthumb":[{"id":"2","url":"/st.jpg","lang":"en","season":"2","likes":"1"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/music/",
+                r#"{"artistthumb":[{"id":"1","url":"/at.jpg","lang":"en","likes":"7"}],
+                    "hdmusiclogo":[{"id":"2","url":"/ml.jpg","lang":"en","likes":"2"}],
+                    "albums":[{"release_group_id":"rg-1","albumcover":[{"id":"3","url":"/ac.jpg","likes":"4"}],
+                               "cdart":[{"id":"4","url":"/cd.jpg","likes":"1"}]}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = FanartClient::new(None).with_base_url(&server.base_url);
+
+        let movie = c.movie_images("603").await;
+        assert!(movie.iter().any(|i| i.image_type == ImageType::Primary));
+        assert!(movie.iter().any(|i| i.image_type == ImageType::Logo));
+
+        // Series drops the season-specific thumb; keeps the poster.
+        let series = c.series_images("121361").await;
+        assert!(series.iter().any(|i| i.image_type == ImageType::Primary));
+        assert!(!series.iter().any(|i| i.image_type == ImageType::Thumb));
+
+        let artist = c.artist_images("mbid").await;
+        assert!(artist.iter().any(|i| i.image_type == ImageType::Primary));
+        assert!(artist.iter().any(|i| i.image_type == ImageType::Logo));
+
+        // Album filtered by release-group id → cover + disc.
+        let album = c.album_images("mbid", "rg-1").await;
+        assert!(album.iter().any(|i| i.image_type == ImageType::Primary));
+        assert!(album.iter().any(|i| i.image_type == ImageType::Disc));
+        // A non-matching release group → nothing.
+        assert!(c.album_images("mbid", "nope").await.is_empty());
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! are feature-gated and deferred (enrichment; need keys; not First-Light).
 //! Filled by the Wave 5 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 
+pub mod audiodb;
 pub mod container_types;
 pub mod error;
 pub mod fanart;
@@ -15,6 +16,8 @@ pub mod local_images;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
+#[cfg(test)]
+mod mock_http;
 pub mod musicbrainz;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
@@ -33,6 +36,7 @@ pub use lrclib::{LrcLibConfig, LrcLibProvider};
 #[cfg(feature = "opensubtitles")]
 pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
+pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use musicbrainz::{AlbumIds, MusicBrainzClient};
 pub use omdb::OmdbClient;
