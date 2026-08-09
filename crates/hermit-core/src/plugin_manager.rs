@@ -64,12 +64,21 @@ pub struct PluginConfigPage {
 
 impl RegisteredPlugin {
     /// Builds a registration, normalizing `has_image`/`can_uninstall` on the
-    /// descriptor (image presence drives `has_image`; compiled-in ⇒ never
-    /// uninstallable).
+    /// descriptor. Image presence drives `has_image`.
+    ///
+    /// `can_uninstall` is forced **`true`** even though a compiled-in extension
+    /// can't actually be removed at runtime. jellyfin-web gates the dashboard
+    /// enable/disable toggle on `CanUninstall` — the *same* flag as the uninstall
+    /// button, with no separate "can be disabled" field — so reporting `false`
+    /// hides the toggle entirely and the extension is stuck showing "Active".
+    /// We report `true` to surface the toggle; [`remove_plugin`] still honestly
+    /// rejects the uninstall itself.
+    ///
+    /// [`remove_plugin`]: HermitPluginManager::remove_plugin
     #[must_use]
     pub fn new(mut descriptor: PluginDescriptor, image: Option<PluginImage>) -> Self {
         descriptor.has_image = image.is_some();
-        descriptor.can_uninstall = false;
+        descriptor.can_uninstall = true;
         Self {
             descriptor,
             image,

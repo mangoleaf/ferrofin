@@ -40,7 +40,7 @@ impl RecordingPlugins {
             description: "a demo plugin".to_owned(),
             enabled: true,
             has_image: true,
-            can_uninstall: false,
+            can_uninstall: true,
         }
     }
 
@@ -152,7 +152,7 @@ async fn get_plugins_lists_installed() {
     let body = body_string(resp).await;
     assert!(body.contains("\"Name\":\"Demo\""), "{body}");
     assert!(body.contains("\"Status\":\"Active\""), "{body}");
-    assert!(body.contains("\"CanUninstall\":false"), "{body}");
+    assert!(body.contains("\"CanUninstall\":true"), "{body}");
 }
 
 #[tokio::test]
