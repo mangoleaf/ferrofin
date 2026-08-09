@@ -121,6 +121,9 @@
 <script>
 const CMP_KEYS = ["fixture_hash", "cpus", "mem", "jellyfin_image"];
 const num = (x) => x == null ? "—" : (+x).toFixed(x < 10 ? 2 : 0);
+// Same-SHA reruns share meta.hermit; run_label carries the " (2)", " (3)" suffix. Older
+// records predate run_label, so fall back to the bare version.
+const vlabel = (r) => r.meta.run_label || r.meta.hermit;
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
 const opCell = (op) => {
   const [m, ...rest] = op.split(" ");
@@ -129,7 +132,7 @@ const opCell = (op) => {
 let RUNS = [];
 
 function fillSelects() {
-  const opt = (r, i) => `<option value="${i}">${r.meta.hermit}${r.meta.legacy ? " (legacy)" : ""}</option>`;
+  const opt = (r, i) => `<option value="${i}">${vlabel(r)}${r.meta.legacy ? " (legacy)" : ""}</option>`;
   const idx = RUNS.map((_, i) => i).reverse();   // newest first
   run.innerHTML = idx.map(i => opt(RUNS[i], i)).join("");
   base.innerHTML = `<option value="">— none —</option>` + idx.map(i => opt(RUNS[i], i)).join("");
@@ -163,7 +166,7 @@ function render() {
   guardBanner(r, b);
 
   const h = r.headline, m = r.meta;
-  subline.innerHTML = `<b style="color:var(--fg)">${m.hermit}</b> · ${m.when || ""} ·
+  subline.innerHTML = `<b style="color:var(--fg)">${vlabel(r)}</b> · ${m.when || ""} ·
     Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
   stats.innerHTML = statCards(h);
@@ -227,7 +230,7 @@ function renderTrend() {
     const h = r.headline, cls = r.meta.legacy ? "legacyrow" : "";
     const spd = h.median_speedup == null ? "—"
       : `<span class="${r.meta.legacy ? "" : (h.median_speedup >= 1 ? "good" : "bad")}">${h.median_speedup}×</span>`;
-    return `<tr class="${cls}"><td class="l">${r.meta.hermit}</td><td class="l">${r.meta.when || ""}</td>
+    return `<tr class="${cls}"><td class="l">${vlabel(r)}</td><td class="l">${r.meta.when || ""}</td>
       <td>${h.comparable_rows}</td><td>${spd}</td>
       <td>${pct(h.win_rate)}</td><td>${pct(h.parity_coverage)}</td>
       <td class="l muted">${(h.tail_losses || []).join(", ")}</td></tr>`;

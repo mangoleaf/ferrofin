@@ -32,6 +32,24 @@ RESULTS = SUITE / "results"
 RAW = RESULTS / "raw"
 
 
+def run_signature(record):
+    """Fingerprint a run's *measured* numbers so an exact re-merge of the same raw
+    artifacts collapses to one entry, while a genuine rerun (which differs in every
+    latency) stays distinct. Excludes meta.when, which changes on every merge."""
+    perf = sorted(
+        (o["perf"].get("variant"), o["perf"].get("h_p50"), o["perf"].get("j_p50"),
+         o["perf"].get("h_p99"), o["perf"].get("j_p99"))
+        for o in record.get("operations", [])
+    )
+    payload = json.dumps(
+        {"headline": record.get("headline"),
+         "footprint": record.get("meta", {}).get("footprint"),
+         "perf": perf},
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def bench_env(key):
     """os.environ, else suite/perf/.env — merge often runs without the bench env
     sourced, and the comparability guard keys on cpus/mem/load, so a silent
@@ -236,12 +254,30 @@ def main():
     }
 
     RESULTS.mkdir(parents=True, exist_ok=True)
-    out = RESULTS / f"run-{sha}.json"
+
+    # Keep every distinct run of the same SHA (variance across reruns is the point) — but
+    # collapse an exact re-merge of the same raw artifacts so a second `run.sh merge`
+    # doesn't double-count one measurement. Genuine reruns differ in every latency, so
+    # their signatures differ; a re-merge is identical and overwrites its own entry.
+    runs = load_json(RESULTS / "runs.json", {"runs": []})
+    sig = run_signature(record)
+    same_sha = [r for r in runs["runs"] if r["meta"]["hermit_sha"] == sha]
+    dup = next((r for r in same_sha if run_signature(r) == sig), None)
+    seq = dup["meta"].get("run_seq", 1) if dup else len(same_sha) + 1
+    record["meta"]["run_seq"] = seq
+    record["meta"]["run_label"] = record["meta"]["hermit"] if seq == 1 \
+        else f"{record['meta']['hermit']} ({seq})"
+
+    # Numbered filename so reruns of one SHA don't clobber each other's record file.
+    out = RESULTS / (f"run-{sha}.json" if seq == 1 else f"run-{sha}-{seq}.json")
     out.write_text(json.dumps(record, indent=2) + "\n")
 
-    # Upsert into the trend file the viewer reads (keyed by sha; newest last).
-    runs = load_json(RESULTS / "runs.json", {"runs": []})
-    runs["runs"] = [r for r in runs["runs"] if r["meta"]["hermit_sha"] != sha] + [record]
+    # Upsert into the trend file the viewer reads (newest last): replace only an exact
+    # re-merge (same sha + identical numbers); otherwise append, preserving prior reruns.
+    if dup:
+        runs["runs"] = [record if r is dup else r for r in runs["runs"]]
+    else:
+        runs["runs"] = runs["runs"] + [record]
     (RESULTS / "runs.json").write_text(json.dumps(runs, indent=2) + "\n")
 
     hl = headline
