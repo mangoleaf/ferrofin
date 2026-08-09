@@ -28,7 +28,7 @@ const ITERATIONS = parseInt(__ENV.TTFS_ITERATIONS || '3', 10);
 // bitrate condition is honored by both.
 const ENCODE_BITRATE = parseInt(__ENV.TTFS_BITRATE || '8000000', 10);
 // The repo's real Chrome device profile fixture — single source of truth.
-const PROFILE = JSON.parse(open('../crates/hermit-model/tests/data/DeviceProfile-Chrome.json'));
+const PROFILE = JSON.parse(open('../../crates/hermit-model/tests/data/DeviceProfile-Chrome.json'));
 // Encode mode: same profile but video transcode pinned to h264, so stream copy is impossible.
 const PROFILE_H264 = JSON.parse(JSON.stringify(PROFILE));
 for (const t of PROFILE_H264.TranscodingProfiles || [])
