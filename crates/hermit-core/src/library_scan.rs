@@ -445,6 +445,70 @@ impl LibraryScanner {
     pub async fn scan(&self, only: Option<Uuid>) -> Result<usize, ServiceError> {
         let folders = self.scoped_folders(only).await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
+        self.run_scan(&folders, planned, None).await
+    }
+
+    /// Scans only the items touched by the given `changed` filesystem paths —
+    /// the path-scoped ingest behind the library monitor's watcher/webhook
+    /// reports, so a single new file is resolved and persisted without
+    /// re-walking (or re-enriching) the whole library.
+    ///
+    /// Per changed path, the plan of its containing library is filtered to the
+    /// items **at or under** the path (the new/changed media) plus its
+    /// **ancestor** items (series/season/album directories, so a file in a
+    /// brand-new season folder brings its hierarchy with it — upserts, cheap
+    /// for pre-existing rows). Deleted-item pruning runs restricted to the
+    /// changed paths, so a reported deletion removes exactly the vanished
+    /// rows. Paths outside every library are ignored.
+    ///
+    /// # Errors
+    /// Propagates the item-store failure exactly as [`scan`](Self::scan) does.
+    pub async fn scan_paths(&self, changed: &[String]) -> Result<usize, ServiceError> {
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let affected: Vec<VirtualFolderInfo> = folders
+            .into_iter()
+            .filter(|f| {
+                f.locations
+                    .iter()
+                    .any(|loc| changed.iter().any(|c| path_is_under(c, loc)))
+            })
+            .collect();
+        if affected.is_empty() {
+            tracing::debug!(
+                paths = changed.len(),
+                "changed paths match no library; nothing to scan"
+            );
+            return Ok(0);
+        }
+        let planned = self.plan(&affected);
+        let scoped: Vec<Planned> = planned
+            .into_iter()
+            .filter(|p| {
+                p.entity.path.as_deref().is_some_and(|item_path| {
+                    changed
+                        .iter()
+                        .any(|c| path_is_under(item_path, c) || path_is_under(c, item_path))
+                })
+            })
+            .collect();
+        tracing::info!(
+            changed = changed.len(),
+            items = scoped.len(),
+            "path-scoped scan planned"
+        );
+        self.run_scan(&affected, scoped, Some(changed)).await
+    }
+
+    /// The shared scan pipeline over an already-planned item set: probe +
+    /// metadata + persistence per item, deleted-item pruning (restricted to
+    /// `prune_scope` when given), the `LibraryChanged` push, and the music
+    /// enrichment pass.
+    async fn run_scan(
+        &self,
+        folders: &[VirtualFolderInfo],
+        planned: Vec<Planned>,
+        prune_scope: Option<&[String]>,
+    ) -> Result<usize, ServiceError> {
         tracing::info!(
             items = planned.len(),
             folders = folders.len(),
@@ -567,7 +631,7 @@ impl LibraryScanner {
         // Drop rows whose files vanished since the last scan, so deleted media
         // stops being listed and served. Best-effort — a failure must not fail
         // the whole scan.
-        let removed = self.prune_deleted(&folders, &planned).await;
+        let removed = self.prune_deleted(folders, &planned, prune_scope).await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
@@ -691,10 +755,18 @@ impl LibraryScanner {
         &self,
         folders: &[VirtualFolderInfo],
         planned: &[Planned],
+        scope: Option<&[String]>,
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
             return removed;
+        };
+        // A path-scoped scan plans only the items under its changed paths, so
+        // rows elsewhere in the library are absent from `planned` without being
+        // deleted — only rows at/under a changed path may be considered stale.
+        let in_scope = |row_path: Option<&str>| match scope {
+            None => true,
+            Some(paths) => row_path.is_some_and(|rp| paths.iter().any(|c| path_is_under(rp, c))),
         };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
@@ -743,6 +815,7 @@ impl LibraryScanner {
             };
             let stale: Vec<Uuid> = existing
                 .iter()
+                .filter(|row| in_scope(row.path.as_deref()))
                 .filter_map(|row| Uuid::parse_str(&row.id).ok())
                 .filter(|id| !live.contains(id))
                 .collect();
@@ -2058,6 +2131,16 @@ impl LibraryScanner {
             }
         }
     }
+}
+
+/// Whether `path` equals `root` or lies underneath it (component-boundary
+/// aware: `/media/tv2` is not under `/media/tv`).
+fn path_is_under(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The file name without its extension — a lightweight display name until real
@@ -3676,6 +3759,139 @@ mod tests {
             1,
             "unknown scope falls back to a full scan"
         );
+    }
+
+    // The path-scoped ingest: a new file's report plans just that file, and a
+    // deleted file's report prunes just its row — the rest of the library is
+    // neither re-planned nor mass-pruned.
+    #[tokio::test]
+    async fn scan_paths_ingests_and_prunes_only_the_changed_paths() {
+        use crate::item_repository::HermitItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::write(movies.join("Alien (1979).mkv"), b"").unwrap();
+        std::fs::write(movies.join("Stalker (1979).mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: movies.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items = Arc::new(HermitItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+                .with_items(items);
+        scanner.scan_all().await.unwrap();
+        assert_eq!(count_type_like(&db, "%Movies.Movie").await, 2);
+
+        // A new file: only it is planned and created.
+        let new_path = movies.join("Solaris (1972).mkv");
+        std::fs::write(&new_path, b"").unwrap();
+        let created = scanner
+            .scan_paths(&[new_path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(created, 1, "only the new file is planned");
+        assert_eq!(count_type_like(&db, "%Movies.Movie").await, 3);
+
+        // A deleted file: exactly its row is pruned.
+        let gone = movies.join("Alien (1979).mkv");
+        std::fs::remove_file(&gone).unwrap();
+        let created = scanner
+            .scan_paths(&[gone.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(created, 0, "a deletion plans nothing");
+        assert_eq!(count_type_like(&db, "%Movies.Movie").await, 2);
+
+        // A path outside every library is ignored.
+        assert_eq!(
+            scanner
+                .scan_paths(&["/nowhere/else.mkv".to_owned()])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(count_type_like(&db, "%Movies.Movie").await, 2);
+    }
+
+    // A file landing in a brand-new season folder brings its ancestor
+    // hierarchy (series + season rows) with it, while sibling seasons and
+    // episodes stay untouched by the plan.
+    #[tokio::test]
+    async fn scan_paths_creates_the_new_hierarchy_around_a_changed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tv = tmp.path().join("tv");
+        std::fs::create_dir_all(tv.join("Firefly/Season 01")).unwrap();
+        std::fs::write(tv.join("Firefly/Season 01/Firefly S01E01.mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "TV",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tv.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence);
+        scanner.scan_all().await.unwrap();
+        assert_eq!(count_type_like(&db, "%TV.Episode").await, 1);
+
+        std::fs::create_dir_all(tv.join("Firefly/Season 02")).unwrap();
+        let ep2 = tv.join("Firefly/Season 02/Firefly S02E01.mkv");
+        std::fs::write(&ep2, b"").unwrap();
+        let created = scanner
+            .scan_paths(&[ep2.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            created, 3,
+            "the new episode plus its series/season ancestors"
+        );
+        assert_eq!(count_type_like(&db, "%TV.Episode").await, 2);
+        assert_eq!(count_type_like(&db, "%TV.Season").await, 2);
+        assert_eq!(count_type_like(&db, "%TV.Series").await, 1);
+    }
+
+    #[test]
+    fn path_is_under_respects_component_boundaries() {
+        assert!(super::path_is_under("/media/tv", "/media/tv"));
+        assert!(super::path_is_under("/media/tv/Show/e.mkv", "/media/tv"));
+        assert!(super::path_is_under("/media/tv/Show/e.mkv", "/media/tv/"));
+        assert!(!super::path_is_under("/media/tv2/e.mkv", "/media/tv"));
+        assert!(!super::path_is_under("/media", "/media/tv"));
     }
 
     /// Counts `BaseItems` whose stored `Type` matches a `LIKE` pattern. Routes

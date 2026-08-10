@@ -14,8 +14,9 @@
 //!   the composition root and tests use a fake.
 //!
 //! `ReportFileSystemChanged` dispatches a real refresh: a non-suppressed change
-//! queues a (coalescing) library scan through the injected [`LibraryScanTrigger`]
-//! (the composition root passes the library manager). Like the C# timer, a
+//! queues a (coalescing) **path-scoped** scan through the injected
+//! [`LibraryScanTrigger`] (the composition root passes the library manager), so
+//! only the items touched by the changed paths are re-resolved. Like the C# timer, a
 //! burst of changes **debounces**: each report (re)arms a settle window of
 //! `LibraryMonitorDelay` seconds (read live from the injected configuration
 //! manager, or fixed via [`HermitLibraryMonitor::with_debounce`]) and the scan
@@ -62,6 +63,20 @@ pub trait LibraryScanTrigger: Send + Sync {
     ///
     /// Returns a [`ServiceError`] if the scan cannot be queued.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+
+    /// Queues a (coalescing) scan covering only the items touched by the given
+    /// changed filesystem paths. Defaults to a full scan so simple triggers
+    /// need not implement path scoping;
+    /// [`HermitLibraryManager`](crate::HermitLibraryManager) overrides it with
+    /// the real path-scoped ingest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the scan cannot be queued.
+    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
+        let _ = paths;
+        self.queue_library_scan().await
+    }
 }
 
 /// Supplies the filesystem roots the monitor should watch.
@@ -218,7 +233,7 @@ impl HermitLibraryMonitor {
                     "library changes settled; queueing scan"
                 );
                 if let Some(library) = &self.refresh_target
-                    && let Err(err) = library.queue_library_scan().await
+                    && let Err(err) = library.queue_scan_paths(paths.into_iter().collect()).await
                 {
                     tracing::warn!(%err, "failed to queue debounced library scan");
                 }
@@ -301,16 +316,14 @@ impl LibraryMonitor for HermitLibraryMonitor {
             return Ok(());
         }
         tracing::debug!(path, "library filesystem change reported");
-        // Dispatch the refresh. Hermit's scanner is whole-library (not per-path),
-        // so a reported change queues a coalescing `scan_all` — the scanner picks
-        // up the new/changed file under `path`. Overlapping reports (a webhook
-        // batch) fold into one scan via the library manager's in-flight guard.
-        // ponytail: whole-library rescan, not Jellyfin's targeted per-item
-        // refresh; upgrade to a path-scoped scan if full rescans get too costly.
+        // Dispatch a path-scoped refresh: the scanner resolves and persists just
+        // the items touched by the reported path (a deleted path prunes its
+        // rows), so one new file does not re-walk the whole library. Overlapping
+        // reports fold via the debounce window and the scan's in-flight guard.
         let delay = self.debounce_delay().await;
         if delay.is_zero() {
             if let Some(library) = &self.refresh_target {
-                library.queue_library_scan().await?;
+                library.queue_scan_paths(vec![path.to_owned()]).await?;
             }
             return Ok(());
         }
@@ -482,6 +495,60 @@ mod tests {
             .await
             .expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A [`LibraryScanTrigger`] fake recording each path-scoped dispatch.
+    #[derive(Default)]
+    struct PathsLibrary {
+        batches: StdMutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LibraryScanTrigger for PathsLibrary {
+        async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+            panic!("the monitor must dispatch path-scoped, not full, scans");
+        }
+        async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
+            self.batches.lock().unwrap().push(paths);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_dispatch_carries_the_changed_path() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        monitor
+            .report_file_system_changed("/media/movies/Solaris (1972).mkv")
+            .await
+            .expect("report");
+        assert_eq!(
+            *library.batches.lock().unwrap(),
+            vec![vec!["/media/movies/Solaris (1972).mkv".to_owned()]]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn debounced_dispatch_carries_the_settled_path_batch() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed("/media/movies/a.mkv")
+            .await
+            .expect("report");
+        monitor
+            .report_file_system_changed("/media/movies/b.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let batches = library.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one settled batch");
+        let mut paths = batches[0].clone();
+        paths.sort();
+        assert_eq!(paths, vec!["/media/movies/a.mkv", "/media/movies/b.mkv"]);
     }
 
     #[tokio::test(start_paused = true)]

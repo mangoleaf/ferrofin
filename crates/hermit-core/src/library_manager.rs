@@ -58,13 +58,42 @@ pub struct HermitLibraryManager {
     /// `queue_library_scan` runs it; `None` (unit tests) keeps it a no-op.
     scanner: Option<Arc<crate::library_scan::LibraryScanner>>,
     /// Coalescing guard for `queue_library_scan`: `true` while a scan task runs.
-    /// A queue request during a running scan sets [`Self::scan_pending`] instead
-    /// of spawning a second scan (the library monitor fans a webhook batch into
-    /// one report per path, and `/Library/Refresh` can be double-clicked).
+    /// A queue request during a running scan merges into [`Self::scan_pending`]
+    /// instead of spawning a second scan (the library monitor fans a webhook
+    /// batch into one report per path, and `/Library/Refresh` can be
+    /// double-clicked).
     scan_in_flight: Arc<AtomicBool>,
-    /// Set when a scan is requested while one is already running, so the running
-    /// task loops once more and picks up the change it would otherwise miss.
-    scan_pending: Arc<AtomicBool>,
+    /// The scope a rerun should cover, merged from every request that arrived
+    /// while a scan was running; the running task loops once more over it so
+    /// changes landing mid-scan are not missed.
+    scan_pending: Arc<std::sync::Mutex<Option<ScanScope>>>,
+}
+
+/// What a queued scan covers.
+#[derive(Debug, Clone)]
+enum ScanScope {
+    /// Every library.
+    Full,
+    /// One library (by CollectionFolder id).
+    Library(Uuid),
+    /// Only the items touched by these changed filesystem paths.
+    Paths(Vec<String>),
+}
+
+impl ScanScope {
+    /// Merges a new request into a pending slot: path sets union; anything
+    /// mixed with a full/library request widens to a full scan (over-scanning
+    /// is the safe direction — the scopes are not otherwise combinable).
+    fn merge_into(self, slot: &mut Option<ScanScope>) {
+        *slot = Some(match (slot.take(), self) {
+            (None, new) => new,
+            (Some(ScanScope::Paths(mut a)), ScanScope::Paths(b)) => {
+                a.extend(b);
+                ScanScope::Paths(a)
+            }
+            _ => ScanScope::Full,
+        });
+    }
 }
 
 impl std::fmt::Debug for HermitLibraryManager {
@@ -90,7 +119,7 @@ impl HermitLibraryManager {
             people,
             scanner: None,
             scan_in_flight: Arc::new(AtomicBool::new(false)),
-            scan_pending: Arc::new(AtomicBool::new(false)),
+            scan_pending: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -107,7 +136,13 @@ impl HermitLibraryManager {
 impl crate::library_monitor::LibraryScanTrigger for HermitLibraryManager {
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         // Reached via the filesystem watcher / Radarr-Sonarr webhooks.
-        self.spawn_scan("watcher", None);
+        self.spawn_scan("watcher", ScanScope::Full);
+        Ok(())
+    }
+
+    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
+        // The monitor's settled change batch: ingest just the touched paths.
+        self.spawn_scan("watcher", ScanScope::Paths(paths));
         Ok(())
     }
 }
@@ -454,7 +489,7 @@ impl LibraryManager for HermitLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        self.spawn_scan("api", None);
+        self.spawn_scan("api", ScanScope::Full);
         Ok(())
     }
 
@@ -462,12 +497,12 @@ impl LibraryManager for HermitLibraryManager {
         &self,
         trigger: &'static str,
     ) -> Result<(), ServiceError> {
-        self.spawn_scan(trigger, None);
+        self.spawn_scan(trigger, ScanScope::Full);
         Ok(())
     }
 
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
-        self.spawn_scan("api", Some(library_id));
+        self.spawn_scan("api", ScanScope::Library(library_id));
         Ok(())
     }
 }
@@ -477,9 +512,9 @@ impl HermitLibraryManager {
     /// span tagged with `trigger`, returning immediately (Jellyfin's refresh is
     /// fire-and-forget — it must not block the HTTP handler). Shared by every
     /// entry point so the coalescing guard and the span are defined once.
-    /// `scope` restricts the scan to one library (CollectionFolder id); `None`
-    /// scans everything.
-    fn spawn_scan(&self, trigger: &'static str, scope: Option<Uuid>) {
+    /// `scope` restricts the scan to one library or to a set of changed paths;
+    /// [`ScanScope::Full`] scans everything.
+    fn spawn_scan(&self, trigger: &'static str, scope: ScanScope) {
         let Some(scanner) = &self.scanner else {
             tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
             return;
@@ -488,10 +523,11 @@ impl HermitLibraryManager {
         // so it can run for minutes. The library-monitor webhooks report one path
         // at a time (a Radarr/Sonarr batch = many calls) and `/Library/Refresh`
         // can be double-clicked, so overlapping requests must fold into one scan.
-        // If a scan is already running, mark a rerun and return; the running task
-        // loops once more to pick up whatever changed mid-scan.
+        // If a scan is already running, merge this request's scope into the
+        // pending rerun and return; the running task loops once more over the
+        // merged scope to pick up whatever changed mid-scan.
         if self.scan_in_flight.swap(true, Ordering::AcqRel) {
-            self.scan_pending.store(true, Ordering::Release);
+            scope.merge_into(&mut self.scan_pending.lock().expect("pending not poisoned"));
             tracing::debug!(
                 trigger,
                 "library scan already running; coalesced (rerun queued)"
@@ -511,11 +547,12 @@ impl HermitLibraryManager {
                 let mut total_created = 0usize;
                 let mut scope = scope;
                 loop {
-                    pending.store(false, Ordering::Release);
-                    // `take()`: only the first pass is scoped. Coalesced reruns
-                    // fold requests whose scopes are unknown here, so they run
-                    // full — over-scanning is the safe direction.
-                    match scanner.scan(scope.take()).await {
+                    let result = match scope {
+                        ScanScope::Full => scanner.scan(None).await,
+                        ScanScope::Library(id) => scanner.scan(Some(id)).await,
+                        ScanScope::Paths(ref paths) => scanner.scan_paths(paths).await,
+                    };
+                    match result {
                         Ok(created) => {
                             total_created += created;
                             tracing::info!(created, "library scan pass complete");
@@ -523,9 +560,11 @@ impl HermitLibraryManager {
                         // Logged exactly once, here, at the scan task's top level.
                         Err(err) => tracing::error!(%err, "library scan failed"),
                     }
-                    // A request that arrived during the scan queued a rerun.
-                    if !pending.swap(false, Ordering::AcqRel) {
-                        break;
+                    // A request that arrived during the scan queued a rerun over
+                    // its merged scope.
+                    match pending.lock().expect("pending not poisoned").take() {
+                        Some(next) => scope = next,
+                        None => break,
                     }
                 }
                 in_flight.store(false, Ordering::Release);
@@ -534,7 +573,7 @@ impl HermitLibraryManager {
                     elapsed_ms = started.elapsed().as_millis(),
                     "library scan complete"
                 );
-                // ponytail: a request landing in the gap between the pending re-check
+                // ponytail: a request landing in the gap between the pending take
                 // and clearing in_flight loses its rerun — harmless (the next webhook
                 // or a manual refresh re-triggers). Tighten only if webhook-driven
                 // scans start missing changes.
@@ -703,6 +742,90 @@ mod tests {
             count(BaseItemKind::Movie).await,
             0,
             "the movie library must not be scanned"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_scan_paths_ingests_only_the_changed_paths() {
+        use crate::file_system::HermitFileSystem;
+        use crate::library_monitor::LibraryScanTrigger;
+        use crate::library_scan::LibraryScanner;
+        use crate::virtual_folder_manager::HermitVirtualFolderManager;
+        use hermit_model::configuration::{LibraryOptions, MediaPathInfo};
+        use hermit_model::entities::CollectionTypeOptions;
+        use hermit_traits::library::VirtualFolderManager;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let movies = tmp.path().join("movies");
+        let tv = tmp.path().join("tv");
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::write(movies.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::create_dir_all(tv.join("Firefly/Season 01")).unwrap();
+        let episode = tv.join("Firefly/Season 01/Firefly S01E01.mkv");
+        std::fs::write(&episode, b"").unwrap();
+
+        let db = test_db().await;
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        for (name, ct, media) in [
+            ("Movies", CollectionTypeOptions::movies, &movies),
+            ("TV", CollectionTypeOptions::tvshows, &tv),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(ct),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: media.to_string_lossy().into_owned(),
+                    }],
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let scanner = Arc::new(LibraryScanner::new(
+            vf,
+            Arc::new(HermitFileSystem::new()),
+            persistence,
+        ));
+        let mgr = manager(&db).with_scanner(scanner);
+
+        // Report the episode's path (what the monitor dispatches after a settle
+        // window): its hierarchy lands, the movie library is never planned.
+        mgr.queue_scan_paths(vec![episode.to_string_lossy().into_owned()])
+            .await
+            .expect("queued");
+        let count = |kind| {
+            let mgr = &mgr;
+            async move {
+                mgr.query_items(&InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+                .items
+                .len()
+            }
+        };
+        for _ in 0..200 {
+            if count(BaseItemKind::Episode).await == 1
+                && !mgr.scan_in_flight.load(Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(count(BaseItemKind::Episode).await, 1, "the episode landed");
+        assert_eq!(count(BaseItemKind::Series).await, 1, "with its series");
+        assert_eq!(
+            count(BaseItemKind::Movie).await,
+            0,
+            "the untouched movie library must not be scanned"
         );
     }
 
