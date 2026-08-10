@@ -669,6 +669,74 @@ async fn broadcast_pushes_to_attached_connections() {
     assert_eq!(frame["MessageType"], "RestartRequired");
 }
 
+// Progress reported from one device must be pushed (`UserDataChanged`) to the
+// same user's OTHER sessions — that's what keeps resume positions in sync when
+// jumping between devices — and must not leak to other users' sessions.
+#[tokio::test]
+async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions() {
+    use hermit_model::data::BaseItemKind;
+    use hermit_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "shared").await;
+    let other_id = Uuid::new_v4();
+    let other = seed_named_user(&db, other_id, "other").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+
+    // The same user on two devices, plus an unrelated user's session.
+    let tv = mgr
+        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", &user)
+        .await
+        .unwrap();
+    let web = mgr
+        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", &user)
+        .await
+        .unwrap();
+    let other_session = mgr
+        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", &other)
+        .await
+        .unwrap();
+
+    let web_conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &web.id.unwrap(),
+        web_conn.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let other_conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &other_session.id.unwrap(),
+        other_conn.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+
+    let info = PlaybackProgressInfo {
+        session_id: tv.id.clone(),
+        item_id,
+        position_ticks: Some(1000),
+        ..PlaybackProgressInfo::default()
+    };
+    mgr.on_playback_progress(&info, false).await.unwrap();
+
+    // The same user's other device received the play-state push …
+    assert_eq!(web_conn.sent_count(), 1);
+    let frame: serde_json::Value =
+        serde_json::from_slice(&web_conn.sent.lock().unwrap()[0]).unwrap();
+    assert_eq!(frame["MessageType"], "UserDataChanged");
+    assert_eq!(frame["Data"]["UserId"], user_id.to_string());
+    assert_eq!(
+        frame["Data"]["UserDataList"][0]["ItemId"],
+        item_id.to_string()
+    );
+    // … and the unrelated user's session did not.
+    assert_eq!(other_conn.sent_count(), 0);
+}
+
 #[tokio::test]
 async fn send_message_command_accepts_any_existing_session() {
     let db = test_db().await;

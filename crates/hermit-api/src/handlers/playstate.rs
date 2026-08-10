@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
-use crate::handlers::session_ctx::{current_session, current_session_id};
+use crate::handlers::session_ctx::{current_session, current_session_id, notify_user_data_changed};
 use crate::state::AppState;
 
 /// Query parameters for the mark-played route (`datePlayed` + optional `userId`).
@@ -90,12 +90,14 @@ async fn mark_played_item(
         .user_data
         .mark_played(user_id, item_id, query.date_played)
         .await?;
+    notify_user_data_changed(&state, user_id, &dto).await;
 
     for guest in additional_user_ids(&state, &auth).await? {
-        state
+        let guest_dto = state
             .user_data
             .mark_played(guest, item_id, query.date_played)
             .await?;
+        notify_user_data_changed(&state, guest, &guest_dto).await;
     }
 
     Ok(Json(dto))
@@ -125,9 +127,11 @@ async fn mark_unplayed_item(
     assert_item_exists(&state, item_id).await?;
 
     let dto = state.user_data.mark_unplayed(user_id, item_id).await?;
+    notify_user_data_changed(&state, user_id, &dto).await;
 
     for guest in additional_user_ids(&state, &auth).await? {
-        state.user_data.mark_unplayed(guest, item_id).await?;
+        let guest_dto = state.user_data.mark_unplayed(guest, item_id).await?;
+        notify_user_data_changed(&state, guest, &guest_dto).await;
     }
 
     Ok(Json(dto))
@@ -148,11 +152,13 @@ async fn mark_played_for_user(
         .user_data
         .mark_played(uid, item_id, query.date_played)
         .await?;
+    notify_user_data_changed(&state, uid, &dto).await;
     for guest in additional_user_ids(&state, &auth).await? {
-        state
+        let guest_dto = state
             .user_data
             .mark_played(guest, item_id, query.date_played)
             .await?;
+        notify_user_data_changed(&state, guest, &guest_dto).await;
     }
     Ok(Json(dto))
 }
@@ -167,8 +173,10 @@ async fn unmark_played_for_user(
     let uid = parse_id(&user.id);
     assert_item_exists(&state, item_id).await?;
     let dto = state.user_data.mark_unplayed(uid, item_id).await?;
+    notify_user_data_changed(&state, uid, &dto).await;
     for guest in additional_user_ids(&state, &auth).await? {
-        state.user_data.mark_unplayed(guest, item_id).await?;
+        let guest_dto = state.user_data.mark_unplayed(guest, item_id).await?;
+        notify_user_data_changed(&state, guest, &guest_dto).await;
     }
     Ok(Json(dto))
 }

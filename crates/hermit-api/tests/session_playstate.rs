@@ -601,7 +601,9 @@ impl SessionManager for RecordingSessions {
         _m: SessionMessageType,
         _d: &str,
     ) -> Result<(), ServiceError> {
-        unimplemented!()
+        // The played/favorite/progress handlers push `UserDataChanged` here;
+        // delivery is covered by the hermit-core session-manager tests.
+        Ok(())
     }
     async fn send_message_to_user_device_sessions(
         &self,

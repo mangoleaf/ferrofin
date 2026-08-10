@@ -745,7 +745,9 @@ impl SessionManager for FakeSessions {
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        // The played/favorite/rating/user-data handlers push `UserDataChanged`
+        // here best-effort; delivery is covered by hermit-core's tests.
+        Ok(())
     }
     async fn send_message_to_user_device_sessions(
         &self,

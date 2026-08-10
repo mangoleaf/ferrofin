@@ -194,11 +194,19 @@ fn fake_sessions_methods_panic() {
         hermit_model::session::SessionMessageType::ForceKeepAlive,
         "d",
     ));
-    assert_panics(f.send_message_to_user_sessions(
-        &[],
-        hermit_model::session::SessionMessageType::ForceKeepAlive,
-        "d",
-    ));
+    // A no-op (not a panic): the user-data handlers push `UserDataChanged`
+    // through it best-effort on every played/favorite/rating write.
+    assert!(
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f.send_message_to_user_sessions(
+                &[],
+                hermit_model::session::SessionMessageType::ForceKeepAlive,
+                "d",
+            ))
+            .is_ok()
+    );
     assert_panics(f.send_message_to_user_device_sessions(
         "d",
         hermit_model::session::SessionMessageType::ForceKeepAlive,

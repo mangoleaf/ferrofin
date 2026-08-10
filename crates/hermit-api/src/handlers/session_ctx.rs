@@ -54,3 +54,29 @@ pub(crate) async fn current_session_id(
         .id
         .ok_or_else(|| ApiError::NotFound("Session not found.".to_owned()))
 }
+
+/// Pushes a `UserDataChanged` message to every session of `user_id`, so the
+/// user's other signed-in devices refresh the item's play-state (resume
+/// position, played/favorite flags) live. Port of Jellyfin's
+/// `UserDataChangedNotifier`, which fires on every user-data save.
+/// Best-effort: a delivery failure must not fail the mutating request.
+pub(crate) async fn notify_user_data_changed(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    dto: &hermit_model::dto::UserItemDataDto,
+) {
+    let info = hermit_model::session::UserDataChangeInfo {
+        user_id,
+        user_data_list: vec![dto.clone()],
+    };
+    if let Ok(data) = serde_json::to_string(&info) {
+        let _ = state
+            .sessions
+            .send_message_to_user_sessions(
+                &[user_id],
+                hermit_model::session::SessionMessageType::UserDataChanged,
+                &data,
+            )
+            .await;
+    }
+}

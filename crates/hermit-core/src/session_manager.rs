@@ -55,7 +55,7 @@ use hermit_model::secret::Secret;
 use hermit_model::session::{
     ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayRequest,
     PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
-    SessionMessageType, SessionUserInfo, TranscodingInfo,
+    SessionMessageType, SessionUserInfo, TranscodingInfo, UserDataChangeInfo,
 };
 
 use hermit_traits::devices::{DeviceManager, DeviceQuery};
@@ -471,6 +471,34 @@ impl HermitSessionManager {
         Ok(())
     }
 
+    /// Pushes the user's refreshed play-state for `item_id` to every session
+    /// belonging to that user (`UserDataChanged`), so their other signed-in
+    /// devices update resume position / played flags live instead of showing
+    /// stale progress until re-login. Port of Jellyfin's
+    /// `UserDataChangedNotifier` (which fires on every user-data save).
+    /// Best-effort: a delivery failure must not fail the playback report.
+    async fn push_user_data_changed(&self, user_id: Uuid, item_id: Uuid) {
+        let Ok(Some(dto)) = self
+            .user_data_manager
+            .get_user_data_dto(item_id, user_id)
+            .await
+        else {
+            return;
+        };
+        let info = UserDataChangeInfo {
+            user_id,
+            user_data_list: vec![dto],
+        };
+        let Ok(data) = serde_json::to_string(&info) else {
+            return;
+        };
+        let _ = self
+            .broadcast(SessionMessageType::UserDataChanged, &data, |s| {
+                s.contains_user(user_id)
+            })
+            .await;
+    }
+
     /// Sends a message to one controllable session, enforcing the controller's
     /// permission when a controlling session is named (C# `AssertCanControl`).
     async fn send_to_controllable(
@@ -600,13 +628,15 @@ impl SessionManager for HermitSessionManager {
         }
 
         // Persist play-state for every user on the session (C#
-        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`).
+        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`), then
+        // push the change to the user's other devices.
         if !info.item_id.is_nil() {
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id);
                 self.user_data_manager
                     .update_play_state(user_id, info.item_id, info.position_ticks)
                     .await?;
+                self.push_user_data_changed(user_id, info.item_id).await;
             }
         }
 
@@ -637,13 +667,15 @@ impl SessionManager for HermitSessionManager {
         }
 
         // Final play-state update per user unless playback failed (C#
-        // `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`).
+        // `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`),
+        // then push the change to the user's other devices.
         if !info.item_id.is_nil() && !info.failed {
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id);
                 self.user_data_manager
                     .update_play_state(user_id, info.item_id, info.position_ticks)
                     .await?;
+                self.push_user_data_changed(user_id, info.item_id).await;
             }
         }
 
