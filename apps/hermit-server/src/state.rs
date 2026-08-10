@@ -493,9 +493,13 @@ pub async fn build_app_state(
             (Arc::new(hermit_core::NoopFileSystemWatcher), None)
         }
     };
+    // Change reports debounce for `LibraryMonitorDelay` seconds (read live from
+    // the server configuration) so a burst — a torrent finishing, a Sonarr
+    // import batch — settles into one scan.
     let library_monitor: Arc<dyn hermit_traits::library::LibraryMonitor> = Arc::new(
         hermit_core::HermitLibraryMonitor::new(fs_watcher, virtual_folders_impl.clone())
-            .with_refresh_target(library_impl.clone()),
+            .with_refresh_target(library_impl.clone())
+            .with_config(Arc::clone(&config_trait)),
     );
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);

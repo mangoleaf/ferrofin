@@ -15,19 +15,38 @@
 //!
 //! `ReportFileSystemChanged` dispatches a real refresh: a non-suppressed change
 //! queues a (coalescing) library scan through the injected [`LibraryScanTrigger`]
-//! (the composition root passes the library manager). The C# debounce timer is
-//! not ported — the scan's own in-flight guard folds a burst of reports into one
-//! scan instead. Without a trigger attached (unit tests) a change is logged only.
+//! (the composition root passes the library manager). Like the C# timer, a
+//! burst of changes **debounces**: each report (re)arms a settle window of
+//! `LibraryMonitorDelay` seconds (read live from the injected configuration
+//! manager, or fixed via [`HermitLibraryMonitor::with_debounce`]) and the scan
+//! dispatches only once the window lapses with no further changes. A zero
+//! delay dispatches immediately. Without a trigger attached (unit tests) a
+//! change is logged only.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::time::Instant;
 
+use hermit_traits::configuration::ServerConfigurationManager;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::LibraryMonitor;
 
 use crate::resolvers::FileSystemWatcher;
+
+/// The debounce accumulator: paths reported since the last dispatch, the
+/// settle deadline (re-armed by every report), and whether a worker task is
+/// currently waiting on that deadline.
+struct PendingChanges {
+    /// Changed paths accumulated in the current settle window.
+    paths: HashSet<String>,
+    /// When the current window lapses (last report + delay).
+    deadline: Instant,
+    /// Whether a debounce worker task is alive and will dispatch.
+    worker_running: bool,
+}
 
 /// The narrow slice of the library manager the monitor needs: queue a rescan.
 ///
@@ -91,6 +110,14 @@ pub struct HermitLibraryMonitor {
     /// C# `ReportFileSystemChanged` → `ProviderManager.QueueRefresh`. `None`
     /// (unit tests without a target) logs the change only.
     refresh_target: Option<Arc<dyn LibraryScanTrigger>>,
+    /// Debounce accumulator shared with the worker task. `std::sync::Mutex`:
+    /// the guard never spans an `.await`.
+    pending: Arc<Mutex<PendingChanges>>,
+    /// A fixed settle delay, taking precedence over the configured one.
+    fixed_debounce: Option<Duration>,
+    /// Where the live `LibraryMonitorDelay` setting is read from. `None` (and
+    /// no [`fixed_debounce`](Self::with_debounce)) means no debounce.
+    config: Option<Arc<dyn ServerConfigurationManager>>,
 }
 
 impl std::fmt::Debug for HermitLibraryMonitor {
@@ -113,6 +140,13 @@ impl HermitLibraryMonitor {
             roots: Arc::new(roots),
             suppressed: Arc::new(Mutex::new(HashSet::new())),
             refresh_target: None,
+            pending: Arc::new(Mutex::new(PendingChanges {
+                paths: HashSet::new(),
+                deadline: Instant::now(),
+                worker_running: false,
+            })),
+            fixed_debounce: None,
+            config: None,
         }
     }
 
@@ -122,6 +156,75 @@ impl HermitLibraryMonitor {
     pub fn with_refresh_target(mut self, library: Arc<dyn LibraryScanTrigger>) -> Self {
         self.refresh_target = Some(library);
         self
+    }
+
+    /// Fixes the settle delay, overriding the configured `LibraryMonitorDelay`.
+    #[must_use]
+    pub fn with_debounce(mut self, delay: Duration) -> Self {
+        self.fixed_debounce = Some(delay);
+        self
+    }
+
+    /// Attaches the configuration manager the live `LibraryMonitorDelay`
+    /// setting is read from (per report, so a dashboard change applies without
+    /// a restart — matching the C# monitor).
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<dyn ServerConfigurationManager>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// The settle delay in effect right now: the fixed override, else the
+    /// configured `LibraryMonitorDelay` (clamped at zero), else zero.
+    async fn debounce_delay(&self) -> Duration {
+        if let Some(fixed) = self.fixed_debounce {
+            return fixed;
+        }
+        match &self.config {
+            Some(config) => match config.configuration().await {
+                Ok(c) => Duration::from_secs(u64::try_from(c.library_monitor_delay).unwrap_or(0)),
+                Err(err) => {
+                    tracing::warn!(%err, "failed to read LibraryMonitorDelay; not debouncing");
+                    Duration::ZERO
+                }
+            },
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Waits out the settle window (re-armed by each new report) and then
+    /// dispatches one scan for the whole batch. Runs on its own task; exactly
+    /// one worker is alive while changes are pending.
+    async fn debounce_worker(self) {
+        loop {
+            let deadline = self
+                .pending
+                .lock()
+                .expect("pending set not poisoned")
+                .deadline;
+            tokio::time::sleep_until(deadline).await;
+            let paths = {
+                let mut pending = self.pending.lock().expect("pending set not poisoned");
+                // A report during the sleep pushed the deadline out — keep waiting.
+                if Instant::now() < pending.deadline {
+                    continue;
+                }
+                pending.worker_running = false;
+                std::mem::take(&mut pending.paths)
+            };
+            if !paths.is_empty() {
+                tracing::info!(
+                    changes = paths.len(),
+                    "library changes settled; queueing scan"
+                );
+                if let Some(library) = &self.refresh_target
+                    && let Err(err) = library.queue_library_scan().await
+                {
+                    tracing::warn!(%err, "failed to queue debounced library scan");
+                }
+            }
+            return;
+        }
     }
 
     /// Whether `path` (or an ancestor of it) is currently suppressed. Mirrors C#
@@ -204,8 +307,23 @@ impl LibraryMonitor for HermitLibraryMonitor {
         // batch) fold into one scan via the library manager's in-flight guard.
         // ponytail: whole-library rescan, not Jellyfin's targeted per-item
         // refresh; upgrade to a path-scoped scan if full rescans get too costly.
-        if let Some(library) = &self.refresh_target {
-            library.queue_library_scan().await?;
+        let delay = self.debounce_delay().await;
+        if delay.is_zero() {
+            if let Some(library) = &self.refresh_target {
+                library.queue_library_scan().await?;
+            }
+            return Ok(());
+        }
+        // Accumulate the path and (re)arm the settle window; the single worker
+        // task dispatches once the window lapses with no further reports.
+        let spawn_worker = {
+            let mut pending = self.pending.lock().expect("pending set not poisoned");
+            pending.paths.insert(path.to_owned());
+            pending.deadline = Instant::now() + delay;
+            !std::mem::replace(&mut pending.worker_running, true)
+        };
+        if spawn_worker {
+            tokio::spawn(self.clone().debounce_worker());
         }
         Ok(())
     }
@@ -364,6 +482,73 @@ mod tests {
             .await
             .expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_of_changes_settles_into_one_scan() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        for i in 0..25 {
+            monitor
+                .report_file_system_changed(&format!("/media/movies/m{i}/m{i}.mkv"))
+                .await
+                .expect("report");
+        }
+        // Nothing dispatches inside the settle window…
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // …and the whole burst folds into exactly one scan after it lapses.
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_changes_extend_the_settle_window() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed("/media/movies/a.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // A second change 30s in re-arms the window: the scan may not fire at
+        // t=60 (30s after the last change)…
+        monitor
+            .report_file_system_changed("/media/movies/b.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // …but does fire once 60s pass with no further changes (t=90).
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_batch_after_dispatch_scans_again() {
+        tokio::time::pause();
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = HermitLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed("/media/movies/a.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The worker exited after dispatching; a fresh change starts a new one.
+        monitor
+            .report_file_system_changed("/media/movies/b.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -33,6 +33,8 @@ reqwest.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# Paused-clock debounce tests (tokio::time::pause / start_paused).
+tokio = { workspace = true, features = ["test-util"] }
 hermit-drawing.workspace = true
 image.workspace = true
 rstest.workspace = true
