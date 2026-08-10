@@ -697,7 +697,9 @@ impl Default for LibraryOptions {
         Self {
             enabled: true,
             enable_photos: true,
-            enable_realtime_monitor: false,
+            // Jellyfin's LibraryOptions ctor default: realtime monitoring on.
+            // (It was false while Hermit's watcher was a no-op.)
+            enable_realtime_monitor: true,
             enable_lufs_scan: false,
             enable_chapter_image_extraction: false,
             extract_chapter_images_during_library_scan: false,

@@ -78,6 +78,7 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 tokio = { version = "1", features = ["full"] }
+notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"] }

@@ -186,6 +186,7 @@ pub mod media_source_manager;
 pub mod media_stream_repository;
 pub mod music_manager;
 pub mod next_up_service;
+pub mod notify_watcher;
 pub mod path_manager;
 pub mod people_repository;
 pub mod playback_metrics;
@@ -239,7 +240,9 @@ pub use item_repository::HermitItemRepository;
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::HermitKeyframeRepository;
 pub use library_manager::HermitLibraryManager;
-pub use library_monitor::{HermitLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher};
+pub use library_monitor::{
+    HermitLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
+};
 pub use library_scan::LibraryScanner;
 pub use linked_children_service::HermitLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
@@ -250,6 +253,7 @@ pub use media_source_manager::HermitMediaSourceManager;
 pub use media_stream_repository::HermitMediaStreamRepository;
 pub use music_manager::HermitMusicManager;
 pub use next_up_service::HermitNextUpService;
+pub use notify_watcher::NotifyFileSystemWatcher;
 pub use path_manager::HermitPathManager;
 pub use people_repository::HermitPeopleRepository;
 pub use playback_metrics::HermitPlaybackMetrics;

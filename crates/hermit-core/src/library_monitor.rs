@@ -45,16 +45,44 @@ pub trait LibraryScanTrigger: Send + Sync {
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 }
 
+/// Supplies the filesystem roots the monitor should watch.
+///
+/// Resolved fresh on every [`LibraryMonitor::start`], so a monitor restart
+/// after a library-structure change (folder added/removed, realtime option
+/// toggled) picks up the new set — the C# monitor re-reads
+/// `GetVirtualFolders` the same way. The composition root implements this
+/// over the virtual-folder manager, filtered to libraries whose
+/// `enable_realtime_monitor` option is on; tests use a plain `Vec<String>`.
+#[async_trait]
+pub trait WatchRootsSource: Send + Sync {
+    /// The root paths to watch right now.
+    async fn watch_roots(&self) -> Vec<String>;
+}
+
+#[async_trait]
+impl WatchRootsSource for Vec<String> {
+    async fn watch_roots(&self) -> Vec<String> {
+        self.clone()
+    }
+}
+
+#[async_trait]
+impl<T: WatchRootsSource + ?Sized> WatchRootsSource for Arc<T> {
+    async fn watch_roots(&self) -> Vec<String> {
+        (**self).watch_roots().await
+    }
+}
+
 /// The concrete library monitor.
 ///
 /// Owns the temporarily-ignored path set (self-suppression) and delegates the
-/// watch lifecycle to the injected [`FileSystemWatcher`]. The roots to watch are
-/// supplied at construction (the composition root reads them from the library
-/// configuration).
+/// watch lifecycle to the injected [`FileSystemWatcher`]. The roots to watch
+/// come from the injected [`WatchRootsSource`], re-read on every `start` (the
+/// composition root supplies the realtime-enabled library roots).
 #[derive(Clone)]
 pub struct HermitLibraryMonitor {
     watcher: Arc<dyn FileSystemWatcher>,
-    roots: Arc<Vec<String>>,
+    roots: Arc<dyn WatchRootsSource>,
     /// Paths currently being written by the server; changes under them are
     /// suppressed. Guarded by a `std::sync::Mutex` because the guard never spans
     /// an `.await` (the set is touched synchronously inside each method).
@@ -68,16 +96,18 @@ pub struct HermitLibraryMonitor {
 impl std::fmt::Debug for HermitLibraryMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HermitLibraryMonitor")
-            .field("roots", &self.roots.len())
             .finish_non_exhaustive()
     }
 }
 
 impl HermitLibraryMonitor {
-    /// Creates a monitor over the given watcher and the library root paths to
-    /// watch.
+    /// Creates a monitor over the given watcher and the source of library root
+    /// paths to watch (a plain `Vec<String>` works for a fixed set).
     #[must_use]
-    pub fn new(watcher: Arc<dyn FileSystemWatcher>, roots: Vec<String>) -> Self {
+    pub fn new(
+        watcher: Arc<dyn FileSystemWatcher>,
+        roots: impl WatchRootsSource + 'static,
+    ) -> Self {
         Self {
             watcher,
             roots: Arc::new(roots),
@@ -115,8 +145,13 @@ impl HermitLibraryMonitor {
 #[async_trait]
 impl LibraryMonitor for HermitLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
-        for root in self.roots.iter() {
-            self.watcher.watch(root).await?;
+        for root in self.roots.watch_roots().await {
+            // Per-root failures (root unmounted, inotify limit) must not stop
+            // the remaining roots from being watched — the C# monitor
+            // try/catches each path the same way.
+            if let Err(err) = self.watcher.watch(&root).await {
+                tracing::warn!(root, %err, "failed to watch library root");
+            }
         }
         Ok(())
     }
@@ -178,11 +213,12 @@ impl LibraryMonitor for HermitLibraryMonitor {
 
 /// A [`FileSystemWatcher`] that watches nothing.
 ///
-/// Live inotify watching is deferred (the OS change-event wiring is a separate
-/// piece of work), but the [`HermitLibraryMonitor`] still needs a watcher to
-/// construct. The composition root pairs this with `with_refresh_target` so the
-/// external-change **webhooks** (`POST /Library/{Series,Movies,Media}/…`) drive a
-/// real refresh; only the passive OS-watch lifecycle (`start`/`stop`) is a no-op.
+/// The composition root's fallback when the real
+/// [`NotifyFileSystemWatcher`](crate::notify_watcher::NotifyFileSystemWatcher)
+/// cannot initialize (e.g. inotify limits exhausted): the external-change
+/// **webhooks** (`POST /Library/{Series,Movies,Media}/…`) still drive a real
+/// refresh; only the passive OS-watch lifecycle (`start`/`stop`) is a no-op.
+/// Unit tests use it wherever a monitor needs a watcher that never fires.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopFileSystemWatcher;
 
@@ -224,6 +260,44 @@ mod tests {
             *self.unwatched_all.lock().unwrap() = true;
             Ok(())
         }
+    }
+
+    /// A watcher that rejects one root and records the rest.
+    struct FlakyWatcher {
+        bad: &'static str,
+        watched: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl FileSystemWatcher for FlakyWatcher {
+        async fn watch(&self, path: &str) -> Result<(), ServiceError> {
+            if path == self.bad {
+                return Err(ServiceError::backend("gone"));
+            }
+            self.watched.lock().unwrap().push(path.to_owned());
+            Ok(())
+        }
+        async fn unwatch(&self, _path: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn unwatch_all(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn start_continues_past_a_failing_root() {
+        let watcher = Arc::new(FlakyWatcher {
+            bad: "/media/unmounted",
+            watched: StdMutex::default(),
+        });
+        let monitor = HermitLibraryMonitor::new(
+            watcher.clone(),
+            vec!["/media/unmounted".to_owned(), "/media/tv".to_owned()],
+        );
+        // One root failing to watch must not fail start or skip later roots.
+        monitor.start().await.expect("start");
+        assert_eq!(*watcher.watched.lock().unwrap(), vec!["/media/tv"]);
     }
 
     #[tokio::test]

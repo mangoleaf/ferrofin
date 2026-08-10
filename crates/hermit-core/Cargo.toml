@@ -19,6 +19,7 @@ hermit-providers.workspace = true
 hermit-keyframes.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
+notify.workspace = true
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -18,10 +18,10 @@
 //! filesystem `HermitVirtualFolderManager` (see `handlers::library` for the two
 //! `LibraryController` structure reads, `PhysicalPaths` + `AvailableOptions`).
 //!
-//! The C# `refreshLibrary` query flag and the `ILibraryMonitor` stop/start dance
-//! are accepted-but-unused: the scan pipeline and filesystem watcher are
-//! later-wave subsystems, so a mutation takes effect on disk immediately and the
-//! requested refresh is a documented no-op (matching `POST /Library/Refresh`).
+//! Every mutation ends with the C# `ILibraryMonitor` stop/start dance (so the
+//! filesystem watcher's root set tracks the new structure and realtime-option
+//! toggles) and honors the `refreshLibrary` query flag by queueing a scan —
+//! mirroring the `finally` block of each C# controller action.
 
 use axum::Router;
 use axum::extract::{Json, Query, State};
@@ -35,6 +35,24 @@ use uuid::Uuid;
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// Restarts the library monitor so its watch set matches the just-mutated
+/// library structure, then queues a full scan when the request asked for one —
+/// the `ILibraryMonitor` stop/start + `refreshLibrary` dance every C#
+/// `LibraryStructureController` action ends with. Best-effort: a watcher or
+/// queue failure must not fail the admin request whose mutation already
+/// succeeded.
+async fn after_structure_change(state: &AppState, refresh_library: bool) {
+    if let Err(err) = state.library_monitor.stop().await {
+        tracing::warn!(%err, "failed to stop library monitor");
+    }
+    if let Err(err) = state.library_monitor.start().await {
+        tracing::warn!(%err, "failed to restart library monitor");
+    }
+    if refresh_library && let Err(err) = state.library.queue_library_scan().await {
+        tracing::warn!(%err, "failed to queue the requested library refresh");
+    }
+}
 
 /// `GET /Library/VirtualFolders` — the configured virtual folders.
 ///
@@ -77,10 +95,8 @@ struct AddVirtualFolderQuery {
     /// The media paths (comma-delimited).
     #[serde(default)]
     paths: Option<String>,
-    /// Whether to refresh the library after adding (accepted, unused — the scan
-    /// pipeline is a later-wave subsystem).
+    /// Whether to queue a library scan after adding.
     #[serde(default)]
-    #[allow(dead_code)]
     refresh_library: bool,
 }
 
@@ -140,6 +156,7 @@ async fn add_virtual_folder(
         .virtual_folders
         .add_virtual_folder(&name, query.collection_type, &options)
         .await?;
+    after_structure_change(&state, query.refresh_library).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -150,10 +167,8 @@ struct RemoveVirtualFolderQuery {
     /// The name of the folder.
     #[serde(default)]
     name: Option<String>,
-    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
-    /// later-wave subsystem).
+    /// Whether to queue a library scan after the removal.
     #[serde(default)]
-    #[allow(dead_code)]
     refresh_library: bool,
 }
 
@@ -181,6 +196,7 @@ async fn remove_virtual_folder(
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
     state.virtual_folders.remove_virtual_folder(&name).await?;
+    after_structure_change(&state, query.refresh_library).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -194,10 +210,8 @@ struct RenameVirtualFolderQuery {
     /// The new name.
     #[serde(default)]
     new_name: Option<String>,
-    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
-    /// later-wave subsystem).
+    /// Whether to queue a library scan after the rename.
     #[serde(default)]
-    #[allow(dead_code)]
     refresh_library: bool,
 }
 
@@ -238,6 +252,7 @@ async fn rename_virtual_folder(
         .virtual_folders
         .rename_virtual_folder(&name, &new_name)
         .await?;
+    after_structure_change(&state, query.refresh_library).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -270,10 +285,8 @@ struct MediaPathQuery {
     /// The path to remove (delete only).
     #[serde(default)]
     path: Option<String>,
-    /// Whether to refresh the library (accepted, unused — the scan pipeline is a
-    /// later-wave subsystem).
+    /// Whether to queue a library scan after the change.
     #[serde(default)]
-    #[allow(dead_code)]
     refresh_library: bool,
 }
 
@@ -292,7 +305,7 @@ struct MediaPathQuery {
 async fn add_media_path(
     State(state): State<AppState>,
     FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
-    Query(_query): Query<MediaPathQuery>,
+    Query(query): Query<MediaPathQuery>,
     Json(body): Json<MediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.unwrap_or_default();
@@ -314,6 +327,7 @@ async fn add_media_path(
         .virtual_folders
         .add_media_path(&name, &path_info)
         .await?;
+    after_structure_change(&state, query.refresh_library).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -361,6 +375,8 @@ async fn update_media_path(
         .virtual_folders
         .update_media_path(&name, &path_info)
         .await?;
+    // No `refreshLibrary` flag on this route (matching the C# action).
+    after_structure_change(&state, false).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -396,6 +412,7 @@ async fn remove_media_path(
         .virtual_folders
         .remove_media_path(&name, &path)
         .await?;
+    after_structure_change(&state, query.refresh_library).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -468,6 +485,8 @@ async fn update_library_options(
         .virtual_folders
         .update_library_options(&name, &options)
         .await?;
+    // Restart the watcher so an `EnableRealtimeMonitor` toggle applies live.
+    after_structure_change(&state, false).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -346,6 +346,30 @@ impl HermitVirtualFolderManager {
 }
 
 #[async_trait]
+impl crate::library_monitor::WatchRootsSource for HermitVirtualFolderManager {
+    async fn watch_roots(&self) -> Vec<String> {
+        // The roots the library monitor should watch: every location of every
+        // library whose `EnableRealtimeMonitor` option is on (the per-library
+        // "Enable real time monitoring" dashboard checkbox).
+        match self.get_virtual_folders().await {
+            Ok(folders) => folders
+                .into_iter()
+                .filter(|f| {
+                    f.library_options
+                        .as_ref()
+                        .is_some_and(|o| o.enable_realtime_monitor)
+                })
+                .flat_map(|f| f.locations)
+                .collect(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to list libraries for watch roots");
+                Vec::new()
+            }
+        }
+    }
+}
+
+#[async_trait]
 impl VirtualFolderManager for HermitVirtualFolderManager {
     async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
         let mut dir = match tokio::fs::read_dir(&self.root).await {
@@ -947,6 +971,23 @@ mod tests {
         expected.sort();
         assert_eq!(locs, expected);
         assert!(folder.library_options.unwrap().enable_realtime_monitor);
+    }
+
+    #[tokio::test]
+    async fn watch_roots_returns_only_realtime_enabled_library_locations() {
+        use crate::library_monitor::WatchRootsSource;
+        let (tmp, mgr) = manager();
+        let watched = media_dir(&tmp, "watched");
+        let unwatched = media_dir(&tmp, "unwatched");
+        let mut on = opts_with_paths(std::slice::from_ref(&watched));
+        on.enable_realtime_monitor = true;
+        mgr.add_virtual_folder("Watched", None, &on).await.unwrap();
+        let mut off = opts_with_paths(&[unwatched]);
+        off.enable_realtime_monitor = false;
+        mgr.add_virtual_folder("Silent", None, &off).await.unwrap();
+
+        // Only the realtime-enabled library's locations are watch roots.
+        assert_eq!(mgr.watch_roots().await, vec![watched]);
     }
 
     #[tokio::test]

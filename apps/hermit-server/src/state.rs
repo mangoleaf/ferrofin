@@ -398,10 +398,14 @@ pub async fn build_app_state(
     // ---- library + media-sources (consume repositories/services) ----------
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
     // the filesystem scanner the library manager runs on `queue_library_scan`.
-    let virtual_folders: Arc<dyn hermit_traits::library::VirtualFolderManager> = Arc::new(
+    // Kept concrete so the library monitor can take it as its `WatchRootsSource`
+    // (the roots of every library with realtime monitoring enabled).
+    let virtual_folders_impl = Arc::new(
         hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service)),
     );
+    let virtual_folders: Arc<dyn hermit_traits::library::VirtualFolderManager> =
+        virtual_folders_impl.clone();
     let mut scanner = hermit_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -471,18 +475,41 @@ pub async fn build_app_state(
         .with_scanner(Arc::clone(&library_scanner)),
     );
     let library: Arc<dyn hermit_traits::library::LibraryManager> = library_impl.clone();
-    // The library monitor backs the external-source change webhooks
-    // (`POST /Library/{Series,Movies,Media}/{Added,Updated}`): a reported path
-    // queues a (coalescing) library scan so tools like Radarr/Sonarr can poke the
-    // server to pick up new media. Live OS inotify watching is deferred, so the
-    // watcher is a no-op — only the webhook-driven refresh path is wired.
+    // The library monitor drives refreshes from two change sources: the
+    // external-source webhooks (`POST /Library/{Series,Movies,Media}/{Added,
+    // Updated}` — Radarr/Sonarr pokes) and the live OS filesystem watcher over
+    // the roots of every library with `EnableRealtimeMonitor` on. Watcher
+    // events are pumped into `report_file_system_changed`, which suppresses
+    // server-initiated writes and queues a (coalescing) scan for the rest. If
+    // the OS watcher cannot initialize (inotify limits), fall back to the
+    // no-op watcher — webhook-driven refresh still works.
+    let (fs_watcher, fs_events): (
+        Arc<dyn hermit_core::resolvers::FileSystemWatcher>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    ) = match hermit_core::NotifyFileSystemWatcher::new() {
+        Ok((watcher, rx)) => (Arc::new(watcher), Some(rx)),
+        Err(err) => {
+            tracing::warn!(%err, "filesystem watcher unavailable; realtime library monitoring disabled");
+            (Arc::new(hermit_core::NoopFileSystemWatcher), None)
+        }
+    };
     let library_monitor: Arc<dyn hermit_traits::library::LibraryMonitor> = Arc::new(
-        hermit_core::HermitLibraryMonitor::new(
-            Arc::new(hermit_core::NoopFileSystemWatcher),
-            Vec::new(),
-        )
-        .with_refresh_target(library_impl.clone()),
+        hermit_core::HermitLibraryMonitor::new(fs_watcher, virtual_folders_impl.clone())
+            .with_refresh_target(library_impl.clone()),
     );
+    if let Some(mut rx) = fs_events {
+        let monitor = Arc::clone(&library_monitor);
+        tokio::spawn(async move {
+            while let Some(path) = rx.recv().await {
+                if let Err(err) = monitor.report_file_system_changed(&path).await {
+                    tracing::warn!(%err, path, "failed to report filesystem change");
+                }
+            }
+        });
+    }
+    if let Err(err) = library_monitor.start().await {
+        tracing::warn!(%err, "failed to start library monitor");
+    }
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
