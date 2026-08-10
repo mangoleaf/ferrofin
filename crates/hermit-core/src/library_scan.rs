@@ -8,9 +8,10 @@
 //!
 //! Dispatches by collection type: `movies`/`homevideos`/`musicvideos`/`mixed`
 //! (and untyped) libraries flatten every video file to a `Movie`; `tvshows` build
-//! the Series→Season→Episode hierarchy; `music` builds MusicAlbum→Audio. Pruning
-//! of deleted files and remote-metadata refresh are follow-ups (see
-//! `brain/plans/PLAN_HERMIT_LIBRARY_SCAN.md`).
+//! the Series→Season→Episode hierarchy; `music` builds MusicAlbum→Audio. After
+//! the walk, items whose files vanished from disk are pruned
+//! ([`prune_deleted`](LibraryScanner::prune_deleted)), so deleted media stops
+//! being served after the next scan.
 //!
 //! Two passes: a **synchronous plan** (walk + filename resolution — this is where
 //! the `!Sync` [`NamingOptions`] lazy-regex cells live, so they never cross an
@@ -299,6 +300,15 @@ impl LibraryScanner {
         self
     }
 
+    /// Attaches the item repository on its own (without the MusicBrainz music
+    /// pass), which the post-scan deleted-item prune needs to list what a
+    /// library currently stores. [`with_music`](Self::with_music) also sets it.
+    #[must_use]
+    pub fn with_items(mut self, item_repository: Arc<dyn ItemRepository>) -> Self {
+        self.item_repository = Some(item_repository);
+        self
+    }
+
     /// Attaches the AudioDb client so music artists/albums get bio + artwork
     /// during the post-scan music pass (keyed off the resolved MusicBrainz ids).
     #[must_use]
@@ -492,6 +502,10 @@ impl LibraryScanner {
                 tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
             }
         }
+        // Drop rows whose files vanished since the last scan, so deleted media
+        // stops being listed and served. Best-effort — a failure must not fail
+        // the whole scan.
+        self.prune_deleted(&folders, &planned).await;
         // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above. Best-effort — a failure here must not fail the whole scan.
@@ -499,6 +513,88 @@ impl LibraryScanner {
             tracing::warn!(%err, "music enrichment pass failed");
         }
         Ok(planned.len())
+    }
+
+    /// Deletes items under the scanned libraries whose backing files no longer
+    /// exist. The walk is the source of truth: any stored row (movie, series,
+    /// season, episode, album, track) keyed to a scanned library that this
+    /// scan did not re-plan is gone from disk — deleted, renamed, or moved —
+    /// and is removed. FK cascades clear its streams/chapters/images/user data;
+    /// by-name rows (genres, studios, artists, people) carry no `TopParentId`
+    /// and are untouched. No-op without an item repository.
+    ///
+    /// Safety: a library whose location is unreachable (unmounted network
+    /// share, detached drive) walks as empty, which is indistinguishable from
+    /// "everything was deleted" — such libraries are skipped with a warning
+    /// rather than mass-pruned. Collection types the planner doesn't scan
+    /// (books/photos/…) are also skipped: their empty plan means "not
+    /// managed", not "deleted".
+    async fn prune_deleted(&self, folders: &[VirtualFolderInfo], planned: &[Planned]) {
+        let Some(items) = &self.item_repository else {
+            return;
+        };
+        let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        for folder in folders {
+            let Some(cf) = collection_folder_id(folder) else {
+                continue;
+            };
+            let planner_scans_type = matches!(
+                folder.collection_type,
+                None | Some(
+                    CollectionTypeOptions::tvshows
+                        | CollectionTypeOptions::music
+                        | CollectionTypeOptions::movies
+                        | CollectionTypeOptions::homevideos
+                        | CollectionTypeOptions::musicvideos
+                        | CollectionTypeOptions::mixed
+                )
+            );
+            if !planner_scans_type {
+                continue;
+            }
+            if let Some(gone) = folder
+                .locations
+                .iter()
+                .find(|loc| !self.file_system.directory_exists(loc))
+            {
+                tracing::warn!(
+                    library = %cf,
+                    location = %gone,
+                    "library location unreachable; skipping deleted-item prune"
+                );
+                continue;
+            }
+            let existing = match items
+                .get_item_list(&InternalItemsQuery {
+                    top_parent_ids: vec![cf],
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
+                    continue;
+                }
+            };
+            let stale: Vec<Uuid> = existing
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .filter(|id| !live.contains(id))
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            match self.persistence.delete_items(&stale).await {
+                Ok(()) => {
+                    tracing::info!(library = %cf, removed = stale.len(), "pruned items deleted from disk");
+                }
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to prune deleted items");
+                }
+            }
+        }
     }
 
     /// The post-scan music-enrichment pass. Resolves each `MusicAlbum`'s and
@@ -3187,6 +3283,75 @@ mod tests {
             count_type_like(&db, "%Movies.Movie").await,
             2,
             "re-scan did not duplicate"
+        );
+    }
+
+    // Deleting media from disk must remove it from the library on the next
+    // scan — and an unreachable library location (unmounted share) must NOT be
+    // treated as "everything deleted".
+    #[tokio::test]
+    async fn rescan_prunes_items_whose_files_were_deleted() {
+        use crate::item_repository::HermitItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use hermit_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tv = tmp.path().join("tv");
+        std::fs::create_dir_all(tv.join("Firefly/Season 01")).unwrap();
+        std::fs::write(tv.join("Firefly/Season 01/Firefly S01E01.mkv"), b"").unwrap();
+        std::fs::create_dir_all(tv.join("Dollhouse/Season 01")).unwrap();
+        std::fs::write(tv.join("Dollhouse/Season 01/Dollhouse S01E01.mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "TV",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tv.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(HermitItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+                .with_items(items);
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(count_type_like(&db, "%TV.Series").await, 2);
+        assert_eq!(count_type_like(&db, "%TV.Episode").await, 2);
+
+        // Delete one whole series from disk → its series/season/episode rows go.
+        std::fs::remove_dir_all(tv.join("Firefly")).unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            count_type_like(&db, "%TV.Series").await,
+            1,
+            "deleted series pruned"
+        );
+        assert_eq!(count_type_like(&db, "%TV.Season").await, 1);
+        assert_eq!(count_type_like(&db, "%TV.Episode").await, 1);
+
+        // Unmounted-share guard: a missing library ROOT walks as empty but must
+        // not be mistaken for mass deletion — the surviving series is retained.
+        std::fs::remove_dir_all(&tv).unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            count_type_like(&db, "%TV.Episode").await,
+            1,
+            "unreachable location skips the prune"
         );
     }
 
