@@ -50,8 +50,16 @@ async fn websocket_upgrade(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let session_id = resolve_session_id(&state, &headers, query.as_deref()).await;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    let caller = resolve_caller(&state, &headers, query.as_deref()).await;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, caller))
+}
+
+/// The resolved identity of an authenticated socket: its session id (the bus
+/// sink key) and the signed-in user (who the subscription streams answer for).
+#[derive(Clone)]
+struct SocketCaller {
+    session_id: String,
+    user_id: uuid::Uuid,
 }
 
 /// Resolves the caller's session id from the socket's access token, or `None`
@@ -69,20 +77,23 @@ async fn websocket_upgrade(
 ///
 /// [`get_session_by_authentication_token`]: hermit_traits::session::SessionManager::get_session_by_authentication_token
 /// [`AuthService`]: hermit_traits::net::AuthService
-async fn resolve_session_id(
+async fn resolve_caller(
     state: &AppState,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> Option<String> {
+) -> Option<SocketCaller> {
     let token = query_param(query, "api_key")
         .or_else(|| query_param(query, "ApiKey"))
         .or_else(|| header_token(headers))?;
-    state
+    let session = state
         .sessions
         .get_session_by_authentication_token(&token, "", "")
         .await
-        .ok()?
-        .id
+        .ok()?;
+    Some(SocketCaller {
+        session_id: session.id?,
+        user_id: session.user_id,
+    })
 }
 
 /// Reads a bare-token header (`X-Emby-Token` / `X-MediaBrowser-Token`).
@@ -115,8 +126,31 @@ enum Action {
     Pong(axum::body::Bytes),
     /// The peer is gone (close frame, stream end, or error) — stop.
     Stop,
-    /// Nothing to do (text/binary/pong in the minimal socket).
+    /// Nothing to do (binary/pong, or an unrecognized text message).
     Ignore,
+    /// A recognized inbound protocol message (parsed from a text frame).
+    Inbound(Inbound),
+}
+
+/// The inbound client→server messages the socket protocol handles: the
+/// keep-alive ping and the dashboard's periodic-stream subscriptions
+/// (Jellyfin's `BasePeriodicWebSocketListener` Start/Stop pairs).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Inbound {
+    /// `KeepAlive` — the client's periodic ping; answered with a `KeepAlive` ack.
+    KeepAlive,
+    /// `SessionsStart` — stream the session list every `period`.
+    SessionsStart(Duration),
+    /// `SessionsStop` — stop the session stream.
+    SessionsStop,
+    /// `ScheduledTasksInfoStart` — stream the task list every `period`.
+    TasksStart(Duration),
+    /// `ScheduledTasksInfoStop` — stop the task stream.
+    TasksStop,
+    /// `ActivityLogEntryStart` — stream new activity entries every `period`.
+    ActivityStart(Duration),
+    /// `ActivityLogEntryStop` — stop the activity stream.
+    ActivityStop,
 }
 
 /// Decides how to react to one received frame.
@@ -124,8 +158,44 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
     match frame {
         Some(Ok(Message::Ping(payload))) => Action::Pong(payload),
         Some(Ok(Message::Close(_)) | Err(_)) | None => Action::Stop,
+        Some(Ok(Message::Text(text))) => {
+            parse_inbound(&text).map_or(Action::Ignore, Action::Inbound)
+        }
         Some(Ok(_)) => Action::Ignore,
     }
+}
+
+/// Parses a text frame as an inbound protocol message, or `None` for anything
+/// unrecognized (matching the C# socket, which ignores unknown message types).
+fn parse_inbound(text: &str) -> Option<Inbound> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let period = || subscription_period(value.get("Data").and_then(|d| d.as_str()));
+    match value.get("MessageType")?.as_str()? {
+        "KeepAlive" => Some(Inbound::KeepAlive),
+        "SessionsStart" => Some(Inbound::SessionsStart(period())),
+        "SessionsStop" => Some(Inbound::SessionsStop),
+        "ScheduledTasksInfoStart" => Some(Inbound::TasksStart(period())),
+        "ScheduledTasksInfoStop" => Some(Inbound::TasksStop),
+        "ActivityLogEntryStart" => Some(Inbound::ActivityStart(period())),
+        "ActivityLogEntryStop" => Some(Inbound::ActivityStop),
+        _ => None,
+    }
+}
+
+/// The default stream period when the subscription's `Data` is absent or
+/// malformed — jellyfin-web subscribes with "0,1500".
+const DEFAULT_STREAM_MILLIS: u64 = 1500;
+
+/// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
+/// `BasePeriodicWebSocketListener` Data convention) into the stream period.
+/// The initial delay is folded into the period (first send after one period).
+fn subscription_period(data: Option<&str>) -> Duration {
+    let millis = data
+        .and_then(|d| d.split(',').nth(1))
+        .and_then(|p| p.trim().parse::<u64>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(DEFAULT_STREAM_MILLIS);
+    Duration::from_millis(millis)
 }
 
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
@@ -134,27 +204,27 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
 #[tracing::instrument(
     name = "ws_session",
     skip_all,
-    fields(session_id = session_id.as_deref().unwrap_or("anonymous"))
+    fields(session_id = caller.as_ref().map_or("anonymous", |c| c.session_id.as_str()))
 )]
-async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Option<String>) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, caller: Option<SocketCaller>) {
     let started = std::time::Instant::now();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
     // closing the loop.
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let registration = match (session_id.as_ref(), state.session_bus.as_ref()) {
-        (Some(sid), Some(bus)) => {
+    let registration = match (caller.as_ref(), state.session_bus.as_ref()) {
+        (Some(c), Some(bus)) => {
             let sink_tx = tx.clone();
             bus.register(
-                sid.clone(),
+                c.session_id.clone(),
                 Box::new(move |msg| {
                     // Failure means the socket's receiver is gone; the socket
                     // unregisters on close, so dropping the message is correct.
                     let _ = sink_tx.send(msg);
                 }),
             );
-            Some((sid.clone(), std::sync::Arc::clone(bus)))
+            Some((c.session_id.clone(), std::sync::Arc::clone(bus)))
         }
         _ => None,
     };
@@ -166,6 +236,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
     keepalive.tick().await; // consume the immediate first tick
 
+    // The dashboard's periodic streams, armed by *Start subscription messages
+    // (each is `None` until subscribed). Only an authenticated socket may
+    // subscribe — the streams answer as the socket's user.
+    let mut streams = Streams::default();
+
     loop {
         tokio::select! {
             frame = socket.recv() => match action_for(frame) {
@@ -176,6 +251,17 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
                 }
                 Action::Stop => break,
                 Action::Ignore => {}
+                Action::Inbound(Inbound::KeepAlive) => {
+                    // Ack the client's ping (C# `SendKeepAliveResponse`).
+                    if socket.send(Message::Text(keep_alive_ack().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Action::Inbound(inbound) => {
+                    if caller.is_some() {
+                        streams.apply(inbound);
+                    }
+                }
             },
             Some(push) = rx.recv() => {
                 // A server→client message (SyncPlay command/update, …).
@@ -190,6 +276,28 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
                     break;
                 }
             }
+            () = tick(&mut streams.sessions) => {
+                if let Some(c) = caller.as_ref()
+                    && let Some(msg) = sessions_message(&state, c.user_id).await
+                    && socket.send(Message::Text(msg.into())).await.is_err()
+                {
+                    break;
+                }
+            }
+            () = tick(&mut streams.tasks) => {
+                if let Some(msg) = tasks_message(&state).await
+                    && socket.send(Message::Text(msg.into())).await.is_err()
+                {
+                    break;
+                }
+            }
+            () = tick(&mut streams.activity) => {
+                if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
+                    && socket.send(Message::Text(msg.into())).await.is_err()
+                {
+                    break;
+                }
+            }
         }
     }
 
@@ -201,6 +309,125 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session_id: Optio
         elapsed_s = started.elapsed().as_secs(),
         "websocket disconnected"
     );
+}
+
+/// The armed periodic streams of one socket.
+struct Streams {
+    sessions: Option<tokio::time::Interval>,
+    tasks: Option<tokio::time::Interval>,
+    activity: Option<tokio::time::Interval>,
+    /// Only activity entries created after this instant are streamed (advanced
+    /// on every send, so each entry is delivered once).
+    activity_since: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for Streams {
+    fn default() -> Self {
+        Self {
+            sessions: None,
+            tasks: None,
+            activity: None,
+            activity_since: chrono::Utc::now(),
+        }
+    }
+}
+
+impl Streams {
+    /// Arms or cancels a stream for one subscription message.
+    fn apply(&mut self, inbound: Inbound) {
+        let arm = |period: Duration| {
+            let mut interval = tokio::time::interval(period);
+            // First send one period from now, not immediately.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.reset();
+            Some(interval)
+        };
+        match inbound {
+            Inbound::SessionsStart(p) => self.sessions = arm(p),
+            Inbound::SessionsStop => self.sessions = None,
+            Inbound::TasksStart(p) => self.tasks = arm(p),
+            Inbound::TasksStop => self.tasks = None,
+            Inbound::ActivityStart(p) => {
+                self.activity_since = chrono::Utc::now();
+                self.activity = arm(p);
+            }
+            Inbound::ActivityStop => self.activity = None,
+            Inbound::KeepAlive => {}
+        }
+    }
+}
+
+/// Awaits the next tick of an armed stream; pends forever when unarmed (so the
+/// select branch never fires for a stream the client hasn't subscribed to).
+async fn tick(stream: &mut Option<tokio::time::Interval>) {
+    match stream {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// One outbound envelope: `{MessageType, MessageId, Data}` with the required
+/// hyphenated `MessageId` (strict Kotlin-SDK clients crash without it).
+fn envelope(message_type: &str, data: &serde_json::Value) -> String {
+    serde_json::json!({
+        "MessageType": message_type,
+        "MessageId": uuid::Uuid::new_v4().hyphenated().to_string(),
+        "Data": data,
+    })
+    .to_string()
+}
+
+/// The `Sessions` stream payload: the session list as the subscribing user
+/// sees it (the session manager applies the caller's visibility).
+async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<String> {
+    let sessions = state
+        .sessions
+        .get_sessions(user_id, None, None, None, false)
+        .await
+        .ok()?;
+    Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
+}
+
+/// The `ScheduledTasksInfo` stream payload: the current task list.
+async fn tasks_message(state: &AppState) -> Option<String> {
+    let tasks = state.tasks.get_tasks().await.ok()?;
+    Some(envelope(
+        "ScheduledTasksInfo",
+        &serde_json::to_value(tasks).ok()?,
+    ))
+}
+
+/// The `ActivityLogEntry` stream payload: entries created since the last send,
+/// or `None` when nothing new happened (no empty pushes).
+async fn activity_message(
+    state: &AppState,
+    since: &mut chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let query = hermit_traits::activity::ActivityLogQuery {
+        min_date: Some(*since),
+        ..Default::default()
+    };
+    let page = state.activity.get_paged_result(&query).await.ok()?;
+    if page.items.is_empty() {
+        return None;
+    }
+    if let Some(latest) = page.items.iter().map(|e| e.date).max() {
+        // The min_date filter is inclusive (`>=`), so step past the newest
+        // delivered entry or it would be re-sent on every tick.
+        *since = latest + chrono::Duration::milliseconds(1);
+    }
+    Some(envelope(
+        "ActivityLogEntry",
+        &serde_json::to_value(page.items).ok()?,
+    ))
+}
+
+/// The `KeepAlive` ack sent in reply to a client keep-alive ping.
+fn keep_alive_ack() -> String {
+    let message_id = uuid::Uuid::new_v4().hyphenated();
+    format!("{{\"MessageType\":\"KeepAlive\",\"MessageId\":\"{message_id}\"}}")
 }
 
 /// The `ForceKeepAlive` message body Jellyfin's protocol uses.
@@ -221,7 +448,8 @@ fn force_keep_alive_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, KEEPALIVE_SECS, action_for, force_keep_alive_message, header_token, query_param,
+        Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_SECS, action_for,
+        force_keep_alive_message, header_token, keep_alive_ack, parse_inbound, query_param,
     };
     use axum::extract::ws::Message;
     use axum::http::HeaderMap;
@@ -265,15 +493,71 @@ mod tests {
     }
 
     #[test]
-    fn text_and_binary_are_ignored() {
+    fn unknown_text_and_binary_are_ignored() {
         assert!(matches!(
             action_for(Some(Ok(Message::Text("{}".into())))),
+            Action::Ignore
+        ));
+        assert!(matches!(
+            action_for(Some(Ok(Message::Text("not json".into())))),
+            Action::Ignore
+        ));
+        assert!(matches!(
+            action_for(Some(Ok(Message::Text(
+                r#"{"MessageType":"SomethingElse"}"#.into()
+            )))),
             Action::Ignore
         ));
         assert!(matches!(
             action_for(Some(Ok(Message::Binary(axum::body::Bytes::new())))),
             Action::Ignore
         ));
+    }
+
+    #[test]
+    fn inbound_protocol_messages_are_recognized() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"KeepAlive"}"#),
+            Some(Inbound::KeepAlive)
+        );
+        // jellyfin-web subscribes with "initialDelay,period" in milliseconds.
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SessionsStart","Data":"0,1500"}"#),
+            Some(Inbound::SessionsStart(Duration::from_millis(1500)))
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SessionsStop","Data":""}"#),
+            Some(Inbound::SessionsStop)
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"ScheduledTasksInfoStart","Data":"1000,1000"}"#),
+            Some(Inbound::TasksStart(Duration::from_secs(1)))
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"ActivityLogEntryStart","Data":"0,1000"}"#),
+            Some(Inbound::ActivityStart(Duration::from_secs(1)))
+        );
+        // Malformed or missing Data falls back to the default period.
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SessionsStart"}"#),
+            Some(Inbound::SessionsStart(Duration::from_millis(
+                DEFAULT_STREAM_MILLIS
+            )))
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SessionsStart","Data":"junk"}"#),
+            Some(Inbound::SessionsStart(Duration::from_millis(
+                DEFAULT_STREAM_MILLIS
+            )))
+        );
+    }
+
+    #[test]
+    fn keep_alive_ack_is_valid_json_with_a_message_id() {
+        let v: serde_json::Value = serde_json::from_str(&keep_alive_ack()).unwrap();
+        assert_eq!(v["MessageType"], "KeepAlive");
+        assert!(v["MessageId"].as_str().unwrap().contains('-'));
     }
 
     #[test]

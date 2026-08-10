@@ -110,6 +110,25 @@ async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> &'s
     }
 }
 
+/// The graceful-shutdown future handed to axum: waits for the first shutdown
+/// trigger, then tells connected clients before the socket drains, so they
+/// show "server unavailable" instead of silently hanging (C# sends
+/// `ServerShuttingDown`; a restart-vs-shutdown distinction would need a
+/// restart channel Hermit doesn't have — both drain the same way).
+async fn announce_shutdown(
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    sessions: Arc<dyn hermit_traits::session::SessionManager>,
+) {
+    let reason = shutdown_signal(shutdown_rx).await;
+    tracing::info!(reason, "graceful shutdown requested");
+    let _ = sessions
+        .send_message_to_all_sessions(
+            hermit_model::session::SessionMessageType::ServerShuttingDown,
+            "",
+        )
+        .await;
+}
+
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
 ///
 /// This is the whole composition root, in order: initialise logging, open +
@@ -260,10 +279,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             app,
         ),
     )
-    .with_graceful_shutdown(async move {
-        let reason = shutdown_signal(shutdown_rx).await;
-        tracing::info!(reason, "graceful shutdown requested");
-    })
+    .with_graceful_shutdown(announce_shutdown(
+        shutdown_rx,
+        Arc::clone(&wired.state.sessions),
+    ))
     .await
     .context("server error")?;
 

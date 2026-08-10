@@ -442,8 +442,37 @@ async fn create_timer(
     RequireAuth(_auth): RequireAuth,
     Json(timer): Json<TimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.create_timer(timer).await?;
+    let program_id = timer.base.program_id.clone();
+    let id = live_tv(&state)?.create_timer(timer).await?;
+    notify_timer_event(
+        &state,
+        hermit_model::session::SessionMessageType::TimerCreated,
+        &id,
+        program_id.as_deref(),
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Pushes a timer lifecycle message (`TimerCreated` / `TimerCancelled` /
+/// `SeriesTimerCreated` / `SeriesTimerCancelled`) to every signed-in session,
+/// carrying the C# `TimerEventInfo` shape (`Id` + optional `ProgramId`) — the
+/// push Jellyfin's `RecordingNotifier` sends so clients refresh their
+/// recording views. Best-effort: delivery must not fail the request.
+async fn notify_timer_event(
+    state: &AppState,
+    message_type: hermit_model::session::SessionMessageType,
+    timer_id: &str,
+    program_id: Option<&str>,
+) {
+    let mut data = serde_json::json!({ "Id": timer_id });
+    if let Some(program_id) = program_id {
+        data["ProgramId"] = serde_json::Value::String(program_id.to_owned());
+    }
+    let _ = state
+        .sessions
+        .send_message_to_all_sessions(message_type, &data.to_string())
+        .await;
 }
 
 /// `POST /LiveTv/Timers/{timerId}` — update a recording timer.
@@ -464,6 +493,13 @@ async fn cancel_timer(
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_timer(&timer_id).await?;
+    notify_timer_event(
+        &state,
+        hermit_model::session::SessionMessageType::TimerCancelled,
+        &timer_id,
+        None,
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -502,7 +538,15 @@ async fn create_series_timer(
     RequireAuth(_auth): RequireAuth,
     Json(timer): Json<SeriesTimerInfoDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.create_series_timer(timer).await?;
+    let program_id = timer.base.program_id.clone();
+    let id = live_tv(&state)?.create_series_timer(timer).await?;
+    notify_timer_event(
+        &state,
+        hermit_model::session::SessionMessageType::SeriesTimerCreated,
+        &id,
+        program_id.as_deref(),
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -526,6 +570,13 @@ async fn cancel_series_timer(
     Path(timer_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.cancel_series_timer(&timer_id).await?;
+    notify_timer_event(
+        &state,
+        hermit_model::session::SessionMessageType::SeriesTimerCancelled,
+        &timer_id,
+        None,
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

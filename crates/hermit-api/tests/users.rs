@@ -388,7 +388,9 @@ impl SessionManager for NoopSessions {
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
+        // The user-update handlers push UserUpdated/UserDeleted here
+        // best-effort; delivery is covered by hermit-core's tests.
+        Ok(())
     }
     async fn send_message_to_user_device_sessions(
         &self,
@@ -1171,7 +1173,9 @@ impl SessionManager for OkSessions {
         _message_type: hermit_model::session::SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        unimplemented!()
+        // The user-update handlers push UserUpdated/UserDeleted here
+        // best-effort; delivery is covered by hermit-core's tests.
+        Ok(())
     }
     async fn send_message_to_user_device_sessions(
         &self,

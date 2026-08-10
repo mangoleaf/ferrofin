@@ -181,6 +181,19 @@ pub trait SessionManager: Send + Sync {
         data: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Sends a pre-serialized JSON message to every session with a signed-in
+    /// user (the delivery target of Jellyfin's library/server notifiers, e.g.
+    /// `LibraryChanged`). Defaulted to a no-op so lightweight test doubles need
+    /// not implement delivery; the concrete session manager overrides it.
+    async fn send_message_to_all_sessions(
+        &self,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (message_type, data);
+        Ok(())
+    }
+
     /// Sends a pre-serialized JSON message to all sessions of a specific device.
     async fn send_message_to_user_device_sessions(
         &self,

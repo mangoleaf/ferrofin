@@ -171,6 +171,12 @@ pub struct HermitTaskManager {
     stored_overrides: Arc<Mutex<HashMap<String, Vec<TaskTriggerInfo>>>>,
     /// Where trigger overrides persist (`None` = in-memory only).
     store_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Optional domain-event seam: every recorded run outcome is published as
+    /// a `TaskCompleted` event (the composition root forwards it to admin
+    /// sessions as the `ScheduledTaskEnded` WebSocket push the dashboard
+    /// listens for). Interior-mutable so it can be wired after construction;
+    /// clones share it.
+    events: Arc<Mutex<Option<Arc<dyn hermit_traits::events::EventManager>>>>,
 }
 
 impl std::fmt::Debug for HermitTaskManager {
@@ -266,8 +272,32 @@ impl HermitTaskManager {
         lock(&self.tasks).get(key).map(Registration::to_info)
     }
 
+    /// Attaches the domain-event seam so run outcomes are published as
+    /// `TaskCompleted` events (→ the `ScheduledTaskEnded` client push).
+    pub fn set_event_manager(&self, events: Arc<dyn hermit_traits::events::EventManager>) {
+        *lock(&self.events) = Some(events);
+    }
+
+    /// Publishes a finished run's [`TaskResult`] as a `TaskCompleted` event
+    /// (best-effort, on a spawned task — outcome recording never blocks on
+    /// delivery). No-op without an event seam or outside a tokio runtime.
+    fn publish_task_completed(&self, result: &TaskResult) {
+        let Some(events) = lock(&self.events).clone() else {
+            return;
+        };
+        let Ok(payload) = serde_json::to_string(result) else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = events.publish("TaskCompleted", &payload).await;
+            });
+        }
+    }
+
     /// Records a run's outcome and returns the task to [`Idle`](TaskState::Idle).
     fn record_result(&self, key: &str, result: TaskResult) {
+        self.publish_task_completed(&result);
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             reg.state = TaskState::Idle;
@@ -440,7 +470,7 @@ impl HermitTaskManager {
         }
         let start = reg.started_at.take().unwrap_or_else(Utc::now);
         reg.state = TaskState::Idle;
-        reg.last_result = Some(TaskResult {
+        let result = TaskResult {
             start_time_utc: start,
             end_time_utc: Utc::now(),
             status,
@@ -449,7 +479,10 @@ impl HermitTaskManager {
             id: Some(key.to_string()),
             error_message: None,
             long_error_message: None,
-        });
+        };
+        reg.last_result = Some(result.clone());
+        drop(guard);
+        self.publish_task_completed(&result);
         Ok(())
     }
 
@@ -808,6 +841,38 @@ mod tests {
         let result = info.last_execution_result.expect("result");
         assert_eq!(result.status, TaskCompletionStatus::Completed);
         assert!(result.end_time_utc >= result.start_time_utc);
+    }
+
+    // A finished run must publish `TaskCompleted` (→ the dashboard's
+    // `ScheduledTaskEnded` push) carrying the run's TaskResult.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_outcome_publishes_task_completed_event() {
+        let mgr = HermitTaskManager::new();
+        let events = crate::event_manager::HermitEventManager::new();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        events.subscribe(
+            "TaskCompleted",
+            Arc::new(move |payload: &str| {
+                let _ = tx.send(payload.to_owned());
+                Ok(())
+            }),
+        );
+        mgr.set_event_manager(Arc::new(events));
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+
+        mgr.run_now("counting").await.expect("run");
+        // The publish is spawned; wait for it (multi-thread runtime keeps the
+        // spawned task progressing while this thread blocks on the channel).
+        let payload = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("TaskCompleted published");
+        let result: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(result["Key"], "counting");
+        assert_eq!(result["Status"], "Completed");
     }
 
     /// A task that stays running until its gate is released.

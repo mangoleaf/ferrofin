@@ -298,8 +298,11 @@ pub async fn build_app_state(
     );
     let file_system: Arc<dyn hermit_traits::filesystem::FileSystem> =
         Arc::new(HermitFileSystem::new());
-    let event_manager: Arc<dyn hermit_traits::events::EventManager> =
-        Arc::new(HermitEventManager::new());
+    // Kept concrete alongside the trait handle: consumers subscribe on the
+    // concrete bus (below, once the session manager exists) while publishers
+    // take the `dyn EventManager` seam. Clones share one registry.
+    let event_bus = HermitEventManager::new();
+    let event_manager: Arc<dyn hermit_traits::events::EventManager> = Arc::new(event_bus.clone());
     let localization: Arc<dyn hermit_traits::localization::LocalizationManager> = Arc::new(
         LocalizationManager::new(&server_config.metadata_country_code),
     );
@@ -451,6 +454,10 @@ pub async fn build_app_state(
     if let Some(every) = config.scan_progress_every {
         scanner = scanner.with_progress_every(every as usize);
     }
+    // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
+    // registered below (once the session manager exists) forward them to
+    // clients over the WebSocket so open views refresh after a scan.
+    scanner = scanner.with_events(Arc::clone(&event_manager));
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
@@ -482,6 +489,9 @@ pub async fn build_app_state(
     // managers exist, and the scheduler starts after registration.
     let task_manager = HermitTaskManager::new();
     task_manager.set_trigger_store(config.config_dir.join("task_triggers.json"));
+    // Run outcomes publish `TaskCompleted` → forwarded to admin sessions as
+    // the `ScheduledTaskEnded` push the dashboard's task page listens for.
+    task_manager.set_event_manager(Arc::clone(&event_manager));
     task_manager.register(Arc::new(hermit_core::RefreshLibraryTask::new(Arc::clone(
         &library,
     ))));
@@ -712,6 +722,62 @@ pub async fn build_app_state(
         )
         .with_session_bus(Arc::clone(&session_bus)),
     );
+
+    // Forward domain events to client sessions over the WebSocket — the Rust
+    // shape of Jellyfin's notifier entry points (`LibraryChangedNotifier`,
+    // `ScheduledTaskEnded`, refresh progress). Consumers subscribe on the
+    // concrete bus and spawn the async send so publication never blocks.
+    {
+        use hermit_model::session::SessionMessageType;
+        let forward = |bus: &HermitEventManager,
+                       event: &'static str,
+                       message_type: SessionMessageType,
+                       admin_only: bool| {
+            let sessions = Arc::clone(&sessions);
+            bus.subscribe(
+                event,
+                Arc::new(move |payload: &str| {
+                    let sessions = Arc::clone(&sessions);
+                    let payload = payload.to_owned();
+                    tokio::spawn(async move {
+                        let result = if admin_only {
+                            sessions
+                                .send_message_to_admin_sessions(message_type, &payload)
+                                .await
+                        } else {
+                            sessions
+                                .send_message_to_all_sessions(message_type, &payload)
+                                .await
+                        };
+                        if let Err(err) = result {
+                            tracing::debug!(%err, ?message_type, "failed to push event to sessions");
+                        }
+                    });
+                    Ok(())
+                }),
+            );
+        };
+        // Library adds/removes → every signed-in client refreshes its views.
+        forward(
+            &event_bus,
+            "LibraryChanged",
+            SessionMessageType::LibraryChanged,
+            false,
+        );
+        // Scan % + task completion → the admin dashboard's live displays.
+        forward(
+            &event_bus,
+            "RefreshProgress",
+            SessionMessageType::RefreshProgress,
+            true,
+        );
+        forward(
+            &event_bus,
+            "TaskCompleted",
+            SessionMessageType::ScheduledTaskEnded,
+            true,
+        );
+    }
 
     // These two maintenance tasks gate on active playback, so they register
     // once the session manager exists (registration order is otherwise inert).

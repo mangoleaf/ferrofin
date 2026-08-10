@@ -537,7 +537,42 @@ async fn delete_user(
     load_user(&state, user_id).await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
     state.users.delete_user(user_id).await?;
+    // Tell the deleted user's still-open clients (their sessions outlive the
+    // token revocation until they disconnect) — port of `UserDeleted`.
+    if let Ok(data) = serde_json::to_string(&user_id.to_string()) {
+        let _ = state
+            .sessions
+            .send_message_to_user_sessions(
+                &[user_id],
+                hermit_model::session::SessionMessageType::UserDeleted,
+                &data,
+            )
+            .await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Pushes a `UserUpdated` message carrying the refreshed [`UserDto`] to the
+/// user's sessions, so open clients pick up name/configuration/policy changes
+/// without re-login (port of Jellyfin's `ServerEventNotifier.OnUserUpdated`).
+/// Best-effort: a delivery failure must not fail the mutating request.
+async fn notify_user_updated(state: &AppState, user_id: Uuid) {
+    let Ok(user) = load_user(state, user_id).await else {
+        return;
+    };
+    let Ok(dto) = state.users.get_user_dto(&user, None).await else {
+        return;
+    };
+    if let Ok(data) = serde_json::to_string(&dto) {
+        let _ = state
+            .sessions
+            .send_message_to_user_sessions(
+                &[user_id],
+                hermit_model::session::SessionMessageType::UserUpdated,
+                &data,
+            )
+            .await;
+    }
 }
 
 /// `POST /Users/New` — create a user.
@@ -602,6 +637,7 @@ async fn update_user(
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
+    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -666,6 +702,7 @@ async fn update_user_policy(
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
     state.users.update_policy(user_id, &new_policy).await?;
+    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -694,6 +731,7 @@ async fn update_user_configuration(
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
     state.users.update_configuration(user_id, &config).await?;
+    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -158,6 +158,46 @@ struct Planned {
 /// `HERMIT_SCAN_PROGRESS_EVERY` bootstrap knob.
 const DEFAULT_SCAN_PROGRESS_EVERY: usize = 100;
 
+/// Per-library done/total counters driving the `RefreshProgress` pushes.
+struct LibraryProgress {
+    /// Planned items per collection folder.
+    totals: HashMap<Uuid, usize>,
+    /// Items processed so far per collection folder.
+    done: HashMap<Uuid, usize>,
+}
+
+impl LibraryProgress {
+    /// Tallies each library's planned item count. An item's library is the
+    /// first entry of its ancestor closure (always the collection folder).
+    fn new(planned: &[Planned]) -> Self {
+        let mut totals: HashMap<Uuid, usize> = HashMap::new();
+        for item in planned {
+            if let Some(&cf) = item.ancestors.first() {
+                *totals.entry(cf).or_default() += 1;
+            }
+        }
+        Self {
+            totals,
+            done: HashMap::new(),
+        }
+    }
+
+    /// Counts `item` as processed. Returns the library id and its completion
+    /// percentage when a progress push is due — at every `cadence` items
+    /// within the library (`0` disables the cadence) and at the library's
+    /// completion — or `None` between pushes.
+    fn advance(&mut self, item: &Planned, cadence: usize) -> Option<(Uuid, f64)> {
+        let cf = *item.ancestors.first()?;
+        let done = self.done.entry(cf).or_default();
+        *done += 1;
+        let total = self.totals.get(&cf).copied().unwrap_or(0).max(1);
+        let complete = *done >= total;
+        let at_cadence = cadence > 0 && done.is_multiple_of(cadence);
+        #[allow(clippy::cast_precision_loss)]
+        (complete || at_cadence).then(|| (cf, (*done as f64 / total as f64) * 100.0))
+    }
+}
+
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -209,6 +249,13 @@ pub struct LibraryScanner {
     /// disables progress logging. Keeps info-level volume at O(items/N) per
     /// RULES_LOGGING; per-item detail stays at `debug`.
     progress_every: usize,
+    /// Optional domain-event seam. When present the scan publishes
+    /// `LibraryChanged` (added/removed items, at scan end) and `RefreshProgress`
+    /// (per-library %, at the progress cadence) — the composition root forwards
+    /// both to client sessions over the WebSocket, which is how open clients
+    /// refresh their views after a scan. Absent in unit tests that don't
+    /// exercise events.
+    events: Option<Arc<dyn hermit_traits::events::EventManager>>,
 }
 
 impl std::fmt::Debug for LibraryScanner {
@@ -243,7 +290,16 @@ impl LibraryScanner {
             chapters: None,
             image_processor: None,
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
+            events: None,
         }
+    }
+
+    /// Attaches the domain-event seam so scans publish `LibraryChanged` and
+    /// `RefreshProgress` (forwarded to client sessions by the composition root).
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn hermit_traits::events::EventManager>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     /// Overrides the scan-progress cadence (items per `info!`); `0` disables
@@ -387,23 +443,19 @@ impl LibraryScanner {
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
     pub async fn scan(&self, only: Option<Uuid>) -> Result<usize, ServiceError> {
-        let mut folders = self.virtual_folders.get_virtual_folders().await?;
-        if let Some(only) = only {
-            if folders
-                .iter()
-                .any(|f| collection_folder_id(f) == Some(only))
-            {
-                folders.retain(|f| collection_folder_id(f) == Some(only));
-            } else {
-                tracing::warn!(library = %only, "scoped scan matched no library; scanning all");
-            }
-        }
+        let folders = self.scoped_folders(only).await?;
         let planned = self.plan(&folders); // sync: NamingOptions never crosses an await
         tracing::info!(
             items = planned.len(),
             folders = folders.len(),
             "library scan planned"
         );
+        // Per-library progress accounting for the `RefreshProgress` pushes: how
+        // many planned items each library has, and how many are done so far.
+        let mut library_progress = LibraryProgress::new(&planned);
+        // Item ids that did not exist before this scan (→ `ItemsAdded` in the
+        // scan-end `LibraryChanged` push). Only tracked when events are wired.
+        let mut items_added: Vec<&Planned> = Vec::new();
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
         let mut art_cache = ArtworkCache::default();
@@ -413,6 +465,10 @@ impl LibraryScanner {
             if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every)
             {
                 tracing::info!(scanned, total = planned.len(), "library scan progress");
+            }
+            if self.events.is_some() && !self.persistence.item_exists(item.id).await.unwrap_or(true)
+            {
+                items_added.push(item);
             }
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
@@ -501,11 +557,20 @@ impl LibraryScanner {
             {
                 tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
             }
+            // Per-library refresh % for open dashboards (`RefreshProgress`),
+            // at the same bounded cadence as the progress log plus each
+            // library's completion.
+            if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
+                self.publish_refresh_progress(cf, pct).await;
+            }
         }
         // Drop rows whose files vanished since the last scan, so deleted media
         // stops being listed and served. Best-effort — a failure must not fail
         // the whole scan.
-        self.prune_deleted(&folders, &planned).await;
+        let removed = self.prune_deleted(&folders, &planned).await;
+        // Announce what the scan changed (`LibraryChanged`) so open clients
+        // refresh their library views without a manual reload.
+        self.publish_library_changed(&items_added, &removed).await;
         // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above. Best-effort — a failure here must not fail the whole scan.
@@ -513,6 +578,96 @@ impl LibraryScanner {
             tracing::warn!(%err, "music enrichment pass failed");
         }
         Ok(planned.len())
+    }
+
+    /// Resolves the folder set a scan covers: all libraries, or — when `only`
+    /// names an existing library's CollectionFolder — just that one. An `only`
+    /// matching no library falls back to a full scan rather than silently
+    /// scanning nothing.
+    async fn scoped_folders(
+        &self,
+        only: Option<Uuid>,
+    ) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let mut folders = self.virtual_folders.get_virtual_folders().await?;
+        if let Some(only) = only {
+            if folders
+                .iter()
+                .any(|f| collection_folder_id(f) == Some(only))
+            {
+                folders.retain(|f| collection_folder_id(f) == Some(only));
+            } else {
+                tracing::warn!(library = %only, "scoped scan matched no library; scanning all");
+            }
+        }
+        Ok(folders)
+    }
+
+    /// Publishes one library's refresh percentage as a `RefreshProgress` event
+    /// (the C# `RefreshProgressMessage` dictionary shape: string values).
+    /// No-op without an event seam.
+    async fn publish_refresh_progress(&self, library: Uuid, pct: f64) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "ItemId": library.to_string(),
+            "Progress": format!("{pct:.2}"),
+        })
+        .to_string();
+        let _ = events.publish("RefreshProgress", &payload).await;
+    }
+
+    /// Publishes the scan's net changes as a `LibraryChanged` event carrying a
+    /// [`LibraryUpdateInfo`] — the payload Jellyfin's `LibraryChangedNotifier`
+    /// pushes so clients refresh home rows and library views. No-op when no
+    /// event seam is wired or nothing changed (an unchanged rescan is silent,
+    /// matching Jellyfin, whose item events only fire on real changes).
+    ///
+    /// `ItemsUpdated` is deliberately left empty: Hermit re-saves every planned
+    /// row on every scan, so "saved" is not "changed" — reporting them all
+    /// would announce the entire library on each rescan.
+    /// ponytail: add dirty tracking if per-item update pushes are ever needed.
+    async fn publish_library_changed(&self, added: &[&Planned], removed: &[(Uuid, Vec<Uuid>)]) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let mut folders_added: Vec<Uuid> = added
+            .iter()
+            .filter_map(|p| p.ancestors.first().copied())
+            .collect();
+        folders_added.sort_unstable();
+        folders_added.dedup();
+        let folders_removed: Vec<Uuid> = removed
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(cf, _)| *cf)
+            .collect();
+        let mut collection_folders: Vec<Uuid> = folders_added
+            .iter()
+            .chain(&folders_removed)
+            .copied()
+            .collect();
+        collection_folders.sort_unstable();
+        collection_folders.dedup();
+
+        let mut update = hermit_model::entities_media::LibraryUpdateInfo {
+            folders_added_to: folders_added.iter().map(Uuid::to_string).collect(),
+            folders_removed_from: folders_removed.iter().map(Uuid::to_string).collect(),
+            items_added: added.iter().map(|p| p.id.to_string()).collect(),
+            items_removed: removed
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().map(Uuid::to_string))
+                .collect(),
+            collection_folders: collection_folders.iter().map(Uuid::to_string).collect(),
+            ..hermit_model::entities_media::LibraryUpdateInfo::default()
+        };
+        update.is_empty = update.compute_is_empty();
+        if update.is_empty {
+            return;
+        }
+        if let Ok(payload) = serde_json::to_string(&update) {
+            let _ = events.publish("LibraryChanged", &payload).await;
+        }
     }
 
     /// Deletes items under the scanned libraries whose backing files no longer
@@ -529,9 +684,17 @@ impl LibraryScanner {
     /// rather than mass-pruned. Collection types the planner doesn't scan
     /// (books/photos/…) are also skipped: their empty plan means "not
     /// managed", not "deleted".
-    async fn prune_deleted(&self, folders: &[VirtualFolderInfo], planned: &[Planned]) {
+    ///
+    /// Returns the deleted item ids per library, feeding the scan-end
+    /// `LibraryChanged` push.
+    async fn prune_deleted(
+        &self,
+        folders: &[VirtualFolderInfo],
+        planned: &[Planned],
+    ) -> Vec<(Uuid, Vec<Uuid>)> {
+        let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
-            return;
+            return removed;
         };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
@@ -589,12 +752,14 @@ impl LibraryScanner {
             match self.persistence.delete_items(&stale).await {
                 Ok(()) => {
                     tracing::info!(library = %cf, removed = stale.len(), "pruned items deleted from disk");
+                    removed.push((cf, stale));
                 }
                 Err(err) => {
                     tracing::warn!(%err, library = %cf, "failed to prune deleted items");
                 }
             }
         }
+        removed
     }
 
     /// The post-scan music-enrichment pass. Resolves each `MusicAlbum`'s and
@@ -3353,6 +3518,91 @@ mod tests {
             1,
             "unreachable location skips the prune"
         );
+    }
+
+    // A scan must announce what changed: new items → a `LibraryChanged` event
+    // with `ItemsAdded` (plus `RefreshProgress` completion), deletions →
+    // `ItemsRemoved`, and an unchanged rescan → silence (no stale pushes).
+    #[tokio::test]
+    async fn scan_publishes_library_changed_and_refresh_progress() {
+        use crate::event_manager::HermitEventManager;
+        use crate::item_repository::HermitItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use hermit_traits::persistence::ItemRepository;
+        use std::sync::Mutex;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(&movies).unwrap();
+        std::fs::write(movies.join("The Matrix (1999).mkv"), b"").unwrap();
+        std::fs::write(movies.join("Dune (2021).mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(HermitItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            HermitVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: movies.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(HermitItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let events = HermitEventManager::new();
+        let changes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let progress: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        for (name, sink) in [("LibraryChanged", &changes), ("RefreshProgress", &progress)] {
+            let sink = Arc::clone(sink);
+            events.subscribe(
+                name,
+                Arc::new(move |payload: &str| {
+                    sink.lock().unwrap().push(payload.to_owned());
+                    Ok(())
+                }),
+            );
+        }
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(HermitFileSystem::new()), persistence)
+                .with_items(items)
+                .with_events(Arc::new(events));
+
+        // First scan: both movies are new → ItemsAdded, and the library's
+        // completion RefreshProgress fires at 100%.
+        scanner.scan_all().await.unwrap();
+        let first: serde_json::Value = serde_json::from_str(&changes.lock().unwrap()[0]).unwrap();
+        assert_eq!(first["ItemsAdded"].as_array().unwrap().len(), 2);
+        assert_eq!(first["IsEmpty"], false);
+        let last_progress: serde_json::Value =
+            serde_json::from_str(progress.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(last_progress["Progress"], "100.00");
+
+        // Unchanged rescan: nothing added or removed → no LibraryChanged push.
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            changes.lock().unwrap().len(),
+            1,
+            "unchanged rescan is silent"
+        );
+
+        // Delete a movie → the next scan announces the removal.
+        std::fs::remove_file(movies.join("Dune (2021).mkv")).unwrap();
+        scanner.scan_all().await.unwrap();
+        let third: serde_json::Value =
+            serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(third["ItemsRemoved"].as_array().unwrap().len(), 1);
+        assert!(third["ItemsAdded"].as_array().unwrap().is_empty());
     }
 
     // `POST /Items/{id}/Refresh` on one library must not scan the other three:

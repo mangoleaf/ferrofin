@@ -813,6 +813,18 @@ impl SessionManager for HermitSessionManager {
         .await
     }
 
+    async fn send_message_to_all_sessions(
+        &self,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        // Every session with a signed-in user (anonymous sockets have nothing
+        // to refresh) — the target set of C# `SendMessageToSessions(Sessions, …)`
+        // as the library/server notifiers use it.
+        self.broadcast(message_type, data, |s| !s.user_id.is_nil())
+            .await
+    }
+
     async fn send_message_to_user_device_sessions(
         &self,
         device_id: &str,
