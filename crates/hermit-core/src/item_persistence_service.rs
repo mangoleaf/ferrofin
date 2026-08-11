@@ -168,16 +168,28 @@ impl HermitItemPersistenceService {
 #[async_trait]
 impl ItemPersistenceService for HermitItemPersistenceService {
     async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+        let mut touched_parents: Vec<Uuid> = Vec::new();
         for id in ids {
             let id_db = guid_to_db(*id);
             if id_db == PLACEHOLDER_ID {
                 // Never delete the UserData placeholder row.
                 continue;
             }
-            // `LinkedChildren` is the one BaseItems FK without `ON DELETE CASCADE`
-            // (it references the item as both parent and child), so clear those
-            // links first — otherwise deleting a playlist/collection, or an item
-            // that belongs to one, trips a FOREIGN KEY constraint (787).
+            // Containers whose membership shrinks need their Data JSON
+            // re-synced after the delete (captured before the edges go).
+            let parents: Vec<String> = sqlx::query_scalar(
+                r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren" WHERE "ChildId" = ?1"#,
+            )
+            .bind(&id_db)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            touched_parents.extend(parents.iter().filter_map(|p| Uuid::parse_str(p).ok()));
+            // `HermitLinkedChildren` is the one BaseItems FK without `ON DELETE
+            // CASCADE` (it references the item as both parent and child), so
+            // clear those links first — otherwise deleting a
+            // playlist/collection, or an item that belongs to one, trips a
+            // FOREIGN KEY constraint (787).
             sqlx::query(
                 r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
             )
@@ -190,6 +202,12 @@ impl ItemPersistenceService for HermitItemPersistenceService {
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
+        }
+        touched_parents.sort_unstable();
+        touched_parents.dedup();
+        for parent in touched_parents {
+            // Deleted containers no-op inside (their row is gone).
+            crate::item_data::sync_container_data(&self.db, parent).await?;
         }
         Ok(())
     }

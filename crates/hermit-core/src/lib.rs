@@ -169,6 +169,7 @@ pub mod event_manager;
 pub mod external_data_manager;
 pub mod file_system;
 pub mod item_count_service;
+pub mod item_data;
 pub mod item_persistence_service;
 pub mod item_repository;
 pub mod item_type_lookup;

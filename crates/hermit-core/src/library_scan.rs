@@ -1843,7 +1843,7 @@ impl LibraryScanner {
             // `/Shows/{id}/{Seasons,Episodes}` queries filter on
             // `SeriesPresentationUniqueKey`, and `series_presentation_key` falls
             // back to this. Use the series id so children can match it.
-            series.presentation_unique_key = Some(series_id.to_string());
+            series.presentation_unique_key = Some(series_id.simple().to_string());
             out.push(Planned {
                 id: series_id,
                 entity: series,
@@ -1891,7 +1891,7 @@ impl LibraryScanner {
                     e.index_number = num.map(i64::from);
                     e.series_id = Some(guid_to_db(series_id));
                     e.series_name = Some(series_name.to_owned());
-                    e.series_presentation_unique_key = Some(series_id.to_string());
+                    e.series_presentation_unique_key = Some(series_id.simple().to_string());
                     out.push(Planned {
                         id: season_id,
                         entity: e,
@@ -1974,7 +1974,7 @@ impl LibraryScanner {
             e.index_number = num.map(i64::from);
             e.series_id = Some(guid_to_db(series_id));
             e.series_name = Some(series_name.to_owned());
-            e.series_presentation_unique_key = Some(series_id.to_string());
+            e.series_presentation_unique_key = Some(series_id.simple().to_string());
             out.push(Planned {
                 id: season_id,
                 entity: e,
@@ -2086,7 +2086,7 @@ impl LibraryScanner {
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
         entity.series_id = Some(guid_to_db(series_id));
-        entity.series_presentation_unique_key = Some(series_id.to_string());
+        entity.series_presentation_unique_key = Some(series_id.simple().to_string());
         entity.season_id = season.map(|(sid, _)| guid_to_db(sid));
         out.push(Planned {
             id,

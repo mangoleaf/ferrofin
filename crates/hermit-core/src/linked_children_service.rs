@@ -26,6 +26,7 @@ use hermit_traits::error::ServiceError;
 use hermit_traits::persistence::LinkedChildrenService;
 
 use crate::db_error::db_err;
+use crate::item_data;
 use crate::item_type_lookup::stored_type_name;
 
 /// The stored `HermitLinkedChildren.ChildType` discriminant for a manually linked
@@ -210,10 +211,16 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         .map_err(db_err)?;
 
         tx.commit().await.map_err(db_err)?;
-        Ok(affected
+        let affected: Vec<Uuid> = affected
             .iter()
             .filter_map(|s| Uuid::parse_str(s).ok())
-            .collect())
+            .collect();
+        // Membership changed for every affected container — write the new
+        // truth through to each `BaseItems.Data` blob.
+        for parent in &affected {
+            item_data::sync_container_data(&self.db, *parent).await?;
+        }
+        Ok(affected)
     }
 
     async fn upsert_linked_child(
@@ -240,6 +247,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        item_data::sync_container_data(&self.db, parent_id).await?;
         Ok(())
     }
 }

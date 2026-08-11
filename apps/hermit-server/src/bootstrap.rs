@@ -357,6 +357,12 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     db.run_migrations()
         .await
         .context("failed to apply database migrations")?;
+    // Playlist/collection membership lives in BaseItems.Data JSON (Jellyfin's
+    // 10.11.8 storage); reconcile it with Hermit's derived cache tables —
+    // imports Jellyfin-written blobs, backfills blobs for pre-Data Hermit rows.
+    hermit_core::item_data::reconcile_container_data(&db)
+        .await
+        .context("failed to reconcile playlist/collection Data JSON")?;
     tracing::info!(database = %config.database_path().display(), "database ready");
     spawn_pool_sampler(&db);
     Ok(db)

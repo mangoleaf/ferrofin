@@ -56,6 +56,7 @@ use hermit_traits::library::LibraryManager;
 use hermit_traits::persistence::LinkedChildrenService;
 
 use crate::db_error::db_err;
+use crate::item_data;
 use crate::item_type_lookup::stored_type_name;
 
 /// The manual [`LinkedChildType`](hermit_db::enums::LinkedChildType) discriminant
@@ -141,6 +142,10 @@ impl CollectionManager for HermitCollectionManager {
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
+        // Even an empty collection gets its Data blob (upserts sync per child,
+        // but a zero-item create would otherwise leave Data without the
+        // LinkedChildren key Jellyfin expects to own).
+        item_data::sync_container_data(&self.db, id).await?;
         Ok(row)
     }
 
@@ -173,6 +178,7 @@ impl CollectionManager for HermitCollectionManager {
             .await
             .map_err(db_err)?;
         }
+        item_data::sync_container_data(&self.db, collection_id).await?;
         Ok(())
     }
 
@@ -355,6 +361,17 @@ impl PlaylistManager for HermitPlaylistManager {
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
+        // Write the full playlist state (owner/shares/children) into
+        // BaseItems.Data — the 10.11.8 storage Jellyfin reads on a swap back.
+        item_data::sync_container_data(&self.db, id).await?;
+        // Jellyfin's Playlist carries PlaylistMediaType in Data; without it a
+        // swap back would default the playlist to Audio.
+        if let Some(media_type) = &request.media_type {
+            // The enum's serde form IS Jellyfin's JSON string ("Video", …).
+            let value = serde_json::to_value(media_type)
+                .map_err(|e| ServiceError::Backend(format!("serialize MediaType: {e}")))?;
+            item_data::set_data_key(&self.db, id, "PlaylistMediaType", value).await?;
+        }
         Ok(PlaylistCreationResult { id: id.to_string() })
     }
 
@@ -404,6 +421,7 @@ impl PlaylistManager for HermitPlaylistManager {
                     .await?;
             }
         }
+        item_data::sync_container_data(&self.db, request.id).await?;
         Ok(())
     }
 
@@ -469,6 +487,7 @@ impl PlaylistManager for HermitPlaylistManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        item_data::sync_container_data(&self.db, request.id).await?;
         Ok(())
     }
 
@@ -486,6 +505,7 @@ impl PlaylistManager for HermitPlaylistManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        item_data::sync_container_data(&self.db, playlist_id).await?;
         Ok(())
     }
 
@@ -551,7 +571,8 @@ impl PlaylistManager for HermitPlaylistManager {
             let at = (target + offset).min(order.len());
             order.insert(at, child.clone());
         }
-        write_sort_order(self.db.writer(), &pid, &order).await
+        write_sort_order(self.db.writer(), &pid, &order).await?;
+        item_data::sync_container_data(&self.db, playlist_id).await
     }
 
     async fn remove_item_from_playlist(
@@ -580,6 +601,9 @@ impl PlaylistManager for HermitPlaylistManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        }
+        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
+            item_data::sync_container_data(&self.db, playlist).await?;
         }
         Ok(())
     }
@@ -623,7 +647,11 @@ impl PlaylistManager for HermitPlaylistManager {
             .unwrap_or(usize::MAX)
             .min(order.len());
         order.insert(target, child);
-        write_sort_order(self.db.writer(), &pid, &order).await
+        write_sort_order(self.db.writer(), &pid, &order).await?;
+        if let Ok(playlist) = Uuid::parse_str(playlist_id) {
+            item_data::sync_container_data(&self.db, playlist).await?;
+        }
+        Ok(())
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
