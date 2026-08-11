@@ -216,7 +216,20 @@ impl PeopleRepository for HermitPeopleRepository {
                 .await
                 .map_err(db_err)?
         } else {
-            let mut qb = base_query(r#"p."Id", p."Name", p."PersonType""#, filter);
+            // Item-scoped credits carry the credited role (a character name)
+            // from the map row, like the C# `GetPeople` projection — without it
+            // every cast entry renders roleless on the detail page. NULLIF folds
+            // the write path's empty-string "no role" back to NULL. The item id
+            // is a `Uuid` (hyphenated hex Display), so inlining it is
+            // injection-safe.
+            let cols = format!(
+                r#"p."Id", p."Name", p."PersonType",
+                   (SELECT NULLIF(mr."Role", '') FROM "PeopleBaseItemMap" mr
+                    WHERE mr."PeopleId" = p."Id" AND mr."ItemId" = '{}'
+                    ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
+                filter.item_id
+            );
+            let mut qb = base_query(&cols, filter);
             push_predicates(&mut qb, filter);
             qb.push(
                 r#" ORDER BY (SELECT MIN(mo."ListOrder") FROM "PeopleBaseItemMap" mo
@@ -263,7 +276,8 @@ impl PeopleRepository for HermitPeopleRepository {
         }
         for chunk in item_ids.chunks(500) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType"
+                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType",
+                          NULLIF(m."Role", '') AS "Role"
                    FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
                    WHERE m."ItemId" IN ("#,
             );

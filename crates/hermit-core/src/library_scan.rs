@@ -1490,7 +1490,21 @@ impl LibraryScanner {
                         .episode_tvdb_still
                         .insert(entity.id.clone(), url.clone());
                 }
-                RemoteMetadata::just_people(tvdb_people(&ep.people))
+                // TVDB's per-episode credits are only the guest cast and the
+                // director/writers; the series regulars live on the series
+                // record. Stock Jellyfin (TMDB) persists the season cast on
+                // every episode too — that is what fills the Cast & Crew
+                // section of an episode detail page — so merge the cached
+                // series' actors in ahead of the episode-specific credits.
+                let series_people = cache
+                    .series_tvdb
+                    .get(&series_id)
+                    .map(|d| d.people.as_slice())
+                    .unwrap_or_default();
+                RemoteMetadata::just_people(merge_series_cast(
+                    tvdb_people(&ep.people),
+                    series_people,
+                ))
             }
             _ => RemoteMetadata::default(),
         }
@@ -2442,6 +2456,31 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
         .collect()
 }
 
+/// Merges a series' regular cast into an episode's own credited people.
+///
+/// The series' `Actor`-typed people (the regulars, in TVDB billing order) come
+/// first, followed by the episode's own credits (guest stars, director,
+/// writers) — the order stock Jellyfin's TMDB episode credits produce. A
+/// regular already credited on the episode itself is dropped in favour of the
+/// episode's entry (its role is the more specific one).
+fn merge_series_cast(
+    episode_people: Vec<PeopleEntity>,
+    series_people: &[hermit_providers::TvdbPerson],
+) -> Vec<PeopleEntity> {
+    let credited: std::collections::HashSet<String> = episode_people
+        .iter()
+        .map(|p| p.name.to_lowercase())
+        .collect();
+    let mut people: Vec<PeopleEntity> = tvdb_people(series_people)
+        .into_iter()
+        .filter(|p| {
+            p.person_type.as_deref() == Some("Actor") && !credited.contains(&p.name.to_lowercase())
+        })
+        .collect();
+    people.extend(episode_people);
+    people
+}
+
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
@@ -3011,6 +3050,59 @@ mod tests {
         };
         super::apply_tvdb_episode(&mut named, &ep);
         assert_eq!(named.name.as_deref(), Some("S01E01"));
+    }
+
+    // merge_series_cast: the series regulars (actors only) lead, the episode's
+    // own credits follow, and a regular already credited on the episode keeps
+    // the episode's (more specific) entry.
+    #[test]
+    fn merge_series_cast_prepends_regulars_and_dedupes() {
+        use hermit_providers::TvdbPerson;
+        let ep_people = super::tvdb_people(&[
+            TvdbPerson {
+                name: "Guest Star".into(),
+                person_type: "GuestStar".into(),
+                role: Some("Villain".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Bill Burr".into(),
+                person_type: "Actor".into(),
+                role: Some("Frank (voice)".into()),
+                image_url: None,
+            },
+        ]);
+        let series_people = vec![
+            TvdbPerson {
+                name: "Bill Burr".into(),
+                person_type: "Actor".into(),
+                role: Some("Frank Murphy".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Laura Dern".into(),
+                person_type: "Actor".into(),
+                role: Some("Sue Murphy".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Series Writer".into(),
+                person_type: "Writer".into(),
+                role: None,
+                image_url: None,
+            },
+        ];
+        let merged = super::merge_series_cast(ep_people, &series_people);
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        // Laura Dern (regular, not on the episode) leads; the episode's own
+        // Bill Burr credit wins over the series one; the series' non-actor
+        // (Writer) is not merged in.
+        assert_eq!(names, vec!["Laura Dern", "Guest Star", "Bill Burr"]);
+        let bill = merged.iter().find(|p| p.name == "Bill Burr").unwrap();
+        assert_eq!(bill.role.as_deref(), Some("Frank (voice)"));
+        // Empty series cache → the episode credits pass through untouched.
+        let alone = super::merge_series_cast(super::tvdb_people(&series_people[..1]), &[]);
+        assert_eq!(alone.len(), 1);
     }
 
     // fetch_tvdb_metadata short-circuits (no network) when it can't act: a series
