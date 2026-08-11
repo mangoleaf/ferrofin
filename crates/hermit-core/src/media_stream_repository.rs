@@ -17,6 +17,7 @@
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::MediaStreamInfoEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::entities::MediaStreamType;
 use uuid::Uuid;
 
@@ -77,7 +78,7 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
         sql.push_str(r#" ORDER BY "StreamIndex""#);
 
         let mut query =
-            sqlx::query_as::<_, MediaStreamInfoEntity>(&sql).bind(filter.item_id.to_string());
+            sqlx::query_as::<_, MediaStreamInfoEntity>(&sql).bind(guid_to_db(filter.item_id));
         if let Some(index) = filter.index {
             query = query.bind(i64::from(index));
         }
@@ -108,7 +109,7 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
             );
             let mut query = sqlx::query_as::<_, MediaStreamInfoEntity>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
@@ -149,15 +150,16 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
                 ?, ?, ?, ?)"#
         );
 
+        let item_id_db = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(&item_id_db)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         for s in streams {
             sqlx::query(&insert_sql)
-                .bind(item_id.to_string())
+                .bind(&item_id_db)
                 .bind(s.stream_index)
                 .bind(&s.aspect_ratio)
                 .bind(s.average_frame_rate)

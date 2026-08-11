@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::SortOrder;
 use hermit_model::live_tv::ItemSortBy;
@@ -97,8 +98,9 @@ impl MusicManager for HermitMusicManager {
         let genres = self.seed_genres(item_id).await?;
         let query = Self::instant_mix_query(&genres);
         let mut mix = self.items.get_item_list(&query).await?;
-        // The seed itself should not appear in its own mix.
-        mix.retain(|row| row.id != item_id.to_string());
+        // The seed itself should not appear in its own mix. Compare in the
+        // canonical stored GUID form — entity ids come back as stored TEXT.
+        mix.retain(|row| row.id != guid_to_db(item_id));
         Ok(mix)
     }
 
@@ -146,7 +148,7 @@ mod tests {
         sqlx::query(
             r#"UPDATE "BaseItems" SET "MediaType" = 'Audio', "Genres" = ?2 WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(genre)
         .execute(db.writer())
         .await
@@ -184,7 +186,7 @@ mod tests {
             .get_instant_mix_from_item(seed, None, &DtoOptions::default())
             .await
             .expect("mix");
-        assert!(mix.iter().all(|r| r.id != seed.to_string()));
+        assert!(mix.iter().all(|r| r.id != guid_to_db(seed)));
         assert_eq!(mix.len(), 1);
     }
 }

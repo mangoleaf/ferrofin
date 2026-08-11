@@ -8,6 +8,7 @@
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
+use hermit_db::store::guid_to_db;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -42,7 +43,7 @@ impl SimilarItemsRepository {
         exclude_ids: &[Uuid],
         limit: i32,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let seed = seed_id.to_string();
+        let seed = guid_to_db(seed_id);
         let mut sql = String::from(
             r#"SELECT bi.* FROM (
                    SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
@@ -88,7 +89,7 @@ impl SimilarItemsRepository {
             .bind(&seed)
             .bind(seed_type);
         for id in exclude_ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
         query = query.bind(i64::from(limit.max(0)));
         query.fetch_all(self.db.pool()).await.map_err(db_err)
@@ -101,7 +102,7 @@ impl SimilarItemsRepository {
         user_id: Uuid,
     ) -> Result<Option<UserEntity>, ServiceError> {
         sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
-            .bind(user_id.to_string())
+            .bind(guid_to_db(user_id))
             .fetch_optional(self.db.pool())
             .await
             .map_err(db_err)
@@ -138,7 +139,7 @@ impl SimilarItemsRepository {
 
         let mut query = sqlx::query_scalar::<_, String>(&sql);
         for id in item_ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
         for t in person_types {
             query = query.bind((*t).to_owned());

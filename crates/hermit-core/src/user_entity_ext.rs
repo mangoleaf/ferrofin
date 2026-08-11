@@ -372,6 +372,7 @@ pub async fn set_permission_tx(
 mod tests {
     use super::*;
     use crate::test_support::{seed_user, test_db};
+    use hermit_db::store::guid_to_db;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -380,16 +381,16 @@ mod tests {
         let id = Uuid::from_u128(1);
         seed_user(&db, id).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        seed_defaults(&mut tx, &id.to_string()).await.expect("seed");
+        seed_defaults(&mut tx, &guid_to_db(id)).await.expect("seed");
         tx.commit().await.expect("commit");
 
         assert!(
-            has_permission(db.pool(), &id.to_string(), PermissionKind::EnableAllDevices)
+            has_permission(db.pool(), &guid_to_db(id), PermissionKind::EnableAllDevices)
                 .await
                 .expect("has perm")
         );
         assert!(
-            !has_permission(db.pool(), &id.to_string(), PermissionKind::IsAdministrator)
+            !has_permission(db.pool(), &guid_to_db(id), PermissionKind::IsAdministrator)
                 .await
                 .expect("has perm")
         );
@@ -403,28 +404,28 @@ mod tests {
 
         set_permission(
             db.pool(),
-            &id.to_string(),
+            &guid_to_db(id),
             PermissionKind::IsAdministrator,
             true,
         )
         .await
         .expect("insert");
         assert!(
-            has_permission(db.pool(), &id.to_string(), PermissionKind::IsAdministrator)
+            has_permission(db.pool(), &guid_to_db(id), PermissionKind::IsAdministrator)
                 .await
                 .expect("read")
         );
 
         set_permission(
             db.pool(),
-            &id.to_string(),
+            &guid_to_db(id),
             PermissionKind::IsAdministrator,
             false,
         )
         .await
         .expect("update");
         assert!(
-            !has_permission(db.pool(), &id.to_string(), PermissionKind::IsAdministrator)
+            !has_permission(db.pool(), &guid_to_db(id), PermissionKind::IsAdministrator)
                 .await
                 .expect("read")
         );
@@ -436,7 +437,7 @@ mod tests {
         let id = Uuid::from_u128(3);
         seed_user(&db, id).await;
         assert!(
-            !has_permission(db.pool(), &id.to_string(), PermissionKind::EnableAllDevices)
+            !has_permission(db.pool(), &guid_to_db(id), PermissionKind::EnableAllDevices)
                 .await
                 .expect("read")
         );
@@ -448,7 +449,7 @@ mod tests {
         let id = Uuid::from_u128(4);
         seed_user(&db, id).await;
         assert!(
-            is_parental_schedule_allowed(db.pool(), &id.to_string(), chrono::Local::now())
+            is_parental_schedule_allowed(db.pool(), &guid_to_db(id), chrono::Local::now())
                 .await
                 .expect("allowed")
         );

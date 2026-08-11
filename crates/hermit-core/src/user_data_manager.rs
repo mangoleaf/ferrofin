@@ -25,6 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::playback::UserDataEntity;
+use hermit_db::store::{guid_to_db, opt_datetime_to_db};
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::{UpdateUserItemDataDto, UserItemDataDto};
 use uuid::Uuid;
@@ -69,12 +70,16 @@ impl HermitUserDataManager {
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
+        // ItemId/UserId are stored uppercase (Jellyfin's GUID casing) while
+        // CustomDataKey keeps the lowercase hyphenated form — exactly what a
+        // real 10.11.8 database contains, so the two need separate binds.
         sqlx::query_as::<_, UserDataEntity>(
             r#"SELECT * FROM "UserData"
-               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?1 LIMIT 1"#,
+               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3 LIMIT 1"#,
         )
+        .bind(guid_to_db(item_id))
+        .bind(guid_to_db(user_id))
         .bind(item_id.to_string())
-        .bind(user_id.to_string())
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)
@@ -89,7 +94,7 @@ impl HermitUserDataManager {
         let row: Option<(Option<i64>, String)> = sqlx::query_as(
             r#"SELECT "RunTimeTicks", "Type" FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -140,7 +145,7 @@ impl HermitUserDataManager {
         .bind(&row.custom_data_key)
         .bind(row.audio_stream_index)
         .bind(row.is_favorite)
-        .bind(row.last_played_date)
+        .bind(opt_datetime_to_db(row.last_played_date))
         .bind(row.likes)
         .bind(row.play_count)
         .bind(row.playback_position_ticks)
@@ -156,8 +161,10 @@ impl HermitUserDataManager {
     /// A default (empty) user-data row for an item/user, used when none exists.
     fn empty_row(item_id: Uuid, user_id: Uuid) -> UserDataEntity {
         UserDataEntity {
-            item_id: item_id.to_string(),
-            user_id: user_id.to_string(),
+            item_id: guid_to_db(item_id),
+            user_id: guid_to_db(user_id),
+            // Jellyfin stores the key in the LOWERCASE hyphenated form even
+            // though ItemId is uppercase (verified against a real 10.11.8 DB).
             custom_data_key: item_id.to_string(),
             audio_stream_index: None,
             is_favorite: false,
@@ -257,14 +264,19 @@ impl UserDataManager for HermitUserDataManager {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
+            // `CustomDataKey = lower(ItemId)` selects the item's DEFAULT row
+            // (not alternate provider keys). A column-to-column equality would
+            // never match real Jellyfin rows: ItemId is stored uppercase but
+            // CustomDataKey lowercase; lower() is ASCII-only, which is exact
+            // for hex GUID text.
             let sql = format!(
                 r#"SELECT * FROM "UserData"
                    WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
-                     AND "CustomDataKey" = "ItemId""#,
+                     AND "CustomDataKey" = lower("ItemId")"#,
             );
-            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(user_id.to_string());
+            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(guid_to_db(user_id));
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in rows {
@@ -463,8 +475,8 @@ impl UserDataManager for HermitUserDataManager {
                SET "AudioStreamIndex" = NULL, "SubtitleStreamIndex" = NULL
                WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
         )
-        .bind(item_id.to_string())
-        .bind(user_id.to_string())
+        .bind(guid_to_db(item_id))
+        .bind(guid_to_db(user_id))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -525,7 +537,7 @@ mod tests {
     async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
         seed_item(db, id, BaseItemKind::Movie).await;
         sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2 WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .bind(runtime_ticks)
             .execute(db.writer())
             .await

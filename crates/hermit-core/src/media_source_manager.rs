@@ -562,6 +562,7 @@ mod tests {
     use crate::media_stream_repository::HermitMediaStreamRepository;
     use crate::test_support::{seed_item, test_db};
     use hermit_db::Database;
+    use hermit_db::store::guid_to_db;
     use hermit_model::data::BaseItemKind;
     use hermit_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
@@ -942,7 +943,7 @@ mod tests {
         sqlx::query(
             r#"UPDATE "BaseItems" SET "Path" = '/media/m.mkv', "RunTimeTicks" = 100 WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .execute(db.writer())
         .await
         .expect("set path");
@@ -960,12 +961,12 @@ mod tests {
         // Link a merged alternate version through the repository: the batch
         // alternates lookup groups it under this primary.
         let alt = BaseItemEntity {
-            id: Uuid::from_u128(0x102).to_string(),
+            id: guid_to_db(Uuid::from_u128(0x102)),
             type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
             name: Some("Alt".to_owned()),
             path: Some("/media/alt.mkv".to_owned()),
             media_type: Some("Video".to_owned()),
-            primary_version_id: Some(id.to_string()),
+            primary_version_id: Some(guid_to_db(id)),
             date_modified: Some(chrono::Utc::now()),
             ..Default::default()
         };

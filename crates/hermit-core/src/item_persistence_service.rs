@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -96,12 +97,12 @@ impl HermitItemPersistenceService {
             .bind(item.critic_rating)
             .bind(&item.custom_rating)
             .bind(&item.data)
-            .bind(item.date_created)
-            .bind(item.date_last_media_added)
-            .bind(item.date_last_refreshed)
-            .bind(item.date_last_saved)
-            .bind(item.date_modified)
-            .bind(item.end_date)
+            .bind(opt_datetime_to_db(item.date_created))
+            .bind(opt_datetime_to_db(item.date_last_media_added))
+            .bind(opt_datetime_to_db(item.date_last_refreshed))
+            .bind(opt_datetime_to_db(item.date_last_saved))
+            .bind(opt_datetime_to_db(item.date_modified))
+            .bind(opt_datetime_to_db(item.end_date))
             .bind(&item.episode_title)
             .bind(&item.external_id)
             .bind(&item.external_series_id)
@@ -134,7 +135,7 @@ impl HermitItemPersistenceService {
             .bind(&item.path)
             .bind(&item.preferred_metadata_country_code)
             .bind(&item.preferred_metadata_language)
-            .bind(item.premiere_date)
+            .bind(opt_datetime_to_db(item.premiere_date))
             .bind(&item.presentation_unique_key)
             .bind(&item.primary_version_id)
             .bind(&item.production_locations)
@@ -148,7 +149,7 @@ impl HermitItemPersistenceService {
             .bind(&item.show_id)
             .bind(item.size)
             .bind(&item.sort_name)
-            .bind(item.start_date)
+            .bind(opt_datetime_to_db(item.start_date))
             .bind(&item.studios)
             .bind(&item.tagline)
             .bind(&item.tags)
@@ -168,7 +169,8 @@ impl HermitItemPersistenceService {
 impl ItemPersistenceService for HermitItemPersistenceService {
     async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
         for id in ids {
-            if id.to_string() == PLACEHOLDER_ID {
+            let id_db = guid_to_db(*id);
+            if id_db == PLACEHOLDER_ID {
                 // Never delete the UserData placeholder row.
                 continue;
             }
@@ -177,12 +179,12 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             // links first — otherwise deleting a playlist/collection, or an item
             // that belongs to one, trips a FOREIGN KEY constraint (787).
             sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
-                .bind(id.to_string())
+                .bind(&id_db)
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(&id_db)
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
@@ -209,7 +211,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             r#"INSERT OR REPLACE INTO "BaseItemProviders"
                ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(provider)
         .bind(value)
         .execute(self.db.writer())
@@ -223,7 +225,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         item_id: Uuid,
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
-        let id = item_id.to_string();
+        let id = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Rewrite this item's links; the shared ItemValues rows are kept.
         sqlx::query(r#"DELETE FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
@@ -237,7 +239,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             }
             let clean = crate::text_util::get_clean_value(value);
             // Get-or-create the (Type, Value) row (unique index on Type+Value).
-            let new_id = Uuid::new_v4().to_string();
+            let new_id = guid_to_db(Uuid::new_v4());
             sqlx::query(
                 r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
                    VALUES (?1,?2,?3,?4)"#,
@@ -293,7 +295,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         let exists: Option<i64> =
             sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?;
@@ -305,7 +307,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         item_id: Uuid,
         ancestor_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
-        let id = item_id.to_string();
+        let id = guid_to_db(item_id);
         // One transaction so the clear+rewrite is atomic on a single connection —
         // otherwise the DELETE and INSERTs land on different pool connections and
         // can interleave with a concurrent rebuild, and `INSERT OR IGNORE` makes
@@ -321,7 +323,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
                 r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
             )
             .bind(&id)
-            .bind(ancestor.to_string())
+            .bind(guid_to_db(*ancestor))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -351,7 +353,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         item_id: Uuid,
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
-        let item = item_id.to_string();
+        let item = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Replace the item's image set (idempotent re-scan).
         sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
@@ -365,14 +367,14 @@ impl ItemPersistenceService for HermitItemPersistenceService {
                    ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             )
-            .bind(uuid::Uuid::new_v4().hyphenated().to_string())
+            .bind(guid_to_db(Uuid::new_v4()))
             .bind(&item)
             .bind(image_type_to_disc(image.image_type))
             .bind(&image.path)
             .bind(i64::from(image.width))
             .bind(i64::from(image.height))
             .bind(image.blur_hash.as_deref().map(str::as_bytes)) // BLOB of the hash's UTF-8 bytes
-            .bind(image.date_modified)
+            .bind(datetime_to_db(image.date_modified))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -386,7 +388,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         item_id: Uuid,
         image: &ItemImageInfo,
     ) -> Result<(), ServiceError> {
-        let item = item_id.to_string();
+        let item = guid_to_db(item_id);
         let disc = image_type_to_disc(image.image_type);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Replace any existing rows of this type (an uploaded image supersedes the
@@ -402,13 +404,13 @@ impl ItemPersistenceService for HermitItemPersistenceService {
                ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "DateModified")
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
         )
-        .bind(uuid::Uuid::new_v4().hyphenated().to_string())
+        .bind(guid_to_db(Uuid::new_v4()))
         .bind(&item)
         .bind(disc)
         .bind(&image.path)
         .bind(i64::from(image.width))
         .bind(i64::from(image.height))
-        .bind(image.date_modified)
+        .bind(datetime_to_db(image.date_modified))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -422,7 +424,7 @@ impl ItemPersistenceService for HermitItemPersistenceService {
         image_type: hermit_model::entities::ImageType,
         _index: Option<i32>,
     ) -> Result<Vec<String>, ServiceError> {
-        let item = item_id.to_string();
+        let item = guid_to_db(item_id);
         let disc = image_type_to_disc(image_type);
         // Collect the on-disk paths before deleting so the caller can remove files.
         let paths: Vec<String> = sqlx::query_scalar(
@@ -634,7 +636,7 @@ mod tests {
         let svc = HermitItemPersistenceService::new(db.clone());
 
         let item = hermit_db::entities::base_items::BaseItemEntity {
-            id: id.to_string(),
+            id: hermit_db::store::guid_to_db(id),
             type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
             name: Some("Amélie".to_owned()),
             ..hermit_db::entities::base_items::BaseItemEntity::default()
@@ -645,7 +647,7 @@ mod tests {
 
         let clean: Option<String> =
             sqlx::query_scalar(r#"SELECT "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(hermit_db::store::guid_to_db(id))
                 .fetch_one(db.pool())
                 .await
                 .expect("query");

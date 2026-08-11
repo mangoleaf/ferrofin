@@ -102,7 +102,7 @@ fn movie_item(id: Uuid, name: &str, path: &str) -> BaseItemEntity {
             .expect("Movie has a stored type name")
             .to_owned();
     BaseItemEntity {
-        id: id.to_string(),
+        id: hermit_db::store::guid_to_db(id),
         name: Some(name.to_owned()),
         path: Some(path.to_owned()),
         media_type: Some("Video".to_owned()),

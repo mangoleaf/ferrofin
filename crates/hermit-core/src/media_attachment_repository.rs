@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::AttachmentStreamInfoEntity;
+use hermit_db::store::guid_to_db;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -54,7 +55,7 @@ impl MediaAttachmentRepository for HermitMediaAttachmentRepository {
         sql.push_str(r#" ORDER BY "Index""#);
 
         let mut query =
-            sqlx::query_as::<_, AttachmentStreamInfoEntity>(&sql).bind(filter.item_id.to_string());
+            sqlx::query_as::<_, AttachmentStreamInfoEntity>(&sql).bind(guid_to_db(filter.item_id));
         if let Some(index) = filter.index {
             query = query.bind(i64::from(index));
         }
@@ -68,7 +69,7 @@ impl MediaAttachmentRepository for HermitMediaAttachmentRepository {
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "AttachmentStreamInfos" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -78,7 +79,7 @@ impl MediaAttachmentRepository for HermitMediaAttachmentRepository {
                    ("ItemId", "Index", "Codec", "CodecTag", "Comment", "Filename", "MimeType")
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
             )
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(attachment.index)
             .bind(&attachment.codec)
             .bind(&attachment.codec_tag)

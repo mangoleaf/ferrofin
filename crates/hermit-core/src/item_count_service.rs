@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::users::UserEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::ItemCounts;
 use uuid::Uuid;
@@ -71,7 +72,7 @@ impl HermitItemCountService {
             );
             sql.push_str(&placeholders(matching.len()));
             sql.push(')');
-            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(ancestor_id.to_string());
+            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(ancestor_id));
             for id in &matching {
                 query = query.bind(id.clone());
             }
@@ -92,7 +93,7 @@ impl HermitItemCountService {
         );
         sql.push_str(&placeholders(descendants.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(user_id.to_string());
+        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
         for id in &descendants {
             query = query.bind(id.clone());
         }
@@ -122,7 +123,7 @@ impl HermitItemCountService {
             );
             let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for (row_id, name) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let (Ok(uuid), Some(name)) = (Uuid::parse_str(&row_id), name) {
@@ -279,7 +280,7 @@ impl ItemCountService for HermitItemCountService {
             );
             let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for (row_id, clean) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let (Ok(uuid), Some(clean)) = (Uuid::parse_str(&row_id), clean) {
@@ -398,7 +399,7 @@ impl ItemCountService for HermitItemCountService {
         );
         sql.push_str(&placeholders(matching.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(parent_id.to_string());
+        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
         for id in &matching {
             query = query.bind(id.clone());
         }
@@ -416,7 +417,7 @@ impl ItemCountService for HermitItemCountService {
         );
         sql.push_str(&placeholders(children.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(user_id.to_string());
+        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
         for id in &children {
             query = query.bind(id.clone());
         }
@@ -446,7 +447,7 @@ impl ItemCountService for HermitItemCountService {
         // re-scanned every leaf in the library (a folder-independent id set) before
         // intersecting via a thousand-parameter `IN` — O(folders × library) with no
         // batching, which dominated the by-name browse endpoints.
-        let ids: Vec<String> = folder_ids.iter().map(Uuid::to_string).collect();
+        let ids: Vec<String> = folder_ids.iter().copied().map(guid_to_db).collect();
         let grouped = |extra_join: &str, extra_where: &str| {
             let mut sql = format!(
                 r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
@@ -510,7 +511,7 @@ impl ItemCountService for HermitItemCountService {
         // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
         // `BaseItems` children plus one of `LinkedChildren` rows; a parent with
         // linked children reports those instead of its hierarchical children.
-        let ids: Vec<String> = parent_ids.iter().map(Uuid::to_string).collect();
+        let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
         let grouped_count = |table: &str| {
             let mut sql =
                 format!(r#"SELECT "ParentId", COUNT(*) FROM "{table}" WHERE "ParentId" IN ("#);
@@ -611,8 +612,8 @@ mod tests {
 
         for child in [played, unplayed] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-                .bind(child.to_string())
-                .bind(folder.to_string())
+                .bind(guid_to_db(child))
+                .bind(guid_to_db(folder))
                 .execute(db.writer())
                 .await
                 .expect("ancestor");
@@ -690,8 +691,8 @@ mod tests {
         let kid = Uuid::from_u128(0xE002);
         seed_item(&db, kid, BaseItemKind::Movie).await;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(kid.to_string())
-            .bind(parent.to_string())
+            .bind(guid_to_db(kid))
+            .bind(guid_to_db(parent))
             .execute(db.writer())
             .await
             .expect("set parent");
@@ -728,15 +729,15 @@ mod tests {
                     r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType")
                        VALUES (?1, ?2, 0)"#,
                 )
-                .bind(boxset.to_string())
-                .bind(child.to_string())
+                .bind(guid_to_db(boxset))
+                .bind(guid_to_db(child))
                 .execute(db.writer())
                 .await
                 .expect("link child");
             } else {
                 sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-                    .bind(child.to_string())
-                    .bind(boxset.to_string())
+                    .bind(guid_to_db(child))
+                    .bind(guid_to_db(boxset))
                     .execute(db.writer())
                     .await
                     .expect("set parent");
@@ -766,8 +767,8 @@ mod tests {
                 r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType")
                    VALUES (?1, ?2, 0)"#,
             )
-            .bind(parent.to_string())
-            .bind(child.to_string())
+            .bind(guid_to_db(parent))
+            .bind(guid_to_db(child))
             .execute(db.writer())
             .await
             .expect("linked child");
@@ -955,7 +956,7 @@ mod tests {
         seed_named_item(&db, person, BaseItemKind::Person, "Alice Parity").await;
         let people_id = Uuid::from_u128(0xCC0A);
         sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,?2,?3)"#)
-            .bind(people_id.to_string())
+            .bind(guid_to_db(people_id))
             .bind("Alice Parity")
             .bind("Actor")
             .execute(db.writer())
@@ -976,8 +977,8 @@ mod tests {
                 r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
                    VALUES (?1,?2,?3,?4,?5)"#,
             )
-            .bind(item.to_string())
-            .bind(people_id.to_string())
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(people_id))
             .bind("Role")
             .bind(0)
             .bind(0)

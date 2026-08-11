@@ -870,8 +870,8 @@ mod tests {
                     ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
                     VALUES (?1, NULL, NULL, 0, 2, ?2, ?3, 0)"#,
             )
-            .bind(Uuid::from_u128(0xA110 + n).to_string())
-            .bind(item.to_string())
+            .bind(hermit_db::store::guid_to_db(Uuid::from_u128(0xA110 + n)))
+            .bind(hermit_db::store::guid_to_db(item))
             .bind(path)
             .execute(db.writer())
             .await
@@ -954,7 +954,7 @@ mod tests {
             .await
             .expect("lookup")
             .expect("some");
-        assert_eq!(found.id, id.to_string());
+        assert_eq!(Uuid::parse_str(&found.id).expect("uuid"), id);
         assert_eq!(found.name.as_deref(), Some("Science Fiction"));
     }
 
@@ -986,13 +986,13 @@ mod tests {
             .expect("batch lookup");
         assert_eq!(got.len(), 3);
         assert_eq!(
-            got[0].as_ref().map(|e| e.id.clone()),
-            Some(drama.to_string())
+            got[0].as_ref().and_then(|e| Uuid::parse_str(&e.id).ok()),
+            Some(drama)
         );
         assert!(got[1].is_none());
         assert_eq!(
-            got[2].as_ref().map(|e| e.id.clone()),
-            Some(scifi.to_string())
+            got[2].as_ref().and_then(|e| Uuid::parse_str(&e.id).ok()),
+            Some(scifi)
         );
 
         // Empty input yields an empty result without a query.
@@ -1016,8 +1016,8 @@ mod tests {
         seed_named_item(&db, child, BaseItemKind::Episode, "Pilot").await;
         for (id, parent_id) in [(child, parent), (parent, grandparent)] {
             sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-                .bind(id.to_string())
-                .bind(parent_id.to_string())
+                .bind(hermit_db::store::guid_to_db(id))
+                .bind(hermit_db::store::guid_to_db(parent_id))
                 .execute(db.writer())
                 .await
                 .expect("set parent");
@@ -1031,8 +1031,11 @@ mod tests {
             .expect("item exists");
         // Nearest parent first, then its parent — the seed item is excluded.
         assert_eq!(ancestors.len(), 2);
-        assert_eq!(ancestors[0].id, parent.to_string());
-        assert_eq!(ancestors[1].id, grandparent.to_string());
+        assert_eq!(Uuid::parse_str(&ancestors[0].id).expect("uuid"), parent);
+        assert_eq!(
+            Uuid::parse_str(&ancestors[1].id).expect("uuid"),
+            grandparent
+        );
 
         // A root item (no parent) yields an empty list, not None.
         let roots = mgr
@@ -1108,7 +1111,7 @@ mod tests {
                     "IsOriginal", "StreamType", "Language")
                    VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)"#,
             )
-            .bind(item.to_string())
+            .bind(hermit_db::store::guid_to_db(item))
             .bind(idx)
             .bind(lang)
             .execute(db.writer())
@@ -1131,7 +1134,7 @@ mod tests {
         // A song credits "Miles Davis" as album artist (ItemValues type 1), and the
         // browsable by-name row is materialized sharing the value id — the shape the
         // by-name aggregate now requires (a value referenced by an in-scope item).
-        let value_id = Uuid::from_u128(0x401).to_string();
+        let value_id = hermit_db::store::guid_to_db(Uuid::from_u128(0x401));
         let song = Uuid::from_u128(0x402);
         seed_named_item(&db, song, BaseItemKind::Audio, "So What").await;
         sqlx::query(
@@ -1143,7 +1146,7 @@ mod tests {
         .await
         .expect("value");
         sqlx::query(r#"INSERT INTO "ItemValuesMap" ("ItemId","ItemValueId") VALUES (?1,?2)"#)
-            .bind(song.to_string())
+            .bind(hermit_db::store::guid_to_db(song))
             .bind(&value_id)
             .execute(db.writer())
             .await
@@ -1189,7 +1192,7 @@ mod tests {
             .await
             .expect("root")
             .expect("some");
-        assert_eq!(resolved.id, root.to_string());
+        assert_eq!(Uuid::parse_str(&resolved.id).expect("uuid"), root);
     }
 
     /// Sets a row's `Width` column so the merge primary-selection heuristic has a
@@ -1197,7 +1200,7 @@ mod tests {
     async fn set_width(db: &Database, id: Uuid, width: i64) {
         sqlx::query(r#"UPDATE "BaseItems" SET "Width" = ?1 WHERE "Id" = ?2"#)
             .bind(width)
-            .bind(id.to_string())
+            .bind(hermit_db::store::guid_to_db(id))
             .execute(db.writer())
             .await
             .expect("set width");
@@ -1226,8 +1229,10 @@ mod tests {
             .expect("read")
             .expect("some");
         assert_eq!(
-            alt.primary_version_id.as_deref(),
-            Some(wide.to_string().as_str())
+            alt.primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok()),
+            Some(wide)
         );
     }
 

@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::PeopleEntity;
+use hermit_db::store::{guid_to_db, opt_datetime_to_db};
 use hermit_model::data::BaseItemKind;
 use hermit_model::querying::QueryResult;
 use sqlx::QueryBuilder;
@@ -93,7 +94,7 @@ fn is_valid_person_type(value: &str) -> bool {
 fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQuery) {
     if !filter.item_id.is_nil() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mx WHERE mx."PeopleId" = p."Id" AND mx."ItemId" = "#);
-        qb.push_bind(filter.item_id.to_string());
+        qb.push_bind(guid_to_db(filter.item_id));
         qb.push(")");
     }
     if let Some(parent) = filter.parent_id {
@@ -102,7 +103,7 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
                 JOIN "AncestorIds" a ON a."ItemId" = mp."ItemId"
                 WHERE mp."PeopleId" = p."Id" AND a."ParentItemId" = "#,
         );
-        qb.push_bind(parent.to_string());
+        qb.push_bind(guid_to_db(parent));
         qb.push(")");
     }
     let include: Vec<&String> = filter
@@ -137,7 +138,7 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" mo WHERE mo."PeopleId" = p."Id" AND mo."ItemId" = "#,
         );
-        qb.push_bind(filter.item_id.to_string());
+        qb.push_bind(guid_to_db(filter.item_id));
         qb.push(r#" AND mo."ListOrder" <= "#);
         qb.push_bind(i64::from(max_order));
         qb.push(")");
@@ -189,7 +190,7 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
         );
         qb.push_bind(PERSON_TYPE_NAME);
         qb.push(r#" AND bi."Name" = p."Name" AND ud."UserId" = "#);
-        qb.push_bind(user_id.to_string());
+        qb.push_bind(guid_to_db(user_id));
         qb.push(r#" AND ud."IsFavorite" = "#);
         qb.push_bind(i64::from(is_favorite));
         qb.push(")");
@@ -220,14 +221,14 @@ impl PeopleRepository for HermitPeopleRepository {
             // from the map row, like the C# `GetPeople` projection — without it
             // every cast entry renders roleless on the detail page. NULLIF folds
             // the write path's empty-string "no role" back to NULL. The item id
-            // is a `Uuid` (hyphenated hex Display), so inlining it is
-            // injection-safe.
+            // is a canonically formatted GUID (hyphenated hex), so inlining it
+            // is injection-safe.
             let cols = format!(
                 r#"p."Id", p."Name", p."PersonType",
                    (SELECT NULLIF(mr."Role", '') FROM "PeopleBaseItemMap" mr
                     WHERE mr."PeopleId" = p."Id" AND mr."ItemId" = '{}'
                     ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
-                filter.item_id
+                guid_to_db(filter.item_id)
             );
             let mut qb = base_query(&cols, filter);
             push_predicates(&mut qb, filter);
@@ -235,7 +236,7 @@ impl PeopleRepository for HermitPeopleRepository {
                 r#" ORDER BY (SELECT MIN(mo."ListOrder") FROM "PeopleBaseItemMap" mo
                     WHERE mo."PeopleId" = p."Id" AND mo."ItemId" = "#,
             );
-            qb.push_bind(filter.item_id.to_string());
+            qb.push_bind(guid_to_db(filter.item_id));
             qb.push(r#"), p."PersonType", p."Name""#);
             qb.build_query_as::<PeopleEntity>()
                 .fetch_all(self.db.pool())
@@ -283,7 +284,7 @@ impl PeopleRepository for HermitPeopleRepository {
             );
             let mut sep = qb.separated(", ");
             for id in chunk {
-                sep.push_bind(id.to_string());
+                sep.push_bind(guid_to_db(*id));
             }
             qb.push(r#") ORDER BY m."ItemId", m."ListOrder", p."PersonType", p."Name""#);
             let rows = qb
@@ -314,7 +315,7 @@ impl PeopleRepository for HermitPeopleRepository {
         // read snapshot and trip `SQLITE_BUSY_SNAPSHOT` (which busy_timeout won't
         // retry). The map is rebuilt below.
         sqlx::query(r#"DELETE FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -347,7 +348,7 @@ impl PeopleRepository for HermitPeopleRepository {
                 id
             } else {
                 let new_id = if person.id.is_empty() {
-                    Uuid::new_v4().to_string()
+                    guid_to_db(Uuid::new_v4())
                 } else {
                     person.id.clone()
                 };
@@ -414,7 +415,7 @@ impl PeopleRepository for HermitPeopleRepository {
                    ("ItemId", "PeopleId", "Role", "ListOrder", "SortOrder")
                    VALUES (?1, ?2, ?3, ?4, ?5)"#,
             )
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(people_id)
             .bind(person.role.clone().unwrap_or_default())
             .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
@@ -439,10 +440,10 @@ impl PeopleRepository for HermitPeopleRepository {
                    "ProductionLocations" = ?5
                WHERE "Id" = ?1"#,
         )
-        .bind(person_id.to_string())
+        .bind(guid_to_db(person_id))
         .bind(metadata.overview)
-        .bind(metadata.premiere_date.map(|d| d.to_rfc3339()))
-        .bind(metadata.end_date.map(|d| d.to_rfc3339()))
+        .bind(opt_datetime_to_db(metadata.premiere_date))
+        .bind(opt_datetime_to_db(metadata.end_date))
         .bind(metadata.birthplace)
         .execute(self.db.writer())
         .await
@@ -487,7 +488,7 @@ impl PeopleRepository for HermitPeopleRepository {
         {
             let mut sep = qb.separated(", ");
             for id in item_ids {
-                sep.push_bind(id.to_string());
+                sep.push_bind(guid_to_db(*id));
             }
         }
         qb.push(")");
@@ -533,6 +534,7 @@ mod tests {
     use super::HermitPeopleRepository;
     use crate::test_support::{seed_item, test_db};
     use hermit_db::entities::base_items::PeopleEntity;
+    use hermit_db::store::guid_to_db;
     use hermit_model::data::BaseItemKind;
     use hermit_traits::options::InternalPeopleQuery;
     use hermit_traits::persistence::{PeopleRepository, PersonMetadata};
@@ -612,7 +614,7 @@ mod tests {
         // person page / image endpoint can resolve it.
         let (base_type, base_name): (String, String) =
             sqlx::query_as(r#"SELECT bi."Type", bi."Name" FROM "BaseItems" bi WHERE bi."Id" = ?1"#)
-                .bind(zendaya.id.to_string())
+                .bind(guid_to_db(zendaya.id))
                 .fetch_one(db.pool())
                 .await
                 .expect("person base item");
@@ -623,7 +625,7 @@ mod tests {
         let role: String = sqlx::query_scalar(
             r#"SELECT "Role" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1 AND "Role" <> '' LIMIT 1"#,
         )
-        .bind(item.to_string())
+        .bind(guid_to_db(item))
         .fetch_one(db.pool())
         .await
         .expect("role");

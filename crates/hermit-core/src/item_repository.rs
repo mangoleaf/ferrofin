@@ -20,6 +20,7 @@ use hermit_db::Database;
 use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::ItemValueType;
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::data::CollectionType;
 use hermit_model::entities::ImageType;
 use hermit_model::entities::MediaStreamType;
@@ -173,7 +174,12 @@ impl HermitItemRepository {
             .filter_map(|k| stored_type_name(*k).map(str::to_owned))
             .collect();
         content_type_names.extend(include_content_types.iter().cloned());
-        let ancestors: Vec<String> = filter.ancestor_ids.iter().map(Uuid::to_string).collect();
+        let ancestors: Vec<String> = filter
+            .ancestor_ids
+            .iter()
+            .copied()
+            .map(guid_to_db)
+            .collect();
 
         // The page of by-name rows, joined to the value-count aggregate so the count
         // comes back in the same query (id = ItemValueId), with the caller's name
@@ -454,7 +460,7 @@ impl ItemRepository for HermitItemRepository {
         let row = sqlx::query_as::<_, BaseItemEntity>(
             r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1 AND "Id" <> ?2"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(PLACEHOLDER_ID)
         .fetch_optional(self.db.pool())
         .await
@@ -513,7 +519,7 @@ impl ItemRepository for HermitItemRepository {
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         let exists: Option<i64> =
             sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?;
@@ -530,7 +536,7 @@ impl ItemRepository for HermitItemRepository {
         let rows = sqlx::query_as::<_, BaseItemEntity>(
             r#"SELECT * FROM "BaseItems" WHERE "PrimaryVersionId" = ?1 AND "Id" <> ?2"#,
         )
-        .bind(primary_id.to_string())
+        .bind(guid_to_db(primary_id))
         .bind(PLACEHOLDER_ID)
         .fetch_all(self.db.pool())
         .await
@@ -553,7 +559,7 @@ impl ItemRepository for HermitItemRepository {
             );
             let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             query = query.bind(PLACEHOLDER_ID);
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
@@ -595,7 +601,7 @@ impl ItemRepository for HermitItemRepository {
             r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
                 ORDER BY "ImageType", "Id""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -622,7 +628,7 @@ impl ItemRepository for HermitItemRepository {
             r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
                 ORDER BY "Id""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(disc)
         .fetch_all(self.db.pool())
         .await
@@ -641,7 +647,7 @@ impl ItemRepository for HermitItemRepository {
         // portable equivalent over stored rows is to exchange the two rows' paths
         // (so the image previously at index1 now resolves at index2) and reset
         // Width/Height to the "unknown" sentinel, stamping DateModified.
-        let now = Utc::now();
+        let now = datetime_to_db(Utc::now());
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "BaseItemImageInfos"
@@ -650,7 +656,7 @@ impl ItemRepository for HermitItemRepository {
         )
         .bind(&first.id)
         .bind(&second.path)
-        .bind(now)
+        .bind(&now)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -661,7 +667,7 @@ impl ItemRepository for HermitItemRepository {
         )
         .bind(&second.id)
         .bind(&first.path)
-        .bind(now)
+        .bind(&now)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -762,7 +768,7 @@ impl ItemRepository for HermitItemRepository {
         sql.push(')');
         let mut query = sqlx::query_scalar::<_, String>(&sql).bind(stream_disc);
         for id in &ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
@@ -800,7 +806,7 @@ impl ItemRepository for HermitItemRepository {
             query = query.bind(*disc);
         }
         for id in &ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
         for (disc, lang) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
             if let Some(t) = by_disc.get(&disc) {
@@ -869,7 +875,7 @@ impl ItemRepository for HermitItemRepository {
                        WHERE ud."ItemId" = bi."Id" AND ud."UserId" = ?2 AND ud."Played" = 1))"#,
         );
         let all_played: i64 = sqlx::query_scalar(&sql)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .bind(uid)
             .fetch_one(self.db.pool())
             .await
@@ -1020,21 +1026,21 @@ mod tests {
         seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
         seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(series.to_string())
-            .bind(library.to_string())
+            .bind(guid_to_db(series))
+            .bind(guid_to_db(library))
             .execute(db.writer())
             .await
             .expect("series parent");
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(episode.to_string())
-            .bind(series.to_string())
+            .bind(guid_to_db(episode))
+            .bind(guid_to_db(series))
             .execute(db.writer())
             .await
             .expect("episode parent");
         for ancestor in [series, library] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-                .bind(episode.to_string())
-                .bind(ancestor.to_string())
+                .bind(guid_to_db(episode))
+                .bind(guid_to_db(ancestor))
                 .execute(db.writer())
                 .await
                 .expect("ancestor");
@@ -1066,7 +1072,7 @@ mod tests {
             .await
             .expect("recursive");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, episode.to_string());
+        assert_eq!(rows[0].id, guid_to_db(episode));
     }
 
     #[tokio::test]
@@ -1097,12 +1103,12 @@ mod tests {
         };
         let rows = repository.get_item_list(&query).await.expect("browse");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, movie.to_string());
+        assert_eq!(rows[0].id, guid_to_db(movie));
 
         // Removing the membership makes the browse empty again.
         sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
-            .bind(boxset.to_string())
-            .bind(movie.to_string())
+            .bind(guid_to_db(boxset))
+            .bind(guid_to_db(movie))
             .execute(db.writer())
             .await
             .expect("remove_from_collection");
@@ -1128,7 +1134,7 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,'Al Pacino','Actor')"#,
         )
-        .bind(person.to_string())
+        .bind(guid_to_db(person))
         .execute(db.writer())
         .await
         .expect("person");
@@ -1136,8 +1142,8 @@ mod tests {
             r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
                VALUES (?1,?2,'',0,0)"#,
         )
-        .bind(movie_a.to_string())
-        .bind(person.to_string())
+        .bind(guid_to_db(movie_a))
+        .bind(guid_to_db(person))
         .execute(db.writer())
         .await
         .expect("credit");
@@ -1149,7 +1155,7 @@ mod tests {
         };
         let rows = repository.get_item_list(&by_id).await.expect("by id");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, movie_a.to_string());
+        assert_eq!(rows[0].id, guid_to_db(movie_a));
 
         // By name resolves the same filmography.
         let by_name = InternalItemsQuery {
@@ -1185,7 +1191,7 @@ mod tests {
                 r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
                    VALUES (?1, ?2, ?3)"#,
             )
-            .bind(item.to_string())
+            .bind(guid_to_db(item))
             .bind(provider)
             .bind(value)
             .execute(db.writer())
@@ -1201,7 +1207,7 @@ mod tests {
         };
         let rows = repository.get_item_list(&query).await.expect("list");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, heat.to_string());
+        assert_eq!(rows[0].id, guid_to_db(heat));
 
         // A non-matching value returns nothing (no partial/prefix matching).
         let miss = InternalItemsQuery {
@@ -1246,9 +1252,9 @@ mod tests {
                 ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
                 VALUES (?1, ?2, NULL, 1080, 2, ?3, '/backdrop.jpg', 1920)"#,
         )
-        .bind(Uuid::from_u128(0x9101).to_string())
+        .bind(guid_to_db(Uuid::from_u128(0x9101)))
         .bind("LKO2".as_bytes().to_vec())
-        .bind(item.to_string())
+        .bind(guid_to_db(item))
         .execute(db.writer())
         .await
         .expect("insert backdrop");
@@ -1258,8 +1264,8 @@ mod tests {
                 ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
                 VALUES (?1, NULL, NULL, 0, 0, ?2, '/poster.jpg', 0)"#,
         )
-        .bind(Uuid::from_u128(0x9102).to_string())
-        .bind(item.to_string())
+        .bind(guid_to_db(Uuid::from_u128(0x9102)))
+        .bind(guid_to_db(item))
         .execute(db.writer())
         .await
         .expect("insert primary");
@@ -1296,8 +1302,8 @@ mod tests {
                     ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
                     VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
             )
-            .bind(Uuid::from_u128(0x9210 + n).to_string())
-            .bind(item.to_string())
+            .bind(guid_to_db(Uuid::from_u128(0x9210 + n)))
+            .bind(guid_to_db(item))
             .bind(path)
             .execute(db.writer())
             .await
@@ -1334,8 +1340,8 @@ mod tests {
                 ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
                 VALUES (?1, NULL, NULL, 1080, 2, ?2, '/only.jpg', 1920)"#,
         )
-        .bind(Uuid::from_u128(0x9310).to_string())
-        .bind(item.to_string())
+        .bind(guid_to_db(Uuid::from_u128(0x9310)))
+        .bind(guid_to_db(item))
         .execute(db.writer())
         .await
         .expect("insert backdrop");
@@ -1555,7 +1561,7 @@ mod tests {
             r#"UPDATE "BaseItems" SET "ProductionYear" = 1999, "OfficialRating" = 'PG-13'
                WHERE "Id" = ?1"#,
         )
-        .bind(movie.to_string())
+        .bind(guid_to_db(movie))
         .execute(db.writer())
         .await
         .expect("set year/rating");
@@ -1596,7 +1602,7 @@ mod tests {
                     "IsOriginal", "StreamType", "Language")
                    VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)"#,
             )
-            .bind(item.to_string())
+            .bind(guid_to_db(item))
             .bind(idx)
             .bind(lang)
             .execute(db.writer())
@@ -1635,8 +1641,8 @@ mod tests {
         let child = Uuid::from_u128(0xC002);
         seed_item(&db, child, BaseItemKind::Episode).await;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(child.to_string())
-            .bind(parent.to_string())
+            .bind(guid_to_db(child))
+            .bind(guid_to_db(parent))
             .execute(db.writer())
             .await
             .expect("set parent");
@@ -1647,8 +1653,8 @@ mod tests {
         // The recursive branch runs its AncestorIds join. With an ancestor row
         // present, the played child makes the closure fully played.
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-            .bind(child.to_string())
-            .bind(parent.to_string())
+            .bind(guid_to_db(child))
+            .bind(guid_to_db(parent))
             .execute(db.writer())
             .await
             .expect("ancestor");
@@ -1673,8 +1679,8 @@ mod tests {
         let unplayed = Uuid::from_u128(0xBEEF);
         seed_item(&db, unplayed, BaseItemKind::Episode).await;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(unplayed.to_string())
-            .bind(parent.to_string())
+            .bind(guid_to_db(unplayed))
+            .bind(guid_to_db(parent))
             .execute(db.writer())
             .await
             .expect("set parent of unplayed");
@@ -1726,8 +1732,8 @@ mod tests {
             sqlx::query(
                 r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "ExtraType" = ?3 WHERE "Id" = ?1"#,
             )
-            .bind(id.to_string())
-            .bind(owner.to_string())
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(owner))
             .bind(extra as i32)
             .execute(db.writer())
             .await
@@ -1742,7 +1748,7 @@ mod tests {
         };
         let res = repository.get_item_list(&query).await.expect("extras");
         assert_eq!(res.len(), 1);
-        assert_eq!(res[0].id, trailer.to_string());
+        assert_eq!(res[0].id, guid_to_db(trailer));
 
         // Both display extras (Trailer + BehindTheScenes) return both.
         let query = InternalItemsQuery {
@@ -1768,7 +1774,7 @@ mod tests {
         // A user-data row with a non-zero position marks the first item resumable.
         seed_user_data(&db, Uuid::from_u128(0xF00D), resumable, false, None).await;
         sqlx::query(r#"UPDATE "UserData" SET "PlaybackPositionTicks" = 5000 WHERE "ItemId" = ?1"#)
-            .bind(resumable.to_string())
+            .bind(guid_to_db(resumable))
             .execute(db.writer())
             .await
             .expect("set position");
@@ -1780,7 +1786,7 @@ mod tests {
         };
         let res = repository.get_item_list(&query).await.expect("resumable");
         assert_eq!(res.len(), 1);
-        assert_eq!(res[0].id, resumable.to_string());
+        assert_eq!(res[0].id, guid_to_db(resumable));
     }
 
     #[tokio::test]
@@ -1795,8 +1801,8 @@ mod tests {
         seed_item(&db, unrelated, BaseItemKind::Movie).await;
         // Only `alt` points at `primary`.
         sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
-            .bind(primary.to_string())
-            .bind(alt.to_string())
+            .bind(guid_to_db(primary))
+            .bind(guid_to_db(alt))
             .execute(db.writer())
             .await
             .expect("link alternate");
@@ -1806,7 +1812,7 @@ mod tests {
             .await
             .expect("query");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, alt.to_string());
+        assert_eq!(rows[0].id, guid_to_db(alt));
 
         // A nil primary short-circuits to empty without hitting the pool.
         assert!(
@@ -1825,7 +1831,7 @@ mod tests {
             .expect("batch");
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[&primary].len(), 1);
-        assert_eq!(batch[&primary][0].id, alt.to_string());
+        assert_eq!(batch[&primary][0].id, guid_to_db(alt));
         assert!(!batch.contains_key(&unrelated));
     }
 }

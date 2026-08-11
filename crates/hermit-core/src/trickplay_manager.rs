@@ -42,6 +42,7 @@ use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::playback::TrickplayInfoEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::configuration::TrickplayOptions;
 use uuid::Uuid;
 
@@ -129,7 +130,7 @@ impl HermitTrickplayManager {
         let rows = sqlx::query_as::<_, TrickplayInfoEntity>(
             r#"SELECT * FROM "TrickplayInfos" WHERE "ItemId" = ?1 ORDER BY "Width""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -139,7 +140,7 @@ impl HermitTrickplayManager {
     /// Deletes the stored trickplay row for one (item, width) pair.
     async fn delete_trickplay_row(&self, item_id: Uuid, width: i32) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" = ?1 AND "Width" = ?2"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(width)
             .execute(self.db.writer())
             .await
@@ -271,7 +272,7 @@ impl HermitTrickplayManager {
         let mut info = self
             .create_tiles(&images, actual_width, options, output_dir)
             .await?;
-        info.item_id = ctx.item_id.to_string();
+        info.item_id = guid_to_db(ctx.item_id);
 
         if let Err(e) = self.save_trickplay_info(&info).await {
             // Make sure no files stay in metadata folders when the info row
@@ -394,7 +395,7 @@ impl HermitTrickplayManager {
         existing_files: &[String],
     ) -> Result<(), ServiceError> {
         let mut info = TrickplayInfoEntity {
-            item_id: item_id.to_string(),
+            item_id: guid_to_db(item_id),
             width,
             interval: options.interval,
             tile_width: options.tile_width,
@@ -663,7 +664,7 @@ impl TrickplayManager for HermitTrickplayManager {
 
     async fn delete_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -706,13 +707,16 @@ impl TrickplayManager for HermitTrickplayManager {
             );
             let mut query = sqlx::query_as::<_, TrickplayInfoEntity>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    // Key the inner manifest with the same lowercase-hyphenated
+                    // media-source id the single-item form emits, independent of
+                    // the stored (uppercase) column format.
                     out.entry(id)
                         .or_default()
-                        .entry(row.item_id.clone())
+                        .entry(id.to_string())
                         .or_default()
                         .insert(row.width, row);
                 }
@@ -935,6 +939,7 @@ fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
 #[cfg(test)]
 mod tests {
     use hermit_db::entities::playback::TrickplayInfoEntity;
+    use hermit_db::store::guid_to_db;
     use hermit_model::configuration::{ServerConfiguration, TrickplayOptions};
     use hermit_model::data::BaseItemKind;
     use uuid::Uuid;
@@ -1128,7 +1133,7 @@ mod tests {
             r#"UPDATE "BaseItems" SET "Path" = ?2, "RunTimeTicks" = ?3, "Width" = ?4
                WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(&path_str)
         .bind(runtime_ticks)
         .bind(video_width)
@@ -1140,7 +1145,7 @@ mod tests {
 
     fn info(item: Uuid, width: i32) -> TrickplayInfoEntity {
         TrickplayInfoEntity {
-            item_id: item.to_string(),
+            item_id: guid_to_db(item),
             width,
             bandwidth: 500_000,
             height: width * 9 / 16,
@@ -1474,7 +1479,7 @@ mod tests {
 
         // A 2x2 tile grid with 6 thumbnails → 2 tiles (4 + 2).
         let stored = TrickplayInfoEntity {
-            item_id: item.to_string(),
+            item_id: guid_to_db(item),
             width: 320,
             bandwidth: 500_000,
             height: 180,

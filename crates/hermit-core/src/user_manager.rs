@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::{PermissionKind, PreferenceKind};
+use hermit_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use hermit_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use hermit_model::data::UnratedItem;
 use hermit_model::dto::{NameIdPair, UserDto};
@@ -192,7 +193,7 @@ impl HermitUserManager {
     /// Fetches a user row by id, or `None`.
     async fn fetch_user(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
         sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1 LIMIT 1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .fetch_optional(self.db.pool())
             .await
             .map_err(db_err)
@@ -251,7 +252,7 @@ impl HermitUserManager {
         >,
     {
         let id = Uuid::new_v4();
-        let id_str = id.to_string();
+        let id_str = guid_to_db(id);
         let internal_id = self.next_internal_id().await?;
         let normalized = name.to_uppercase();
 
@@ -417,7 +418,7 @@ impl UserManager for HermitUserManager {
             r#"SELECT "Id" FROM "Users" WHERE "NormalizedUsername" = ?1 AND "Id" != ?2 LIMIT 1"#,
         )
         .bind(&normalized)
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -432,7 +433,7 @@ impl UserManager for HermitUserManager {
         sqlx::query(
             r#"UPDATE "Users" SET "Username" = ?2, "NormalizedUsername" = ?3 WHERE "Id" = ?1"#,
         )
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .bind(new_name)
         .bind(&normalized)
         .execute(self.db.writer())
@@ -483,8 +484,8 @@ impl UserManager for HermitUserManager {
         .bind(user.hide_played_in_latest)
         .bind(user.internal_id)
         .bind(user.invalid_login_attempt_count)
-        .bind(user.last_activity_date)
-        .bind(user.last_login_date)
+        .bind(opt_datetime_to_db(user.last_activity_date))
+        .bind(opt_datetime_to_db(user.last_login_date))
         .bind(user.login_attempts_before_lockout)
         .bind(user.max_active_sessions)
         .bind(user.max_parental_rating_score)
@@ -560,13 +561,13 @@ impl UserManager for HermitUserManager {
         ] {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(&sql)
-                .bind(user_id.to_string())
+                .bind(guid_to_db(user_id))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
         }
         sqlx::query(r#"DELETE FROM "Users" WHERE "Id" = ?1"#)
-            .bind(user_id.to_string())
+            .bind(guid_to_db(user_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -599,7 +600,7 @@ impl UserManager for HermitUserManager {
             r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,
         )
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .bind(hash)
         .execute(self.db.writer())
         .await
@@ -696,7 +697,7 @@ impl UserManager for HermitUserManager {
                     "LastActivityDate" = ?2, "LastLoginDate" = ?2 WHERE "Id" = ?1"#,
             )
             .bind(&user.id)
-            .bind(now)
+            .bind(datetime_to_db(now))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -829,7 +830,7 @@ impl UserManager for HermitUserManager {
         config: &UserConfiguration,
     ) -> Result<(), ServiceError> {
         self.require_user(user_id).await?;
-        let id = user_id.to_string();
+        let id = guid_to_db(user_id);
 
         sqlx::query(
             r#"UPDATE "Users" SET
@@ -901,7 +902,7 @@ impl UserManager for HermitUserManager {
         // many boolean permissions) are a deferred follow-up, flagged rather than
         // silently dropped.
         self.require_user(user_id).await?;
-        let id = user_id.to_string();
+        let id = guid_to_db(user_id);
 
         sqlx::query(
             r#"UPDATE "Users" SET
@@ -990,7 +991,7 @@ impl UserManager for HermitUserManager {
         sqlx::query(
             r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES (?1, ?2, ?3)"#,
         )
-        .bind(chrono::Utc::now())
+        .bind(datetime_to_db(chrono::Utc::now()))
         .bind(dest.to_string_lossy().as_ref())
         .bind(&user.id)
         .execute(&mut *tx)
@@ -1016,7 +1017,7 @@ impl UserManager for HermitUserManager {
         let row = sqlx::query_as::<_, hermit_db::entities::users::ImageInfoEntity>(
             r#"SELECT * FROM "ImageInfos" WHERE "UserId" = ?1 LIMIT 1"#,
         )
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;

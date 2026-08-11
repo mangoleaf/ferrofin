@@ -9,6 +9,7 @@ use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::PermissionKind;
+use hermit_db::store::guid_to_db;
 use hermit_model::configuration::ServerConfiguration;
 use hermit_model::dto::{BaseItemDto, SessionInfoDto};
 use hermit_model::secret::Secret;
@@ -188,14 +189,14 @@ async fn seed_named_user(db: &Database, id: Uuid, username: &str) -> UserEntity 
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
            VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ?2, '', 1, 1, 1, 0, 0, 0, ?3)"#,
     )
-    .bind(id.to_string())
+    .bind(guid_to_db(id))
     .bind(username.to_uppercase())
     .bind(username)
     .execute(db.writer())
     .await
     .expect("insert user");
     sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_one(db.pool())
         .await
         .expect("fetch user")

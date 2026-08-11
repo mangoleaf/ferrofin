@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::ChapterEntity;
+use hermit_db::store::{guid_to_db, opt_datetime_to_db};
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -48,7 +49,7 @@ impl HermitChapterRepository {
 impl ChapterRepository for HermitChapterRepository {
     async fn delete_chapters(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "Chapters" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -62,7 +63,7 @@ impl ChapterRepository for HermitChapterRepository {
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "Chapters" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -74,9 +75,9 @@ impl ChapterRepository for HermitChapterRepository {
                     "Name", "StartPositionTicks")
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
             )
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(chapter_index)
-            .bind(chapter.image_date_modified)
+            .bind(opt_datetime_to_db(chapter.image_date_modified))
             .bind(&chapter.image_path)
             .bind(&chapter.name)
             .bind(chapter.start_position_ticks)
@@ -92,7 +93,7 @@ impl ChapterRepository for HermitChapterRepository {
         let rows = sqlx::query_as::<_, ChapterEntity>(
             r#"SELECT * FROM "Chapters" WHERE "ItemId" = ?1 ORDER BY "StartPositionTicks""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -119,7 +120,7 @@ impl ChapterRepository for HermitChapterRepository {
             );
             let mut query = sqlx::query_as::<_, ChapterEntity>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
@@ -138,7 +139,7 @@ impl ChapterRepository for HermitChapterRepository {
         let row = sqlx::query_as::<_, ChapterEntity>(
             r#"SELECT * FROM "Chapters" WHERE "ItemId" = ?1 AND "ChapterIndex" = ?2"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(i64::from(index))
         .fetch_optional(self.db.pool())
         .await

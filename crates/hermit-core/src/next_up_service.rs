@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::data::BaseItemKind;
 use uuid::Uuid;
 
@@ -77,7 +78,7 @@ impl HermitNextUpService {
         sql.push(')');
         let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
         for id in ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
         let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
         for row in rows {
@@ -141,9 +142,9 @@ impl NextUpService for HermitNextUpService {
             .bind(&user.id)
             .bind(PLACEHOLDER_ID);
         for id in &filter.top_parent_ids {
-            query = query.bind(id.to_string());
+            query = query.bind(guid_to_db(*id));
         }
-        query = query.bind(date_cutoff);
+        query = query.bind(datetime_to_db(date_cutoff));
         let mut keys = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
         if let Some(limit) = filter.limit {
@@ -495,6 +496,7 @@ mod tests {
     use crate::test_support::{seed_episode, seed_user, seed_user_data, test_db};
     use chrono::{DateTime, Utc};
     use hermit_db::entities::users::UserEntity;
+    use hermit_db::store::guid_to_db;
     use hermit_traits::options::InternalItemsQuery;
     use hermit_traits::persistence::NextUpService;
     use uuid::Uuid;
@@ -566,11 +568,11 @@ mod tests {
         let series = batch.get("series-a").expect("series present");
         assert_eq!(
             series.last_watched.as_ref().map(|e| e.id.clone()),
-            Some(e2.to_string())
+            Some(guid_to_db(e2))
         );
         assert_eq!(
             series.next_up.as_ref().map(|e| e.id.clone()),
-            Some(e3.to_string())
+            Some(guid_to_db(e3))
         );
     }
 
@@ -599,6 +601,6 @@ mod tests {
             .expect("batch");
         let series = batch.get("series-a").expect("series present");
         assert_eq!(series.specials.len(), 1);
-        assert_eq!(series.specials[0].id, special.to_string());
+        assert_eq!(series.specials[0].id, guid_to_db(special));
     }
 }

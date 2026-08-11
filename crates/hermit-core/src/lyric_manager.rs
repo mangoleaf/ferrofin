@@ -456,6 +456,7 @@ mod tests {
 
     use async_trait::async_trait;
     use hermit_db::Database;
+    use hermit_db::store::guid_to_db;
     use hermit_model::data::BaseItemKind;
     use hermit_model::lyrics::{LyricMetadata, LyricSearchRequest};
     use hermit_traits::error::ServiceError;
@@ -543,7 +544,7 @@ mod tests {
                    "AlbumArtists" = ?5, "RunTimeTicks" = ?6
                WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(path)
         .bind("Baldur's Gate 3")
         .bind("Borislav Slavov|Extra Artist")

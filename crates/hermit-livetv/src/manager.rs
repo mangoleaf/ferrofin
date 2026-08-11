@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hermit_db::Database;
+use hermit_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
@@ -93,7 +94,7 @@ impl HermitLiveTvManager {
                 let key = if ch.id.is_empty() { &ch.name } else { &ch.id };
                 let id = Uuid::new_v5(&CHANNEL_NS, format!("{tuner_id}|{key}").as_bytes());
                 let channel_type = if ch.is_radio { "Radio" } else { "Tv" };
-                b.push_bind(id.to_string())
+                b.push_bind(guid_to_db(id))
                     .push_bind(tuner_id)
                     .push_bind(&ch.id)
                     .push_bind(&ch.name)
@@ -134,8 +135,8 @@ impl HermitLiveTvManager {
             .iter()
             .flat_map(|prog| {
                 let channel_ids = by_tvg.get(&prog.channel_id).map_or(&[][..], Vec::as_slice);
-                let start = prog.start.map(|s| s.to_rfc3339()).unwrap_or_default();
-                let end = prog.stop.map(|s| s.to_rfc3339());
+                let start = opt_datetime_to_db(prog.start).unwrap_or_default();
+                let end = opt_datetime_to_db(prog.stop);
                 let genres = if prog.categories.is_empty() {
                     None
                 } else {
@@ -144,7 +145,7 @@ impl HermitLiveTvManager {
                 channel_ids.iter().map(move |channel_id| {
                     let id = Uuid::new_v5(&PROGRAM_NS, format!("{channel_id}|{start}").as_bytes());
                     (
-                        id.to_string(),
+                        guid_to_db(id),
                         channel_id,
                         start.clone(),
                         end.clone(),
@@ -237,7 +238,7 @@ impl LiveTvManager for HermitLiveTvManager {
             .id
             .clone()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("m3u".to_owned());
@@ -292,7 +293,7 @@ impl LiveTvManager for HermitLiveTvManager {
             .id
             .clone()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+            .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
         info.id = Some(id.clone());
         if info.type_.is_none() {
             info.type_ = Some("xmltv".to_owned());
@@ -352,7 +353,7 @@ impl LiveTvManager for HermitLiveTvManager {
             r#"SELECT "Id","Name","Number","ChannelType","ImageUrl"
                FROM "LiveTvChannels" WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -364,9 +365,11 @@ impl LiveTvManager for HermitLiveTvManager {
         query: &InternalItemsQuery,
         _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        // Optional channel filter drawn from the query's channel ids.
+        // Optional channel filter drawn from the query's channel ids, in the
+        // canonical stored GUID form so it compares equal to the "ChannelId"
+        // column text.
         let channel_filter: Vec<String> =
-            query.channel_ids.iter().map(ToString::to_string).collect();
+            query.channel_ids.iter().copied().map(guid_to_db).collect();
         let rows = sqlx::query(
             r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
                       p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
@@ -402,7 +405,7 @@ impl LiveTvManager for HermitLiveTvManager {
                JOIN "LiveTvChannels" c ON c."Id" = p."ChannelId"
                WHERE p."Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -439,7 +442,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         let url: Option<String> =
             sqlx::query_scalar(r#"SELECT "StreamUrl" FROM "LiveTvChannels" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?;
@@ -471,12 +474,12 @@ impl LiveTvManager for HermitLiveTvManager {
                  "Status"=excluded."Status","Data"=excluded."Data""#,
         )
         .bind(&id)
-        .bind(timer.base.channel_id.to_string())
+        .bind(guid_to_db(timer.base.channel_id))
         .bind(&timer.base.program_id)
         .bind(&timer.series_timer_id)
         .bind(timer.base.name.clone().unwrap_or_default())
-        .bind(timer.base.start_date.to_rfc3339())
-        .bind(timer.base.end_date.to_rfc3339())
+        .bind(datetime_to_db(timer.base.start_date))
+        .bind(datetime_to_db(timer.base.end_date))
         .bind(recording_status_name(timer.status))
         .bind(timer.base.pre_padding_seconds)
         .bind(timer.base.post_padding_seconds)
@@ -524,7 +527,7 @@ impl LiveTvManager for HermitLiveTvManager {
                  "Name"=excluded."Name","Data"=excluded."Data""#,
         )
         .bind(&id)
-        .bind(timer.base.channel_id.to_string())
+        .bind(guid_to_db(timer.base.channel_id))
         .bind(&timer.base.program_id)
         .bind(timer.base.name.clone().unwrap_or_default())
         .bind(&data)
@@ -571,7 +574,7 @@ impl LiveTvManager for HermitLiveTvManager {
             r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
                FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -581,7 +584,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         let path: Option<String> =
             sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?
@@ -594,7 +597,7 @@ impl LiveTvManager for HermitLiveTvManager {
         // Remove the file first (best-effort), then the row.
         let path: Option<String> =
             sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?
@@ -604,7 +607,7 @@ impl LiveTvManager for HermitLiveTvManager {
         }
         self.delete_by_id(
             r#"DELETE FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
-            &id.to_string(),
+            &guid_to_db(id),
         )
         .await
     }
@@ -733,7 +736,7 @@ fn ensure_id(id: &mut Option<String>) -> String {
     let value = id
         .clone()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+        .unwrap_or_else(|| guid_to_db(Uuid::new_v4()));
     *id = Some(value.clone());
     value
 }
@@ -756,11 +759,19 @@ fn recording_status_name(status: RecordingStatus) -> &'static str {
     }
 }
 
-/// Parses an RFC-3339 timestamp stored in the guide cache.
+/// Parses a timestamp stored in the guide cache: the canonical storage format
+/// (`YYYY-MM-DD HH:MM:SS.fffffff`, UTC by convention — see
+/// [`hermit_db::store`]), falling back to RFC-3339 for rows written before the
+/// cache switched to the canonical format.
 fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
         .ok()
-        .map(|dt| dt.with_timezone(&Utc))
+        .map(|naive| naive.and_utc())
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        })
 }
 
 /// Maps a `sqlx` error into a [`ServiceError`] via `hermit-db`'s `DbError`, for

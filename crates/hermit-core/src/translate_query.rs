@@ -21,11 +21,13 @@
 //! see the inline `// deferred:` notes. Everything ported matches the C#
 //! predicate exactly for non-folder items.
 //!
-//! `Guid` columns are stored as hyphenated `TEXT`, so identity binds use
-//! [`Uuid::to_string`]; `DateTime<Utc>` binds directly (sqlx encodes SQLite
-//! datetimes as text).
+//! `Guid` columns are stored as UPPERCASE hyphenated `TEXT` and datetimes as
+//! `YYYY-MM-DD HH:MM:SS.fffffff` (Jellyfin's canonical storage formats), so
+//! identity binds use [`guid_to_db`] and datetime binds use [`datetime_to_db`]
+//! — byte-identical to Jellyfin-written rows under SQLite `BINARY` collation.
 
 use hermit_db::enums::ItemValueType;
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::SortOrder;
 use hermit_model::live_tv::ItemSortBy;
@@ -191,14 +193,14 @@ pub(crate) fn append_predicates<'a>(
             qb.push(
                 r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = bi."Id" AND a."ParentItemId" = "#,
             )
-            .push_bind(filter.parent_id.to_string())
+            .push_bind(guid_to_db(filter.parent_id))
             .push(")");
         } else if filter.physical_children_only {
             // Physical children only (delete-cascade): NEVER merge LinkedChildren, so
             // deleting a box-set/playlist removes only the container, not the items it
             // references (linked children are references, not owned children).
             qb.push(r#" AND bi."ParentId" = "#)
-                .push_bind(filter.parent_id.to_string());
+                .push_bind(guid_to_db(filter.parent_id));
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
@@ -206,11 +208,11 @@ pub(crate) fn append_predicates<'a>(
             // subquery is empty for ordinary folders and this stays identical to
             // a plain `ParentId` equality for non-collection browses.
             qb.push(r#" AND (bi."ParentId" = "#)
-                .push_bind(filter.parent_id.to_string())
+                .push_bind(guid_to_db(filter.parent_id))
                 .push(
                     r#" OR bi."Id" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = "#,
                 )
-                .push_bind(filter.parent_id.to_string())
+                .push_bind(guid_to_db(filter.parent_id))
                 .push(r#" AND "ChildType" = 0))"#);
         }
     }
@@ -490,49 +492,58 @@ fn append_date_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalIt
         None => {}
     }
     if let Some(d) = min_end {
-        qb.push(r#" AND bi."EndDate" >= "#).push_bind(d);
+        qb.push(r#" AND bi."EndDate" >= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = max_end {
-        qb.push(r#" AND bi."EndDate" <= "#).push_bind(d);
+        qb.push(r#" AND bi."EndDate" <= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter.min_start_date {
-        qb.push(r#" AND bi."StartDate" >= "#).push_bind(d);
+        qb.push(r#" AND bi."StartDate" >= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter.max_start_date {
-        qb.push(r#" AND bi."StartDate" <= "#).push_bind(d);
+        qb.push(r#" AND bi."StartDate" <= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter.min_premiere_date {
-        qb.push(r#" AND bi."PremiereDate" >= "#).push_bind(d);
+        qb.push(r#" AND bi."PremiereDate" >= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter.max_premiere_date {
-        qb.push(r#" AND bi."PremiereDate" <= "#).push_bind(d);
+        qb.push(r#" AND bi."PremiereDate" <= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter.min_date_created {
-        qb.push(r#" AND bi."DateCreated" >= "#).push_bind(d);
+        qb.push(r#" AND bi."DateCreated" >= "#)
+            .push_bind(datetime_to_db(d));
     }
     if let Some(d) = filter
         .min_date_last_saved
         .or(filter.min_date_last_saved_for_user)
     {
         qb.push(r#" AND (bi."DateLastSaved" IS NOT NULL AND bi."DateLastSaved" >= "#)
-            .push_bind(d)
+            .push_bind(datetime_to_db(d))
             .push(")");
     }
     if filter.is_airing == Some(true) {
         qb.push(r#" AND bi."StartDate" <= "#)
-            .push_bind(now)
+            .push_bind(datetime_to_db(now))
             .push(r#" AND bi."EndDate" >= "#)
-            .push_bind(now);
+            .push_bind(datetime_to_db(now));
     } else if filter.is_airing == Some(false) {
         qb.push(r#" AND bi."StartDate" > "#)
-            .push_bind(now)
+            .push_bind(datetime_to_db(now))
             .push(r#" AND bi."EndDate" < "#)
-            .push_bind(now);
+            .push_bind(datetime_to_db(now));
     }
     if filter.is_unaired == Some(true) {
-        qb.push(r#" AND bi."PremiereDate" >= "#).push_bind(now);
+        qb.push(r#" AND bi."PremiereDate" >= "#)
+            .push_bind(datetime_to_db(now));
     } else if filter.is_unaired == Some(false) {
-        qb.push(r#" AND bi."PremiereDate" < "#).push_bind(now);
+        qb.push(r#" AND bi."PremiereDate" < "#)
+            .push_bind(datetime_to_db(now));
     }
 }
 
@@ -605,7 +616,7 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
     let Some(user_id) = filter.user_id() else {
         return;
     };
-    let uid = user_id.to_string();
+    let uid = guid_to_db(user_id);
 
     if let Some(want) = filter.is_favorite {
         push_user_data_exists(qb, &uid, r#"ud."IsFavorite" = 1"#, want);
@@ -968,9 +979,10 @@ fn item_value_type_ints(types: &[ItemValueType]) -> Vec<i64> {
     types.iter().map(|t| i64::from(i32::from(*t))).collect()
 }
 
-/// Converts item ids to their hyphenated string form for `Guid` `TEXT` binds.
+/// Converts item ids to the canonical stored `Guid` `TEXT` form (UPPERCASE
+/// hyphenated) for binds.
 fn to_guid_strings(ids: &[Uuid]) -> Vec<String> {
-    ids.iter().map(Uuid::to_string).collect()
+    ids.iter().copied().map(guid_to_db).collect()
 }
 
 /// The stored `MediaType` name for a [`hermit_model::data::MediaType`]

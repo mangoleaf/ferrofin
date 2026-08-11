@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use hermit_db::Database;
 use hermit_db::entities::activity::ActivityLogEntity;
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::activity::{ActivityLogEntry, LogLevel};
 use hermit_model::querying::QueryResult;
 use hermit_traits::activity::{
@@ -157,11 +158,11 @@ impl ActivityManager for HermitActivityManager {
         }
         if let Some(min_date) = query.min_date {
             wheres.push(r#"a."DateCreated" >= ?"#.to_owned());
-            binds.push(min_date.to_rfc3339());
+            binds.push(datetime_to_db(min_date));
         }
         if let Some(max_date) = query.max_date {
             wheres.push(r#"a."DateCreated" <= ?"#.to_owned());
-            binds.push(max_date.to_rfc3339());
+            binds.push(datetime_to_db(max_date));
         }
         for (col, value) in [
             (r#"a."Name""#, &query.name),
@@ -230,7 +231,7 @@ impl ActivityManager for HermitActivityManager {
         // read-side item filter binds against.
         let user_id = entry
             .user_id
-            .map_or_else(|| EMPTY_GUID.to_owned(), |u| u.to_string());
+            .map_or_else(|| EMPTY_GUID.to_owned(), guid_to_db);
         let item_id = entry.item_id.map(|i| i.simple().to_string());
         sqlx::query(
             r#"INSERT INTO "ActivityLogs"
@@ -245,7 +246,7 @@ impl ActivityManager for HermitActivityManager {
         .bind(entry.short_overview)
         .bind(item_id)
         .bind(severity_to_int(entry.severity))
-        .bind(Utc::now().to_rfc3339())
+        .bind(datetime_to_db(Utc::now()))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -254,10 +255,11 @@ impl ActivityManager for HermitActivityManager {
 
     async fn clean(&self, before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
         // Port of `ActivityManager.CleanAsync`: bulk-delete entries older than
-        // the cutoff. `DateCreated` is stored as RFC 3339 text, which orders
-        // lexicographically for UTC timestamps, so a text comparison is exact.
+        // the cutoff. `DateCreated` is stored as canonical
+        // `YYYY-MM-DD HH:MM:SS.fffffff` text, which orders lexicographically for
+        // UTC timestamps, so a text comparison is exact.
         let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" < ?1"#)
-            .bind(before.to_rfc3339())
+            .bind(datetime_to_db(before))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -315,7 +317,7 @@ mod tests {
             "T1",
             "11111111-1111-1111-1111-111111111111",
             2,
-            "2024-01-01T00:00:00+00:00",
+            "2024-01-01 00:00:00.0000000",
             None,
         )
         .await;
@@ -325,7 +327,7 @@ mod tests {
             "T2",
             EMPTY_GUID,
             4,
-            "2025-01-01T00:00:00+00:00",
+            "2025-01-01 00:00:00.0000000",
             None,
         )
         .await;
@@ -393,7 +395,7 @@ mod tests {
             "T",
             "22222222-2222-2222-2222-222222222222",
             2,
-            "2025-06-01T00:00:00+00:00",
+            "2025-06-01 00:00:00.0000000",
             None,
         )
         .await;
@@ -403,7 +405,7 @@ mod tests {
             "T",
             EMPTY_GUID,
             2,
-            "2025-06-02T00:00:00+00:00",
+            "2025-06-02 00:00:00.0000000",
             None,
         )
         .await;
@@ -441,7 +443,7 @@ mod tests {
                 "LibraryScan",
                 EMPTY_GUID,
                 2,
-                &format!("2025-01-0{}T00:00:00+00:00", i + 1),
+                &format!("2025-01-0{} 00:00:00.0000000", i + 1),
                 None,
             )
             .await;
@@ -452,7 +454,7 @@ mod tests {
             "Other",
             EMPTY_GUID,
             2,
-            "2025-02-01T00:00:00+00:00",
+            "2025-02-01 00:00:00.0000000",
             None,
         )
         .await;

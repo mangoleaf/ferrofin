@@ -21,6 +21,7 @@ use hermit_db::Database;
 use hermit_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use hermit_db::entities::users::UserEntity;
 use hermit_db::enums::{PermissionKind, PreferenceKind};
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::devices::DeviceInfo;
 use hermit_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
 use hermit_model::querying::QueryResult;
@@ -178,8 +179,10 @@ impl HermitDeviceManager {
                 .map_err(db_err)?;
 
         if let Some(user_id) = query.user_id {
-            let uid = user_id.to_string();
-            all.retain(|d| d.user_id == uid);
+            // Compare in the canonical storage form so stored (uppercase) GUIDs
+            // match regardless of the caller's formatting.
+            let uid = guid_to_db(user_id);
+            all.retain(|d| d.user_id.eq_ignore_ascii_case(&uid));
         }
         if let Some(device_id) = &query.device_id {
             all.retain(|d| &d.device_id == device_id);
@@ -224,9 +227,9 @@ impl DeviceManager for HermitDeviceManager {
         .bind(&device.access_token)
         .bind(&device.app_name)
         .bind(&device.app_version)
-        .bind(device.date_created)
-        .bind(device.date_last_activity)
-        .bind(device.date_modified)
+        .bind(datetime_to_db(device.date_created))
+        .bind(datetime_to_db(device.date_last_activity))
+        .bind(datetime_to_db(device.date_modified))
         .bind(&device.device_id)
         .bind(&device.device_name)
         .bind(device.is_active)
@@ -327,7 +330,7 @@ impl DeviceManager for HermitDeviceManager {
                 let row = sqlx::query_as::<_, UserEntity>(
                     r#"SELECT * FROM "Users" WHERE "Id" = ?1 LIMIT 1"#,
                 )
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)?;
@@ -376,9 +379,9 @@ impl DeviceManager for HermitDeviceManager {
         .bind(&device.access_token)
         .bind(&device.app_name)
         .bind(&device.app_version)
-        .bind(device.date_created)
-        .bind(device.date_last_activity)
-        .bind(device.date_modified)
+        .bind(datetime_to_db(device.date_created))
+        .bind(datetime_to_db(device.date_last_activity))
+        .bind(datetime_to_db(device.date_modified))
         .bind(&device.device_id)
         .bind(&device.device_name)
         .bind(device.is_active)
@@ -478,7 +481,7 @@ mod tests {
             device_id: device_id.to_owned(),
             device_name: "Phone".to_owned(),
             is_active: true,
-            user_id: user.to_string(),
+            user_id: guid_to_db(user),
         }
     }
 

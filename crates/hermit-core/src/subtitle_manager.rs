@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::MediaStreamInfoEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
 
@@ -282,7 +283,7 @@ impl SubtitleManager for HermitSubtitleManager {
                WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
                  AND "StreamType" = ?3 AND "IsExternal" = 1"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(i64::from(index))
         .bind(subtitle_disc)
         .fetch_optional(self.db.pool())
@@ -306,7 +307,7 @@ impl SubtitleManager for HermitSubtitleManager {
                WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
                  AND "StreamType" = ?3 AND "IsExternal" = 1"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(i64::from(index))
         .bind(subtitle_disc)
         .execute(self.db.writer())
@@ -408,7 +409,7 @@ mod tests {
     async fn set_item_path(db: &Database, item: Uuid, media: &std::path::Path) {
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
             .bind(media.to_str().unwrap())
-            .bind(item.to_string())
+            .bind(guid_to_db(item))
             .execute(db.writer())
             .await
             .expect("set path");

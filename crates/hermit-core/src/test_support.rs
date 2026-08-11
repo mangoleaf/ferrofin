@@ -14,6 +14,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use hermit_db::Database;
 use hermit_db::entities::users::UserEntity;
+use hermit_db::store::{guid_to_db, opt_datetime_to_db, opt_guid_to_db};
 use hermit_model::data::BaseItemKind;
 use uuid::Uuid;
 
@@ -67,7 +68,7 @@ pub async fn seed_named_item(db: &Database, id: Uuid, kind: BaseItemKind, name: 
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
            VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, 0, ?3)"#,
     )
-    .bind(id.to_string())
+    .bind(guid_to_db(id))
     .bind(type_name(kind))
     .bind(if name.is_empty() { None } else { Some(name) })
     .execute(db.writer())
@@ -94,13 +95,13 @@ pub async fn seed_episode(
             "TopParentId", "Name")
            VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, ?3, ?4, ?5, ?6, ?7, ?8)"#,
     )
-    .bind(id.to_string())
+    .bind(guid_to_db(id))
     .bind(type_name(BaseItemKind::Episode))
     .bind(i64::from(is_virtual))
     .bind(series_key)
     .bind(season)
     .bind(episode)
-    .bind(top_parent.map(|t| t.to_string()))
+    .bind(opt_guid_to_db(top_parent))
     .bind(format!("S{season}E{episode}"))
     .execute(db.writer())
     .await
@@ -113,7 +114,7 @@ pub async fn seed_episode(
 pub async fn set_clean_name(db: &Database, id: Uuid, name: &str) {
     let clean = crate::text_util::get_clean_value(name);
     sqlx::query(r#"UPDATE "BaseItems" SET "CleanName" = ?2 WHERE "Id" = ?1"#)
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(clean)
         .execute(db.writer())
         .await
@@ -143,7 +144,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
     let value_id = if let Some(id) = existing {
         id
     } else {
-        let new_id = Uuid::new_v4().to_string();
+        let new_id = guid_to_db(Uuid::new_v4());
         sqlx::query(
             r#"INSERT INTO "ItemValues" ("ItemValueId", "Type", "Value", "CleanValue")
                VALUES (?1, ?2, ?3, ?4)"#,
@@ -162,7 +163,7 @@ pub async fn seed_item_genre(db: &Database, item_id: Uuid, genre: &str) {
         r#"INSERT INTO "ItemValuesMap" ("ItemId", "ItemValueId")
            VALUES (?1, ?2) ON CONFLICT DO NOTHING"#,
     )
-    .bind(item_id.to_string())
+    .bind(guid_to_db(item_id))
     .bind(&value_id)
     .execute(db.writer())
     .await
@@ -198,22 +199,22 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
            VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 'U', '', 1, 1, 1, 0, 0, 0, 'u')"#,
     )
-    .bind(id.to_string())
+    .bind(guid_to_db(id))
     .execute(db.writer())
     .await
     .expect("insert user");
 
     sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_one(db.pool())
         .await
         .expect("fetch seeded user")
 }
 
 /// Inserts a `UserData` row marking `item` played (or not) by `user` at the
-/// given last-played timestamp. The timestamp is bound as a real
-/// [`DateTime<Utc>`] so it round-trips (and string-compares) with the values the
-/// next-up service binds.
+/// given last-played timestamp. The timestamp is bound in the canonical storage
+/// format (via [`opt_datetime_to_db`]) so it round-trips (and string-compares)
+/// with the values the next-up service binds.
 pub async fn seed_user_data(
     db: &Database,
     user: Uuid,
@@ -227,10 +228,10 @@ pub async fn seed_user_data(
             "PlayCount", "PlaybackPositionTicks", "Played")
            VALUES (?1, ?2, ?3, 0, ?4, 0, 0, ?5)"#,
     )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(user))
     .bind(item.to_string())
-    .bind(user.to_string())
-    .bind(item.to_string())
-    .bind(last_played)
+    .bind(opt_datetime_to_db(last_played))
     .bind(i64::from(played))
     .execute(db.writer())
     .await

@@ -13,6 +13,7 @@ use chrono::Utc;
 use tracing::warn;
 
 use hermit_db::Database;
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_traits::error::ServiceError;
 use hermit_traits::metrics::{PlaybackDecision, PlaybackMetrics};
 
@@ -50,8 +51,8 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
                ON CONFLICT("PlaySessionId") DO NOTHING"#,
         )
         .bind(&decision.play_session_id)
-        .bind(decision.item_id.to_string())
-        .bind(decision.user_id.to_string())
+        .bind(guid_to_db(decision.item_id))
+        .bind(guid_to_db(decision.user_id))
         .bind(&decision.client)
         .bind(&decision.device_id)
         .bind(&decision.play_method)
@@ -62,7 +63,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
         .bind(&decision.target_container)
         .bind(&decision.target_video_codec)
         .bind(&decision.target_audio_codec)
-        .bind(Utc::now().to_rfc3339())
+        .bind(datetime_to_db(Utc::now()))
         .execute(self.db.writer())
         .await;
         if let Err(err) = result {
@@ -77,7 +78,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
                WHERE "PlaySessionId" = ?1"#,
         )
         .bind(play_session_id)
-        .bind(Utc::now().to_rfc3339())
+        .bind(datetime_to_db(Utc::now()))
         .execute(self.db.writer())
         .await;
         if let Err(err) = result {
@@ -97,7 +98,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
                WHERE "PlaySessionId" = ?1"#,
         )
         .bind(play_session_id)
-        .bind(Utc::now().to_rfc3339())
+        .bind(datetime_to_db(Utc::now()))
         .bind(position_ticks)
         .execute(self.db.writer())
         .await;

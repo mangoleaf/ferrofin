@@ -15,6 +15,7 @@ pub mod database;
 pub mod entities;
 pub mod enums;
 pub mod error;
+pub mod store;
 
 pub use database::Database;
 pub use error::{DbError, Result};

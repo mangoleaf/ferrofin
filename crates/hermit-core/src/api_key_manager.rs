@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use hermit_db::Database;
 use hermit_db::entities::security::ApiKeyEntity;
+use hermit_db::store::datetime_to_db;
 use uuid::Uuid;
 
 use hermit_model::security::AuthenticationInfo;
@@ -87,7 +88,7 @@ impl ApiKeyManager for HermitApiKeyManager {
                 VALUES (?1, ?2, ?2, ?3)"#,
         )
         .bind(&access_token)
-        .bind(now)
+        .bind(datetime_to_db(now))
         .bind(name)
         .execute(self.db.writer())
         .await

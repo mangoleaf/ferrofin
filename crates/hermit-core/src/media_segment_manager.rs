@@ -23,6 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::playback::MediaSegmentEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use uuid::Uuid;
 
@@ -103,9 +104,9 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
                ("Id", "EndTicks", "ItemId", "SegmentProviderId", "StartTicks", "Type")
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .bind(segment.end_ticks)
-        .bind(segment.item_id.to_string())
+        .bind(guid_to_db(segment.item_id))
         .bind(segment_provider_id)
         .bind(segment.start_ticks)
         .bind(Self::type_discriminant(segment.type_))
@@ -121,7 +122,7 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
 
     async fn delete_segment(&self, segment_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "MediaSegments" WHERE "Id" = ?1"#)
-            .bind(segment_id.to_string())
+            .bind(guid_to_db(segment_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -130,7 +131,7 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
 
     async fn delete_segments(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -150,7 +151,7 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
             sql.push_str(r#" AND "Type" = ?3"#);
         }
         let mut query = sqlx::query(&sql)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(provider_id.to_owned());
         if let Some(kind) = type_filter {
             query = query.bind(Self::type_discriminant(kind));
@@ -188,7 +189,7 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
         let rows = sqlx::query_as::<_, MediaSegmentEntity>(
             r#"SELECT * FROM "MediaSegments" WHERE "ItemId" = ?1 ORDER BY "StartTicks""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -210,7 +211,7 @@ impl MediaSegmentManager for HermitMediaSegmentManager {
     async fn has_segments(&self, item_id: Uuid) -> Result<bool, ServiceError> {
         let count: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaSegments" WHERE "ItemId" = ?1"#)
-                .bind(item_id.to_string())
+                .bind(guid_to_db(item_id))
                 .fetch_one(self.db.pool())
                 .await
                 .map_err(db_err)?;

@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::KeyframeDataEntity;
+use hermit_db::store::guid_to_db;
 use uuid::Uuid;
 
 use hermit_traits::error::ServiceError;
@@ -49,7 +50,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
         let rows = sqlx::query_as::<_, KeyframeDataEntity>(
             r#"SELECT * FROM "KeyframeData" WHERE "ItemId" = ?1"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -63,7 +64,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -71,7 +72,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
             r#"INSERT INTO "KeyframeData" ("ItemId", "KeyframeTicks", "TotalDuration")
                VALUES (?1, ?2, ?3)"#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(&data.keyframe_ticks)
         .bind(data.total_duration)
         .execute(&mut *tx)
@@ -83,7 +84,7 @@ impl KeyframeRepository for HermitKeyframeRepository {
 
     async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;

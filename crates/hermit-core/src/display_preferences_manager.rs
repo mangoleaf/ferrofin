@@ -19,9 +19,9 @@
 //!   entity in C#. Here they `UPDATE` the row addressed by
 //!   `(UserId, ItemId, Client)` (an `upsert` is unnecessary — the getters
 //!   guarantee the row exists before a client edits it).
-//! - `Guid` identity arguments are [`Uuid`]; they are bound as their hyphenated
-//!   string form to match the `TEXT` columns, consistent with the rest of the
-//!   crate.
+//! - `Guid` identity arguments are [`Uuid`]; they are bound in the canonical
+//!   storage form ([`guid_to_db`], uppercase hyphenated) to match the `TEXT`
+//!   columns, consistent with the rest of the crate.
 
 use std::collections::HashMap;
 
@@ -30,6 +30,7 @@ use hermit_db::Database;
 use hermit_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
+use hermit_db::store::guid_to_db;
 use hermit_traits::configuration::DisplayPreferencesManager;
 use hermit_traits::error::ServiceError;
 use uuid::Uuid;
@@ -69,8 +70,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT * FROM "DisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(item_id))
         .bind(client)
         .fetch_optional(self.db.pool())
         .await
@@ -94,13 +95,13 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
         .bind(DEFAULT_CHROMECAST_VERSION)
         .bind(client)
         .bind(i64::from(DEFAULT_ENABLE_NEXT_VIDEO_INFO_OVERLAY))
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .bind(DEFAULT_SCROLL_DIRECTION)
         .bind(i64::from(DEFAULT_SHOW_BACKDROP))
         .bind(i64::from(DEFAULT_SHOW_SIDEBAR))
         .bind(DEFAULT_SKIP_BACKWARD_LENGTH)
         .bind(DEFAULT_SKIP_FORWARD_LENGTH)
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -109,8 +110,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT * FROM "DisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(item_id))
         .bind(client)
         .fetch_one(self.db.pool())
         .await
@@ -127,8 +128,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT * FROM "ItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(item_id))
         .bind(client)
         .fetch_optional(self.db.pool())
         .await
@@ -150,12 +151,12 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
                VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
         )
         .bind(client)
-        .bind(Uuid::nil().to_string())
+        .bind(guid_to_db(Uuid::nil()))
         .bind(i64::from(DEFAULT_REMEMBER_INDEXING))
         .bind(i64::from(DEFAULT_REMEMBER_SORTING))
         .bind(DEFAULT_SORT_BY)
         .bind(DEFAULT_SORT_ORDER)
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .bind(DEFAULT_VIEW_TYPE)
         .execute(self.db.writer())
         .await
@@ -165,8 +166,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT * FROM "ItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(Uuid::nil().to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(Uuid::nil()))
         .bind(client)
         .fetch_one(self.db.pool())
         .await
@@ -184,9 +185,9 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT * FROM "ItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "Client" = ?2 AND "ItemId" <> ?3"#,
         )
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .bind(client)
-        .bind(Uuid::nil().to_string())
+        .bind(guid_to_db(Uuid::nil()))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)
@@ -202,8 +203,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"SELECT "Key", "Value" FROM "CustomItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(item_id))
         .bind(client)
         .fetch_all(self.db.pool())
         .await
@@ -226,8 +227,8 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
             r#"DELETE FROM "CustomItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3"#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(user_id))
+        .bind(guid_to_db(item_id))
         .bind(client)
         .execute(&mut *tx)
         .await
@@ -240,9 +241,9 @@ impl DisplayPreferencesManager for HermitDisplayPreferencesManager {
                    VALUES (?1, ?2, ?3, ?4, ?5)"#,
             )
             .bind(client)
-            .bind(item_id.to_string())
+            .bind(guid_to_db(item_id))
             .bind(key)
-            .bind(user_id.to_string())
+            .bind(guid_to_db(user_id))
             .bind(value.as_deref())
             .execute(&mut *tx)
             .await

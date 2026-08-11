@@ -25,6 +25,7 @@ use chrono::{DateTime, Utc};
 use hermit_db::entities::base_items::{
     BaseItemEntity, ChapterEntity, MediaStreamInfoEntity, PeopleEntity,
 };
+use hermit_db::store::guid_to_db;
 use hermit_model::data::BaseItemKind;
 use hermit_model::dto::MediaSourceInfo;
 use hermit_model::entities::{CollectionTypeOptions, ImageType};
@@ -1400,7 +1401,7 @@ impl LibraryScanner {
             .people
             .iter()
             .map(|p| PeopleEntity {
-                id: Uuid::new_v4().to_string(),
+                id: guid_to_db(Uuid::new_v4()),
                 name: p.name.clone(),
                 person_type: Some(p.person_type.clone()),
                 role: p.role.clone(),
@@ -1760,15 +1761,15 @@ impl LibraryScanner {
         let id = item_type_lookup::derive_item_id(kind, path)?;
         let sort_name = create_sort_name(&name);
         let entity = BaseItemEntity {
-            id: id.to_string(),
+            id: guid_to_db(id),
             type_: item_type_lookup::stored_type_name(kind)
                 .unwrap_or_default()
                 .to_owned(),
             name: Some(name),
             sort_name: Some(sort_name),
             path: Some(path.to_owned()),
-            parent_id: Some(parent.to_string()),
-            top_parent_id: Some(cf.to_string()),
+            parent_id: Some(guid_to_db(parent)),
+            top_parent_id: Some(guid_to_db(cf)),
             is_folder,
             date_created: Some(Utc::now()),
             ..BaseItemEntity::default()
@@ -1888,7 +1889,7 @@ impl LibraryScanner {
                         continue;
                     };
                     e.index_number = num.map(i64::from);
-                    e.series_id = Some(series_id.to_string());
+                    e.series_id = Some(guid_to_db(series_id));
                     e.series_name = Some(series_name.to_owned());
                     e.series_presentation_unique_key = Some(series_id.to_string());
                     out.push(Planned {
@@ -1971,7 +1972,7 @@ impl LibraryScanner {
             };
             e.path = None;
             e.index_number = num.map(i64::from);
-            e.series_id = Some(series_id.to_string());
+            e.series_id = Some(guid_to_db(series_id));
             e.series_name = Some(series_name.to_owned());
             e.series_presentation_unique_key = Some(series_id.to_string());
             out.push(Planned {
@@ -2084,9 +2085,9 @@ impl LibraryScanner {
         entity.season_name = season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
-        entity.series_id = Some(series_id.to_string());
+        entity.series_id = Some(guid_to_db(series_id));
         entity.series_presentation_unique_key = Some(series_id.to_string());
-        entity.season_id = season.map(|(sid, _)| sid.to_string());
+        entity.season_id = season.map(|(sid, _)| guid_to_db(sid));
         out.push(Planned {
             id,
             entity,
@@ -2277,7 +2278,7 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &hermit_providers::xbmc::item::NfoB
 /// are left empty; the person-type key is the Jellyfin `PersonType` name.
 fn person_to_entity(p: hermit_providers::container_types::PersonInfo) -> PeopleEntity {
     PeopleEntity {
-        id: Uuid::new_v4().to_string(),
+        id: guid_to_db(Uuid::new_v4()),
         name: p.name,
         person_type: Some(format!("{:?}", p.type_)),
         role: p.role,
@@ -2488,7 +2489,7 @@ fn tvdb_people(people: &[hermit_providers::TvdbPerson]) -> Vec<PeopleEntity> {
     people
         .iter()
         .map(|p| PeopleEntity {
-            id: Uuid::new_v4().to_string(),
+            id: guid_to_db(Uuid::new_v4()),
             name: p.name.clone(),
             person_type: Some(p.person_type.clone()),
             role: p.role.clone(),
@@ -2796,16 +2797,16 @@ mod tests {
         persistence
             .save_items(&[
                 BaseItemEntity {
-                    id: album_id.to_string(),
+                    id: hermit_db::store::guid_to_db(album_id),
                     type_: stored(BaseItemKind::MusicAlbum),
                     name: Some("Kind of Blue".into()),
                     ..Default::default()
                 },
                 BaseItemEntity {
-                    id: track_id.to_string(),
+                    id: hermit_db::store::guid_to_db(track_id),
                     type_: stored(BaseItemKind::Audio),
                     name: Some("So What".into()),
-                    parent_id: Some(album_id.to_string()),
+                    parent_id: Some(hermit_db::store::guid_to_db(album_id)),
                     album_artists: Some("Miles Davis".into()),
                     production_year: Some(1959),
                     ..Default::default()
@@ -3594,10 +3595,16 @@ mod tests {
             "two movies (flat + nested), poster ignored"
         );
 
-        let cf = vf.get_virtual_folders().await.unwrap()[0]
-            .item_id
-            .clone()
-            .unwrap();
+        // The DTO projects the id in display form; the stored form is canonical.
+        let cf = hermit_db::store::guid_to_db(
+            uuid::Uuid::parse_str(
+                vf.get_virtual_folders().await.unwrap()[0]
+                    .item_id
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
         // Both movies parent to the collection folder and carry an ancestor row.
         let movie_rows: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "BaseItems"
@@ -4027,10 +4034,16 @@ mod tests {
             .scan_all()
             .await
             .unwrap();
-        let cf = vf.get_virtual_folders().await.unwrap()[0]
-            .item_id
-            .clone()
-            .unwrap();
+        // The DTO projects the id in display form; the stored form is canonical.
+        let cf = hermit_db::store::guid_to_db(
+            uuid::Uuid::parse_str(
+                vf.get_virtual_folders().await.unwrap()[0]
+                    .item_id
+                    .as_deref()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
         (db, cf)
     }
 
@@ -4242,9 +4255,13 @@ mod tests {
             "virtual season carries the season number"
         );
         assert_eq!(season.2, None, "a virtual season has no on-disk path");
+        // The presentation key keeps its own (display) format; compare as GUIDs.
         assert_eq!(
-            season.3.as_deref(),
-            Some(series_id.as_str()),
+            season
+                .3
+                .as_deref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+            uuid::Uuid::parse_str(&series_id).ok(),
             "season links to the series by presentation key"
         );
 
@@ -4268,9 +4285,10 @@ mod tests {
         assert_eq!(ep.1, Some(2));
         assert_eq!(ep.2.as_deref(), Some(season.0.as_str()), "SeasonId set");
         assert_eq!(ep.3.as_deref(), Some(series_id.as_str()), "SeriesId set");
+        // The presentation key keeps its own (display) format; compare as GUIDs.
         assert_eq!(
-            ep.4.as_deref(),
-            Some(series_id.as_str()),
+            ep.4.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()),
+            uuid::Uuid::parse_str(&series_id).ok(),
             "episode links to the series by presentation key (drives the Episodes query)"
         );
         // Ancestor closure is depth 3 (cf, series, season).

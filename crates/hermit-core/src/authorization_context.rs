@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use hermit_db::Database;
 use hermit_db::entities::security::{ApiKeyEntity, DeviceEntity};
+use hermit_db::store::datetime_to_db;
 use uuid::Uuid;
 
 use hermit_traits::configuration::ServerConfigurationManager;
@@ -310,8 +311,8 @@ impl HermitAuthorizationContext {
         .bind(device.id)
         .bind(&device.device_name)
         .bind(&device.app_version)
-        .bind(device.date_last_activity)
-        .bind(device.date_modified)
+        .bind(datetime_to_db(device.date_last_activity))
+        .bind(datetime_to_db(device.date_modified))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -722,7 +723,7 @@ mod tests {
                VALUES (?1, ?2, ?2, ?3)"#,
         )
         .bind(token)
-        .bind(Utc::now())
+        .bind(datetime_to_db(Utc::now()))
         .bind(name)
         .execute(db.writer())
         .await
@@ -742,10 +743,10 @@ mod tests {
         .bind("dev-tok")
         .bind("Web")
         .bind("1.0")
-        .bind(now)
+        .bind(datetime_to_db(now))
         .bind("dev-1")
         .bind("Firefox")
-        .bind(uid.to_string())
+        .bind(hermit_db::store::guid_to_db(uid))
         .execute(db.writer())
         .await
         .expect("insert device");

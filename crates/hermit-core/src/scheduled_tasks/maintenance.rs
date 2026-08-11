@@ -24,6 +24,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use chrono::Utc;
 use hermit_db::Database;
+use hermit_db::store::datetime_to_db;
 use hermit_model::data::BaseItemKind;
 use hermit_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use hermit_traits::activity::ActivityManager;
@@ -651,7 +652,7 @@ impl ScheduledTask for CleanupUserDataTask {
                WHERE "ItemId" = ?1 AND "RetentionDate" IS NOT NULL AND "RetentionDate" < ?2"#,
         )
         .bind(PLACEHOLDER_ID)
-        .bind(cutoff.to_rfc3339())
+        .bind(datetime_to_db(cutoff))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -753,6 +754,7 @@ mod tests {
     use crate::test_support::test_db;
     use hermit_db::entities::security::DeviceEntity;
     use hermit_db::entities::users::UserEntity;
+    use hermit_db::store::guid_to_db;
     use hermit_model::dto::SessionInfoDto;
     use hermit_model::session::{
         ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
@@ -1276,7 +1278,7 @@ mod tests {
             async move {
                 sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
                     .bind(path)
-                    .bind(id.to_string())
+                    .bind(guid_to_db(id))
                     .execute(db.writer())
                     .await
                     .expect("set path");
@@ -1290,8 +1292,8 @@ mod tests {
                 r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                    VALUES (?1, ?2, 0, 0)"#,
             )
-            .bind(parent.to_string())
-            .bind(child.to_string())
+            .bind(guid_to_db(parent))
+            .bind(guid_to_db(child))
             .execute(db.writer())
             .await
             .expect("link");
@@ -1410,17 +1412,17 @@ mod tests {
                 .expect("insert userdata");
             }
         };
-        insert(live_item.to_string(), "live", None).await;
+        insert(guid_to_db(live_item), "live", None).await;
         insert(
             PLACEHOLDER_ID.to_owned(),
             "expired",
-            Some((Utc::now() - chrono::Duration::days(120)).to_rfc3339()),
+            Some(datetime_to_db(Utc::now() - chrono::Duration::days(120))),
         )
         .await;
         insert(
             PLACEHOLDER_ID.to_owned(),
             "recent",
-            Some((Utc::now() - chrono::Duration::days(5)).to_rfc3339()),
+            Some(datetime_to_db(Utc::now() - chrono::Duration::days(5))),
         )
         .await;
 

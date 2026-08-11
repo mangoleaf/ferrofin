@@ -56,6 +56,7 @@ use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use hermit_db::entities::users::UserEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::{
     BaseItemDto, BaseItemPerson, ItemCounts, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
@@ -382,7 +383,7 @@ impl HermitDtoService {
             r#"SELECT * FROM "BaseItemImageInfos"
                WHERE "ItemId" = ?1 ORDER BY "ImageType", "Id""#,
         )
-        .bind(item_id.to_string())
+        .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -413,7 +414,7 @@ impl HermitDtoService {
             );
             let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in &rows {
@@ -1161,7 +1162,7 @@ impl HermitDtoService {
             );
             let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
             for id in chunk {
-                query = query.bind(id.to_string());
+                query = query.bind(guid_to_db(*id));
             }
             for (item_id, key, value) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&item_id) {
@@ -1952,7 +1953,7 @@ mod tests {
         let folder_id = Uuid::new_v4();
         seed_named_item(&db, folder_id, BaseItemKind::Season, "Season 1").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(folder_id.to_string())
+            .bind(guid_to_db(folder_id))
             .execute(db.writer())
             .await
             .expect("mark folder");
@@ -1962,7 +1963,7 @@ mod tests {
         let genre_id = Uuid::new_v4();
         seed_named_item(&db, genre_id, BaseItemKind::Genre, "Drama").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(genre_id.to_string())
+            .bind(guid_to_db(genre_id))
             .execute(db.writer())
             .await
             .expect("mark by-name folder");
@@ -1980,9 +1981,9 @@ mod tests {
                    "ParentId" = CASE "Id" WHEN ?2 THEN ?3 ELSE "ParentId" END
                WHERE "Id" IN (?1, ?2)"#,
         )
-        .bind(byname_artist_id.to_string())
-        .bind(physical_artist_id.to_string())
-        .bind(folder_id.to_string())
+        .bind(guid_to_db(byname_artist_id))
+        .bind(guid_to_db(physical_artist_id))
+        .bind(guid_to_db(folder_id))
         .execute(db.writer())
         .await
         .expect("mark artist folders");
@@ -2583,8 +2584,8 @@ mod tests {
                ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash")
                VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)"#,
         )
-        .bind(Uuid::new_v4().to_string())
-        .bind(item_id.to_string())
+        .bind(guid_to_db(Uuid::new_v4()))
+        .bind(guid_to_db(item_id))
         .bind(image_type)
         .bind(path)
         .bind(blur.map(|b| b.as_bytes().to_vec()))
@@ -2596,7 +2597,7 @@ mod tests {
     /// Reads back a full item row.
     async fn fetch_item(db: &Database, id: Uuid) -> BaseItemEntity {
         sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .fetch_one(db.pool())
             .await
             .expect("fetch item")
@@ -2611,7 +2612,7 @@ mod tests {
             r#"UPDATE "BaseItems" SET "ProductionYear" = 2010, "RunTimeTicks" = 88_000_000,
                "Overview" = 'A thief', "OfficialRating" = 'PG-13' WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .execute(db.writer())
         .await
         .unwrap();
@@ -2639,7 +2640,7 @@ mod tests {
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "Inception").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "Overview" = 'A thief' WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .execute(db.writer())
             .await
             .unwrap();
@@ -2666,7 +2667,7 @@ mod tests {
             r#"UPDATE "BaseItems" SET "Genres" = 'Action|Sci-Fi', "Tags" = 'imax|4k'
                WHERE "Id" = ?1"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .execute(db.writer())
         .await
         .unwrap();
@@ -2737,7 +2738,7 @@ mod tests {
             r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
                VALUES (?1, 'Imdb', 'tt1375666')"#,
         )
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .execute(db.writer())
         .await
         .unwrap();
@@ -2860,7 +2861,7 @@ mod tests {
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Season, "Season 1").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .execute(db.writer())
             .await
             .expect("mark folder");
@@ -2917,7 +2918,7 @@ mod tests {
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::CollectionFolder, "Shows").await;
         sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .execute(db.writer())
             .await
             .expect("mark folder");
@@ -2974,7 +2975,7 @@ mod tests {
     impl LibraryManager for DbBackedLibrary {
         async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
                 .map_err(db_err)
@@ -3154,7 +3155,7 @@ mod tests {
             r#"INSERT INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
                VALUES (?1, ?2, 3, 'Warner Bros.')"#,
         )
-        .bind(vid.to_string())
+        .bind(guid_to_db(vid))
         .bind(&clean)
         .execute(db.writer())
         .await

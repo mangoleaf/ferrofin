@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::BaseItemKind;
 use uuid::Uuid;
 
@@ -65,7 +66,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
             sql.push_str(r#" AND "ChildType" = ?2"#);
         }
         sql.push_str(r#" ORDER BY "SortOrder""#);
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(parent_id.to_string());
+        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
         if let Some(ct) = child_type {
             query = query.bind(i64::from(ct));
         }
@@ -140,7 +141,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
                    JOIN "BaseItems" bi ON bi."Id" = lc."ParentId"
                    WHERE lc."ChildId" = ?1 AND lc."ChildType" = ?2 AND bi."Type" = ?3"#,
             )
-            .bind(child_id.to_string())
+            .bind(guid_to_db(child_id))
             .bind(i64::from(MANUAL_CHILD_TYPE))
             .bind(type_name)
             .fetch_all(self.db.pool())
@@ -151,7 +152,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
                 r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
                    WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
             )
-            .bind(child_id.to_string())
+            .bind(guid_to_db(child_id))
             .bind(i64::from(MANUAL_CHILD_TYPE))
             .fetch_all(self.db.pool())
             .await
@@ -171,7 +172,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
             r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
         )
-        .bind(from_child_id.to_string())
+        .bind(guid_to_db(from_child_id))
         .bind(i64::from(MANUAL_CHILD_TYPE))
         .fetch_all(&mut *tx)
         .await
@@ -190,9 +191,9 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
                  AND "ParentId" IN (SELECT "ParentId" FROM "LinkedChildren"
                      WHERE "ChildId" = ?3 AND "ChildType" = ?2)"#,
         )
-        .bind(from_child_id.to_string())
+        .bind(guid_to_db(from_child_id))
         .bind(i64::from(MANUAL_CHILD_TYPE))
-        .bind(to_child_id.to_string())
+        .bind(guid_to_db(to_child_id))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -201,8 +202,8 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
             r#"UPDATE "LinkedChildren" SET "ChildId" = ?1
                WHERE "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
-        .bind(to_child_id.to_string())
-        .bind(from_child_id.to_string())
+        .bind(guid_to_db(to_child_id))
+        .bind(guid_to_db(from_child_id))
         .bind(i64::from(MANUAL_CHILD_TYPE))
         .execute(&mut *tx)
         .await
@@ -233,8 +234,8 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
                     FROM "LinkedChildren" WHERE "ParentId" = ?1))
                ON CONFLICT("ParentId", "ChildId") DO UPDATE SET "ChildType" = excluded."ChildType""#,
         )
-        .bind(parent_id.to_string())
-        .bind(child_id.to_string())
+        .bind(guid_to_db(parent_id))
+        .bind(guid_to_db(child_id))
         .bind(i64::from(child_type))
         .execute(self.db.writer())
         .await

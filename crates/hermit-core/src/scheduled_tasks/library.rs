@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use hermit_db::Database;
 use hermit_db::entities::base_items::{BaseItemEntity, KeyframeDataEntity};
+use hermit_db::store::{datetime_to_db, guid_to_db};
 use hermit_model::configuration::LibraryOptions;
 use hermit_model::data::{BaseItemKind, MediaType};
 use hermit_model::dto::MediaSourceInfo;
@@ -183,7 +184,7 @@ impl ScheduledTask for KeyframeExtractionTask {
                 match extracted {
                     Ok(data) => {
                         let entity = KeyframeDataEntity {
-                            item_id: item_id.to_string(),
+                            item_id: guid_to_db(item_id),
                             keyframe_ticks: Some(
                                 serde_json::to_string(&data.keyframe_ticks)
                                     .map_err(|e| ServiceError::backend(e.to_string()))?,
@@ -850,7 +851,7 @@ impl PeopleValidationTask {
         base: f64,
         span: f64,
     ) -> Result<(), ServiceError> {
-        let cutoff = (Utc::now() - chrono::Duration::days(PEOPLE_REFRESH_DAYS)).to_rfc3339();
+        let cutoff = datetime_to_db(Utc::now() - chrono::Duration::days(PEOPLE_REFRESH_DAYS));
         let ids: Vec<String> = sqlx::query_scalar(
             r#"SELECT "Id" FROM "BaseItems" b
                WHERE "Type" = ?1
@@ -1719,7 +1720,7 @@ mod tests {
     async fn set_path(db: &hermit_db::Database, id: Uuid, path: &str) {
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#)
             .bind(path)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .execute(db.writer())
             .await
             .expect("set path");
@@ -1728,7 +1729,7 @@ mod tests {
     async fn set_media_type(db: &hermit_db::Database, id: Uuid, media_type: &str) {
         sqlx::query(r#"UPDATE "BaseItems" SET "MediaType" = ?1 WHERE "Id" = ?2"#)
             .bind(media_type)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .execute(db.writer())
             .await
             .expect("set media type");
@@ -1736,8 +1737,8 @@ mod tests {
 
     async fn add_ancestor(db: &hermit_db::Database, item: Uuid, ancestor: Uuid) {
         sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-            .bind(item.to_string())
-            .bind(ancestor.to_string())
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(ancestor))
             .execute(db.writer())
             .await
             .expect("ancestor");
@@ -1815,15 +1816,15 @@ mod tests {
                 .expect("query");
         let with_lufs: Vec<&str> = lufs.iter().map(|(id, _)| id.as_str()).collect();
         assert!(
-            with_lufs.contains(&album.to_string().as_str()),
+            with_lufs.contains(&guid_to_db(album).as_str()),
             "album measured"
         );
         assert!(
-            with_lufs.contains(&t1.to_string().as_str()),
+            with_lufs.contains(&guid_to_db(t1).as_str()),
             "track 1 measured"
         );
         assert!(
-            with_lufs.contains(&t2.to_string().as_str()),
+            with_lufs.contains(&guid_to_db(t2).as_str()),
             "track 2 measured"
         );
         assert!(lufs.iter().all(|(_, v)| *v == Some(-21.5)));
@@ -1976,7 +1977,7 @@ mod tests {
                 sqlx::query(
                     r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, ?2, 'Actor')"#,
                 )
-                .bind(id.to_string())
+                .bind(guid_to_db(id))
                 .bind(name)
                 .execute(db.writer())
                 .await
@@ -1995,8 +1996,8 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, 'Hero')"#,
         )
-        .bind(item.to_string())
-        .bind(dup.to_string())
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(dup))
         .execute(db.writer())
         .await
         .expect("map");
@@ -2017,14 +2018,14 @@ mod tests {
             .await
             .expect("people");
         assert_eq!(people.len(), 1, "dup merged, orphan removed");
-        assert_eq!(people[0].0, keep.to_string(), "first id survives");
+        assert_eq!(people[0].0, guid_to_db(keep), "first id survives");
 
         let mapped: Vec<String> =
             sqlx::query_scalar(r#"SELECT "PeopleId" FROM "PeopleBaseItemMap""#)
                 .fetch_all(db.pool())
                 .await
                 .expect("map");
-        assert_eq!(mapped, vec![keep.to_string()], "link re-pointed");
+        assert_eq!(mapped, vec![guid_to_db(keep)], "link re-pointed");
 
         let person_items: Vec<String> = sqlx::query_scalar(
             r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
@@ -2034,7 +2035,7 @@ mod tests {
         .expect("items");
         assert_eq!(
             person_items,
-            vec![person_item.to_string()],
+            vec![guid_to_db(person_item)],
             "dead item removed"
         );
 
@@ -2161,7 +2162,7 @@ mod tests {
             set_path(&db, id, &path.to_string_lossy()).await;
         }
         let existing = KeyframeDataEntity {
-            item_id: done.to_string(),
+            item_id: guid_to_db(done),
             keyframe_ticks: Some("[1,2,3]".to_owned()),
             total_duration: 42,
         };

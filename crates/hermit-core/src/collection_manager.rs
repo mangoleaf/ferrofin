@@ -38,6 +38,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hermit_db::Database;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::BaseItemKind;
 use hermit_model::entities_media::PlaylistUserPermissions;
 use hermit_model::playlists::{
@@ -80,7 +81,7 @@ async fn insert_named_item(
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
            VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4)"#,
     )
-    .bind(id.to_string())
+    .bind(guid_to_db(id))
     .bind(type_name)
     .bind(i64::from(is_folder))
     .bind(name)
@@ -89,7 +90,7 @@ async fn insert_named_item(
     .map_err(db_err)?;
 
     sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-        .bind(id.to_string())
+        .bind(guid_to_db(id))
         .fetch_one(db.pool())
         .await
         .map_err(db_err)
@@ -166,8 +167,8 @@ impl CollectionManager for HermitCollectionManager {
                 r#"DELETE FROM "LinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
-            .bind(collection_id.to_string())
-            .bind(item_id.to_string())
+            .bind(guid_to_db(collection_id))
+            .bind(guid_to_db(*item_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -261,8 +262,8 @@ impl HermitPlaylistManager {
                LEFT JOIN "PlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
                WHERE bi."Id" = ?1"#,
         )
-        .bind(playlist_id.to_string())
-        .bind(user_id.to_string())
+        .bind(guid_to_db(playlist_id))
+        .bind(guid_to_db(user_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -279,7 +280,11 @@ impl HermitPlaylistManager {
         let open_access = open_access != 0;
         // A NULL owner in an existing meta row is an API-key playlist: no user
         // owns it, so — like a legacy row — every caller is owner-equivalent.
-        let level = if owner.is_none() || owner.as_deref() == Some(user_id.to_string().as_str()) {
+        // Parse-compare the stored owner GUID so rows written in either case
+        // (legacy lowercase, canonical uppercase) still match.
+        let owner_is_caller =
+            owner.as_deref().and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
+        let level = if owner.is_none() || owner_is_caller {
             PlaylistAccessLevel::Owner
         } else if let Some(can_edit) = can_edit {
             if can_edit != 0 {
@@ -330,8 +335,8 @@ impl PlaylistManager for HermitPlaylistManager {
             r#"INSERT INTO "Playlists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, ?3)"#,
         )
-        .bind(id.to_string())
-        .bind((!request.user_id.is_nil()).then(|| request.user_id.to_string()))
+        .bind(guid_to_db(id))
+        .bind((!request.user_id.is_nil()).then(|| guid_to_db(request.user_id)))
         .bind(i64::from(request.public.unwrap_or(false)))
         .execute(self.db.writer())
         .await
@@ -359,7 +364,7 @@ impl PlaylistManager for HermitPlaylistManager {
         self.require_playlist(request.id).await?;
         if let Some(name) = &request.name {
             sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ?2 WHERE "Id" = ?1"#)
-                .bind(request.id.to_string())
+                .bind(guid_to_db(request.id))
                 .bind(name)
                 .execute(self.db.writer())
                 .await
@@ -368,7 +373,7 @@ impl PlaylistManager for HermitPlaylistManager {
         if let Some(public) = request.public {
             // A legacy playlist has no meta row; updating 0 rows is harmless.
             sqlx::query(r#"UPDATE "Playlists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#)
-                .bind(request.id.to_string())
+                .bind(guid_to_db(request.id))
                 .bind(i64::from(public))
                 .execute(self.db.writer())
                 .await
@@ -377,7 +382,7 @@ impl PlaylistManager for HermitPlaylistManager {
         if let Some(users) = &request.users {
             // C# replaces `Shares` wholesale on update.
             sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1"#)
-                .bind(request.id.to_string())
+                .bind(guid_to_db(request.id))
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
@@ -418,7 +423,7 @@ impl PlaylistManager for HermitPlaylistManager {
                ORDER BY bi."Name""#,
         )
         .bind(type_name)
-        .bind(user_id.to_string())
+        .bind(guid_to_db(user_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -456,8 +461,8 @@ impl PlaylistManager for HermitPlaylistManager {
             r#"INSERT INTO "PlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
                ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
         )
-        .bind(request.id.to_string())
-        .bind(request.user_id.to_string())
+        .bind(guid_to_db(request.id))
+        .bind(guid_to_db(request.user_id))
         .bind(i64::from(request.can_edit.unwrap_or(false)))
         .execute(self.db.writer())
         .await
@@ -472,8 +477,8 @@ impl PlaylistManager for HermitPlaylistManager {
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#)
-            .bind(playlist_id.to_string())
-            .bind(user_id.to_string())
+            .bind(guid_to_db(playlist_id))
+            .bind(guid_to_db(user_id))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -488,7 +493,7 @@ impl PlaylistManager for HermitPlaylistManager {
             r#"SELECT "UserId", "CanEdit" FROM "PlaylistShares"
                WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
         )
-        .bind(playlist_id.to_string())
+        .bind(guid_to_db(playlist_id))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -522,8 +527,8 @@ impl PlaylistManager for HermitPlaylistManager {
         let Some(pos) = position else {
             return Ok(());
         };
-        let pid = playlist_id.to_string();
-        let added: Vec<String> = item_ids.iter().map(Uuid::to_string).collect();
+        let pid = guid_to_db(playlist_id);
+        let added: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
         let mut order: Vec<String> = sqlx::query_scalar(
             r#"SELECT "ChildId" FROM "LinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
@@ -552,9 +557,12 @@ impl PlaylistManager for HermitPlaylistManager {
     ) -> Result<(), ServiceError> {
         // Entry ids are approximated by the child item id (see module docs). The
         // wire form is a dashless `Guid('N')` (`GetPlaylistItems` emits
-        // `item.id.replace('-', "")`), but `ChildId` is stored dashed. Parse and
-        // re-`to_string()` to normalise back to the stored dashed form; skip any
-        // entry id that isn't a valid GUID.
+        // `item.id.replace('-', "")`), but `ChildId` is stored in the canonical
+        // dashed uppercase form. Parse and re-format via `guid_to_db` to
+        // normalise back to the stored form (same for the playlist id, which
+        // arrives as a caller-formatted string); skip any entry id that isn't a
+        // valid GUID.
+        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
         for entry_id in entry_ids {
             let Ok(child) = Uuid::parse_str(entry_id) else {
                 continue;
@@ -563,8 +571,8 @@ impl PlaylistManager for HermitPlaylistManager {
                 r#"DELETE FROM "LinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
-            .bind(playlist_id)
-            .bind(child.to_string())
+            .bind(&pid)
+            .bind(guid_to_db(child))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -583,23 +591,25 @@ impl PlaylistManager for HermitPlaylistManager {
         // then rewrite the `SortOrder` ordinals. `entry_id` is the `ChildId` (as
         // `remove_item_from_playlist` treats it).
         // Same ordering the read path uses (`get_linked_children_ids`), so the
-        // relocation matches what the client sees.
+        // relocation matches what the client sees. The playlist id arrives as a
+        // caller-formatted string — normalise to the stored canonical form.
+        let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
         let mut order: Vec<String> = sqlx::query_scalar(
             r#"SELECT "ChildId" FROM "LinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
-        .bind(playlist_id)
+        .bind(&pid)
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
 
-        // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored dashed.
-        // Normalise before locating the entry position (see
-        // `remove_item_from_playlist`).
+        // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
+        // canonical dashed uppercase form. Normalise before locating the entry
+        // position (see `remove_item_from_playlist`).
         let Ok(child_id) = Uuid::parse_str(entry_id) else {
             return Ok(()); // not a GUID — nothing to move
         };
-        let needle = child_id.to_string();
+        let needle = guid_to_db(child_id);
         let Some(pos) = order.iter().position(|c| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
@@ -609,7 +619,7 @@ impl PlaylistManager for HermitPlaylistManager {
             .unwrap_or(usize::MAX)
             .min(order.len());
         order.insert(target, child);
-        write_sort_order(self.db.writer(), playlist_id, &order).await
+        write_sort_order(self.db.writer(), &pid, &order).await
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
@@ -741,15 +751,13 @@ mod tests {
             })
             .await
             .expect("browse");
-        let ids: Vec<_> = result.items.iter().map(|i| i.id.clone()).collect();
-        assert!(
-            ids.contains(&movie_a.to_string()),
-            "movie_a missing: {ids:?}"
-        );
-        assert!(
-            ids.contains(&movie_b.to_string()),
-            "movie_b missing: {ids:?}"
-        );
+        let ids: Vec<Uuid> = result
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert!(ids.contains(&movie_a), "movie_a missing: {ids:?}");
+        assert!(ids.contains(&movie_b), "movie_b missing: {ids:?}");
         assert_eq!(result.total_record_count, 2);
     }
 
@@ -885,9 +893,12 @@ mod tests {
             .await
             .expect("items");
         assert_eq!(items.len(), 2);
-        let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
-        assert!(ids.contains(&track_a.to_string()));
-        assert!(ids.contains(&track_b.to_string()));
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert!(ids.contains(&track_a));
+        assert!(ids.contains(&track_b));
     }
 
     #[tokio::test]
@@ -919,14 +930,14 @@ mod tests {
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
-        let ids: Vec<String> = mgr
+        let ids: Vec<Uuid> = mgr
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
             .iter()
-            .map(|i| i.id.clone())
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
-        assert_eq!(ids, vec![c.to_string(), a.to_string(), b.to_string()]);
+        assert_eq!(ids, vec![c, a, b]);
     }
 
     #[tokio::test]
@@ -1007,16 +1018,16 @@ mod tests {
         mgr.add_item_to_playlist(playlist_id, &[c], Some(0), owner)
             .await
             .expect("add at 0");
-        let order: Vec<String> = mgr
+        let order: Vec<Uuid> = mgr
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
             .iter()
-            .map(|i| i.id.clone())
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
         assert_eq!(
             order,
-            vec![c.to_string(), a.to_string(), b.to_string()],
+            vec![c, a, b],
             "position 0 should move the appended item to the front"
         );
 
@@ -1026,15 +1037,16 @@ mod tests {
         mgr.add_item_to_playlist(playlist_id, &[d], None, owner)
             .await
             .expect("append");
-        let last = mgr
-            .get_playlist_items(playlist_id, owner)
-            .await
-            .expect("items2")
-            .last()
-            .expect("non-empty")
-            .id
-            .clone();
-        assert_eq!(last, d.to_string(), "no position should append at the end");
+        let last = Uuid::parse_str(
+            &mgr.get_playlist_items(playlist_id, owner)
+                .await
+                .expect("items2")
+                .last()
+                .expect("non-empty")
+                .id,
+        )
+        .expect("uuid");
+        assert_eq!(last, d, "no position should append at the end");
     }
 
     #[tokio::test]
@@ -1265,12 +1277,14 @@ mod tests {
             .await
             .expect("p3");
 
-        let visible: Vec<String> = mgr
+        let p1 = Uuid::parse_str(&p1).expect("uuid");
+        let p2 = Uuid::parse_str(&p2).expect("uuid");
+        let visible: Vec<Uuid> = mgr
             .get_playlists(alice)
             .await
             .unwrap()
             .into_iter()
-            .map(|r| r.id)
+            .filter_map(|r| Uuid::parse_str(&r.id).ok())
             .collect();
         assert_eq!(visible.len(), 2, "alice sees her own + bob's shared");
         assert!(visible.contains(&p1) && visible.contains(&p2));

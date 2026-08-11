@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use hermit_db::entities::base_items::BaseItemEntity;
+use hermit_db::store::guid_to_db;
 use hermit_model::data::BaseItemKind;
 use hermit_traits::error::ServiceError;
 use hermit_traits::library::VirtualFolderManager;
@@ -138,7 +139,7 @@ impl HermitVirtualFolderManager {
             return Ok(());
         }
         let entity = BaseItemEntity {
-            id: id.to_string(),
+            id: guid_to_db(id),
             type_: item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
                 .unwrap_or_default()
                 .to_owned(),
@@ -666,6 +667,8 @@ mod tests {
 
         let folders = mgr.get_virtual_folders().await.expect("get");
         let item_id = folders[0].item_id.clone().expect("ItemId projected");
+        // The DTO projects the id in display form; the row's Id is canonical.
+        let db_id = super::guid_to_db(uuid::Uuid::parse_str(&item_id).expect("uuid"));
 
         // Jellyfin always emits a non-null RefreshStatus; at rest it is "Idle".
         assert_eq!(folders[0].refresh_status.as_deref(), Some("Idle"));
@@ -673,7 +676,7 @@ mod tests {
         // The persisted CollectionFolder row exists with the projected id.
         let (type_, is_folder): (String, bool) =
             sqlx::query_as(r#"SELECT "Type", "IsFolder" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item_id)
+                .bind(&db_id)
                 .fetch_one(db.pool())
                 .await
                 .expect("collection folder row exists");
@@ -684,7 +687,7 @@ mod tests {
         mgr.remove_virtual_folder("Movies").await.expect("remove");
         let remaining: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item_id)
+                .bind(&db_id)
                 .fetch_one(db.pool())
                 .await
                 .expect("count");
@@ -706,11 +709,13 @@ mod tests {
             .item_id
             .clone()
             .expect("ItemId");
+        // The DTO projects the id in display form; the row's Id is canonical.
+        let db_id = super::guid_to_db(uuid::Uuid::parse_str(&item_id).expect("uuid"));
 
         // Simulate a library created before CollectionFolder rows existed: the
         // on-disk folder remains but its BaseItems row is gone.
         sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(&item_id)
+            .bind(&db_id)
             .execute(db.writer())
             .await
             .expect("delete row");
@@ -720,7 +725,7 @@ mod tests {
         let folders = mgr.get_virtual_folders().await.expect("get");
         assert_eq!(folders[0].item_id.as_deref(), Some(item_id.as_str()));
         let exists: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(&item_id)
+            .bind(&db_id)
             .fetch_one(db.pool())
             .await
             .expect("count");

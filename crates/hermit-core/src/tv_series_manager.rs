@@ -292,6 +292,7 @@ mod tests {
     use async_trait::async_trait;
     use hermit_db::entities::base_items::BaseItemEntity;
     use hermit_db::entities::users::UserEntity;
+    use hermit_db::store::guid_to_db;
     use hermit_model::dto::BaseItemDto;
     use uuid::Uuid;
 
@@ -328,7 +329,7 @@ mod tests {
             Ok(())
         }
         async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
-            Ok((self.user.id == id.to_string()).then(|| self.user.clone()))
+            Ok((self.user.id == guid_to_db(id)).then(|| self.user.clone()))
         }
         async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
             Ok(Some(self.user.clone()))
@@ -712,7 +713,7 @@ mod tests {
     async fn seeded_episode(db: &hermit_db::Database, id: Uuid) -> BaseItemEntity {
         seed_episode(db, id, "series-key", 1, 1, false, None).await;
         sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .fetch_one(db.pool())
             .await
             .expect("fetch episode row")
@@ -722,7 +723,7 @@ mod tests {
     async fn seeded_folder(db: &hermit_db::Database, id: Uuid) -> BaseItemEntity {
         crate::test_support::seed_item(db, id, hermit_model::data::BaseItemKind::Folder).await;
         sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(id.to_string())
+            .bind(guid_to_db(id))
             .fetch_one(db.pool())
             .await
             .expect("fetch folder row")
