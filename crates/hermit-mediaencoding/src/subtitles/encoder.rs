@@ -547,7 +547,25 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         if input_path.is_empty() {
             return Err("inputPath is empty".to_owned());
         }
-        let args = format!("-y  -i \"{input_path}\" -c:s srt \"{output_path}\"");
+
+        // Tell ffmpeg the source charset (C# `GetSubtitleFileCharacterSet`), or
+        // it decodes a legacy-encoded file as UTF-8 and mangles every non-ASCII
+        // character. ffmpeg auto-converts UTF-16 `.smi`/`.sami` itself and
+        // rejects an explicit `-sub_charenc` for them, so those stay unset.
+        let charset = self
+            .get_subtitle_file_character_set(subtitle_stream)
+            .await?;
+        let is_utf16_smi = (ends_with_ignore_ascii_case(&input_path, ".smi")
+            || ends_with_ignore_ascii_case(&input_path, ".sami"))
+            && (charset.eq_ignore_ascii_case("utf-16be")
+                || charset.eq_ignore_ascii_case("utf-16le"));
+        let encoding_param = if charset.is_empty() || is_utf16_smi {
+            String::new()
+        } else {
+            format!(" -sub_charenc {charset}")
+        };
+
+        let args = format!("-y{encoding_param} -i \"{input_path}\" -c:s srt \"{output_path}\"");
         self.io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
             .await
@@ -707,6 +725,14 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     if bytes.starts_with(&[0xFE, 0xFF]) {
         return DetectedCharset::Other(encoding_rs::UTF_16BE);
     }
+    // BOM-less UTF-16 must be ruled out BEFORE the valid-UTF-8 shortcut:
+    // mostly-ASCII UTF-16 text is also valid UTF-8 (NUL bytes are legal), and
+    // serving it verbatim renders every char NUL-interleaved — e.g. ♪ (U+266A)
+    // in a BOM-less UTF-16LE subtitle displays as the raw bytes "j&". The C#
+    // `UtfUnknown.CharsetDetector` detects this case; `chardetng` does not.
+    if let Some(encoding) = detect_bomless_utf16(bytes) {
+        return DetectedCharset::Other(encoding);
+    }
     if std::str::from_utf8(bytes).is_ok() {
         return DetectedCharset::Utf8OrAscii;
     }
@@ -719,6 +745,35 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     } else {
         DetectedCharset::Other(encoding)
     }
+}
+
+/// Detects BOM-less UTF-16 text by its null-byte pattern (the UTF-16 probers of
+/// C# `UtfUnknown`): predominantly-ASCII UTF-16 has a NUL high byte in most
+/// code units and none in the low bytes. Text without that shape (e.g. CJK
+/// UTF-16, any 8-bit encoding, real UTF-8) returns `None` and falls through to
+/// the ordinary detection.
+fn detect_bomless_utf16(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let pairs = bytes.len() / 2;
+    // Too short to establish a pattern (matches the detector's reluctance to
+    // classify tiny buffers).
+    if pairs < 4 {
+        return None;
+    }
+    let mut even_nuls = 0usize;
+    let mut odd_nuls = 0usize;
+    for pair in bytes.chunks_exact(2) {
+        even_nuls += usize::from(pair[0] == 0);
+        odd_nuls += usize::from(pair[1] == 0);
+    }
+    // "Most" high bytes NUL, and strictly none on the other side — the
+    // asymmetry is what distinguishes UTF-16 ASCII text from binary noise.
+    if odd_nuls > pairs / 2 && even_nuls == 0 {
+        return Some(encoding_rs::UTF_16LE);
+    }
+    if even_nuls > pairs / 2 && odd_nuls == 0 {
+        return Some(encoding_rs::UTF_16BE);
+    }
+    None
 }
 
 /// The delivery protocol for `path`. Port of `MediaSourceManager.GetPathProtocol`.

@@ -186,6 +186,11 @@ async fn readable_file_unsupported_external_text_converts_to_srt() {
     let stream = sub_stream(3, "microdvd", Some("/media/movie.sub"), true);
     let source = source_with("guid5", "/media/movie.mkv", vec![stream.clone()]);
     let io = RecordingIo::default();
+    // The conversion charset-detects the source first, so the file must exist.
+    io.files
+        .lock()
+        .unwrap()
+        .insert("/media/movie.sub".to_owned(), b"{1}{50}Hello".to_vec());
     let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
 
     let info = encoder.get_readable_file(&source, &stream).await.unwrap();

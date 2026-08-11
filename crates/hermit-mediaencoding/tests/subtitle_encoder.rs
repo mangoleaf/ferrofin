@@ -24,11 +24,13 @@ const CUE_COUNT: usize = 500;
 // A Greek line that requires a non-UTF-8 legacy encoding to reproduce the bug.
 const GREEK_TEXT: &str = "Καλημέρα κόσμε, αυτό είναι ένας υπότιτλος.";
 
-/// In-memory [`SubtitleIo`] fake: files are served from a byte map; HTTP and
-/// ffmpeg extraction are unused by the ported test paths.
+/// In-memory [`SubtitleIo`] fake: files are served from a byte map; ffmpeg
+/// extraction records its argument strings for assertion (the handle is shared
+/// so tests keep access after the fake moves into the encoder).
 #[derive(Default)]
 struct FakeIo {
     files: Mutex<HashMap<String, Vec<u8>>>,
+    extract_args: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeIo {
@@ -79,7 +81,8 @@ impl SubtitleIo for FakeIo {
         ))
     }
 
-    async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, _output_paths: &[String]) -> Result<(), String> {
+        self.extract_args.lock().unwrap().push(args.to_owned());
         Ok(())
     }
 }
@@ -276,6 +279,120 @@ async fn get_subtitle_stream_utf8_local_file_preserves_content() {
 
     let text = String::from_utf8(stream.into_bytes()).unwrap();
     assert!(text.contains(GREEK_TEXT));
+}
+
+// ---- GetSubtitleStream BOM-less UTF-16 detection ----------------------------
+//
+// Mostly-ASCII UTF-16 text without a BOM is also *valid* UTF-8 (NUL bytes are
+// legal), so a naive detector serves it verbatim and ♪ (U+266A, UTF-16LE bytes
+// 6A 26) renders as the literal text "j&". The C# `UtfUnknown` detector
+// classifies these by their null-byte pattern; these tests pin the ported
+// behaviour.
+
+fn build_lyric_srt() -> String {
+    let mut builder = String::new();
+    for i in 1..=8 {
+        builder.push_str(&i.to_string());
+        builder.push('\n');
+        let _ = writeln!(builder, "00:00:0{i},000 --> 00:00:0{},000", i + 1);
+        builder.push_str("♪ Come and get your love ♪\n\n");
+    }
+    builder
+}
+
+async fn assert_bomless_utf16_decoded(big_endian: bool) {
+    let srt = build_lyric_srt();
+    let mut wide = Vec::new();
+    for unit in srt.encode_utf16() {
+        wide.extend_from_slice(&if big_endian {
+            unit.to_be_bytes()
+        } else {
+            unit.to_le_bytes()
+        });
+    }
+
+    let path = "/media/lyrics.srt";
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), FakeIo::with_file(path, wide));
+    let file_info = SubtitleInfo {
+        path: path.to_owned(),
+        protocol: MediaProtocol::File,
+        format: "srt".to_owned(),
+        is_external: true,
+    };
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+    assert!(stream.is_converted(), "BOM-less UTF-16 must be re-encoded");
+    let text = String::from_utf8(stream.into_bytes()).unwrap();
+    assert!(text.contains("♪ Come and get your love ♪"));
+    assert!(!text.contains("j&"), "music note must not decay to j&");
+    assert!(!text.contains('\0'), "no interleaved NULs");
+}
+
+#[tokio::test]
+async fn get_subtitle_stream_bomless_utf16le_keeps_music_notes() {
+    assert_bomless_utf16_decoded(false).await;
+}
+
+#[tokio::test]
+async fn get_subtitle_stream_bomless_utf16be_keeps_music_notes() {
+    assert_bomless_utf16_decoded(true).await;
+}
+
+// ---- ConvertTextSubtitleToSrt charset hint ----------------------------------
+//
+// Port of the C# arg construction: `-y{charenc} -i "{in}" -c:s srt "{out}"`.
+// Without `-sub_charenc` ffmpeg decodes a legacy-encoded file as UTF-8 and
+// mangles every non-ASCII character; UTF-16 `.smi`/`.sami` must stay unset
+// (ffmpeg auto-converts those and rejects an explicit charset).
+
+async fn convert_smi_and_capture_args(bytes: Vec<u8>) -> String {
+    let path = "/media/sub.smi";
+    let io = FakeIo::with_file(path, bytes);
+    let captured = io.extract_args.clone();
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
+    let media_source = MediaSourceInfo {
+        id: Some("cafe".to_owned()),
+        ..MediaSourceInfo::default()
+    };
+    let stream = external_stream(path);
+    encoder
+        .get_readable_file(&media_source, &stream)
+        .await
+        .unwrap();
+    let args = captured.lock().unwrap().clone();
+    assert_eq!(args.len(), 1, "exactly one ffmpeg conversion expected");
+    args.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn convert_text_subtitle_passes_charenc_for_legacy_encoding() {
+    let srt = build_greek_srt();
+    let (legacy, _, _) = encoding_rs::WINDOWS_1253.encode(&srt);
+    let args = convert_smi_and_capture_args(legacy.into_owned()).await;
+    assert!(
+        args.contains("-sub_charenc windows-1253"),
+        "expected charset hint in: {args}"
+    );
+}
+
+#[tokio::test]
+async fn convert_text_subtitle_omits_charenc_for_utf8() {
+    let args = convert_smi_and_capture_args(build_greek_srt().into_bytes()).await;
+    assert!(!args.contains("-sub_charenc"), "no charset hint in: {args}");
+    assert!(args.starts_with("-y -i"), "single space after -y: {args}");
+}
+
+#[tokio::test]
+async fn convert_text_subtitle_omits_charenc_for_utf16_smi() {
+    let srt = build_greek_srt();
+    let mut wide = vec![0xFF, 0xFE];
+    for unit in srt.encode_utf16() {
+        wide.extend_from_slice(&unit.to_le_bytes());
+    }
+    let args = convert_smi_and_capture_args(wide).await;
+    assert!(
+        !args.contains("-sub_charenc"),
+        "ffmpeg auto-converts UTF-16 smi; no hint in: {args}"
+    );
 }
 
 // ---- ConvertSubtitles determinism ------------------------------------------
