@@ -445,10 +445,28 @@ impl Config {
         })
     }
 
-    /// The path to the SQLite database file, `{data_dir}/hermit.db`.
+    /// The path to the SQLite database file.
+    ///
+    /// Normally `{data_dir}/hermit.db`. Drop-in adoption: when no `hermit.db`
+    /// exists but the data dir holds a Jellyfin database — `jellyfin.db` at
+    /// the root, or Jellyfin's own layout `data/jellyfin.db` — that file is
+    /// opened instead and adopted in place
+    /// (`hermit_db::Database` validates the version and takes a backup).
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join(DATABASE_FILE_NAME)
+        let hermit = self.data_dir.join(DATABASE_FILE_NAME);
+        if hermit.exists() {
+            return hermit;
+        }
+        for candidate in [
+            self.data_dir.join("jellyfin.db"),
+            self.data_dir.join("data").join("jellyfin.db"),
+        ] {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        hermit
     }
 
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for

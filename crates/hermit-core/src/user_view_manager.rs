@@ -55,6 +55,9 @@ pub struct HermitUserViewManager {
     /// The on-disk playlists directory (`{data}/playlists`), the provisioned
     /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
     playlists_path: Option<PathBuf>,
+    /// The per-database item-id derivation mode (see
+    /// [`item_type_lookup::IdDerivation`]).
+    id_derivation: item_type_lookup::IdDerivation,
 }
 
 impl std::fmt::Debug for HermitUserViewManager {
@@ -74,7 +77,16 @@ impl HermitUserViewManager {
             items,
             persistence: None,
             playlists_path: None,
+            id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
         }
+    }
+
+    /// Sets the per-database id-derivation mode. Called once by the
+    /// composition root (unit tests keep the legacy default).
+    #[must_use]
+    pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
+        self.id_derivation = mode;
+        self
     }
 
     /// Attaches the item store and the playlists directory so
@@ -94,8 +106,9 @@ impl HermitUserViewManager {
 
     /// The deterministic `ManualPlaylistsFolder` item id (`GetNewItemIdInternal`
     /// over the folder path).
-    fn playlists_folder_id(playlists_path: &std::path::Path) -> Option<Uuid> {
-        item_type_lookup::derive_item_id(
+    fn playlists_folder_id(&self, playlists_path: &std::path::Path) -> Option<Uuid> {
+        item_type_lookup::derive_item_id_with(
+            &self.id_derivation,
             BaseItemKind::ManualPlaylistsFolder,
             &playlists_path.to_string_lossy(),
         )
@@ -112,7 +125,7 @@ impl HermitUserViewManager {
         else {
             return Ok(());
         };
-        let Some(id) = Self::playlists_folder_id(playlists_path) else {
+        let Some(id) = self.playlists_folder_id(playlists_path) else {
             return Ok(());
         };
         if persistence.item_exists(id).await? {

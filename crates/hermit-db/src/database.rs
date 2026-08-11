@@ -91,6 +91,7 @@ impl Database {
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
             let mut conn = write_options.clone().connect().await?;
+            adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
@@ -217,6 +218,20 @@ impl Database {
         Ok(rows)
     }
 
+    /// Reads a `HermitMeta` value (Hermit's own key/value table), or [`None`]
+    /// when the key is unset.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let value =
+            sqlx::query_scalar(r#"SELECT "Value" FROM "HermitMeta" WHERE "Key" = ?1 LIMIT 1"#)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value)
+    }
+
     /// The single-connection **writer** pool, for `INSERT`/`UPDATE`/`DELETE`
     /// (`.execute(...)`) and write transactions (`.begin()`).
     ///
@@ -228,6 +243,194 @@ impl Database {
     pub fn writer(&self) -> &SqlitePool {
         &self.writer
     }
+}
+
+/// The exact `__EFMigrationsHistory` migration-id set a Jellyfin 10.11.8
+/// server leaves behind (68 rows) — the only Jellyfin database
+/// generation Hermit adopts. Captured from a real `jellyfin/jellyfin:10.11.8`.
+const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
+    "20200514181226_AddActivityLog",
+    "20200613202153_AddUsers",
+    "20200728005145_AddDisplayPreferences",
+    "20200905220533_FixDisplayPreferencesIndex",
+    "20201004171403_AddMaxActiveSessions",
+    "20201204223655_AddCustomDisplayPreferences",
+    "20210320181425_AddIndexesAndCollations",
+    "20210407110544_NullableCustomPrefValue",
+    "20210814002109_AddDevices",
+    "20221022080052_AddIndexActivityLogsDateCreated",
+    "20230526173516_RemoveEasyPassword",
+    "20230626233818_AddTrickplayInfos",
+    "20230923170422_UserCastReceiver",
+    "20240729140605_AddMediaSegments",
+    "20240928082930_MarkSegmentProviderIdNonNullable",
+    "20241020103111_LibraryDbMigration",
+    "20241111131257_AddedCustomDataKey",
+    "20241111135439_AddedCustomDataKeyKey",
+    "20241112152323_FixAncestorIdConfig",
+    "20241112232041_FixMediaStreams",
+    "20241112234144_FixMediaStreams2",
+    "20241113133548_EnforceUniqueItemValue",
+    "20250202021306_FixedCollation",
+    "20250204092455_MakeStartEndDateNullable",
+    "20250214031148_ChannelIdGuid",
+    "20250326065026_AddInheritedParentalRatingSubValue",
+    "20250327101120_AddKeyframeData",
+    "20250327171413_AddHdr10PlusFlag",
+    "20250331182844_FixAttachmentMigration",
+    "20250401142247_FixAncestors",
+    "20250405075612_FixItemValuesIndices",
+    "20250420000000_CreateNetworkConfiguration",
+    "20250420010000_MigrateNetworkConfiguration",
+    "20250420020000_MigrateMusicBrainzTimeout",
+    "20250420030000_MigrateEncodingOptions",
+    "20250420040000_RenameEnableGroupingIntoCollections",
+    "20250420050000_DisableTranscodingThrottling",
+    "20250420060000_CreateUserLoggingConfigFile",
+    "20250420070000_MigrateActivityLogDb",
+    "20250420080000_RemoveDuplicateExtras",
+    "20250420090000_AddDefaultPluginRepository",
+    "20250420100000_MigrateUserDb",
+    "20250420110000_ReaddDefaultPluginRepository",
+    "20250420120000_MigrateDisplayPreferencesDb",
+    "20250420130000_RemoveDownloadImagesInAdvance",
+    "20250420140000_MigrateAuthenticationDb",
+    "20250420150000_FixPlaylistOwner",
+    "20250420160000_AddDefaultCastReceivers",
+    "20250420170000_UpdateDefaultPluginRepository",
+    "20250420180000_FixAudioData",
+    "20250420190000_RemoveDuplicatePlaylistChildren",
+    "20250420193000_MigrateLibraryDbCompatibilityCheck",
+    "20250420200000_MigrateLibraryDb",
+    "20250420210000_MoveExtractedFiles",
+    "20250420220000_MigrateRatingLevels",
+    "20250420230000_MoveTrickplayFiles",
+    "20250420230000_RefreshInternalDateModified",
+    "20250421000000_MigrateKeyframeData",
+    "20250609115616_DetachUserDataInsteadOfDelete",
+    "20250618010000_MigrateLibraryUserData",
+    "20250620180000_FixDates",
+    "20250622170802_BaseItemImageInfoDateModifiedNullable",
+    "20250714044826_ResetJournalMode",
+    "20250730215000_ReseedFolderFlag",
+    "20250913211637_AddProperParentChildRelationBaseItemWithCascade",
+    "20250925203415_ExtendPeopleMapKey",
+    "20251009200000_CleanMusicArtist",
+    "20260206200000_FixLibrarySubtitleDownloadLanguages",
+];
+
+/// Hermit migrations at or below this version define the Jellyfin-owned
+/// schema shape; an adopted Jellyfin database already HAS that shape, so they
+/// are baselined as applied-without-running. Everything above is
+/// Hermit-additive (and written to be a no-op on Jellyfin-formatted data).
+const JELLYFIN_SHAPE_MIGRATION_HEAD: i64 = 7;
+
+/// Adopts an existing Jellyfin 10.11.8 SQLite database in place, if `conn` is
+/// one — the drop-in path (`brain/plans/PLAN_DB_DROPIN.md` Workstream D).
+///
+/// Detection: an `__EFMigrationsHistory` table with no `_sqlx_migrations`
+/// alongside it. The applied EF migration-id set must match
+/// [`JELLYFIN_10_11_8_MIGRATIONS`] **exactly** — anything newer, older, or
+/// partial is refused loudly rather than half-adopted. On adoption the file
+/// is copied aside once (`<db>.pre-hermit`), Hermit's schema-shape migrations
+/// (`0001`–`0007`) are baselined into `_sqlx_migrations` without executing —
+/// the Jellyfin database already has that exact shape — and the caller's
+/// normal `MIGRATOR.run` then applies only the Hermit-additive tail.
+/// `__EFMigrationsHistory`/`__EFMigrationsLock` are never touched, so
+/// switching back to Jellyfin keeps working.
+async fn adopt_jellyfin_database(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+) -> Result<()> {
+    use sqlx::migrate::Migrate;
+
+    let is_jellyfin: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if is_jellyfin.is_none() {
+        return Ok(()); // Hermit-native (or fresh) database
+    }
+    let already_adopted: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if already_adopted.is_some() {
+        return Ok(());
+    }
+
+    // Version gate: exactly the 10.11.8 set, or refuse (never half-adopt).
+    let applied: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut expected: Vec<&str> = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+    expected.sort_unstable();
+    if applied
+        .iter()
+        .map(String::as_str)
+        .ne(expected.iter().copied())
+    {
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|e| !applied.iter().any(|a| a == *e))
+            .copied()
+            .collect();
+        let extra: Vec<&str> = applied
+            .iter()
+            .filter(|a| !expected.contains(&a.as_str()))
+            .map(String::as_str)
+            .collect();
+        return Err(crate::DbError::UnsupportedJellyfinDatabase {
+            reason: format!(
+                "its migration history does not match Jellyfin 10.11.8 \
+                 ({} applied vs {} expected; missing: {missing:?}; unknown: {extra:?}). \
+                 Hermit adopts exactly the 10.11.8 schema generation — \
+                 bring the database to Jellyfin 10.11.x first (or restore a backup)",
+                applied.len(),
+                expected.len(),
+            ),
+        });
+    }
+
+    // One-time safety copy, WAL folded in first so the file is complete.
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&mut *conn)
+        .await?;
+    let backup = path.with_extension("db.pre-hermit");
+    if !backup.exists() {
+        std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
+            path: backup.display().to_string(),
+            source,
+        })?;
+    }
+
+    // Baseline the schema-shape migrations: recorded as applied, never run.
+    conn.ensure_migrations_table().await?;
+    for migration in MIGRATOR.iter() {
+        if migration.version > JELLYFIN_SHAPE_MIGRATION_HEAD {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+        )
+        .bind(migration.version)
+        .bind(&*migration.description)
+        .bind(&*migration.checksum)
+        .execute(&mut *conn)
+        .await?;
+    }
+    tracing::info!(
+        database = %path.display(),
+        backup = %backup.display(),
+        baselined_through = JELLYFIN_SHAPE_MIGRATION_HEAD,
+        "adopted an existing Jellyfin 10.11.8 database in place"
+    );
+    Ok(())
 }
 
 /// Snapshots the database file before migration `0007` first applies.
@@ -583,6 +786,91 @@ mod tests {
         assert_eq!(counts.get("Movie"), Some(&2));
         assert_eq!(counts.get("Episode"), Some(&1));
         assert_eq!(counts.get("PLACEHOLDER"), Some(&1));
+    }
+
+    /// Creates a file-backed database shaped exactly like a real Jellyfin
+    /// 10.11.8 one: the committed schema fixture plus the EF migration rows.
+    async fn seed_jellyfin_fixture(path: &std::path::Path, migrations: &[&str]) {
+        use sqlx::ConnectOptions;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("open fixture db");
+        sqlx::raw_sql(include_str!("../tests/data/jellyfin-10.11.8-schema.sql"))
+            .execute(&mut conn)
+            .await
+            .expect("apply fixture schema");
+        for id in migrations {
+            sqlx::query(
+                r#"INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion")
+                   VALUES (?1, '10.11.8.0')"#,
+            )
+            .bind(id)
+            .execute(&mut conn)
+            .await
+            .expect("insert EF migration row");
+        }
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn adopts_a_jellyfin_10_11_8_database_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+
+        // Shape migrations baselined, additive tail actually applied.
+        let versions: Vec<i64> =
+            sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
+                .fetch_all(db.pool())
+                .await
+                .expect("sqlx history");
+        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
+        let recorded = i64::try_from(versions.len()).expect("small count");
+        assert_eq!(recorded, head, "every migration recorded");
+        assert!(versions.contains(&JELLYFIN_SHAPE_MIGRATION_HEAD));
+
+        // Jellyfin's bookkeeping untouched; safety copy exists.
+        let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("ef rows");
+        assert_eq!(ef_rows, 68);
+        assert!(path.with_extension("db.pre-hermit").exists());
+
+        // Second open is a clean no-op (already adopted).
+        drop(db);
+        Database::connect_sized(&url, Some(2))
+            .await
+            .expect("re-open after adoption");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_wrong_generation_jellyfin_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // One migration short of the 10.11.8 set — e.g. an older 10.11.x or a
+        // partially upgraded database.
+        let short = &JELLYFIN_10_11_8_MIGRATIONS[..JELLYFIN_10_11_8_MIGRATIONS.len() - 1];
+        seed_jellyfin_fixture(&path, short).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("adoption must refuse");
+        assert!(
+            matches!(err, crate::DbError::UnsupportedJellyfinDatabase { .. }),
+            "unexpected error: {err}"
+        );
+        // Refusal leaves the database untouched: no sqlx history, no backup.
+        assert!(!path.with_extension("db.pre-hermit").exists());
     }
 
     #[tokio::test]

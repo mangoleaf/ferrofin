@@ -27,6 +27,14 @@ pub enum DbError {
         value: i32,
     },
 
+    /// An existing Jellyfin database could not be adopted (wrong schema
+    /// generation). The database is left untouched.
+    #[error("cannot adopt this Jellyfin database: {reason}")]
+    UnsupportedJellyfinDatabase {
+        /// Why adoption was refused, with the supported-version statement.
+        reason: String,
+    },
+
     /// The pre-migration database snapshot could not be written.
     #[error("failed to write database backup `{path}`: {source}")]
     Backup {

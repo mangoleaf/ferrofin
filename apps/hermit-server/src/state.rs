@@ -366,12 +366,24 @@ pub async fn build_app_state(
         Arc::new(HermitDisplayPreferencesManager::new(db.clone()));
     let activity: Arc<dyn hermit_traits::activity::ActivityManager> =
         Arc::new(HermitActivityManager::new(db.clone()));
+    // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
+    // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
+    // databases, grandfathered lowercase for pre-parity Hermit ones
+    // (`HermitMeta.item_id_derivation`, seeded by migration 0009).
+    let id_derivation = hermit_core::item_type_lookup::IdDerivation::from_meta(
+        db.meta_get("item_id_derivation")
+            .await
+            .context("failed to read the item-id derivation mode")?
+            .as_deref(),
+        Some(paths.program_data_path()),
+    );
     // The playlists media folder lives at `{data}/playlists` (C#
     // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
     let user_views: Arc<dyn hermit_traits::library::UserViewManager> = Arc::new(
         HermitUserViewManager::new(Arc::clone(&item_repository))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path),
+            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            .with_id_derivation(id_derivation.clone()),
     );
     let music: Arc<dyn hermit_traits::library::MusicManager> =
         Arc::new(HermitMusicManager::new(Arc::clone(&item_repository)));
@@ -402,7 +414,8 @@ pub async fn build_app_state(
     // (the roots of every library with realtime monitoring enabled).
     let virtual_folders_impl = Arc::new(
         hermit_core::HermitVirtualFolderManager::new(paths.default_user_views_path())
-            .with_item_store(Arc::clone(&item_persistence_service)),
+            .with_item_store(Arc::clone(&item_persistence_service))
+            .with_id_derivation(id_derivation.clone()),
     );
     let virtual_folders: Arc<dyn hermit_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -411,6 +424,7 @@ pub async fn build_app_state(
         Arc::clone(&file_system),
         Arc::clone(&item_persistence_service),
     )
+    .with_id_derivation(id_derivation)
     // Probe each media file during the scan (duration/size + per-stream codecs)
     // so the web client can pick direct play and the transcoder has stream info.
     .with_probe(

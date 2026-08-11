@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS "ActivityLogs"(
   "LogSeverity" INTEGER NOT NULL,
   "RowVersion" INTEGER NOT NULL
 );
-CREATE TABLE sqlite_sequence(name,seq);
 CREATE TABLE IF NOT EXISTS "AccessSchedules"(
   "Id" INTEGER NOT NULL CONSTRAINT "PK_AccessSchedules" PRIMARY KEY AUTOINCREMENT,
   "UserId" TEXT NOT NULL,
@@ -585,4 +584,3 @@ CREATE INDEX "IX_PeopleBaseItemMap_ItemId_SortOrder" ON "PeopleBaseItemMap"(
 CREATE INDEX "IX_PeopleBaseItemMap_PeopleId" ON "PeopleBaseItemMap"(
   "PeopleId"
 );
-CREATE TABLE sqlite_stat1(tbl,idx,stat);

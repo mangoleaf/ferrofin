@@ -204,6 +204,9 @@ pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
     file_system: Arc<dyn FileSystem>,
     persistence: Arc<dyn ItemPersistenceService>,
+    /// The per-database item-id derivation mode (see
+    /// [`item_type_lookup::IdDerivation`]).
+    id_derivation: item_type_lookup::IdDerivation,
     /// Optional ffprobe seam. When present, each leaf media file is probed during
     /// the scan so its duration/size and per-stream codec info are persisted —
     /// which is what lets the web client choose direct play (and the transcoder
@@ -277,6 +280,7 @@ impl LibraryScanner {
             virtual_folders,
             file_system,
             persistence,
+            id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             media_encoder: None,
             media_streams: None,
             tmdb: None,
@@ -293,6 +297,14 @@ impl LibraryScanner {
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
         }
+    }
+
+    /// Sets the per-database id-derivation mode. Called once by the
+    /// composition root (unit tests keep the legacy default).
+    #[must_use]
+    pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
+        self.id_derivation = mode;
+        self
     }
 
     /// Attaches the domain-event seam so scans publish `LibraryChanged` and
@@ -1751,6 +1763,7 @@ impl LibraryScanner {
     /// type-specific fields and pushes it with its ancestor closure). `None` when
     /// the id cannot be derived.
     fn base_item(
+        &self,
         kind: BaseItemKind,
         cf: Uuid,
         parent: Uuid,
@@ -1758,7 +1771,7 @@ impl LibraryScanner {
         path: &str,
         is_folder: bool,
     ) -> Option<(Uuid, BaseItemEntity)> {
-        let id = item_type_lookup::derive_item_id(kind, path)?;
+        let id = item_type_lookup::derive_item_id_with(&self.id_derivation, kind, path)?;
         let sort_name = create_sort_name(&name);
         let entity = BaseItemEntity {
             id: guid_to_db(id),
@@ -1808,7 +1821,7 @@ impl LibraryScanner {
                 folder_name(dir).unwrap_or(clean_name)
             };
             let Some((id, mut entity)) =
-                Self::base_item(BaseItemKind::Movie, cf, cf, name, &entry.path, false)
+                self.base_item(BaseItemKind::Movie, cf, cf, name, &entry.path, false)
             else {
                 continue;
             };
@@ -1834,7 +1847,7 @@ impl LibraryScanner {
             let name = info.name.unwrap_or_else(|| entry.name.clone());
             let series_name = name.clone();
             let Some((series_id, mut series)) =
-                Self::base_item(BaseItemKind::Series, cf, cf, name, &entry.path, true)
+                self.base_item(BaseItemKind::Series, cf, cf, name, &entry.path, true)
             else {
                 continue;
             };
@@ -1878,7 +1891,7 @@ impl LibraryScanner {
                 if season.season_number.is_some() || season.is_season_folder {
                     let num = season.season_number;
                     let name = num.map_or_else(|| entry.name.clone(), season_display_name);
-                    let Some((season_id, mut e)) = Self::base_item(
+                    let Some((season_id, mut e)) = self.base_item(
                         BaseItemKind::Season,
                         cf,
                         series_id,
@@ -1916,7 +1929,7 @@ impl LibraryScanner {
                 loose.push(entry.path);
             }
         }
-        Self::plan_loose_episodes(&loose, cf, series_id, series_name, series_dir, naming, out);
+        self.plan_loose_episodes(&loose, cf, series_id, series_name, series_dir, naming, out);
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths`.
@@ -1934,7 +1947,10 @@ impl LibraryScanner {
     /// filename-detected season number, emitting one `Season` per distinct number
     /// and each episode parented to it. A file with no detectable season number
     /// falls into a single "Season Unknown" grouping.
+    // The C# planner's parameter list, plus the scanner receiver.
+    #[allow(clippy::too_many_arguments)]
     fn plan_loose_episodes(
+        &self,
         paths: &[String],
         cf: Uuid,
         series_id: Uuid,
@@ -1966,7 +1982,7 @@ impl LibraryScanner {
             // path unset (it is a virtual grouping, not an on-disk folder).
             let synthetic = format!("{series_dir}/#virtual-season-{}", num.unwrap_or(-1));
             let Some((season_id, mut e)) =
-                Self::base_item(BaseItemKind::Season, cf, series_id, name, &synthetic, true)
+                self.base_item(BaseItemKind::Season, cf, series_id, name, &synthetic, true)
             else {
                 continue;
             };
@@ -1986,7 +2002,7 @@ impl LibraryScanner {
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
             let season_name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
-            Self::emit_episode(
+            self.emit_episode(
                 path,
                 cf,
                 series_id,
@@ -2026,7 +2042,7 @@ impl LibraryScanner {
                     out,
                 );
             } else if video_resolver::is_video_file(&entry.path, naming) {
-                Self::emit_episode(
+                self.emit_episode(
                     &entry.path,
                     cf,
                     series_id,
@@ -2045,6 +2061,7 @@ impl LibraryScanner {
     /// filename's episode/season numbers.
     #[allow(clippy::too_many_arguments)]
     fn emit_episode(
+        &self,
         path: &str,
         cf: Uuid,
         series_id: Uuid,
@@ -2059,7 +2076,7 @@ impl LibraryScanner {
             Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
             None => (series_id, vec![cf, series_id]),
         };
-        let Some((id, mut entity)) = Self::base_item(
+        let Some((id, mut entity)) = self.base_item(
             BaseItemKind::Episode,
             cf,
             parent,
@@ -2106,7 +2123,7 @@ impl LibraryScanner {
             .collect();
         if !audio.is_empty() {
             let album_name = file_stem(dir);
-            if let Some((album_id, album)) = Self::base_item(
+            if let Some((album_id, album)) = self.base_item(
                 BaseItemKind::MusicAlbum,
                 cf,
                 cf,
@@ -2120,7 +2137,7 @@ impl LibraryScanner {
                     ancestors: vec![cf],
                 });
                 for track in &audio {
-                    let Some((id, mut entity)) = Self::base_item(
+                    let Some((id, mut entity)) = self.base_item(
                         BaseItemKind::Audio,
                         cf,
                         album_id,

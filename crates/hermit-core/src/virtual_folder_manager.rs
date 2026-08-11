@@ -77,6 +77,9 @@ pub struct HermitVirtualFolderManager {
     /// library with a null `ItemId`) and that `/UserViews` returns. `None` in unit
     /// tests keeps the manager filesystem-only.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// The per-database item-id derivation mode (see
+    /// [`item_type_lookup::IdDerivation`]).
+    id_derivation: item_type_lookup::IdDerivation,
 }
 
 impl std::fmt::Debug for HermitVirtualFolderManager {
@@ -84,6 +87,7 @@ impl std::fmt::Debug for HermitVirtualFolderManager {
         f.debug_struct("HermitVirtualFolderManager")
             .field("root", &self.root)
             .field("has_item_store", &self.persistence.is_some())
+            .field("id_derivation", &self.id_derivation)
             .finish()
     }
 }
@@ -98,6 +102,7 @@ impl HermitVirtualFolderManager {
         Self {
             root: default_user_views_path.into(),
             persistence: None,
+            id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
         }
     }
 
@@ -109,11 +114,22 @@ impl HermitVirtualFolderManager {
         self
     }
 
+    /// Sets the per-database id-derivation mode. Called once by the
+    /// composition root (unit tests keep the legacy default).
+    #[must_use]
+    pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
+        self.id_derivation = mode;
+        self
+    }
+
     /// The deterministic `CollectionFolder` item id for a virtual-folder directory
     /// (`GetNewItemIdInternal` over the folder path) — both the created row's id
-    /// and the value projected onto [`VirtualFolderInfo::item_id`].
-    fn collection_folder_id(folder_path: &Path) -> Option<uuid::Uuid> {
-        item_type_lookup::derive_item_id(
+    /// and the value projected onto [`VirtualFolderInfo::item_id`]. Under the
+    /// Jellyfin derivation this reproduces the ids an adopted 10.11.8 database
+    /// already carries, so the self-healing upsert lands on the existing rows.
+    fn collection_folder_id(&self, folder_path: &Path) -> Option<uuid::Uuid> {
+        item_type_lookup::derive_item_id_with(
+            &self.id_derivation,
             BaseItemKind::CollectionFolder,
             &folder_path.to_string_lossy(),
         )
@@ -131,7 +147,7 @@ impl HermitVirtualFolderManager {
         name: &str,
     ) -> Result<(), ServiceError> {
         let (Some(persistence), Some(id)) =
-            (&self.persistence, Self::collection_folder_id(folder_path))
+            (&self.persistence, self.collection_folder_id(folder_path))
         else {
             return Ok(());
         };
@@ -402,7 +418,7 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
                 locations: Self::resolve_locations(&path).await?,
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
-                item_id: Self::collection_folder_id(&path).map(|g| g.to_string()),
+                item_id: self.collection_folder_id(&path).map(|g| g.to_string()),
                 // Jellyfin always reports a non-null refresh status; at rest it is
                 // "Idle" (it becomes "Queued"/"Active" only while a scan is running,
                 // which this manager does not track).
@@ -485,7 +501,7 @@ impl VirtualFolderManager for HermitVirtualFolderManager {
         // Delete the CollectionFolder row before the directory (its id derives from
         // the path). Child items are pruned by a later scan.
         if let (Some(persistence), Some(id)) =
-            (&self.persistence, Self::collection_folder_id(&folder_path))
+            (&self.persistence, self.collection_folder_id(&folder_path))
         {
             persistence.delete_items(std::slice::from_ref(&id)).await?;
         }

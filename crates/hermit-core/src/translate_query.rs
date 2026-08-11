@@ -42,6 +42,14 @@ use hermit_traits::options::InternalItemsQuery;
 /// excludes it (C# `PlaceholderId`).
 pub(crate) const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+/// The "unowned" predicate. C# treats `OwnerId = Guid.Empty` as "no owner": a
+/// real Jellyfin database stores the ZERO GUID on virtually every row
+/// (adopted-DB evidence), while Hermit's writer leaves the column NULL — every
+/// ownership predicate must accept both spellings of "unowned" or an adopted
+/// library filters to nothing.
+const NO_OWNER: &str =
+    r#"(bi."OwnerId" IS NULL OR bi."OwnerId" = '00000000-0000-0000-0000-000000000000')"#;
+
 /// HD/UHD resolution thresholds used by the `IsHD` / `Is4K` filters
 /// (C# `HDWidth` / `UHDWidth` / `UHDHeight`).
 const HD_WIDTH: i64 = 1200;
@@ -297,22 +305,24 @@ pub(crate) fn append_predicates<'a>(
     }
 
     if let Some(has) = filter.has_owner_id {
-        qb.push(if has {
-            r#" AND bi."OwnerId" IS NOT NULL"#
+        if has {
+            qb.push(" AND NOT ").push(NO_OWNER);
         } else {
-            r#" AND bi."OwnerId" IS NULL"#
-        });
+            qb.push(" AND ").push(NO_OWNER);
+        }
     } else if filter.owner_ids.is_empty()
         && filter.extra_types.is_empty()
         && !filter.include_owned_items
     {
         // Exclude alternate versions + owned non-extra items from general queries.
         if filter.is_resumable == Some(true) {
-            qb.push(r#" AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)"#);
+            qb.push(" AND (")
+                .push(NO_OWNER)
+                .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         } else {
-            qb.push(
-                r#" AND bi."PrimaryVersionId" IS NULL AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)"#,
-            );
+            qb.push(r#" AND bi."PrimaryVersionId" IS NULL AND ("#)
+                .push(NO_OWNER)
+                .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
         }
     }
     if !filter.owner_ids.is_empty() {

@@ -186,22 +186,82 @@ pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// Derives a scanned item's stable `Guid` from its kind + filesystem path — the
-/// port of Jellyfin's `LibraryManager.GetNewItemIdInternal`
-/// (`key = TypeFullName + path`, MD5 over the UTF-16LE bytes → `Guid`).
+/// How stable item ids are derived from kind + path — a **per-database** mode.
 ///
-/// The path is lowercased, matching Jellyfin's default
-/// `EnableCaseSensitiveItemIds = false`. Returns [`None`] for a kind with no
+/// Jellyfin 10.11.8 derives `MD5(TypeFullName + key)` over UTF-16LE where
+/// `key` keeps its case (`EnableCaseSensitiveItemIds` defaults to **true**)
+/// and paths under `ProgramDataPath` are rewritten relative (`strip prefix`,
+/// trim `/\`, `/`→`\`) for machine independence — verified byte-for-byte
+/// against a real 10.11.8 database. Early Hermit lowercased the path and
+/// skipped the rewrite; databases scanned that way keep their ids via
+/// [`IdDerivation::LegacyLowercase`] (stored in `HermitMeta`,
+/// `item_id_derivation`), while fresh and adopted databases use
+/// [`IdDerivation::Jellyfin`] so scans converge on Jellyfin's ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdDerivation {
+    /// Jellyfin 10.11.8 parity: case-sensitive, data-dir-relative rewrite.
+    Jellyfin {
+        /// The `ProgramDataPath` equivalent (Hermit's data dir), if known.
+        program_data_path: Option<String>,
+    },
+    /// Pre-parity Hermit behavior: lowercased path, no rewrite. Grandfathered
+    /// for databases that already carry ids derived this way.
+    LegacyLowercase,
+}
+
+impl IdDerivation {
+    /// The `HermitMeta.item_id_derivation` value naming this mode.
+    #[must_use]
+    pub fn meta_value(&self) -> &'static str {
+        match self {
+            Self::Jellyfin { .. } => "jellyfin-10.11.8",
+            Self::LegacyLowercase => "legacy-lowercase",
+        }
+    }
+
+    /// Resolves the mode from a stored `HermitMeta` value (`None`/unknown ⇒
+    /// Jellyfin parity, the correct default for fresh and adopted databases).
+    #[must_use]
+    pub fn from_meta(value: Option<&str>, program_data_path: Option<String>) -> Self {
+        match value {
+            Some("legacy-lowercase") => Self::LegacyLowercase,
+            _ => Self::Jellyfin { program_data_path },
+        }
+    }
+}
+
+/// Derives a scanned item's stable `Guid` from its kind + filesystem path
+/// under the given [`IdDerivation`] — the port of Jellyfin's
+/// `LibraryManager.GetNewItemIdInternal` (`key = TypeFullName + path`, MD5
+/// over the UTF-16LE bytes → `Guid`). Returns [`None`] for a kind with no
 /// stored type name.
-///
-/// ponytail: no `ProgramDataPath`-relative rewrite / backslash normalization
-/// (those matter only for cross-install id parity on Windows); add if we ever
-/// import a foreign Jellyfin database.
+#[must_use]
+pub fn derive_item_id_with(
+    mode: &IdDerivation,
+    kind: BaseItemKind,
+    path: &str,
+) -> Option<uuid::Uuid> {
+    let type_name = stored_type_name(kind)?;
+    let key = match mode {
+        IdDerivation::Jellyfin { program_data_path } => {
+            let rewritten = program_data_path
+                .as_deref()
+                .and_then(|data| path.strip_prefix(data))
+                .map(|rel| rel.trim_start_matches(['/', '\\']).replace('/', "\\"));
+            rewritten.unwrap_or_else(|| path.to_owned())
+        }
+        IdDerivation::LegacyLowercase => path.to_lowercase(),
+    };
+    Some(hermit_common::extensions::get_md5(&format!(
+        "{type_name}{key}"
+    )))
+}
+
+/// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for
+/// call sites that have not been handed a per-database mode.
 #[must_use]
 pub fn derive_item_id(kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
-    let type_name = stored_type_name(kind)?;
-    let key = format!("{type_name}{}", path.to_lowercase());
-    Some(hermit_common::extensions::get_md5(&key))
+    derive_item_id_with(&IdDerivation::LegacyLowercase, kind, path)
 }
 
 /// The inverse of [`stored_type_name`]: maps a stored `BaseItems.Type` name back
@@ -246,7 +306,9 @@ impl ItemTypeLookupTrait for ItemTypeLookup {
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemTypeLookup, stored_type_name};
+    use super::{
+        IdDerivation, ItemTypeLookup, derive_item_id, derive_item_id_with, stored_type_name,
+    };
     use hermit_model::data::BaseItemKind;
     use hermit_traits::persistence::ItemTypeLookup as _;
 
@@ -295,6 +357,70 @@ mod tests {
         assert_eq!(
             stored_type_name(BaseItemKind::TvChannel),
             stored_type_name(BaseItemKind::LiveTvChannel)
+        );
+    }
+
+    /// Oracle values captured from a real `jellyfin/jellyfin:10.11.8` database
+    /// (the drop-in spike): the derivation must reproduce them byte-for-byte.
+    #[test]
+    fn jellyfin_derivation_matches_a_real_database() {
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        // A scanned movie: case-sensitive path, no rewrite (outside /config).
+        assert_eq!(
+            derive_item_id_with(
+                &mode,
+                BaseItemKind::Movie,
+                "/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv",
+            ),
+            Some(uuid::Uuid::parse_str("D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E").expect("uuid")),
+        );
+        // A collection folder under the data dir: relative + backslash rewrite.
+        assert_eq!(
+            derive_item_id_with(
+                &mode,
+                BaseItemKind::CollectionFolder,
+                "/config/root/default/Movies",
+            ),
+            Some(uuid::Uuid::parse_str("F137A2DD-21BB-C1B9-9AA5-C0F6BF02A805").expect("uuid")),
+        );
+    }
+
+    #[test]
+    fn legacy_derivation_is_the_old_lowercase_form() {
+        // The grandfathered mode must keep producing pre-parity ids so
+        // existing Hermit libraries stay self-consistent.
+        let legacy = derive_item_id_with(
+            &IdDerivation::LegacyLowercase,
+            BaseItemKind::Movie,
+            "/Media/Film.mkv",
+        );
+        assert_eq!(
+            legacy,
+            derive_item_id(BaseItemKind::Movie, "/media/film.mkv")
+        );
+        let jellyfin = derive_item_id_with(
+            &IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            BaseItemKind::Movie,
+            "/Media/Film.mkv",
+        );
+        assert_ne!(legacy, jellyfin, "case must matter in parity mode");
+    }
+
+    #[test]
+    fn id_derivation_meta_round_trips() {
+        assert_eq!(
+            IdDerivation::from_meta(Some("legacy-lowercase"), None),
+            IdDerivation::LegacyLowercase
+        );
+        let parity = IdDerivation::from_meta(None, Some("/data".to_owned()));
+        assert_eq!(parity.meta_value(), "jellyfin-10.11.8");
+        assert_eq!(
+            IdDerivation::LegacyLowercase.meta_value(),
+            "legacy-lowercase"
         );
     }
 }
