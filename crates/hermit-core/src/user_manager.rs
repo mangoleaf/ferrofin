@@ -254,7 +254,6 @@ impl HermitUserManager {
         let id = Uuid::new_v4();
         let id_str = guid_to_db(id);
         let internal_id = self.next_internal_id().await?;
-        let normalized = name.to_uppercase();
 
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
@@ -263,16 +262,15 @@ impl HermitUserManager {
                 "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
                 "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
                 "HidePlayedInLatest", "CastReceiverId", "InternalId", "InvalidLoginAttemptCount",
-                "MaxActiveSessions", "MustUpdatePassword", "NormalizedUsername",
+                "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections",
                 "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, ?5, 1, 1, 1, 0, 0, 0, ?6)"#,
+               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, 1, 1, 1, 0, 0, 0, ?5)"#,
         )
         .bind(&id_str)
         .bind(DEFAULT_AUTH_PROVIDER_ID)
         .bind(internal_id)
-        .bind(&normalized)
         .bind(DEFAULT_PASSWORD_RESET_PROVIDER_ID)
         .bind(name)
         .execute(&mut *tx)
@@ -391,10 +389,13 @@ impl UserManager for HermitUserManager {
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        // 10.11.8 has no NormalizedUsername column; Jellyfin matches usernames
+        // OrdinalIgnoreCase in memory. NOCASE is SQLite's ASCII equivalent — a
+        // documented, bounded divergence for non-ASCII usernames.
         sqlx::query_as::<_, UserEntity>(
-            r#"SELECT * FROM "Users" WHERE "NormalizedUsername" = ?1 LIMIT 1"#,
+            r#"SELECT * FROM "Users" WHERE "Username" = ?1 COLLATE NOCASE LIMIT 1"#,
         )
-        .bind(name.to_uppercase())
+        .bind(name)
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)
@@ -413,11 +414,11 @@ impl UserManager for HermitUserManager {
             ));
         }
 
-        let normalized = new_name.to_uppercase();
         let clash: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "Users" WHERE "NormalizedUsername" = ?1 AND "Id" != ?2 LIMIT 1"#,
+            r#"SELECT "Id" FROM "Users"
+               WHERE "Username" = ?1 COLLATE NOCASE AND "Id" != ?2 LIMIT 1"#,
         )
-        .bind(&normalized)
+        .bind(new_name)
         .bind(guid_to_db(user_id))
         .fetch_optional(self.db.pool())
         .await
@@ -430,15 +431,12 @@ impl UserManager for HermitUserManager {
 
         // Ensure the user exists before updating (C# throws ResourceNotFound).
         self.require_user(user_id).await?;
-        sqlx::query(
-            r#"UPDATE "Users" SET "Username" = ?2, "NormalizedUsername" = ?3 WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(new_name)
-        .bind(&normalized)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        sqlx::query(r#"UPDATE "Users" SET "Username" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(user_id))
+            .bind(new_name)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -462,12 +460,12 @@ impl UserManager for HermitUserManager {
                 "LastActivityDate" = ?14, "LastLoginDate" = ?15,
                 "LoginAttemptsBeforeLockout" = ?16, "MaxActiveSessions" = ?17,
                 "MaxParentalRatingScore" = ?18, "MaxParentalRatingSubScore" = ?19,
-                "MustUpdatePassword" = ?20, "NormalizedUsername" = ?21,
-                "Password" = ?22, "PasswordResetProviderId" = ?23,
-                "PlayDefaultAudioTrack" = ?24, "RememberAudioSelections" = ?25,
-                "RememberSubtitleSelections" = ?26, "RemoteClientBitrateLimit" = ?27,
-                "SubtitleLanguagePreference" = ?28, "SubtitleMode" = ?29,
-                "SyncPlayAccess" = ?30, "Username" = ?31,
+                "MustUpdatePassword" = ?20,
+                "Password" = ?21, "PasswordResetProviderId" = ?22,
+                "PlayDefaultAudioTrack" = ?23, "RememberAudioSelections" = ?24,
+                "RememberSubtitleSelections" = ?25, "RemoteClientBitrateLimit" = ?26,
+                "SubtitleLanguagePreference" = ?27, "SubtitleMode" = ?28,
+                "SyncPlayAccess" = ?29, "Username" = ?30,
                 "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,
         )
@@ -491,7 +489,6 @@ impl UserManager for HermitUserManager {
         .bind(user.max_parental_rating_score)
         .bind(user.max_parental_rating_sub_score)
         .bind(user.must_update_password)
-        .bind(&user.normalized_username)
         .bind(&user.password)
         .bind(&user.password_reset_provider_id)
         .bind(user.play_default_audio_track)
@@ -513,9 +510,9 @@ impl UserManager for HermitUserManager {
         require_valid_username(name)?;
 
         let existing: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "Users" WHERE "NormalizedUsername" = ?1 LIMIT 1"#,
+            r#"SELECT "Id" FROM "Users" WHERE "Username" = ?1 COLLATE NOCASE LIMIT 1"#,
         )
-        .bind(name.to_uppercase())
+        .bind(name)
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -1422,7 +1419,6 @@ mod tests {
 
         let user = mgr.create_user("alice").await.expect("create");
         assert_eq!(user.username, "alice");
-        assert_eq!(user.normalized_username, "ALICE");
         assert_eq!(user.authentication_provider_id, DEFAULT_AUTH_PROVIDER_ID);
         // Jellyfin User defaults: Latest hides played, and the default Cast receiver id.
         assert!(user.hide_played_in_latest);

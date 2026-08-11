@@ -12,9 +12,9 @@
 //! [`LibraryManager`](hermit_traits::library::LibraryManager) so the same
 //! persistence seam backs everything.
 //!
-//! Playlist **ownership and access** are real: the `Playlists` table records the
+//! Playlist **ownership and access** are real: the `HermitPlaylists` table records the
 //! owner + open-access flag (C# `Playlist.OwnerUserId`/`OpenAccess`), the
-//! `PlaylistShares` table records per-user share permissions (`Playlist.Shares`),
+//! `HermitPlaylistShares` table records per-user share permissions (`Playlist.Shares`),
 //! and every read resolves the caller's [`PlaylistAccess`] — owner, `CanEdit`
 //! share, read-only share, or open-access — with invisible playlists reported as
 //! `NotFound` (the C# `GetPlaylistForUser` null). A playlist with no `Playlists`
@@ -164,7 +164,7 @@ impl CollectionManager for HermitCollectionManager {
     ) -> Result<(), ServiceError> {
         for item_id in item_ids {
             sqlx::query(
-                r#"DELETE FROM "LinkedChildren"
+                r#"DELETE FROM "HermitLinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(guid_to_db(collection_id))
@@ -247,8 +247,8 @@ impl HermitPlaylistManager {
     /// Resolves the caller's access to a playlist (C# `Playlist.IsVisible` plus
     /// the owner/`CanEdit` split the controller checks derive from it).
     ///
-    /// One LEFT-JOIN query: the base row proves existence, the `Playlists` meta
-    /// row carries owner/open-access, and the caller's own `PlaylistShares` row
+    /// One LEFT-JOIN query: the base row proves existence, the `HermitPlaylists` meta
+    /// row carries owner/open-access, and the caller's own `HermitPlaylistShares` row
     /// (if any) carries `CanEdit`. Missing **or invisible** → `NotFound`.
     async fn access(
         &self,
@@ -258,8 +258,8 @@ impl HermitPlaylistManager {
         let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
             r#"SELECT p."OwnerUserId", p."OpenAccess", s."CanEdit"
                FROM "BaseItems" bi
-               LEFT JOIN "Playlists" p ON p."PlaylistId" = bi."Id"
-               LEFT JOIN "PlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
+               LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = bi."Id"
+               LEFT JOIN "HermitPlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
                WHERE bi."Id" = ?1"#,
         )
         .bind(guid_to_db(playlist_id))
@@ -332,7 +332,7 @@ impl PlaylistManager for HermitPlaylistManager {
         // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
         // (API-key create) stores NULL — unowned, visible to all.
         sqlx::query(
-            r#"INSERT INTO "Playlists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+            r#"INSERT INTO "HermitPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, ?3)"#,
         )
         .bind(guid_to_db(id))
@@ -372,16 +372,18 @@ impl PlaylistManager for HermitPlaylistManager {
         }
         if let Some(public) = request.public {
             // A legacy playlist has no meta row; updating 0 rows is harmless.
-            sqlx::query(r#"UPDATE "Playlists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#)
-                .bind(guid_to_db(request.id))
-                .bind(i64::from(public))
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
+            sqlx::query(
+                r#"UPDATE "HermitPlaylists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#,
+            )
+            .bind(guid_to_db(request.id))
+            .bind(i64::from(public))
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
         }
         if let Some(users) = &request.users {
             // C# replaces `Shares` wholesale on update.
-            sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1"#)
+            sqlx::query(r#"DELETE FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1"#)
                 .bind(guid_to_db(request.id))
                 .execute(self.db.writer())
                 .await
@@ -412,13 +414,13 @@ impl PlaylistManager for HermitPlaylistManager {
         // open-access, owned by the caller, or shared with the caller.
         let rows = sqlx::query_as::<_, BaseItemEntity>(
             r#"SELECT bi.* FROM "BaseItems" bi
-               LEFT JOIN "Playlists" p ON p."PlaylistId" = bi."Id"
+               LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = bi."Id"
                WHERE bi."Type" = ?1 AND (
                    p."PlaylistId" IS NULL
                    OR p."OwnerUserId" IS NULL
                    OR p."OpenAccess" = 1
                    OR p."OwnerUserId" = ?2
-                   OR EXISTS (SELECT 1 FROM "PlaylistShares" s
+                   OR EXISTS (SELECT 1 FROM "HermitPlaylistShares" s
                               WHERE s."PlaylistId" = bi."Id" AND s."UserId" = ?2))
                ORDER BY bi."Name""#,
         )
@@ -458,7 +460,7 @@ impl PlaylistManager for HermitPlaylistManager {
     ) -> Result<(), ServiceError> {
         // Upsert the share row (POST is idempotent — re-sharing updates CanEdit).
         sqlx::query(
-            r#"INSERT INTO "PlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
+            r#"INSERT INTO "HermitPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
                ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
         )
         .bind(guid_to_db(request.id))
@@ -476,12 +478,14 @@ impl PlaylistManager for HermitPlaylistManager {
         user_id: Uuid,
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "PlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#)
-            .bind(guid_to_db(playlist_id))
-            .bind(guid_to_db(user_id))
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        sqlx::query(
+            r#"DELETE FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
+        )
+        .bind(guid_to_db(playlist_id))
+        .bind(guid_to_db(user_id))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -490,7 +494,7 @@ impl PlaylistManager for HermitPlaylistManager {
         playlist_id: Uuid,
     ) -> Result<Vec<PlaylistUserPermissions>, ServiceError> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT "UserId", "CanEdit" FROM "PlaylistShares"
+            r#"SELECT "UserId", "CanEdit" FROM "HermitPlaylistShares"
                WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
         )
         .bind(guid_to_db(playlist_id))
@@ -530,7 +534,7 @@ impl PlaylistManager for HermitPlaylistManager {
         let pid = guid_to_db(playlist_id);
         let added: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
         let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "LinkedChildren"
+            r#"SELECT "ChildId" FROM "HermitLinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(&pid)
@@ -568,7 +572,7 @@ impl PlaylistManager for HermitPlaylistManager {
                 continue;
             };
             sqlx::query(
-                r#"DELETE FROM "LinkedChildren"
+                r#"DELETE FROM "HermitLinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(&pid)
@@ -595,7 +599,7 @@ impl PlaylistManager for HermitPlaylistManager {
         // caller-formatted string — normalise to the stored canonical form.
         let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
         let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "LinkedChildren"
+            r#"SELECT "ChildId" FROM "HermitLinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(&pid)
@@ -623,7 +627,7 @@ impl PlaylistManager for HermitPlaylistManager {
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        // Ownership is recorded (the `Playlists` table), but the user-deletion
+        // Ownership is recorded (the `HermitPlaylists` table), but the user-deletion
         // cascade — delete owned playlists, transfer shared ones (C#
         // `RemovePlaylists`) — is still deferred; nothing is removed.
         Ok(())
@@ -640,7 +644,7 @@ async fn write_sort_order(
     let mut tx = pool.begin().await.map_err(db_err)?;
     for (ordinal, child) in order.iter().enumerate() {
         sqlx::query(
-            r#"UPDATE "LinkedChildren" SET "SortOrder" = ?1
+            r#"UPDATE "HermitLinkedChildren" SET "SortOrder" = ?1
                WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
         )
         .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
@@ -1234,7 +1238,7 @@ mod tests {
 
         let db = test_db().await;
         let mgr = playlist_manager(&db);
-        // A pre-ownership row: the BaseItems row exists with no `Playlists` meta.
+        // A pre-ownership row: the BaseItems row exists with no `HermitPlaylists` meta.
         let legacy = Uuid::new_v4();
         seed_item(&db, legacy, BaseItemKind::Playlist).await;
 

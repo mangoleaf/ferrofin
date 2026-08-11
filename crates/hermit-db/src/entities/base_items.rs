@@ -4,7 +4,7 @@
 //! Covered tables: `BaseItems`, `BaseItemImageInfos`, `BaseItemMetadataFields`,
 //! `BaseItemProviders`, `BaseItemTrailerTypes`, `Chapters`, `AncestorIds`,
 //! `ItemValues`, `ItemValuesMap`, `Peoples`, `PeopleBaseItemMap`,
-//! `LinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
+//! `HermitLinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
 //! `KeyframeData`.
 //!
 //! Each struct mirrors one table one-to-one: field names and order match the
@@ -119,8 +119,10 @@ pub struct BaseItemEntity {
     pub normalization_gain: Option<f64>,
     /// The official rating (`OfficialRating`), if any.
     pub official_rating: Option<String>,
-    /// The original language (`OriginalLanguage`), if any.
-    pub original_language: Option<String>,
+    /// Pipe-delimited lowercase hyphenated GUIDs of this item's extras
+    /// (`ExtraIds`) — 10.11.8's extras linkage (C# `string.Join('|', …)` over
+    /// `Guid.ToString()`), kept in sync with `OwnerId` on the extras.
+    pub extra_ids: Option<String>,
     /// The original title (`OriginalTitle`), if any.
     pub original_title: Option<String>,
     /// The overview text (`Overview`), if any.
@@ -464,8 +466,6 @@ pub struct MediaStreamInfoEntity {
     pub is_hearing_impaired: Option<bool>,
     /// Whether the video is interlaced (`IsInterlaced`), if known.
     pub is_interlaced: Option<bool>,
-    /// Whether this is the original stream (`IsOriginal`).
-    pub is_original: bool,
     /// The key frames, as stored (`KeyFrames`), if any.
     pub key_frames: Option<String>,
     /// The stream language (`Language`), if any.

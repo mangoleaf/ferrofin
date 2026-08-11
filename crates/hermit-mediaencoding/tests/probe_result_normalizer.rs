@@ -154,7 +154,6 @@ fn get_media_info_metadata_success() {
 
     let audio1 = &res.media_source.media_streams[1];
     assert_eq!(audio1.codec.as_deref(), Some("eac3"));
-    assert!(audio1.is_original);
     assert_eq!(
         audio1.audio_spatial_format(),
         AudioSpatialFormat::DolbyAtmos
@@ -162,7 +161,6 @@ fn get_media_info_metadata_success() {
 
     let audio2 = &res.media_source.media_streams[2];
     assert_eq!(audio2.codec.as_deref(), Some("dts"));
-    assert!(!audio2.is_original);
     assert_eq!(audio2.audio_spatial_format(), AudioSpatialFormat::Dtsx);
 
     assert!(res.chapters.is_empty());
@@ -206,7 +204,6 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s1.codec.as_deref(), Some("aac"));
     assert_eq!(s1.channels, Some(7));
     assert!(s1.is_default);
-    assert!(!s1.is_original);
     assert_eq!(s1.language.as_deref(), Some("eng"));
     assert_eq!(s1.title.as_deref(), Some("Surround 6.1"));
 

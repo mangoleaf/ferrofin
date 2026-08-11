@@ -1108,8 +1108,8 @@ mod tests {
             sqlx::query(
                 r#"INSERT INTO "MediaStreamInfos"
                    ("ItemId", "StreamIndex", "IsDefault", "IsExternal", "IsForced",
-                    "IsOriginal", "StreamType", "Language")
-                   VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)"#,
+                    "StreamType", "Language")
+                   VALUES (?1, ?2, 0, 0, 0, 0, ?3)"#,
             )
             .bind(hermit_db::store::guid_to_db(item))
             .bind(idx)

@@ -27,6 +27,15 @@ pub enum DbError {
         value: i32,
     },
 
+    /// The pre-migration database snapshot could not be written.
+    #[error("failed to write database backup `{path}`: {source}")]
+    Backup {
+        /// The destination the snapshot was being copied to.
+        path: String,
+        /// The underlying filesystem failure.
+        source: std::io::Error,
+    },
+
     /// A stored `Guid` column did not parse as a hyphenated UUID.
     #[error("invalid guid in column `{column}`: {source}")]
     InvalidGuid {

@@ -311,8 +311,6 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                 stream.localized_default = Some(self.localization.get_localized_string("Default"));
                 stream.localized_external =
                     Some(self.localization.get_localized_string("External"));
-                stream.localized_original =
-                    Some(self.localization.get_localized_string("Original"));
                 if let Some(lang) = stream.language.as_deref().filter(|l| !l.is_empty()) {
                     stream.localized_language =
                         Some(self.localization.get_language_display_name(lang));
@@ -534,7 +532,6 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
             stream.is_default = disposition.get("default").copied() == Some(1);
             stream.is_forced = disposition.get("forced").copied() == Some(1);
             stream.is_hearing_impaired = disposition.get("hearing_impaired").copied() == Some(1);
-            stream.is_original = disposition.get("original").copied() == Some(1);
         }
 
         normalize_stream_title(&mut stream);

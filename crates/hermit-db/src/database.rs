@@ -30,6 +30,10 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub struct Database {
     pool: SqlitePool,
     writer: SqlitePool,
+    /// The on-disk database file, when file-backed (`None` for in-memory).
+    /// Lets [`Database::run_migrations`] snapshot the file before a
+    /// table-rebuild migration.
+    file_path: Option<std::path::PathBuf>,
 }
 
 impl Database {
@@ -73,7 +77,25 @@ impl Database {
         let write_options = read_options
             .clone()
             .busy_timeout(std::time::Duration::from_secs(30));
-        Self::connect_with(read_options, write_options, pool_size).await
+        let file_path = url
+            .strip_prefix("sqlite://")
+            .or_else(|| url.strip_prefix("sqlite:"))
+            .filter(|p| !p.is_empty() && *p != ":memory:")
+            .map(std::path::PathBuf::from);
+        // Apply migrations on a dedicated throwaway connection BEFORE the
+        // pools open. A pooled connection that spans a table-rebuild migration
+        // (0007 rebuilds `Users`/`BaseItems`) keeps stale column metadata and
+        // mis-decodes `SELECT *` by position afterwards — seen live as
+        // `Password` decoding as INTEGER on the first post-upgrade boot. With
+        // the schema settled first, every pooled connection post-dates it.
+        if let Some(path) = &file_path {
+            use sqlx::ConnectOptions;
+            let mut conn = write_options.clone().connect().await?;
+            backup_before_rebuild(&mut conn, path).await?;
+            MIGRATOR.run(&mut conn).await?;
+            sqlx::Connection::close(conn).await?;
+        }
+        Self::connect_with(read_options, write_options, pool_size, file_path).await
     }
 
     /// Opens a pool against a fresh, private in-memory SQLite database.
@@ -94,7 +116,11 @@ impl Database {
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
         let writer = pool.clone();
-        Ok(Self { pool, writer })
+        Ok(Self {
+            pool,
+            writer,
+            file_path: None,
+        })
     }
 
     /// Builds the reader + writer pools from fully-formed connect options.
@@ -108,6 +134,7 @@ impl Database {
         read_options: SqliteConnectOptions,
         write_options: SqliteConnectOptions,
         pool_size: Option<u32>,
+        file_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let max_connections = pool_size.unwrap_or_else(default_pool_size);
         let pool = SqlitePoolOptions::new()
@@ -126,7 +153,11 @@ impl Database {
             writer_connections = 1,
             "database pools opened"
         );
-        Ok(Self { pool, writer })
+        Ok(Self {
+            pool,
+            writer,
+            file_path,
+        })
     }
 
     /// Applies all pending migrations (currently `0001_initial`) to the
@@ -137,6 +168,15 @@ impl Database {
     /// Returns [`DbError::Migrate`](crate::DbError::Migrate) if a migration
     /// fails to apply.
     pub async fn run_migrations(&self) -> Result<()> {
+        // File-backed databases were already migrated on a dedicated
+        // connection inside `connect_sized` (see the staleness note there);
+        // this pass is then a no-op. It remains the real migration path for
+        // the in-memory test database, whose single shared connection cannot
+        // go stale.
+        if let Some(path) = &self.file_path {
+            let mut conn = self.writer.acquire().await?;
+            backup_before_rebuild(&mut conn, path).await?;
+        }
         // One-time on the fresh/upgrade path: which schema head we brought the DB
         // to. `MIGRATOR.run` is idempotent, so this logs the target head, not
         // necessarily a newly-applied set.
@@ -163,7 +203,7 @@ impl Database {
     /// Counts library items grouped by their stored (C#) `Type` name.
     ///
     /// Feeds the `hermit_library_items{type=…}` metric gauge. Runs on the read
-    /// pool over the `IX_BaseItems_Type_CleanName` index; the placeholder seed
+    /// pool over the `HermitIX_BaseItems_Type_CleanName` index; the placeholder seed
     /// row (`Type = 'PLACEHOLDER'`) is included as-is (the metric wiring maps the
     /// stored name to its last `.`-segment, so callers filter as they see fit).
     ///
@@ -188,6 +228,49 @@ impl Database {
     pub fn writer(&self) -> &SqlitePool {
         &self.writer
     }
+}
+
+/// Snapshots the database file before migration `0007` first applies.
+///
+/// `0007` rebuilds `BaseItems`/`Users` (the 12-step SQLite table-rebuild
+/// dance) — the riskiest migration shipped so far — so an existing
+/// file-backed database gets copied aside once (`<db>.pre-0007`) before it
+/// runs. Fresh databases (no `_sqlx_migrations` yet) and databases already at
+/// or past 0007 are left alone.
+async fn backup_before_rebuild(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+) -> Result<()> {
+    let has_history: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if has_history.is_none() {
+        return Ok(()); // fresh database — nothing worth snapshotting
+    }
+    let applied_0007: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM \"_sqlx_migrations\" WHERE version = 7")
+            .fetch_optional(&mut *conn)
+            .await?;
+    if applied_0007.is_some() {
+        return Ok(());
+    }
+    // Fold the WAL into the main file so a plain file copy is a complete,
+    // consistent snapshot (startup: no other writers yet).
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&mut *conn)
+        .await?;
+    let backup = path.with_extension("db.pre-0007");
+    std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
+        path: backup.display().to_string(),
+        source,
+    })?;
+    tracing::info!(
+        backup = %backup.display(),
+        "database snapshot taken before the 0007 schema-rebuild migration"
+    );
+    Ok(())
 }
 
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
@@ -292,7 +375,7 @@ mod tests {
         "ItemValues",
         "ItemValuesMap",
         "KeyframeData",
-        "LinkedChildren",
+        "HermitLinkedChildren",
         "MediaSegments",
         "MediaStreamInfos",
         "PeopleBaseItemMap",

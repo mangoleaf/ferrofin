@@ -507,9 +507,6 @@ pub struct BaseItemDto {
     /// Gets or sets the current program.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_program: Option<Box<BaseItemDto>>,
-    /// Gets or sets the original language.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub original_language: Option<String>,
 }
 
 impl IHasProviderIds for BaseItemDto {

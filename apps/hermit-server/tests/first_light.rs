@@ -145,7 +145,7 @@ fn movie_item(id: Uuid, name: &str, path: &str) -> BaseItemEntity {
         lufs: None,
         normalization_gain: None,
         official_rating: None,
-        original_language: None,
+        extra_ids: None,
         original_title: None,
         overview: None,
         owner_id: None,

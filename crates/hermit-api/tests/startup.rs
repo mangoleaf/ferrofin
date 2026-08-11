@@ -63,7 +63,6 @@ fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
         max_parental_rating_score: None,
         max_parental_rating_sub_score: None,
         must_update_password: false,
-        normalized_username: username.to_ascii_uppercase(),
         password: password.map(ToOwned::to_owned),
         password_reset_provider_id: String::new(),
         play_default_audio_track: false,

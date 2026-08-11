@@ -2,7 +2,7 @@
 //!
 //! Configuration (tuner hosts, listing providers) is stored verbatim as JSON so
 //! reads round-trip the DTO. `refresh_guide` fetches each tuner host (M3U) and
-//! listing provider (XMLTV), rewrites `LiveTvChannels`/`LiveTvPrograms`, and
+//! listing provider (XMLTV), rewrites `HermitLiveTvChannels`/`HermitLiveTvPrograms`, and
 //! binds programmes to channels by the tuner `tvg-id` / XMLTV `channel id`.
 //! Channels and programmes are surfaced to clients as `BaseItemDto`s.
 
@@ -76,7 +76,7 @@ impl HermitLiveTvManager {
         let channels = parse_m3u(m3u_body);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
-        sqlx::query(r#"DELETE FROM "LiveTvChannels" WHERE "TunerHostId" = ?1"#)
+        sqlx::query(r#"DELETE FROM "HermitLiveTvChannels" WHERE "TunerHostId" = ?1"#)
             .bind(tuner_id)
             .execute(&mut *tx)
             .await
@@ -86,7 +86,7 @@ impl HermitLiveTvManager {
         // per channel.
         for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 9).enumerate() {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-                r#"INSERT INTO "LiveTvChannels"
+                r#"INSERT INTO "HermitLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex") "#,
             );
             let base = chunk_index * (SQLITE_BIND_LIMIT / 9);
@@ -116,7 +116,7 @@ impl HermitLiveTvManager {
         let guide = parse_xmltv(xmltv_body);
 
         // Map each tvg-id to the channel UUIDs that carry it.
-        let rows = sqlx::query(r#"SELECT "Id","TvgId" FROM "LiveTvChannels""#)
+        let rows = sqlx::query(r#"SELECT "Id","TvgId" FROM "HermitLiveTvChannels""#)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -159,7 +159,7 @@ impl HermitLiveTvManager {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for chunk in rows.chunks(SQLITE_BIND_LIMIT / 15) {
             let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-                r#"INSERT OR REPLACE INTO "LiveTvPrograms"
+                r#"INSERT OR REPLACE INTO "HermitLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
                     "IsRepeat","OfficialRating") "#,
@@ -220,7 +220,7 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn get_tuner_hosts(&self) -> Result<Vec<TunerHostInfo>, ServiceError> {
-        let rows = sqlx::query(r#"SELECT "Data" FROM "LiveTvTunerHosts" ORDER BY "Id""#)
+        let rows = sqlx::query(r#"SELECT "Data" FROM "HermitLiveTvTunerHosts" ORDER BY "Id""#)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -252,7 +252,7 @@ impl LiveTvManager for HermitLiveTvManager {
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize tuner host", e))?;
         sqlx::query(
-            r#"INSERT INTO "LiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
+            r#"INSERT INTO "HermitLiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
                ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
         )
         .bind(&id)
@@ -266,7 +266,7 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn delete_tuner_host(&self, id: &str) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "LiveTvTunerHosts" WHERE "Id" = ?1"#)
+        sqlx::query(r#"DELETE FROM "HermitLiveTvTunerHosts" WHERE "Id" = ?1"#)
             .bind(id)
             .execute(self.db.writer())
             .await
@@ -275,10 +275,11 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError> {
-        let rows = sqlx::query(r#"SELECT "Data" FROM "LiveTvListingProviders" ORDER BY "Id""#)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
+        let rows =
+            sqlx::query(r#"SELECT "Data" FROM "HermitLiveTvListingProviders" ORDER BY "Id""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
         Ok(rows
             .iter()
             .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
@@ -307,7 +308,7 @@ impl LiveTvManager for HermitLiveTvManager {
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize listing provider", e))?;
         sqlx::query(
-            r#"INSERT INTO "LiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
+            r#"INSERT INTO "HermitLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
                ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
         )
         .bind(&id)
@@ -321,7 +322,7 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "LiveTvListingProviders" WHERE "Id" = ?1"#)
+        sqlx::query(r#"DELETE FROM "HermitLiveTvListingProviders" WHERE "Id" = ?1"#)
             .bind(id)
             .execute(self.db.writer())
             .await
@@ -335,7 +336,7 @@ impl LiveTvManager for HermitLiveTvManager {
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         let rows = sqlx::query(
             r#"SELECT "Id","Name","Number","ChannelType","ImageUrl"
-               FROM "LiveTvChannels" ORDER BY "SortIndex", "Name""#,
+               FROM "HermitLiveTvChannels" ORDER BY "SortIndex", "Name""#,
         )
         .fetch_all(self.db.pool())
         .await
@@ -351,7 +352,7 @@ impl LiveTvManager for HermitLiveTvManager {
     ) -> Result<Option<BaseItemDto>, ServiceError> {
         let row = sqlx::query(
             r#"SELECT "Id","Name","Number","ChannelType","ImageUrl"
-               FROM "LiveTvChannels" WHERE "Id" = ?1"#,
+               FROM "HermitLiveTvChannels" WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(id))
         .fetch_optional(self.db.pool())
@@ -374,8 +375,8 @@ impl LiveTvManager for HermitLiveTvManager {
             r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
                       p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
                       p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
-               FROM "LiveTvPrograms" p
-               JOIN "LiveTvChannels" c ON c."Id" = p."ChannelId"
+               FROM "HermitLiveTvPrograms" p
+               JOIN "HermitLiveTvChannels" c ON c."Id" = p."ChannelId"
                ORDER BY p."StartDate""#,
         )
         .fetch_all(self.db.pool())
@@ -401,8 +402,8 @@ impl LiveTvManager for HermitLiveTvManager {
             r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
                       p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
                       p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
-               FROM "LiveTvPrograms" p
-               JOIN "LiveTvChannels" c ON c."Id" = p."ChannelId"
+               FROM "HermitLiveTvPrograms" p
+               JOIN "HermitLiveTvChannels" c ON c."Id" = p."ChannelId"
                WHERE p."Id" = ?1"#,
         )
         .bind(guid_to_db(id))
@@ -441,7 +442,7 @@ impl LiveTvManager for HermitLiveTvManager {
 
     async fn get_channel_stream_url(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         let url: Option<String> =
-            sqlx::query_scalar(r#"SELECT "StreamUrl" FROM "LiveTvChannels" WHERE "Id" = ?1"#)
+            sqlx::query_scalar(r#"SELECT "StreamUrl" FROM "HermitLiveTvChannels" WHERE "Id" = ?1"#)
                 .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
@@ -450,20 +451,23 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        self.json_list(r#"SELECT "Data" FROM "LiveTvTimers" ORDER BY "StartDate""#)
+        self.json_list(r#"SELECT "Data" FROM "HermitLiveTvTimers" ORDER BY "StartDate""#)
             .await
     }
 
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
-        self.json_get(r#"SELECT "Data" FROM "LiveTvTimers" WHERE "Id" = ?1"#, id)
-            .await
+        self.json_get(
+            r#"SELECT "Data" FROM "HermitLiveTvTimers" WHERE "Id" = ?1"#,
+            id,
+        )
+        .await
     }
 
     async fn create_timer(&self, mut timer: TimerInfoDto) -> Result<String, ServiceError> {
         let id = ensure_id(&mut timer.base.id);
         let data = to_json(&timer)?;
         sqlx::query(
-            r#"INSERT INTO "LiveTvTimers"
+            r#"INSERT INTO "HermitLiveTvTimers"
                ("Id","ChannelId","ProgramId","SeriesTimerId","Name","StartDate","EndDate","Status",
                 "PrePaddingSeconds","PostPaddingSeconds","Data")
                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
@@ -496,18 +500,18 @@ impl LiveTvManager for HermitLiveTvManager {
     }
 
     async fn cancel_timer(&self, id: &str) -> Result<(), ServiceError> {
-        self.delete_by_id(r#"DELETE FROM "LiveTvTimers" WHERE "Id" = ?1"#, id)
+        self.delete_by_id(r#"DELETE FROM "HermitLiveTvTimers" WHERE "Id" = ?1"#, id)
             .await
     }
 
     async fn get_series_timers(&self) -> Result<Vec<SeriesTimerInfoDto>, ServiceError> {
-        self.json_list(r#"SELECT "Data" FROM "LiveTvSeriesTimers" ORDER BY "Name""#)
+        self.json_list(r#"SELECT "Data" FROM "HermitLiveTvSeriesTimers" ORDER BY "Name""#)
             .await
     }
 
     async fn get_series_timer(&self, id: &str) -> Result<Option<SeriesTimerInfoDto>, ServiceError> {
         self.json_get(
-            r#"SELECT "Data" FROM "LiveTvSeriesTimers" WHERE "Id" = ?1"#,
+            r#"SELECT "Data" FROM "HermitLiveTvSeriesTimers" WHERE "Id" = ?1"#,
             id,
         )
         .await
@@ -520,7 +524,7 @@ impl LiveTvManager for HermitLiveTvManager {
         let id = ensure_id(&mut timer.base.id);
         let data = to_json(&timer)?;
         sqlx::query(
-            r#"INSERT INTO "LiveTvSeriesTimers" ("Id","ChannelId","ProgramId","Name","Data")
+            r#"INSERT INTO "HermitLiveTvSeriesTimers" ("Id","ChannelId","ProgramId","Name","Data")
                VALUES (?1,?2,?3,?4,?5)
                ON CONFLICT("Id") DO UPDATE SET
                  "ChannelId"=excluded."ChannelId","ProgramId"=excluded."ProgramId",
@@ -548,19 +552,22 @@ impl LiveTvManager for HermitLiveTvManager {
 
     async fn cancel_series_timer(&self, id: &str) -> Result<(), ServiceError> {
         // Drop the series timer and any timers it scheduled.
-        sqlx::query(r#"DELETE FROM "LiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
+        sqlx::query(r#"DELETE FROM "HermitLiveTvTimers" WHERE "SeriesTimerId" = ?1"#)
             .bind(id)
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        self.delete_by_id(r#"DELETE FROM "LiveTvSeriesTimers" WHERE "Id" = ?1"#, id)
-            .await
+        self.delete_by_id(
+            r#"DELETE FROM "HermitLiveTvSeriesTimers" WHERE "Id" = ?1"#,
+            id,
+        )
+        .await
     }
 
     async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         let rows = sqlx::query(
             r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
-               FROM "LiveTvRecordings" ORDER BY "StartDate" DESC"#,
+               FROM "HermitLiveTvRecordings" ORDER BY "StartDate" DESC"#,
         )
         .fetch_all(self.db.pool())
         .await
@@ -572,7 +579,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         let row = sqlx::query(
             r#"SELECT "Id","Name","Overview","StartDate","EndDate","Status","ChannelId"
-               FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
+               FROM "HermitLiveTvRecordings" WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(id))
         .fetch_optional(self.db.pool())
@@ -583,7 +590,7 @@ impl LiveTvManager for HermitLiveTvManager {
 
     async fn get_recording_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         let path: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
+            sqlx::query_scalar(r#"SELECT "Path" FROM "HermitLiveTvRecordings" WHERE "Id" = ?1"#)
                 .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
@@ -596,7 +603,7 @@ impl LiveTvManager for HermitLiveTvManager {
     async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
         // Remove the file first (best-effort), then the row.
         let path: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Path" FROM "LiveTvRecordings" WHERE "Id" = ?1"#)
+            sqlx::query_scalar(r#"SELECT "Path" FROM "HermitLiveTvRecordings" WHERE "Id" = ?1"#)
                 .bind(guid_to_db(id))
                 .fetch_optional(self.db.pool())
                 .await
@@ -606,7 +613,7 @@ impl LiveTvManager for HermitLiveTvManager {
             let _ = tokio::fs::remove_file(&path).await;
         }
         self.delete_by_id(
-            r#"DELETE FROM "LiveTvRecordings" WHERE "Id" = ?1"#,
+            r#"DELETE FROM "HermitLiveTvRecordings" WHERE "Id" = ?1"#,
             &guid_to_db(id),
         )
         .await

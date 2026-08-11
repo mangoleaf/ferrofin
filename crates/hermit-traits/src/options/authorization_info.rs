@@ -89,7 +89,6 @@ mod tests {
             max_parental_rating_score: None,
             max_parental_rating_sub_score: None,
             must_update_password: false,
-            normalized_username: String::new(),
             password: None,
             password_reset_provider_id: String::new(),
             play_default_audio_track: false,

@@ -1,6 +1,6 @@
 //! [`HermitPlaybackMetrics`] — the concrete [`PlaybackMetrics`] over SQLite.
 //!
-//! Writes one `PlaybackSessions` row per PlaybackInfo decision and updates it
+//! Writes one `HermitPlaybackSessions` row per PlaybackInfo decision and updates it
 //! on playstate start/stop. See `brain/PLAN_PERFORMANCE.md` Track A: the point
 //! is ranking `TranscodeReasons` by frequency and cost to find transcodes that
 //! a better profile decision would have avoided.
@@ -42,7 +42,7 @@ impl HermitPlaybackMetrics {
 impl PlaybackMetrics for HermitPlaybackMetrics {
     async fn record_decision(&self, decision: &PlaybackDecision) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"INSERT INTO "PlaybackSessions"
+            r#"INSERT INTO "HermitPlaybackSessions"
                ("PlaySessionId", "ItemId", "UserId", "Client", "DeviceId",
                 "PlayMethod", "TranscodeReasons", "Container", "VideoCodec",
                 "AudioCodec", "TargetContainer", "TargetVideoCodec",
@@ -74,7 +74,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
 
     async fn record_started(&self, play_session_id: &str) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"UPDATE "PlaybackSessions" SET "StartedAt" = COALESCE("StartedAt", ?2)
+            r#"UPDATE "HermitPlaybackSessions" SET "StartedAt" = COALESCE("StartedAt", ?2)
                WHERE "PlaySessionId" = ?1"#,
         )
         .bind(play_session_id)
@@ -93,7 +93,7 @@ impl PlaybackMetrics for HermitPlaybackMetrics {
         position_ticks: Option<i64>,
     ) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"UPDATE "PlaybackSessions"
+            r#"UPDATE "HermitPlaybackSessions"
                SET "StoppedAt" = ?2, "PositionTicks" = ?3
                WHERE "PlaySessionId" = ?1"#,
         )
@@ -149,7 +149,7 @@ mod tests {
         let row: (String, String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
             r#"SELECT "PlayMethod", "TranscodeReasons", "StartedAt", "StoppedAt",
                           "PositionTicks"
-                   FROM "PlaybackSessions" WHERE "PlaySessionId" = ?1"#,
+                   FROM "HermitPlaybackSessions" WHERE "PlaySessionId" = ?1"#,
         )
         .bind(&psid)
         .fetch_one(db.pool())

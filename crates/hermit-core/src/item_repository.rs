@@ -1106,12 +1106,14 @@ mod tests {
         assert_eq!(rows[0].id, guid_to_db(movie));
 
         // Removing the membership makes the browse empty again.
-        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#)
-            .bind(guid_to_db(boxset))
-            .bind(guid_to_db(movie))
-            .execute(db.writer())
-            .await
-            .expect("remove_from_collection");
+        sqlx::query(
+            r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
+        )
+        .bind(guid_to_db(boxset))
+        .bind(guid_to_db(movie))
+        .execute(db.writer())
+        .await
+        .expect("remove_from_collection");
         assert!(
             repository
                 .get_item_list(&query)
@@ -1599,8 +1601,8 @@ mod tests {
             sqlx::query(
                 r#"INSERT INTO "MediaStreamInfos"
                    ("ItemId", "StreamIndex", "IsDefault", "IsExternal", "IsForced",
-                    "IsOriginal", "StreamType", "Language")
-                   VALUES (?1, ?2, 0, 0, 0, 0, 0, ?3)"#,
+                    "StreamType", "Language")
+                   VALUES (?1, ?2, 0, 0, 0, 0, ?3)"#,
             )
             .bind(guid_to_db(item))
             .bind(idx)

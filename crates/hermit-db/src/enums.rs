@@ -269,7 +269,7 @@ db_enum! {
 }
 
 db_enum! {
-    /// The kind of a linked child (`LinkedChildren.ChildType`).
+    /// The kind of a linked child (`HermitLinkedChildren.ChildType`).
     pub enum LinkedChildType {
         /// Manually linked child.
         Manual = 0,

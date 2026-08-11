@@ -28,7 +28,7 @@ use hermit_traits::persistence::LinkedChildrenService;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 
-/// The stored `LinkedChildren.ChildType` discriminant for a manually linked
+/// The stored `HermitLinkedChildren.ChildType` discriminant for a manually linked
 /// child (C# `LinkedChildType.Manual`).
 const MANUAL_CHILD_TYPE: i32 = 0;
 
@@ -61,7 +61,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         child_type: Option<i32>,
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut sql =
-            String::from(r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#);
+            String::from(r#"SELECT "ChildId" FROM "HermitLinkedChildren" WHERE "ParentId" = ?1"#);
         if child_type.is_some() {
             sql.push_str(r#" AND "ChildType" = ?2"#);
         }
@@ -137,7 +137,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
 
         let ids: Vec<String> = if let Some(type_name) = parent_type_name {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT lc."ParentId" FROM "LinkedChildren" lc
+                r#"SELECT DISTINCT lc."ParentId" FROM "HermitLinkedChildren" lc
                    JOIN "BaseItems" bi ON bi."Id" = lc."ParentId"
                    WHERE lc."ChildId" = ?1 AND lc."ChildType" = ?2 AND bi."Type" = ?3"#,
             )
@@ -149,7 +149,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
             .map_err(db_err)?
         } else {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
+                r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren"
                    WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
             )
             .bind(guid_to_db(child_id))
@@ -169,7 +169,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
-            r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"
+            r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -186,9 +186,9 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         // Delete edges whose parent already links the target (would collide on the
         // (ParentId, ChildId) primary key), then retarget the rest.
         sqlx::query(
-            r#"DELETE FROM "LinkedChildren"
+            r#"DELETE FROM "HermitLinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2
-                 AND "ParentId" IN (SELECT "ParentId" FROM "LinkedChildren"
+                 AND "ParentId" IN (SELECT "ParentId" FROM "HermitLinkedChildren"
                      WHERE "ChildId" = ?3 AND "ChildType" = ?2)"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -199,7 +199,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         .map_err(db_err)?;
 
         sqlx::query(
-            r#"UPDATE "LinkedChildren" SET "ChildId" = ?1
+            r#"UPDATE "HermitLinkedChildren" SET "ChildId" = ?1
                WHERE "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
         .bind(guid_to_db(to_child_id))
@@ -228,10 +228,10 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         // order is insertion order and reordering (`move_item`) has stable
         // ordinals to rewrite. An existing edge keeps its position.
         sqlx::query(
-            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, ?3,
                    (SELECT COALESCE(MAX("SortOrder"), -1) + 1
-                    FROM "LinkedChildren" WHERE "ParentId" = ?1))
+                    FROM "HermitLinkedChildren" WHERE "ParentId" = ?1))
                ON CONFLICT("ParentId", "ChildId") DO UPDATE SET "ChildType" = excluded."ChildType""#,
         )
         .bind(guid_to_db(parent_id))

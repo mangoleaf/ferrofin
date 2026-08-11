@@ -65,12 +65,12 @@ mod tests {
                 "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
                 "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
                 "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
-                "MaxActiveSessions", "MustUpdatePassword", "NormalizedUsername",
+                "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections", "RowVersion",
                 "SubtitleMode", "SyncPlayAccess", "Username"
             ) VALUES (
-                ?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 42, 0, 5, 0, 'ADA',
+                ?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 42, 0, 5, 0,
                 'reset', 1, 1, 1, 7, 1, 2, 'ada'
             )"#,
         )
@@ -628,7 +628,7 @@ mod tests {
         insert_base_item(&db, child_id).await;
 
         sqlx::query(
-            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType",
+            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType",
                 "SortOrder") VALUES (?1, ?2, 1, 5)"#,
         )
         .bind(guid_to_db(item_id))
@@ -648,9 +648,9 @@ mod tests {
 
         sqlx::query(
             r#"INSERT INTO "MediaStreamInfos" ("ItemId", "StreamIndex", "Codec",
-                "IsDefault", "IsExternal", "IsForced", "IsOriginal", "StreamType",
+                "IsDefault", "IsExternal", "IsForced", "StreamType",
                 "Width", "Height", "IsAvc", "AverageFrameRate", "Level")
-                VALUES (?1, 0, 'h264', 1, 0, 0, 1, 1, 1920, 1080, 1, 23.976, 4.1)"#,
+                VALUES (?1, 0, 'h264', 1, 0, 0, 1, 1920, 1080, 1, 23.976, 4.1)"#,
         )
         .bind(guid_to_db(item_id))
         .execute(db.writer())
@@ -667,7 +667,7 @@ mod tests {
         .expect("insert keyframe data");
 
         let link: LinkedChildEntity =
-            sqlx::query_as(r#"SELECT * FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            sqlx::query_as(r#"SELECT * FROM "HermitLinkedChildren" WHERE "ParentId" = ?1"#)
                 .bind(guid_to_db(item_id))
                 .fetch_one(db.pool())
                 .await

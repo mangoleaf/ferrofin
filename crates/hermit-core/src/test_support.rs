@@ -193,11 +193,11 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
             "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
             "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
             "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
-            "MaxActiveSessions", "MustUpdatePassword", "NormalizedUsername",
+            "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 'U', '', 1, 1, 1, 0, 0, 0, 'u')"#,
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'u')"#,
     )
     .bind(guid_to_db(id))
     .execute(db.writer())

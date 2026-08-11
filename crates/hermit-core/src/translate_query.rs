@@ -16,7 +16,7 @@
 //! ordering table are ported directly. The deep recursive-descendant `EXISTS`
 //! folders (per-series played/resumable aggregation, box-set collapsing,
 //! chapter/subtitle folder roll-ups) are **not** expanded here — they need the
-//! `AncestorIds`/`LinkedChildren` recursive CTEs that belong with the library
+//! `AncestorIds`/`HermitLinkedChildren` recursive CTEs that belong with the library
 //! manager (a later unit). Those filters are skipped rather than mistranslated;
 //! see the inline `// deferred:` notes. Everything ported matches the C#
 //! predicate exactly for non-folder items.
@@ -196,7 +196,7 @@ pub(crate) fn append_predicates<'a>(
             .push_bind(guid_to_db(filter.parent_id))
             .push(")");
         } else if filter.physical_children_only {
-            // Physical children only (delete-cascade): NEVER merge LinkedChildren, so
+            // Physical children only (delete-cascade): NEVER merge HermitLinkedChildren, so
             // deleting a box-set/playlist removes only the container, not the items it
             // references (linked children are references, not owned children).
             qb.push(r#" AND bi."ParentId" = "#)
@@ -204,13 +204,13 @@ pub(crate) fn append_predicates<'a>(
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
-            // box-sets and playlists carry `LinkedChildren` rows, so the `IN`
+            // box-sets and playlists carry `HermitLinkedChildren` rows, so the `IN`
             // subquery is empty for ordinary folders and this stays identical to
             // a plain `ParentId` equality for non-collection browses.
             qb.push(r#" AND (bi."ParentId" = "#)
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(
-                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = "#,
+                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "HermitLinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(r#" AND "ChildType" = 0))"#);

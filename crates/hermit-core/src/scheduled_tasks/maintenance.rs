@@ -1289,7 +1289,7 @@ mod tests {
 
         for (parent, child) in [(boxset, live), (boxset, dead), (playlist, dead)] {
             sqlx::query(
-                r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+                r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                    VALUES (?1, ?2, 0, 0)"#,
             )
             .bind(guid_to_db(parent))

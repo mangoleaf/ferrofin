@@ -65,8 +65,6 @@ pub struct UserEntity {
     pub max_parental_rating_sub_score: Option<i64>,
     /// Whether the user must change their password (`MustUpdatePassword`).
     pub must_update_password: bool,
-    /// The normalized (uppercased) username (`NormalizedUsername`, unique).
-    pub normalized_username: String,
     /// The hashed password (`Password`), if one is set.
     pub password: Option<String>,
     /// The password-reset provider id (`PasswordResetProviderId`).

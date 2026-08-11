@@ -959,7 +959,6 @@ impl HermitDtoService {
         dto.name = item.name.clone();
         dto.original_title = item.original_title.clone();
         dto.official_rating = item.official_rating.clone();
-        dto.original_language = item.original_language.clone();
         // `Container` has no dedicated column on the row at this layer (it lives in
         // the serialized `Data` blob, not yet parsed here), so it stays `None`.
 

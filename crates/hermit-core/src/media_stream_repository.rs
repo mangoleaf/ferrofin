@@ -56,7 +56,7 @@ const STREAM_COLUMNS: &str = r#"
     "DvBlSignalCompatibilityId", "DvLevel", "DvProfile", "DvVersionMajor",
     "DvVersionMinor", "ElPresentFlag", "Hdr10PlusPresentFlag", "Height",
     "IsAnamorphic", "IsAvc", "IsDefault", "IsExternal", "IsForced",
-    "IsHearingImpaired", "IsInterlaced", "IsOriginal", "KeyFrames", "Language",
+    "IsHearingImpaired", "IsInterlaced", "KeyFrames", "Language",
     "Level", "NalLengthSize", "Path", "PixelFormat", "Profile", "RealFrameRate",
     "RefFrames", "Rotation", "RpuPresentFlag", "SampleRate", "StreamType",
     "TimeBase", "Title", "Width"
@@ -147,7 +147,7 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
             r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?)"#
+                ?, ?, ?)"#
         );
 
         let item_id_db = guid_to_db(item_id);
@@ -190,7 +190,6 @@ impl MediaStreamRepository for HermitMediaStreamRepository {
                 .bind(s.is_forced)
                 .bind(s.is_hearing_impaired)
                 .bind(s.is_interlaced)
-                .bind(s.is_original)
                 .bind(&s.key_frames)
                 .bind(&s.language)
                 .bind(s.level)
@@ -259,7 +258,6 @@ mod tests {
             is_forced: false,
             is_hearing_impaired: None,
             is_interlaced: None,
-            is_original: false,
             key_frames: None,
             language: language.map(str::to_owned),
             level: None,

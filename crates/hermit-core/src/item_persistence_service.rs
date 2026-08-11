@@ -126,7 +126,7 @@ impl HermitItemPersistenceService {
             .bind(&item.name)
             .bind(item.normalization_gain)
             .bind(&item.official_rating)
-            .bind(&item.original_language)
+            .bind(&item.extra_ids)
             .bind(&item.original_title)
             .bind(&item.overview)
             .bind(&item.owner_id)
@@ -178,11 +178,13 @@ impl ItemPersistenceService for HermitItemPersistenceService {
             // (it references the item as both parent and child), so clear those
             // links first — otherwise deleting a playlist/collection, or an item
             // that belongs to one, trips a FOREIGN KEY constraint (787).
-            sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
-                .bind(&id_db)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
+            sqlx::query(
+                r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
+            )
+            .bind(&id_db)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
             sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(&id_db)
                 .execute(self.db.writer())
@@ -483,7 +485,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "InheritedParentalRatingSubValue", "InheritedParentalRatingValue", "IsFolder",
     "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
     "LUFS", "MediaType", "Name", "NormalizationGain", "OfficialRating",
-    "OriginalLanguage", "OriginalTitle", "Overview", "OwnerId", "ParentId",
+    "ExtraIds", "OriginalTitle", "Overview", "OwnerId", "ParentId",
     "ParentIndexNumber", "Path", "PreferredMetadataCountryCode",
     "PreferredMetadataLanguage", "PremiereDate", "PresentationUniqueKey",
     "PrimaryVersionId", "ProductionLocations", "ProductionYear", "RunTimeTicks",
@@ -516,7 +518,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "IsVirtualItem" = excluded."IsVirtualItem", "LUFS" = excluded."LUFS",
     "MediaType" = excluded."MediaType", "Name" = excluded."Name",
     "NormalizationGain" = excluded."NormalizationGain", "OfficialRating" = excluded."OfficialRating",
-    "OriginalLanguage" = excluded."OriginalLanguage", "OriginalTitle" = excluded."OriginalTitle",
+    "ExtraIds" = excluded."ExtraIds", "OriginalTitle" = excluded."OriginalTitle",
     "Overview" = excluded."Overview", "OwnerId" = excluded."OwnerId",
     "ParentId" = excluded."ParentId", "ParentIndexNumber" = excluded."ParentIndexNumber",
     "Path" = excluded."Path",
@@ -588,7 +590,7 @@ mod tests {
         assert!(!svc.item_exists(playlist).await.expect("exists p"));
         assert!(svc.item_exists(member_b).await.expect("member_b survives"));
 
-        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "LinkedChildren""#)
+        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "HermitLinkedChildren""#)
             .fetch_one(db.pool())
             .await
             .expect("count");

@@ -83,8 +83,6 @@ pub(crate) struct UpdateItemRequest {
     forced_sort_name: Option<String>,
     #[serde(default)]
     original_title: Option<String>,
-    #[serde(default)]
-    original_language: Option<String>,
     #[serde(default, deserialize_with = "opt_f32")]
     critic_rating: Option<f32>,
     #[serde(default, deserialize_with = "opt_f32")]
@@ -192,7 +190,6 @@ fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
     item.original_title = non_empty(request.original_title.as_deref());
-    item.original_language = non_empty(request.original_language.as_deref());
     item.critic_rating = request.critic_rating.map(f64::from);
     item.community_rating = request.community_rating.map(f64::from);
     item.index_number = request.index_number.map(i64::from);

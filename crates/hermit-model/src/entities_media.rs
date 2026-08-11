@@ -462,9 +462,6 @@ pub struct MediaStream {
     /// The localized language name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_language: Option<String>,
-    /// The localized "original" label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub localized_original: Option<String>,
     /// The NAL length size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nal_length_size: Option<String>,
@@ -500,14 +497,6 @@ pub struct MediaStream {
     pub is_forced: bool,
     /// A value indicating whether this instance is for the hearing impaired.
     pub is_hearing_impaired: bool,
-    /// A value indicating whether this instance is original.
-    ///
-    /// Not serialized: `IsOriginal` is absent from the 10.11.8 `MediaStream`
-    /// schema (`additionalProperties: false`), so emitting it would make the
-    /// response schema-invalid. The field is retained for the DB round-trip
-    /// (`stream_to_dto`/`stream_dto_to_entity`); it just never hits the wire.
-    #[serde(skip)]
-    pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<i32>,
@@ -710,10 +699,6 @@ impl MediaStream {
 
                 if self.is_external {
                     attributes.push(localized_or(self.localized_external.as_ref(), "External"));
-                }
-
-                if self.is_original {
-                    attributes.push(localized_or(self.localized_original.as_ref(), "Original"));
                 }
 
                 Some(join_with_title(self.title.as_deref(), &attributes, " - "))
@@ -1556,11 +1541,9 @@ mod tests {
         s.channels = Some(6);
         s.is_default = true;
         s.is_external = true;
-        s.is_original = true;
         let title = s.display_title().unwrap();
         assert!(title.contains("Default"));
         assert!(title.contains("External"));
-        assert!(title.contains("Original"));
         assert!(title.contains("6 ch"));
 
         // A special language code (und) is not shown; LC profile expands the codec.
@@ -1853,17 +1836,5 @@ mod tests {
         assert!(json.get("LibraryOptions").is_some());
         let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, info);
-    }
-
-    #[test]
-    fn media_stream_never_serializes_is_original() {
-        // `IsOriginal` is absent from the 10.11.8 schema (additionalProperties:
-        // false), so it must never appear on the wire even when set to true.
-        let stream = MediaStream {
-            is_original: true,
-            ..MediaStream::default()
-        };
-        let json = serde_json::to_value(&stream).unwrap();
-        assert!(json.get("IsOriginal").is_none());
     }
 }

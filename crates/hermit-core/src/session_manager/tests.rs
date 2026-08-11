@@ -183,14 +183,13 @@ async fn seed_named_user(db: &Database, id: Uuid, username: &str) -> UserEntity 
             "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
             "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
             "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
-            "MaxActiveSessions", "MustUpdatePassword", "NormalizedUsername",
+            "MaxActiveSessions", "MustUpdatePassword",
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ?2, '', 1, 1, 1, 0, 0, 0, ?3)"#,
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2)"#,
     )
     .bind(guid_to_db(id))
-    .bind(username.to_uppercase())
     .bind(username)
     .execute(db.writer())
     .await

@@ -260,7 +260,7 @@ pub struct InternalItemsQuery {
     /// The parent item id (`Guid.Empty` ⇒ nil means unset).
     pub parent_id: Uuid,
     /// When set, a non-recursive `parent_id` browse matches only PHYSICAL children
-    /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `LinkedChildren`
+    /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `HermitLinkedChildren`
     /// members. Used by delete-cascade so removing a box-set/playlist never deletes
     /// the referenced items (linked children are references, not owned children).
     pub physical_children_only: bool,
