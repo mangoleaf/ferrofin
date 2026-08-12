@@ -577,6 +577,7 @@ fn quota_cores(quota: i64, period: i64) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row as _;
 
     /// The 31 head tables the migration must create.
     const EXPECTED_TABLES: &[&str] = &[
@@ -616,6 +617,7 @@ mod tests {
     /// Seeds a file database at the pre-0007 schema (migrations 0001–0006
     /// applied and recorded) so a test can drive the real 0007+ upgrade path
     /// over pre-existing rows. Returns the `sqlite://` url.
+    #[allow(clippy::too_many_lines)] // linear seed of many representative rows
     async fn seed_pre_0007_database(path: &std::path::Path) -> String {
         use sqlx::ConnectOptions;
         // Foreign keys ON here so the seeded child rows are genuinely
@@ -704,6 +706,55 @@ mod tests {
         .execute(&mut conn)
         .await
         .expect("seed userdata");
+        // A second item as the primary version, linked from `item` via a
+        // LOWERCASE PrimaryVersionId — the alternate-version link that the
+        // migration must uppercase (read case-sensitively).
+        let primary = "00000000-0000-0000-0000-0000000000bb";
+        sqlx::query(
+            r#"INSERT INTO "BaseItems" ("Id","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+               "IsRepeat","IsSeries","IsVirtualItem","Type")
+               VALUES (?1,0,0,0,1,0,0,0,'MediaBrowser.Controller.Entities.Movies.Movie')"#,
+        )
+        .bind(primary)
+        .execute(&mut conn)
+        .await
+        .expect("seed primary item");
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(primary)
+            .bind(item)
+            .execute(&mut conn)
+            .await
+            .expect("link alternate version");
+        // A Live TV tuner + channel + programme with LOWERCASE GUIDs — the
+        // join key (`Channels.Id = Programs.ChannelId`) and by-id lookups the
+        // migration must uppercase or Live TV goes blank after upgrade.
+        let tuner = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let channel = "11111111-2222-3333-4444-555555555555";
+        sqlx::query(
+            r#"INSERT INTO "LiveTvTunerHosts" ("Id","Url","Type","Data")
+               VALUES (?1,'http://x','m3u','{}')"#,
+        )
+        .bind(tuner)
+        .execute(&mut conn)
+        .await
+        .expect("seed tuner");
+        sqlx::query(
+            r#"INSERT INTO "LiveTvChannels" ("Id","TunerHostId","Name","StreamUrl")
+               VALUES (?1,?2,'Ch','http://s')"#,
+        )
+        .bind(channel)
+        .bind(tuner)
+        .execute(&mut conn)
+        .await
+        .expect("seed channel");
+        sqlx::query(
+            r#"INSERT INTO "LiveTvPrograms" ("Id","ChannelId","StartDate","Title")
+               VALUES ('66666666-7777-8888-9999-aaaaaaaaaaaa',?1,'2026-01-01 00:00:00','Show')"#,
+        )
+        .bind(channel)
+        .execute(&mut conn)
+        .await
+        .expect("seed programme");
         sqlx::Connection::close(conn).await.expect("close");
         format!("sqlite://{}", path.display())
     }
@@ -735,7 +786,7 @@ mod tests {
             ("Permissions", 1),
             ("Preferences", 1),
             ("Users", 1),
-            ("BaseItems", 2), // seeded movie + the placeholder root row
+            ("BaseItems", 3), // seeded movie + its primary version + placeholder
             ("UserData", 1),
         ] {
             let n: i64 = sqlx::query_scalar(&format!(r#"SELECT COUNT(*) FROM "{table}""#))
@@ -753,6 +804,106 @@ mod tests {
         .await
         .expect("admin perm");
         assert_eq!(admin, 1, "the IsAdministrator permission must survive");
+    }
+
+    /// Invariant guard for the GUID-casing bug class: after upgrading a
+    /// populated database, NO column may still hold a lowercase hyphenated
+    /// GUID. The seed plants lowercase GUIDs in the columns the migration is
+    /// responsible for (user/item ids, `PrimaryVersionId`, Live TV
+    /// channel/programme ids); this test scans EVERY TEXT column of EVERY
+    /// table so a future column added without a matching UPPER also trips it.
+    ///
+    /// N-format keys (`PresentationUniqueKey`, `CustomDataKey`,
+    /// `ActivityLogs.ItemId`) are lowercase BY DESIGN but carry no hyphens, so
+    /// the hyphenated-GUID pattern never matches them.
+    #[tokio::test]
+    async fn upgrading_a_populated_database_leaves_no_lowercase_guid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hermit.db");
+        let url = seed_pre_0007_database(&path).await;
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+
+        // A lowercase hyphenated GUID: 8-4-4-4-12 hex with a lowercase a–f.
+        let is_lower_guid = |v: &str| {
+            v.len() == 36
+                && v.as_bytes()[8] == b'-'
+                && v.as_bytes()[13] == b'-'
+                && v.as_bytes()[18] == b'-'
+                && v.as_bytes()[23] == b'-'
+                && v.chars().any(|c| c.is_ascii_lowercase())
+                && v.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        };
+
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '\\_%' ESCAPE '\\'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("tables");
+
+        // `UserData.CustomDataKey` is lowercase-hyphenated BY DESIGN: real
+        // Jellyfin stores the UserData key as the lowercase item id even though
+        // `ItemId` is uppercase (verified against a real 10.11.8 database).
+        let allowed_lowercase: &[(&str, &str)] = &[("UserData", "CustomDataKey")];
+
+        let mut offenders = Vec::new();
+        for t in &tables {
+            let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info(\"{t}\")"))
+                .fetch_all(db.pool())
+                .await
+                .expect("cols")
+                .into_iter()
+                .filter(|r| r.get::<String, _>("type").eq_ignore_ascii_case("TEXT"))
+                .map(|r| r.get::<String, _>("name"))
+                .collect();
+            for c in cols {
+                if allowed_lowercase.contains(&(t.as_str(), c.as_str())) {
+                    continue;
+                }
+                let vals: Vec<String> = sqlx::query_scalar(&format!(
+                    "SELECT \"{c}\" FROM \"{t}\" WHERE \"{c}\" IS NOT NULL"
+                ))
+                .fetch_all(db.pool())
+                .await
+                .unwrap_or_default();
+                if vals.iter().any(|v| is_lower_guid(v)) {
+                    offenders.push(format!("{t}.{c}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "columns still holding lowercase hyphenated GUIDs after upgrade \
+             (add them to 0007's UPPER block): {offenders:?}"
+        );
+
+        // And the specific links resolve: the alternate version is uppercase.
+        let pv: Option<String> = sqlx::query_scalar(
+            r#"SELECT "PrimaryVersionId" FROM "BaseItems" WHERE "PrimaryVersionId" IS NOT NULL LIMIT 1"#,
+        )
+        .fetch_optional(db.pool())
+        .await
+        .expect("pv");
+        assert_eq!(
+            pv.as_deref(),
+            Some("00000000-0000-0000-0000-0000000000BB"),
+            "PrimaryVersionId must be uppercased"
+        );
+        // The Live TV channel↔programme join key matches (both uppercase).
+        let joined: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "HermitLiveTvPrograms" p
+               JOIN "HermitLiveTvChannels" c ON c."Id" = p."ChannelId""#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("join");
+        assert_eq!(
+            joined, 1,
+            "Live TV programme must still join to its channel"
+        );
     }
 
     #[test]

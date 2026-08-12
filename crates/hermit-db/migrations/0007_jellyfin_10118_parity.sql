@@ -366,6 +366,35 @@ UPDATE "HermitPlaylists" SET "PlaylistId" = UPPER("PlaylistId") WHERE "PlaylistI
 UPDATE "HermitPlaylists" SET "OwnerUserId" = UPPER("OwnerUserId") WHERE "OwnerUserId" IS NOT NULL AND length("OwnerUserId") = 36 AND substr("OwnerUserId", 9, 1) = '-';
 UPDATE "HermitPlaylistShares" SET "PlaylistId" = UPPER("PlaylistId") WHERE "PlaylistId" IS NOT NULL AND length("PlaylistId") = 36 AND substr("PlaylistId", 9, 1) = '-';
 UPDATE "HermitPlaylistShares" SET "UserId" = UPPER("UserId") WHERE "UserId" IS NOT NULL AND length("UserId") = 36 AND substr("UserId", 9, 1) = '-';
+-- BaseItems.PrimaryVersionId: the alternate-version link, read case-sensitively
+-- via guid_to_db (item_repository get_items_by_primary_version). Missing this
+-- silently unlinks every alternate version on upgrade.
+UPDATE "BaseItems" SET "PrimaryVersionId" = UPPER("PrimaryVersionId") WHERE "PrimaryVersionId" IS NOT NULL AND length("PrimaryVersionId") = 36 AND substr("PrimaryVersionId", 9, 1) = '-';
+-- Live TV + playback sessions (Hermit-invented): hermit-livetv/playback_metrics
+-- read these uppercase (guid_to_db). EVERY GUID column is converted — both
+-- sides of each FK (TunerHostId↔TunerHosts.Id, ChannelId↔Channels.Id) so the
+-- post-migration foreign_key_check stays clean, plus the soft references
+-- (ProgramId/TimerId/SeriesTimerId) so timers/recordings keep resolving. The
+-- shape guard leaves non-GUID ids (TvgId, PlaySessionId, DeviceId) untouched.
+UPDATE "HermitLiveTvTunerHosts" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvChannels" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvChannels" SET "TunerHostId" = UPPER("TunerHostId") WHERE "TunerHostId" IS NOT NULL AND length("TunerHostId") = 36 AND substr("TunerHostId", 9, 1) = '-';
+UPDATE "HermitLiveTvListingProviders" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvPrograms" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvPrograms" SET "ChannelId" = UPPER("ChannelId") WHERE "ChannelId" IS NOT NULL AND length("ChannelId") = 36 AND substr("ChannelId", 9, 1) = '-';
+UPDATE "HermitLiveTvRecordings" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvRecordings" SET "ChannelId" = UPPER("ChannelId") WHERE "ChannelId" IS NOT NULL AND length("ChannelId") = 36 AND substr("ChannelId", 9, 1) = '-';
+UPDATE "HermitLiveTvRecordings" SET "TimerId" = UPPER("TimerId") WHERE "TimerId" IS NOT NULL AND length("TimerId") = 36 AND substr("TimerId", 9, 1) = '-';
+UPDATE "HermitLiveTvRecordings" SET "SeriesTimerId" = UPPER("SeriesTimerId") WHERE "SeriesTimerId" IS NOT NULL AND length("SeriesTimerId") = 36 AND substr("SeriesTimerId", 9, 1) = '-';
+UPDATE "HermitLiveTvTimers" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvTimers" SET "ChannelId" = UPPER("ChannelId") WHERE "ChannelId" IS NOT NULL AND length("ChannelId") = 36 AND substr("ChannelId", 9, 1) = '-';
+UPDATE "HermitLiveTvTimers" SET "ProgramId" = UPPER("ProgramId") WHERE "ProgramId" IS NOT NULL AND length("ProgramId") = 36 AND substr("ProgramId", 9, 1) = '-';
+UPDATE "HermitLiveTvTimers" SET "SeriesTimerId" = UPPER("SeriesTimerId") WHERE "SeriesTimerId" IS NOT NULL AND length("SeriesTimerId") = 36 AND substr("SeriesTimerId", 9, 1) = '-';
+UPDATE "HermitLiveTvSeriesTimers" SET "Id" = UPPER("Id") WHERE "Id" IS NOT NULL AND length("Id") = 36 AND substr("Id", 9, 1) = '-';
+UPDATE "HermitLiveTvSeriesTimers" SET "ChannelId" = UPPER("ChannelId") WHERE "ChannelId" IS NOT NULL AND length("ChannelId") = 36 AND substr("ChannelId", 9, 1) = '-';
+UPDATE "HermitLiveTvSeriesTimers" SET "ProgramId" = UPPER("ProgramId") WHERE "ProgramId" IS NOT NULL AND length("ProgramId") = 36 AND substr("ProgramId", 9, 1) = '-';
+UPDATE "HermitPlaybackSessions" SET "ItemId" = UPPER("ItemId") WHERE "ItemId" IS NOT NULL AND length("ItemId") = 36 AND substr("ItemId", 9, 1) = '-';
+UPDATE "HermitPlaybackSessions" SET "UserId" = UPPER("UserId") WHERE "UserId" IS NOT NULL AND length("UserId") = 36 AND substr("UserId", 9, 1) = '-';
 
 -- ── Datetimes: RFC3339 ('T' + offset, written by sqlx before 0007) becomes ──
 -- ── Jellyfin's 'YYYY-MM-DD HH:MM:SS.SSS' (UTC, no offset). New writes carry ──
