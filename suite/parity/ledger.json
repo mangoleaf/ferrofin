@@ -22,7 +22,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: weighted similarity scorer not ported (same as Items/{id}/Similar).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Artists",
@@ -58,7 +58,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: an artist instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid artist).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Artists/{itemId}/InstantMix",
@@ -82,7 +82,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Artists/{name}",
@@ -94,7 +94,7 @@
       "note": "H=404 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: by-name artist lookup needs a music library; the parity fixture is movies+TV only, so there is no artist corpus to diff (H=404 vs J=200).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Artists/{name}/Images/{imageType}/{imageIndex}",
@@ -130,7 +130,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/Lyrics",
@@ -142,7 +142,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Audio/{itemId}/Lyrics",
@@ -154,7 +154,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/RemoteSearch/Lyrics",
@@ -166,7 +166,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
@@ -178,7 +178,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.aac",
@@ -190,7 +190,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3",
@@ -202,7 +202,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -214,7 +214,7 @@
       "note": "unresolved path param: playlistId,segmentId",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/main.m3u8",
@@ -226,7 +226,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/master.m3u8",
@@ -238,7 +238,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Audio/{itemId}/master.m3u8",
@@ -250,7 +250,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/stream",
@@ -262,7 +262,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream",
@@ -274,7 +274,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/stream.{container}",
@@ -286,7 +286,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Audio/{itemId}/stream.{container}",
@@ -298,7 +298,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Audio/{itemId}/universal",
@@ -310,7 +310,7 @@
       "note": "H=200 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Audio/{itemId}/universal",
@@ -322,7 +322,7 @@
       "note": "H=200 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Auth/Keys",
@@ -406,7 +406,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: writes a backup archive to the host filesystem; heavy and instance-specific, no cross-server-stable effect to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Backup/Manifest",
@@ -418,7 +418,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: reads a backup archive's manifest from the host filesystem; no archive exists and the path is instance-specific (both servers 400).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Backup/Restore",
@@ -430,7 +430,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Branding/Configuration",
@@ -550,7 +550,7 @@
       "note": "unresolved path param: channelId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Channels/{channelId}/Items",
@@ -562,7 +562,7 @@
       "note": "unresolved path param: channelId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /ClientLog/Document",
@@ -681,8 +681,8 @@
       "schema_valid": null,
       "note": "unresolved path param: displayPreferencesId",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) \u2014 the by-client resolution Jellyfin uses.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /DisplayPreferences/{displayPreferencesId}",
@@ -718,7 +718,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: lists the server host's filesystem, which differs per container instance.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Environment/Drives",
@@ -730,7 +730,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: per-host filesystem drives.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Environment/NetworkShares",
@@ -754,7 +754,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Environment/ValidatePath",
@@ -778,7 +778,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Episode/{Id}/Timestamps",
@@ -790,7 +790,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Episode/{id}/IntroSkipperSegments",
@@ -802,7 +802,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /FallbackFont/Fonts",
@@ -838,7 +838,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Genres",
@@ -849,8 +849,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Genres/{genreName}",
@@ -861,8 +861,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre\u2192200 BaseItemDto (both servers), absent\u2192Hermit 404 vs Jellyfin auto-created 200. Shape verified.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}",
@@ -874,7 +874,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}",
@@ -886,7 +886,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -898,7 +898,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}",
@@ -910,7 +910,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /GetUtcTime",
@@ -934,7 +934,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /IntroSkipper/SupportBundle",
@@ -946,7 +946,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Intros/AnalyzerActions/UpdateSeason",
@@ -958,7 +958,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Intros/AnalyzerActions/{SeasonId}",
@@ -970,7 +970,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Intros/EraseTimestamps",
@@ -982,7 +982,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Intros/RebuildDatabase",
@@ -994,7 +994,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Intros/ScanSeason/{SeriesId}/{SeasonId}",
@@ -1006,7 +1006,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Intros/ScanStatus",
@@ -1018,7 +1018,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1030,7 +1030,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Intros/Show/{SeriesId}/{SeasonId}",
@@ -1042,7 +1042,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Items",
@@ -1126,7 +1126,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/Book",
@@ -1138,7 +1138,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/BoxSet",
@@ -1150,7 +1150,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/Movie",
@@ -1162,7 +1162,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicAlbum",
@@ -1174,7 +1174,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicArtist",
@@ -1186,7 +1186,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/MusicVideo",
@@ -1198,7 +1198,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/Person",
@@ -1210,7 +1210,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/Series",
@@ -1222,7 +1222,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/RemoteSearch/Trailer",
@@ -1234,7 +1234,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/Root",
@@ -1246,7 +1246,7 @@
       "note": "H=404 J=200",
       "deep_verified": null,
       "classification": "deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope \u2014 see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/Suggestions",
@@ -1258,7 +1258,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Items/{itemId}",
@@ -1282,7 +1282,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/{itemId}",
@@ -1294,7 +1294,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/Ancestors",
@@ -1306,7 +1306,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/{itemId}/ContentType",
@@ -1342,7 +1342,7 @@
       "note": "H=200 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/ExternalIdInfos",
@@ -1354,7 +1354,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/File",
@@ -1366,7 +1366,7 @@
       "note": "H=200 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/Images",
@@ -1558,7 +1558,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: Countries/ParentalRatings/ContentTypeOptions now match; the only residual is ExternalIdInfos, which is empty because remote-id providers (TMDB/etc.) are feature-gated off.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/PlaybackInfo",
@@ -1570,7 +1570,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/{itemId}/PlaybackInfo",
@@ -1606,7 +1606,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: remote image providers feature-gated off.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Items/{itemId}/RemoteImages/Download",
@@ -1618,7 +1618,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages/Providers",
@@ -1630,7 +1630,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: remote image providers feature-gated off.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteSearch/Subtitles/{language}",
@@ -1654,7 +1654,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/Similar",
@@ -1666,7 +1666,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Items/{itemId}/SpecialFeatures",
@@ -1726,7 +1726,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Libraries/AvailableOptions",
@@ -1737,8 +1737,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Library/Media/Updated",
@@ -1750,7 +1750,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Library/MediaFolders",
@@ -1762,7 +1762,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Library/Movies/Added",
@@ -1774,7 +1774,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Library/Movies/Updated",
@@ -1786,7 +1786,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Library/PhysicalPaths",
@@ -1798,7 +1798,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Library/Refresh",
@@ -1822,7 +1822,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Library/Series/Updated",
@@ -1834,7 +1834,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Library/VirtualFolders",
@@ -1942,7 +1942,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveStreams/Open",
@@ -1954,7 +1954,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/ChannelMappingOptions",
@@ -1966,7 +1966,7 @@
       "note": "H=200 J=500",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveTv/ChannelMappings",
@@ -1978,7 +1978,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Channels",
@@ -2002,7 +2002,7 @@
       "note": "unresolved path param: channelId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/GuideInfo",
@@ -2014,7 +2014,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: now-relative guide window (now .. now+7d) matches Jellyfin's behavior, but the exact StartDate/EndDate timestamps can't match across two independently-clocked servers.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Info",
@@ -2038,7 +2038,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveTv/ListingProviders",
@@ -2050,7 +2050,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/Default",
@@ -2074,7 +2074,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/SchedulesDirect/Countries",
@@ -2086,7 +2086,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/LiveRecordings/{recordingId}/stream",
@@ -2098,7 +2098,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
@@ -2110,7 +2110,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Programs",
@@ -2134,7 +2134,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Programs/Recommended",
@@ -2158,7 +2158,7 @@
       "note": "unresolved path param: programId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Recordings",
@@ -2206,7 +2206,7 @@
       "note": "unresolved path param: groupId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Recordings/Series",
@@ -2230,7 +2230,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Recordings/{recordingId}",
@@ -2242,7 +2242,7 @@
       "note": "unresolved path param: recordingId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/SeriesTimers",
@@ -2266,7 +2266,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /LiveTv/SeriesTimers/{timerId}",
@@ -2278,7 +2278,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/SeriesTimers/{timerId}",
@@ -2290,7 +2290,7 @@
       "note": "unresolved path param: timerId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveTv/SeriesTimers/{timerId}",
@@ -2302,7 +2302,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Timers",
@@ -2326,7 +2326,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Timers/Defaults",
@@ -2337,8 +2337,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/\u2026), 200 + schema conformant.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /LiveTv/Timers/{timerId}",
@@ -2350,7 +2350,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Timers/{timerId}",
@@ -2362,7 +2362,7 @@
       "note": "unresolved path param: timerId",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveTv/Timers/{timerId}",
@@ -2374,7 +2374,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /LiveTv/TunerHosts",
@@ -2386,7 +2386,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /LiveTv/TunerHosts",
@@ -2398,7 +2398,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/TunerHosts/Types",
@@ -2410,7 +2410,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /LiveTv/Tuners/Discover",
@@ -2446,7 +2446,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Localization/Countries",
@@ -2518,7 +2518,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /MediaSegmentsApi/{itemId}",
@@ -2530,7 +2530,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /MediaSegmentsApi/{segmentId}",
@@ -2542,7 +2542,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /MergeVersions/MergeEpisodes",
@@ -2554,7 +2554,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /MergeVersions/MergeMovies",
@@ -2566,7 +2566,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /MergeVersions/SplitEpisodes",
@@ -2578,7 +2578,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /MergeVersions/SplitMovies",
@@ -2590,7 +2590,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Movies/Recommendations",
@@ -2602,7 +2602,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Movies/{itemId}/Similar",
@@ -2614,7 +2614,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /MusicGenres",
@@ -2625,8 +2625,8 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres).",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /MusicGenres/InstantMix",
@@ -2638,7 +2638,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /MusicGenres/{genreName}",
@@ -2650,7 +2650,7 @@
       "note": "H=404 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /MusicGenres/{name}/Images/{imageType}",
@@ -2722,7 +2722,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: no external plugin package repository (compiled-in extensions).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Packages/Installed/{name}",
@@ -2734,7 +2734,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Packages/Installing/{packageId}",
@@ -2746,7 +2746,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Packages/{name}",
@@ -2758,7 +2758,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Persons",
@@ -2781,8 +2781,8 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person\u2192200 BaseItemDto, absent\u2192404 (both servers 404 in the harness run). Shape verified.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Persons/{name}/Images/{imageType}",
@@ -2842,7 +2842,7 @@
       "note": "H=200 J=200",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /PlayingItems/{itemId}",
@@ -2902,7 +2902,7 @@
       "note": "H=200 J=404",
       "deep_verified": null,
       "classification": "expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Playlists/{playlistId}",
@@ -2998,7 +2998,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": false,
       "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side \u2014 not a defect.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Users/{userId}",
@@ -3034,7 +3034,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Plugins/{pluginId}",
@@ -3046,7 +3046,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Plugins/{pluginId}/Configuration",
@@ -3058,7 +3058,7 @@
       "note": "unresolved path param: pluginId",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Configuration",
@@ -3070,7 +3070,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Plugins/{pluginId}/Manifest",
@@ -3082,7 +3082,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /Plugins/{pluginId}/{version}",
@@ -3094,7 +3094,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Disable",
@@ -3106,7 +3106,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Plugins/{pluginId}/{version}/Enable",
@@ -3118,7 +3118,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Plugins/{pluginId}/{version}/Image",
@@ -3130,7 +3130,7 @@
       "note": "unresolved path param: pluginId,version",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Providers/Lyrics/{lyricId}",
@@ -3142,7 +3142,7 @@
       "note": "unresolved path param: lyricId",
       "deep_verified": null,
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Providers/Subtitles/Subtitles/{subtitleId}",
@@ -3154,7 +3154,7 @@
       "note": "unresolved path param: subtitleId",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /QuickConnect/Authorize",
@@ -3214,7 +3214,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Repositories",
@@ -3226,7 +3226,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /ScheduledTasks",
@@ -3238,7 +3238,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: LastExecutionResult depends on whether/when a task last ran.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /ScheduledTasks/Running/{taskId}",
@@ -3298,7 +3298,7 @@
       "note": "H=400 J=400",
       "deep_verified": false,
       "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Sessions",
@@ -3550,7 +3550,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Shows/{seriesId}/Episodes",
@@ -3586,7 +3586,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SkipButtonCss/UpdateSkipDuration",
@@ -3598,7 +3598,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Songs/{itemId}/InstantMix",
@@ -3622,7 +3622,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: first-run setup-wizard endpoint; the provisioned server has already completed setup, so there is no wizard state to advance or diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Startup/Configuration",
@@ -3646,7 +3646,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Startup/FirstUser",
@@ -3670,7 +3670,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Startup/User",
@@ -3694,7 +3694,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Studios",
@@ -3717,8 +3717,8 @@
       "schema_valid": null,
       "note": "H=404 J=200",
       "deep_verified": false,
-      "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "166c7b3 2026-08-08"
+      "classification": "accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect \u2192 J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 \u2014 a GET with no filesystem write. Verified live 2026-08-11: existing\u2192200, absent\u2192404.",
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Studios/{name}/Images/{imageType}",
@@ -3778,7 +3778,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Join",
@@ -3790,7 +3790,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Leave",
@@ -3802,7 +3802,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /SyncPlay/List",
@@ -3826,7 +3826,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/New",
@@ -3838,7 +3838,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/NextItem",
@@ -3850,7 +3850,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Pause",
@@ -3862,7 +3862,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Ping",
@@ -3874,7 +3874,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/PreviousItem",
@@ -3886,7 +3886,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Queue",
@@ -3898,7 +3898,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Ready",
@@ -3910,7 +3910,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/RemoveFromPlaylist",
@@ -3922,7 +3922,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Seek",
@@ -3934,7 +3934,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/SetIgnoreWait",
@@ -3946,7 +3946,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/SetNewQueue",
@@ -3958,7 +3958,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/SetPlaylistItem",
@@ -3970,7 +3970,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/SetRepeatMode",
@@ -3982,7 +3982,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/SetShuffleMode",
@@ -3994,7 +3994,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Stop",
@@ -4006,7 +4006,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /SyncPlay/Unpause",
@@ -4018,7 +4018,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /SyncPlay/{id}",
@@ -4030,7 +4030,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /System/ActivityLog/Entries",
@@ -4042,7 +4042,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: activity-log entries differ per instance/run.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /System/Configuration",
@@ -4054,7 +4054,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds \u2014 setup state, not a bug.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /System/Configuration",
@@ -4162,7 +4162,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: per-host disk paths and free/used space.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /System/Logs",
@@ -4174,7 +4174,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: log-file set differs per instance/run.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /System/Logs/Log",
@@ -4186,7 +4186,7 @@
       "note": "H=400 J=400",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /System/Ping",
@@ -4198,7 +4198,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /System/Ping",
@@ -4222,7 +4222,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /System/Shutdown",
@@ -4234,7 +4234,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Tmdb/ClientConfiguration",
@@ -4258,7 +4258,7 @@
       "note": "H=200 J=500",
       "deep_verified": null,
       "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Trailers/{itemId}/Similar",
@@ -4270,7 +4270,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "deferred: weighted similarity scorer not ported.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "DELETE /UserFavoriteItems/{itemId}",
@@ -4438,7 +4438,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /UserViews/GroupingOptions",
@@ -4522,7 +4522,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "POST /Users/ForgotPassword/Pin",
@@ -4534,7 +4534,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Users/Me",
@@ -4690,7 +4690,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8",
@@ -4702,7 +4702,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg",
@@ -4714,7 +4714,7 @@
       "note": "H=400 J=404",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8",
@@ -4726,7 +4726,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}",
@@ -4738,7 +4738,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}",
@@ -4750,7 +4750,7 @@
       "note": "unresolved path param: playlistId,segmentId",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/live.m3u8",
@@ -4762,7 +4762,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/main.m3u8",
@@ -4774,7 +4774,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/master.m3u8",
@@ -4786,7 +4786,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Videos/{itemId}/master.m3u8",
@@ -4798,7 +4798,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/stream",
@@ -4810,7 +4810,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream",
@@ -4822,7 +4822,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/stream.{container}",
@@ -4834,7 +4834,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "HEAD /Videos/{itemId}/stream.{container}",
@@ -4846,7 +4846,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8",
@@ -4858,7 +4858,7 @@
       "note": "streaming: not status-classifiable",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}",
@@ -4870,7 +4870,7 @@
       "note": "H=404 J=500",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}",
@@ -4882,7 +4882,7 @@
       "note": "H=404 J=500",
       "deep_verified": null,
       "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}",
@@ -4894,7 +4894,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Years",
@@ -4906,7 +4906,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /Years/{year}",
@@ -4918,7 +4918,7 @@
       "note": "H=404 J=200",
       "deep_verified": null,
       "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200).",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /web/ConfigurationPage",
@@ -4930,7 +4930,7 @@
       "note": "H=404 J=404",
       "deep_verified": null,
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
       "operation": "GET /web/ConfigurationPages",
@@ -4942,7 +4942,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "expected-extension: plugin configuration pages come from external plugins Hermit doesn't host.",
-      "last_verified": "af3dda1 2026-08-01"
+      "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     }
   ]
 }

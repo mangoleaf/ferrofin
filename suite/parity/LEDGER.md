@@ -248,7 +248,7 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `POST /Backup/Restore` — not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run.
 - ⚠️ `GET /Channels/{channelId}/Features` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `GET /Channels/{channelId}/Items` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
-- ⚠️ `GET /DisplayPreferences/{displayPreferencesId}` — flagged: read diff vs Jellyfin (verify)
+- ⚠️ `GET /DisplayPreferences/{displayPreferencesId}` — verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses.
 - ⚠️ `GET /Environment/DirectoryContents` — not-testable-this-way: lists the server host's filesystem, which differs per container instance.
 - ⚠️ `GET /Environment/Drives` — instance: per-host filesystem drives.
 - ⚠️ `GET /Environment/ParentPath` — not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific.
@@ -256,8 +256,8 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `POST /Episode/{Id}/Timestamps` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
 - ⚠️ `GET /Episode/{id}/IntroSkipperSegments` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `POST /FileTransformation/RegisterTransformation` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
-- ⚠️ `GET /Genres` — flagged: read diff vs Jellyfin (verify)
-- ⚠️ `GET /Genres/{genreName}` — flagged: read diff vs Jellyfin (verify)
+- ⚠️ `GET /Genres` — verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result.
+- ⚠️ `GET /Genres/{genreName}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Hermit 404 vs Jellyfin auto-created 200. Shape verified.
 - ⚠️ `GET /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
 - ⚠️ `HEAD /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
 - ⚠️ `GET /Genres/{name}/Images/{imageType}/{imageIndex}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
@@ -297,7 +297,7 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
 - ⚠️ `GET /Items/{itemId}/Similar` — deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak).
 - ⚠️ `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
-- ⚠️ `GET /Libraries/AvailableOptions` — flagged: read diff vs Jellyfin (sweep single-item align)
+- ⚠️ `GET /Libraries/AvailableOptions` — verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant.
 - ⚠️ `POST /Library/Media/Updated` — deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.
 - ⚠️ `GET /Library/MediaFolders` — instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows.
 - ⚠️ `POST /Library/Movies/Added` — deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral.
@@ -327,7 +327,7 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `GET /LiveTv/SeriesTimers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `POST /LiveTv/SeriesTimers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `POST /LiveTv/Timers` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
-- ⚠️ `GET /LiveTv/Timers/Defaults` — flagged: read diff vs Jellyfin (sweep single-item align)
+- ⚠️ `GET /LiveTv/Timers/Defaults` — verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/…), 200 + schema conformant.
 - ⚠️ `DELETE /LiveTv/Timers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `GET /LiveTv/Timers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `POST /LiveTv/Timers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
@@ -343,14 +343,14 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `POST /MergeVersions/SplitEpisodes` — expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
 - ⚠️ `POST /MergeVersions/SplitMovies` — expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
 - ⚠️ `GET /Movies/{itemId}/Similar` — deferred: same weighted similarity scorer as Items/{id}/Similar.
-- ⚠️ `GET /MusicGenres` — flagged: read diff vs Jellyfin (sweep single-item align)
+- ⚠️ `GET /MusicGenres` — verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres).
 - ⚠️ `GET /MusicGenres/InstantMix` — not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre).
 - ⚠️ `GET /MusicGenres/{genreName}` — not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200).
 - ⚠️ `GET /Packages` — expected-extension: no external plugin package repository (compiled-in extensions).
 - ⚠️ `POST /Packages/Installed/{name}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
 - ⚠️ `DELETE /Packages/Installing/{packageId}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
 - ⚠️ `GET /Packages/{name}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `GET /Persons/{name}` — flagged: read diff vs Jellyfin (verify)
+- ⚠️ `GET /Persons/{name}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified.
 - ⚠️ `GET /Playback/BitrateTest` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
 - ⚠️ `GET /Playlists/{itemId}/InstantMix` — expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.
 - ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect.
@@ -376,7 +376,7 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `POST /Startup/Configuration` — not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done.
 - ⚠️ `POST /Startup/RemoteAccess` — not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server.
 - ⚠️ `POST /Startup/User` — not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server.
-- ⚠️ `GET /Studios/{name}` — flagged: read diff vs Jellyfin (verify)
+- ⚠️ `GET /Studios/{name}` — accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404.
 - ⚠️ `POST /SyncPlay/Buffering` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
 - ⚠️ `POST /SyncPlay/Join` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
 - ⚠️ `POST /SyncPlay/Leave` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
@@ -496,7 +496,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Devices/Info` | registered | REAL | ✅ | · | ✅ | ok |
 | `GET /Devices/Options` | registered | REAL | ✅ | · | ✅ | ok |
 | `POST /Devices/Options` | registered | REAL | · | · | ✅ | ok |
-| `GET /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ⚠️ | flagged: read diff vs Jellyfin (verify) |
+| `GET /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ⚠️ | verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses. |
 | `POST /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Environment/DefaultDirectoryBrowser` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Environment/DirectoryContents` | registered | REAL | ✅ | · | · | not-testable-this-way: lists the server host's filesystem, which differs per container instance. |
@@ -510,8 +510,8 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /FallbackFont/Fonts` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /FallbackFont/Fonts/{name}` | registered | REAL | ✅ | · | ✅ |  |
 | `POST /FileTransformation/RegisterTransformation` | registered | REAL | · | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
-| `GET /Genres` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (verify) |
-| `GET /Genres/{genreName}` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (verify) |
+| `GET /Genres` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result. |
+| `GET /Genres/{genreName}` | registered | REAL | ✅ | ✅ | ⚠️ | accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Hermit 404 vs Jellyfin auto-created 200. Shape verified. |
 | `GET /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
 | `HEAD /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
 | `GET /Genres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
@@ -584,7 +584,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Items/{itemId}/ThemeSongs` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Items/{itemId}/ThemeVideos` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` | registered | REAL | · | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
-| `GET /Libraries/AvailableOptions` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (sweep single-item align) |
+| `GET /Libraries/AvailableOptions` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant. |
 | `POST /Library/Media/Updated` | registered | REAL | · | · | · | deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral. |
 | `GET /Library/MediaFolders` | registered | REAL | ✅ | ✅ | ⚠️ | instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows. |
 | `POST /Library/Movies/Added` | registered | REAL | · | · | · | deferred-hollow: filesystem-change webhook handed to NoopLibraryMonitor (not wired); documented deferral. |
@@ -634,7 +634,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /LiveTv/SeriesTimers/{timerId}` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `GET /LiveTv/Timers` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /LiveTv/Timers` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
-| `GET /LiveTv/Timers/Defaults` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (sweep single-item align) |
+| `GET /LiveTv/Timers/Defaults` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/…), 200 + schema conformant. |
 | `DELETE /LiveTv/Timers/{timerId}` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `GET /LiveTv/Timers/{timerId}` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `POST /LiveTv/Timers/{timerId}` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
@@ -658,7 +658,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /MergeVersions/SplitMovies` | registered | REAL | · | · | ⚠️ | expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
 | `GET /Movies/Recommendations` | registered | REAL | ✅ | ✅ | ✅ | deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data. |
 | `GET /Movies/{itemId}/Similar` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: same weighted similarity scorer as Items/{id}/Similar. |
-| `GET /MusicGenres` | registered | REAL | ✅ | ✅ | ⚠️ | flagged: read diff vs Jellyfin (sweep single-item align) |
+| `GET /MusicGenres` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres). |
 | `GET /MusicGenres/InstantMix` | registered | REAL | ✅ | · | · | not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre). |
 | `GET /MusicGenres/{genreName}` | registered | REAL | ⚠️ | · | · | not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200). |
 | `GET /MusicGenres/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
@@ -671,7 +671,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `DELETE /Packages/Installing/{packageId}` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
 | `GET /Packages/{name}` | registered | REAL | ✅ | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
 | `GET /Persons` | registered | REAL | ✅ | ✅ | ✅ | ok |
-| `GET /Persons/{name}` | registered | REAL | ✅ | · | ⚠️ | flagged: read diff vs Jellyfin (verify) |
+| `GET /Persons/{name}` | registered | REAL | ✅ | · | ⚠️ | accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified. |
 | `GET /Persons/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `HEAD /Persons/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `GET /Persons/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ✅ | · | ✅ |  |
@@ -749,7 +749,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Startup/User` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /Startup/User` | registered | REAL | · | · | · | not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server. |
 | `GET /Studios` | registered | REAL | ✅ | ✅ | ✅ | ok |
-| `GET /Studios/{name}` | registered | REAL | ⚠️ | · | ⚠️ | flagged: read diff vs Jellyfin (verify) |
+| `GET /Studios/{name}` | registered | REAL | ⚠️ | · | ⚠️ | accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404. |
 | `GET /Studios/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `HEAD /Studios/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `GET /Studios/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ✅ | · | ✅ |  |
