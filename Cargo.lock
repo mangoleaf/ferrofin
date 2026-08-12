@@ -1201,6 +1201,7 @@ dependencies = [
  "hermit-traits",
  "regex",
  "reqwest",
+ "rstest",
  "serde",
  "serde_json",
  "tempfile",

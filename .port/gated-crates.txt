@@ -16,3 +16,6 @@ hermit-livetv
 hermit-hls
 hermit-core
 hermit-api
+hermit-chromaprint
+hermit-extensions
+hermit-metrics

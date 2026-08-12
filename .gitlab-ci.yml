@@ -322,7 +322,11 @@ coverage:
         [ -z "$crate" ] && continue
         case "$crate" in \#*) continue ;; esac
         echo "── coverage: $crate ──"
-        cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only || fail=1
+        # `-p X` still instruments X's workspace deps, so their (uncovered) source
+        # lands in the TOTAL the gate compares against. Exclude every sibling.
+        others=$(ls crates | grep -v "^$crate\$" | paste -sd'|')
+        cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
+          --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
       done < .port/gated-crates.txt
       exit $fail
   rules:

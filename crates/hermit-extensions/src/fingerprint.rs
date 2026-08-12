@@ -164,4 +164,96 @@ mod tests {
     fn rejects_non_numeric_points() {
         assert!(parse_fpcalc("FINGERPRINT=1,two,3\n").is_err());
     }
+
+    #[tokio::test]
+    async fn run_reports_a_missing_program() {
+        let err = run("hermit-no-such-program", &[]).await.expect_err("spawn");
+        assert!(err.starts_with("spawn hermit-no-such-program:"), "{err}");
+    }
+
+    #[test]
+    fn discover_fpcalc_reports_presence_not_a_path() {
+        // Either outcome is valid (fpcalc is optional); it must never invent one.
+        assert!(discover_fpcalc().is_none_or(|p| p == "fpcalc"));
+    }
+
+    /// The real `Command` path, over stub `fpcalc`/`ffmpeg` scripts.
+    ///
+    /// One test, run in sequence: every stub is written before the first spawn.
+    /// Writing an executable in one thread while another forks makes the child
+    /// inherit the still-open write fd, and the exec then fails `ETXTBSY` — so
+    /// these cases must not interleave with each other's script writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_fingerprinting_over_stub_programs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Writes an executable `#!/bin/sh` script into `dir`, returning its path.
+        fn stub(dir: &std::path::Path, name: &str, body: &str) -> String {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            path.to_string_lossy().into_owned()
+        }
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let root = dir.path().to_string_lossy().into_owned();
+        // fpcalc records the `-length` it was given, so the assertions below can
+        // prove the analysis window reaches it.
+        let fpcalc = stub(
+            dir.path(),
+            "fpcalc",
+            &format!(
+                r#"while [ $# -gt 0 ]; do
+  case "$1" in -length) echo "$2" > {root}/length ;; esac
+  shift
+done
+echo "FINGERPRINT=1,2,3""#
+            ),
+        );
+        let ffmpeg = stub(dir.path(), "ffmpeg", &format!("touch {root}/ffmpeg-ran"));
+        let broken_ffmpeg = stub(dir.path(), "ffmpeg-broken", "exit 1");
+        let boom = stub(dir.path(), "boom", "echo 'it broke' >&2; exit 3");
+        let length = || {
+            std::fs::read_to_string(dir.path().join("length"))
+                .expect("length")
+                .trim()
+                .to_owned()
+        };
+
+        // A non-zero exit carries the status and stderr.
+        let err = run(&boom, &[]).await.expect_err("non-zero exit");
+        assert!(err.contains("exit"), "{err}");
+        assert!(err.ends_with("it broke"), "{err}");
+
+        // An intro window (start == 0) goes straight to fpcalc.
+        let fp = FpcalcFingerprinter::new(fpcalc.clone(), ffmpeg);
+        assert_eq!(
+            fp.fingerprint("/media/a.mkv", 0.0, 90.0).await.expect("fp"),
+            vec![1, 2, 3]
+        );
+        assert_eq!(length(), "90");
+        assert!(!dir.path().join("ffmpeg-ran").exists());
+
+        // A credits window is decoded to a temp WAV first, and fingerprinted
+        // whole — not truncated to fpcalc's 120 s default, which used to gut
+        // credits detection.
+        assert_eq!(
+            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+                .await
+                .expect("fp"),
+            vec![1, 2, 3]
+        );
+        assert!(dir.path().join("ffmpeg-ran").exists());
+        assert_eq!(length(), "300");
+
+        // A failing decode fails the fingerprint rather than fingerprinting junk.
+        let fp = FpcalcFingerprinter::new(fpcalc, broken_ffmpeg);
+        assert!(
+            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+                .await
+                .is_err()
+        );
+    }
 }

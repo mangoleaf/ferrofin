@@ -110,3 +110,109 @@ pub fn register_tasks(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use hermit_traits::error::ServiceError;
+    use hermit_traits::merge_versions::{MergeProgress, MergeVersionsManager};
+    use hermit_traits::plugins::DisabledPluginManager;
+    use hermit_traits::tasks::TaskManager;
+
+    use super::*;
+
+    struct NoMerges;
+
+    #[async_trait]
+    impl MergeVersionsManager for NoMerges {
+        async fn merge_movies(&self, _p: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn split_movies(&self, _p: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn merge_episodes(&self, _p: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn split_episodes(&self, _p: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    async fn context() -> ExtensionContext {
+        let db = hermit_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
+            Arc::new(hermit_core::item_type_lookup::ItemTypeLookup::new());
+        let library: Arc<dyn LibraryManager> = Arc::new(hermit_core::HermitLibraryManager::new(
+            Arc::new(hermit_core::HermitItemRepository::new(db.clone(), lookup)),
+            Arc::new(hermit_core::HermitItemCountService::new(db.clone())),
+            Arc::new(hermit_core::HermitItemPersistenceService::new(db.clone())),
+            Arc::new(hermit_core::HermitPeopleRepository::new(db.clone())),
+        ));
+        ExtensionContext {
+            media_segments: Arc::new(hermit_core::HermitMediaSegmentManager::new(
+                db.clone(),
+                Arc::clone(&library),
+            )),
+            library,
+            plugins: Arc::new(DisabledPluginManager),
+            fingerprinter: None,
+            cache_dir: PathBuf::from("/tmp/hermit-extensions-test-cache"),
+            merge_versions: Arc::new(NoMerges),
+        }
+    }
+
+    #[test]
+    fn registered_plugins_carry_each_extensions_seed_config_and_pages() {
+        let extensions = builtin_extensions();
+        assert_eq!(extensions.len(), 3);
+        let plugins = registered_plugins(&extensions);
+        assert_eq!(plugins.len(), extensions.len());
+        for (plugin, ext) in plugins.iter().zip(&extensions) {
+            assert_eq!(plugin.descriptor.id, ext.id());
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&plugin.default_config)
+                    .expect("seed config is JSON")
+                    .is_object(),
+                "{} must seed an object config",
+                plugin.descriptor.name
+            );
+            assert_eq!(plugin.config_pages.len(), ext.config_pages().len());
+        }
+    }
+
+    #[test]
+    fn extension_ids_are_unique() {
+        let ids: std::collections::HashSet<Uuid> =
+            builtin_extensions().iter().map(|e| e.id()).collect();
+        assert_eq!(ids.len(), 3, "plugin ids double as /Plugins keys");
+    }
+
+    #[tokio::test]
+    async fn register_tasks_registers_every_extensions_tasks() {
+        let cx = context().await;
+        let extensions = builtin_extensions();
+        let expected: Vec<String> = extensions
+            .iter()
+            .flat_map(|e| e.tasks(&cx))
+            .map(|t| t.key().to_owned())
+            .collect();
+        assert!(!expected.is_empty());
+
+        let tasks = HermitTaskManager::new();
+        register_tasks(&extensions, &cx, &tasks);
+        let registered: std::collections::HashSet<String> = tasks
+            .get_tasks()
+            .await
+            .expect("tasks")
+            .into_iter()
+            .filter_map(|t| t.key)
+            .collect();
+        for key in expected {
+            assert!(registered.contains(&key), "{key} was not registered");
+        }
+    }
+}

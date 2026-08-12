@@ -890,6 +890,11 @@ fn decode_points(bytes: &[u8]) -> Option<Vec<u32>> {
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // exact compares on deterministic window/tick math
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use hermit_traits::persistence::ItemPersistenceService;
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -952,5 +957,532 @@ mod tests {
         consider(&mut best, cid, Some(TimeRange::new(5.0, 40.0)), 3000.0);
         assert_eq!(best[&cid].start, 3005.0);
         assert_eq!(best[&cid].end, 3040.0);
+    }
+
+    #[test]
+    fn consider_ignores_a_missing_segment() {
+        let mut best = HashMap::new();
+        consider(&mut best, Uuid::from_u128(1), None, 0.0);
+        assert!(best.is_empty());
+    }
+
+    #[rstest]
+    #[case(AnalysisMode::Introduction, "intro")]
+    // "credits2" orphans the v1 cache fingerprinted under fpcalc's 120 s default.
+    #[case(AnalysisMode::Credits, "credits2")]
+    #[case(AnalysisMode::Recap, "recap")]
+    fn mode_tag_is_the_cache_key_discriminator(#[case] mode: AnalysisMode, #[case] tag: &str) {
+        assert_eq!(mode_tag(mode), tag);
+    }
+
+    #[rstest]
+    #[case(AnalysisMode::Introduction, 20.0)]
+    #[case(AnalysisMode::Credits, 40.0)]
+    #[case(AnalysisMode::Recap, 30.0)]
+    fn compare_config_takes_the_modes_minimum_duration(
+        #[case] mode: AnalysisMode,
+        #[case] expected: f64,
+    ) {
+        let cfg = IntroSkipperConfig {
+            minimum_intro_duration: 20,
+            minimum_credits_duration: 40,
+            minimum_recap_duration: 30,
+            ..IntroSkipperConfig::default()
+        };
+        let cmp = cfg.compare_config(mode);
+        assert_eq!(cmp.min_region_duration, expected);
+        assert_eq!(cmp.inverted_index_shift, 2);
+        assert_eq!(cmp.max_bit_diff, 6);
+    }
+
+    #[test]
+    fn compare_config_falls_back_when_the_bit_diff_is_negative() {
+        let cfg = IntroSkipperConfig {
+            maximum_fingerprint_point_differences: -1,
+            ..IntroSkipperConfig::default()
+        };
+        assert_eq!(
+            cfg.compare_config(AnalysisMode::Introduction).max_bit_diff,
+            6
+        );
+    }
+
+    // ---- to_episode --------------------------------------------------------
+
+    fn row(id: &str, path: Option<&str>, ticks: Option<i64>) -> BaseItemEntity {
+        BaseItemEntity {
+            id: id.to_owned(),
+            path: path.map(str::to_owned),
+            run_time_ticks: ticks,
+            ..BaseItemEntity::default()
+        }
+    }
+
+    #[rstest]
+    #[case::no_path(row("00000000-0000-0000-0000-000000000001", None, Some(10)))]
+    #[case::empty_path(row("00000000-0000-0000-0000-000000000001", Some(""), Some(10)))]
+    #[case::no_runtime(row("00000000-0000-0000-0000-000000000001", Some("/a.mkv"), None))]
+    #[case::zero_runtime(row("00000000-0000-0000-0000-000000000001", Some("/a.mkv"), Some(0)))]
+    #[case::bad_uuid(row("not-a-uuid", Some("/a.mkv"), Some(10)))]
+    fn to_episode_rejects_unanalyzable_rows(#[case] row: BaseItemEntity) {
+        assert!(to_episode(&row).is_none());
+    }
+
+    #[test]
+    fn to_episode_converts_ticks_to_seconds() {
+        let ep = to_episode(&row(
+            "00000000-0000-0000-0000-00000000002a",
+            Some("/media/s01e01.mkv"),
+            Some(1_800 * 10_000_000),
+        ))
+        .expect("episode");
+        assert_eq!(ep.id, Uuid::from_u128(42));
+        assert_eq!(ep.path, "/media/s01e01.mkv");
+        assert_eq!(ep.duration_secs, 1800.0);
+    }
+
+    #[test]
+    fn ticks_round_trip_through_seconds() {
+        assert_eq!(secs_to_ticks(1.5), 15_000_000);
+        assert_eq!(ticks_to_secs(15_000_000), 1.5);
+    }
+
+    // ---- intro offsets -----------------------------------------------------
+
+    fn one_region(start: f64, end: f64) -> HashMap<Uuid, TimeRange> {
+        HashMap::from([(Uuid::from_u128(1), TimeRange::new(start, end))])
+    }
+
+    #[rstest]
+    // (start_offset, end_offset) → the resulting (start, end) of a 10..70 intro.
+    #[case::no_offsets(0, 0, (10.0, 70.0))]
+    #[case::start_only(5, 0, (15.0, 70.0))]
+    #[case::end_only(0, 5, (10.0, 65.0))]
+    #[case::both(5, 5, (15.0, 65.0))]
+    // Offsets that would invert (or empty) the region are refused wholesale.
+    #[case::inverting(40, 40, (10.0, 70.0))]
+    // Negative offsets clamp to zero rather than widening the region.
+    #[case::negative_clamps(-5, -5, (10.0, 70.0))]
+    fn apply_intro_offsets_shifts_within_bounds(
+        #[case] start_offset: i32,
+        #[case] end_offset: i32,
+        #[case] expected: (f64, f64),
+    ) {
+        let cfg = IntroSkipperConfig {
+            intro_start_offset: start_offset,
+            intro_end_offset: end_offset,
+            ..IntroSkipperConfig::default()
+        };
+        let mut regions = one_region(10.0, 70.0);
+        apply_intro_offsets(&mut regions, &cfg);
+        let r = &regions[&Uuid::from_u128(1)];
+        assert_eq!((r.start, r.end), expected);
+    }
+
+    // ---- extension surface -------------------------------------------------
+
+    #[test]
+    fn descriptor_uses_the_upstream_guid() {
+        let d = IntroSkipperExtension::new().descriptor();
+        assert_eq!(
+            d.id.to_string(),
+            "c83d86bb-a1e0-4c35-a113-e2101cf4ee6b",
+            "clients and the vendored dashboard address the plugin by this id"
+        );
+        assert_eq!(IntroSkipperExtension.id(), d.id);
+        assert_eq!(d.name, "Intro Skipper");
+        assert!(!d.can_uninstall);
+    }
+
+    #[test]
+    fn config_pages_ship_the_vendored_dashboard_app() {
+        let pages = IntroSkipperExtension.config_pages();
+        let names: Vec<&str> = pages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Intro Skipper", "introskipper.js", "introskipper.css"]
+        );
+        // Only the shell page is a main-menu entry; the JS/CSS are loaded by name.
+        assert!(pages[0].enable_in_main_menu);
+        assert!(!pages[1].enable_in_main_menu);
+        assert!(!pages[2].enable_in_main_menu);
+        assert!(pages.iter().all(|p| !p.bytes.is_empty()));
+    }
+
+    // ---- the detection task over real managers ------------------------------
+
+    /// A fingerprinter returning a canned fingerprint per path, counting calls so
+    /// a test can prove the on-disk cache short-circuits the (expensive) decode.
+    struct FakeFingerprinter {
+        prints: HashMap<String, Vec<u32>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Fingerprinter for FakeFingerprinter {
+        async fn fingerprint(
+            &self,
+            path: &str,
+            _start: f64,
+            _end: f64,
+        ) -> Result<Vec<u32>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.prints
+                .get(path)
+                .cloned()
+                .ok_or_else(|| format!("no canned fingerprint for {path}"))
+        }
+    }
+
+    /// Two episodes sharing a 30 s "intro" (identical leading points) and
+    /// diverging afterwards — the shape `compare_episodes` is built to find.
+    fn shared_intro_prints() -> (Vec<u32>, Vec<u32>) {
+        // hermit-chromaprint samples at ~0.1238 s/point, so 30 s ≈ 242 points.
+        let shared: Vec<u32> = (0..400u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+        let mut a = shared.clone();
+        let mut b = shared;
+        a.extend((0..400u32).map(|i| i.wrapping_mul(0x1234_5678) | 1));
+        b.extend((0..400u32).map(|i| i.wrapping_mul(0x8765_4321) | 2));
+        (a, b)
+    }
+
+    struct Harness {
+        task: DetectSegmentsTask,
+        segments: Arc<dyn MediaSegmentManager>,
+        calls: Arc<AtomicUsize>,
+        _cache: tempfile::TempDir,
+    }
+
+    /// Builds the task over an in-memory database seeded with `episodes`
+    /// (`(id, path, duration_secs)`), all in one season.
+    async fn harness(
+        episodes: &[(Uuid, &str, f64)],
+        plugin_enabled: bool,
+        config: &str,
+        with_fingerprinter: bool,
+    ) -> Harness {
+        let db = hermit_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+
+        let persistence = Arc::new(hermit_core::HermitItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn hermit_traits::persistence::ItemTypeLookup> =
+            Arc::new(hermit_core::item_type_lookup::ItemTypeLookup::new());
+        let items = Arc::new(hermit_core::HermitItemRepository::new(db.clone(), lookup));
+        let library: Arc<dyn LibraryManager> = Arc::new(hermit_core::HermitLibraryManager::new(
+            items,
+            Arc::new(hermit_core::HermitItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(hermit_core::HermitPeopleRepository::new(db.clone())),
+        ));
+
+        let type_name = hermit_core::item_type_lookup::stored_type_name(BaseItemKind::Episode)
+            .expect("stored type name");
+        let rows: Vec<BaseItemEntity> = episodes
+            .iter()
+            .map(|(id, path, secs)| BaseItemEntity {
+                id: id.to_string(),
+                type_: type_name.to_owned(),
+                path: Some((*path).to_owned()),
+                #[allow(clippy::cast_possible_truncation)]
+                run_time_ticks: Some((secs * TICKS_PER_SECOND) as i64),
+                season_id: Some("season-1".to_owned()),
+                ..BaseItemEntity::default()
+            })
+            .collect();
+        persistence.save_items(&rows).await.expect("seed episodes");
+
+        let segments: Arc<dyn MediaSegmentManager> = Arc::new(
+            hermit_core::HermitMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
+        );
+
+        let (a, b) = shared_intro_prints();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prints = episodes
+            .iter()
+            .enumerate()
+            .map(|(i, (_, path, _))| {
+                (
+                    (*path).to_owned(),
+                    if i % 2 == 0 { a.clone() } else { b.clone() },
+                )
+            })
+            .collect();
+        let fingerprinter: Option<Arc<dyn Fingerprinter>> = with_fingerprinter.then(|| {
+            Arc::new(FakeFingerprinter {
+                prints,
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn Fingerprinter>
+        });
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        Harness {
+            task: DetectSegmentsTask {
+                library,
+                media_segments: Arc::clone(&segments),
+                plugins: Arc::new(FakePlugins {
+                    enabled: plugin_enabled,
+                    config: config.as_bytes().to_vec(),
+                }),
+                fingerprinter,
+                cache_dir: cache.path().join("introskipper"),
+                running: Arc::new(AtomicBool::new(false)),
+            },
+            segments,
+            calls,
+            _cache: cache,
+        }
+    }
+
+    /// A plugin manager reporting one plugin with a fixed enabled flag + config.
+    struct FakePlugins {
+        enabled: bool,
+        config: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl PluginManager for FakePlugins {
+        async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
+            Ok(Some(PluginDescriptor {
+                id,
+                enabled: self.enabled,
+                ..PluginDescriptor::default()
+            }))
+        }
+        async fn enable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn disable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn remove_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_plugin_configuration(&self, _id: Uuid) -> Result<Vec<u8>, ServiceError> {
+            Ok(self.config.clone())
+        }
+        async fn set_plugin_configuration(
+            &self,
+            _id: Uuid,
+            _config: Vec<u8>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn plugin_image(
+            &self,
+            _id: Uuid,
+        ) -> Result<Option<hermit_traits::plugins::PluginImage>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_repositories(
+            &self,
+        ) -> Result<Vec<hermit_model::updates::RepositoryInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn set_repositories(
+            &self,
+            _repositories: Vec<hermit_model::updates::RepositoryInfo>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn list_packages(
+            &self,
+        ) -> Result<Vec<hermit_model::updates::PackageInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    const EP_A: Uuid = Uuid::from_u128(0xA1);
+    const EP_B: Uuid = Uuid::from_u128(0xA2);
+    const TWO_EPISODES: [(Uuid, &str, f64); 2] = [
+        (EP_A, "/media/s01e01.mkv", 1800.0),
+        (EP_B, "/media/s01e02.mkv", 1800.0),
+    ];
+
+    async fn intros_of(segments: &Arc<dyn MediaSegmentManager>, id: Uuid) -> Vec<MediaSegmentDto> {
+        segments
+            .get_segments(id, Some(&[MediaSegmentType::Intro]), false)
+            .await
+            .expect("segments")
+    }
+
+    #[tokio::test]
+    async fn detects_a_shared_intro_and_writes_segments() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let progress = TaskProgress::default();
+        h.task.execute(&progress).await.expect("execute");
+
+        assert_eq!(progress.current(), 100.0);
+        for id in [EP_A, EP_B] {
+            let found = intros_of(&h.segments, id).await;
+            assert_eq!(found.len(), 1, "episode {id} should get one Intro segment");
+            assert!(
+                found[0].end_ticks > found[0].start_ticks,
+                "segment must be non-empty"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rerun_reuses_the_fingerprint_cache() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        let first = h.calls.load(Ordering::SeqCst);
+        assert!(first > 0, "the first pass must fingerprint");
+
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(
+            h.calls.load(Ordering::SeqCst),
+            first,
+            "the on-disk cache must short-circuit the second pass"
+        );
+        // Re-running replaces this provider's rows rather than duplicating them.
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    #[rstest]
+    // A disabled plugin, an absent fpcalc, and a season of one all no-op.
+    #[case::disabled(false, true, &TWO_EPISODES[..])]
+    #[case::no_fpcalc(true, false, &TWO_EPISODES[..])]
+    #[case::single_episode(true, true, &TWO_EPISODES[..1])]
+    #[tokio::test]
+    async fn analysis_no_ops(
+        #[case] enabled: bool,
+        #[case] with_fingerprinter: bool,
+        #[case] episodes: &[(Uuid, &str, f64)],
+    ) {
+        let h = harness(episodes, enabled, "{}", with_fingerprinter).await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_concurrent_pass_is_refused() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        // Simulate a pass in flight (e.g. `/Intros/ScanSeason` started one).
+        h.task.running.store(true, Ordering::SeqCst);
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            h.task.running.load(Ordering::SeqCst),
+            "the refused run must not clear another pass's latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_toggles_off_skip_their_analysis() {
+        let h = harness(
+            &TWO_EPISODES,
+            true,
+            r#"{"ScanIntroduction":false,"ScanCredits":false}"#,
+            true,
+        )
+        .await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_over_long_region_is_not_written() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        // MaximumIntroDuration is the write-side veto; 0 rejects everything.
+        let regions = HashMap::from([(EP_A, TimeRange::new(0.0, 30.0))]);
+        assert_eq!(
+            h.task
+                .write_segments(&regions, MediaSegmentType::Intro, 0.0)
+                .await,
+            0
+        );
+        // A zero-length region is rejected too.
+        let empty = HashMap::from([(EP_A, TimeRange::new(5.0, 5.0))]);
+        assert_eq!(
+            h.task
+                .write_segments(&empty, MediaSegmentType::Intro, 600.0)
+                .await,
+            0
+        );
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_stored_config_falls_back_to_defaults() {
+        let h = harness(&TWO_EPISODES, true, "not json", true).await;
+        assert_eq!(h.task.load_config().await.analysis_percent, 25);
+    }
+
+    #[tokio::test]
+    async fn an_unfingerprintable_episode_is_skipped() {
+        // A 1 s episode: the intro window is shorter than the minimum, so it is
+        // never fingerprinted and the season has no comparable pair.
+        let eps = [
+            (EP_A, "/media/short1.mkv", 1.0),
+            (EP_B, "/media/short2.mkv", 1.0),
+        ];
+        let h = harness(&eps, true, "{}", true).await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fingerprinter_error_does_not_abort_the_pass() {
+        let h = harness(
+            &[
+                (EP_A, "/media/unknown-a.mkv", 1800.0),
+                (EP_B, "/media/unknown-b.mkv", 1800.0),
+            ],
+            true,
+            "{}",
+            true,
+        )
+        .await;
+        // The fake only knows the paths it was seeded with — here it errors for
+        // both, which must be logged and skipped, not propagated.
+        let h = Harness {
+            task: DetectSegmentsTask {
+                fingerprinter: Some(Arc::new(FakeFingerprinter {
+                    prints: HashMap::new(),
+                    calls: Arc::clone(&h.calls),
+                })),
+                ..h.task.clone()
+            },
+            ..h
+        };
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    // ---- the Media Segment Scan task ---------------------------------------
+
+    #[tokio::test]
+    async fn media_segment_scan_task_drives_the_same_detection() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let scan = MediaSegmentScanTask {
+            detect: Arc::new(h.task.clone()),
+        };
+        assert_eq!(scan.key(), "TaskExtractMediaSegments");
+        assert_eq!(scan.name(), "Media Segment Scan");
+        assert!(!scan.description().is_empty());
+        assert_eq!(scan.category(), "Library");
+        let triggers = scan.default_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].interval_ticks, Some(12 * 3600 * 10_000_000));
+
+        scan.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn detect_task_metadata_is_stable() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        assert_eq!(h.task.key(), "IntroSkipper.Detect");
+        assert_eq!(h.task.name(), "Detect intros and credits");
+        assert!(h.task.description().contains("media segments"));
+        assert_eq!(h.task.category(), "Intro Skipper");
     }
 }
