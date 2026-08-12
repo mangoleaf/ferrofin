@@ -8,6 +8,9 @@
 # public sources. CI keeps its fast path by overriding WEB_IMAGE/RUNTIME_IMAGE
 # with prebuilt base images (ci/web.Dockerfile, ci/runtime.Dockerfile — same
 # contents, baked once); BuildKit then skips the unused local stages entirely.
+# NOTE: kaniko does NOT skip unused stages by default — the CI service-image
+# build MUST pass `--skip-unused-stages=true` or it rebuilds jellyfin-web from
+# source every release (see .gitlab-ci.yml).
 ARG WEB_IMAGE=web-build
 ARG RUNTIME_IMAGE=runtime-build
 

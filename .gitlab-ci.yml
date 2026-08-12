@@ -397,6 +397,14 @@ docker-image:
       if echo "${CI_COMMIT_TAG:-}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
         DESTS="$DESTS --destination $IMAGE:latest"
       fi
+    # --skip-unused-stages is LOAD-BEARING: the root Dockerfile also defines
+    # local `web-source`/`runtime-build` stages so a plain `docker build .`
+    # is self-contained, but WEB_IMAGE/RUNTIME_IMAGE below override the `web`
+    # and final `FROM`s with the prebuilt CI base images. Unlike BuildKit,
+    # kaniko builds EVERY defined stage by default — without this flag it runs
+    # the jellyfin-web `npm run build:production` (and the ffmpeg apt install)
+    # on every release, re-hitting their network fragility for no reason. The
+    # flag prunes stages outside the target's dependency graph.
     - >-
       /kaniko/executor
       --context "$CI_PROJECT_DIR"
@@ -404,6 +412,7 @@ docker-image:
       --build-arg SERVICE_VERSION="$IMAGE_VERSION"
       --build-arg WEB_IMAGE="$CI_REGISTRY_IMAGE/ci:web-$JELLYFIN_WEB_VERSION"
       --build-arg RUNTIME_IMAGE="$CI_REGISTRY_IMAGE/ci:runtime-bookworm-ffmpeg7"
+      --skip-unused-stages=true
       $DESTS
       --push-retry 5
   rules:
