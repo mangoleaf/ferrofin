@@ -566,8 +566,12 @@ impl LibraryScanner {
             if people.is_empty() {
                 people = remote.people;
             }
+            // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
+            // links) and the stored `DateCreated` on rows that already exist —
+            // this entity is rebuilt from disk and would otherwise reset both
+            // on every scan.
             self.persistence
-                .save_items(std::slice::from_ref(&entity))
+                .save_scanned_items(std::slice::from_ref(&entity))
                 .await?;
             // Persist the external provider ids now the item row exists to FK
             // against: the remote match's (Tmdb/Imdb/Tvdb) plus the embedded

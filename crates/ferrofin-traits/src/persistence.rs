@@ -316,6 +316,21 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Persists (inserts or updates) the given item rows.
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
+    /// Persists item rows rebuilt from disk by the library scan, preserving the
+    /// columns the scanner does not own on already-stored rows:
+    ///
+    /// - `PrimaryVersionId` — merge-versions links; a scanned entity always
+    ///   carries `None`, and a plain [`save_items`](Self::save_items) upsert
+    ///   would erase every merged alternate version on each scan.
+    /// - `DateCreated` — the item's first-import timestamp; re-stamping it with
+    ///   the scan time breaks "date added" ordering.
+    ///
+    /// The default delegates to [`save_items`](Self::save_items) (for stub/fake
+    /// services); the real service uses a scan-specific upsert.
+    async fn save_scanned_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
+        self.save_items(items).await
+    }
+
     /// Replaces an item's `ItemValues` links (genres/studios/tags) with `values`,
     /// each a `(type discriminant, display value)` pair. Get-or-creates the shared
     /// `ItemValues` row per (type, value) and rewrites this item's `ItemValuesMap`

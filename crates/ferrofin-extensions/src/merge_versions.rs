@@ -127,13 +127,22 @@ impl Extension for MergeVersionsExtension {
 /// One day as scheduler ticks (100 ns) — the upstream tasks' default interval.
 const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
 
-/// The upstream tasks' shared default trigger: run every 24 hours.
-fn daily_trigger() -> Vec<TaskTriggerInfo> {
-    vec![TaskTriggerInfo {
-        type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(DAY_TICKS),
-        ..TaskTriggerInfo::default()
-    }]
+/// The merge tasks' shared default triggers: every 24 hours (upstream's
+/// default) plus at startup. The startup trigger is a deliberate divergence
+/// from upstream: the interval clock resets on every boot, so a server that
+/// restarts more often than daily would otherwise never run the merge at all.
+fn default_triggers() -> Vec<TaskTriggerInfo> {
+    vec![
+        TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(DAY_TICKS),
+            ..TaskTriggerInfo::default()
+        },
+        TaskTriggerInfo {
+            type_: TaskTriggerInfoType::StartupTrigger,
+            ..TaskTriggerInfo::default()
+        },
+    ]
 }
 
 /// Whether the Merge Versions plugin is currently enabled (live toggle).
@@ -166,7 +175,7 @@ impl ScheduledTask for MergeMoviesTask {
         "Merge Versions"
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-        daily_trigger()
+        default_triggers()
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // Gate on the plugin being enabled (live toggle — no restart needed).
@@ -201,7 +210,7 @@ impl ScheduledTask for MergeEpisodesTask {
         "Merge Versions"
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
-        daily_trigger()
+        default_triggers()
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         if !plugin_enabled(&self.plugins).await {
@@ -1331,6 +1340,9 @@ mod tests {
             assert_eq!(task.category(), "Merge Versions");
             let triggers = task.default_triggers();
             assert_eq!(triggers[0].interval_ticks, Some(DAY_TICKS));
+            // Startup trigger: the interval clock resets each boot, so without
+            // this a frequently-restarted server never merges at all.
+            assert_eq!(triggers[1].type_, TaskTriggerInfoType::StartupTrigger);
             // Disabled plugin → the task is a silent no-op, not a failure.
             let progress = TaskProgress::default();
             task.execute(&progress).await.expect("skip when disabled");

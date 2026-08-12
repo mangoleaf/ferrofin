@@ -71,12 +71,11 @@ impl FerrofinItemPersistenceService {
         Self { db }
     }
 
-    /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`).
-    ///
-    /// Every non-key column is bound; on conflict each is overwritten, so a save
-    /// fully replaces the stored row (matching the C# save semantics for the
-    /// scalar `BaseItems` columns).
-    async fn upsert_item(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+    /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`) using
+    /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
+    /// the library scan's ownership-respecting variant. Both bind the same
+    /// columns in the same order.
+    async fn upsert_item(&self, item: &BaseItemEntity, sql: &str) -> Result<(), ServiceError> {
         // C# `SaveItem` always stamps `CleanName = GetCleanValue(item.Name)` at
         // write time (no caller pre-computes it); deriving here keeps every
         // saved item matchable by the search filter, which queries `CleanName`.
@@ -85,7 +84,7 @@ impl FerrofinItemPersistenceService {
             .as_deref()
             .filter(|n| !n.is_empty())
             .map(crate::text_util::get_clean_value);
-        sqlx::query(UPSERT_SQL)
+        sqlx::query(sql)
             .bind(&item.id)
             .bind(&item.album)
             .bind(&item.album_artists)
@@ -214,7 +213,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
 
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
-            self.upsert_item(item).await?;
+            self.upsert_item(item, UPSERT_SQL).await?;
+        }
+        Ok(())
+    }
+
+    async fn save_scanned_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
+        for item in items {
+            self.upsert_item(item, scan_upsert_sql()).await?;
         }
         Ok(())
     }
@@ -557,6 +563,29 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "Type" = excluded."Type", "UnratedType" = excluded."UnratedType", "Width" = excluded."Width"
 "#;
 
+/// The library scan's upsert: identical to [`UPSERT_SQL`] except for the two
+/// columns the scanner does not own on an existing row —
+///
+/// - `PrimaryVersionId` is left untouched (a scanned entity always carries
+///   `None`, and overwriting erased every merge-versions link on each scan),
+/// - `DateCreated` keeps its stored first-import value (`coalesce` still fills
+///   it when the stored value is `NULL`).
+///
+/// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
+/// cannot drift between the two statements; the substitutions are asserted in
+/// `scan_upsert_preserves_unowned_columns`.
+fn scan_upsert_sql() -> &'static str {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        UPSERT_SQL
+            .replace(
+                r#""DateCreated" = excluded."DateCreated","#,
+                r#""DateCreated" = coalesce("DateCreated", excluded."DateCreated"),"#,
+            )
+            .replace(r#""PrimaryVersionId" = excluded."PrimaryVersionId","#, "")
+    });
+    &SQL
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_model::data::BaseItemKind;
@@ -778,5 +807,80 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(coltrane, 0);
+    }
+
+    // The library scan rebuilds entities from disk with no merge link and a
+    // scan-time DateCreated. Its save must not clobber either on an existing
+    // row (a plain save_items erased every merge-versions link on each scan),
+    // while the full save — the merge/split write path — must still set AND
+    // clear both.
+    #[tokio::test]
+    async fn scan_upsert_preserves_unowned_columns() {
+        // Guard the text-substitution derivation of the scan SQL: if the base
+        // UPSERT_SQL text drifts, the replacements silently no-op and this
+        // catches it before the behavioral asserts do.
+        let sql = super::scan_upsert_sql();
+        assert!(sql.contains(r#"coalesce("DateCreated", excluded."DateCreated")"#));
+        assert!(!sql.contains(r#""PrimaryVersionId" = excluded."PrimaryVersionId""#));
+
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::new_v4();
+        let first_import = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // A merged alternate version: full save sets the link + import date.
+        let mut item = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Episode)
+                .unwrap()
+                .to_owned(),
+            name: Some("S01E01".into()),
+            primary_version_id: Some("PRIMARY-ID".into()),
+            date_created: Some(first_import),
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&item))
+            .await
+            .expect("full save");
+
+        // The next scan re-saves the same row rebuilt from disk: link gone,
+        // DateCreated re-stamped to scan time.
+        item.primary_version_id = None;
+        item.date_created = Some(chrono::Utc::now());
+        item.name = Some("S01E01 rescanned".into());
+        svc.save_scanned_items(std::slice::from_ref(&item))
+            .await
+            .expect("scan save");
+
+        let (name, pvid, created): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                r#"SELECT "Name", "PrimaryVersionId", "DateCreated"
+                   FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("row");
+        assert_eq!(name.as_deref(), Some("S01E01 rescanned"), "scan owns Name");
+        assert_eq!(pvid.as_deref(), Some("PRIMARY-ID"), "merge link survives");
+        assert_eq!(
+            created,
+            ferrofin_db::store::opt_datetime_to_db(Some(first_import)),
+            "first-import DateCreated survives"
+        );
+
+        // Split/unmerge still clears the link through the full save.
+        svc.save_items(std::slice::from_ref(&item))
+            .await
+            .expect("full re-save");
+        let pvid: Option<String> =
+            sqlx::query_scalar(r#"SELECT "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(pvid, None, "full save still clears the merge link");
     }
 }
