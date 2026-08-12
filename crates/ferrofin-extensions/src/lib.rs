@@ -1,6 +1,6 @@
 //! Curated, compiled-in **extensions** for Ferrofin — the Rust answer to Jellyfin
 //! plugins (Rust cannot load .NET assemblies at runtime; see
-//! `brain/plans/PLAN_FERROFIN_EXTENSIONS.md`).
+//! `docs/EXTENSIONS.md`).
 //!
 //! An [`Extension`] is a repo-curated capability that **surfaces as a plugin** on
 //! the frozen `/Plugins` API (enable/disable toggle, config page) via the

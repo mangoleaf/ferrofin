@@ -88,9 +88,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
-      # 80% line-coverage gate. Applied per-ported-crate via the allowlist until
-      # every crate is ported, then flip to `--workspace`. See brain/PLAN_FERROFIN_PORT.md.
-      # ffmpeg is only needed by integration tests in later waves; unit/parity tests avoid it.
+      # 80% line-coverage gate, enforced per-crate via the allowlist (`.port/`).
+      # ffmpeg is only needed by the env-gated integration tests; unit/parity tests avoid it.
       - name: coverage gate (ported crates)
         shell: bash
         run: |

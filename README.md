@@ -1,40 +1,162 @@
+<div align="center">
+
 # Ferrofin
 
-A from-scratch **Rust** port of [Jellyfin](https://github.com/jellyfin/jellyfin), the
-open-source media server. Ferrofin speaks the **same HTTP API** as Jellyfin, so existing
-Jellyfin TV clients (Wolphin, Swiftfin, Findroid) connect to it unchanged — the client
-only ever sees an HTTP endpoint and can't tell the server is Rust.
+**A drop-in Rust implementation of the Jellyfin media server.**
 
-The name: a ferrofin crab moves into an existing shell. Ferrofin moves into Jellyfin's API
-shell — reusing its contract while replacing the body.
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+[![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](rust-toolchain.toml)
+[![API parity: 412/412 REAL](https://img.shields.io/badge/API%20parity-412%2F412%20REAL-brightgreen.svg)](docs/FEATURES.md)
 
-## Status
+<!-- CI + latest-release badges: add at public-repo publish, once the canonical host/registry is fixed. -->
 
-Ported component-by-component, strictly bottom-up, with a hard **80% line-coverage
-gate** per crate. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate map
-and the porting rules.
+</div>
+
+Ferrofin speaks the **same HTTP API** as [Jellyfin](https://github.com/jellyfin/jellyfin), so
+existing Jellyfin clients — the web UI, and native TV/mobile apps like Swiftfin, Findroid, and
+Wolphin — connect to it **unchanged**. A client only ever sees an HTTP endpoint; it can't tell
+the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place.
+
+> The name: a hermit crab moves into a shell it didn't grow. Ferrofin (*ferro*, iron/rust +
+> *fin*, from Jellyfin) moves into Jellyfin's API shell — reusing the contract that clients
+> depend on while replacing the body with idiomatic Rust.
+
+- **Want to try it?** → [Quickstart](#quickstart)
+- **Coming from Jellyfin?** → [Migrating from Jellyfin](#migrating-from-jellyfin)
+- **What actually works?** → [Feature status](docs/FEATURES.md)
+- **Want to contribute?** → [CONTRIBUTING.md](CONTRIBUTING.md)
+
+<!-- Screenshot of jellyfin-web served by Ferrofin: add at publish (proof it drives real clients). -->
+
+## Why
+
+- **Small footprint, single static binary.** One `ferrofin-server` executable plus ffmpeg —
+  no .NET runtime. Runs comfortably on hardware where the reference server strains.
+- **Drop-in compatible.** Same API contract, same on-disk database format (pinned byte-equal
+  to Jellyfin 10.11.8), same password hashes. Adopt an existing library with no re-scan; swap
+  back to Jellyfin safely.
+- **Honest about what it is.** Every operation in the Jellyfin API contract is wired to a real
+  handler and cross-checked against a real Jellyfin server (see below) — not a demo with gaps
+  papered over by fake `200`s.
+
+## Benchmarks
+
+> **Deferred.** Ferrofin is dramatically lighter on memory and faster to cold-start than the
+> reference .NET server, but the "N× faster" throughput number swings widely run-to-run on
+> identical code, so publishing it as a headline would be dishonest. A freshly-rerun,
+> methodology-linked benchmark table lands here before the public release. The methodology
+> already lives at [`suite/README.md`](suite/README.md) and
+> [`suite/perf/README.md`](suite/perf/README.md).
+
+The one reproducible compatibility stat, meanwhile: the parity harness diffs Ferrofin's
+responses against a real `jellyfin/jellyfin:10.11.8` server across the whole API. **412/412
+operations are real handlers, 201 of them deep-verified byte-for-byte, 0 untested.**
+
+## Feature status
+
+All 412 operations in the vendored contract are implemented — no `501` stubs. The
+tiered matrix (verified · known-partial · not-implemented-by-design) is in
+**[`docs/FEATURES.md`](docs/FEATURES.md)**. In short, working end-to-end: auth/users/QuickConnect,
+library scan + live filesystem watch, browse/query, images, sessions/playstate/remote control,
+WebSocket push, playlists/collections, direct play + live HLS transcode, Live TV (M3U/XMLTV +
+DVR), SyncPlay, all 17 scheduled tasks, metrics/tracing, and backup/restore. The deliberate
+gaps: dynamic plugin loading (Ferrofin uses [compiled-in extensions](docs/EXTENSIONS.md)
+instead), DLNA SSDP discovery, and remote metadata providers (feature-gated off by default).
+
+## Quickstart
+
+**Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`):
+
+```sh
+docker run -d --name ferrofin \
+  -p 8096:8096 \
+  -v ferrofin-data:/data \
+  <registry>/ferrofin:latest        # registry set at publish
+```
+
+**Helm:**
+
+```sh
+helm install ferrofin oci://<registry>/ferrofin/charts/ferrofin
+```
+
+See [`charts/ferrofin/values.example.yaml`](charts/ferrofin/values.example.yaml) for a worked
+configuration.
+
+**From source** (needs the pinned Rust toolchain; ffmpeg optional — its absence only disables
+transcode):
+
+```sh
+cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
+```
+
+On a fresh database Ferrofin seeds an `admin` user and **logs a generated password — record
+it** (or set `FERROFIN_ADMIN_PASSWORD` for a headless install). Then:
+
+```sh
+curl http://localhost:8096/System/Info/Public   # smoke test
+# open http://localhost:8096/web, or point a native Jellyfin client at the server
+```
+
+Configuration is via CLI flags, `FERROFIN_*` environment variables, or `{data_dir}/config.toml`
+(precedence in that order). The full surface is in [`docs/CONFIG.md`](docs/CONFIG.md).
+
+## Migrating from Jellyfin
+
+Ferrofin reads Jellyfin's database format directly. Point it at a data directory containing a
+Jellyfin `jellyfin.db` (10.11.8) and on first boot it:
+
+1. **Detects** the Jellyfin database and validates its migration set (refuses loudly rather
+   than half-adopting an unexpected version),
+2. **Backs it up** (`jellyfin.db.pre-ferrofin`, logged) before touching anything,
+3. **Adopts it in place** — no re-scan, no re-import. Users, watch state, playlists, and Live
+   TV config carry forward.
+
+The adoption is **two-way**: Ferrofin only adds its own tables in a collision-proof namespace
+and never rewrites Jellyfin's schema objects, so you can stop Ferrofin and start Jellyfin back
+on the same database. Existing native Ferrofin databases upgrade in place across releases the
+same way. The round-trip is covered by `suite/roundtrip.sh`.
+
+## Extensions vs. plugins
+
+Jellyfin plugins are .NET assemblies loaded at runtime; Rust has no equivalent, and Ferrofin
+doesn't fake one. Instead it ships **compiled-in extensions** that surface through the same
+`/Plugins` API — they appear in the dashboard, have settings pages, and enable/disable at
+runtime. Three Jellyfin plugins are ported today (Intro Skipper, File Transformation, Merge
+Versions). Full explanation: **[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**.
+
+## Architecture
+
+A Rust workspace of ~20 crates, edition 2024, bottom-up dependency spine. The load-bearing
+idea: clients depend on Jellyfin's **API surface**, not its code, so the contract is the
+vendored OpenAPI spec and everything behind it is designed idiomatically in Rust (traits as
+the dependency-injection seam; no ported OOP object hierarchy).
+
+```
+util ─┐
+model ┼─ common ─┬─ db ──────┐
+naming┘          │            │
+keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
+chromaprint      health       │          ├─ drawing
+                 metrics      │          ├─ providers
+                              │          ├─ livetv
+                              │          └─ extensions
+                              └──────────────► core ─► api ─► server (bin)
+```
+
+Full crate map, C#→Rust mapping, and porting rules: **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+
+## Contributing
+
+Ferrofin ports Jellyfin faithfully and gates every change behind `cargo fmt`, `clippy -D
+warnings`, the full test suite, and an ≥80% per-crate coverage floor. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and, for the deeper operating guide, [`CLAUDE.md`](CLAUDE.md).
+
+Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. The Jellyfin repo is
-internally inconsistent (root `LICENSE` is GPL-2.0, but the library `.csproj` packages being
-ported declare `GPL-3.0-only`); Ferrofin follows the `GPL-3.0-only` metadata on the specific
-crates it derives from.
-
-## Layout
-
-```
-crates/      library crates (ferrofin-util, ferrofin-model, ferrofin-naming, … ferrofin-api)
-apps/        ferrofin-server (the binary / composition root)
-contracts/   vendored Jellyfin OpenAPI spec — the authoritative client contract
-docs/        architecture + conventions (metrics/tracing/logging) + plugin pins
-.port/       the per-crate coverage-gate allowlist
-```
-
-## Build
-
-```sh
-cargo build --workspace
-cargo test  --workspace
-cargo llvm-cov nextest --fail-under-lines 80 -p <crate>   # coverage gate (line coverage; stable toolchain)
-```
+**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. The Jellyfin repository is
+internally inconsistent on this point (the root `LICENSE` is GPL-2.0, but the library `.csproj`
+packages being ported declare `GPL-3.0-only`); Ferrofin follows the `GPL-3.0-only` metadata on
+the specific crates it derives from. See [`LICENSE`](LICENSE).

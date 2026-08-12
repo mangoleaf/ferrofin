@@ -17,7 +17,7 @@
 //!   from the vendored OpenAPI spec.
 //!
 //! Every instrument added here must satisfy the metric-collection rules in
-//! `brain/rules/RULES_METRICS.md` (parity-first names, bounded labels,
+//! `docs/conventions/METRICS.md` (parity-first names, bounded labels,
 //! noop-when-disabled, sync callbacks). Read that file before adding a metric.
 
 mod error;

@@ -14,7 +14,7 @@
 # release, run the manual `create-release` job; it derives the next version and
 # pushes a TAG on the commit it ran on (it does NOT commit to main). No hand-made tags.
 #
-# Tag scheme (see brain/plans/PLAN_RELEASE_STRATEGY.md):
+# Tag scheme (see RELEASE.md):
 #   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C

@@ -19,7 +19,7 @@
 //!   seam) and reach [`MergeVersionsService`] through the
 //!   [`MergeVersionsManager`] trait.
 //!
-//! Accepted divergences from the C# (see `brain/PLUGINS_UPSTREAM.md`):
+//! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation

@@ -45,9 +45,10 @@ util ─┐
 model ┼─ common ─┬─ db ──────┐
 naming┘          │            │
 keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
-                 health       │          ├─ drawing
-                              │          ├─ providers
-                              │          └─ livetv (stub)
+chromaprint      health       │          ├─ drawing
+                 metrics      │          ├─ providers
+                              │          ├─ livetv
+                              │          └─ extensions
                               └──────────────► core ─► api ─► server (bin)
 ```
 
@@ -57,16 +58,19 @@ keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
 | `ferrofin-model` | all DTOs + enums (serde + utoipa) — the shared data universe; also the DLNA profile/StreamBuilder logic |
 | `ferrofin-naming` | filename → media parsing |
 | `ferrofin-keyframes` | keyframe extraction structures |
+| `ferrofin-chromaprint` | audio fingerprinting (chromaprint) for the intro-skipper extension |
 | `ferrofin-common` | config, app-paths, **password hashing** (real PBKDF2-HMAC-SHA512/SHA1, byte-compatible with Jellyfin) |
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the schema migration, `Database` handle |
+| `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 10.11.8 for drop-in adoption) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
-| `ferrofin-providers` | metadata providers (local NFO; remote TMDB/MusicBrainz are feature-gated) |
-| `ferrofin-livetv` | Live TV (currently a disabled stub) |
+| `ferrofin-providers` | metadata providers (local NFO always on; remote TMDB/TVDB/MusicBrainz/OMDb/fanart feature-gated) |
+| `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
+| `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (replaces the .NET plugin host — see `docs/EXTENSIONS.md`) |
 | `ferrofin-core` | the concrete manager implementations — the workhorse |
 | `ferrofin-api` | axum router + handlers (the HTTP layer) |
 | `apps/ferrofin-server` | the binary: config → DB → ffmpeg → wire everything → serve |
@@ -105,7 +109,12 @@ Behavior that was a `virtual` method on `BaseItem` becomes a **free function ove
 `ferrofin-db` uses **runtime** sqlx — `#[derive(sqlx::FromRow)]` + `sqlx::query_as`, and
 `sqlx::migrate!()` for the schema. **Do not use the compile-time `query!`/`query_as!`
 macros** — they require a live `DATABASE_URL` at build/CI time, which we deliberately avoid.
-The schema is a single migration reflecting the current head (`crates/ferrofin-db/migrations/`).
+The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
+Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 10.11.8 database** — that is
+what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
+migrates in place; swapping back to Jellyfin is safe). Ferrofin-own tables/indexes live in a
+collision-proof `Hermit*`/`HermitIX_*` namespace. The `schema_conformance` test guards the
+pin; see `suite/roundtrip.sh` for the two-way swap test.
 
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.
@@ -153,9 +162,11 @@ cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 #   ffmpeg/ffprobe are auto-discovered ($PATH or --ffmpeg); absent ffmpeg only disables transcode.
 ```
 
-Note: Ferrofin serves the **API**, not a web UI — a browser at `/` returns 404 by design.
-Test with an API endpoint (`curl http://localhost:8096/System/Info/Public`), load
-`/api-docs/openapi.json` into an API tool, or point a native Jellyfin client at the server.
+Note: Ferrofin serves the Jellyfin **web client** at `/web` when `FERROFIN_WEB_DIR` points
+at a built jellyfin-web `dist/` (the release image bakes it in). Without it, Ferrofin is
+API-only and a browser at `/` returns 404. Test with an API endpoint
+(`curl http://localhost:8096/System/Info/Public`), load `/api-docs/openapi.json` into an API
+tool, open `/web`, or point a native Jellyfin client at the server.
 
 Clients authenticate with `POST /Users/AuthenticateByName`, then send the token on every
 request via `Authorization: MediaBrowser Token="…", Client="…", Device="…", DeviceId="…", Version="…"`.
@@ -220,17 +231,28 @@ the substance of what a handler actually does — don't rely on a green checkmar
 
 ## Current scope
 
-Ferrofin boots and serves the core: authentication, library browse/query, item read+write,
-images, sessions/playstate, playlists/collections, direct-play, and live HLS transcode.
+**All 412 operations in the vendored contract are wired to real handlers — 0 stubs, 0 `501`s.**
+The parity ledger (`suite/parity/LEDGER.md`) classifies every op `REAL`, with 201 of them
+deep-verified (response + read-back diffed clean against Jellyfin 10.11.8) and the remainder
+classified as accepted divergences. Working end-to-end: authentication/users/QuickConnect,
+library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
+control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
+burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 17 scheduled tasks,
+metrics/tracing, trickplay/chapters/lyrics/media segments, and backup/restore. See
+`docs/FEATURES.md` for the tiered status matrix.
 
-Not everything is implemented. Un-ported routes return `501`. The largest gaps are the
-subsystems that need real subsystem work (not just a handler): **Live TV**, **SyncPlay**, a
-**dynamic plugin host** (no Rust equivalent to .NET runtime assembly loading), and the **web
-UI** (a separate frontend — nothing is served at `/` or `/web`). Remote metadata providers
-(TMDB/MusicBrainz) are feature-gated off and return empty results until enabled.
+The real remaining gaps are **by design**, not un-ported routes:
+- **Dynamic plugin loading** — no Rust equivalent to .NET runtime assembly loading. Ferrofin
+  ships **compiled-in extensions** instead (`docs/EXTENSIONS.md`); `/Plugins` install/uninstall
+  is intentionally rejected.
+- **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
+  SSDP broadcast/discovery.
+- **Remote metadata providers** (TMDB/TVDB/MusicBrainz/OMDb/fanart) are feature-gated **off**
+  by default and return empty results until enabled with an API key.
 
-When you implement a `501` route, the pattern is: write the handler in
-`ferrofin-api/src/handlers/<controller>.rs` calling the `AppState` managers, add it to
-`handlers::REAL_ROUTES` and `handlers::register`, and — if the backing manager method is
-missing or stubbed — implement it for real in `ferrofin-traits` + `ferrofin-core`. Keep the
-contract-superset test green. Never fake a deferred subsystem to make a route "pass."
+The design invariant still holds for any **future** route added to the contract: every path
+is registered, an un-ported one returns `501` (never `404`), and the pattern is — write the
+handler in `ferrofin-api/src/handlers/<controller>.rs` calling the `AppState` managers, add it
+to `handlers::REAL_ROUTES` and `handlers::register`, implement the backing method in
+`ferrofin-traits` + `ferrofin-core`, keep the contract-superset test green. Never fake a
+deferred subsystem to make a route "pass."
