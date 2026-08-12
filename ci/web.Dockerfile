@@ -12,9 +12,16 @@ ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom so CI doesn't OOM.
 ENV NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /web
+# jellyfin-web pulls a couple of deps straight from github.com archive URLs, which
+# ECONNRESET / socket-hang-up from CI. Raise npm's fetch retries and wrap `npm ci`
+# in a retry loop so a transient network blip doesn't fail the whole image build.
 RUN git clone --depth 1 --branch "v${JELLYFIN_WEB_VERSION}" \
       https://github.com/jellyfin/jellyfin-web.git . \
- && npm ci --no-audit --no-fund \
+ && npm config set fetch-retries 5 fetch-retry-mintimeout 20000 fetch-retry-maxtimeout 120000 \
+ && n=0; until npm ci --no-audit --no-fund; do \
+      n=$((n+1)); [ "$n" -ge 5 ] && echo "npm ci failed after $n attempts" && exit 1; \
+      echo "npm ci failed, retry $n/5 after 15s"; sleep 15; \
+    done \
  && npm run build:production
 # build:production emits the static client bundle to /web/dist.
 

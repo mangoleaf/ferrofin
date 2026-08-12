@@ -21,9 +21,15 @@ ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom.
 ENV NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /web
+# jellyfin-web pulls a couple of deps from github.com archive URLs that ECONNRESET;
+# raise npm's fetch retries and retry `npm ci` so a transient blip doesn't fail the build.
 RUN git clone --depth 1 --branch "v${JELLYFIN_WEB_VERSION}" \
       https://github.com/jellyfin/jellyfin-web.git . \
- && npm ci --no-audit --no-fund \
+ && npm config set fetch-retries 5 fetch-retry-mintimeout 20000 fetch-retry-maxtimeout 120000 \
+ && n=0; until npm ci --no-audit --no-fund; do \
+      n=$((n+1)); [ "$n" -ge 5 ] && echo "npm ci failed after $n attempts" && exit 1; \
+      echo "npm ci failed, retry $n/5 after 15s"; sleep 15; \
+    done \
  && npm run build:production
 FROM scratch AS web-build
 COPY --from=web-source /web/dist /dist

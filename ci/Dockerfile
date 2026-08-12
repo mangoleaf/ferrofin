@@ -8,11 +8,14 @@ FROM rust:1.97.1-bookworm
 # rustfmt + clippy (lint) and llvm-tools-preview (coverage instrumentation).
 RUN rustup component add rustfmt clippy llvm-tools-preview
 
-# cargo-nextest (test runner) + cargo-llvm-cov (coverage) as prebuilt binaries
-# via cargo-binstall, so the image build stays fast.
-RUN curl -L --proto '=https' --tlsv1.2 -sSf \
-      https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
- && cargo binstall -y cargo-nextest cargo-llvm-cov \
+# cargo-nextest (test runner) + cargo-llvm-cov (coverage). We deliberately avoid
+# cargo-binstall / GitHub release downloads here: those 503 / rate-limit from CI
+# runners. cargo-nextest ships an official (Cloudflare-backed) tarball at
+# get.nexte.st; cargo-llvm-cov is built from crates.io. Both sidestep github.com.
+RUN curl -LsSf --retry 5 --retry-all-errors --proto '=https' --tlsv1.2 \
+      https://get.nexte.st/latest/linux \
+    | tar zxf - -C "$CARGO_HOME/bin" \
+ && cargo install --locked cargo-llvm-cov \
  && rm -rf "$CARGO_HOME/registry"
 
 # Smoke-check the tools exist at build time (fails the image build if any is missing).
