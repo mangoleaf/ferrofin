@@ -5,6 +5,10 @@ separately: the k6 load bench (now `suite/perf/`), the retired k6 parity diff (d
 the Python parity suite (now `suite/parity/`). Everything lives under this one folder:
 the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 
+> Note: some short commit SHAs referenced here and in `results/run-<sha>.json` /
+> `perf-baseline.json` predate a one-time history rewrite done before this repo went public,
+> so they no longer resolve to a commit. They remain valid as run labels.
+
 ## Entry points
 
 ```
