@@ -8,7 +8,7 @@
 //! `Arc<dyn Trait>` fields of [`AppState`].
 //!
 //! The construction order is the topological order of the manager dependency
-//! DAG; see `brain/PLAN_HERMIT_PORT.md`. This unit wires the 33 core managers
+//! DAG. This unit wires the 33 core managers
 //! and then replaces the media-encoding seams (`hls` / `attachments`) — installed
 //! as disabled stubs by [`AppState::new`] — with the real ffmpeg-backed transcode
 //! pair via [`with_media_encoding`](AppState::with_media_encoding) (built by
@@ -994,7 +994,7 @@ pub async fn build_app_state(
     // plugin registry (built above with the OpenSubtitles plugin registered). The
     // manager persists the repository list and per-plugin configuration under
     // `{config}/plugins/`. Runtime install/load is Tier 2 (a WASM/libloading
-    // host). See brain/PLAN_HERMIT_PLUGINS.md.
+    // host); the compiled-in plugin design is described in `docs/PLUGINS_UPSTREAM.md`.
     let state = state.with_plugins(Arc::clone(&plugins));
 
     // ---- SyncPlay ---------------------------------------------------------
@@ -1021,7 +1021,7 @@ pub async fn build_app_state(
     )
     .await;
 
-    // ---- playback metrics (brain/PLAN_PERFORMANCE.md Track A) --------------
+    // ---- playback-decision metrics (feeds the benchmark suite) -------------
     let playback_metrics: Arc<dyn hermit_traits::metrics::PlaybackMetrics> =
         Arc::new(hermit_core::HermitPlaybackMetrics::new(db.clone()));
 

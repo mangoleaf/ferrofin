@@ -6,7 +6,7 @@ prometheus-net surface: every metric whose concept exists in Rust keeps Jellyfin
 exact name, labels, and buckets, so existing Jellyfin Grafana dashboards work
 against Hermit unchanged.
 
-Rules for adding/changing a metric live in `brain/rules/RULES_METRICS.md`.
+Rules for adding/changing a metric live in `docs/conventions/METRICS.md`.
 
 ## Enable it
 
@@ -62,6 +62,38 @@ Then import into Grafana (both carry a `datasource` variable — pick your Prome
 The `http_*` / `process_*` panels also light up when a dashboard is pointed at a
 Jellyfin instance with metrics enabled (benchmark leg, port 18097) — that is the
 parity proof.
+
+## Traces + log↔trace correlation (OTLP → Tempo)
+
+Metrics are one signal; traces are a separate, opt-in one. Setting
+`OTEL_EXPORTER_OTLP_ENDPOINT` turns on OTLP gRPC span export (off otherwise — no
+overhead). Traces are the **only** signal on OTLP; metrics stay on this
+Prometheus scrape and logs stay on stdout/file. Design rules live in
+`docs/conventions/TRACING.md`.
+
+```bash
+# Export sampled request traces to Alloy → Tempo (default sample ratio 0.25).
+OTEL_EXPORTER_OTLP_ENDPOINT=http://<alloy-host>:4317 \
+OTEL_TRACES_SAMPLER_ARG=0.25 \
+  hermit-server --data-dir ./data
+```
+
+With export on, stdout is structured JSON by default and every log line emitted
+inside a **sampled** request carries the request's `trace_id` (unsampled requests
+carry none — no dead links). `HERMIT_LOG_FORMAT=text` restores the legacy
+human-readable stdout for interactive dev; the rotating log **file** is always
+plain text regardless (it feeds the `GET /System/Logs` dashboard viewer).
+
+To click from a log line straight to its trace in Grafana, add a **Loki derived
+field** on the Loki datasource:
+
+- **Name:** `trace_id`
+- **Regex:** `trace_id":"([0-9a-f]{32})`
+- **Internal link → data source:** your Tempo datasource
+- **URL/Query:** `${__value.raw}`
+
+Grafana → Explore (Loki) then shows a "Tempo" button on each `trace_id`-bearing
+line that opens the request waterfall.
 
 ## Metric table
 

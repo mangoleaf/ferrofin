@@ -8,8 +8,7 @@
 //! tests, never the unit suite, so it is carved out of the line-coverage gate.
 //! Everything that feeds it — argument building, output normalisation,
 //! version validation — is unit-tested against
-//! [`NoopTranscoder`](super::media_encoder) fakes and stays counted. See
-//! `brain/DEFERRED.md` for the carve-out rationale.
+//! [`NoopTranscoder`](super::media_encoder) fakes and stays counted.
 #![cfg_attr(coverage_nightly, coverage(off))]
 
 use std::process::Stdio;

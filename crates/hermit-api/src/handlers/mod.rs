@@ -580,7 +580,7 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     // `PackageController`) over the compile-time plugin registry. Reads,
     // enable/disable, config, and the repository list are real; install and
     // uninstall are honest rejections (they need the Tier-2 dynamic host, not a
-    // faked success). See `handlers::plugins` / `brain/PLAN_HERMIT_PLUGINS.md`.
+    // faked success). See `handlers::plugins`.
     ("get", "/Plugins"),
     ("get", "/Plugins/{pluginId}/Configuration"),
     ("post", "/Plugins/{pluginId}/Configuration"),

@@ -22,7 +22,7 @@ members = [
     "crates/hermit-api",
     "apps/hermit-server",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
-    # Dependency-ordered waves — see brain/PLAN_HERMIT_PORT.md:
+    # Dependency-ordered (bottom-up port waves):
     #   Wave 0: hermit-util, hermit-keyframes
     #   Wave 1: hermit-model
     #   Wave 2: hermit-common, hermit-naming, hermit-networking, hermit-health

@@ -5,7 +5,7 @@
 //! bitrate/quality/thread params, and the `CanStreamCopy{Video,Audio}`
 //! direct-play-vs-transcode decision.
 //!
-//! **Deferred (see `brain/DEFERRED.md`):** the entire hardware-acceleration
+//! **Deferred:** the entire hardware-acceleration
 //! matrix (nvenc/qsv/vaapi/videotoolbox/rkmpp/amf), tonemapping/HDR filters, and
 //! hardware scale/filter chains. Where a software-path branch would consult a
 //! deferred hardware helper (e.g. the DOVI dynamic-metadata-removal check in

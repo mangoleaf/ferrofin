@@ -5,7 +5,7 @@
 //! - [`ff_probe`] — `FfProbe.FfProbeKeyframeExtractor`.
 //! - [`ff_tool`] — `FfTool.FfToolKeyframeExtractor` (unimplemented upstream stub).
 //!
-//! The Matroska extractor is deferred (Wave 5). See `brain/PLAN_HERMIT_PORT.md`.
+//! The Matroska extractor is deferred.
 
 pub mod error;
 pub mod ff_probe;

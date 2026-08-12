@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The drop-in round-trip test — the DB-adoption requirement's definition of done
-# (brain/plans/PLAN_DB_DROPIN.md Workstream E; REQ_JELLYFIN_DB_DROPIN).
+# The drop-in round-trip test — the DB-adoption feature's definition of done
+# (adopt in place, mutate, swap back to Jellyfin — nothing may be lost).
 #
 #   1. A real jellyfin/jellyfin:10.11.8 container creates a database: startup
 #      wizard, two libraries over the synthetic fixture media, a scan, and

@@ -5,7 +5,6 @@
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
 //! metadata. The remote API plugins (TMDB/MusicBrainz/OMDB/AudioDb/ListenBrainz)
 //! are feature-gated and deferred (enrichment; need keys; not First-Light).
-//! Filled by the Wave 5 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 
 pub mod audiodb;
 pub mod container_types;

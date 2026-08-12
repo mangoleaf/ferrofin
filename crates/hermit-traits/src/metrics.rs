@@ -3,8 +3,8 @@
 //! Not a port of a Jellyfin interface: upstream throws the per-request
 //! `StreamInfo` decision away, which is exactly why avoidable transcodes are
 //! invisible there. Hermit records every PlaybackInfo decision (play method +
-//! `TranscodeReasons`) into the `HermitPlaybackSessions` table so
-//! `brain/PLAN_PERFORMANCE.md` Track A can rank transcode causes by cost.
+//! `TranscodeReasons`) into the `HermitPlaybackSessions` table so transcode
+//! causes can be ranked by cost.
 //!
 //! Recording must never break playback: implementations swallow and log their
 //! own storage errors; the methods only fail on programmer error.

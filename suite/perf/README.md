@@ -7,7 +7,7 @@ code — the only thing that differs is the layer we reimplemented (routing, DB 
 serialization), which is exactly what we want to measure.
 
 Reports render into `results/` (gitignored); keep the ones worth publishing in
-`brain/benchmarks/` with a date prefix (e.g. `2026-07-30-COMPARISON.md`).
+`suite/results/` (the committed run records are the trend history).
 
 ## What it measures
 

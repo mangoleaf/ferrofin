@@ -2,8 +2,7 @@
 //!
 //! Each module mirrors a C# file from the `Jellyfin.Extensions` namespace,
 //! translated to idiomatic Rust while preserving observable behavior (the
-//! upstream xUnit tests are ported verbatim as the oracle). See
-//! `brain/PLAN_HERMIT_PORT.md`.
+//! upstream xUnit tests are ported verbatim as the oracle).
 
 pub mod copy_to_extensions;
 pub mod dictionary_extensions;

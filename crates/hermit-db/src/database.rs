@@ -326,7 +326,7 @@ const JELLYFIN_10_11_8_MIGRATIONS: [&str; 68] = [
 const JELLYFIN_SHAPE_MIGRATION_HEAD: i64 = 7;
 
 /// Adopts an existing Jellyfin 10.11.8 SQLite database in place, if `conn` is
-/// one — the drop-in path (`brain/plans/PLAN_DB_DROPIN.md` Workstream D).
+/// one — the drop-in path (exercised end-to-end by `suite/roundtrip.sh`).
 ///
 /// Detection: an `__EFMigrationsHistory` table with no `_sqlx_migrations`
 /// alongside it. The applied EF migration-id set must match

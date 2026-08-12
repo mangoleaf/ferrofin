@@ -7,7 +7,8 @@
 //! collation (no `COLLATE` clauses exist in the schema), so Hermit must bind
 //! byte-identical formats or lookups silently miss Jellyfin-written rows.
 //! Every SQL bind of a [`Uuid`] or [`DateTime`] goes through these helpers;
-//! see `brain/knowledge/JELLYFIN_DB_SCHEMA_DIFF.md` for the evidence.
+//! the formats were verified against a real Jellyfin 10.11.8 database (see
+//! the schema fixture `tests/data/jellyfin-10.11.8-schema.sql`).
 //!
 //! The one deliberate exception: `PresentationUniqueKey` (and the composed
 //! `UserData.CustomDataKey` strings) use the lowercase un-hyphenated N-format —

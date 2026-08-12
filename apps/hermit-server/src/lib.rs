@@ -17,7 +17,6 @@
 //! - [`run`] — the end-to-end boot-and-serve entry point the binary calls.
 //!
 //! Port bootstrap semantics from `Jellyfin.Server`'s `Program.Main` + `Startup`.
-//! See `brain/PLAN_HERMIT_PORT.md`.
 
 pub mod bootstrap;
 pub mod config;

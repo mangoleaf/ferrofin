@@ -3,7 +3,7 @@ name: sync-plugin-upstream
 description: >-
   Check the third-party Jellyfin plugins ported into hermit-extensions against
   their upstream repos and port any behavioral changes, keeping
-  brain/PLUGINS_UPSTREAM.md pins current. Use when asked to "sync plugins",
+  docs/PLUGINS_UPSTREAM.md pins current. Use when asked to "sync plugins",
   "update <plugin> from upstream", "check plugin upstream", "is intro
   skipper/merge versions up to date", or "/sync-plugin-upstream". Optional
   argument: a plugin name to sync just one.
@@ -12,13 +12,13 @@ description: >-
 # Sync ported plugins with upstream
 
 Keep Hermit's compiled-in plugin ports faithful to their upstream repos. The
-manifest `brain/PLUGINS_UPSTREAM.md` is the source of truth: one table row per
+manifest `docs/PLUGINS_UPSTREAM.md` is the source of truth: one table row per
 plugin with upstream repo, local clone path, and **Ported rev** (the commit the
 Hermit code is faithful to). Run from the repo root.
 
 ## Step 1 — read the manifest, fetch upstream
 
-Parse the table in `brain/PLUGINS_UPSTREAM.md`. For each plugin (or just the
+Parse the table in `docs/PLUGINS_UPSTREAM.md`. For each plugin (or just the
 one named in the argument):
 
 ```bash
@@ -80,7 +80,7 @@ sufficient).
 
 ## Step 5 — update the manifest
 
-In `brain/PLUGINS_UPSTREAM.md`, for each synced plugin set **Ported rev** to
+In `docs/PLUGINS_UPSTREAM.md`, for each synced plugin set **Ported rev** to
 the new upstream commit (short hash) and refresh **Upstream version** from
 `git describe --tags`. Record any new accepted divergences in the per-plugin
 notes. Update the matching `*_REV` in `build.rs` even when only logic changed,

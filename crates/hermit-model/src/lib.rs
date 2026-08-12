@@ -5,7 +5,6 @@
 //! logic). Pure data + serde/utoipa derives — most-referenced crate.
 //!
 //! Ported wave-by-wave in dependency order; modules mirror the C# namespaces.
-//! See `brain/PLAN_HERMIT_PORT.md`.
 
 pub mod activity;
 pub mod api_client;

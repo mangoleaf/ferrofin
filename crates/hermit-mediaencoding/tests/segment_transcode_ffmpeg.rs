@@ -7,8 +7,8 @@
 //! the same orchestration the HTTP layer uses. They are excluded from the
 //! unit-coverage gate (integration `tests/` never count toward
 //! `cargo llvm-cov -p hermit-mediaencoding`, and the concrete spawn module carries
-//! a module-level `#![cfg_attr(coverage_nightly, coverage(off))]` carve-out — see
-//! `brain/DEFERRED.md`) and skip themselves unless `HERMIT_FFMPEG_TESTS` is set
+//! a module-level `#![cfg_attr(coverage_nightly, coverage(off))]` carve-out)
+//! and skip themselves unless `HERMIT_FFMPEG_TESTS` is set
 //! *and* both `ffmpeg` and `ffprobe` are on `PATH`, so ffmpeg-less CI stays green.
 //!
 //! Run with:

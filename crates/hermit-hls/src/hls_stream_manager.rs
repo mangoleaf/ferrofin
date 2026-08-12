@@ -25,8 +25,8 @@
 //! The **un-ported** piece — turning the raw [`HlsStreamRequest`] into a concrete
 //! transcode plan (media-source resolution, `StreamState`, and the ffmpeg
 //! command-line) — is Jellyfin's `StreamingHelpers.GetStreamingState` +
-//! `EncodingHelper.GetCommandLineArguments`, the last large slice of the port
-//! (see `brain/DEFERRED.md`). It sits behind the [`StreamStatePlanner`] seam so
+//! `EncodingHelper.GetCommandLineArguments`, the last large slice of the port.
+//! It sits behind the [`StreamStatePlanner`] seam so
 //! everything above it stays testable; the Wave-8 wiring supplies the real
 //! planner over `hermit-core`'s media-source manager + the ported
 //! [`EncodingHelper`](hermit_mediaencoding::EncodingHelper) arg builder.

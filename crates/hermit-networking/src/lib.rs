@@ -19,7 +19,7 @@
 //! The [`hermit_model::net`] value types (`IpData`, `IpNetwork`,
 //! `AddressFamily`, `PublishedServerUriOverride`) are reused, not redefined.
 //!
-//! Deferred (see `brain/DEFERRED.md`): the UDP `AutoDiscoveryHost`, the
+//! Deferred: the UDP `AutoDiscoveryHost`, the
 //! Happy-Eyeballs `HttpClientExtension` (reqwest does this itself), the UDP
 //! `SocketFactory`, OS network-change event wiring, and live interface
 //! enumeration.

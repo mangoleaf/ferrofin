@@ -26,7 +26,7 @@
 //! persisted encoding options select it, else software `libx264`. What it does
 //! *not* do is the full device-profile negotiation, the rest of the
 //! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
-//! (only stored/embedded burn-in). Those are deferred (see `brain/DEFERRED.md`).
+//! (only stored/embedded burn-in). Those are deferred.
 
 use std::path::PathBuf;
 use std::sync::Arc;

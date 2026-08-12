@@ -13,7 +13,7 @@
 //! Image ordering mirrors the plugin's `GetImages` sort exactly: widest first
 //! (HD variants win), then by language (preferred > `en` > none > other), then
 //! by community likes. The `music` (artist/album) leg is deferred until Hermit
-//! stamps MusicBrainz ids on music items (see `brain/METADATA_PROVIDERS.md`).
+//! stamps MusicBrainz ids on music items.
 
 use hermit_model::entities::ImageType;
 use serde::Deserialize;

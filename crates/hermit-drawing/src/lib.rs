@@ -1,8 +1,7 @@
 //! Image processing for Hermit — port of `Jellyfin.Drawing` + `Emby.Photos`.
 //!
 //! Implements the `hermit-traits` `ImageProcessor` / `ImageEncoder` traits via
-//! the `image` crate (resize/crop/format; no native Skia). Filled by the Wave 5
-//! PortJob. See `brain/PLAN_HERMIT_PORT.md`.
+//! the `image` crate (resize/crop/format; no native Skia).
 
 pub mod error;
 pub mod image_encoder;

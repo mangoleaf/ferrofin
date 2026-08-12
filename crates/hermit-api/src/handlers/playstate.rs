@@ -204,8 +204,8 @@ async fn report_playback_start(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Best-effort Track-A metrics update: marks the `PlaybackSessions` row started
-/// (`brain/PLAN_PERFORMANCE.md`). Never fails the report.
+/// Best-effort playback-decision metrics update: marks the `PlaybackSessions`
+/// row started. Never fails the report.
 async fn record_metrics_started(state: &AppState, play_session_id: Option<&str>) {
     if let (Some(metrics), Some(psid)) = (state.playback_metrics.as_ref(), play_session_id) {
         let _ = metrics.record_started(psid).await;

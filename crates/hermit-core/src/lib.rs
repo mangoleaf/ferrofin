@@ -11,7 +11,6 @@
 //! as `Arc<dyn Trait>` and injected at the composition root (`hermit-server`,
 //! Wave 8) — this crate depends only on `hermit-traits` for them, not on the
 //! impl crates. Peripheral + deferred-subsystem managers are minimal/stub.
-//! Filled by the Wave 6 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 //!
 //! ## Unit 1 — item repository + query translation (First-Light core)
 //!

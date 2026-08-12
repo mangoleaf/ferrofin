@@ -171,8 +171,8 @@ pub struct Inner {
     /// files without the composition root's web mount anyway).
     pub file_transformations: Option<Arc<dyn hermit_traits::plugins::FileTransformationService>>,
 
-    /// The playback-decision metrics recorder (`brain/PLAN_PERFORMANCE.md`
-    /// Track A). `None` until the composition root wires it via
+    /// The playback-decision metrics recorder (feeds the benchmark suite's
+    /// playback metrics). `None` until the composition root wires it via
     /// [`AppState::with_playback_metrics`]; while unset decisions are simply
     /// not recorded (recording is observability, never load-bearing).
     pub playback_metrics: Option<Arc<dyn hermit_traits::metrics::PlaybackMetrics>>,

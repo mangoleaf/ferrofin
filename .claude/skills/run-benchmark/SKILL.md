@@ -83,6 +83,6 @@ cd suite/perf
 
 ## Publishing
 
-Reports worth keeping go to `brain/benchmarks/` with a date prefix
+Reports worth keeping go to `suite/results/` next to the run records
 (`2026-08-04-COMPARISON.md`); `results/` is gitignored except committed run
 records under `suite/results/`.

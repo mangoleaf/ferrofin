@@ -32,8 +32,7 @@
 //! the unit's conditional gate, EXIF is therefore **deferred**: the
 //! extension gate ([`is_exif_candidate`]) is ported and unit-tested so the EXIF
 //! branch can be dropped in later without reshaping this file, but no
-//! `kamadak-exif` dependency is added and no fields are mapped. See the port
-//! report / `brain/PLAN_HERMIT_PORT.md`.
+//! `kamadak-exif` dependency is added and no fields are mapped.
 
 use chrono::{DateTime, Utc};
 use hermit_model::entities::ImageType;

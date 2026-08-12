@@ -8,7 +8,7 @@
 //! line-coverage gate below. Everything it feeds — the `start_ffmpeg`
 //! orchestration, the wait-until-segment loops, kill/cleanup — is unit-tested
 //! against [`FakeSegmentTranscoder`](super::FakeSegmentTranscoder) and stays
-//! counted. See `brain/DEFERRED.md` for the carve-out rationale.
+//! counted.
 #![cfg_attr(coverage_nightly, coverage(off))]
 
 use std::process::Stdio;

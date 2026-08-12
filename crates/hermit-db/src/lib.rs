@@ -8,7 +8,6 @@
 //!
 //! The commented-out richer per-type schema in the C# `JellyfinDbContext`
 //! (Movie/Episode/Metadata tables) is NOT active upstream and is not ported.
-//! Filled by the Wave 3 PortJob. See `brain/PLAN_HERMIT_PORT.md`.
 
 pub mod conversions;
 pub mod database;

@@ -6,7 +6,6 @@
 //! sits behind a `Transcoder` trait so unit tests use a fake. The full
 //! hardware-acceleration matrix (nvenc/qsv/vaapi/videotoolbox) and BdInfo are
 //! deferred; core software transcode + ffprobe parsing are ported.
-//! Filled by the Wave 5 PortJob. See `brain/PLAN_HERMIT_PORT.md` + `brain/DEFERRED.md`.
 
 pub mod attachments;
 pub mod configuration;

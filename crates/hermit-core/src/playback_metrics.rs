@@ -1,8 +1,8 @@
 //! [`HermitPlaybackMetrics`] — the concrete [`PlaybackMetrics`] over SQLite.
 //!
 //! Writes one `HermitPlaybackSessions` row per PlaybackInfo decision and updates it
-//! on playstate start/stop. See `brain/PLAN_PERFORMANCE.md` Track A: the point
-//! is ranking `TranscodeReasons` by frequency and cost to find transcodes that
+//! on playstate start/stop. The point is ranking `TranscodeReasons` by
+//! frequency and cost to find transcodes that
 //! a better profile decision would have avoided.
 //!
 //! Storage failures are logged and swallowed — metrics must never break

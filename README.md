@@ -10,10 +10,9 @@ shell — reusing its contract while replacing the body.
 
 ## Status
 
-Early. Ported component-by-component, strictly bottom-up, with a hard **80% line-coverage
-gate** per crate. See [`brain/PLAN_HERMIT_PORT.md`](brain/PLAN_HERMIT_PORT.md) for the wave
-plan and live status, and [`brain/DEFERRED.md`](brain/DEFERRED.md) for what's intentionally
-stubbed.
+Ported component-by-component, strictly bottom-up, with a hard **80% line-coverage
+gate** per crate. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate map
+and the porting rules.
 
 ## License
 
@@ -28,8 +27,8 @@ crates it derives from.
 crates/      library crates (hermit-util, hermit-model, hermit-naming, … hermit-api)
 apps/        hermit-server (the binary / composition root)
 contracts/   vendored Jellyfin OpenAPI spec — the authoritative client contract
-brain/       project knowledge base + plan + deferred-work ledger
-.port/        per-crate PortJob artifacts + the coverage-gate allowlist
+docs/        architecture + conventions (metrics/tracing/logging) + plugin pins
+.port/       the per-crate coverage-gate allowlist
 ```
 
 ## Build

@@ -3,7 +3,7 @@
 //!
 //! The fixture (`tests/data/jellyfin-10.11.8-schema.sql`) is the sqlite_master
 //! dump of a database created by a real `jellyfin/jellyfin:10.11.8` server —
-//! the drop-in contract (`brain/plans/PLAN_DB_DROPIN.md` Workstream E). This
+//! the drop-in contract. This
 //! test is the tripwire for future drift: any schema change that breaks
 //! byte-parity with 10.11.8 fails here, and the future Jellyfin-12 sync will
 //! be gated on an updated fixture the same way.

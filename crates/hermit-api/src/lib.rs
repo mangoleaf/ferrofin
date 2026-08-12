@@ -10,8 +10,7 @@
 //! table is [`VENDORED_ROUTES`]). First-Light and core routes have real
 //! handlers; un-ported routes return `501 Not Implemented` via the shared
 //! [`routes::not_implemented`] handler. The test `tests/contract_superset.rs`
-//! asserts the registered route table is a superset of the vendored spec. See
-//! `brain/PLAN_HERMIT_PORT.md`.
+//! asserts the registered route table is a superset of the vendored spec.
 //!
 //! This crate is the INFRA layer landed by Wave 7 unit 1: [`AppState`],
 //! [`error::ApiError`], [`auth`] (token middleware + `RequireAuth`),

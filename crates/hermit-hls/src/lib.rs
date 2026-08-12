@@ -7,8 +7,6 @@
 //!   (+ `IDynamicHlsPlaylistGenerator`), including the parity-core timing
 //!   helpers ([`compute_segments`], [`compute_equal_length_segments`],
 //!   [`is_extraction_allowed_for_file`]).
-//!
-//! See `brain/PLAN_HERMIT_PORT.md`.
 
 pub mod create_main_playlist_request;
 pub mod dynamic_hls_playlist_generator;

@@ -16,7 +16,7 @@
 //! series' seasons/episodes and an album's tracks (and queues a provider refresh
 //! when a series' display order changes). Those walks need the un-ported `Folder`
 //! OOP child tree, so the portable seam applies the edit to the addressed row and
-//! defers the cascades (logged in `brain/DEFERRED.md`). Every scalar/collection
+//! defers the cascades. Every scalar/collection
 //! field on the row is updated faithfully.
 
 use axum::extract::{Path, Query, State};

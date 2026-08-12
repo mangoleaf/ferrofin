@@ -10,7 +10,8 @@
 //! Runtime installation / removal (a dynamic plugin host — WASM or `libloading`)
 //! is **Tier 2** and out of scope: [`remove_plugin`](PluginManager::remove_plugin)
 //! rejects a compiled-in plugin, and [`list_packages`](PluginManager::list_packages)
-//! returns `[]` (no repository fetch yet). See `brain/PLAN_HERMIT_PLUGINS.md`.
+//! returns `[]` (no repository fetch yet). See `docs/PLUGINS_UPSTREAM.md` for
+//! the compiled-in plugin design.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

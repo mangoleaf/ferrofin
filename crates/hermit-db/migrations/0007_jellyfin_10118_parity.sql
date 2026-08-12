@@ -1,7 +1,8 @@
 -- 0007: pin the schema to Jellyfin 10.11.8 (drop-in requirement).
 --
 -- Hermit 0001 was transliterated from the v12.0-rc3 EF model snapshot; real
--- 10.11.8 databases differ (see brain/knowledge/JELLYFIN_DB_SCHEMA_DIFF.md).
+-- 10.11.8 databases differ (evidence: the committed schema fixture at
+-- crates/hermit-db/tests/data/jellyfin-10.11.8-schema.sql).
 -- This migration converges every Jellyfin-owned table to the exact shape a
 -- fresh 10.11.8 server creates, renames Hermit-invented tables/indexes out of
 -- upstream's namespace (Hermit*/HermitIX_*), and normalizes stored GUID casing

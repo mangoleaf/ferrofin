@@ -3,7 +3,7 @@
 //! Ports the plugin/package/repository API over the
 //! [`PluginManager`](hermit_traits::plugins::PluginManager) seam
 //! (`AppState::plugins`), backed by the registry of **compile-time** plugins the
-//! composition root registers (see `brain/PLAN_HERMIT_PLUGINS.md`). Reads
+//! composition root registers (see `docs/PLUGINS_UPSTREAM.md`). Reads
 //! (`GetPlugins`, config, repositories, image, manifest) and the enable/disable +
 //! repository-set mutators are real; the operations that need a *runtime* plugin
 //! host — installing a package and uninstalling a compiled-in plugin — return an
