@@ -225,6 +225,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn set_primary_version_id(
+        &self,
+        item_id: Uuid,
+        primary_version_id: Option<Uuid>,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(primary_version_id.map(guid_to_db))
+            .bind(guid_to_db(item_id))
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn save_provider_id(
         &self,
         item_id: Uuid,
@@ -882,5 +896,52 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(pvid, None, "full save still clears the merge link");
+    }
+
+    // Merge/split write their link through set_primary_version_id, which must
+    // touch ONLY that column: the callers hold rows loaded earlier, and a
+    // full-row write would revert concurrent scan/refresh/edit writes to the
+    // load-time values.
+    #[tokio::test]
+    async fn set_primary_version_id_leaves_other_columns_alone() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (id, primary) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, id, BaseItemKind::Episode).await;
+        // A concurrent writer's change, landed after any caller loaded the row.
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Name" = 'fresh title', "RunTimeTicks" = 42 WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .expect("concurrent write");
+
+        svc.set_primary_version_id(id, Some(primary))
+            .await
+            .expect("link");
+        let (name, ticks, pvid): (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+            r#"SELECT "Name", "RunTimeTicks", "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("row");
+        assert_eq!(pvid, Some(ferrofin_db::store::guid_to_db(primary)));
+        assert_eq!(
+            name.as_deref(),
+            Some("fresh title"),
+            "link write must not touch Name"
+        );
+        assert_eq!(ticks, Some(42), "link write must not touch RunTimeTicks");
+
+        svc.set_primary_version_id(id, None).await.expect("unlink");
+        let pvid: Option<String> =
+            sqlx::query_scalar(r#"SELECT "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(pvid, None);
     }
 }

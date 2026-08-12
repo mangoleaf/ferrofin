@@ -331,6 +331,19 @@ pub trait ItemPersistenceService: Send + Sync {
         self.save_items(items).await
     }
 
+    /// Sets (or clears, with `None`) an item's `PrimaryVersionId` merge link
+    /// without touching any other column.
+    ///
+    /// Merge/split write through this instead of a full-row save: they load
+    /// rows only to decide the linkage, and saving those loaded copies back
+    /// wholesale would revert every other column to its load-time value if a
+    /// scan, metadata refresh, or user edit landed in between.
+    async fn set_primary_version_id(
+        &self,
+        item_id: Uuid,
+        primary_version_id: Option<Uuid>,
+    ) -> Result<(), ServiceError>;
+
     /// Replaces an item's `ItemValues` links (genres/studios/tags) with `values`,
     /// each a `(type discriminant, display value)` pair. Get-or-creates the shared
     /// `ItemValues` row per (type, value) and rewrites this item's `ItemValuesMap`

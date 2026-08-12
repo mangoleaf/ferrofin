@@ -339,24 +339,24 @@ impl LibraryManager for FerrofinLibraryManager {
         let primary_id = items[primary_index].id.clone();
 
         // Link every non-primary item to the primary by pointer, and ensure the
-        // primary itself is a standalone (its own pointer cleared).
-        let mut updated = Vec::new();
+        // primary itself is a standalone (its own pointer cleared). Targeted
+        // single-column writes: the rows were loaded to *decide* the linkage,
+        // and a full-row save would write their other columns back stale.
+        let primary_uuid = Uuid::parse_str(&primary_id)
+            .map_err(|_| ServiceError::invalid_input("malformed item id"))?;
         for item in &items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
             if item.id == primary_id {
                 if item.primary_version_id.is_some() {
-                    let mut primary = item.clone();
-                    primary.primary_version_id = None;
-                    updated.push(primary);
+                    self.persistence.set_primary_version_id(id, None).await?;
                 }
             } else if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
-                let mut alt = item.clone();
-                alt.primary_version_id = Some(primary_id.clone());
-                updated.push(alt);
+                self.persistence
+                    .set_primary_version_id(id, Some(primary_uuid))
+                    .await?;
             }
-        }
-
-        if !updated.is_empty() {
-            self.persistence.save_items(&updated).await?;
         }
         Ok(())
     }
@@ -375,21 +375,21 @@ impl LibraryManager for FerrofinLibraryManager {
         };
 
         // Clear the pointer on every alternate that references the primary, then on
-        // the primary itself, so each becomes a standalone version again.
-        let mut updated = Vec::new();
-        for mut alt in self.items.get_items_by_primary_version(primary_id).await? {
-            alt.primary_version_id = None;
-            updated.push(alt);
+        // the primary itself, so each becomes a standalone version again. Targeted
+        // single-column writes — a full-row save of the loaded copies would revert
+        // any column another writer changed since the load.
+        for alt in self.items.get_items_by_primary_version(primary_id).await? {
+            let Ok(id) = Uuid::parse_str(&alt.id) else {
+                continue;
+            };
+            self.persistence.set_primary_version_id(id, None).await?;
         }
-        if let Some(mut primary) = self.items.retrieve_item(primary_id).await?
+        if let Some(primary) = self.items.retrieve_item(primary_id).await?
             && primary.primary_version_id.is_some()
         {
-            primary.primary_version_id = None;
-            updated.push(primary);
-        }
-
-        if !updated.is_empty() {
-            self.persistence.save_items(&updated).await?;
+            self.persistence
+                .set_primary_version_id(primary_id, None)
+                .await?;
         }
         Ok(())
     }

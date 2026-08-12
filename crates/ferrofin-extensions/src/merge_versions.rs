@@ -382,22 +382,27 @@ impl MergeVersionsService {
             });
         let primary_id = primary.id.clone();
 
-        let mut updated = Vec::new();
+        // Targeted single-column writes: the group rows were loaded to decide
+        // the linkage, and a full-row save would write every other column back
+        // stale — a scan or metadata refresh running concurrently (the bulk
+        // tasks share the nightly window with RefreshLibrary) would have its
+        // writes for these rows silently reverted.
+        let Ok(primary_uuid) = Uuid::parse_str(&primary_id) else {
+            return Ok(());
+        };
         for item in group.values() {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
             if item.id == primary_id {
                 if item.primary_version_id.is_some() {
-                    let mut primary = item.clone();
-                    primary.primary_version_id = None;
-                    updated.push(primary);
+                    self.persistence.set_primary_version_id(id, None).await?;
                 }
             } else if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
-                let mut alt = item.clone();
-                alt.primary_version_id = Some(primary_id.clone());
-                updated.push(alt);
+                self.persistence
+                    .set_primary_version_id(id, Some(primary_uuid))
+                    .await?;
             }
-        }
-        if !updated.is_empty() {
-            self.persistence.save_items(&updated).await?;
         }
         tracing::info!(
             merged = group.len() - 1,
