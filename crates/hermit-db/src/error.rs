@@ -35,6 +35,15 @@ pub enum DbError {
         reason: String,
     },
 
+    /// A migration left dangling foreign-key references (`foreign_key_check`
+    /// reported violations). The database is not opened; the pre-migration
+    /// backup should be restored.
+    #[error("migration produced {violations} foreign-key violation(s); database not opened")]
+    MigrationIntegrity {
+        /// The number of `foreign_key_check` rows reported.
+        violations: usize,
+    },
+
     /// The pre-migration database snapshot could not be written.
     #[error("failed to write database backup `{path}`: {source}")]
     Backup {

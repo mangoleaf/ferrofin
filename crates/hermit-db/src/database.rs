@@ -83,17 +83,40 @@ impl Database {
             .filter(|p| !p.is_empty() && *p != ":memory:")
             .map(std::path::PathBuf::from);
         // Apply migrations on a dedicated throwaway connection BEFORE the
-        // pools open. A pooled connection that spans a table-rebuild migration
-        // (0007 rebuilds `Users`/`BaseItems`) keeps stale column metadata and
-        // mis-decodes `SELECT *` by position afterwards — seen live as
-        // `Password` decoding as INTEGER on the first post-upgrade boot. With
-        // the schema settled first, every pooled connection post-dates it.
+        // pools open, with foreign keys DISABLED.
+        //
+        // Two reasons this connection is special:
+        //  1. A pooled connection that spans a table-rebuild migration
+        //     (0007 rebuilds `Users`/`BaseItems`) keeps stale column metadata
+        //     and mis-decodes `SELECT *` by position afterwards.
+        //  2. `foreign_keys = OFF` is LOAD-BEARING. A table rebuild drops the
+        //     parent table; SQLite's implicit row-delete on `DROP TABLE` fires
+        //     `ON DELETE CASCADE` on every child (Permissions, Preferences,
+        //     Devices, UserData/watch-history, AncestorIds, MediaStreamInfos,
+        //     …), silently gutting user data. `defer_foreign_keys` only defers
+        //     the integrity CHECK, NOT the cascade ACTION — it does not help.
+        //     `foreign_keys` cannot be changed inside a transaction, so it must
+        //     be set OFF on this connection BEFORE `MIGRATOR.run` opens its
+        //     per-migration transactions (SQLite's own recommended table-
+        //     rebuild procedure). A `foreign_key_check` afterwards surfaces any
+        //     integrity violation the rebuild introduced.
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
-            let mut conn = write_options.clone().connect().await?;
+            let mut conn = write_options.clone().foreign_keys(false).connect().await?;
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            let violations = sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&mut conn)
+                .await?
+                .len();
+            if violations > 0 {
+                tracing::error!(
+                    violations,
+                    "foreign-key violations after migration — database integrity is compromised"
+                );
+                return Err(crate::DbError::MigrationIntegrity { violations });
+            }
             sqlx::Connection::close(conn).await?;
         }
         Self::connect_with(read_options, write_options, pool_size, file_path).await
@@ -589,6 +612,148 @@ mod tests {
         "UserData",
         "Users",
     ];
+
+    /// Seeds a file database at the pre-0007 schema (migrations 0001–0006
+    /// applied and recorded) so a test can drive the real 0007+ upgrade path
+    /// over pre-existing rows. Returns the `sqlite://` url.
+    async fn seed_pre_0007_database(path: &std::path::Path) -> String {
+        use sqlx::ConnectOptions;
+        // Foreign keys ON here so the seeded child rows are genuinely
+        // constrained — exactly the production shape that made the 0007
+        // rebuild cascade-delete them.
+        use sqlx::migrate::Migrate;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .expect("open seed db");
+        conn.ensure_migrations_table()
+            .await
+            .expect("migrations table");
+        for m in MIGRATOR.iter().filter(|m| m.version <= 6) {
+            sqlx::raw_sql(&m.sql)
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, installed_on, success, checksum, execution_time) \
+                 VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+            )
+            .bind(m.version)
+            .bind(&*m.description)
+            .bind(&*m.checksum)
+            .execute(&mut conn)
+            .await
+            .expect("record migration");
+        }
+        // A user with an IsAdministrator permission (Kind=2) + a preference +
+        // a played UserData row — the FK children that must survive the
+        // Users/BaseItems rebuilds in 0007.
+        let uid = "eef5ffe4-b970-4ed2-8ce8-f1881e032051";
+        sqlx::query(
+            r#"INSERT INTO "Users" ("Id","AuthenticationProviderId","DisplayCollectionsView",
+               "DisplayMissingEpisodes","EnableAutoLogin","EnableLocalPassword",
+               "EnableNextEpisodeAutoPlay","EnableUserPreferenceAccess","HidePlayedInLatest",
+               "InternalId","InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+               "NormalizedUsername","PasswordResetProviderId","PlayDefaultAudioTrack",
+               "RememberAudioSelections","RememberSubtitleSelections","RowVersion","SubtitleMode",
+               "SyncPlayAccess","Username")
+               VALUES (?1,'auth',0,0,0,0,1,1,1,1,0,0,0,'ADMIN','reset',1,1,1,0,0,0,'admin')"#,
+        )
+        .bind(uid)
+        .execute(&mut conn)
+        .await
+        .expect("seed user");
+        sqlx::query(
+            r#"INSERT INTO "Permissions" ("Id","Kind","RowVersion","Value","UserId")
+               VALUES (1,2,0,1,?1)"#,
+        )
+        .bind(uid)
+        .execute(&mut conn)
+        .await
+        .expect("seed permission");
+        sqlx::query(
+            r#"INSERT INTO "Preferences" ("Id","Kind","RowVersion","Value","UserId")
+               VALUES (1,0,0,'x',?1)"#,
+        )
+        .bind(uid)
+        .execute(&mut conn)
+        .await
+        .expect("seed preference");
+        // A BaseItem + a UserData child (watch history) referencing it.
+        let item = "00000000-0000-0000-0000-0000000000aa";
+        sqlx::query(
+            r#"INSERT INTO "BaseItems" ("Id","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+               "IsRepeat","IsSeries","IsVirtualItem","Type")
+               VALUES (?1,0,0,0,1,0,0,0,'MediaBrowser.Controller.Entities.Movies.Movie')"#,
+        )
+        .bind(item)
+        .execute(&mut conn)
+        .await
+        .expect("seed item");
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+               "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1,?2,?1,0,1,0,1)"#,
+        )
+        .bind(item)
+        .bind(uid)
+        .execute(&mut conn)
+        .await
+        .expect("seed userdata");
+        sqlx::Connection::close(conn).await.expect("close");
+        format!("sqlite://{}", path.display())
+    }
+
+    /// Regression for the 0007 cascade-delete data-loss bug: rebuilding a
+    /// parent table (`Users`/`BaseItems`) via DROP fired `ON DELETE CASCADE`
+    /// on every FK child, wiping Permissions/Preferences/Devices/UserData on
+    /// any populated database. The migration connection must run with foreign
+    /// keys OFF so the rebuild preserves child rows.
+    #[tokio::test]
+    async fn upgrading_a_populated_database_preserves_fk_child_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hermit.db");
+        let url = seed_pre_0007_database(&path).await;
+
+        // The real upgrade path: connect_sized runs 0007..=head with the fix.
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade a populated database");
+
+        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
+        let at: i64 = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("version");
+        assert_eq!(at, head, "migrated to head");
+
+        for (table, expected) in [
+            ("Permissions", 1),
+            ("Preferences", 1),
+            ("Users", 1),
+            ("BaseItems", 2), // seeded movie + the placeholder root row
+            ("UserData", 1),
+        ] {
+            let n: i64 = sqlx::query_scalar(&format!(r#"SELECT COUNT(*) FROM "{table}""#))
+                .fetch_one(db.pool())
+                .await
+                .unwrap_or_else(|e| panic!("count {table}: {e}"));
+            assert_eq!(n, expected, "`{table}` rows must survive the 0007 rebuild");
+        }
+        // The admin's IsAdministrator permission specifically — this is what
+        // the device-access check needs, and losing it broke login.
+        let admin: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "Permissions" WHERE "Kind" = 2 AND "Value" = 1"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("admin perm");
+        assert_eq!(admin, 1, "the IsAdministrator permission must survive");
+    }
 
     #[test]
     fn cpu_max_parses_to_usable_cores() {
