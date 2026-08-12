@@ -5,7 +5,7 @@
 header = """
 # Changelog
 
-All notable changes to Hermit are documented here.
+All notable changes to Ferrofin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com) and
 [Conventional Commits](https://www.conventionalcommits.org); versions follow
 [Semantic Versioning](https://semver.org).\n

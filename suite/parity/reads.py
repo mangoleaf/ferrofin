@@ -12,7 +12,7 @@ Emits parity/reads-results.json (deep_verified per read op); gen-ledger.py inges
 it, superseding the static seed for the ops it re-verifies live.
 
 Run via sweep.sh (idempotently connects to the already-up servers), or directly:
-  HERMIT_URL=... JELLYFIN_URL=... parity/reads.py
+  FERROFIN_URL=... JELLYFIN_URL=... parity/reads.py
 Offline self-check:
   parity/reads.py --check
 """
@@ -114,7 +114,7 @@ def path_id_map(base, token, user_id):
 
 
 def correlate(hmap, jmap):
-    """Shared Paths -> list of (hermit_id, jellyfin_id), capped."""
+    """Shared Paths -> list of (ferrofin_id, jellyfin_id), capped."""
     shared = sorted(set(hmap) & set(jmap))
     return [(hmap[p], jmap[p]) for p in shared[:CORRELATE_LIMIT]]
 
@@ -153,12 +153,12 @@ def resolve_named(base, token, user_id):
     }
 
 
-def run(hermit_url, jellyfin_url):
-    ht, hu = bring_up(hermit_url, "hermit")
+def run(ferrofin_url, jellyfin_url):
+    ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
-    hc, jc = resolve_named(hermit_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
+    hc, jc = resolve_named(ferrofin_url, ht, hu), resolve_named(jellyfin_url, jt, ju)
 
-    pairs = correlate(path_id_map(hermit_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
+    pairs = correlate(path_id_map(ferrofin_url, ht, hu), path_id_map(jellyfin_url, jt, ju))
     rows = {}
 
     def record(op, clean, total, buckets):
@@ -195,7 +195,7 @@ def run(hermit_url, jellyfin_url):
         if ep["kind"] in ("plain", "user"):
             path = ep["url"](hc if ep["kind"] == "user" else {})
             jpath = ep["url"](jc if ep["kind"] == "user" else {})
-            hs, hb = token_get(hermit_url, path, ht)
+            hs, hb = token_get(ferrofin_url, path, ht)
             js, jb = token_get(jellyfin_url, jpath, jt)
             if hb is None or jb is None:
                 record(ep["op"], 0, 0, {})
@@ -206,7 +206,7 @@ def run(hermit_url, jellyfin_url):
             agg = {"mismatch": [], "missing": [], "extra": []}
             clean = tested = 0
             for hid, jid in pairs:
-                hs, hb = token_get(hermit_url, ep["url"](hc, hid), ht)
+                hs, hb = token_get(ferrofin_url, ep["url"](hc, hid), ht)
                 js, jb = token_get(jellyfin_url, ep["url"](jc, jid), jt)
                 if hb is None or jb is None:
                     continue
@@ -225,9 +225,9 @@ def main():
     if "--check" in sys.argv:
         selfcheck()
         return
-    hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
+    ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL", "http://localhost:18097")
-    rows, npairs = run(hermit, jellyfin)
+    rows, npairs = run(ferrofin, jellyfin)
     out = {"generated_by": "suite/parity/reads.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "correlated_items": npairs, "rows": rows}
     with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

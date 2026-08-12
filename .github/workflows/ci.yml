@@ -44,7 +44,7 @@ jobs:
         run: |
           base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           if git diff --name-only "$base" HEAD | grep -qE \
-            '^(crates/hermit-(core|db|api)/|suite/)'; then
+            '^(crates/ferrofin-(core|db|api)/|suite/)'; then
             echo "relevant=1" >> "$GITHUB_OUTPUT"
           else
             echo "perf-gate: no perf-relevant paths touched — skipping"
@@ -89,7 +89,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
       # 80% line-coverage gate. Applied per-ported-crate via the allowlist until
-      # every crate is ported, then flip to `--workspace`. See brain/PLAN_HERMIT_PORT.md.
+      # every crate is ported, then flip to `--workspace`. See brain/PLAN_FERROFIN_PORT.md.
       # ffmpeg is only needed by integration tests in later waves; unit/parity tests avoid it.
       - name: coverage gate (ported crates)
         shell: bash

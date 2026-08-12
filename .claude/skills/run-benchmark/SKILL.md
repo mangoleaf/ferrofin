@@ -1,22 +1,22 @@
 ---
 name: run-benchmark
 description: >-
-  Run the Hermit benchmark: the fast per-change perf gate, the full
-  Hermit-vs-Jellyfin two-leg comparison, or the merged parity+perf suite —
+  Run the Ferrofin benchmark: the fast per-change perf gate, the full
+  Ferrofin-vs-Jellyfin two-leg comparison, or the merged parity+perf suite —
   and read the results honestly. Use when asked to "run the benchmark",
   "bench it", "run the perf gate", "check for a perf regression",
   "compare against Jellyfin", "rebaseline", or "/run-benchmark".
 ---
 
-# Running the Hermit benchmark
+# Running the Ferrofin benchmark
 
 Three entry points, escalating in cost. Pick by intent — don't run the full
 comparison to answer a regression question.
 
 | Intent | Command | Time | Servers |
 |---|---|---|---|
-| "Did my change regress perf?" | `cd suite/perf && ./perf-gate.sh` | ~5 min | Hermit only (working tree) |
-| Full Hermit-vs-Jellyfin numbers | `cd suite/perf && ./run.sh` (= `suite/run.sh perf`) | ~30+ min | both, one at a time |
+| "Did my change regress perf?" | `cd suite/perf && ./perf-gate.sh` | ~5 min | Ferrofin only (working tree) |
+| Full Ferrofin-vs-Jellyfin numbers | `cd suite/perf && ./run.sh` (= `suite/run.sh perf`) | ~30+ min | both, one at a time |
 | Release record (parity + perf, merged) | `suite/run.sh all` | ~45+ min | both |
 | Re-join existing artifacts, no measurement | `suite/run.sh merge` | seconds | none |
 
@@ -34,7 +34,7 @@ first-time fixture generation). `suite/perf/.env` must exist (`cp .env.example .
   rule is: hands off until the leg finishes. Reusing a bench DeviceId in a probe
   can revoke the measurement token and zero a row.
 - Each perf leg starts from a **fresh DB** (`docker compose down -v`) — don't
-  "save time" by reusing state. `BENCH_ONLY=hermit|jellyfin ./run.sh` re-runs
+  "save time" by reusing state. `BENCH_ONLY=ferrofin|jellyfin ./run.sh` re-runs
   one leg while keeping the other's raw results, and skips the wipe of the
   other leg's summary only.
 - The full run **overwrites `suite/perf/results/raw/*.json`** — if the current
@@ -49,7 +49,7 @@ cd suite/perf
 ./perf-gate.sh --rebaseline   # capture a new baseline (see rules below)
 ```
 
-- Mandatory for any change touching `hermit-core`, `hermit-db`, `hermit-api`,
+- Mandatory for any change touching `ferrofin-core`, `ferrofin-db`, `ferrofin-api`,
   or the query/repository/DTO paths (per root `CLAUDE.md`).
 - Fails if any sentinel exceeds **1.5× baseline on p50, p95, or p99** or its
   200-rate drops. A first-round failure re-runs once and must reproduce —
@@ -62,13 +62,13 @@ cd suite/perf
 ## Reading the results
 
 - Full run: `suite/perf/results/latest.md` (+ raw per-leg
-  `results/raw/{hermit,jellyfin}-summary.json`). Merged suite record:
+  `results/raw/{ferrofin,jellyfin}-summary.json`). Merged suite record:
   `suite/results/run-<sha>.json`. Dashboard: `suite/viewer/serve.sh` →
   http://127.0.0.1:8125/suite/viewer/.
 - Headline stats (median speedup, win rate) count **comparable rows only** —
   deep-verified parity + both-200 + no body drift. A "loss" can be p50-only:
-  check p95/p99 before concluding Hermit is slower (a win requires all three
-  percentiles; the board has had rows where Hermit "lost" p50 by 4ms and won
+  check p95/p99 before concluding Ferrofin is slower (a win requires all three
+  percentiles; the board has had rows where Ferrofin "lost" p50 by 4ms and won
   p99 by 20×).
 - Cheap endpoints' p50 under the mixed 50-VU loop includes **DB-pool queueing
   behind the heavy rows** — it is not that endpoint's intrinsic cost. Verify

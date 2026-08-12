@@ -1,5 +1,5 @@
-# Release image of the Hermit server:
-#   - the hermit-server binary (built from this workspace),
+# Release image of the Ferrofin server:
+#   - the ferrofin-server binary (built from this workspace),
 #   - ffmpeg/ffprobe (scan probes with ffprobe, transcode needs ffmpeg),
 #   - jellyfin-web (served at /web).
 #
@@ -51,20 +51,20 @@ FROM ${WEB_IMAGE} AS web
 FROM rust:1.97.1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p hermit-server
+RUN cargo build --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}
-COPY --from=build /src/target/release/hermit-server /usr/local/bin/hermit-server
-COPY --from=web /dist /usr/share/hermit/web
+COPY --from=build /src/target/release/ferrofin-server /usr/local/bin/ferrofin-server
+COPY --from=web /dist /usr/share/ferrofin/web
 # The release version, passed from CI (--build-arg SERVICE_VERSION=<tag>). The
 # binary reports it (falling back to the crate version when unset for local builds).
 ARG SERVICE_VERSION=
 ENV SERVICE_VERSION=$SERVICE_VERSION
-# HERMIT_WEB_DIR lives OUTSIDE /data on purpose: /data is a mounted volume that
+# FERROFIN_WEB_DIR lives OUTSIDE /data on purpose: /data is a mounted volume that
 # would shadow anything baked under it.
-ENV HERMIT_DATA_DIR=/data HERMIT_BIND_ADDR=0.0.0.0 HERMIT_PORT=8096 \
-    HERMIT_WEB_DIR=/usr/share/hermit/web
+ENV FERROFIN_DATA_DIR=/data FERROFIN_BIND_ADDR=0.0.0.0 FERROFIN_PORT=8096 \
+    FERROFIN_WEB_DIR=/usr/share/ferrofin/web
 VOLUME /data
 EXPOSE 8096
-ENTRYPOINT ["hermit-server"]
+ENTRYPOINT ["ferrofin-server"]

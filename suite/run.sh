@@ -30,7 +30,7 @@ case "$stage" in
   gate)
     if [ "${1:-}" = "--measure" ]; then
       # Fresh measurement at reduced load (fast via VUs/duration), then merge, then check. Runs
-      # both legs so run.sh's report step has both summaries; the gate itself only reads Hermit's.
+      # both legs so run.sh's report step has both summaries; the gate itself only reads Ferrofin's.
       shift
       RUN_TRANSCODE=0 BENCH_VUS="${PERF_GATE_VUS:-10}" BENCH_DURATION="${PERF_GATE_SECONDS:-10}s" \
         "$ROOT/suite/perf/run.sh"

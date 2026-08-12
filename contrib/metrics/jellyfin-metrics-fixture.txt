@@ -1,7 +1,7 @@
 # Captured live from a real Jellyfin 10.11.8 instance (EnableMetrics: true) on 2026-08-04.
 # This is the empirical parity oracle (RULES_METRICS rule 1): where any doc/table disagrees
 # with the names/labels/buckets below, THIS FILE WINS. Portable families (http_*, process_*)
-# are ported 1:1 by hermit-metrics; dotnet_*/prometheus_net_* are documented divergences.
+# are ported 1:1 by ferrofin-metrics; dotnet_*/prometheus_net_* are documented divergences.
 #
 # HELP dotnet_contention_total The number of locks contended
 # TYPE dotnet_contention_total counter

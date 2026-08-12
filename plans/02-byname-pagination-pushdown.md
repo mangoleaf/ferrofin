@@ -1,12 +1,12 @@
 # Plan 2 — Push pagination/name filters into the by-name aggregate query
 
 ## Problem
-`item_values_with_counts` (`crates/hermit-core/src/item_repository.rs:153-252`) backs
+`item_values_with_counts` (`crates/ferrofin-core/src/item_repository.rs:153-252`) backs
 `get_genres` / `get_music_genres` / `get_studios` / `get_artists` /
 `get_album_artists` / `get_all_artists`. It **ignores** the caller's `start_index`,
 `limit`, `search_term`, `name_starts_with`, `name_starts_with_or_greater`, and
 `name_less_than` (all threaded in via `ByNameListQuery::base_query` in
-`crates/hermit-api/src/handlers/by_name.rs:74-94` but silently dropped). It:
+`crates/ferrofin-api/src/handlers/by_name.rs:74-94` but silently dropped). It:
 
 1. aggregates counts for **every** matching `ItemValues` row,
 2. loads **every** by-name `BaseItems` row via an `IN` list,
@@ -45,7 +45,7 @@ Watch out: `search_term` on Jellyfin is a *contains* match while
 
 ## Verification
 - Standard gates: fmt, clippy `-D warnings`, `cargo nextest run --workspace`, coverage
-  ≥80% on hermit-core (`cargo llvm-cov nextest -p hermit-core --fail-under-lines 80
+  ≥80% on ferrofin-core (`cargo llvm-cov nextest -p ferrofin-core --fail-under-lines 80
   --summary-only`).
 - Unit tests: paged + name-filtered by-name queries against a seeded test DB (extend
   the existing item_repository test module; there is already a

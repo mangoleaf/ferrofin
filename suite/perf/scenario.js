@@ -3,12 +3,12 @@
 // The VU loop then hits each read endpoint, recording latency into a per-endpoint Trend.
 //
 // Run indirectly via run.sh. Direct:
-//   TARGET=hermit BASE_URL=http://localhost:8096 k6 run scenario.js
+//   TARGET=ferrofin BASE_URL=http://localhost:8096 k6 run scenario.js
 import http from 'k6/http';
 import { Trend, Rate } from 'k6/metrics';
 import { ENDPOINTS, fire, okStatus, tokenHeaders, bringUp, enrichContext } from './bench-lib.js';
 
-const TARGET = __ENV.TARGET;                 // 'hermit' | 'jellyfin'
+const TARGET = __ENV.TARGET;                 // 'ferrofin' | 'jellyfin'
 const BASE = __ENV.BASE_URL;
 const EXPECTED = parseInt(__ENV.EXPECTED_ITEMS || '0', 10);
 const MAIN_SECS = parseInt((__ENV.BENCH_DURATION || '30s').replace('s', ''), 10) || 30;

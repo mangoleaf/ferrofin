@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Perf regression gate — Hermit-only, sentinel endpoints, diff vs perf-baseline.json.
+# Perf regression gate — Ferrofin-only, sentinel endpoints, diff vs perf-baseline.json.
 #
-# Builds the current working tree into the benchmark image, brings up Hermit
-# alone (skips Jellyfin for speed — the gate compares Hermit to its OWN baseline,
+# Builds the current working tree into the benchmark image, brings up Ferrofin
+# alone (skips Jellyfin for speed — the gate compares Ferrofin to its OWN baseline,
 # not to Jellyfin), drives each sentinel endpoint at a light fixed load, and
 # fails (exit 1) if any endpoint exceeds PERF_GATE_FACTOR× its baseline on p50,
 # p95, OR p99, or if its 200-rate < 100%. Median-only gating hides tail
@@ -50,20 +50,20 @@ if [ -n "${REAL_MEDIA_DIR:-}" ] || [ -n "${REAL_TV_DIR:-}" ]; then EXPECTED_ITEM
 else EXPECTED_ITEMS=$(( ${FIXTURE_MOVIES:-0} + ${FIXTURE_SERIES:-0} * ${FIXTURE_EPISODES_PER_SERIES:-0} )); fi
 export LIBRARIES="$LIBS" REAL_MEDIA_DIR REAL_TV_DIR BENCH_ADMIN_USER BENCH_ADMIN_PASSWORD EXPECTED_ITEMS JELLYFIN_IMAGE
 
-BASE="http://localhost:$HERMIT_HOST_PORT"
+BASE="http://localhost:$FERROFIN_HOST_PORT"
 
-run_endpoints() {   # $1 = space-separated endpoint names → results/raw/perfgate-hermit-<name>.json
+run_endpoints() {   # $1 = space-separated endpoint names → results/raw/perfgate-ferrofin-<name>.json
   for name in $1; do
-    k6 run -e ENDPOINT="$name" -e TARGET=hermit -e BASE_URL="$BASE" \
+    k6 run -e ENDPOINT="$name" -e TARGET=ferrofin -e BASE_URL="$BASE" \
       perf-gate.js </dev/null >/dev/null 2>&1 || true
   done
 }
 
-echo ">> perf-gate: ${VUS} VUs × ${SECS}s/endpoint, factor ${FACTOR}× (Hermit only)"
+echo ">> perf-gate: ${VUS} VUs × ${SECS}s/endpoint, factor ${FACTOR}× (Ferrofin only)"
 # bringup_scan takes the base URL, not the bare port — passing the port made
 # the readiness loop poll host "18196" and hang (caught the first time this
 # script was actually run end-to-end; plan 08 step 2).
-bringup_scan hermit "$BASE" hermit || { echo "perf-gate: Hermit failed to come up"; exit 2; }
+bringup_scan ferrofin "$BASE" ferrofin || { echo "perf-gate: Ferrofin failed to come up"; exit 2; }
 run_endpoints "$ENDPOINTS_LIST"
 
 if [ "$REBASELINE" = 1 ]; then

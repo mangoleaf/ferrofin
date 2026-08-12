@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate Hermit's version strings from git tags — the single source of truth
+# Generate Ferrofin's version strings from git tags — the single source of truth
 # for both the release tag (create-release) and the image tag (docker build).
 # Kept here (not inline in .gitlab-ci.yml) so the logic is unit-testable with bats
 # and checkable with shellcheck instead of buried in YAML.

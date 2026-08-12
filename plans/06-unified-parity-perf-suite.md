@@ -2,7 +2,7 @@
 
 ## Current state (three stacks, grown separately)
 1. **`benchmark/`** — k6 load harness. `run.sh` (+ `run-phase-{a,b,c}.sh`) runs the
-   Hermit and Jellyfin containers **one at a time** (ports 18096/18097), endpoints
+   Ferrofin and Jellyfin containers **one at a time** (ports 18096/18097), endpoints
    defined ad-hoc in `bench-lib.js` as `{name: 'items_filters2', path: (c) => ...}`.
    Per-version results in `bench-data.json`; viewer `index.html` served at :8124.
 2. **`benchmark/parity.sh` + `parity.js`** — an older k6 body-diff harness (both
@@ -19,8 +19,8 @@
   name. Cross-referencing parity ↔ perf is manual. (`items_filters2` vs
   `GET /Items/Filters2`.)
 - **M2 — Perf was never conditioned on parity.** Early runs showed 800–2100× median
-  "speedups" while Hermit served hollow/incomplete bodies; as parity work made
-  responses real (e.g. the NFO scan populating genres/studios/people), Hermit
+  "speedups" while Ferrofin served hollow/incomplete bodies; as parity work made
+  responses real (e.g. the NFO scan populating genres/studios/people), Ferrofin
   "got slower". The headline trend conflates *doing the work correctly now* with
   *actual regressions* — unfair in both directions and it hid real regressions.
 - **M3 — No stable endpoint identity across runs.** The bench set grew 7 → 31 → 83
@@ -87,7 +87,7 @@ suite/run.sh gate            # Plan 4's fast regression gate, reading merged res
 Each `suite/run.sh all` emits one JSON:
 
 ```json
-{ "meta": { "hermit": "<git describe>", "hermit_sha": "…",
+{ "meta": { "ferrofin": "<git describe>", "ferrofin_sha": "…",
             "jellyfin_image": "jellyfin/jellyfin:10.11.8@sha256:…",
             "fixture_hash": "<sha256 of gen-fixtures output manifest>",
             "cpus": 4, "mem": "…", "load": {"vus": 50, "seconds": 30},
@@ -107,7 +107,7 @@ Each `suite/run.sh all` emits one JSON:
   records `parity_coverage` (% of benched ops deep-verified) so the historical
   trend decomposes into "coverage went up" vs "speed went down".
 - **Percentile rule (repo owner, 2026-08-03):** every perf record carries p50,
-  p95, and p99 for both servers, and an endpoint counts as a Hermit "win" only
+  p95, and p99 for both servers, and an endpoint counts as a Ferrofin "win" only
   when it wins on **all three**. A p50 win with a p95/p99 loss is surfaced as a
   tail loss, never folded into a single "faster" verdict — median-only speedup
   scoreboards hid 2× p99 regressions in the past.

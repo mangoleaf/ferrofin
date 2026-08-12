@@ -1,4 +1,4 @@
-# Hermit CI/CD — the canonical pipeline (GitLab is the source of truth).
+# Ferrofin CI/CD — the canonical pipeline (GitLab is the source of truth).
 #
 # Stages:
 #   test    — fmt / clippy / unit tests, plus the per-crate 80% coverage gate.
@@ -452,14 +452,14 @@ release:
     - echo "Creating GitLab Release for $CI_COMMIT_TAG"
   release:
     tag_name: $CI_COMMIT_TAG
-    name: "Hermit $CI_COMMIT_TAG"
+    name: "Ferrofin $CI_COMMIT_TAG"
     description: release_notes.md
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
 
 # ---------------------------------------------------------------------------
 # chart — official Helm chart as an OCI artifact
-#   install: helm install hermit oci://$REGISTRY/charts/hermit --version <chart-version>
+#   install: helm install ferrofin oci://$REGISTRY/charts/ferrofin --version <chart-version>
 #
 # Both chart version and appVersion are taken from the tag (via helm flags):
 #   - chart-vA.B.C : chart-only release @ A.B.C
@@ -481,8 +481,8 @@ helm-chart:
       helm registry login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD"
       # Chart version is bare semver (Helm requires it). appVersion keeps the v so
       # the chart's default image.tag (= appVersion) matches the v-tagged image.
-      helm package charts/hermit --version "$VER" --app-version "v${VER}" --destination /tmp
-      helm push "/tmp/hermit-${VER}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
+      helm package charts/ferrofin --version "$VER" --app-version "v${VER}" --destination /tmp
+      helm push "/tmp/ferrofin-${VER}.tgz" "oci://${CI_REGISTRY_IMAGE}/charts"
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
     - if: '$CI_COMMIT_TAG =~ /^chart-v\d+\.\d+\.\d+$/'

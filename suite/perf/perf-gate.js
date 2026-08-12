@@ -1,4 +1,4 @@
-// Perf regression gate — closed-model, Hermit-only, one endpoint per run.
+// Perf regression gate — closed-model, Ferrofin-only, one endpoint per run.
 //
 // Reuses bench-lib's auth + ENDPOINTS machinery. Unlike phase-a.js (open-model
 // release profiler) this drives a fixed pool of VUs as-fast-as-possible for a

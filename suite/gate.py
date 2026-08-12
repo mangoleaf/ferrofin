@@ -8,7 +8,7 @@ one baseline file (this directory's perf-baseline.json, sections `raw` and
 `merged`):
 
 Raw capture mode — driven by suite/perf/perf-gate.sh, which runs k6 per
-sentinel endpoint into results/raw/perfgate-hermit-<name>.json (CWD-relative,
+sentinel endpoint into results/raw/perfgate-ferrofin-<name>.json (CWD-relative,
 the runner cd's into suite/perf/):
 
   python3 ../gate.py compare-raw    <baselineFile> <factor> <name...>
@@ -74,7 +74,7 @@ def classify(base, cur, factor, min_delta_ms=0.0):
 
 def _load_raw(name):
     try:
-        return json.loads(Path(f"results/raw/perfgate-hermit-{name}.json").read_text())
+        return json.loads(Path(f"results/raw/perfgate-ferrofin-{name}.json").read_text())
     except (OSError, ValueError):
         return None
 
@@ -161,9 +161,9 @@ def rebaseline_merged(run):
         variants[p["variant"]] = {"op": o["op"], "h_p50": p["h_p50"], "h_p95": p["h_p95"],
                                   "h_p99": p["h_p99"], "deep_verified": o["parity"]["deep_verified"]}
     doc = _read_baseline_file(BASELINE)
-    doc["merged"] = {"factor": FACTOR, "hermit": run["meta"]["hermit"], "variants": variants}
+    doc["merged"] = {"factor": FACTOR, "ferrofin": run["meta"]["ferrofin"], "variants": variants}
     BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
-    print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['hermit']} [merged]")
+    print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['ferrofin']} [merged]")
 
 
 def check_merged(run):
@@ -179,7 +179,7 @@ def check_merged(run):
         if b is None:
             continue
         if p["h_ok"] is not None and p["h_ok"] < 100:
-            fails.append(f"{p['variant']}: Hermit 200-rate {p['h_ok']}% < 100%")
+            fails.append(f"{p['variant']}: Ferrofin 200-rate {p['h_ok']}% < 100%")
         for pct in ("h_p50", "h_p95", "h_p99"):
             if (p[pct] is not None and b[pct] and p[pct] > b[pct] * FACTOR
                     and (p[pct] - b[pct]) > MIN_DELTA_MS):
@@ -194,7 +194,7 @@ def check_merged(run):
             print(f"  ✗ {f}", file=sys.stderr)
         sys.exit(1)
     print(f">> gate OK: {len(base)} baselined ops within {FACTOR}× and parity held "
-          f"(run {run['meta']['hermit']})")
+          f"(run {run['meta']['ferrofin']})")
 
 
 if __name__ == "__main__":

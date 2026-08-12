@@ -1,12 +1,12 @@
 
-> **Living document.** Mandatory rules for distributed tracing in the `hermit-*`
+> **Living document.** Mandatory rules for distributed tracing in the `ferrofin-*`
 > workspace. The implementation these rules assume is specified in
-> the OTLP bootstrap (`apps/hermit-server/src/bootstrap.rs`). Unlike metrics, tracing has **no
+> the OTLP bootstrap (`apps/ferrofin-server/src/bootstrap.rs`). Unlike metrics, tracing has **no
 > Jellyfin parity constraint** — upstream has no tracing; this is purely additive.
 
 # Tracing conventions
 
-Hermit exports its existing `tracing` spans as OpenTelemetry traces over **OTLP
+Ferrofin exports its existing `tracing` spans as OpenTelemetry traces over **OTLP
 gRPC** (Alloy `:4317` → Tempo), enabled purely by environment. A slow request can
 then be opened as a per-request waterfall in Grafana.
 
@@ -56,7 +56,7 @@ returns). A restart that loses the last spans is a bug.
 The sampled request span carries a `trace_id` field, and every `tracing` event
 inside the request inherits it — **never** stamp trace ids per-callsite by hand.
 
-- Stdout is structured **JSON by default**; `HERMIT_LOG_FORMAT=text` restores the
+- Stdout is structured **JSON by default**; `FERROFIN_LOG_FORMAT=text` restores the
   legacy human-readable tee for interactive dev.
 - The rotating log **file** stays plain text always — `GET /System/Logs` feeds the
   Jellyfin dashboard log viewer, which renders raw lines (this IS a parity
@@ -69,6 +69,6 @@ inside the request inherits it — **never** stamp trace ids per-callsite by han
 - Inbound W3C `traceparent` extraction (no Jellyfin client sends it).
 - Outbound context injection into provider HTTP calls (TMDB/OMDb) — YAGNI until
   remote providers are on by default.
-- Any Hermit config-file / `ServerConfiguration` field for tracing — this is
+- Any Ferrofin config-file / `ServerConfiguration` field for tracing — this is
   deployment config (env only), not user config, so `/System/Configuration` stays
   byte-identical to Jellyfin.

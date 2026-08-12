@@ -4,7 +4,7 @@
 // Reuses the exact provisioning path the load/parity scripts use (bench-lib).
 import { bringUp } from './bench-lib.js';
 
-const TARGET = __ENV.TARGET;                 // 'hermit' | 'jellyfin'
+const TARGET = __ENV.TARGET;                 // 'ferrofin' | 'jellyfin'
 const BASE = __ENV.BASE_URL;
 const EXPECTED = parseInt(__ENV.EXPECTED_ITEMS || '0', 10);
 

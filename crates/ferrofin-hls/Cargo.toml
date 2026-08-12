@@ -1,0 +1,25 @@
+[package]
+name = "ferrofin-hls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HLS playlist generation for Ferrofin (port of Jellyfin.MediaEncoding.Hls)."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-mediaencoding.workspace = true
+ferrofin-keyframes.workspace = true
+ferrofin-model.workspace = true
+ferrofin-traits.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true

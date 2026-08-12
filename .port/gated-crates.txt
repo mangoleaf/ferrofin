@@ -1,21 +1,21 @@
 # Crates that have passed a PortJob and are under the 80% line-coverage CI gate.
 # One crate name per line. The INTEGRATE stage appends a crate here on success.
 # Flip CI to `--workspace` once every planned crate is listed.
-hermit-util
-hermit-keyframes
-hermit-model
-hermit-common
-hermit-naming
-hermit-networking
-hermit-health
-hermit-db
-hermit-mediaencoding
-hermit-drawing
-hermit-providers
-hermit-livetv
-hermit-hls
-hermit-core
-hermit-api
-hermit-chromaprint
-hermit-extensions
-hermit-metrics
+ferrofin-util
+ferrofin-keyframes
+ferrofin-model
+ferrofin-common
+ferrofin-naming
+ferrofin-networking
+ferrofin-health
+ferrofin-db
+ferrofin-mediaencoding
+ferrofin-drawing
+ferrofin-providers
+ferrofin-livetv
+ferrofin-hls
+ferrofin-core
+ferrofin-api
+ferrofin-chromaprint
+ferrofin-extensions
+ferrofin-metrics

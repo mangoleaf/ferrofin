@@ -41,7 +41,7 @@ def main():
                          "comparable": False, "reason": "legacy: pre-merge run, no parity/fixture hash"},
             })
         legacy.append({
-            "meta": {"hermit": ver.get("hermit", "?"), "hermit_sha": ver.get("hermit", "?"),
+            "meta": {"ferrofin": ver.get("ferrofin", "?"), "ferrofin_sha": ver.get("ferrofin", "?"),
                      "jellyfin_image": ver.get("jellyfin"), "fixture_hash": None,
                      "cpus": None, "mem": None, "load": {"vus": None, "duration": None},
                      "perf_source": "legacy", "when": ver.get("when"), "legacy": True},

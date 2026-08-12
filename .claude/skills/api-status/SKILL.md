@@ -1,7 +1,7 @@
 ---
 name: api-status
 description: >-
-  Generate Hermit's API implementation-status report against the vendored
+  Generate Ferrofin's API implementation-status report against the vendored
   Jellyfin OpenAPI contract: every operation classified REAL / PARTIAL / HOLLOW /
   STUB(501), a per-controller table, the hollow-endpoint "landmine" list, and a
   summary. Use when asked for "API status", "implementation status", "what
@@ -11,7 +11,7 @@ description: >-
 
 # API implementation-status report
 
-Produce an honest status of Hermit's API vs. the Jellyfin contract. Run from the
+Produce an honest status of Ferrofin's API vs. the Jellyfin contract. Run from the
 repo root.
 
 ## The one thing that makes this report honest
@@ -46,13 +46,13 @@ floor; Step 2 reclassifies some REAL rows down to HOLLOW/PARTIAL.
 ## Step 2 — depth audit (find the HOLLOW/PARTIAL handlers)
 
 Fan out subagents (Agent tool, `general-purpose`) over the handler files. Batch
-the ~64 files in `crates/hermit-api/src/handlers/` into ~8 groups of similar size
-(see `wc -l crates/hermit-api/src/handlers/*.rs`); group by domain
+the ~64 files in `crates/ferrofin-api/src/handlers/` into ~8 groups of similar size
+(see `wc -l crates/ferrofin-api/src/handlers/*.rs`); group by domain
 (items/library, media/streaming, images/subs, users/sessions, system/admin,
 by-name/metadata, playlists/tv, plugins/livetv/misc). Give each agent this exact
 rubric:
 
-> You are auditing a Rust axum API (Hermit, a Jellyfin-compatible server) for
+> You are auditing a Rust axum API (Ferrofin, a Jellyfin-compatible server) for
 > HOLLOW route handlers — registered, returns 200, but returns constant/empty
 > data regardless of the request, so a client sees "success" but no real data.
 > Audit ONLY these files: `<list>`. For each `.route(...)` in the file's
@@ -73,16 +73,16 @@ rubric:
 ## Step 3 — confirm the manager layer (catch hollow-at-impl)
 
 A handler that calls a manager is only REAL if the *injected* impl is real. Check
-the composition root `apps/hermit-server/src/state.rs` for the tells:
+the composition root `apps/ferrofin-server/src/state.rs` for the tells:
 
 - **Underscore-bound = never wired into `AppState`** (e.g. `let _live_tv = ...`):
   the handlers for it can't be using it — they return constants. HOLLOW.
 - **Empty-constructed providers**: `LocalProviderManager::new(Vec::new())` →
   remote metadata/image/subtitle search all HOLLOW.
 - **`Null*` / stub structs**: `NullImageEncoder` (image resize/format = no-op),
-  `HermitLyricManager` (stub — all methods return `None`/empty), `Disabled*`.
+  `FerrofinLyricManager` (stub — all methods return `None`/empty), `Disabled*`.
 - Grep to be sure:
-  `grep -rn "struct .*Manager" crates/hermit-core/src | grep -i "stub\|disabled\|null"`
+  `grep -rn "struct .*Manager" crates/ferrofin-core/src | grep -i "stub\|disabled\|null"`
   and read the impl (`Ok(None)`, `Ok(Vec::new())`, `todo!`, "deferred", "stub").
 
 Fold any manager-layer stubs into the classifications from Step 2 (a REAL-looking
@@ -119,7 +119,7 @@ and the STUB + HOLLOW op lists. Build the report from it:
 ## Notes
 
 - `scan.py` normalizes paths param-agnostically and folds the `.{container}` /
-  `.m3u8` / `/stream` suffix equivalences Hermit's router relies on, so
+  `.m3u8` / `/stream` suffix equivalences Ferrofin's router relies on, so
   `REAL_ROUTES` matches the spec paths. HEAD ops (image variants) are included.
 - The classification TSV is a **snapshot** — regenerate it via Steps 2–3 each run;
   do not cache stale findings. The deterministic REAL-vs-STUB split (Step 1) is

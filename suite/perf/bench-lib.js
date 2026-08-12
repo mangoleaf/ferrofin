@@ -42,7 +42,7 @@ export function authenticate(base, target) {
 
 // `includeTypes` omitted ⇒ count ALL item types (recursive). Progress polling must use the
 // unfiltered count: it climbs steadily as rows are indexed, whereas the Movie,Episode-filtered
-// count lags on Hermit (items are classified late in the scan) and can sit flat for ~20s during a
+// count lags on Ferrofin (items are classified late in the scan) and can sit flat for ~20s during a
 // single slow 4K ffprobe — which used to make waitForScan settle prematurely (e.g. at 3 items).
 export function itemCount(base, ctx, includeTypes) {
   const t = includeTypes ? `&includeItemTypes=${includeTypes}` : '';
@@ -73,7 +73,7 @@ export function waitForScan(base, target, ctx, _expected) {
 // Add the libraries from the LIBRARIES env (real media and/or synthetic padding) and kick a scan.
 export function provision(base, target, ctx) {
   const h = tokenHeaders(ctx.token);
-  // Fairness: Hermit's remote metadata providers are inert (feature-gated / no keys), so
+  // Fairness: Ferrofin's remote metadata providers are inert (feature-gated / no keys), so
   // Jellyfin's must be off too — else its TMDB/OMDb fetchers stay on (slower, network-dependent,
   // richer DTOs = a different workload). Empty fetcher arrays disable them; local NFO/image stay on.
   const noRemote = {
@@ -86,13 +86,13 @@ export function provision(base, target, ctx) {
   };
   for (const l of JSON.parse(__ENV.LIBRARIES || '[]')) {
     const q = `name=${encodeURIComponent(l.name)}&collectionType=${l.type}&paths=${encodeURIComponent(l.path)}`;
-    // Always send a real JSON body: an empty body with a JSON content-type is a 400 on Hermit.
+    // Always send a real JSON body: an empty body with a JSON content-type is a 400 on Ferrofin.
     const body = target === 'jellyfin' ? JSON.stringify(noRemote) : '{}';
     const r = http.post(`${base}/Library/VirtualFolders?${q}${target === 'jellyfin' ? '&refreshLibrary=true' : ''}`, body, h);
     if (r.status >= 300) throw new Error(`[${target}] add library "${l.name}" failed: ${r.status} ${r.body}`);
   }
   if (target !== 'jellyfin') {
-    const r = http.post(`${base}/Library/Refresh`, null, h);   // hermit: kick the scan
+    const r = http.post(`${base}/Library/Refresh`, null, h);   // ferrofin: kick the scan
     if (r.status >= 300) throw new Error(`[${target}] /Library/Refresh failed: ${r.status}`);
   }
 }
@@ -258,7 +258,7 @@ export const ENDPOINTS = [
   { name: 'item_similar_movie', path: (c) => `/Movies/${c.itemId}/Similar?userId=${c.userId}&limit=12` },
   { name: 'media_segments', path: (c) => `/MediaSegments/${c.itemId}` },
 
-  // Image serve + resize (hermit-drawing). Best-effort: N/A if no local poster is discovered.
+  // Image serve + resize (ferrofin-drawing). Best-effort: N/A if no local poster is discovered.
   { name: 'image_primary', path: (c) => `/Items/${c.imageItemId}/Images/Primary?fillHeight=400&fillWidth=400` },
 
   // ── Expanded surface (2026-08: 43/412 benched ops was ~10%) ──────────────

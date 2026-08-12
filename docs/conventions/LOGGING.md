@@ -1,17 +1,17 @@
 
-> **Living document.** Mandatory rules for logging across the `hermit-*` workspace.
+> **Living document.** Mandatory rules for logging across the `ferrofin-*` workspace.
 > These govern every `tracing` statement and span, now and later. The
 > implementation these assume is specified in
-> the tracing-subscriber setup (`apps/hermit-server/src/bootstrap.rs`). Logs share the pipeline with traces
+> the tracing-subscriber setup (`apps/ferrofin-server/src/bootstrap.rs`). Logs share the pipeline with traces
 > ([TRACING.md](TRACING.md)): a log event inside a span inherits its
 > fields, so good spans make good logs.
 
 # Logging conventions
 
-Hermit logs through `tracing` to two sinks: **structured JSON on stdout** (default;
+Ferrofin logs through `tracing` to two sinks: **structured JSON on stdout** (default;
 Alloy → Loki) and a **plain-text daily-rotating file** under `{data_dir}/log`
 (always text — `GET /System/Logs` renders it in the dashboard, a parity surface).
-`HERMIT_LOG_FORMAT=text` switches stdout to the human-readable tee for interactive
+`FERROFIN_LOG_FORMAT=text` switches stdout to the human-readable tee for interactive
 dev. Neither of these may change.
 
 ## 1. Levels mean things
@@ -33,7 +33,7 @@ whose volume is O(items) may sit above `debug`.**
 At the **outermost layer that still has context** — never also at the origin.
 
 - **Request paths**: the existing `ApiError` boundary
-  (`hermit-api/src/error.rs`) logs 5xx once. Do **not** add origin logging on request
+  (`ferrofin-api/src/error.rs`) logs 5xx once. Do **not** add origin logging on request
   paths — that double-logs.
 - **Background paths** (spawned tasks, samplers, schedulers): at the task's own top
   level, with the span active.
@@ -82,7 +82,7 @@ polish, not required).
 
 No `.expose()` in any log statement; tokens, passwords, API keys, and `Authorization`
 header contents stay out — spans and events alike. Secret hygiene
-(`hermit-model/src/secret.rs`, `secrecy`-backed) is load-bearing; keep it. Raw
+(`ferrofin-model/src/secret.rs`, `secrecy`-backed) is load-bearing; keep it. Raw
 filesystem paths and entity IDs **are** fine in logs (unlike metric labels — different
 rules; cardinality doesn't bind logs).
 

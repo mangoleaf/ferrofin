@@ -1,7 +1,7 @@
 # Plan 3 — DTO projection pass: one path, fully batched
 
 ## Problem
-`HermitDtoService` (`crates/hermit-core/src/dto_service.rs`, ~2950 lines) has **two
+`FerrofinDtoService` (`crates/ferrofin-core/src/dto_service.rs`, ~2950 lines) has **two
 paths**:
 
 - **Batch** (`get_base_item_dtos`, lines ~1386-1573): prefetches ~11 relations for the
@@ -25,7 +25,7 @@ Remaining N+1s **inside the batch path**:
    prefetch at ~1449-1482 — "attach_artists is unconditional").
 
 Non-problem (verified, don't "fix"): `get_image_cache_tag` is a pure md5(path+ticks)
-computation (`crates/hermit-drawing/src/processor.rs:460-481`) — no I/O. Leave the
+computation (`crates/ferrofin-drawing/src/processor.rs:460-481`) — no I/O. Leave the
 per-image calls alone.
 
 ## Fix
@@ -36,7 +36,7 @@ per-image calls alone.
    **cannot be reached**. This is the durable fix: future handlers physically can't
    write the N+1.
 2. **Batch `set_item_by_name_info`.** Add a batch method to `ItemCountService`
-   (`hermit-traits` + `hermit-core/src/item_count_service.rs`): resolve all page items'
+   (`ferrofin-traits` + `ferrofin-core/src/item_count_service.rs`): resolve all page items'
    `CleanName`s in one query, then one grouped count query
    (`GROUP BY iv."CleanValue", bi."Type"`) covering every name on the page. Wire it
    into `get_base_item_dtos` where the per-item loop currently calls
@@ -49,7 +49,7 @@ per-image calls alone.
    rather than by requested field — verify with the parity harness, then implement
    what Jellyfin does. Do not silently drop fields Jellyfin sends (strict Android TV
    SDK crashes on missing-where-Jellyfin-sends-non-null).
-4. While in the file: `movies.rs:86-98` (hermit-api) calls `get_base_item_dtos` once
+4. While in the file: `movies.rs:86-98` (ferrofin-api) calls `get_base_item_dtos` once
    per recommendation category (~8 calls/request → 8× prefetch). If cheap, collect all
    category items, project once, and reassemble per category preserving order/dupes.
    This endpoint (`movie_recommendations`) has a known concurrency cliff (~200 rps,
@@ -58,7 +58,7 @@ per-image calls alone.
 
 ## Verification
 - Standard gates: fmt, clippy `-D warnings`, `cargo nextest run --workspace`
-  (+ doctests), coverage ≥80% per touched crate (hermit-core, hermit-traits is
+  (+ doctests), coverage ≥80% per touched crate (ferrofin-core, ferrofin-traits is
   exempt).
 - Parity: `benchmark/parity.sh` — single-item endpoints (`/Users/{id}/Items/{id}`,
   `/Persons/{name}`, `/Genres/{name}`) and list endpoints must stay byte-identical.
@@ -69,7 +69,7 @@ per-image calls alone.
   movie_recommendations"`. Expect item_detail (the single-item N+1) and persons
   (ItemCounts loop) to improve most.
 - **Run the server and hit it over real HTTP** (project rule: green tests are
-  necessary, not sufficient). Dev server needs `HERMIT_WEB_DIR` set or `/web` serves
+  necessary, not sufficient). Dev server needs `FERROFIN_WEB_DIR` set or `/web` serves
   nothing.
 
 ## Constraints

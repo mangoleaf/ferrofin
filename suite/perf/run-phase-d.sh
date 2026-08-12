@@ -4,7 +4,7 @@
 # run.sh's 50-VU table stays the stress headline.
 #
 #   ./run-phase-d.sh                    both servers
-#   BENCH_ONLY=hermit ./run-phase-d.sh
+#   BENCH_ONLY=ferrofin ./run-phase-d.sh
 #   PHASE_D_VUS=8 PHASE_D_DUR=120s     knobs (defaults shown)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -26,8 +26,8 @@ phase_d() {  # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && phase_d hermit "$HERMIT_HOST_PORT" hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && phase_d jellyfin "$JELLYFIN_HOST_PORT" jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && phase_d ferrofin "$FERROFIN_HOST_PORT" ferrofin
+[ "${BENCH_ONLY:-}" != "ferrofin" ]   && phase_d jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase D report"

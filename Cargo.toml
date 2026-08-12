@@ -1,34 +1,34 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/hermit-util",
-    "crates/hermit-keyframes",
-    "crates/hermit-model",
-    "crates/hermit-common",
-    "crates/hermit-naming",
-    "crates/hermit-networking",
-    "crates/hermit-health",
-    "crates/hermit-db",
-    "crates/hermit-traits",
-    "crates/hermit-mediaencoding",
-    "crates/hermit-hls",
-    "crates/hermit-drawing",
-    "crates/hermit-providers",
-    "crates/hermit-livetv",
-    "crates/hermit-chromaprint",
-    "crates/hermit-core",
-    "crates/hermit-extensions",
-    "crates/hermit-metrics",
-    "crates/hermit-api",
-    "apps/hermit-server",
+    "crates/ferrofin-util",
+    "crates/ferrofin-keyframes",
+    "crates/ferrofin-model",
+    "crates/ferrofin-common",
+    "crates/ferrofin-naming",
+    "crates/ferrofin-networking",
+    "crates/ferrofin-health",
+    "crates/ferrofin-db",
+    "crates/ferrofin-traits",
+    "crates/ferrofin-mediaencoding",
+    "crates/ferrofin-hls",
+    "crates/ferrofin-drawing",
+    "crates/ferrofin-providers",
+    "crates/ferrofin-livetv",
+    "crates/ferrofin-chromaprint",
+    "crates/ferrofin-core",
+    "crates/ferrofin-extensions",
+    "crates/ferrofin-metrics",
+    "crates/ferrofin-api",
+    "apps/ferrofin-server",
     # crates are added here as each PortJob's SCAFFOLD stage lands them.
     # Dependency-ordered (bottom-up port waves):
-    #   Wave 0: hermit-util, hermit-keyframes
-    #   Wave 1: hermit-model
-    #   Wave 2: hermit-common, hermit-naming, hermit-networking, hermit-health
-    #   Wave 3: hermit-db          Wave 4: hermit-traits
-    #   Wave 5: hermit-mediaencoding, hermit-hls, hermit-drawing, hermit-providers, hermit-livetv(stub)
-    #   Wave 6: hermit-core        Wave 7: hermit-api        Wave 8: apps/hermit-server
+    #   Wave 0: ferrofin-util, ferrofin-keyframes
+    #   Wave 1: ferrofin-model
+    #   Wave 2: ferrofin-common, ferrofin-naming, ferrofin-networking, ferrofin-health
+    #   Wave 3: ferrofin-db          Wave 4: ferrofin-traits
+    #   Wave 5: ferrofin-mediaencoding, ferrofin-hls, ferrofin-drawing, ferrofin-providers, ferrofin-livetv(stub)
+    #   Wave 6: ferrofin-core        Wave 7: ferrofin-api        Wave 8: apps/ferrofin-server
 ]
 
 [workspace.package]
@@ -37,13 +37,13 @@ edition = "2024"
 license = "GPL-3.0-only"          # matches the GPL-3.0-only package metadata on the Jellyfin crates being ported
 publish = false
 # Placeholder until the public repository exists (set at the public release).
-repository = "https://example.com/hermit"
+repository = "https://example.com/ferrofin"
 
 [workspace.lints.rust]
 missing_docs = "warn"
 # `coverage_nightly` is set by cargo-llvm-cov (nightly) to gate the
 # `#[coverage(off)]` carve-outs on un-mockable I/O modules (e.g. the real
-# ffmpeg spawn in hermit-mediaencoding). Register it so stable builds don't warn.
+# ffmpeg spawn in ferrofin-mediaencoding). Register it so stable builds don't warn.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [workspace.lints.clippy]
@@ -53,25 +53,25 @@ doc_markdown = "allow"
 
 [workspace.dependencies]
 # ── intra-workspace (path deps added as crates land) ───────────────
-hermit-util = { path = "crates/hermit-util" }
-hermit-keyframes = { path = "crates/hermit-keyframes" }
-hermit-model = { path = "crates/hermit-model" }
-hermit-common = { path = "crates/hermit-common" }
-hermit-naming = { path = "crates/hermit-naming" }
-hermit-networking = { path = "crates/hermit-networking" }
-hermit-health = { path = "crates/hermit-health" }
-hermit-db = { path = "crates/hermit-db" }
-hermit-traits = { path = "crates/hermit-traits" }
-hermit-mediaencoding = { path = "crates/hermit-mediaencoding" }
-hermit-hls = { path = "crates/hermit-hls" }
-hermit-drawing = { path = "crates/hermit-drawing" }
-hermit-providers = { path = "crates/hermit-providers" }
-hermit-livetv = { path = "crates/hermit-livetv" }
-hermit-chromaprint = { path = "crates/hermit-chromaprint" }
-hermit-core = { path = "crates/hermit-core" }
-hermit-extensions = { path = "crates/hermit-extensions" }
-hermit-metrics = { path = "crates/hermit-metrics" }
-hermit-api = { path = "crates/hermit-api" }
+ferrofin-util = { path = "crates/ferrofin-util" }
+ferrofin-keyframes = { path = "crates/ferrofin-keyframes" }
+ferrofin-model = { path = "crates/ferrofin-model" }
+ferrofin-common = { path = "crates/ferrofin-common" }
+ferrofin-naming = { path = "crates/ferrofin-naming" }
+ferrofin-networking = { path = "crates/ferrofin-networking" }
+ferrofin-health = { path = "crates/ferrofin-health" }
+ferrofin-db = { path = "crates/ferrofin-db" }
+ferrofin-traits = { path = "crates/ferrofin-traits" }
+ferrofin-mediaencoding = { path = "crates/ferrofin-mediaencoding" }
+ferrofin-hls = { path = "crates/ferrofin-hls" }
+ferrofin-drawing = { path = "crates/ferrofin-drawing" }
+ferrofin-providers = { path = "crates/ferrofin-providers" }
+ferrofin-livetv = { path = "crates/ferrofin-livetv" }
+ferrofin-chromaprint = { path = "crates/ferrofin-chromaprint" }
+ferrofin-core = { path = "crates/ferrofin-core" }
+ferrofin-extensions = { path = "crates/ferrofin-extensions" }
+ferrofin-metrics = { path = "crates/ferrofin-metrics" }
+ferrofin-api = { path = "crates/ferrofin-api" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
@@ -102,15 +102,15 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 utoipa = "5"
 
 # ── metrics + traces: OpenTelemetry ────────────────────────────────
-# metrics → prometheus exposition (hermit-metrics only); traces → OTLP gRPC
-# (hermit-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
+# metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
+# (ferrofin-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
 # (the expected +1 offset); bump both together if otel ever moves.
 opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.33"
-# encode-only; hermit-metrics ONLY — the 0.32 exporter exposes no render helper,
+# encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }
 
@@ -131,9 +131,9 @@ clap = { version = "4.5", features = ["derive"] }
 bitflags = "2"
 regex = "1"
 fancy-regex = "0.14"    # for C# regexes that use lookaround
-quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (hermit-providers)
+quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration
 insta = { version = "1", features = ["json"] }   # golden-file parity snapshots
-tempfile = "3"          # temp SQLite files for hermit-db tests
+tempfile = "3"          # temp SQLite files for ferrofin-db tests

@@ -2,7 +2,7 @@
 """Deterministic core of the api-status skill.
 
 Enumerates every operation in the vendored Jellyfin OpenAPI contract
-(`contracts/jellyfin-openapi-*.json`) and joins it against hermit-api's
+(`contracts/jellyfin-openapi-*.json`) and joins it against ferrofin-api's
 `REAL_ROUTES` table to classify each op:
 
   REAL  - a real handler is registered (router skips the shared 501 stub)
@@ -14,7 +14,7 @@ it returns real data. A handler can be REGISTERED yet HOLLOW (returns a constant
 states can only be found by reading handler bodies + the composition root; the
 skill's agent-audit step produces a classification TSV that this script overlays.
 
-Usage (run from the hermit repo root):
+Usage (run from the ferrofin repo root):
   scan.py                       # REAL vs STUB baseline table
   scan.py classify.tsv          # overlay HOLLOW/PARTIAL from the audit
   scan.py classify.tsv --list   # also dump the STUB + HOLLOW op lists
@@ -38,14 +38,14 @@ METHODS = ("get", "post", "put", "delete", "patch", "head")
 def norm(method, path):
     """Param-name-agnostic key that matches REAL_ROUTES to spec paths.
 
-    Replicates the router's `to_axum_path` (crates/hermit-api/src/routes.rs): any
+    Replicates the router's `to_axum_path` (crates/ferrofin-api/src/routes.rs): any
     segment containing a `{placeholder}` collapses to a single `{}` capture of the
     whole segment, so a mixed literal+param segment folds to `{}` too
     (`stream.{container}` -> `{}`, `Stream.{routeFormat}` -> `{}`,
     `{segmentId}.{container}` -> `{}`). Literal-only segments are kept verbatim
     (`subtitles.m3u8`, `stream`, `Countries`), and param names are irrelevant.
     This is exactly the equivalence the router keys on, so a route registered
-    under Hermit's spelling matches the vendored spec path it serves.
+    under Ferrofin's spelling matches the vendored spec path it serves.
     """
     segments = ["{}" if "{" in seg else seg for seg in path.split("/")]
     return (method, "/".join(segments))
@@ -59,7 +59,7 @@ def load_spec():
 
 
 def load_real_routes():
-    mod = open("crates/hermit-api/src/handlers/mod.rs").read()
+    mod = open("crates/ferrofin-api/src/handlers/mod.rs").read()
     start = mod.index("pub const REAL_ROUTES")
     blk = mod[start:]
     blk = blk[: blk.index("\n];")]

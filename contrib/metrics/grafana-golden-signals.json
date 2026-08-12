@@ -1,8 +1,8 @@
 {
   "__inputs": [],
   "__requires": [],
-  "title": "Hermit \u2014 Golden Signals",
-  "uid": "hermit-golden-signals",
+  "title": "Ferrofin \u2014 Golden Signals",
+  "uid": "ferrofin-golden-signals",
   "editable": true,
   "schemaVersion": 39,
   "version": 1,
@@ -165,7 +165,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_sessions_active",
+          "expr": "ferrofin_sessions_active",
           "legendFormat": "sessions"
         }
       ]
@@ -209,7 +209,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_playback_streams_active",
+          "expr": "ferrofin_playback_streams_active",
           "legendFormat": "streams"
         }
       ]
@@ -706,7 +706,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_db_pool_connections - hermit_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections",
           "legendFormat": "{{pool}}"
         }
       ]

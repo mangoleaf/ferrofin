@@ -9,7 +9,7 @@
 # PHASE_B_ENDPOINTS.
 #
 #   ./run-phase-b.sh                    both servers, curated endpoints
-#   BENCH_ONLY=hermit ./run-phase-b.sh
+#   BENCH_ONLY=ferrofin ./run-phase-b.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=../lib.sh
@@ -54,8 +54,8 @@ sweep() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && sweep hermit "$HERMIT_HOST_PORT" hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && sweep jellyfin "$JELLYFIN_HOST_PORT" jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && sweep ferrofin "$FERROFIN_HOST_PORT" ferrofin
+[ "${BENCH_ONLY:-}" != "ferrofin" ]   && sweep jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase B report"

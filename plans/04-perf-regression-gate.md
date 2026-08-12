@@ -13,8 +13,8 @@ converts slowdowns from a trend someone notices into a gate agents can't slip pa
   `PHASE_B_ENDPOINTS` env var (default already includes the right sentinels:
   `info_public user_me items_sortname items_mixed item_detail persons studios
   suggestions movie_recommendations items_filters2 image_primary`).
-- `benchmark/docker-compose.yml`, `Dockerfile.hermit`, `gen-fixtures.sh` — the
-  containerized Hermit+Jellyfin pair with a deterministic 2,637-item fixture library.
+- `benchmark/docker-compose.yml`, `Dockerfile.ferrofin`, `gen-fixtures.sh` — the
+  containerized Ferrofin+Jellyfin pair with a deterministic 2,637-item fixture library.
 - `benchmark/bench-data.json` — historical per-version results (p50/p95/p99/speedup
   per endpoint) served at :8124; use it to seed the baseline.
 - Harness gotchas (hard-won, do not rediscover): ports 18096/18097; no legacy auth
@@ -24,8 +24,8 @@ converts slowdowns from a trend someone notices into a gate agents can't slip pa
 A `benchmark/perf-gate.sh` that:
 
 1. Builds the current working tree into the benchmark image and runs phase-b on the
-   sentinel endpoints, **Hermit only** (skip the Jellyfin side for speed — the gate
-   compares Hermit to its own baseline, not to Jellyfin). Reduced load is fine
+   sentinel endpoints, **Ferrofin only** (skip the Jellyfin side for speed — the gate
+   compares Ferrofin to its own baseline, not to Jellyfin). Reduced load is fine
    (e.g. 10 VUs × 10 s/endpoint) as long as the baseline is captured under the
    *same* parameters.
 2. Compares each endpoint's **p50, p95, AND p99** to
@@ -39,7 +39,7 @@ A `benchmark/perf-gate.sh` that:
    on p50 while its p99 was 2× worse than Jellyfin's — median-only gating
    hides tail regressions, and tail latency is what users feel as stutter.
    The baseline file stores all three percentiles per endpoint, the failure
-   report names which percentile(s) tripped, and any "Hermit vs Jellyfin"
+   report names which percentile(s) tripped, and any "Ferrofin vs Jellyfin"
    summary the gate prints must show per-percentile comparisons (an endpoint
    only counts as a "win" if it wins on p50, p95, and p99; a p50 win with a
    tail loss is reported as a tail loss).
@@ -50,7 +50,7 @@ A `benchmark/perf-gate.sh` that:
 
 Then wire it in:
 - Document in `benchmark/README.md` and in `CLAUDE.md` under quality gates: perf-gate
-  must pass for any change touching `hermit-core`, `hermit-db`, `hermit-api`, or
+  must pass for any change touching `ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or
   `translate_query`/repository/dto code.
 - If a CI workflow exists (`.github/workflows/`), add it as a job gated on those
   paths; if CI has no Docker/ffmpeg, make the job best-effort but keep the local gate

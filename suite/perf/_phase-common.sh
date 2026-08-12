@@ -3,8 +3,8 @@
 # Run in an ISOLATED compose project + host ports, so a concurrent (or hung)
 # run.sh on the default `benchmark` project (ports 18096/18097) can't tear down
 # our containers mid-scan — and we can't clobber it either. Overridable.
-export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-hermit-phase}"
-export HERMIT_HOST_PORT="${HERMIT_HOST_PORT:-18196}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ferrofin-phase}"
+export FERROFIN_HOST_PORT="${FERROFIN_HOST_PORT:-18196}"
 export JELLYFIN_HOST_PORT="${JELLYFIN_HOST_PORT:-18197}"
 #
 # bringup_scan <svc> <base> <target>

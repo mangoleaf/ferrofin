@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """suite/merge.py — join parity (ledger) + perf (bench) into ONE run record (Plan 6, M2/M4).
 
-Reads, all at a single Hermit SHA:
+Reads, all at a single Ferrofin SHA:
   - suite/registry.json          variant id → contract operation (the join key, M1)
   - suite/parity/ledger.json           per-op parity depth + deep_verified + classification
   - perf (per variant latencies), from EITHER
-        suite/perf/results/raw/{hermit,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
+        suite/perf/results/raw/{ferrofin,jellyfin}-summary.json   (a fresh `suite/run.sh perf`)
         or the latest entry of suite/perf/bench-data.json       (fallback)
-  - suite/results/raw/perf-fingerprints-{hermit,jellyfin}.json (optional, mid-run honesty check)
+  - suite/results/raw/perf-fingerprints-{ferrofin,jellyfin}.json (optional, mid-run honesty check)
 
 Writes suite/results/run-<sha>.json and upserts it into suite/results/runs.json (the trend the
 viewer reads). Fairness rules baked in (not left to the reader):
   - a row is `comparable` only if the op is deep_verified, both servers answered 200 for it, and
-    Hermit's body SHAPE matched Jellyfin's when both were captured during the perf leg (same
+    Ferrofin's body SHAPE matched Jellyfin's when both were captured during the perf leg (same
     library state — comparing across the parity/perf legs false-flags play-state fields);
   - the headline median-speedup / win-rate are computed over comparable rows ONLY;
-  - a Hermit "win" requires beating Jellyfin on p50 AND p95 AND p99 — a p50 win with a tail loss
+  - a Ferrofin "win" requires beating Jellyfin on p50 AND p95 AND p99 — a p50 win with a tail loss
     is surfaced as a tail loss, never folded into "faster".
 """
 import hashlib
@@ -114,7 +114,7 @@ def footprint():
         return round(max(vals)) if vals else None
 
     out = {}
-    for tgt, key in (("hermit", "h"), ("jellyfin", "j")):
+    for tgt, key in (("ferrofin", "h"), ("jellyfin", "j")):
         out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
         out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
         out[f"{key}_items"] = first(f"{tgt}-count.txt")
@@ -134,7 +134,7 @@ def footprint():
 
 def perf_by_variant():
     """{variant: {h_p50,h_p95,h_p99,h_rps,h_ok, j_*}} from raw summaries, else bench-data latest."""
-    h = load_json(SUITE / "perf/results/raw/hermit-summary.json")
+    h = load_json(SUITE / "perf/results/raw/ferrofin-summary.json")
     j = load_json(SUITE / "perf/results/raw/jellyfin-summary.json")
     if h and j:
         out = {}
@@ -185,7 +185,7 @@ def main():
     v2op = variant_to_op()
     par = parity_by_op()
     perf, perf_src = perf_by_variant()
-    fp_h = load_json(RAW / "perf-fingerprints-hermit.json", {})
+    fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
 
     operations, benched_ops, deep_ops = [], set(), set()
@@ -237,8 +237,8 @@ def main():
     sha = sh("git", "rev-parse", "--short", "HEAD") or "unknown"
     record = {
         "meta": {
-            "hermit": sh("git", "describe", "--tags", "--always") or "dev",
-            "hermit_sha": sha,
+            "ferrofin": sh("git", "describe", "--tags", "--always") or "dev",
+            "ferrofin_sha": sha,
             "jellyfin_image": bench_env("JELLYFIN_IMAGE") or "jellyfin/jellyfin:10.11.8",
             "fixture_hash": fixture_hash(),
             "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
@@ -261,12 +261,12 @@ def main():
     # their signatures differ; a re-merge is identical and overwrites its own entry.
     runs = load_json(RESULTS / "runs.json", {"runs": []})
     sig = run_signature(record)
-    same_sha = [r for r in runs["runs"] if r["meta"]["hermit_sha"] == sha]
+    same_sha = [r for r in runs["runs"] if r["meta"]["ferrofin_sha"] == sha]
     dup = next((r for r in same_sha if run_signature(r) == sig), None)
     seq = dup["meta"].get("run_seq", 1) if dup else len(same_sha) + 1
     record["meta"]["run_seq"] = seq
-    record["meta"]["run_label"] = record["meta"]["hermit"] if seq == 1 \
-        else f"{record['meta']['hermit']} ({seq})"
+    record["meta"]["run_label"] = record["meta"]["ferrofin"] if seq == 1 \
+        else f"{record['meta']['ferrofin']} ({seq})"
 
     # Numbered filename so reruns of one SHA don't clobber each other's record file.
     out = RESULTS / (f"run-{sha}.json" if seq == 1 else f"run-{sha}-{seq}.json")

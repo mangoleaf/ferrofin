@@ -1,0 +1,172 @@
+# =============================================================================
+# Ferrofin — worked example values
+# =============================================================================
+# A realistic, fully-worked deployment: private registry, GPU transcoding,
+# read-only media libraries, and separate persistent volumes for the database
+# and the cache. Every environment-specific value below is a PLACEHOLDER — copy
+# this file, then replace the `<...>` and example names with your own.
+#
+# For the full option reference and defaults, see values.yaml in this chart.
+# Only the keys you override need to appear in your own values file.
+# =============================================================================
+
+replicaCount: 1
+
+image:
+  # Your image location. The chart default points at the project's own registry;
+  # override it if you mirror the image somewhere else.
+  repository: registry.example.com/<org>/ferrofin
+  # Empty → the chart's appVersion. Pin a tag (e.g. "0.12.0") in production.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Pull secret for a PRIVATE registry. Create it once in the release namespace:
+#   kubectl create secret docker-registry <name> -n <namespace> \
+#     --docker-server=registry.example.com \
+#     --docker-username=<user> --docker-password=<token>
+imagePullSecrets:
+  - name: <registry-pull-secret>
+
+# -----------------------------------------------------------------------------
+# GPU transcoding (NVIDIA). Omit this whole block for CPU-only transcoding.
+# -----------------------------------------------------------------------------
+# `privileged` is the simplest way to give the container the GPU; if you run the
+# NVIDIA device plugin with proper device requests you can often drop it.
+securityContext:
+  privileged: true
+
+service:
+  type: ClusterIP
+  port: 8096
+
+resources:
+  limits:
+    # Requires the NVIDIA device plugin installed in the cluster.
+    nvidia.com/gpu: 1
+    memory: 8Gi
+    cpu: 8000m
+  requests:
+    memory: 2Gi
+    cpu: 1000m
+
+# -----------------------------------------------------------------------------
+# Scheduling. REQUIRED when your PVs are node-local (e.g. StorageClass backed by
+# a local disk): pin the pod to the node that physically holds the volumes.
+# Delete this block if your storage is network-attached (NFS/Ceph/cloud disks).
+# -----------------------------------------------------------------------------
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["<storage-node>"]
+
+# -----------------------------------------------------------------------------
+# Persistence — TWO separate volumes on purpose (see the volumes block below):
+#   /data       → database, config.toml, metadata   (small, precious)
+#   /data/cache → resized-image cache + transcodes   (large, regenerable, churny)
+# Keeping the cache OFF the database volume means cache growth or transcode churn
+# can never fill the volume your SQLite DB lives on and wedge the server.
+# -----------------------------------------------------------------------------
+persistence:
+  config:
+    enabled: true
+    mountPath: /data
+    # Use a pre-created PVC, or drop existingClaim and set size/storageClass to
+    # let the chart create one.
+    existingClaim: <ferrofin-config-pvc>
+    # size: 10Gi
+    # storageClass: ""
+
+# -----------------------------------------------------------------------------
+# Extra volumes: media libraries (read-only) + the dedicated cache volume.
+# -----------------------------------------------------------------------------
+volumes:
+  # --- Media, mounted read-only (Ferrofin only ever reads your libraries) --------
+  - name: media-tv
+    persistentVolumeClaim:
+      claimName: <media-tv-pvc>
+  - name: media-movies
+    persistentVolumeClaim:
+      claimName: <media-movies-pvc>
+  # --- Dedicated cache volume (image cache + transcode scratch) ----------------
+  # NOTE: mount this at /data/cache, NOT /data/transcodes. Ferrofin writes BOTH the
+  # resized-image cache (/data/cache/images) and transcode scratch
+  # (/data/cache/transcodes) under {data_dir}/cache. Mounting only /data/transcodes
+  # leaves the image cache on the database volume and this PV mostly unused.
+  - name: ferrofin-cache
+    persistentVolumeClaim:
+      claimName: <ferrofin-cache-pvc>
+
+volumeMounts:
+  - name: media-tv
+    mountPath: /media/TV
+    readOnly: true
+  - name: media-movies
+    mountPath: /media/Movies
+    readOnly: true
+  # Whole cache dir on the dedicated volume — keeps cache/transcode churn off the
+  # 10Gi-ish database volume.
+  - name: ferrofin-cache
+    mountPath: /data/cache
+
+# -----------------------------------------------------------------------------
+# Application config. `ferrofin.config` becomes a ConfigMap injected as env vars.
+# Full config is FERROFIN_* env or {data_dir}/config.toml.
+# -----------------------------------------------------------------------------
+ferrofin:
+  # Raw env (secrets, device flags). For a metadata provider key, prefer a Secret
+  # referenced via `ferrofin.envFrom` rather than putting it here in plaintext.
+  env:
+    # GPU passthrough (drop if not using NVIDIA):
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: "all"
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "all"
+  config:
+    # Move the cache dir explicitly if you don't want the {data_dir}/cache default.
+    # If you set this, mount your cache volume HERE instead of /data/cache.
+    # FERROFIN_CACHE_DIR: "/data/cache"
+
+    # The URL clients reach this server on (behind your ingress/reverse proxy).
+    # FERROFIN_PUBLISHED_URL: "https://ferrofin.example.com"
+
+    # Prometheus /metrics endpoint (scraped by the ServiceMonitor below).
+    FERROFIN_ENABLE_METRICS: "true"
+    FERROFIN_METRICS_SAMPLE_INTERVAL: "30"
+
+    # Export sampled request traces over OTLP gRPC to your collector (→ Tempo/Jaeger).
+    # Off unless set; stdout stays structured JSON with a trace_id on each line.
+    # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<otel-collector>.<namespace>.svc.cluster.local:4317"
+    # OTEL_TRACES_SAMPLER_ARG: "0.25"
+
+# -----------------------------------------------------------------------------
+# Metrics — Ferrofin exposes a Prometheus /metrics endpoint (enable it above via
+# FERROFIN_ENABLE_METRICS). Turn on the ServiceMonitor if you run the Prometheus
+# Operator.
+# -----------------------------------------------------------------------------
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+
+# -----------------------------------------------------------------------------
+# Ingress — expose Ferrofin outside the cluster. Pick ingress OR httpRoute.
+# -----------------------------------------------------------------------------
+# ingress:
+#   enabled: true
+#   className: nginx
+#   annotations:
+#     cert-manager.io/cluster-issuer: letsencrypt
+#   hosts:
+#     - host: ferrofin.example.com
+#       paths:
+#         - path: /
+#           pathType: Prefix
+#   tls:
+#     - secretName: ferrofin-tls
+#       hosts:
+#         - ferrofin.example.com

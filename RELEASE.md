@@ -1,7 +1,7 @@
-# Releasing Hermit
+# Releasing Ferrofin
 
-Hermit ships two artifacts from this repo: the **server image** and the official
-**Helm chart** (`charts/hermit/`). They are versioned **independently**. This is
+Ferrofin ships two artifacts from this repo: the **server image** and the official
+**Helm chart** (`charts/ferrofin/`). They are versioned **independently**. This is
 the operational checklist.
 
 ## The versioning model
@@ -46,7 +46,7 @@ respin — never re-point an existing rc tag.
 
 For template/values fixes with no app change:
 
-1. `helm lint charts/hermit` and render-test with a real values file.
+1. `helm lint charts/ferrofin` and render-test with a real values file.
 2. Push the `chart-vA.B.C` tag (via `create-release` with
    `FORCE_VERSION=chart-vA.B.C`). CI publishes the chart only, at version
    `A.B.C`, leaving the app version untouched.
@@ -54,8 +54,8 @@ For template/values fixes with no app change:
 ## Verifying a release
 
 ```bash
-docker pull  <registry>/hermit:X.Y.Z
-helm pull    oci://<registry>/hermit/charts/hermit --version A.B.C
+docker pull  <registry>/ferrofin:X.Y.Z
+helm pull    oci://<registry>/ferrofin/charts/ferrofin --version A.B.C
 ```
 
 (Substitute the registry the release pipeline publishes to.)

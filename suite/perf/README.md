@@ -1,6 +1,6 @@
-# Hermit vs Jellyfin benchmark
+# Ferrofin vs Jellyfin benchmark
 
-Hermit is a Rust port of the Jellyfin server that speaks the **identical HTTP API**. That's
+Ferrofin is a Rust port of the Jellyfin server that speaks the **identical HTTP API**. That's
 the whole reason this benchmark is simple: point one request driver at each server, feed both
 the **same media library** and the **same request sequence**, and compare. No per-server client
 code — the only thing that differs is the layer we reimplemented (routing, DB access, DTO
@@ -22,7 +22,7 @@ vs C# actually differs):
 | `GET /Items` (Movie, DateCreated desc) | the query planner under a different sort |
 | `GET /Items` (Episode) | episode-shaped DTOs + the Series/Season/Episode resolver (needs `REAL_TV_DIR`) |
 | `GET /Items/{id}` | single-item DTO build |
-| `GET /Items/{id}/Images/Primary` | image serve + resize (`hermit-drawing`) — see caveat |
+| `GET /Items/{id}/Images/Primary` | image serve + resize (`ferrofin-drawing`) — see caveat |
 | `POST /Items/{id}/PlaybackInfo` | the hottest real-client POST: play-decision + MediaSource build |
 | `POST /Sessions/Playing/Progress` | the media-server write path — clients report every ~10 s |
 | `POST /UserItems/{id}/UserData` | idempotent user-data upsert |
@@ -61,7 +61,7 @@ before ffmpeg output, not transcode throughput.
 
 - **Sustained transcode throughput** — that's ffmpeg, identical on both. Benchmarking it would
   compare ffmpeg to itself.
-- **Web UI** — Hermit ships no UI; there's nothing to compare.
+- **Web UI** — Ferrofin ships no UI; there's nothing to compare.
 
 ## Fairness (this is where benchmarks lie, so it's most of the harness)
 
@@ -73,19 +73,19 @@ before ffmpeg output, not transcode throughput.
 2. **Equal item count is asserted.** Scan completion is detected by polling `GET /Items` until
    the total settles — a signal defined purely in terms of the shared API, so it's identical on
    both servers. The report records each server's actual scanned count and **flags a mismatch**:
-   real-world filenames can parse differently between Hermit's and Jellyfin's naming resolvers,
+   real-world filenames can parse differently between Ferrofin's and Jellyfin's naming resolvers,
    and if the counts diverge you're comparing different workloads. (That divergence is itself a
    useful parity signal worth chasing down.)
 3. **Equal resource caps.** Both run in Docker with the same `cpus` / `mem_limit` (`.env`).
 4. **Sequential, never concurrent.** `run.sh` benches one server at a time on the same host —
    contention would corrupt both.
 5. **Warm, then measure.** Full scan + one warmup pass fills caches before the measured load.
-6. **Pinned versions.** The Jellyfin image (pin by digest) and Hermit git SHA are recorded in
+6. **Pinned versions.** The Jellyfin image (pin by digest) and Ferrofin git SHA are recorded in
    every report.
 
 ### Caveats worth knowing
 
-- **Image endpoint** relies on each server discovering a local `poster.jpg`. If Hermit's local
+- **Image endpoint** relies on each server discovering a local `poster.jpg`. If Ferrofin's local
   image discovery differs from Jellyfin's, that row may show a not-found path on one side rather
   than a real resize. It's flagged, not hidden.
 - **Cold start** includes container init (same for both), so read it as relative, not absolute.
@@ -109,8 +109,8 @@ With a small real library (e.g. 20 movies) the query endpoints are valid but won
 row-count *scaling*. If you want that too, set `FIXTURE_MOVIES=500` / `FIXTURE_SERIES=50` in
 `.env` to pad with synthetic items — your real files still drive the transcode test.
 
-`run.sh` generates fixtures (first run only), builds the Hermit image, benches both servers, and
-writes `results/<hermit-version>.md` + `results/latest.md`.
+`run.sh` generates fixtures (first run only), builds the Ferrofin image, benches both servers, and
+writes `results/<ferrofin-version>.md` + `results/latest.md`.
 
 Every knob is in `.env`: fixture size, VU count, load duration, resource caps, Jellyfin pin.
 
@@ -125,8 +125,8 @@ and its only in-loop signal is body-diff *correctness*, so a 100× latency regre
 can land "green" (this happened: studios p50 191 ms → 19,152 ms, invisibly). The gate
 closes that hole.
 
-`perf-gate.sh` builds the **current working tree**, brings up **Hermit only** (it
-compares Hermit to its own past self, not to Jellyfin — half the containers, half the
+`perf-gate.sh` builds the **current working tree**, brings up **Ferrofin only** (it
+compares Ferrofin to its own past self, not to Jellyfin — half the containers, half the
 time), drives the sentinel endpoints at a light fixed load, and **fails (exit 1)** if
 any endpoint exceeds `1.5×` its baseline on **p50, p95, *or* p99**, or if its 200-rate
 drops below 100%. All three percentiles gate deliberately: median-only gating has hidden
@@ -158,12 +158,12 @@ captured under. **Re-`--rebaseline` at each release** (and after any intended pe
 the baseline and gate on the same host/fixture.
 
 > Runs in ~5 min, so the loop agent runs it per iteration on any change touching
-> `hermit-core`, `hermit-db`, `hermit-api`, or the query/repository/DTO paths. See the
+> `ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths. See the
 > quality-gates section of the root `CLAUDE.md`.
 
 ## Regenerating on every release
 
-`./run.sh` *is* the regeneration command — run it at each Hermit release and commit the new
+`./run.sh` *is* the regeneration command — run it at each Ferrofin release and commit the new
 `results/<version>.md`. As the AI-generated handlers get optimized, diffing successive reports
 shows the port getting faster over time.
 
@@ -190,11 +190,11 @@ jobs:
 | File | Role |
 |---|---|
 | `docker-compose.yml` | both servers, equal caps, shared fixture volume |
-| `Dockerfile.hermit` | release build of the Hermit server + ffmpeg |
+| `Dockerfile.ferrofin` | release build of the Ferrofin server + ffmpeg |
 | `gen-fixtures.sh` | build the identical media library |
 | `scenario.js` | k6: provision → scan-wait → warm → per-endpoint load |
 | `transcode.js` | k6: experimental time-to-first-segment (opt-in) |
 | `run.sh` | orchestrate both, capture footprint, render the report |
-| `perf-gate.sh` | fast Hermit-only regression gate vs `../perf-baseline.json` (p50/p95/p99) |
+| `perf-gate.sh` | fast Ferrofin-only regression gate vs `../perf-baseline.json` (p50/p95/p99) |
 | `perf-gate.js` | k6: closed-model per-endpoint load for the gate (emits the percentiles) |
 | `.env.example` | every tunable, with defaults |

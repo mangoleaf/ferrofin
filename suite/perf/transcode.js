@@ -24,11 +24,11 @@ const USER = __ENV.BENCH_ADMIN_USER || 'bench', PASS = __ENV.BENCH_ADMIN_PASSWOR
 const ITERATIONS = parseInt(__ENV.TTFS_ITERATIONS || '3', 10);
 // Encode-mode bitrate cap — jellyfin-web's "1080p" quality rung. Being far below the 4K
 // source bitrate is what forces a genuine re-encode on both servers (stream copy would
-// exceed the cap): Hermit ignores the Allow*StreamCopy flags today (parity gap), but the
+// exceed the cap): Ferrofin ignores the Allow*StreamCopy flags today (parity gap), but the
 // bitrate condition is honored by both.
 const ENCODE_BITRATE = parseInt(__ENV.TTFS_BITRATE || '8000000', 10);
 // The repo's real Chrome device profile fixture — single source of truth.
-const PROFILE = JSON.parse(open('../../crates/hermit-model/tests/data/DeviceProfile-Chrome.json'));
+const PROFILE = JSON.parse(open('../../crates/ferrofin-model/tests/data/DeviceProfile-Chrome.json'));
 // Encode mode: same profile but video transcode pinned to h264, so stream copy is impossible.
 const PROFILE_H264 = JSON.parse(JSON.stringify(PROFILE));
 for (const t of PROFILE_H264.TranscodingProfiles || [])
@@ -136,7 +136,7 @@ function measure(ctx, mode, iter) {
   console.log(`[${TARGET}] ttfs ${mode}#${iter}: ${ms} ms (segment ${(seg.body.length / 1e6).toFixed(1)} MB)`);
 
   // Kill this measurement's ffmpeg so it can't contend with the next one. Twice: once by
-  // playSessionId (the jellyfin-web way), once device-scoped with an empty psid — Hermit's
+  // playSessionId (the jellyfin-web way), once device-scoped with an empty psid — Ferrofin's
   // jobs don't carry a PlaySessionId yet, so only the device-scoped form matches there.
   const psid = pi.json().PlaySessionId;
   if (psid) http.del(`${BASE}/Videos/ActiveEncodings?deviceId=${dev}&playSessionId=${psid}`, null, h);

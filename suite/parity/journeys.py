@@ -4,7 +4,7 @@
 Each journey runs a real mutation sequence (setup → POST/PUT/DELETE → read-back)
 against BOTH servers using each server's own ids, and checks the effect invariant
 on the read-back (e.g. after a favorite POST, the item's UserData.IsFavorite is
-true). A write op is `deep_verified` when its effect is confirmed on Hermit AND
+true). A write op is `deep_verified` when its effect is confirmed on Ferrofin AND
 Jellyfin behaves the same way. Where they diverge, the row is classified, not
 silently passed — this is exactly how the harness surfaces real write gaps (e.g.
 the rating-DELETE that never clears Likes).
@@ -15,7 +15,7 @@ read-only media mount — nothing on real disk is touched. Results go to
 write ops).
 
 Run via sweep.sh (brings both servers up), or directly against provisioned servers:
-  HERMIT_URL=... JELLYFIN_URL=... parity/journeys.py
+  FERROFIN_URL=... JELLYFIN_URL=... parity/journeys.py
 Offline self-check:
   parity/journeys.py --check
 """
@@ -664,7 +664,7 @@ def j_bulk_item_delete(base, token, user, mid, _m2):
     if pid:
         # Both servers accept the bulk delete. The removal *effect* is deep-verified by the
         # singular DELETE /Items/{itemId}; a read-back here is unreliable because Jellyfin
-        # deletes asynchronously (the item lingers a beat) while Hermit deletes synchronously.
+        # deletes asynchronously (the item lingers a beat) while Ferrofin deletes synchronously.
         st, _ = http("DELETE", f"{base}/Items?ids={pid}", token)
         r["DELETE /Items"] = st < 300
         http("DELETE", f"{base}/Items/{pid}", token)  # ensure cleanup even if bulk lagged
@@ -786,9 +786,9 @@ def run_all(base, token, user):
     return out
 
 
-def journeys(hermit_url, jellyfin_url):
-    ht, hu = bring_up(hermit_url, "hermit")
-    h = run_all(hermit_url, ht, hu)
+def journeys(ferrofin_url, jellyfin_url):
+    ht, hu = bring_up(ferrofin_url, "ferrofin")
+    h = run_all(ferrofin_url, ht, hu)
     j = {}
     if jellyfin_url:
         jt, ju = bring_up(jellyfin_url, "jellyfin")
@@ -801,16 +801,16 @@ def journeys(hermit_url, jellyfin_url):
         if jellyfin_url:
             deep = bool(h_ok and j_ok)
             if h_ok and not j_ok:
-                cls = "flagged: Jellyfin read-back differed (verify: oracle setup or Hermit extra)"
+                cls = "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)"
             elif not h_ok and j_ok:
-                cls = "flagged: Hermit read-back did not reflect the write (verify: real gap vs read-back method)"
+                cls = "flagged: Ferrofin read-back did not reflect the write (verify: real gap vs read-back method)"
             elif not h_ok:
                 cls = "flagged: write effect not observed on either server (likely corpus/setup)"
             else:
                 cls = "ok"
             rows[op] = {"deep_verified": deep, "classification": cls, "note": f"H={h_ok} J={j_ok}"}
         else:
-            rows[op] = {"deep_verified": bool(h_ok), "classification": "ok" if h_ok else "write effect not confirmed on Hermit",
+            rows[op] = {"deep_verified": bool(h_ok), "classification": "ok" if h_ok else "write effect not confirmed on Ferrofin",
                         "note": f"H={h_ok}"}
     return rows, {k: v for k, v in h.items() if k.startswith("_")}
 
@@ -819,9 +819,9 @@ def main():
     if "--check" in sys.argv:
         selfcheck()
         return
-    hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
+    ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL")
-    rows, errors = journeys(hermit, jellyfin)
+    rows, errors = journeys(ferrofin, jellyfin)
     out = {"generated_by": "suite/parity/journeys.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "errors": errors, "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/journey-results.json"), "w") as f:
@@ -838,7 +838,7 @@ def selfcheck():
         return bool(h_ok and j_ok)
     assert combine(True, True) is True
     assert combine(True, False) is False   # Jellyfin disagrees → not verified
-    assert combine(False, True) is False   # real Hermit gap → not verified
+    assert combine(False, True) is False   # real Ferrofin gap → not verified
     # Every journey advertises only op keys that exist in the vendored spec.
     import glob
     spec = json.load(open(sorted(glob.glob(os.path.join(ROOT, "contracts/jellyfin-openapi-*.json")))[-1]))

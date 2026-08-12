@@ -5,36 +5,36 @@
 #   1. A real jellyfin/jellyfin:10.11.8 container creates a database: startup
 #      wizard, two libraries over the synthetic fixture media, a scan, and
 #      user data (played flags, a favorite, a playlist, a collection).
-#   2. Hermit ADOPTS the extracted config dir in place (no export, no rescan),
+#   2. Ferrofin ADOPTS the extracted config dir in place (no export, no rescan),
 #      serves it over HTTP, and MUTATES it: marks a movie played, favorites
 #      another, appends to the Jellyfin-created playlist.
 #   3. Jellyfin 10.11.8 boots on the same dir and must see everything —
-#      login, browse, Hermit's played flag/favorite, and the playlist edit.
+#      login, browse, Ferrofin's played flag/favorite, and the playlist edit.
 #
-# Requirements: docker, curl, jq, sqlite3, a built hermit-server binary
-# (cargo build -p hermit-server). The fixture media must exist
+# Requirements: docker, curl, jq, sqlite3, a built ferrofin-server binary
+# (cargo build -p ferrofin-server). The fixture media must exist
 # (suite/perf/gen-fixtures.sh) — its HOST path is mounted at the SAME path in
 # the containers so the .mblink targets and DB paths resolve on both sides.
 #
-# Ports: 18110 (fixture jellyfin), 18111 (hermit), 18112 (verify jellyfin).
+# Ports: 18110 (fixture jellyfin), 18111 (ferrofin), 18112 (verify jellyfin).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 JELLYFIN_IMAGE="${JELLYFIN_IMAGE:-jellyfin/jellyfin:10.11.8}"
 MEDIA_DIR="$(pwd)/suite/perf/fixtures/media"
 WORK="${ROUNDTRIP_WORK:-$(mktemp -d)}"
-HERMIT_BIN="${HERMIT_BIN:-./target/debug/hermit-server}"
+FERROFIN_BIN="${FERROFIN_BIN:-./target/debug/ferrofin-server}"
 USER_NAME=rtadmin
 USER_PW=rtpass123
 AUTH='Authorization: MediaBrowser Client="rt", Device="rt", DeviceId="rt-1", Version="1.0"'
 
 [ -d "$MEDIA_DIR/movies" ] || { echo "fixture media missing — run suite/perf/gen-fixtures.sh"; exit 1; }
-[ -x "$HERMIT_BIN" ] || { echo "hermit binary missing — cargo build -p hermit-server"; exit 1; }
+[ -x "$FERROFIN_BIN" ] || { echo "ferrofin binary missing — cargo build -p ferrofin-server"; exit 1; }
 
 fail() { echo "ROUNDTRIP FAIL: $*" >&2; exit 1; }
 cleanup() {
   docker rm -f rt-fixture rt-verify >/dev/null 2>&1 || true
-  pkill -f "hermit-server .*--port 18111" 2>/dev/null || true
+  pkill -f "ferrofin-server .*--port 18111" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -108,17 +108,17 @@ docker stop -t 30 rt-fixture >/dev/null
 rm -rf "$WORK/config" && docker cp rt-fixture:/config "$WORK/config" >/dev/null
 docker rm -f rt-fixture >/dev/null
 
-# ── 2. Hermit adopts + mutates ─────────────────────────────────────────────
-echo ">> [2/3] hermit adopts the database in place"
-HERMIT_DATA_DIR="$WORK/config" HERMIT_ADMIN_USER=unused HERMIT_ADMIN_PASSWORD=unusedpw \
-  "$HERMIT_BIN" --bind 127.0.0.1 --port 18111 > "$WORK/hermit.log" 2>&1 &
+# ── 2. Ferrofin adopts + mutates ─────────────────────────────────────────────
+echo ">> [2/3] ferrofin adopts the database in place"
+FERROFIN_DATA_DIR="$WORK/config" FERROFIN_ADMIN_USER=unused FERROFIN_ADMIN_PASSWORD=unusedpw \
+  "$FERROFIN_BIN" --bind 127.0.0.1 --port 18111 > "$WORK/ferrofin.log" 2>&1 &
 HB=http://127.0.0.1:18111
-wait_200 "$HB/System/Info/Public" || fail "hermit never came up (see $WORK/hermit.log)"
-grep -q 'adopted an existing Jellyfin' "$WORK/hermit.log" || fail "adoption did not trigger"
-[ -f "$WORK/config/data/jellyfin.db.pre-hermit" ] || fail "no pre-hermit backup"
-read -r HTOK HUID <<<"$(login "$HB")" || fail "hermit login with the JELLYFIN-created account"
+wait_200 "$HB/System/Info/Public" || fail "ferrofin never came up (see $WORK/ferrofin.log)"
+grep -q 'adopted an existing Jellyfin' "$WORK/ferrofin.log" || fail "adoption did not trigger"
+[ -f "$WORK/config/data/jellyfin.db.pre-ferrofin" ] || fail "no pre-ferrofin backup"
+read -r HTOK HUID <<<"$(login "$HB")" || fail "ferrofin login with the JELLYFIN-created account"
 hm_movies=$(api "$HB" "/Items?userId=$HUID&recursive=true&includeItemTypes=Movie&limit=0" "$HTOK" | jq -r .TotalRecordCount)
-[ "$hm_movies" -ge 100 ] || fail "hermit browse: expected the adopted movies, got $hm_movies"
+[ "$hm_movies" -ge 100 ] || fail "ferrofin browse: expected the adopted movies, got $hm_movies"
 HM3=$(movie_id "$HB" "$HTOK" "$HUID" "Movie 0003")
 HM4=$(movie_id "$HB" "$HTOK" "$HUID" "Movie 0004")
 post "$HB" "/UserPlayedItems/$HM3?userId=$HUID" "$HTOK" >/dev/null
@@ -126,25 +126,25 @@ post "$HB" "/UserFavoriteItems/$HM4?userId=$HUID" "$HTOK" >/dev/null
 PL=$(api "$HB" "/Items?userId=$HUID&recursive=true&includeItemTypes=Playlist&limit=1" "$HTOK" | jq -r '.Items[0].Id')
 post "$HB" "/Playlists/$PL/Items?ids=$HM3&userId=$HUID" "$HTOK" >/dev/null
 pl_n=$(api "$HB" "/Playlists/$PL/Items?userId=$HUID" "$HTOK" | jq '.Items | length')
-[ "$pl_n" = 3 ] || fail "hermit playlist edit: expected 3 items, got $pl_n"
-pkill -f "hermit-server .*--port 18111"; sleep 2
+[ "$pl_n" = 3 ] || fail "ferrofin playlist edit: expected 3 items, got $pl_n"
+pkill -f "ferrofin-server .*--port 18111"; sleep 2
 
 # ── 3. Jellyfin boots on the result and must see everything ────────────────
-echo ">> [3/3] jellyfin boots on the hermit-mutated database"
+echo ">> [3/3] jellyfin boots on the ferrofin-mutated database"
 docker run -d --name rt-verify -p 18112:8096 \
   -v "$WORK/config":/config -v "$MEDIA_DIR":"$MEDIA_DIR":ro "$JELLYFIN_IMAGE" >/dev/null
 VB=http://localhost:18112
 wait_200 "$VB/System/Info/Public" || fail "verify jellyfin never came up"
-read -r VTOK VUID <<<"$(login "$VB")" || fail "jellyfin login after hermit's tenure"
+read -r VTOK VUID <<<"$(login "$VB")" || fail "jellyfin login after ferrofin's tenure"
 v_movies=$(api "$VB" "/Items?userId=$VUID&recursive=true&includeItemTypes=Movie&limit=0" "$VTOK" | jq -r .TotalRecordCount)
 [ "$v_movies" = "$hm_movies" ] || fail "movie count changed across the round trip ($hm_movies -> $v_movies)"
 played=$(api "$VB" "/Items?userId=$VUID&recursive=true&filters=IsPlayed&includeItemTypes=Movie&limit=10&sortBy=SortName" "$VTOK" | jq -r '[.Items[].Name] | join(",")')
-grep -q 'Movie 0003' <<<"$played" || fail "hermit's played flag lost (played: $played)"
+grep -q 'Movie 0003' <<<"$played" || fail "ferrofin's played flag lost (played: $played)"
 favs=$(api "$VB" "/Items?userId=$VUID&recursive=true&filters=IsFavorite&includeItemTypes=Movie&limit=10" "$VTOK" | jq -r '[.Items[].Name] | join(",")')
-grep -q 'Movie 0004' <<<"$favs" || fail "hermit's favorite lost (favorites: $favs)"
+grep -q 'Movie 0004' <<<"$favs" || fail "ferrofin's favorite lost (favorites: $favs)"
 VPL=$(api "$VB" "/Items?userId=$VUID&recursive=true&includeItemTypes=Playlist&limit=1" "$VTOK" | jq -r '.Items[0].Id')
 vpl_items=$(api "$VB" "/Playlists/$VPL/Items?userId=$VUID" "$VTOK" | jq -r '[.Items[].Name] | join(",")')
-grep -q 'Movie 0003' <<<"$vpl_items" || fail "hermit's playlist edit lost (items: $vpl_items)"
+grep -q 'Movie 0003' <<<"$vpl_items" || fail "ferrofin's playlist edit lost (items: $vpl_items)"
 docker logs rt-verify 2>&1 | grep -qiE '\[ERR\]|fatal' && fail "jellyfin logged errors on the adopted-then-mutated database"
 
 echo "ROUNDTRIP PASS: adopt -> serve -> mutate -> swap back, nothing lost"

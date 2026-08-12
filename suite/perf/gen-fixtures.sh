@@ -32,8 +32,8 @@ link() { cp -l "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
 # by-name endpoints (Genres/Studios/Persons), Years, and similarity/search testable, and the diff
 # stays clean because both read the same files. Sets rotate to give real variety without randomness.
 GENRES=(Action Drama Comedy Thriller SciFi)
-STUDIOS=("Parity Pictures" "Hermit Studios")
-ACTORS=("Alice Parity" "Bob Parity" "Carol Hermit")
+STUDIOS=("Parity Pictures" "Ferrofin Studios")
+ACTORS=("Alice Parity" "Bob Parity" "Carol Ferrofin")
 movie_nfo() { # $1=dir $2=title $3=index
   local i=$3 g1="${GENRES[$((i % 5))]}" g2="${GENRES[$(((i+2) % 5))]}" st="${STUDIOS[$((i % 2))]}"
   local a1="${ACTORS[$((i % 3))]}" a2="${ACTORS[$(((i+1) % 3))]}"

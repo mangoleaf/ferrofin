@@ -1,0 +1,212 @@
+# Default values for the Ferrofin chart.
+# The value contract deliberately mirrors the subset of the upstream jellyfin-helm
+# chart that a typical deployment uses, so switching a Jellyfin release to Ferrofin is
+# near-zero churn: image, service, persistence.config, volumes/volumeMounts, probes,
+# affinity, resources, metrics/serviceMonitor.
+#
+# Two intentional differences from jellyfin-helm:
+#   - the app config block is `ferrofin:` (not `jellyfin:`), and has no enableDLNA (Ferrofin has no DLNA).
+#   - config mounts at /data (Ferrofin's data dir), not /config.
+
+# -- Number of Ferrofin replicas. Ferrofin is single-writer (SQLite); leave at 1.
+replicaCount: 1
+
+image:
+  # -- Container image repository. Override per-environment; the placeholder is
+  # replaced by the published image location at the public release.
+  repository: registry.example.com/ferrofin
+  # -- Image tag. Empty → chart appVersion.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for the (private) registry. e.g. [{name: gitlab-registry}]
+imagePullSecrets: []
+
+# -- Service account for the pod.
+serviceAccount:
+  # -- Create a dedicated service account.
+  create: true
+  # -- Mount the SA's API token into the pod.
+  automount: true
+  # -- Annotations for the service account.
+  annotations: {}
+  # -- Name to use. Empty → generated from the fullname.
+  name: ""
+
+# -- Override the chart name.
+nameOverride: ""
+# -- Override the fully-qualified release name.
+fullnameOverride: ""
+
+# -- Annotations added to the pod.
+podAnnotations: {}
+# -- Labels added to the pod.
+podLabels: {}
+
+# -- Pod-level security context (e.g. fsGroup/runAsUser).
+podSecurityContext: {}
+# -- Container-level security context (e.g. privileged for GPU passthrough).
+securityContext: {}
+
+service:
+  # -- Service type.
+  type: ClusterIP
+  # -- Service port (also the container port Ferrofin listens on).
+  port: 8096
+
+# -- Ingress (standard networking.k8s.io/v1). Most clusters use this to expose Ferrofin.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: ferrofin.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: ferrofin-tls
+    #   hosts:
+    #     - ferrofin.example.com
+
+# -- HTTPRoute for the Gateway API (gateway.networking.k8s.io/v1). Alternative to ingress.
+httpRoute:
+  enabled: false
+  annotations: {}
+  # -- Gateways to attach to.
+  parentRefs: []
+    # - name: my-gateway
+    #   namespace: gateway-system
+  # -- Hostnames to match.
+  hostnames: []
+    # - ferrofin.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+# -- Resource requests/limits.
+resources: {}
+
+# -- Node selector.
+nodeSelector: {}
+# -- Tolerations.
+tolerations: []
+# -- Affinity rules.
+affinity: {}
+
+# -- Extra volumes on the pod (media PVCs, hostPath /dev/dri, etc.).
+volumes: []
+# -- Extra volume mounts on the Ferrofin container.
+volumeMounts: []
+
+persistence:
+  config:
+    # -- Persist Ferrofin's data dir (SQLite DB, config.toml, metadata). false → emptyDir (ephemeral).
+    enabled: true
+    # -- Where the config/data volume mounts. Ferrofin's data dir.
+    mountPath: /data
+    # -- Use an existing PVC instead of letting the chart create one.
+    existingClaim: ""
+    # -- Size for the chart-created PVC (ignored when existingClaim is set).
+    size: 10Gi
+    accessMode: ReadWriteOnce
+    # -- StorageClass for the chart-created PVC. "" → cluster default. null → no storageClassName field.
+    storageClass: ""
+    annotations: {}
+
+# -- Ferrofin application configuration.
+ferrofin:
+  # -- Extra CLI args passed to ferrofin-server (flags override FERROFIN_* env).
+  args: []
+  # -- Extra environment variables. Config is FERROFIN_* env or {data_dir}/config.toml.
+  env: []
+  # -- Load env from EXISTING ConfigMaps/Secrets (e.g. a Secret with FERROFIN_OMDB_KEY).
+  envFrom: []
+  # -- Key/value pairs rendered into a chart-managed ConfigMap and injected into
+  # the container as environment variables (via envFrom). For non-secret config;
+  # put secrets in a Secret referenced through `envFrom`. Changing a value rolls
+  # the pod so it takes effect.
+  config: {}
+    # FERROFIN_PUBLISHED_URL: "https://ferrofin.example.com"
+    # FERROFIN_LOG: "info"   # EnvFilter/RUST_LOG syntax, e.g. "debug" or "ferrofin_api=debug,info"
+
+# -- Liveness probe. Ferrofin serves GET /health/live (process-only 200).
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 4
+
+# -- Readiness probe. Ferrofin serves GET /health/ready (runs dependency checks).
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+# -- Startup probe: give a fresh DB time to migrate + seed before liveness kicks in.
+startupProbe:
+  tcpSocket:
+    port: http
+  periodSeconds: 10
+  failureThreshold: 30
+
+# -- Metrics. NOTE: Ferrofin does not expose /metrics yet, so this is off by default.
+# The ServiceMonitor template exists for contract parity — flip enabled on once Ferrofin
+# grows a metrics endpoint.
+metrics:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+    # -- Namespace for the ServiceMonitor. "" → release namespace.
+    namespace: ""
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 30s
+    path: /metrics
+    port: 8096
+    scheme: http
+
+# -- NetworkPolicy for pod isolation. Needs a CNI that enforces it (Calico, Cilium, etc.).
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # -- Allow ingress from any pod/namespace. Set false to restrict to the selectors below.
+    allowExternal: true
+    podSelector: {}
+    namespaceSelector: {}
+    customRules: []
+  egress:
+    # -- Allow DNS (keep enabled — Ferrofin needs it for metadata providers).
+    allowDNS: true
+    dnsNamespace: kube-system
+    dnsPodSelector:
+      k8s-app: kube-dns
+    # -- Allow all egress. Set false to use restrictedEgress below.
+    allowAllEgress: true
+    restrictedEgress:
+      # -- Allow outbound HTTPS (metadata providers: TMDB, OMDb, MusicBrainz).
+      allowMetadata: true
+      # -- Allow pod-to-pod egress within the cluster.
+      allowInCluster: true
+      # -- Extra CIDRs to allow.
+      allowedCIDRs: []
+    customRules: []
+  metrics:
+    # -- Namespace Prometheus runs in. Empty → release namespace.
+    namespace: ""
+    podSelector:
+      app.kubernetes.io/name: prometheus

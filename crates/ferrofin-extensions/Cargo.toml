@@ -1,0 +1,29 @@
+[package]
+name = "ferrofin-extensions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Curated, compiled-in extensions (Jellyfin plugins) for Ferrofin, including the intro skipper."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-chromaprint.workspace = true
+ferrofin-traits.workspace = true
+ferrofin-core.workspace = true
+ferrofin-model.workspace = true
+ferrofin-db.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

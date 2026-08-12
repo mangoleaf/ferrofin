@@ -30,7 +30,7 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
 - **Speed is shown only for deep-verified ops.** A row is `comparable` only if the parity ledger
   deep-verified that op, both servers answered 200, and the body didn't drift since the parity pass
   (`suite/fingerprint.py`). Median-speedup / win-rate are computed over comparable rows **only** —
-  so "Hermit got slower" can't secretly mean "Hermit started doing the work correctly."
+  so "Ferrofin got slower" can't secretly mean "Ferrofin started doing the work correctly."
 - **Write (non-GET) rows are fingerprint-exempt by design** — a fingerprint probe would itself
   mutate state, and write bodies mint per-run tokens/timestamps. Their honesty gate instead:
   `deep_verified` must come from the parity **write journey**, and both servers must hit 100%

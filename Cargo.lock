@@ -747,6 +747,387 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrofin-api"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "chrono",
+ "ferrofin-api",
+ "ferrofin-common",
+ "ferrofin-db",
+ "ferrofin-health",
+ "ferrofin-model",
+ "ferrofin-networking",
+ "ferrofin-traits",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "utoipa",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "ferrofin-chromaprint"
+version = "0.4.1"
+dependencies = [
+ "rstest",
+]
+
+[[package]]
+name = "ferrofin-common"
+version = "0.4.1"
+dependencies = [
+ "pbkdf2",
+ "regex",
+ "rstest",
+ "serde",
+ "sha1",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-core"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ferrofin-common",
+ "ferrofin-db",
+ "ferrofin-drawing",
+ "ferrofin-keyframes",
+ "ferrofin-model",
+ "ferrofin-naming",
+ "ferrofin-providers",
+ "ferrofin-traits",
+ "image",
+ "libc",
+ "notify",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rstest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-db"
+version = "0.4.1"
+dependencies = [
+ "chrono",
+ "ferrofin-model",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-drawing"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "blurhash",
+ "chrono",
+ "ferrofin-common",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "image",
+ "rstest",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "webp",
+]
+
+[[package]]
+name = "ferrofin-extensions"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "ferrofin-chromaprint",
+ "ferrofin-core",
+ "ferrofin-db",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "regex",
+ "reqwest",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-health"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
+name = "ferrofin-hls"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "ferrofin-keyframes",
+ "ferrofin-mediaencoding",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "rstest",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-keyframes"
+version = "0.4.1"
+dependencies = [
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "ferrofin-livetv"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ferrofin-db",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "quick-xml",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-mediaencoding"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chardetng",
+ "chrono",
+ "encoding_rs",
+ "ferrofin-common",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "quick-xml",
+ "regex",
+ "rstest",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-metrics"
+version = "0.4.1"
+dependencies = [
+ "axum",
+ "libc",
+ "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "prometheus",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "ferrofin-model"
+version = "0.4.1"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "ferrofin-util",
+ "insta",
+ "rstest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-naming"
+version = "0.4.1"
+dependencies = [
+ "chrono",
+ "fancy-regex",
+ "ferrofin-model",
+ "ferrofin-util",
+ "regex",
+ "rstest",
+ "serde",
+]
+
+[[package]]
+name = "ferrofin-networking"
+version = "0.4.1"
+dependencies = [
+ "fancy-regex",
+ "ferrofin-common",
+ "ferrofin-model",
+ "ferrofin-util",
+ "rstest",
+ "serde",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ferrofin-providers"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ferrofin-common",
+ "ferrofin-db",
+ "ferrofin-model",
+ "ferrofin-traits",
+ "quick-xml",
+ "reqwest",
+ "rstest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-server"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "config",
+ "ferrofin-api",
+ "ferrofin-common",
+ "ferrofin-core",
+ "ferrofin-db",
+ "ferrofin-drawing",
+ "ferrofin-extensions",
+ "ferrofin-health",
+ "ferrofin-hls",
+ "ferrofin-livetv",
+ "ferrofin-mediaencoding",
+ "ferrofin-metrics",
+ "ferrofin-model",
+ "ferrofin-naming",
+ "ferrofin-networking",
+ "ferrofin-providers",
+ "ferrofin-traits",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-traits"
+version = "0.4.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ferrofin-db",
+ "ferrofin-model",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ferrofin-util"
+version = "0.4.1"
+dependencies = [
+ "rand 0.8.7",
+ "regex",
+ "rstest",
+ "thiserror",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1067,387 +1448,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hermit-api"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "axum",
- "axum-extra",
- "chrono",
- "hermit-api",
- "hermit-common",
- "hermit-db",
- "hermit-health",
- "hermit-model",
- "hermit-networking",
- "hermit-traits",
- "opentelemetry",
- "opentelemetry_sdk",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "utoipa",
- "uuid",
- "zip",
-]
-
-[[package]]
-name = "hermit-chromaprint"
-version = "0.4.1"
-dependencies = [
- "rstest",
-]
-
-[[package]]
-name = "hermit-common"
-version = "0.4.1"
-dependencies = [
- "pbkdf2",
- "regex",
- "rstest",
- "serde",
- "sha1",
- "sha2",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "hermit-core"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "chrono",
- "hermit-common",
- "hermit-db",
- "hermit-drawing",
- "hermit-keyframes",
- "hermit-model",
- "hermit-naming",
- "hermit-providers",
- "hermit-traits",
- "image",
- "libc",
- "notify",
- "opentelemetry",
- "opentelemetry_sdk",
- "reqwest",
- "rstest",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "hermit-db"
-version = "0.4.1"
-dependencies = [
- "chrono",
- "hermit-model",
- "serde",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-drawing"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "blurhash",
- "chrono",
- "hermit-common",
- "hermit-model",
- "hermit-traits",
- "image",
- "rstest",
- "tempfile",
- "thiserror",
- "tokio",
- "uuid",
- "webp",
-]
-
-[[package]]
-name = "hermit-extensions"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "hermit-chromaprint",
- "hermit-core",
- "hermit-db",
- "hermit-model",
- "hermit-traits",
- "regex",
- "reqwest",
- "rstest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-health"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "axum",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
- "utoipa",
-]
-
-[[package]]
-name = "hermit-hls"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "hermit-keyframes",
- "hermit-mediaencoding",
- "hermit-model",
- "hermit-traits",
- "rstest",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-keyframes"
-version = "0.4.1"
-dependencies = [
- "rstest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "hermit-livetv"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "chrono",
- "hermit-db",
- "hermit-model",
- "hermit-traits",
- "quick-xml",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-mediaencoding"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "chardetng",
- "chrono",
- "encoding_rs",
- "hermit-common",
- "hermit-model",
- "hermit-traits",
- "quick-xml",
- "regex",
- "rstest",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-metrics"
-version = "0.4.1"
-dependencies = [
- "axum",
- "libc",
- "opentelemetry",
- "opentelemetry-prometheus",
- "opentelemetry_sdk",
- "prometheus",
- "serde_json",
- "thiserror",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "hermit-model"
-version = "0.4.1"
-dependencies = [
- "bitflags",
- "chrono",
- "hermit-util",
- "insta",
- "rstest",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "utoipa",
- "uuid",
-]
-
-[[package]]
-name = "hermit-naming"
-version = "0.4.1"
-dependencies = [
- "chrono",
- "fancy-regex",
- "hermit-model",
- "hermit-util",
- "regex",
- "rstest",
- "serde",
-]
-
-[[package]]
-name = "hermit-networking"
-version = "0.4.1"
-dependencies = [
- "fancy-regex",
- "hermit-common",
- "hermit-model",
- "hermit-util",
- "rstest",
- "serde",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "hermit-providers"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "chrono",
- "hermit-common",
- "hermit-db",
- "hermit-model",
- "hermit-traits",
- "quick-xml",
- "reqwest",
- "rstest",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "hermit-server"
-version = "0.4.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "clap",
- "config",
- "hermit-api",
- "hermit-common",
- "hermit-core",
- "hermit-db",
- "hermit-drawing",
- "hermit-extensions",
- "hermit-health",
- "hermit-hls",
- "hermit-livetv",
- "hermit-mediaencoding",
- "hermit-metrics",
- "hermit-model",
- "hermit-naming",
- "hermit-networking",
- "hermit-providers",
- "hermit-traits",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "tempfile",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "hermit-traits"
-version = "0.4.1"
-dependencies = [
- "async-trait",
- "chrono",
- "hermit-db",
- "hermit-model",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "hermit-util"
-version = "0.4.1"
-dependencies = [
- "rand 0.8.7",
- "regex",
- "rstest",
- "thiserror",
- "unicode-normalization",
- "uuid",
-]
 
 [[package]]
 name = "hex"

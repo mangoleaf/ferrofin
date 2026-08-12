@@ -55,7 +55,7 @@ baseline. On an **idle host**:
 skipped it, arguing near-zero signal. Resolve it explicitly:
 
 - Add a **non-blocking** (`continue-on-error: true`) job to `ci.yml`, gated on
-  paths `crates/hermit-core/**`, `crates/hermit-db/**`, `crates/hermit-api/**`,
+  paths `crates/ferrofin-core/**`, `crates/ferrofin-db/**`, `crates/ferrofin-api/**`,
   `benchmark/**`, `suite/**`, that runs the gate if `docker` and `k6` are
   available and exits 0 with a clear "skipped: no docker/k6 on runner" notice
   otherwise. Cheap, honest, and the mandatory-local rule stays the real gate.

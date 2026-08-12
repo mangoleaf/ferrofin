@@ -1,19 +1,19 @@
 # Plan 7 — End the SQLite pool contention: measure, resize, and (if proven) split
 
 ## Problem
-Under the benchmark's mixed 50-VU load, Hermit's latency is dominated by
+Under the benchmark's mixed 50-VU load, Ferrofin's latency is dominated by
 **connection-acquisition queueing**, not query work, and C# Jellyfin beats Rust
-Hermit on throughput. Direct evidence: `/Items/Counts` is 61 ms isolated (a single
+Ferrofin on throughput. Direct evidence: `/Items/Counts` is 61 ms isolated (a single
 query) but was 2,342 ms under load — ~2.28 s of that was waiting for one of the
 pool's 4 permits. Every request makes N queries and re-enters the FIFO queue N
 times; cheap 2 ms queries wait behind 61 ms ones (head-of-line blocking); ~46 of 50
 VUs are parked on the semaphore at any instant.
 
-Current implementation (`crates/hermit-db/src/database.rs`):
+Current implementation (`crates/ferrofin-db/src/database.rs`):
 - One shared read+write `SqlitePool`, WAL + `synchronous=NORMAL`,
   `busy_timeout=30s` (lines 36-44).
 - Pool size = `min(available_parallelism, cgroup CFS quota)`, fallback 4
-  (`default_pool_size`, lines 120-129); `HERMIT_DB_POOL` env overrides (line 82).
+  (`default_pool_size`, lines 120-129); `FERROFIN_DB_POOL` env overrides (line 82).
 - Every call site acquires per query via `db.pool()` (~41 files).
 
 The size-equals-cores rationale (comment at lines 66-80) came from a **Phase-B
@@ -42,7 +42,7 @@ from the wrong data.
   probes during a run.
 - On the 50-VU question: 50 zero-think-time VUs is not a realistic home-server
   load (that's ~5–10 clients with think time), but it is a legitimate stress
-  signal — and the goal stands regardless: **Hermit must beat Jellyfin under the
+  signal — and the goal stands regardless: **Ferrofin must beat Jellyfin under the
   same conditions.** Fix the contention, then also add a realistic-load scenario
   (step 5) so future numbers aren't read through an unrealistic lens.
 
@@ -50,11 +50,11 @@ from the wrong data.
 Write `benchmark/pool-sweep.sh` (reuses `run-phase-b.sh` internals):
 
 1. Build the current HEAD image once.
-2. For `HERMIT_DB_POOL` in `4 8 16 32 64` (the env override already plumbs
+2. For `FERROFIN_DB_POOL` in `4 8 16 32 64` (the env override already plumbs
    through — verify it reaches the container via docker-compose env, add it if
    not): run the **mixed** endpoint set (the one that exposed the convoy:
    `items_counts items_filters2 user_me sessions studios items_mixed
-   item_detail suggestions`) at 50 VUs, Hermit only.
+   item_detail suggestions`) at 50 VUs, Ferrofin only.
 3. Emit one table: pool size × {p50, p95, p99, rps} per endpoint + aggregate.
    Persist to `benchmark/results/pool-sweep-<sha>.json`.
 4. Run the winner's config against Jellyfin side-by-side (full phase-b) for the
@@ -70,16 +70,16 @@ it.
 In `default_pool_size` (`database.rs:120`):
 - Decouple the mixed-load pool size from core count: the expected outcome is a
   default like `clamp(cores × K, cores, CAP)` with K≈4–8 chosen from the sweep
-  knee. Keep `HERMIT_DB_POOL` as the override.
+  knee. Keep `FERROFIN_DB_POOL` as the override.
 - Rewrite the lines 66-80 comment block to document **both regimes** (single-hot-
   query saturation vs mixed-load queueing), cite the sweep script as the way to
   re-derive the number, and state why size≠cores is correct for latency.
 - **Decided (repo owner, 2026-08-03): the pool size becomes a `config.toml`
-  setting.** Add `[database] pool_size` to the config (`hermit-common` config
+  setting.** Add `[database] pool_size` to the config (`ferrofin-common` config
   structs + the server's config plumbing), defaulting to the string/variant
   `auto`, where `auto` = the formula chosen from the sweep. An explicit integer
-  overrides. Precedence: `HERMIT_DB_POOL` env > config value > `auto` — the
-  same env-over-file order as every other Hermit knob (an earlier draft of this
+  overrides. Precedence: `FERROFIN_DB_POOL` env > config value > `auto` — the
+  same env-over-file order as every other Ferrofin knob (an earlier draft of this
   plan inverted it; consistency won). Document the setting where
   the other config keys are documented, and cover parse + precedence with a
   test. The multiplier/cap behind `auto` stay named consts with the sweep
@@ -97,8 +97,8 @@ under WAL, a blocked writer sits on its connection while readers churn. Split:
 - API: add `Database::writer()` returning the write pool; `pool()` keeps working
   (reads). Migrate **write call sites only** (`execute`-shaped: INSERT/UPDATE/
   DELETE and the transaction begins in write paths) to `writer()` — grep for
-  `.execute(` and `begin()` in hermit-core/hermit-db/hermit-livetv; the SQL
-  boundary ratchet's file list (`crates/hermit-db/tests/sql_boundary.rs`) is a
+  `.execute(` and `begin()` in ferrofin-core/ferrofin-db/ferrofin-livetv; the SQL
+  boundary ratchet's file list (`crates/ferrofin-db/tests/sql_boundary.rs`) is a
   ready worklist. Transactions that read-then-write use the writer connection.
 - In-memory test DB (`connect_in_memory`, line 55) must keep a single shared
   connection semantics — give it writer==reader (same 1-connection pool) so
@@ -124,7 +124,7 @@ the perf-gate baseline (Plan 4) once merged.
 
 ## Verification
 - Standard gates: fmt, clippy `-D warnings`, `cargo nextest run --workspace`,
-  doctests, coverage ≥80% on hermit-db (the split adds logic — test writer
+  doctests, coverage ≥80% on ferrofin-db (the split adds logic — test writer
   serialization: two concurrent writes both land; a write during a long read
   doesn't error).
 - The sweep table committed with the change (in the commit message or
@@ -133,7 +133,7 @@ the perf-gate baseline (Plan 4) once merged.
   (re-run one Phase-B hot endpoint at the new default to prove the old regime
   didn't regress).
 - Headline: full phase-b vs Jellyfin at the new default — the win/loss table.
-  Target: Hermit ≥1× Jellyfin p50 on every previously-losing mixed-load
+  Target: Ferrofin ≥1× Jellyfin p50 on every previously-losing mixed-load
   endpoint, and the 48/83-slower-than-Jellyfin count from v0.8.2 substantially
   reduced. Report the exact numbers.
 - No write-path regressions: livetv guide sync test, playstate tests, and the
@@ -148,8 +148,8 @@ the perf-gate baseline (Plan 4) once merged.
   journal mode, or any on-disk property of the database file.
 
 ## Conflicts
-Touches `hermit-db` (all plans read it, none still in flight modify it) and
-write call sites across hermit-core/hermit-livetv — coordinate with Plan 3 (DTO
+Touches `ferrofin-db` (all plans read it, none still in flight modify it) and
+write call sites across ferrofin-core/ferrofin-livetv — coordinate with Plan 3 (DTO
 pass) if run concurrently; prefer landing Plan 3 first or accepting rebase pain
 in dto_service.rs only. `pool-sweep.sh` is additive alongside Plan 4/6 harness
 work; if Plan 6's `suite/` restructure lands first, put the sweep there instead.

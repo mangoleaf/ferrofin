@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hermit ⇄ Jellyfin — suite (parity × perf)</title>
+<title>Ferrofin ⇄ Jellyfin — suite (parity × perf)</title>
 <style>
   /* The shared look of the two retired viewers (:8123 parity, :8124 bench),
      carried forward onto the one merged page. */
@@ -71,7 +71,7 @@
 </head>
 <body>
 <header>
-  <h1>Hermit ⇄ Jellyfin — suite <span class="sub">(parity × perf · speed shown for deep-verified ops only)</span></h1>
+  <h1>Ferrofin ⇄ Jellyfin — suite <span class="sub">(parity × perf · speed shown for deep-verified ops only)</span></h1>
   <div class="controls">
     <label class="pick">Run<select id="run"></select></label>
     <label class="pick">Compare to<select id="base"><option value="">— none —</option></select></label>
@@ -89,7 +89,7 @@
   <table id="ops"><thead><tr>
     <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
     <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
-    <th title="Hermit p50 change vs the selected base run">Δ vs base</th>
+    <th title="Ferrofin p50 change vs the selected base run">Δ vs base</th>
     <th>speedup</th><th>verdict</th><th class="l">note</th>
   </tr></thead><tbody></tbody></table>
 
@@ -121,9 +121,9 @@
 <script>
 const CMP_KEYS = ["fixture_hash", "cpus", "mem", "jellyfin_image"];
 const num = (x) => x == null ? "—" : (+x).toFixed(x < 10 ? 2 : 0);
-// Same-SHA reruns share meta.hermit; run_label carries the " (2)", " (3)" suffix. Older
+// Same-SHA reruns share meta.ferrofin; run_label carries the " (2)", " (3)" suffix. Older
 // records predate run_label, so fall back to the bare version.
-const vlabel = (r) => r.meta.run_label || r.meta.hermit;
+const vlabel = (r) => r.meta.run_label || r.meta.ferrofin;
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
 const opCell = (op) => {
   const [m, ...rest] = op.split(" ");
@@ -171,7 +171,7 @@ function render() {
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
   stats.innerHTML = statCards(h);
   const fp = m.footprint;
-  // Footprint cards: Hermit vs Jellyfin per metric, Hermit green when it wins.
+  // Footprint cards: Ferrofin vs Jellyfin per metric, Ferrofin green when it wins.
   const fpCard = (label, hVal, jVal, hNum, jNum, hTitle, jTitle) => {
     const color = hNum != null && jNum != null
       ? (hNum < jNum ? "var(--good)" : hNum > jNum ? "var(--bad)" : "var(--fg)") : "var(--fg)";

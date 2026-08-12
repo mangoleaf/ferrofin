@@ -10,11 +10,11 @@ keep appearing: each new manager grows its own SQL, copying whatever local patte
 sees. A full DAL/ORM rewrite was considered and **rejected** (churn against a
 196-endpoint parity-verified surface, and the schema is fixed by the Jellyfin-DB
 drop-in requirement). The lazy alternative: enforce the boundary that already exists
-(`hermit-db` entities + repository/persistence modules + `translate_query`) with a
+(`ferrofin-db` entities + repository/persistence modules + `translate_query`) with a
 ratchet, and fix the known write-path N+1 loops.
 
 ## Part A — the ratchet (a test, not a framework)
-1. Add a workspace test (e.g. `crates/hermit-db/tests/sql_boundary.rs`, or a root
+1. Add a workspace test (e.g. `crates/ferrofin-db/tests/sql_boundary.rs`, or a root
    `tests/` integration test if cleaner) that walks `crates/*/src` with `std::fs`,
    counts `sqlx::query` occurrences per file, and compares against a checked-in
    allowlist (`sql_boundary_allowlist.toml` or a const in the test): current files
@@ -23,8 +23,8 @@ ratchet, and fix the known write-path N+1 loops.
      with a message explaining the rule: *new SQL goes in a repository/persistence
      module in the allowlist's designated set; when you reduce a file's count, lower
      its ceiling in the same commit.*
-   - Designated always-allowed modules (no ceiling): `hermit-db/src/**`,
-     `hermit-core/src/item_repository.rs`, `translate_query.rs`,
+   - Designated always-allowed modules (no ceiling): `ferrofin-db/src/**`,
+     `ferrofin-core/src/item_repository.rs`, `translate_query.rs`,
      `people_repository.rs`, `media_stream_repository.rs`,
      `item_persistence_service.rs`, `item_count_service.rs`,
      `user_data_manager.rs`. (Adjust to actual repository-role files found at
@@ -35,7 +35,7 @@ ratchet, and fix the known write-path N+1 loops.
    files are touched for other reasons (the ceilings enforce monotonic improvement).
 
 ## Part B — fix the known write-path N+1 loops (concrete, bounded)
-`crates/hermit-core/src/livetv/manager.rs`:
+`crates/ferrofin-core/src/livetv/manager.rs`:
 - ~lines 83–96: per-channel `INSERT` in a loop during M3U sync.
 - ~line 145+: per-program `INSERT` in a loop during XMLTV guide sync (guides are
   thousands of programs — thousands of round-trips per refresh).
@@ -48,12 +48,12 @@ mirror its pattern. Live TV is fully implemented (phases 1–6 of the Live TV bu
 done and wired); don't stub anything.
 
 Also sweep for other per-row query loops in write paths (`grep -n "for .*{" -A3` near
-`execute(` in hermit-core) and list any found in the report — fix only if equally
+`execute(` in ferrofin-core) and list any found in the report — fix only if equally
 bounded, otherwise just report.
 
 ## Verification
 - Standard gates: fmt, clippy `-D warnings`, `cargo nextest run --workspace`,
-  coverage ≥80% on hermit-core.
+  coverage ≥80% on ferrofin-core.
 - Part A: deliberately add a `sqlx::query` line to a non-allowlisted file, confirm the
   test fails with the explanatory message, remove it.
 - Part B: the Live TV refresh scheduled task against a real M3U/XMLTV fixture (unit

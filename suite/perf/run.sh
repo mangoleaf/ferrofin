@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One command to (re)generate the Hermit-vs-Jellyfin benchmark. Run this every release.
+# One command to (re)generate the Ferrofin-vs-Jellyfin benchmark. Run this every release.
 #   ./run.sh
 # Requires: docker, docker compose, k6, jq on the host. ffmpeg only for gen-fixtures.sh.
 set -euo pipefail
@@ -20,7 +20,7 @@ suite_load_env .env
 suite_mint_device_id run
 
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
-# BENCH_ONLY=hermit|jellyfin re-runs one leg, keeping the other's raw results.
+# BENCH_ONLY=ferrofin|jellyfin re-runs one leg, keeping the other's raw results.
 if [ -z "${BENCH_ONLY:-}" ]; then rm -f results/raw/*.json; fi
 
 # Library list + synthetic fixtures (shared bring-up — see suite/lib.sh).
@@ -56,7 +56,7 @@ bench() {  # $1=service $2=port $3=TARGET
   local svc="$1" base="http://localhost:$2" target="$3"
   echo ">> [$target] clean start"
   docker compose down -v >/dev/null 2>&1 || true
-  # BENCH_SKIP_BUILD=1: use the existing hermit-bench:local image (e.g. one built
+  # BENCH_SKIP_BUILD=1: use the existing ferrofin-bench:local image (e.g. one built
   # from a clean `git archive HEAD` while the working tree carries in-flight edits).
   if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then
     docker compose up -d "$svc"
@@ -88,7 +88,7 @@ bench() {  # $1=service $2=port $3=TARGET
 
   [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" CAP_TOKEN="$ctok" CAP_UID="$cuid" k6 run transcode.js || true
   suite_count_items "$base" "$ctok" "$cuid" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
-  # Perf-side body fingerprint, BOTH servers — merge.py compares Hermit's shape
+  # Perf-side body fingerprint, BOTH servers — merge.py compares Ferrofin's shape
   # against Jellyfin's from this same leg (same fresh-scan DB state), flagging
   # "fast because the body went hollow/differently-shaped" at bench time.
   # (Comparing against the parity pass false-flagged ~25 ops: parity's write
@@ -98,8 +98,8 @@ bench() {  # $1=service $2=port $3=TARGET
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench hermit   18096 hermit;   fi
-if [ "${BENCH_ONLY:-}" != "hermit" ];   then bench jellyfin 18097 jellyfin; fi
+if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
+if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering report"
@@ -108,14 +108,14 @@ DATE=$(date -u +%Y-%m-%dT%H:%MZ)
 HOST="$(nproc) cores / $(free -h 2>/dev/null | awk '/Mem:/{print $2}' || echo '?') RAM, capped at ${BENCH_CPUS} cpus / ${BENCH_MEM}"
 export VERSION DATE HOST JELLYFIN_IMAGE EXPECTED_ITEMS BENCH_VUS BENCH_DURATION BENCH_CPUS BENCH_MEM
 
-H_RSS=$(peak results/raw/hermit-rss.txt); J_RSS=$(peak results/raw/jellyfin-rss.txt)
-H_COLD=$(cat results/raw/hermit-cold.txt); J_COLD=$(cat results/raw/jellyfin-cold.txt)
-H_N=$(cat results/raw/hermit-count.txt); J_N=$(cat results/raw/jellyfin-count.txt)
+H_RSS=$(peak results/raw/ferrofin-rss.txt); J_RSS=$(peak results/raw/jellyfin-rss.txt)
+H_COLD=$(cat results/raw/ferrofin-cold.txt); J_COLD=$(cat results/raw/jellyfin-cold.txt)
+H_N=$(cat results/raw/ferrofin-count.txt); J_N=$(cat results/raw/jellyfin-count.txt)
 WARN=""
-[ "$H_N" != "$J_N" ] && WARN="> ⚠️ Servers scanned different item counts (Hermit ${H_N} vs Jellyfin ${J_N}) — naming/resolver divergence on real files. Latency numbers then compare slightly different workloads; investigate before publishing."
+[ "$H_N" != "$J_N" ] && WARN="> ⚠️ Servers scanned different item counts (Ferrofin ${H_N} vs Jellyfin ${J_N}) — naming/resolver divergence on real files. Latency numbers then compare slightly different workloads; investigate before publishing."
 
 # jq builds the endpoint comparison table from the two summaries.
-TABLE=$(jq -rn --slurpfile h results/raw/hermit-summary.json --slurpfile j results/raw/jellyfin-summary.json '
+TABLE=$(jq -rn --slurpfile h results/raw/ferrofin-summary.json --slurpfile j results/raw/jellyfin-summary.json '
   ($h[0].endpoints) as $H | ($j[0].endpoints) as $J |
   ($H|keys_unsorted[]) as $k |
   (if $H[$k].p50 and $J[$k].p50 then "\((($J[$k].p50)/($H[$k].p50)*100|round)/100)x" else "n/a" end) as $spd |
@@ -125,41 +125,41 @@ TABLE=$(jq -rn --slurpfile h results/raw/hermit-summary.json --slurpfile j resul
 OUT="results/${VERSION}.md"
 {
 cat <<EOF
-# Hermit vs Jellyfin — benchmark
+# Ferrofin vs Jellyfin — benchmark
 
-- **Hermit:** \`${VERSION}\`  **Jellyfin:** \`${JELLYFIN_IMAGE}\`
+- **Ferrofin:** \`${VERSION}\`  **Jellyfin:** \`${JELLYFIN_IMAGE}\`
 - **When:** ${DATE}
 - **Host:** ${HOST}
-- **Library:** ${H_N} items (Hermit) / ${J_N} (Jellyfin) · **Load:** ${BENCH_VUS} VUs × ${BENCH_DURATION}/endpoint
+- **Library:** ${H_N} items (Ferrofin) / ${J_N} (Jellyfin) · **Load:** ${BENCH_VUS} VUs × ${BENCH_DURATION}/endpoint
 - Method & caveats: see [README](../README.md).
 
 ${WARN}
 
 ## Latency (ms, p50 / p95 / p99) and throughput
 
-| Endpoint | Hermit | Jellyfin | RPS (H vs J) | 200-rate (H / J) | p50 speedup |
+| Endpoint | Ferrofin | Jellyfin | RPS (H vs J) | 200-rate (H / J) | p50 speedup |
 |---|---|---|---|---|---|
 ${TABLE}
 
-> "speedup" = Jellyfin p50 ÷ Hermit p50 (>1 means Hermit is faster). Latency is recorded for
+> "speedup" = Jellyfin p50 ÷ Ferrofin p50 (>1 means Ferrofin is faster). Latency is recorded for
 > expected-status responses only (200, or 204 for the playstate write); a rate below 100% means
 > that endpoint partly errored on that server — treat its row as a parity bug to chase, not a
 > performance signal.
 
 ## Footprint
 
-| Metric | Hermit | Jellyfin |
+| Metric | Ferrofin | Jellyfin |
 |---|---|---|
 | Cold start (container → first 200) | ${H_COLD}s | ${J_COLD}s |
 | Peak anon memory (cache-excluded; scan + load, incl. ffprobe children) | ${H_RSS} MiB | ${J_RSS} MiB |
 | Items scanned | ${H_N} | ${J_N} |
 EOF
-if [ "${RUN_TRANSCODE:-0}" = "1" ] && [ -f results/raw/hermit-transcode.json ]; then
+if [ "${RUN_TRANSCODE:-0}" = "1" ] && [ -f results/raw/ferrofin-transcode.json ]; then
   fmt_ttfs() { jq -r --arg m "$2" '.[$m] | if . then "\(.med) ms (\(.min)–\(.max), \(.runs) runs)" else "N/A" end' "$1"; }
   printf '| HLS play-start, stream-copy remux (median TTFS) | %s | %s |\n' \
-    "$(fmt_ttfs results/raw/hermit-transcode.json copy)" "$(fmt_ttfs results/raw/jellyfin-transcode.json copy)"
+    "$(fmt_ttfs results/raw/ferrofin-transcode.json copy)" "$(fmt_ttfs results/raw/jellyfin-transcode.json copy)"
   printf '| HLS play-start, forced 4K HEVC→H.264 encode (median TTFS) | %s | %s |\n' \
-    "$(fmt_ttfs results/raw/hermit-transcode.json encode)" "$(fmt_ttfs results/raw/jellyfin-transcode.json encode)"
+    "$(fmt_ttfs results/raw/ferrofin-transcode.json encode)" "$(fmt_ttfs results/raw/jellyfin-transcode.json encode)"
 fi
 } > "$OUT"
 

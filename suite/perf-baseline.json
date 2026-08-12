@@ -64,7 +64,7 @@
   },
   "merged": {
     "factor": 1.5,
-    "hermit": "v0.8.5-2-gbfbd201",
+    "ferrofin": "v0.8.5-2-gbfbd201",
     "variants": {
       "activity_log": {
         "op": "GET /System/ActivityLog/Entries",

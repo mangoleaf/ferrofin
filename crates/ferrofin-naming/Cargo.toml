@@ -1,0 +1,21 @@
+[package]
+name = "ferrofin-naming"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Filename → media parsing for Ferrofin (port of Emby.Naming)."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-model.workspace = true
+ferrofin-util.workspace = true
+serde.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

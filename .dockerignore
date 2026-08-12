@@ -1,4 +1,4 @@
-# Keep the docker build context small — suite/perf/Dockerfile.hermit uses the repo root.
+# Keep the docker build context small — suite/perf/Dockerfile.ferrofin uses the repo root.
 target/
 .git/
 suite/

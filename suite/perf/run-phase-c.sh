@@ -7,7 +7,7 @@
 # the fair Rust-vs-.NET footprint number (same external yardstick for both).
 #
 #   ./run-phase-c.sh                    both servers
-#   BENCH_ONLY=hermit ./run-phase-c.sh
+#   BENCH_ONLY=ferrofin ./run-phase-c.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=../lib.sh
@@ -37,8 +37,8 @@ mixed() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && mixed hermit "$HERMIT_HOST_PORT" hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && mixed jellyfin "$JELLYFIN_HOST_PORT" jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && mixed ferrofin "$FERROFIN_HOST_PORT" ferrofin
+[ "${BENCH_ONLY:-}" != "ferrofin" ]   && mixed jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase C report"

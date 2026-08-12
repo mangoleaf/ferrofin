@@ -1,0 +1,16 @@
+{{- if .Values.ferrofin.config }}
+# Chart-managed env ConfigMap: each key/value under `ferrofin.config` becomes an
+# environment variable in the Ferrofin container (injected via envFrom in the
+# Deployment). For non-secret configuration — use a Secret + ferrofin.envFrom for
+# secrets. Changing these rolls the pod (see the checksum/config pod annotation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferrofin.fullname" . }}-env
+  labels:
+    {{- include "ferrofin.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := .Values.ferrofin.config }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- end }}

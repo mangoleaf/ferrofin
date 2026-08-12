@@ -1,0 +1,32 @@
+[package]
+name = "ferrofin-mediaencoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ffmpeg/ffprobe media encoding for Ferrofin (port of MediaBrowser.MediaEncoding + EncodingHelper)."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-traits.workspace = true
+ferrofin-model.workspace = true
+ferrofin-common.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+quick-xml.workspace = true
+encoding_rs = "0.8"
+chardetng = "0.1"
+shlex = "1"
+tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true

@@ -2,31 +2,31 @@
 # run.sh brings them up ONE AT A TIME (never concurrently — contention corrupts both).
 # Explicit project name: the folder moved once already (benchmark/ → suite/perf/) and the
 # directory-derived default orphans old containers/volumes on rename.
-name: hermit-bench
+name: ferrofin-bench
 services:
-  hermit:
+  ferrofin:
     build:
       context: ../..
-      dockerfile: suite/perf/Dockerfile.hermit
-    image: hermit-bench:local
+      dockerfile: suite/perf/Dockerfile.ferrofin
+    image: ferrofin-bench:local
     cpus: ${BENCH_CPUS}
     mem_limit: ${BENCH_MEM}
-    ports: ["${HERMIT_HOST_PORT:-18096}:8096"]   # host 8096 is often a live dev Hermit — stay clear
+    ports: ["${FERROFIN_HOST_PORT:-18096}:8096"]   # host 8096 is often a live dev Ferrofin — stay clear
     environment:
-      HERMIT_ADMIN_USER: ${BENCH_ADMIN_USER}
-      HERMIT_ADMIN_PASSWORD: ${BENCH_ADMIN_PASSWORD}
-      HERMIT_DATA_DIR: /data
-      HERMIT_BIND_ADDR: 0.0.0.0
-      HERMIT_PORT: "8096"
-      # Pool-sweep knob (benchmark/pool-sweep.sh): empty ⇒ Hermit's own default.
-      HERMIT_DB_POOL: ${HERMIT_DB_POOL:-}
-      # Lets the sweep surface the db_pool sampler (RUST_LOG=hermit_server=debug).
+      FERROFIN_ADMIN_USER: ${BENCH_ADMIN_USER}
+      FERROFIN_ADMIN_PASSWORD: ${BENCH_ADMIN_PASSWORD}
+      FERROFIN_DATA_DIR: /data
+      FERROFIN_BIND_ADDR: 0.0.0.0
+      FERROFIN_PORT: "8096"
+      # Pool-sweep knob (benchmark/pool-sweep.sh): empty ⇒ Ferrofin's own default.
+      FERROFIN_DB_POOL: ${FERROFIN_DB_POOL:-}
+      # Lets the sweep surface the db_pool sampler (RUST_LOG=ferrofin_server=debug).
       RUST_LOG: ${BENCH_RUST_LOG:-info}
     volumes:
       - ${REAL_MEDIA_DIR:-./fixtures/empty}:/media/movies-real:ro
       - ${REAL_TV_DIR:-./fixtures/empty}:/media/tv-real:ro
       - ./fixtures/media:/media/synth:ro
-      - hermit-data:/data
+      - ferrofin-data:/data
 
   jellyfin:
     image: ${JELLYFIN_IMAGE}
@@ -42,6 +42,6 @@ services:
 
 # Named volumes so `docker compose down -v` gives each run a clean DB.
 volumes:
-  hermit-data:
+  ferrofin-data:
   jellyfin-config:
   jellyfin-cache:

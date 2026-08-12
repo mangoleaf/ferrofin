@@ -13,18 +13,18 @@ function load(target) {
   }
   return out;
 }
-const H = load('hermit'), J = load('jellyfin');
+const H = load('ferrofin'), J = load('jellyfin');
 const names = [...new Set([...Object.keys(H), ...Object.keys(J)])].sort();
 
 const n = (x, d = 2) => (x == null ? '·' : Number(x).toFixed(d));
-const spd = (h, j) => (h && j ? (j / h) : null);              // >1 ⇒ Hermit faster / leaner
+const spd = (h, j) => (h && j ? (j / h) : null);              // >1 ⇒ Ferrofin faster / leaner
 const cell = (e) => (e ? `${n(e.p50)} / ${n(e.p95)} / ${n(e.p99)}` : '·');
 const drop = (e) => (e && e.dropped > 0 ? ` ⚠️${e.dropped}` : '');
 
 const rows = names.map((name) => {
   const h = H[name], j = J[name];
   const latSpd = spd(h?.p50, j?.p50);
-  const cpuSpd = spd(h?.cpu_us_per_req, j?.cpu_us_per_req);   // >1 ⇒ Hermit uses less CPU
+  const cpuSpd = spd(h?.cpu_us_per_req, j?.cpu_us_per_req);   // >1 ⇒ Ferrofin uses less CPU
   return { name, h, j, latSpd, cpuSpd };
 });
 
@@ -34,21 +34,21 @@ const table = rows.map(({ name, h, j, latSpd, cpuSpd }) =>
   + `| ${latSpd == null ? '·' : n(latSpd) + 'x'} | ${cpuSpd == null ? '·' : n(cpuSpd) + 'x'} |`,
 ).join('\n');
 
-const md = `# Hermit vs Jellyfin — Phase A (isolated, open-model per endpoint)
+const md = `# Ferrofin vs Jellyfin — Phase A (isolated, open-model per endpoint)
 
-- **Hermit:** \`${version}\`  **Jellyfin:** \`${process.env.JELLYFIN_IMAGE || '?'}\`
+- **Ferrofin:** \`${version}\`  **Jellyfin:** \`${process.env.JELLYFIN_IMAGE || '?'}\`
 - **Model:** open (constant arrival rate), one endpoint at a time, ${rate} req/s for ${dur} after warm-up.
 - **CPU/req:** container cgroup \`cpu.stat usage_usec\` delta over the run, minus idle baseline, ÷ requests.
 - Isolated ⇒ each row is that handler's own latency + CPU, with no cross-endpoint contention.
 
 ## Latency (ms, p50 / p95 / p99) and CPU cost
 
-| Endpoint | Hermit lat | Jellyfin lat | CPU µs/req (H / J) | lat speedup | CPU efficiency |
+| Endpoint | Ferrofin lat | Jellyfin lat | CPU µs/req (H / J) | lat speedup | CPU efficiency |
 |---|---|---|---|---|---|
 ${table}
 
-> "lat speedup" = Jellyfin p50 ÷ Hermit p50 (>1 = Hermit faster). "CPU efficiency" =
-> Jellyfin µs/req ÷ Hermit µs/req (>1 = Hermit burns less CPU per request). ⚠️N = N
+> "lat speedup" = Jellyfin p50 ÷ Ferrofin p50 (>1 = Ferrofin faster). "CPU efficiency" =
+> Jellyfin µs/req ÷ Ferrofin µs/req (>1 = Ferrofin burns less CPU per request). ⚠️N = N
 > dropped arrivals (endpoint could not sustain the offered rate ⇒ treat its row as
 > saturated, not a clean latency).
 `;

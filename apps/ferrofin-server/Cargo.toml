@@ -1,0 +1,71 @@
+[package]
+name = "ferrofin-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Ferrofin server binary — the composition root (port of Jellyfin.Server): config, DB, ffmpeg, wire, serve."
+
+[lints]
+workspace = true
+
+# The composition root lives in the library crate so the binary stays thin and
+# the First-Light integration test can drive the boot sequence directly.
+[lib]
+name = "ferrofin_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrofin-server"
+path = "src/main.rs"
+
+[dependencies]
+# every impl crate — this is the composition root that assembles them
+ferrofin-api.workspace = true
+ferrofin-core.workspace = true
+ferrofin-traits.workspace = true
+ferrofin-model.workspace = true
+ferrofin-db.workspace = true
+ferrofin-common.workspace = true
+ferrofin-naming.workspace = true
+ferrofin-networking.workspace = true
+ferrofin-health.workspace = true
+ferrofin-mediaencoding.workspace = true
+ferrofin-hls.workspace = true
+ferrofin-drawing.workspace = true
+ferrofin-providers.workspace = true
+ferrofin-extensions.workspace = true
+ferrofin-livetv.workspace = true
+ferrofin-metrics.workspace = true
+
+axum = { workspace = true, features = ["ws", "macros"] }
+tower.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
+tower-http.workspace = true   # ServeDir/ServeFile for the static web client
+tokio = { workspace = true }
+async-trait.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+config.workspace = true
+serde.workspace = true
+serde_json.workspace = true   # best-effort system.json pre-read for log retention
+shlex = "1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+# OTLP trace export (off unless OTEL_EXPORTER_OTLP_ENDPOINT is set); see PLAN_TRACES.
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# First-Light integration test: drive the real router via tower oneshot and
+# assert JSON bodies.
+tower.workspace = true
+# `testing` unlocks the in-memory span exporter for the tracing→OTel bridge smoke test.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true

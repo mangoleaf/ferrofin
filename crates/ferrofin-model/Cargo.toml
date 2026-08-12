@@ -1,0 +1,25 @@
+[package]
+name = "ferrofin-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "DTOs and enums for Ferrofin (port of MediaBrowser.Model) — the shared data universe."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-util.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+insta.workspace = true

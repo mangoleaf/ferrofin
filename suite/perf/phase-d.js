@@ -9,7 +9,7 @@
 // between steps.
 //
 // Run via run-phase-d.sh (which boots + scans the server first). Direct:
-//   TARGET=hermit BASE_URL=http://localhost:18196 k6 run phase-d.js
+//   TARGET=ferrofin BASE_URL=http://localhost:18196 k6 run phase-d.js
 import http from 'k6/http';
 import { sleep } from 'k6';
 import exec from 'k6/execution';

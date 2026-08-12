@@ -1,9 +1,9 @@
-# Contributing to Hermit
+# Contributing to Ferrofin
 
-Thanks for your interest in Hermit — a from-scratch Rust implementation of the
+Thanks for your interest in Ferrofin — a from-scratch Rust implementation of the
 Jellyfin server API. This guide covers how to build, test, and submit changes.
 
-Hermit is **GPL-3.0-only** (it is a derivative of Jellyfin's GPL-3.0 server crates).
+Ferrofin is **GPL-3.0-only** (it is a derivative of Jellyfin's GPL-3.0 server crates).
 By contributing you agree your work is licensed under the same terms.
 
 ## Development setup
@@ -13,7 +13,7 @@ Rust workspace, edition 2024, toolchain pinned to **1.97.1** (stable — see
 
 ```bash
 cargo build --workspace
-cargo run -p hermit-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
+cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
 On a fresh database the server seeds an admin user and logs a generated password —
@@ -29,7 +29,7 @@ cargo nextest run --workspace          # + cargo test --workspace --doc for doct
 ```
 
 Every `pub` item needs a `///` doc and pedantic clippy must pass (warnings are
-errors in CI). New code needs tests: Hermit ports Jellyfin behavior faithfully,
+errors in CI). New code needs tests: Ferrofin ports Jellyfin behavior faithfully,
 so where upstream ships xUnit `[Theory]/[InlineData]` cases, transliterate them
 into `rstest` `#[case]` tests — the C# expected values are the oracle.
 
@@ -71,7 +71,7 @@ git commit -s
 2. Keep the change scoped; run the quality gates locally before pushing.
 3. Open a merge request against `main`. CI runs fmt/clippy/tests + the coverage gate.
 4. If you add or rename an HTTP route, keep the contract-superset test green
-   (`crates/hermit-api/tests/contract_superset.rs`) — the registered route table
+   (`crates/ferrofin-api/tests/contract_superset.rs`) — the registered route table
    must remain a superset of the vendored Jellyfin OpenAPI spec.
 
 ## Reporting bugs and security issues

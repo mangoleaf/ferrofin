@@ -23,7 +23,7 @@ ROW = re.compile(
     r"\s*([\d.]+)x?\s*\|"
 )
 HDR = {
-    "hermit": re.compile(r"\*\*Hermit:\*\*\s*`([^`]+)`"),
+    "ferrofin": re.compile(r"\*\*Ferrofin:\*\*\s*`([^`]+)`"),
     "jellyfin": re.compile(r"\*\*Jellyfin:\*\*\s*`([^`]+)`"),
     "when": re.compile(r"\*\*When:\*\*\s*(.+)"),
     "host": re.compile(r"\*\*Host:\*\*\s*(.+)"),
@@ -73,7 +73,7 @@ def parse(path):
             label, herm, jelly = (c.strip() for c in fm.groups())
             if label in ("Metric", "") or set(label) <= {"-", ":"}:
                 continue  # header / separator row
-            v["footprint"].append({"metric": label, "hermit": herm, "jellyfin": jelly})
+            v["footprint"].append({"metric": label, "ferrofin": herm, "jellyfin": jelly})
     return v
 
 

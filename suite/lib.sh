@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# suite/lib.sh — the ONE copy of the Hermit↔Jellyfin bring-up (Plan 6, fixes M6 + M7).
+# suite/lib.sh — the ONE copy of the Ferrofin↔Jellyfin bring-up (Plan 6, fixes M6 + M7).
 # Sourced, never executed. Every caller cd's into suite/perf/ first (fixtures/, gen-fixtures.sh,
 # docker-compose.yml all live there); these functions assume that cwd.
 #

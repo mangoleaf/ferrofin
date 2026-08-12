@@ -1,8 +1,8 @@
 # Contracts
 
 Vendored, pinned copies of the **Jellyfin OpenAPI spec** — the authoritative HTTP contract
-that TV clients (Wolphin, Swiftfin, Findroid) depend on. `hermit-api` is built to satisfy
-this surface, and a Wave 7 CI test diffs `hermit-api`'s generated spec against it (Hermit
+that TV clients (Wolphin, Swiftfin, Findroid) depend on. `ferrofin-api` is built to satisfy
+this surface, and a Wave 7 CI test diffs `ferrofin-api`'s generated spec against it (Ferrofin
 must be a superset; drift fails CI).
 
 ## `jellyfin-openapi-10.11.8.json`

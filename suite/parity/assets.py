@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Layer-3 binary/asset differential: image, font, and CSS endpoints.
 
-Binary responses can't be JSON-diffed, and byte-identity is the wrong bar — Hermit's
+Binary responses can't be JSON-diffed, and byte-identity is the wrong bar — Ferrofin's
 Rust `image` crate and Jellyfin's SkiaSharp re-encode the same source to different bytes.
 So this layer diffs the *derived properties* a client actually depends on:
 
@@ -17,7 +17,7 @@ Emits parity/asset-results.json; gen-ledger.py ingests it as the authority for t
 ops (superseding their "not-testable-this-way: binary" classification).
 
 Run via sweep.sh, or directly against provisioned servers:
-  HERMIT_URL=... JELLYFIN_URL=... parity/assets.py
+  FERROFIN_URL=... JELLYFIN_URL=... parity/assets.py
 Offline self-check:
   parity/assets.py --check
 """
@@ -255,7 +255,7 @@ def write_effects(base, token, c):
     gone = raw("GET", base, f"/UserImage?userId={u}", token)[0]
     r["DELETE /UserImage"] = d < 300 and gone >= 400
 
-    # Branding splashscreen: enable it (Hermit serves the GET only when enabled), upload,
+    # Branding splashscreen: enable it (Ferrofin serves the GET only when enabled), upload,
     # read it back as an image, delete, then restore the disabled default.
     http("POST", f"{base}/System/Configuration/Branding", token,
          json.dumps({"SplashscreenEnabled": True, "LoginDisclaimer": "", "CustomCss": ""}))
@@ -271,13 +271,13 @@ def write_effects(base, token, c):
 
 
 # ------------------------------------------------------------- run
-def run(hermit_url, jellyfin_url):
-    ht, hu = bring_up(hermit_url, "hermit")
+def run(ferrofin_url, jellyfin_url):
+    ht, hu = bring_up(ferrofin_url, "ferrofin")
     jt, ju = bring_up(jellyfin_url, "jellyfin")
-    hc, jc = resolve(hermit_url, ht, hu), resolve(jellyfin_url, jt, ju)
+    hc, jc = resolve(ferrofin_url, ht, hu), resolve(jellyfin_url, jt, ju)
 
     rows = {}
-    hsig, jsig = read_signatures(hermit_url, ht, hc), read_signatures(jellyfin_url, jt, jc)
+    hsig, jsig = read_signatures(ferrofin_url, ht, hc), read_signatures(jellyfin_url, jt, jc)
     for op in sorted(hsig):
         h, j = hsig[op], jsig.get(op)
         ok = j is not None and sig_match(h, j)
@@ -285,7 +285,7 @@ def run(hermit_url, jellyfin_url):
                     "classification": "" if ok else "flagged: asset property diff vs Jellyfin (verify)",
                     "note": f"H={h} J={j}"}
 
-    hw, jw = write_effects(hermit_url, ht, hc), write_effects(jellyfin_url, jt, jc)
+    hw, jw = write_effects(ferrofin_url, ht, hc), write_effects(jellyfin_url, jt, jc)
     for op in sorted(hw):
         h_ok, j_ok = hw[op], jw.get(op)
         ok = bool(h_ok and j_ok)
@@ -299,9 +299,9 @@ def main():
     if "--check" in sys.argv:
         selfcheck()
         return
-    hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
+    ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL", "http://localhost:18097")
-    rows = run(hermit, jellyfin)
+    rows = run(ferrofin, jellyfin)
     out = {"generated_by": "suite/parity/assets.py", "last_verified": os.environ.get("PARITY_STAMP", ""),
            "rows": rows}
     with open(os.path.join(ROOT, "suite/parity/asset-results.json"), "w") as f:

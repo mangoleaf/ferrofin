@@ -5,11 +5,11 @@
 # at a fixed arrival rate (phase-a.js, constant-arrival-rate), snapshotting the
 # container's cgroup cpu.stat around each run to attribute CPU-seconds/request.
 # Produces per-endpoint p50/p95/p99 + CPU-µs/req that are actually comparable
-# between Hermit and Jellyfin (no cross-endpoint interference, honest tails).
+# between Ferrofin and Jellyfin (no cross-endpoint interference, honest tails).
 #
 #   ./run-phase-a.sh                    both servers
-#   BENCH_ONLY=hermit ./run-phase-a.sh  one server
-#   BENCH_SKIP_BUILD=1 ...              reuse the existing hermit-bench:local image
+#   BENCH_ONLY=ferrofin ./run-phase-a.sh  one server
+#   BENCH_SKIP_BUILD=1 ...              reuse the existing ferrofin-bench:local image
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=../lib.sh
@@ -68,8 +68,8 @@ profile() {   # $1=service $2=port $3=target
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-[ "${BENCH_ONLY:-}" != "jellyfin" ] && profile hermit "$HERMIT_HOST_PORT" hermit
-[ "${BENCH_ONLY:-}" != "hermit" ]   && profile jellyfin "$JELLYFIN_HOST_PORT" jellyfin
+[ "${BENCH_ONLY:-}" != "jellyfin" ] && profile ferrofin "$FERROFIN_HOST_PORT" ferrofin
+[ "${BENCH_ONLY:-}" != "ferrofin" ]   && profile jellyfin "$JELLYFIN_HOST_PORT" jellyfin
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase A report"

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Hermit are documented here.
+All notable changes to Ferrofin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com) and
 [Conventional Commits](https://www.conventionalcommits.org); versions follow
 [Semantic Versioning](https://semver.org).
@@ -151,12 +151,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 
 ### Features
 - Add OpenTelemetry-backed Prometheus /metrics endpoint
-- Add HERMIT_ENABLE_METRICS bootstrap override
+- Add FERROFIN_ENABLE_METRICS bootstrap override
 
 ### Miscellaneous
 - Add run-benchmark skill
 - Add missing crate dependency
-- Add secrecy crate dependency to hermit-providers and hermit-model
+- Add secrecy crate dependency to ferrofin-providers and ferrofin-model
 
 ### Performance
 - Serve user DTOs from the auth cache instead of 2-3 DB round-trips per request
@@ -218,7 +218,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 
 ### Performance
 - One projection path — single item is a batch of one
-- Add Hermit-only p50/p95/p99 regression gate (plan 4)
+- Add Ferrofin-only p50/p95/p99 regression gate (plan 4)
 - Unify parity + benchmark into one cross-referenced suite
 - Split reader/writer pools; pool size becomes a config knob (auto = cores)
 - One comparator, one baseline — suite/gate.py absorbs perf-gate.mjs
@@ -324,7 +324,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - CLAUDE.md toolchain pin 1.97.0 -> 1.97.1 (match rust-toolchain.toml)
 
 ### Miscellaneous
-- Classify playstate-progress + playlist-share-delete as methodology (not Hermit bugs)
+- Classify playstate-progress + playlist-share-delete as methodology (not Ferrofin bugs)
 
 ### Performance
 - Use jellyfin-ffmpeg's tonemapx for software HDR tonemap
@@ -428,11 +428,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - Allow triggering create-release early, auto-cancel if tests fail
 
 ### Documentation
-- Fix env example to HERMIT_LOG (the var Hermit reads)
+- Fix env example to FERROFIN_LOG (the var Ferrofin reads)
 - Triage roadmap + per-op verdicts from the parity-triage workflow
 
 ### Features
-- Chart-managed env ConfigMap injected into Hermit
+- Chart-managed env ConfigMap injected into Ferrofin
 
 ### Miscellaneous
 - Refresh ledger after batch 1+2 fixes; denylist ETag (instance hash)
@@ -514,7 +514,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - Populate DTO field defaults + honour fields on /Items/Latest
 - Compute image dimensions + blurhash during the scan
 - Serve the full ISO-639 culture list
-- Bundle pinned jellyfin-web client at /usr/share/hermit/web
+- Bundle pinned jellyfin-web client at /usr/share/ferrofin/web
 
 ## [0.2.3] - 2026-08-01
 
@@ -615,7 +615,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - The client now fetches metadata, not just artwork
 
 ### Features
-- Scaffold hermit workspace + Wave 0 port
+- Scaffold ferrofin workspace + Wave 0 port
 - Port MediaBrowser.Model DTOs and enums
 - Wave 2
 - Port Jellyfin.Database schema + entities (sqlx + SQLite)
@@ -625,7 +625,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - Port Jellyfin.Api — contract-complete axum layer
 - Implement 236 endpoints for real (Wave 7b)
 - Real HLS transcode pipeline + more endpoints
-- Composition root — Hermit boots as a real server (Wave 8)
+- Composition root — Ferrofin boots as a real server (Wave 8)
 - Implement 31 of the 35 core-not-yet-wired routes
 - Serve a static web client at /web
 - Session WebSocket at /socket (fix "Connection Failure")
@@ -665,7 +665,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - Log playback to the dashboard activity feed
 - Enrich cast/crew with TMDB biography, birthday, birthplace
 - Rotten Tomatoes critic rating via OMDb
-- Plan + hermit-chromaprint pure intro/credits math
+- Plan + ferrofin-chromaprint pure intro/credits math
 - Intro Skipper — audio-fingerprint intro/credits detection
 - Implement four hollow functional gaps end-to-end
 - Dashboard settings page for plugins (Intro Skipper)
@@ -677,7 +677,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 - Vendor real plugin web UIs; add the File Transformation extension
 - Enforce ownership, shares, and open-access for real
 - Real per-item metadata refresh, incl. seasons/episodes
-- Working Hermit-vs-Jellyfin harness, first run green
+- Working Ferrofin-vs-Jellyfin harness, first run green
 - The full Jellyfin dashboard task set + a real trigger scheduler
 - Real transcode TTFS — copy + forced-encode modes; fix 30s transcode start timeout
 - Honor the negotiated bitrate/resolution caps — downscale, -maxrate, HDR tonemap
@@ -687,9 +687,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 ### Miscellaneous
 - Cleanup commited .rcg/ files
 - Gitignore .rcg/
-- Lockfile for hermit-networking dependency
+- Lockfile for ferrofin-networking dependency
 - Fake MediaSourceManager impls + Cargo.lock for refresh_media_streams
-- Refresh Cargo.lock for hermit-providers tokio/tracing deps
+- Refresh Cargo.lock for ferrofin-providers tokio/tracing deps
 - Add hermitcodegraph server entry
 
 ### Performance

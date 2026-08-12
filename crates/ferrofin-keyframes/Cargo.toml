@@ -1,0 +1,19 @@
+[package]
+name = "ferrofin-keyframes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Keyframe extraction for Ferrofin (port of Jellyfin.MediaEncoding.Keyframes)."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest.workspace = true
+serde_json = { workspace = true }
+tempfile.workspace = true

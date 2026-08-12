@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """suite/fingerprint.py — record a per-operation body "shape" hash for one running server.
 
-The mid-run honesty check (Plan 6): the parity stage captures Hermit's body shapes; the perf
+The mid-run honesty check (Plan 6): the parity stage captures Ferrofin's body shapes; the perf
 stage captures them again on the fresh perf bring-up. merge.py flags any op whose shape drifted
 between the two as `comparable: false` — catching "fast because the body went hollow/wrong since
 the last parity pass" at near-zero cost.
 
 Shape, not bytes: parity and perf run on separate bring-ups with fresh DBs, so UUIDs/dates/paths
 differ every time. We hash the SET OF DOTTED KEY-PATHS (field presence, array-index-insensitive),
-which is stable across DBs but changes the moment Hermit starts omitting fields (genres, people…).
+which is stable across DBs but changes the moment Ferrofin starts omitting fields (genres, people…).
 
 Usage:  python3 suite/fingerprint.py capture <base-url> <out.json>
   ponytail: a spot-check, one probe per variant — not a literal 1-in-N mid-stream sample.

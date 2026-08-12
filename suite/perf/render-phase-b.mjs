@@ -13,7 +13,7 @@ function load(target) {
   }
   return out;
 }
-const H = load('hermit'), J = load('jellyfin');
+const H = load('ferrofin'), J = load('jellyfin');
 const names = [...new Set([...Object.keys(H), ...Object.keys(J)])].sort();
 
 const num = (x) => (x == null ? '·' : x);
@@ -25,20 +25,20 @@ const rows = names.map((name) => {
     + `| ${ratio == null ? '·' : ratio.toFixed(2) + '×'} |`;
 }).join('\n');
 
-const md = `# Hermit vs Jellyfin — Phase B (per-endpoint saturation sweep)
+const md = `# Ferrofin vs Jellyfin — Phase B (per-endpoint saturation sweep)
 
-- **Hermit:** \`${version}\`  **Jellyfin:** \`${process.env.JELLYFIN_IMAGE || '?'}\`
+- **Ferrofin:** \`${version}\`  **Jellyfin:** \`${process.env.JELLYFIN_IMAGE || '?'}\`
 - Each endpoint driven (open model) at a rising arrival-rate ladder until the
   server drops arrivals or stops returning 200; the last clean rate is its
   **max sustainable throughput** (req/s). Curated endpoint subset.
 
 ## Max sustainable throughput (req/s)
 
-| Endpoint | Hermit max RPS | Jellyfin max RPS | p99 at max (H / J, ms) | throughput ratio |
+| Endpoint | Ferrofin max RPS | Jellyfin max RPS | p99 at max (H / J, ms) | throughput ratio |
 |---|---|---|---|---|
 ${rows}
 
-> ratio = Hermit max RPS ÷ Jellyfin max RPS (>1 = Hermit sustains more). The
+> ratio = Ferrofin max RPS ÷ Jellyfin max RPS (>1 = Ferrofin sustains more). The
 > sweep ladder is coarse (×2 steps), so treat these as order-of-magnitude
 > capacity, not exact ceilings.
 `;

@@ -2,16 +2,16 @@
 
 ## Problem
 `GET /Studios`, `/Genres`, `/Persons`, `/Years` are 2–8× slower than both Jellyfin and
-Hermit v0.6.1 (benchmark: studios p50 was 191 ms at v0.6.1, ~450–1550 ms now; Jellyfin
+Ferrofin v0.6.1 (benchmark: studios p50 was 191 ms at v0.6.1, ~450–1550 ms now; Jellyfin
 does ~210 ms). Root cause chain:
 
 - Commit `8451f23` wired folder `UserData.UnplayedItemCount` into the DTO builder: every
   folder row on a list page triggers played/total leaf-descendant counting.
 - Commit `e9d2110` batched that into two grouped joins over `AncestorIds × BaseItems
   (× UserData)` — `get_played_and_total_count_batch` in
-  `crates/hermit-core/src/item_count_service.rs:290`.
+  `crates/ferrofin-core/src/item_count_service.rs:290`.
 - By-name rows (Studio/Genre/MusicGenre/Person/Year) are stored with `IsFolder = 1`, so
-  they pass the filter at `crates/hermit-core/src/dto_service.rs:1522-1544` (which only
+  they pass the filter at `crates/ferrofin-core/src/dto_service.rs:1522-1544` (which only
   excludes `CollectionFolder`/`UserView`). But by-name items **never appear as
   `AncestorIds.ParentItemId`** — they have no descendant closure — so the two aggregate
   scans run on every request and provably return zero for every row. Under the
@@ -34,9 +34,9 @@ rows.
    ~1496-1519 and the `played_counts` block ~1522-1544) to also exclude the by-name
    kinds that cannot have `AncestorIds` descendants: `Genre`, `MusicGenre`, `Studio`,
    `Person`, `Year`. Match whatever the parity oracle from step 1 says — if Jellyfin
-   doesn't emit these fields for those kinds, Hermit must not either (don't emit 0;
-   omit). If Hermit currently emits them and Jellyfin doesn't, that's a parity bug to
-   fix in the same change, per the "Don't port Jellyfin bugs / keep Hermit correct
+   doesn't emit these fields for those kinds, Ferrofin must not either (don't emit 0;
+   omit). If Ferrofin currently emits them and Jellyfin doesn't, that's a parity bug to
+   fix in the same change, per the "Don't port Jellyfin bugs / keep Ferrofin correct
    only on *accepted* divergences" rule — emitting extra fields breaks strict clients
    (see Android TV crash history: strict SDK crashes on shape divergence).
 3. Check the single-item path (`get_base_item_dto` → same counts logic around
@@ -47,7 +47,7 @@ rows.
 ## Verification (all required)
 - `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo nextest run --workspace`.
-- Coverage gate on touched crates: `cargo llvm-cov nextest -p hermit-core
+- Coverage gate on touched crates: `cargo llvm-cov nextest -p ferrofin-core
   --fail-under-lines 80 --summary-only` (compare per-file rows vs a stashed baseline —
   the gate has a known local quirk of exiting 1 even on clean main).
 - Parity: response bodies for `/Studios`, `/Genres`, `/Persons`, `/Years`,
@@ -60,7 +60,7 @@ rows.
 ## Constraints
 - Never create/switch branches; work on the shared HEAD.
 - No AI-attribution trailers in commits.
-- Tests go in the existing domain-named test files (hermit-api has 33 domain test
+- Tests go in the existing domain-named test files (ferrofin-api has 33 domain test
   files; extend the by-name/user-data ones, never `batchN`-style files).
 
 ## Conflicts

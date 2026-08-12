@@ -1,0 +1,790 @@
+//! Tests for [`FerrofinSessionManager`] over a real in-memory `ferrofin-db` plus the
+//! real concrete sibling managers (user/device/user-data/library) and a minimal
+//! fake [`DtoService`] (only its unused-here trait surface).
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
+use ferrofin_db::enums::PermissionKind;
+use ferrofin_db::store::guid_to_db;
+use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::dto::{BaseItemDto, SessionInfoDto};
+use ferrofin_model::secret::Secret;
+use ferrofin_model::session::{ClientCapabilities, MessageCommand, SessionMessageType};
+use uuid::Uuid;
+
+use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::dto::DtoService;
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::net::WebSocketConnection;
+use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
+use ferrofin_traits::system::ServerApplicationPaths;
+
+use super::FerrofinSessionManager;
+use crate::configuration_manager::default_server_configuration;
+use crate::device_manager::FerrofinDeviceManager;
+use crate::event_manager::FerrofinEventManager;
+use crate::item_count_service::FerrofinItemCountService;
+use crate::item_persistence_service::FerrofinItemPersistenceService;
+use crate::item_repository::FerrofinItemRepository;
+use crate::item_type_lookup::ItemTypeLookup;
+use crate::library_manager::FerrofinLibraryManager;
+use crate::people_repository::FerrofinPeopleRepository;
+use crate::user_data_manager::FerrofinUserDataManager;
+use crate::user_entity_ext::set_permission;
+use crate::user_manager::FerrofinUserManager;
+
+/// A config manager returning the factory-default configuration.
+struct FixedConfig {
+    config: ServerConfiguration,
+}
+
+#[async_trait]
+impl ServerConfigurationManager for FixedConfig {
+    fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
+        unreachable!("not used in these tests")
+    }
+    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+        Ok(self.config.clone())
+    }
+    async fn update_configuration(
+        &self,
+        _configuration: &ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        Ok(ferrofin_model::branding::BrandingOptions::default())
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// A DTO service that is never invoked by the tested paths (the manager holds it
+/// only for the deferred now-playing-item enrichment).
+struct UnusedDtoService;
+
+#[async_trait]
+impl DtoService for UnusedDtoService {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unreachable!("dto service is not exercised by these tests")
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("dto service is not exercised by these tests")
+    }
+    async fn get_base_item_dtos(
+        &self,
+        _items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        unreachable!("dto service is not exercised by these tests")
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("dto service is not exercised by these tests")
+    }
+}
+
+/// A fake WebSocket connection that records every pushed frame.
+struct FakeConnection {
+    auth: AuthorizationInfo,
+    open: bool,
+    sent: Mutex<Vec<Vec<u8>>>,
+}
+
+impl FakeConnection {
+    fn new(auth: AuthorizationInfo) -> Arc<Self> {
+        Arc::new(Self {
+            auth,
+            open: true,
+            sent: Mutex::new(Vec::new()),
+        })
+    }
+    fn sent_count(&self) -> usize {
+        self.sent.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl WebSocketConnection for FakeConnection {
+    fn remote_endpoint(&self) -> Option<&str> {
+        None
+    }
+    fn authorization_info(&self) -> &AuthorizationInfo {
+        &self.auth
+    }
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    async fn send(&self, message: &[u8]) -> Result<(), ServiceError> {
+        self.sent.lock().unwrap().push(message.to_vec());
+        Ok(())
+    }
+    async fn apply_request_culture(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// Builds a session manager wired over `db` with the real sibling managers.
+fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ItemTypeLookup::new());
+    let library = Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ));
+    Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+        library,
+        Arc::new(UnusedDtoService),
+        Arc::new(FerrofinEventManager::new()),
+        db.clone(),
+        "server-1".to_owned(),
+    ))
+}
+
+/// Inserts a minimal `Users` row with the given username, returning the row.
+async fn seed_named_user(db: &Database, id: Uuid, username: &str) -> UserEntity {
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2)"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(username)
+    .execute(db.writer())
+    .await
+    .expect("insert user");
+    sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("fetch user")
+}
+
+async fn test_db() -> Database {
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    db
+}
+
+#[tokio::test]
+async fn log_session_activity_creates_and_reuses_a_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+
+    let first = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", &user)
+        .await
+        .unwrap();
+    assert_eq!(first.client.as_deref(), Some("Web"));
+    assert_eq!(first.device_name.as_deref(), Some("Chrome"));
+    assert_eq!(first.device_id.as_deref(), Some("dev-1"));
+    assert_eq!(first.server_id.as_deref(), Some("server-1"));
+
+    // Same app+device → same session id (reused, not duplicated).
+    let again = mgr
+        .log_session_activity("Web", "1.1", "dev-1", "Chrome", "1.2.3.4", &user)
+        .await
+        .unwrap();
+    assert_eq!(first.id, again.id);
+    assert_eq!(again.application_version.as_deref(), Some("1.1"));
+}
+
+#[tokio::test]
+async fn empty_device_name_falls_back_to_network_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-x", "", "e", &user)
+        .await
+        .unwrap();
+    assert_eq!(dto.device_name.as_deref(), Some("Network Device"));
+}
+
+#[tokio::test]
+async fn additional_users_add_and_remove() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let primary = seed_named_user(&db, Uuid::new_v4(), "primary").await;
+    let guest_id = Uuid::new_v4();
+    let _guest = seed_named_user(&db, guest_id, "guest").await;
+
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+
+    mgr.add_additional_user(&session_id, guest_id)
+        .await
+        .unwrap();
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    let s = sessions
+        .iter()
+        .find(|s| s.id.as_deref() == Some(&session_id))
+        .unwrap();
+    assert_eq!(s.additional_users.as_ref().unwrap().len(), 1);
+
+    mgr.remove_additional_user(&session_id, guest_id)
+        .await
+        .unwrap();
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    let s = sessions
+        .iter()
+        .find(|s| s.id.as_deref() == Some(&session_id))
+        .unwrap();
+    assert!(s.additional_users.as_ref().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn adding_the_primary_user_as_additional_is_rejected() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let primary_id = Uuid::new_v4();
+    let primary = seed_named_user(&db, primary_id, "primary").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .await
+        .unwrap();
+    let err = mgr
+        .add_additional_user(&dto.id.unwrap(), primary_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn report_capabilities_updates_session_and_persists() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+
+    let caps = ClientCapabilities {
+        supports_media_control: true,
+        ..ClientCapabilities::default()
+    };
+    mgr.report_capabilities(&session_id, &caps).await.unwrap();
+
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    let s = sessions
+        .iter()
+        .find(|s| s.id.as_deref() == Some(&session_id))
+        .unwrap();
+    assert!(s.supports_media_control);
+}
+
+#[tokio::test]
+async fn bus_connected_session_is_controllable_and_receives_play() {
+    let db = test_db().await;
+    let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
+        Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mgr = Arc::new(
+        manager(&db)
+            .as_ref()
+            .clone()
+            .with_session_bus(Arc::clone(&bus)),
+    );
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    let dto = mgr
+        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+    mgr.report_capabilities(
+        &session_id,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Not yet connected → not remote-controllable, not listed as castable.
+    let listed = mgr
+        .get_sessions(user_id, None, None, Some(user_id), false)
+        .await
+        .unwrap();
+    assert!(listed.is_empty());
+
+    // The `/socket` handler registers a sink on the bus for this session.
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink_received = Arc::clone(&received);
+    bus.register(
+        session_id.clone(),
+        Box::new(move |msg| sink_received.lock().unwrap().push(msg)),
+    );
+
+    let listed = mgr
+        .get_sessions(user_id, None, None, Some(user_id), false)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].supports_remote_control);
+    assert!(listed[0].is_active);
+
+    // A Play command reaches the session over the bus.
+    let play = ferrofin_model::session::PlayRequest {
+        item_ids: vec![Uuid::new_v4()],
+        play_command: ferrofin_model::session::PlayCommand::PlayNow,
+        ..ferrofin_model::session::PlayRequest::default()
+    };
+    mgr.send_play_command("", &session_id, &play).await.unwrap();
+    let messages = received.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    let envelope: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+    assert_eq!(envelope["MessageType"], "Play");
+    assert_eq!(envelope["Data"]["PlayCommand"], "PlayNow");
+}
+
+#[tokio::test]
+async fn report_now_viewing_rejects_bad_id() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let err = mgr
+        .report_now_viewing_item(&dto.id.unwrap(), "not-a-uuid")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn authenticate_direct_opens_a_session_and_mints_a_token() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Chrome".to_owned()),
+        remote_endpoint: Some("1.2.3.4".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let result = mgr.authenticate_direct(&request).await.unwrap();
+    let session: &SessionInfoDto = &result.session;
+    assert_eq!(session.user_id, user_id);
+    assert_eq!(session.server_id.as_deref(), Some("server-1"));
+
+    // The result carries a non-empty minted access token (the bug: it used to be
+    // dropped, leaving the API's `AccessToken` null).
+    assert!(
+        !result.access_token.expose().is_empty(),
+        "authenticate returns a non-empty access token"
+    );
+
+    // A device row (with an access token) now exists for the user, and it is the
+    // *same* token the result returned.
+    let persisted: String =
+        sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
+            .bind("dev-1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(!persisted.is_empty());
+    assert_eq!(
+        result.access_token.expose(),
+        persisted.as_str(),
+        "the returned token equals the persisted Devices.AccessToken"
+    );
+
+    // The freshly minted token resolves back to a session.
+    let resolved = mgr
+        .get_session_by_authentication_token(result.access_token.expose(), "dev-1", "1.2.3.4")
+        .await
+        .unwrap();
+    assert_eq!(resolved.user_id, user_id);
+}
+
+#[tokio::test]
+async fn authenticate_new_session_enforces_password_and_returns_the_token() {
+    // The interactive path (`authenticate_new_session`) runs the password check
+    // (empty password authenticates a passwordless user) and must return the same
+    // minted token it persists — the fix that lets the API echo `AccessToken`.
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let request = AuthenticationRequest {
+        username: Some("bob".to_owned()),
+        password: Some(Secret::new("")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-9".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some("1.2.3.4".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let result = mgr.authenticate_new_session(&request).await.unwrap();
+    assert_eq!(result.session.user_id, user_id);
+    assert!(
+        !result.access_token.expose().is_empty(),
+        "authenticate_new_session returns a non-empty token"
+    );
+
+    let persisted: String =
+        sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
+            .bind("dev-9")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(result.access_token.expose(), persisted.as_str());
+
+    // The token authenticates future requests.
+    let resolved = mgr
+        .get_session_by_authentication_token(result.access_token.expose(), "dev-9", "1.2.3.4")
+        .await
+        .unwrap();
+    assert_eq!(resolved.user_id, user_id);
+}
+
+#[tokio::test]
+async fn authenticate_requires_the_mandatory_fields() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let err = mgr
+        .authenticate_direct(&AuthenticationRequest::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn authenticate_unknown_user_is_unauthorized() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let request = AuthenticationRequest {
+        username: Some("ghost".to_owned()),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Chrome".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let err = mgr.authenticate_direct(&request).await.unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn logout_by_token_ends_the_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Chrome".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let token = mgr
+        .authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token;
+
+    mgr.logout(token.expose()).await.unwrap();
+
+    // The device row is gone and the token no longer resolves.
+    let count: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Devices""#)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let err = mgr
+        .get_session_by_authentication_token(token.expose(), "dev-1", "e")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn get_sessions_non_admin_sees_only_own() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let bob_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let bob = seed_named_user(&db, bob_id, "bob").await;
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &alice)
+        .await
+        .unwrap();
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &bob)
+        .await
+        .unwrap();
+
+    // Alice (non-admin) sees only her own session.
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].user_id, alice_id);
+}
+
+#[tokio::test]
+async fn get_sessions_admin_sees_all() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let admin_id = Uuid::new_v4();
+    let admin = seed_named_user(&db, admin_id, "admin").await;
+    set_permission(
+        db.writer(),
+        &admin.id,
+        PermissionKind::IsAdministrator,
+        true,
+    )
+    .await
+    .unwrap();
+    let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &admin)
+        .await
+        .unwrap();
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &other)
+        .await
+        .unwrap();
+
+    let sessions = mgr
+        .get_sessions(admin_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+}
+
+#[tokio::test]
+async fn broadcast_pushes_to_attached_connections() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+
+    let conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(&session_id, conn.clone() as Arc<dyn WebSocketConnection>)
+        .await
+        .unwrap();
+
+    mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+        .await
+        .unwrap();
+    assert_eq!(conn.sent_count(), 1);
+    let frame: serde_json::Value = serde_json::from_slice(&conn.sent.lock().unwrap()[0]).unwrap();
+    assert_eq!(frame["MessageType"], "RestartRequired");
+}
+
+// Progress reported from one device must be pushed (`UserDataChanged`) to the
+// same user's OTHER sessions — that's what keeps resume positions in sync when
+// jumping between devices — and must not leak to other users' sessions.
+#[tokio::test]
+async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "shared").await;
+    let other_id = Uuid::new_v4();
+    let other = seed_named_user(&db, other_id, "other").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+
+    // The same user on two devices, plus an unrelated user's session.
+    let tv = mgr
+        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", &user)
+        .await
+        .unwrap();
+    let web = mgr
+        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", &user)
+        .await
+        .unwrap();
+    let other_session = mgr
+        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", &other)
+        .await
+        .unwrap();
+
+    let web_conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &web.id.unwrap(),
+        web_conn.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let other_conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &other_session.id.unwrap(),
+        other_conn.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+
+    let info = PlaybackProgressInfo {
+        session_id: tv.id.clone(),
+        item_id,
+        position_ticks: Some(1000),
+        ..PlaybackProgressInfo::default()
+    };
+    mgr.on_playback_progress(&info, false).await.unwrap();
+
+    // The same user's other device received the play-state push …
+    assert_eq!(web_conn.sent_count(), 1);
+    let frame: serde_json::Value =
+        serde_json::from_slice(&web_conn.sent.lock().unwrap()[0]).unwrap();
+    assert_eq!(frame["MessageType"], "UserDataChanged");
+    assert_eq!(frame["Data"]["UserId"], user_id.to_string());
+    assert_eq!(
+        frame["Data"]["UserDataList"][0]["ItemId"],
+        item_id.to_string()
+    );
+    // … and the unrelated user's session did not.
+    assert_eq!(other_conn.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn send_message_command_accepts_any_existing_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+
+    let command = MessageCommand {
+        text: "hi".to_owned(),
+        ..MessageCommand::default()
+    };
+    // Jellyfin's SendMessageToSession hands the message to whatever controllers the
+    // session has (here none → a no-op) and returns success — it does NOT gate on
+    // remote-control support or an open connection.
+    mgr.send_message_command("", &session_id, &command)
+        .await
+        .unwrap();
+
+    // A command to a session that does not exist is a NotFound (C#
+    // GetSessionToRemoteControl → ResourceNotFoundException → 404).
+    let err = mgr
+        .send_message_command("", &Uuid::new_v4().to_string(), &command)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn report_session_ended_removes_the_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.unwrap();
+
+    mgr.report_session_ended(&session_id).await.unwrap();
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    assert!(sessions.is_empty());
+}

@@ -1,0 +1,22 @@
+[package]
+name = "ferrofin-networking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Network/bind/published-URL resolution for Ferrofin (port of Jellyfin.Networking)."
+
+[lints]
+workspace = true
+
+[dependencies]
+ferrofin-common.workspace = true
+ferrofin-model.workspace = true
+ferrofin-util.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+fancy-regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

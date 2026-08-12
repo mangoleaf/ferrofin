@@ -3,12 +3,12 @@
 
 For every operation in the vendored Jellyfin spec, generate a request (path
 params filled from a live fixture library, minimal query, empty/example body for
-writes), send it to Hermit and — if a Jellyfin oracle URL is given — to Jellyfin,
+writes), send it to Ferrofin and — if a Jellyfin oracle URL is given — to Jellyfin,
 and record two signals per op into `parity/sweep-results.json`:
 
-  status_conformant  Hermit's HTTP status *class* (2xx/4xx/5xx) matches Jellyfin's.
+  status_conformant  Ferrofin's HTTP status *class* (2xx/4xx/5xx) matches Jellyfin's.
                      null if no oracle, or the request couldn't be built.
-  schema_valid       Hermit's 2xx JSON body validates against the op's response
+  schema_valid       Ferrofin's 2xx JSON body validates against the op's response
                      schema in the vendored spec ($ref-resolved, OpenAPI-nullable
                      aware). null for empty/non-JSON/non-2xx responses.
 
@@ -19,7 +19,7 @@ Provisioning (wizard/auth/libraries/scan-wait) is ported from benchmark/bench-li
 sweep.sh brings the two servers up via docker and passes their URLs.
 
 Run (both servers already up + LIBRARIES env set — see sweep.sh):
-  HERMIT_URL=http://localhost:18096 JELLYFIN_URL=http://localhost:18097 parity/sweep.py
+  FERROFIN_URL=http://localhost:18096 JELLYFIN_URL=http://localhost:18097 parity/sweep.py
 Offline self-check (no servers):
   parity/sweep.py --check
 """
@@ -259,11 +259,11 @@ def load_spec():
     return json.load(open(f))
 
 
-def sweep(hermit_url, jellyfin_url):
+def sweep(ferrofin_url, jellyfin_url):
     spec = load_spec()
     validate = make_validator(spec)
-    ht, hu = bring_up(hermit_url, "hermit")
-    fixtures = resolve_fixtures(hermit_url, ht, hu)
+    ht, hu = bring_up(ferrofin_url, "ferrofin")
+    fixtures = resolve_fixtures(ferrofin_url, ht, hu)
     if jellyfin_url:
         jt, ju = bring_up(jellyfin_url, "jellyfin")
 
@@ -284,12 +284,12 @@ def sweep(hermit_url, jellyfin_url):
                 results[opkey] = {"status_conformant": None, "schema_valid": None,
                                   "note": "streaming: not status-classifiable"}
                 continue
-            hurl, skip = build_url(path, fixtures)   # per-server ids: Hermit's on Hermit
+            hurl, skip = build_url(path, fixtures)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
                 continue
-            hs, hraw = http(method, hermit_url + with_user_query(hurl, op, params, hu), ht)
-            # schema_valid: Hermit 2xx JSON vs response schema (needs no oracle)
+            hs, hraw = http(method, ferrofin_url + with_user_query(hurl, op, params, hu), ht)
+            # schema_valid: Ferrofin 2xx JSON vs response schema (needs no oracle)
             sv = None
             sch = response_schema(op)
             if 200 <= hs < 300 and sch is not None and hraw:
@@ -374,9 +374,9 @@ def main():
     if "--check" in sys.argv:
         selfcheck()
         return
-    hermit = os.environ.get("HERMIT_URL", "http://localhost:18096")
+    ferrofin = os.environ.get("FERROFIN_URL", "http://localhost:18096")
     jellyfin = os.environ.get("JELLYFIN_URL")   # optional oracle
-    write_results(sweep(hermit, jellyfin))
+    write_results(sweep(ferrofin, jellyfin))
 
 
 if __name__ == "__main__":

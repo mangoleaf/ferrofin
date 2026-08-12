@@ -1,8 +1,8 @@
 {
   "__inputs": [],
   "__requires": [],
-  "title": "Hermit \u2014 Deep Dive",
-  "uid": "hermit-deep-dive",
+  "title": "Ferrofin \u2014 Deep Dive",
+  "uid": "ferrofin-deep-dive",
   "editable": true,
   "schemaVersion": 39,
   "version": 1,
@@ -430,7 +430,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_db_pool_connections",
+          "expr": "ferrofin_db_pool_connections",
           "legendFormat": "{{pool}} total"
         },
         {
@@ -439,7 +439,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_idle_connections",
           "legendFormat": "{{pool}} idle"
         },
         {
@@ -448,7 +448,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_db_pool_connections - hermit_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections",
           "legendFormat": "{{pool}} in-use"
         }
       ]
@@ -499,7 +499,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * (hermit_db_pool_connections - hermit_db_pool_idle_connections) / clamp_min(hermit_db_pool_connections, 1)",
+          "expr": "100 * (ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections) / clamp_min(ferrofin_db_pool_connections, 1)",
           "legendFormat": "{{pool}}"
         }
       ]
@@ -542,7 +542,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_library_items",
+          "expr": "ferrofin_library_items",
           "legendFormat": "{{type}}",
           "instant": true,
           "range": false
@@ -754,7 +754,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_tokio_alive_tasks",
+          "expr": "ferrofin_tokio_alive_tasks",
           "legendFormat": "tokio alive tasks"
         },
         {
@@ -763,7 +763,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_tokio_workers",
+          "expr": "ferrofin_tokio_workers",
           "legendFormat": "tokio workers"
         }
       ]
@@ -807,7 +807,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_uptime_seconds",
+          "expr": "ferrofin_uptime_seconds",
           "legendFormat": "uptime"
         }
       ]
@@ -907,7 +907,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_sessions_active",
+          "expr": "ferrofin_sessions_active",
           "legendFormat": "sessions"
         }
       ]
@@ -951,7 +951,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_playback_streams_active",
+          "expr": "ferrofin_playback_streams_active",
           "legendFormat": "streams"
         }
       ]
@@ -995,7 +995,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_transcode_jobs_active",
+          "expr": "ferrofin_transcode_jobs_active",
           "legendFormat": "transcodes"
         }
       ]
@@ -1039,7 +1039,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_uptime_seconds / 3600",
+          "expr": "ferrofin_uptime_seconds / 3600",
           "legendFormat": "hours"
         }
       ]
@@ -1093,7 +1093,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "hermit_playback_streams",
+          "expr": "ferrofin_playback_streams",
           "legendFormat": "{{method}}"
         }
       ]
