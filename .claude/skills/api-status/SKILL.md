@@ -12,7 +12,7 @@ description: >-
 # API implementation-status report
 
 Produce an honest status of Hermit's API vs. the Jellyfin contract. Run from the
-repo root (`/home/mango/dev/hermit`).
+repo root.
 
 ## The one thing that makes this report honest
 

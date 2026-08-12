@@ -7,7 +7,7 @@ description: >-
   when a new HERMIT_* setting lands, or when asked to "update the example
   values", "sync values.example", "regenerate the values example", "keep the
   chart example current", or "de-identify the values". Run from the repo root
-  (/home/mango/dev/hermit).
+  (the repo root).
 ---
 
 # Keep the chart values-example in sync
@@ -64,7 +64,7 @@ example must be a **de-identified generalization**, never a copy.
 
 5. **De-identification gate — MUST pass before finishing.** Run:
    ```
-   grep -niE 'mangoleaf|mlstudios|mangoarch|nvme0|/mnt/|k3s|alloy\.loki|gitlab-registry|hermit-cold|hermit-hot|Educational|10\.|192\.168|[a-z0-9.-]+\.svc\.cluster\.local' charts/hermit/values.example.yaml
+   grep -niE '<private-hostname-or-org>|nvme0|/mnt/|k3s|10\.|192\.168|[a-z0-9.-]+\.svc\.cluster\.local' charts/hermit/values.example.yaml
    ```
    Any hit is a leak. Replace real registries → `registry.example.com/<org>/…`,
    hostnames → `<storage-node>`, claim names → `<...-pvc>`, cluster-internal DNS →

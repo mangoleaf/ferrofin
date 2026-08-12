@@ -1,0 +1,3250 @@
+{
+  "meta": {
+    "hermit": "v0.16.0",
+    "hermit_sha": "166c7b3",
+    "jellyfin_image": "jellyfin/jellyfin:10.11.8",
+    "fixture_hash": "fa0024c9f239ea12",
+    "cpus": 4,
+    "mem": "4g",
+    "load": {
+      "vus": 50,
+      "duration": "30s"
+    },
+    "perf_source": "raw-summary",
+    "footprint": {
+      "h_cold_s": "0.5",
+      "h_rss_peak_mib": 319,
+      "h_items": "2516",
+      "h_ttfs_copy": {
+        "med": 121,
+        "min": 117,
+        "max": 121,
+        "runs": 3
+      },
+      "h_ttfs_encode": {
+        "med": 2262,
+        "min": 2243,
+        "max": 2332,
+        "runs": 3
+      },
+      "j_cold_s": "1.0",
+      "j_rss_peak_mib": 1374,
+      "j_items": "2516",
+      "j_ttfs_copy": {
+        "med": 130,
+        "min": 127,
+        "max": 263,
+        "runs": 3
+      },
+      "j_ttfs_encode": {
+        "med": 3593,
+        "min": 3511,
+        "max": 3620,
+        "runs": 3
+      }
+    },
+    "when": "2026-08-09T00:46Z",
+    "run_seq": 2,
+    "run_label": "v0.16.0 (2)"
+  },
+  "headline": {
+    "comparable_rows": 75,
+    "median_speedup": 7.69,
+    "win_rate": 0.707,
+    "tail_losses": [
+      "item_userdata",
+      "image_primary",
+      "video_additional_parts",
+      "playlist_users"
+    ],
+    "parity_coverage": 0.798
+  },
+  "operations": [
+    {
+      "op": "GET /System/ActivityLog/Entries",
+      "tag": "ActivityLog",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: activity-log entries differ per instance/run."
+      },
+      "perf": {
+        "variant": "activity_log",
+        "h_p50": 17.7,
+        "h_p95": 44.98,
+        "h_p99": 59.05,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 10.03,
+        "j_p95": 197.11,
+        "j_p99": 229.37,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.57,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Artists/AlbumArtists",
+      "tag": "Artists",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "album_artists",
+        "h_p50": 11.4,
+        "h_p95": 35.89,
+        "h_p99": 50.74,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 143.58,
+        "j_p95": 283.47,
+        "j_p99": 291.33,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 12.59,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Artists",
+      "tag": "Artists",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "artists",
+        "h_p50": 11.99,
+        "h_p95": 38.9,
+        "h_p99": 50.06,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 145.05,
+        "j_p95": 293.58,
+        "j_p99": 372.61,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 12.1,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Auth/Keys",
+      "tag": "ApiKey",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_keys",
+        "h_p50": 7.94,
+        "h_p95": 31.14,
+        "h_p99": 50.42,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.43,
+        "j_p95": 264.37,
+        "j_p99": 298.98,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.81,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /Users/AuthenticateByName",
+      "tag": "User",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "auth_login",
+        "h_p50": 98.21,
+        "h_p95": 187.39,
+        "h_p99": 196.51,
+        "h_rps": 81.9,
+        "h_ok": 100,
+        "j_p50": 113.75,
+        "j_p95": 200.51,
+        "j_p99": 208.22,
+        "j_rps": 0.2,
+        "j_ok": 0.3,
+        "speedup": 1.16,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "200-rate < 100%"
+      }
+    },
+    {
+      "op": "GET /Auth/Providers",
+      "tag": "Session",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_providers",
+        "h_p50": 0.07,
+        "h_p95": 0.18,
+        "h_p99": 0.6,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.8,
+        "j_p95": 229.33,
+        "j_p99": 234.49,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 54.29,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Auth/PasswordResetProviders",
+      "tag": "Session",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "auth_pw_providers",
+        "h_p50": 0.07,
+        "h_p95": 0.22,
+        "h_p99": 0.64,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.79,
+        "j_p95": 229.63,
+        "j_p99": 359.93,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 54.14,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Libraries/AvailableOptions",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "available_options",
+        "h_p50": 0.13,
+        "h_p95": 0.23,
+        "h_p99": 0.44,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 143.61,
+        "j_p95": 359.4,
+        "j_p99": 405.45,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1104.69,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Backup",
+      "tag": "Backup",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "backup_list",
+        "h_p50": 0.08,
+        "h_p95": 0.23,
+        "h_p99": 0.42,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.63,
+        "j_p95": 11.41,
+        "j_p99": 26.11,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 32.88,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Configuration",
+      "tag": "Branding",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding",
+        "h_p50": 0.07,
+        "h_p95": 0.19,
+        "h_p99": 0.46,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.34,
+        "j_p95": 181.73,
+        "j_p99": 299.91,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 47.71,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Css",
+      "tag": "Branding",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding_css",
+        "h_p50": 0.08,
+        "h_p95": 0.19,
+        "h_p99": 0.46,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 5.1,
+        "j_p95": 13.85,
+        "j_p99": 31.42,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 63.75,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Branding/Css.css",
+      "tag": "Branding",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "branding_css_ext",
+        "h_p50": 0.07,
+        "h_p95": 0.17,
+        "h_p99": 0.52,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 5.03,
+        "j_p95": 14.19,
+        "j_p99": 29.91,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 71.86,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels",
+      "tag": "Channels",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels",
+        "h_p50": 0.09,
+        "h_p95": 0.16,
+        "h_p99": 0.25,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 60.59,
+        "j_p95": 132.93,
+        "j_p99": 146.59,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 673.22,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels/Features",
+      "tag": "Channels",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels_features",
+        "h_p50": 0.08,
+        "h_p95": 0.16,
+        "h_p99": 0.25,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.56,
+        "j_p95": 24,
+        "j_p99": 198.6,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 44.5,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Channels/Items/Latest",
+      "tag": "Channels",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "channels_latest",
+        "h_p50": 0.08,
+        "h_p95": 0.15,
+        "h_p99": 0.22,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.66,
+        "j_p95": 17.91,
+        "j_p99": 198.03,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 45.75,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Devices",
+      "tag": "Devices",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "devices",
+        "h_p50": 42.96,
+        "h_p95": 138.09,
+        "h_p99": 148.27,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 30.8,
+        "j_p95": 291.17,
+        "j_p99": 299.2,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.72,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Devices/Info",
+      "tag": "Devices",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "devices_info",
+        "h_p50": 10.45,
+        "h_p95": 82.61,
+        "h_p99": 171.93,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.37,
+        "j_p95": 10.66,
+        "j_p99": 153.53,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.23,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Environment/DefaultDirectoryBrowser",
+      "tag": "Environment",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "env_default_browser",
+        "h_p50": 0.09,
+        "h_p95": 0.22,
+        "h_p99": 0.44,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.37,
+        "j_p95": 12.06,
+        "j_p99": 27.19,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 26.33,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Environment/NetworkShares",
+      "tag": "Environment",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "env_network_shares",
+        "h_p50": 0.08,
+        "h_p95": 0.21,
+        "h_p99": 0.4,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.29,
+        "j_p95": 11.11,
+        "j_p99": 18.22,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 28.62,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /FallbackFont/Fonts",
+      "tag": "Subtitle",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "fallback_fonts",
+        "h_p50": 0.08,
+        "h_p95": 0.18,
+        "h_p99": 0.4,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 4.73,
+        "j_p95": 18.59,
+        "j_p99": 25.93,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 59.13,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Filters",
+      "tag": "Filter",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "filters",
+        "h_p50": 89.08,
+        "h_p95": 198.61,
+        "h_p99": 366.44,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 190.33,
+        "j_p95": 911.1,
+        "j_p99": 1129.9,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 2.14,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Genres",
+      "tag": "Genres",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (verify)"
+      },
+      "perf": {
+        "variant": "genres",
+        "h_p50": 103.03,
+        "h_p95": 456.8,
+        "h_p99": 544.89,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 479.51,
+        "j_p95": 1663.69,
+        "j_p99": 2311.12,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 4.65,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /UserViews/GroupingOptions",
+      "tag": "UserViews",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "grouping_options",
+        "h_p50": 8.61,
+        "h_p95": 32.47,
+        "h_p99": 53.65,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 74.84,
+        "j_p95": 302.22,
+        "j_p99": 413.02,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 8.69,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}",
+      "tag": "Image",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "image_primary",
+        "h_p50": 14.18,
+        "h_p95": 65.07,
+        "h_p99": 102.47,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 15.24,
+        "j_p95": 67.36,
+        "j_p99": 67.74,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.07,
+        "win_all_three": false,
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Info/Public",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "info_public",
+        "h_p50": 0.15,
+        "h_p95": 30.36,
+        "h_p99": 30.54,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 25.48,
+        "j_p95": 223.7,
+        "j_p99": 880.41,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 169.87,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Ancestors",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope)."
+      },
+      "perf": {
+        "variant": "item_ancestors",
+        "h_p50": 106.53,
+        "h_p95": 195.58,
+        "h_p99": 313.28,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 42.51,
+        "j_p95": 545.96,
+        "j_p99": 702.76,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.4,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/CriticReviews",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_critic_reviews",
+        "h_p50": 0.08,
+        "h_p95": 0.15,
+        "h_p99": 0.18,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.01,
+        "j_p95": 42.69,
+        "j_p99": 89.4,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 87.62,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}",
+      "tag": "UserLibrary",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred)."
+      },
+      "perf": {
+        "variant": "item_detail",
+        "h_p50": 156.81,
+        "h_p95": 243.41,
+        "h_p99": 787.55,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 59.98,
+        "j_p95": 529.1,
+        "j_p99": 702.7,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.38,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ExternalIdInfos",
+      "tag": "ItemLookup",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "deferred: external-id provider metadata (TMDB/etc.) is feature-gated off."
+      },
+      "perf": {
+        "variant": "item_external_ids",
+        "h_p50": 4.05,
+        "h_p95": 17.9,
+        "h_p99": 47.76,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.83,
+        "j_p95": 74.93,
+        "j_p99": 89.29,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.93,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
+      "tag": "Image",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_image_indexed",
+        "h_p50": 12.91,
+        "h_p95": 71.47,
+        "h_p99": 118,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 8.62,
+        "j_p95": 30.79,
+        "j_p99": 67.38,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.67,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
+      "tag": "Image",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_image_parametrized",
+        "h_p50": 9.77,
+        "h_p95": 49.83,
+        "h_p99": 76.14,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.51,
+        "j_p95": 30.28,
+        "j_p99": 43.18,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.77,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Images",
+      "tag": "Image",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_images",
+        "h_p50": 13.59,
+        "h_p95": 43.97,
+        "h_p99": 72.15,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 40.02,
+        "j_p95": 403.14,
+        "j_p99": 547.53,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 2.94,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/InstantMix",
+      "tag": "InstantMix",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_instant_mix",
+        "h_p50": 10.66,
+        "h_p95": 33.14,
+        "h_p99": 76.24,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 9.85,
+        "j_p95": 31.06,
+        "j_p99": 43.41,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.92,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Intros",
+      "tag": "UserLibrary",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_intros",
+        "h_p50": 4.08,
+        "h_p95": 15.81,
+        "h_p99": 47.96,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.81,
+        "j_p95": 67.4,
+        "j_p99": 75.2,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.67,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/LocalTrailers",
+      "tag": "UserLibrary",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_local_trailers",
+        "h_p50": 6.79,
+        "h_p95": 25.28,
+        "h_p99": 47.81,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.76,
+        "j_p95": 30.84,
+        "j_p99": 42.84,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.0,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/PlaybackInfo",
+      "tag": "MediaInfo",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/probe-noise: same MediaStream probe-value residual as Items/{itemId}."
+      },
+      "perf": {
+        "variant": "item_playbackinfo",
+        "h_p50": 19.96,
+        "h_p95": 78.91,
+        "h_p99": 126.24,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 10.76,
+        "j_p95": 74.91,
+        "j_p99": 89.35,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.54,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "POST /Items/{itemId}/PlaybackInfo",
+      "tag": "MediaInfo",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_playbackinfo_post",
+        "h_p50": 27.09,
+        "h_p95": 59.45,
+        "h_p99": 148.8,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.66,
+        "j_p95": 31.77,
+        "j_p99": 1371.62,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.25,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/Similar",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "deferred: weighted GetSimilarityScore scorer not ported; the single-year metadata-poor fixture also has no stable target (every candidate ties under Jellyfin's Random tiebreak)."
+      },
+      "perf": {
+        "variant": "item_similar",
+        "h_p50": 39.06,
+        "h_p95": 87.48,
+        "h_p99": 94.82,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 44.31,
+        "j_p95": 301.56,
+        "j_p99": 427.5,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.13,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Movies/{itemId}/Similar",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "deferred: same weighted similarity scorer as Items/{id}/Similar."
+      },
+      "perf": {
+        "variant": "item_similar_movie",
+        "h_p50": 24.3,
+        "h_p95": 94.78,
+        "h_p99": 162.2,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 13.47,
+        "j_p95": 67.34,
+        "j_p99": 67.63,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.55,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/SpecialFeatures",
+      "tag": "UserLibrary",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_special_features",
+        "h_p50": 8.26,
+        "h_p95": 28.36,
+        "h_p99": 65.69,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.41,
+        "j_p95": 33.29,
+        "j_p99": 75.01,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.9,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeMedia",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_media",
+        "h_p50": 13.75,
+        "h_p95": 37.1,
+        "h_p99": 76.92,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.59,
+        "j_p95": 30.24,
+        "j_p99": 38.41,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.55,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeSongs",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_songs",
+        "h_p50": 27.43,
+        "h_p95": 113.25,
+        "h_p99": 144.07,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 15.76,
+        "j_p95": 43.76,
+        "j_p99": 67.62,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.57,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/{itemId}/ThemeVideos",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_theme_videos",
+        "h_p50": 19.07,
+        "h_p95": 71.35,
+        "h_p99": 108.13,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 14.09,
+        "j_p95": 29.1,
+        "j_p99": 67.4,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.74,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /UserItems/{itemId}/UserData",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "item_userdata",
+        "h_p50": 8.75,
+        "h_p95": 25.74,
+        "h_p99": 102.91,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 9.88,
+        "j_p95": 31.16,
+        "j_p99": 39.6,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.13,
+        "win_all_three": false,
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /UserItems/{itemId}/UserData",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "item_userdata_post",
+        "h_p50": 31.73,
+        "h_p95": 87.5,
+        "h_p99": 302.6,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 8.57,
+        "j_p95": 190.39,
+        "j_p99": 601.47,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.27,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_boxset",
+        "h_p50": 14.92,
+        "h_p95": 59.09,
+        "h_p99": 89.05,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 66.88,
+        "j_p95": 177.26,
+        "j_p99": 207.59,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 4.48,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/Counts",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "items_counts",
+        "h_p50": 19.05,
+        "h_p95": 50.35,
+        "h_p99": 63.04,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 264.19,
+        "j_p95": 477.47,
+        "j_p99": 522.74,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 13.87,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_datesort",
+        "h_p50": 125.49,
+        "h_p95": 295.06,
+        "h_p99": 575.91,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 791.14,
+        "j_p95": 2014.08,
+        "j_p99": 2446.24,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 6.3,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_episodes",
+        "h_p50": 110,
+        "h_p95": 518.05,
+        "h_p99": 701.38,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 1635.7,
+        "j_p95": 3170.72,
+        "j_p99": 4115.95,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 14.87,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_favorite",
+        "h_p50": 13.27,
+        "h_p95": 53.85,
+        "h_p99": 63.93,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 66.99,
+        "j_p95": 145.91,
+        "j_p99": 208.14,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.05,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items/Filters2",
+      "tag": "Filter",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_filters2",
+        "h_p50": 25.47,
+        "h_p95": 61.74,
+        "h_p99": 66.87,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 143.5,
+        "j_p95": 336.19,
+        "j_p99": 413.46,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.63,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Latest",
+      "tag": "UserLibrary",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_latest",
+        "h_p50": 760.96,
+        "h_p95": 2508.25,
+        "h_p99": 2755.99,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 416.73,
+        "j_p95": 2439.52,
+        "j_p99": 2441.7,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.55,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_mixed",
+        "h_p50": 198.31,
+        "h_p95": 577.89,
+        "h_p99": 632.53,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 1565.64,
+        "j_p95": 2852.94,
+        "j_p99": 3337.57,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 7.89,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_paged",
+        "h_p50": 61.3,
+        "h_p95": 103.9,
+        "h_p99": 163.04,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 104.49,
+        "j_p95": 191.99,
+        "j_p99": 223.75,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.7,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_random",
+        "h_p50": 69.07,
+        "h_p95": 109.93,
+        "h_p99": 124.8,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 129.14,
+        "j_p95": 239.05,
+        "j_p99": 345.55,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.87,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_rating",
+        "h_p50": 75.54,
+        "h_p95": 109.06,
+        "h_p99": 144.29,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 133.42,
+        "j_p95": 237.31,
+        "j_p99": 244.59,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.77,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /UserItems/Resume",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_resume",
+        "h_p50": 80.88,
+        "h_p95": 156,
+        "h_p99": 287.31,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 412.8,
+        "j_p95": 2654.26,
+        "j_p99": 2658.97,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.1,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_series",
+        "h_p50": 579.62,
+        "h_p95": 871.35,
+        "h_p99": 985.64,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 833.97,
+        "j_p95": 2552.64,
+        "j_p99": 3111.39,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.44,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Items",
+      "tag": "Items",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "items_sortname",
+        "h_p50": 111.59,
+        "h_p95": 252.93,
+        "h_p99": 365.5,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 360.1,
+        "j_p95": 1677.18,
+        "j_p99": 2439.49,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 3.23,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /LiveTv/Channels",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_channels",
+        "h_p50": 4.75,
+        "h_p95": 22.67,
+        "h_p99": 50.81,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 26.11,
+        "j_p95": 86.98,
+        "j_p99": 95.24,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.5,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Info",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_info",
+        "h_p50": 4.84,
+        "h_p95": 22.23,
+        "h_p99": 32.08,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 38.27,
+        "j_p95": 105.1,
+        "j_p99": 141.7,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 7.91,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/ListingProviders/Default",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_listing_default",
+        "h_p50": 0.08,
+        "h_p95": 0.18,
+        "h_p99": 0.25,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 4.95,
+        "j_p95": 26.7,
+        "j_p99": 755.08,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 61.88,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Programs",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_programs",
+        "h_p50": 4.13,
+        "h_p95": 21.15,
+        "h_p99": 33.59,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 31.78,
+        "j_p95": 89.33,
+        "j_p99": 89.43,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 7.69,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Programs/Recommended",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_programs_recommended",
+        "h_p50": 2.83,
+        "h_p95": 12.11,
+        "h_p99": 57.23,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 4.32,
+        "j_p95": 30.01,
+        "j_p99": 245.59,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.53,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Folders",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recording_folders",
+        "h_p50": 0.09,
+        "h_p95": 0.17,
+        "h_p99": 0.26,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 4.99,
+        "j_p95": 18.8,
+        "j_p99": 267.8,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 55.44,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Groups",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recording_groups",
+        "h_p50": 0.08,
+        "h_p95": 0.17,
+        "h_p99": 0.28,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 5.28,
+        "j_p95": 15.98,
+        "j_p99": 838.31,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 66.0,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recordings",
+        "h_p50": 3.84,
+        "h_p95": 20.96,
+        "h_p99": 40.3,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 20.57,
+        "j_p95": 71.64,
+        "j_p99": 76.15,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.36,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Recordings/Series",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_recordings_series",
+        "h_p50": 0.08,
+        "h_p95": 0.18,
+        "h_p99": 0.26,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 4.17,
+        "j_p95": 18.81,
+        "j_p99": 544.35,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 52.12,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/SeriesTimers",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_series_timers",
+        "h_p50": 3.77,
+        "h_p95": 17.68,
+        "h_p99": 43.54,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 14.58,
+        "j_p95": 75.2,
+        "j_p99": 89.37,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 3.87,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /LiveTv/Timers",
+      "tag": "LiveTv",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "livetv_timers",
+        "h_p50": 4.27,
+        "h_p95": 14.91,
+        "h_p99": 38.68,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 16.24,
+        "j_p95": 70,
+        "j_p99": 89.4,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 3.8,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/Countries",
+      "tag": "Localization",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_countries",
+        "h_p50": 0.16,
+        "h_p95": 0.37,
+        "h_p99": 0.72,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.18,
+        "j_p95": 77.96,
+        "j_p99": 277.09,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 38.62,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/Options",
+      "tag": "Localization",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_options",
+        "h_p50": 0.09,
+        "h_p95": 0.26,
+        "h_p99": 6.11,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.26,
+        "j_p95": 143.57,
+        "j_p99": 255.46,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 36.22,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/ParentalRatings",
+      "tag": "Localization",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "loc_parental",
+        "h_p50": 0.09,
+        "h_p95": 0.25,
+        "h_p99": 1.41,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.07,
+        "j_p95": 142.25,
+        "j_p99": 359.96,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 34.11,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Localization/Cultures",
+      "tag": "Localization",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "localization_cultures",
+        "h_p50": 0.26,
+        "h_p95": 0.79,
+        "h_p99": 0.94,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 8.61,
+        "j_p95": 210.69,
+        "j_p99": 417.85,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 33.12,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Library/MediaFolders",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: after WI-7 the folder COUNT matches; residual is /config-vs-/data path-alignment noise on the folder rows."
+      },
+      "perf": {
+        "variant": "media_folders",
+        "h_p50": 52.51,
+        "h_p95": 418.07,
+        "h_p99": 626.51,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 21.88,
+        "j_p95": 853.43,
+        "j_p99": 1356.26,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.42,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /MediaSegments/{itemId}",
+      "tag": "MediaSegments",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "media_segments",
+        "h_p50": 11.94,
+        "h_p95": 51.88,
+        "h_p99": 89,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 10.18,
+        "j_p95": 39.56,
+        "j_p99": 67.57,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.85,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Configuration/MetadataOptions/Default",
+      "tag": "Configuration",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "metadata_options",
+        "h_p50": 0.08,
+        "h_p95": 0.19,
+        "h_p99": 0.28,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 10.68,
+        "j_p95": 195.71,
+        "j_p99": 234.24,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 133.5,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Movies/Recommendations",
+      "tag": "Movies",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."
+      },
+      "perf": {
+        "variant": "movie_recommendations",
+        "h_p50": 44.03,
+        "h_p95": 84.86,
+        "h_p99": 92.98,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 117.74,
+        "j_p95": 230.29,
+        "j_p99": 287.87,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 2.67,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /MusicGenres",
+      "tag": "MusicGenres",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "flagged: read diff vs Jellyfin (sweep single-item align)"
+      },
+      "perf": {
+        "variant": "music_genres",
+        "h_p50": 14.92,
+        "h_p95": 43.51,
+        "h_p99": 54.71,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 120.85,
+        "j_p95": 230.33,
+        "j_p99": 291.3,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 8.1,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Shows/NextUp",
+      "tag": "TvShows",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "nextup",
+        "h_p50": 147.25,
+        "h_p95": 313.24,
+        "h_p99": 355.61,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 300.82,
+        "j_p95": 1393.43,
+        "j_p99": 1683.54,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 2.04,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Persons",
+      "tag": "Persons",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "persons",
+        "h_p50": 315.79,
+        "h_p95": 628.41,
+        "h_p99": 656.03,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 529.03,
+        "j_p95": 1223.98,
+        "j_p99": 2014.03,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.68,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Library/PhysicalPaths",
+      "tag": "Library",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: data-dir-relative physical paths differ by container (/config vs /data)."
+      },
+      "perf": {
+        "variant": "physical_paths",
+        "h_p50": 31.77,
+        "h_p95": 92.89,
+        "h_p99": 147.22,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 123.71,
+        "j_p95": 298.68,
+        "j_p99": 359.79,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 3.89,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}",
+      "tag": "Playlists",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_detail",
+        "h_p50": 20.49,
+        "h_p95": 112.46,
+        "h_p99": 153.17,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.47,
+        "j_p95": 26.56,
+        "j_p99": 38.42,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.36,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Items",
+      "tag": "Playlists",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_items",
+        "h_p50": 52.57,
+        "h_p95": 199.04,
+        "h_p99": 352.65,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.67,
+        "j_p95": 20.81,
+        "j_p99": 31.42,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.13,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Playlists/{playlistId}/Users",
+      "tag": "Playlists",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playlist_users",
+        "h_p50": 5.42,
+        "h_p95": 16.29,
+        "h_p99": 48.61,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.29,
+        "j_p95": 20.81,
+        "j_p99": 31.42,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.16,
+        "win_all_three": false,
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "POST /Sessions/Playing/Progress",
+      "tag": "Playstate",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "playstate_progress",
+        "h_p50": 27.34,
+        "h_p95": 92.82,
+        "h_p99": 241.69,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.94,
+        "j_p95": 137.83,
+        "j_p99": 1075.34,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.25,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Plugins",
+      "tag": "Plugins",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins."
+      },
+      "perf": {
+        "variant": "plugins",
+        "h_p50": 0.1,
+        "h_p95": 0.33,
+        "h_p99": 0.47,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 21.6,
+        "j_p95": 974.36,
+        "j_p99": 1236.64,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 216.0,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /QuickConnect/Enabled",
+      "tag": "QuickConnect",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "quick_connect",
+        "h_p50": 0.09,
+        "h_p95": 0.2,
+        "h_p99": 0.29,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 6.88,
+        "j_p95": 255.56,
+        "j_p99": 336.44,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 76.44,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /ScheduledTasks/{taskId}",
+      "tag": "ScheduledTasks",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "scheduled_task_detail",
+        "h_p50": 0.1,
+        "h_p95": 0.2,
+        "h_p99": 0.5,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.61,
+        "j_p95": 15.78,
+        "j_p99": 274.64,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 36.1,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /ScheduledTasks",
+      "tag": "ScheduledTasks",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: LastExecutionResult depends on whether/when a task last ran."
+      },
+      "perf": {
+        "variant": "scheduled_tasks",
+        "h_p50": 0.14,
+        "h_p95": 0.32,
+        "h_p99": 0.46,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 12.26,
+        "j_p95": 981.98,
+        "j_p99": 1369.94,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 87.57,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /Search/Hints",
+      "tag": "Search",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>."
+      },
+      "perf": {
+        "variant": "search_hints",
+        "h_p50": 22.39,
+        "h_p95": 48.61,
+        "h_p99": 74.84,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 182.41,
+        "j_p95": 702.07,
+        "j_p99": 844.9,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 8.15,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Sessions",
+      "tag": "Session",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "sessions",
+        "h_p50": 30.65,
+        "h_p95": 401.6,
+        "h_p99": 526.68,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 8.57,
+        "j_p95": 433.59,
+        "j_p99": 1125.73,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.28,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Episodes",
+      "tag": "TvShows",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "shows_episodes",
+        "h_p50": 42.98,
+        "h_p95": 150.38,
+        "h_p99": 206.42,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 19.28,
+        "j_p95": 43.02,
+        "j_p99": 67.37,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.45,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Shows/{seriesId}/Seasons",
+      "tag": "TvShows",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "shows_seasons",
+        "h_p50": 147.24,
+        "h_p95": 258.56,
+        "h_p99": 332.11,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 25.31,
+        "j_p95": 44.47,
+        "j_p99": 67.94,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.17,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Startup/Configuration",
+      "tag": "Startup",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_config",
+        "h_p50": 0.07,
+        "h_p95": 0.15,
+        "h_p99": 1.23,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.69,
+        "j_p95": 14.1,
+        "j_p99": 20.42,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 52.71,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Startup/FirstUser",
+      "tag": "Startup",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_first_user",
+        "h_p50": 6.41,
+        "h_p95": 16.69,
+        "h_p99": 71.08,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 3.73,
+        "j_p95": 13.42,
+        "j_p99": 20.4,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.58,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Startup/User",
+      "tag": "Startup",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "startup_user",
+        "h_p50": 5.6,
+        "h_p95": 17.45,
+        "h_p99": 139.46,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.35,
+        "j_p95": 13.15,
+        "j_p99": 20.8,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.42,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Studios",
+      "tag": "Studios",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "studios",
+        "h_p50": 94.49,
+        "h_p95": 288.08,
+        "h_p99": 359.69,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 479.68,
+        "j_p95": 1480.45,
+        "j_p99": 1502.67,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 5.08,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Items/Suggestions",
+      "tag": "Suggestions",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior)."
+      },
+      "perf": {
+        "variant": "suggestions",
+        "h_p50": 230.45,
+        "h_p95": 353.89,
+        "h_p99": 407.54,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 325.04,
+        "j_p95": 561.75,
+        "j_p99": 599.35,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.41,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /SyncPlay/List",
+      "tag": "SyncPlay",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "syncplay_list",
+        "h_p50": 5.56,
+        "h_p95": 23.24,
+        "h_p99": 47.93,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 52.99,
+        "j_p95": 139.22,
+        "j_p99": 146.57,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 9.53,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Configuration",
+      "tag": "Configuration",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds \u2014 setup state, not a bug."
+      },
+      "perf": {
+        "variant": "system_config",
+        "h_p50": 0.12,
+        "h_p95": 0.21,
+        "h_p99": 0.3,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 18.46,
+        "j_p95": 132.05,
+        "j_p99": 219.32,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 153.83,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Configuration/{key}",
+      "tag": "Configuration",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_config_key",
+        "h_p50": 0.13,
+        "h_p95": 0.27,
+        "h_p99": 1,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.27,
+        "j_p95": 10.22,
+        "j_p99": 24.24,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 17.46,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /System/Endpoint",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_endpoint",
+        "h_p50": 0.12,
+        "h_p95": 0.5,
+        "h_p99": 0.74,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 5.79,
+        "j_p95": 214.4,
+        "j_p99": 329.09,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 48.25,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /System/Info",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "system_info",
+        "h_p50": 0.14,
+        "h_p95": 0.52,
+        "h_p99": 13.21,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 5.05,
+        "j_p95": 229.13,
+        "j_p99": 692.52,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 36.07,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /System/Logs",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: log-file set differs per instance/run."
+      },
+      "perf": {
+        "variant": "system_logs",
+        "h_p50": 0.11,
+        "h_p95": 0.27,
+        "h_p99": 1.29,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 8.51,
+        "j_p95": 197.42,
+        "j_p99": 265.13,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 77.36,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Ping",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name)."
+      },
+      "perf": {
+        "variant": "system_ping",
+        "h_p50": 0.09,
+        "h_p95": 0.22,
+        "h_p99": 0.6,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 38.32,
+        "j_p95": 219.27,
+        "j_p99": 424.66,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 425.78,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "not deep-verified"
+      }
+    },
+    {
+      "op": "GET /System/Info/Storage",
+      "tag": "System",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: per-host disk paths and free/used space."
+      },
+      "perf": {
+        "variant": "system_storage",
+        "h_p50": 33.2,
+        "h_p95": 71.15,
+        "h_p99": 96.03,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 36.29,
+        "j_p95": 195.75,
+        "j_p99": 265.8,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.09,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Tmdb/ClientConfiguration",
+      "tag": "Tmdb",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "tmdb_config",
+        "h_p50": 0.08,
+        "h_p95": 0.22,
+        "h_p99": 0.35,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.58,
+        "j_p95": 13.83,
+        "j_p99": 65.53,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 32.25,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Shows/Upcoming",
+      "tag": "TvShows",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "upcoming",
+        "h_p50": 26.81,
+        "h_p95": 80.7,
+        "h_p99": 147.57,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 360.13,
+        "j_p95": 1395.92,
+        "j_p99": 1684.74,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 13.43,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/{userId}",
+      "tag": "User",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "user_by_id",
+        "h_p50": 3,
+        "h_p95": 12.99,
+        "h_p99": 57.42,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 2.88,
+        "j_p95": 12.02,
+        "j_p99": 229.34,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 0.96,
+        "win_all_three": false,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/Me",
+      "tag": "User",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "user_me",
+        "h_p50": 0.12,
+        "h_p95": 0.64,
+        "h_p99": 0.86,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 9.8,
+        "j_p95": 297.29,
+        "j_p99": 530.66,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 81.67,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /UserViews",
+      "tag": "UserViews",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."
+      },
+      "perf": {
+        "variant": "user_views",
+        "h_p50": 23.96,
+        "h_p95": 628.11,
+        "h_p99": 628.54,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 208.78,
+        "j_p95": 1677.14,
+        "j_p99": 1677.22,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 8.71,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Users",
+      "tag": "User",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "users_all",
+        "h_p50": 6.96,
+        "h_p95": 31.94,
+        "h_p99": 51.82,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 12.91,
+        "j_p95": 265.2,
+        "j_p99": 299.69,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.85,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Users/Public",
+      "tag": "User",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "users_public",
+        "h_p50": 6.93,
+        "h_p95": 31.33,
+        "h_p99": 44.91,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 25.6,
+        "j_p95": 298.63,
+        "j_p99": 359.95,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 3.69,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /GetUtcTime",
+      "tag": "TimeSync",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "utc_time",
+        "h_p50": 0.08,
+        "h_p95": 0.25,
+        "h_p99": 0.57,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 7.83,
+        "j_p95": 117.78,
+        "j_p99": 284.53,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 97.88,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Videos/{itemId}/AdditionalParts",
+      "tag": "Videos",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": null
+      },
+      "perf": {
+        "variant": "video_additional_parts",
+        "h_p50": 6.05,
+        "h_p95": 41.71,
+        "h_p99": 73.17,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 9.92,
+        "j_p95": 30.17,
+        "j_p99": 67.7,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 1.64,
+        "win_all_three": false,
+        "tail_loss": true,
+        "comparable": true,
+        "reason": null
+      }
+    },
+    {
+      "op": "GET /Library/VirtualFolders",
+      "tag": "LibraryStructure",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": true,
+        "classification": "ok"
+      },
+      "perf": {
+        "variant": "virtual_folders",
+        "h_p50": 8.17,
+        "h_p95": 140.78,
+        "h_p99": 283.27,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 131.61,
+        "j_p95": 836.92,
+        "j_p99": 1242.36,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 16.11,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    },
+    {
+      "op": "GET /Years",
+      "tag": "Years",
+      "parity": {
+        "depth": "REAL",
+        "deep_verified": false,
+        "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope)."
+      },
+      "perf": {
+        "variant": "years",
+        "h_p50": 138.36,
+        "h_p95": 260.49,
+        "h_p99": 552.07,
+        "h_rps": 10,
+        "h_ok": 100,
+        "j_p50": 324.15,
+        "j_p95": 1702.78,
+        "j_p99": 1702.81,
+        "j_rps": 3.3,
+        "j_ok": 100,
+        "speedup": 2.34,
+        "win_all_three": true,
+        "tail_loss": false,
+        "comparable": false,
+        "reason": "body shape diverges from Jellyfin at bench time"
+      }
+    }
+  ]
+}

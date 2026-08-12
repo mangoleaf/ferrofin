@@ -14,7 +14,7 @@ description: >-
 Keep Hermit's compiled-in plugin ports faithful to their upstream repos. The
 manifest `brain/PLUGINS_UPSTREAM.md` is the source of truth: one table row per
 plugin with upstream repo, local clone path, and **Ported rev** (the commit the
-Hermit code is faithful to). Run from the repo root (`/home/mango/dev/hermit`).
+Hermit code is faithful to). Run from the repo root.
 
 ## Step 1 — read the manifest, fetch upstream
 

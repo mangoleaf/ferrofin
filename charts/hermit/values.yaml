@@ -12,8 +12,9 @@
 replicaCount: 1
 
 image:
-  # -- Container image repository. Overridden per-environment; default points at the GitLab registry.
-  repository: registry.mangoleafstudios.com/mlstudios/hermit
+  # -- Container image repository. Override per-environment; the placeholder is
+  # replaced by the published image location at the public release.
+  repository: registry.example.com/hermit
   # -- Image tag. Empty → chart appVersion.
   tag: ""
   # -- Image pull policy.

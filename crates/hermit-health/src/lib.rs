@@ -1,5 +1,5 @@
-//! Lean health-check router for Hermit — a local replacement for rest's
-//! `mlstudios-health` (which Hermit does not depend on).
+//! Lean health-check router for Hermit — liveness/readiness endpoints with
+//! no dependency on any external health crate.
 //!
 //! This crate is NEW code (no C# source); it mirrors the whisper-api pattern
 //! (`create_router` + health checkers). It provides:

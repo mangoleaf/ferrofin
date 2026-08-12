@@ -36,7 +36,8 @@ version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-only"          # matches the GPL-3.0-only package metadata on the Jellyfin crates being ported
 publish = false
-repository = "https://github.com/mangoleaf/hermit"
+# Placeholder until the public repository exists (set at the public release).
+repository = "https://example.com/hermit"
 
 [workspace.lints.rust]
 missing_docs = "warn"

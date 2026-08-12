@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Lean health-check router for Hermit (local replacement for rest's mlstudios-health)."
+description = "Lean health-check router for Hermit (liveness/readiness endpoints)."
 
 [lints]
 workspace = true

@@ -1,7 +1,6 @@
 # Hermit Helm chart
 
-Official chart for the [Hermit](https://gitlab.mangoleafstudios.com/mlstudios/hermit)
-media server — a Rust implementation of the Jellyfin server API.
+Official chart for the [Hermit](https://example.com/hermit) media server — a Rust implementation of the Jellyfin server API.
 
 The value contract mirrors the common subset of the upstream
 [jellyfin-helm](https://github.com/jellyfin/jellyfin-helm) chart, so moving a Jellyfin
@@ -12,21 +11,20 @@ release to Hermit is near-zero churn. Two intentional differences:
 
 ## Install
 
-The chart is published to the GitLab OCI registry next to the image:
+The chart is published as an OCI artifact next to the image:
 
 ```bash
-helm registry login registry.mangoleafstudios.com
-helm install hermit oci://registry.mangoleafstudios.com/mlstudios/hermit/charts/hermit \
+helm install hermit oci://<registry>/hermit/charts/hermit \
   --version 0.1.0 -n hermit --create-namespace -f my-values.yaml
 ```
 
-The image is private — provide `imagePullSecrets` (a `docker-registry` secret) in your values.
+For a private registry, provide `imagePullSecrets` (a `docker-registry` secret) in your values.
 
 ## Key values
 
 | Key | Default | Purpose |
 |---|---|---|
-| `image.repository` / `image.tag` | GitLab registry / chart appVersion | Server image |
+| `image.repository` / `image.tag` | see `values.yaml` / chart appVersion | Server image |
 | `imagePullSecrets` | `[]` | Secrets for the private registry |
 | `service.port` | `8096` | Port Hermit listens on (also the container port) |
 | `persistence.config.enabled` | `true` | Persist the data dir; `false` → emptyDir |

@@ -1,8 +1,8 @@
 /target
 **/*.rs.bk
 *.pdb
-# per-crate PortJob artifacts (inventory/coverage/report JSON) — kept locally, not committed
-/.port/*/coverage.json
+# per-crate PortJob agent scratch — only the coverage-gate allowlist is tracked
+/.port/*/
 # local media/data used for manual First-Light testing
 /data
 *.db
@@ -10,6 +10,10 @@
 *.db-wal
 # insta review leftovers
 *.snap.new
+# agent worktrees (can grow to tens of GB of checkouts + target dirs)
+**/.claude/worktrees/
+# per-machine Claude settings
+.claude/settings.local.json
 
 brain/
 .rcg/

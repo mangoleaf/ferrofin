@@ -1,0 +1,52 @@
+# git-cliff configuration — changelog generated from Conventional Commits.
+# https://git-cliff.org  ·  used by CI (release-notes job) and locally: `git-cliff -o CHANGELOG.md`
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to Hermit are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com) and
+[Conventional Commits](https://www.conventionalcommits.org); versions follow
+[Semantic Versioning](https://semver.org).\n
+"""
+# tera template — one section per release, grouped by commit type.
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}\
+- {{ commit.message | upper_first }}{% if commit.breaking %} **[breaking]**{% endif %}
+{% endfor %}\
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+# Map commit prefixes to changelog sections.
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^doc", group = "Documentation" },
+  { message = "^test", group = "Testing" },
+  { message = "^ci", group = "CI/CD" },
+  { message = "^build", group = "Build" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "Miscellaneous" },
+  { body = ".*security", group = "Security" },
+]
+# Only tags shaped like a version release; ignore chart-only tags in the app changelog.
+tag_pattern = "v[0-9]*"
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
