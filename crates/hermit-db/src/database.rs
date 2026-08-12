@@ -844,10 +844,16 @@ mod tests {
         .await
         .expect("tables");
 
-        // `UserData.CustomDataKey` is lowercase-hyphenated BY DESIGN: real
-        // Jellyfin stores the UserData key as the lowercase item id even though
-        // `ItemId` is uppercase (verified against a real 10.11.8 database).
-        let allowed_lowercase: &[(&str, &str)] = &[("UserData", "CustomDataKey")];
+        // Columns that are lowercase-hyphenated BY DESIGN, not join keys:
+        //  - `UserData.CustomDataKey` — real Jellyfin stores the key lowercase
+        //    while `ItemId` is uppercase (verified against a real 10.11.8 DB).
+        //  - `HermitPlaybackSessions.PlaySessionId` — an opaque self-referential
+        //    session id (written and matched as the same raw string, never
+        //    cross-joined to a Jellyfin-owned uppercase id).
+        let allowed_lowercase: &[(&str, &str)] = &[
+            ("UserData", "CustomDataKey"),
+            ("HermitPlaybackSessions", "PlaySessionId"),
+        ];
 
         let mut offenders = Vec::new();
         for t in &tables {
