@@ -228,7 +228,8 @@ sccache-creds:
   stage: .pre
   image: alpine:3
   variables:
-    VAULT_ADDR: "http://vault.vault.svc.cluster.local:8200"
+    # VAULT_ADDR is a GitLab CI/CD variable (Settings → CI/CD → Variables), not
+    # committed — it points at homelab-internal infrastructure. Set it there.
     SCCACHE_VAULT_PATH: "secret/data/gitlab/sccache"
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -252,8 +253,8 @@ sccache-creds:
   variables:
     SCCACHE_VERSION: "0.16.0"
     SCCACHE_BUCKET: gitlab-sccache
-    SCCACHE_REGION: garage
-    SCCACHE_ENDPOINT: http://garage.garage.svc.cluster.local:3900
+    # SCCACHE_REGION + SCCACHE_ENDPOINT are GitLab CI/CD variables (not committed) —
+    # they name homelab-internal S3 cache infrastructure. Set them in Settings → CI/CD.
     SCCACHE_S3_USE_SSL: "false"
   needs:
     - job: sccache-creds
