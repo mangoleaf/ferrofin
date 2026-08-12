@@ -18,3 +18,7 @@
 brain/
 .rcg/
 __pycache__/
+
+# local agent tooling — not part of the public project
+.mcp.json
+.claude/
