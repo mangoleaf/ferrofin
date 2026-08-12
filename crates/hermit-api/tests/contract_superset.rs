@@ -153,7 +153,7 @@ async fn probed_contract_routes_never_404() {
 /// Duplicates are harmless to the router (which mounts real handlers by
 /// membership, not by iterating this table), but they inflate the "REAL vs 501"
 /// route count and mislead the contract accounting. This guard keeps the table
-/// a true set so the counts in `PORT_REPORT.md` stay honest.
+/// a true set so downstream implementation-status counts stay honest.
 #[test]
 fn real_routes_have_no_duplicates() {
     use hermit_api::handlers::REAL_ROUTES;
