@@ -1055,10 +1055,16 @@ fn push_order_expression(
                     WHERE oud."UserId" = "#
             ));
             qb.push_bind(uid);
+            // The alternates arm navigates UserData.ItemId → BaseItems.Id (a
+            // PK lookup), exactly as upstream's `w.Item.PrimaryVersionId ==
+            // e.Id`. The inverted `IN (SELECT … WHERE PrimaryVersionId = …)`
+            // form re-scanned BaseItems per (row × userdata row): 97.5s for a
+            // 12-row Resume query on the live DB vs 33ms this way.
             qb.push(
-                r#" AND (oud."ItemId" = bi."Id" OR oud."ItemId" IN
-                    (SELECT alt."Id" FROM "BaseItems" alt
-                     WHERE alt."PrimaryVersionId" = bi."Id")))"#,
+                r#" AND (oud."ItemId" = bi."Id" OR EXISTS
+                    (SELECT 1 FROM "BaseItems" alt
+                     WHERE alt."Id" = oud."ItemId"
+                       AND alt."PrimaryVersionId" = bi."Id")))"#,
             );
             // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
             if by == ItemSortBy::IsUnplayed {

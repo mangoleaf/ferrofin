@@ -467,10 +467,23 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let Some(item) = self.items.retrieve_item(item_id).await? else {
+        let Some(mut item) = self.items.retrieve_item(item_id).await? else {
             // Not a library item — it may be a Live TV channel.
             return self.channel_media_source(item_id).await;
         };
+        // An ALTERNATE version (PrimaryVersionId set) resolves through its
+        // primary, so playing any version yields the full merged source list
+        // (upstream navigates the same way; the alternate alone would hide its
+        // siblings from the version picker).
+        if let Some(primary) = item
+            .primary_version_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            && let Some(primary_item) = self.items.retrieve_item(primary).await?
+        {
+            item = primary_item;
+        }
+        let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
         let streams = self.streams_dto(item_id).await?;
         let mut sources = vec![Self::static_source(&item, streams)];
         // Append merged alternate versions' sources (C# GetStaticMediaSources includes the item's

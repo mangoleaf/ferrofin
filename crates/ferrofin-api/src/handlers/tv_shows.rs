@@ -426,7 +426,12 @@ async fn get_episodes(
     // `episodes.SkipWhile(i => i.Id != startItemId)` — drop everything before the
     // match; if the item isn't in this list, the skip consumes all (empty).
     if let Some(start_item_id) = query.start_item_id {
-        let start = start_item_id.to_string();
+        // Stored ids are UPPERCASE-hyphenated (`guid_to_db`); `Uuid::to_string()`
+        // is lowercase and can never match — the compare-in-stored-form rule.
+        // (The old lowercase compare cleared EVERY episode list, which
+        // jellyfin-web's episode playback path reported as "Unable to find a
+        // valid media source to play".)
+        let start = ferrofin_db::store::guid_to_db(start_item_id);
         match episodes.iter().position(|e| e.id == start) {
             Some(pos) => drop(episodes.drain(..pos)),
             None => episodes.clear(),

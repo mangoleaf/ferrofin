@@ -79,7 +79,9 @@ fn user_entity(id: Uuid, username: &str) -> UserEntity {
 /// Builds a minimal [`BaseItemEntity`] of the given kind carrying id + name.
 fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
     BaseItemEntity {
-        id: id.to_string(),
+        // Stored ids are UPPERCASE-hyphenated in production (guid_to_db);
+        // lowercase fixtures masked the startItemId casing regression.
+        id: id.to_string().to_uppercase(),
         album: None,
         album_artists: None,
         artists: None,
@@ -354,9 +356,9 @@ impl LibraryManager for StubLibrary {
         } else {
             // Episodes (or the Upcoming episode query).
             Ok(vec![
-                item_entity(Uuid::from_u128(0x11), "Episode 1", "Episode"),
-                item_entity(Uuid::from_u128(0x12), "Episode 2", "Episode"),
-                item_entity(Uuid::from_u128(0x13), "Episode 3", "Episode"),
+                item_entity(Uuid::from_u128(0xE1), "Episode 1", "Episode"),
+                item_entity(Uuid::from_u128(0xE2), "Episode 2", "Episode"),
+                item_entity(Uuid::from_u128(0xE3), "Episode 3", "Episode"),
             ])
         }
     }
@@ -624,6 +626,23 @@ async fn episodes_paginate_with_start_and_limit() {
     assert_eq!(result.total_record_count, 3);
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].name.as_deref(), Some("Episode 2"));
+}
+
+#[tokio::test]
+async fn episodes_start_item_id_returns_the_tail_slice() {
+    // The regression: lowercase Uuid::to_string() vs UPPERCASE stored ids
+    // cleared every list, which jellyfin-web's episode playback path surfaced
+    // as "Unable to find a valid media source to play".
+    let start = Uuid::from_u128(0xE2);
+    let (status, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?startItemId={start}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+    let names: Vec<_> = result
+        .items
+        .iter()
+        .filter_map(|i| i.name.as_deref())
+        .collect();
+    assert_eq!(names, ["Episode 2", "Episode 3"]);
 }
 
 #[tokio::test]
