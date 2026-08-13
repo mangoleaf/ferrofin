@@ -98,6 +98,72 @@ pub fn read_linked_children(data: &Map<String, Value>) -> Vec<LinkedChildJson> {
         .unwrap_or_default()
 }
 
+/// Reads the `RemoteTrailers` array from a `Data` column value as
+/// `(name, url)` pairs, in stored order. Entries without a URL are dropped.
+///
+/// Jellyfin stores every item's remote trailers here (`MediaUrl` objects:
+/// `{"Url": …, "Name": …}`) — it is the only home for them in the 10.11.8
+/// schema, so reading and writing it keeps the drop-in round trip lossless.
+#[must_use]
+pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)> {
+    parse_data(data)
+        .get("RemoteTrailers")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let url = e.get("Url")?.as_str()?.to_owned();
+                    let name = e
+                        .get("Name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .filter(|n| !n.is_empty());
+                    Some((name, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merges `trailers` into a `Data` column value's `RemoteTrailers` array,
+/// returning the new column text — or `None` when nothing changed (every URL
+/// was already present), so callers can skip a pointless write.
+///
+/// De-duplicates by URL and appends, mirroring upstream's
+/// `MetadataService.MergeBaseItemData` (`DistinctBy(t => t.Url)`). Every other
+/// key in the blob is preserved.
+#[must_use]
+pub fn merge_remote_trailers(
+    data: Option<&str>,
+    trailers: &[(Option<String>, String)],
+) -> Option<String> {
+    let existing = read_remote_trailers(data);
+    let mut merged = existing.clone();
+    for (name, url) in trailers {
+        if !merged.iter().any(|(_, u)| u == url) {
+            merged.push((name.clone(), url.clone()));
+        }
+    }
+    if merged.len() == existing.len() {
+        return None;
+    }
+    let mut object = parse_data(data);
+    let entries: Vec<Value> = merged
+        .into_iter()
+        .map(|(name, url)| {
+            let mut e = Map::new();
+            e.insert("Url".to_owned(), Value::String(url));
+            if let Some(name) = name {
+                e.insert("Name".to_owned(), Value::String(name));
+            }
+            Value::Object(e)
+        })
+        .collect();
+    object.insert("RemoteTrailers".to_owned(), Value::Array(entries));
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —
 /// the presence signal that Jellyfin (or a prior Ferrofin sync) owns this blob.
 #[must_use]
@@ -641,6 +707,66 @@ mod tests {
 
     /// A verbatim box-set `Data` blob (path-only children) from the same DB.
     const REAL_BOXSET_DATA: &str = r#"{"DisplayOrder":"PremiereDate","LibraryFolderIds":["f137a2dd21bbc1b99aa5c0f6bf02a805"],"IsRoot":false,"LinkedChildren":[{"Path":"/media/synth/movies/Movie 0001 (2020)/Movie 0001 (2020).mkv","Type":"Manual"},{"Path":"/media/synth/movies/Movie 0002 (2020)/Movie 0002 (2020).mkv","Type":"Manual"}],"IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"ExtraIds":[],"DateLastSaved":"2026-08-11T17:47:45.7268844Z","RemoteTrailers":[]}"#;
+
+    #[test]
+    fn remote_trailers_merge_dedupes_and_preserves_other_keys() {
+        // Starting from a real 10.11.8 blob (empty RemoteTrailers, plus keys
+        // Ferrofin does not model), merging must append and keep the rest.
+        let merged = merge_remote_trailers(
+            Some(REAL_BOXSET_DATA),
+            &[(
+                Some("Official Trailer".to_owned()),
+                "https://www.youtube.com/watch?v=abc".to_owned(),
+            )],
+        )
+        .expect("first merge writes");
+        let trailers = read_remote_trailers(Some(&merged));
+        assert_eq!(
+            trailers,
+            vec![(
+                Some("Official Trailer".to_owned()),
+                "https://www.youtube.com/watch?v=abc".to_owned()
+            )]
+        );
+        let map = parse_data(Some(&merged));
+        assert_eq!(
+            map.get("DisplayOrder").and_then(Value::as_str),
+            Some("PremiereDate")
+        );
+        assert_eq!(read_linked_children(&map).len(), 2);
+
+        // Re-merging the same URL changes nothing (no pointless write), even
+        // under a different name.
+        assert!(
+            merge_remote_trailers(
+                Some(&merged),
+                &[(
+                    Some("Teaser".to_owned()),
+                    "https://www.youtube.com/watch?v=abc".to_owned()
+                )]
+            )
+            .is_none()
+        );
+
+        // A new URL appends after the existing one.
+        let two = merge_remote_trailers(
+            Some(&merged),
+            &[(None, "https://www.youtube.com/watch?v=def".to_owned())],
+        )
+        .expect("second merge writes");
+        let trailers = read_remote_trailers(Some(&two));
+        assert_eq!(trailers.len(), 2);
+        assert_eq!(trailers[1].0, None);
+        assert!(trailers[1].1.ends_with("def"));
+    }
+
+    #[test]
+    fn remote_trailers_read_tolerates_missing_and_malformed() {
+        assert!(read_remote_trailers(None).is_empty());
+        assert!(read_remote_trailers(Some("not json")).is_empty());
+        // Entries without a Url are dropped.
+        assert!(read_remote_trailers(Some(r#"{"RemoteTrailers":[{"Name":"x"}]}"#)).is_empty());
+    }
 
     #[test]
     fn parses_real_playlist_data() {

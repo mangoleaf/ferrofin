@@ -991,9 +991,17 @@ impl FerrofinDtoService {
         dto.critic_rating = item.critic_rating.map(f64_to_f32);
 
         if options.contains_field(ItemFields::RemoteTrailers) {
-            // Remote trailers are a per-item collection with no flat column at
-            // this layer; left empty until the trailer-types join is wired.
-            dto.remote_trailers = Some(Vec::new());
+            // Trailers live in the serialized `Data` blob (Jellyfin's only home
+            // for them); the scan writes them there from TMDB/NFO.
+            dto.remote_trailers = Some(
+                crate::item_data::read_remote_trailers(item.data.as_deref())
+                    .into_iter()
+                    .map(|(name, url)| ferrofin_model::entities_media::MediaUrl {
+                        url: Some(url),
+                        name,
+                    })
+                    .collect(),
+            );
         }
 
         dto.name = item.name.clone();
@@ -2736,6 +2744,44 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .expect("fetch item")
+    }
+
+    #[tokio::test]
+    async fn remote_trailers_come_from_the_data_blob() {
+        // jellyfin-web's Trailer button is gated on RemoteTrailers.length; the
+        // scan writes them into `Data` (Jellyfin's only home for them).
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Solaris").await;
+        let mut item = fetch_item(&db, id).await;
+        item.data = Some(
+            r#"{"RemoteTrailers":[{"Url":"https://www.youtube.com/watch?v=abc","Name":"Trailer"}]}"#
+                .to_owned(),
+        );
+        let svc = service(db);
+
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let trailers = dto.remote_trailers.expect("field requested by default");
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(
+            trailers[0].url.as_deref(),
+            Some("https://www.youtube.com/watch?v=abc")
+        );
+        assert_eq!(trailers[0].name.as_deref(), Some("Trailer"));
+
+        // Not requested → the field stays absent.
+        let no_fields = DtoOptions {
+            fields: vec![],
+            ..DtoOptions::default()
+        };
+        let bare = svc
+            .get_base_item_dto(&item, &no_fields, None, None)
+            .await
+            .unwrap();
+        assert!(bare.remote_trailers.is_none());
     }
 
     #[tokio::test]

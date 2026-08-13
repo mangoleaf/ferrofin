@@ -1512,7 +1512,15 @@ impl LibraryScanner {
         let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
         let wants_rating =
             self.omdb.as_ref().is_some_and(|o| o.is_enabled()) && entity.critic_rating.is_none();
-        if has_overview && !wants_rating {
+        // Also fetch when the row still carries no remote trailers, so titles
+        // scanned before trailers were persisted backfill their YouTube links
+        // (the client's Trailer button is gated on them).
+        // ponytail: a title TMDB has no trailer for re-fetches on every scan,
+        // exactly like the RT backfill above. Store a "checked" marker if that
+        // ever costs real time.
+        let wants_trailers =
+            crate::item_data::read_remote_trailers(entity.data.as_deref()).is_empty();
+        if has_overview && !wants_rating && !wants_trailers {
             return RemoteMetadata::default();
         }
         let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
@@ -2765,6 +2773,16 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
     merge_multi_value(&mut entity.tags, &n.tags);
+    // NFO `<trailer>` URLs join the same `Data.RemoteTrailers` array the TMDB
+    // path writes (upstream keeps one merged list, deduped by URL).
+    let trailers: Vec<(Option<String>, String)> = n
+        .remote_trailers
+        .iter()
+        .map(|url| (None, url.clone()))
+        .collect();
+    if let Some(data) = crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers) {
+        entity.data = Some(data);
+    }
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -2801,6 +2819,16 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = d.premiere_date.as_deref().and_then(parse_ymd);
+    }
+    // Trailers live in the serialized `Data` blob — Jellyfin's only home for
+    // them — so the client's Trailer button links out to YouTube like upstream.
+    let trailers: Vec<(Option<String>, String)> = d
+        .trailers
+        .iter()
+        .map(|t| (Some(t.name.clone()), t.url.clone()))
+        .collect();
+    if let Some(data) = crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers) {
+        entity.data = Some(data);
     }
 }
 
