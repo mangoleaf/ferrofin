@@ -246,6 +246,10 @@ impl LibraryProgress {
     }
 }
 
+/// How many descendant images feed a library tile collage — upstream
+/// `CollectionFolderImageProvider.GetItemsWithImages` samples 8.
+const LIBRARY_COLLAGE_SOURCES: i32 = 8;
+
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -299,6 +303,10 @@ pub struct LibraryScanner {
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
+    /// Maps `OfficialRating` strings to the numeric parental score persisted
+    /// in `InheritedParentalRatingValue` (what the Parental Rating sort and
+    /// the max-parental-rating filters read). `None` in minimal unit tests.
+    localization: Option<Arc<crate::localization_manager::LocalizationManager>>,
     /// Emit a scan-progress `info!` every N items (bootstrap knob
     /// `FERROFIN_SCAN_PROGRESS_EVERY`; default [`DEFAULT_SCAN_PROGRESS_EVERY`]). `0`
     /// disables progress logging. Keeps info-level volume at O(items/N) per
@@ -346,6 +354,7 @@ impl LibraryScanner {
             people: None,
             chapters: None,
             image_processor: None,
+            localization: None,
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
         }
@@ -373,6 +382,30 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_progress_every(mut self, every: usize) -> Self {
         self.progress_every = every;
+        self
+    }
+
+    /// Stamps the numeric parental score derived from `OfficialRating` — what
+    /// the Parental Rating sort and the max-rating filters read (upstream
+    /// `BaseItem.OnMetadataChanged` → `GetParentalRatingScore`).
+    fn apply_parental_rating_score(&self, entity: &mut BaseItemEntity) {
+        if let Some(localization) = &self.localization
+            && let Some(rating) = entity.official_rating.as_deref()
+            && let Some(score) = localization.get_rating_score(rating, None)
+        {
+            entity.inherited_parental_rating_value = Some(i64::from(score.score));
+            entity.inherited_parental_rating_sub_value = score.sub_score.map(i64::from);
+        }
+    }
+
+    /// Attaches the localization manager, so scanned items carry the numeric
+    /// parental-rating score derived from their `OfficialRating`.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<crate::localization_manager::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
         self
     }
 
@@ -477,6 +510,14 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_metadata(mut self, tmdb: Arc<TmdbClient>, metadata_dir: PathBuf) -> Self {
         self.tmdb = Some(tmdb);
+        self.metadata_dir = Some(metadata_dir);
+        self
+    }
+
+    /// Sets only the metadata art directory (no TMDB client) — the uploaded-art
+    /// preservation and library-tile passes work without remote providers.
+    #[must_use]
+    pub fn with_metadata_dir(mut self, metadata_dir: PathBuf) -> Self {
         self.metadata_dir = Some(metadata_dir);
         self
     }
@@ -642,6 +683,7 @@ impl LibraryScanner {
             if people.is_empty() {
                 people = remote.people;
             }
+            self.apply_parental_rating_score(&mut entity);
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
             // supplement whatever the built-in chain left unfilled. Their
             // contributed ids are filtered against every id already known —
@@ -729,6 +771,13 @@ impl LibraryScanner {
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
+        // Library tile images: composite each library's Primary from its own
+        // content (upstream CollectionFolderImageProvider), so the home
+        // screen's "My Media" tiles carry artwork instead of the blue
+        // placeholder. Best-effort — a failure must not fail the scan.
+        if let Err(err) = self.refresh_library_images(folders).await {
+            tracing::warn!(%err, "library image pass failed");
+        }
         // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above. Best-effort — a failure here must not fail the whole scan.
@@ -1773,6 +1822,109 @@ impl LibraryScanner {
         }
     }
 
+    /// Composites a Primary image for every library whose tile is missing or
+    /// stale, from up to [`LIBRARY_COLLAGE_SOURCES`] random descendants'
+    /// artwork (Backdrop > Primary > Thumb, upstream's preference).
+    ///
+    /// Port of `CollectionFolderImageProvider`: upstream refreshes each
+    /// `CollectionFolder`'s dynamic image on library validation, composing a
+    /// 960×540 collage regenerated when older than 7 days — the numbers are
+    /// upstream's (`BaseDynamicImageProvider`/`HasChangedByDate`). Without
+    /// this, the home screen's "My Media" tiles render the icon-on-blue
+    /// fallback forever.
+    async fn refresh_library_images(
+        &self,
+        folders: &[VirtualFolderInfo],
+    ) -> Result<(), ServiceError> {
+        let (Some(items), Some(processor), Some(meta_root)) = (
+            &self.item_repository,
+            &self.image_processor,
+            &self.metadata_dir,
+        ) else {
+            return Ok(());
+        };
+        for folder in folders {
+            let Some(cf) = collection_folder_id(folder) else {
+                continue;
+            };
+            let out_dir = meta_root.join(guid_to_db(cf));
+            let out = out_dir.join("primary.png");
+            // Regenerate only when missing or older than 7 days (upstream's
+            // HasChangedByDate window).
+            let fresh = std::fs::metadata(&out)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
+            if fresh {
+                continue;
+            }
+            // Random content sample; over-fetch since not every row has art.
+            let sample = InternalItemsQuery {
+                ancestor_ids: vec![cf],
+                recursive: true,
+                is_folder: Some(false),
+                is_virtual_item: Some(false),
+                limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
+                order_by: vec![(
+                    ferrofin_model::live_tv::ItemSortBy::Random,
+                    ferrofin_model::dto::SortOrder::Descending,
+                )],
+                ..Default::default()
+            };
+            let mut inputs = Vec::new();
+            for id in items.get_item_ids(&sample).await? {
+                if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
+                    break;
+                }
+                let infos = items.get_image_infos(id).await?;
+                let best = infos
+                    .iter()
+                    .find(|i| i.image_type == ImageType::Backdrop)
+                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Primary))
+                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Thumb));
+                if let Some(image) = best
+                    && image.is_local_file()
+                    && std::path::Path::new(&image.path).exists()
+                {
+                    inputs.push(image.path.clone());
+                }
+            }
+            if inputs.is_empty() {
+                continue; // an empty library keeps the icon tile
+            }
+            if let Err(err) = std::fs::create_dir_all(&out_dir) {
+                tracing::warn!(%err, library = %cf, "failed to create the library art dir");
+                continue;
+            }
+            let options = ferrofin_traits::options::ImageCollageOptions {
+                input_paths: inputs,
+                output_path: out.to_string_lossy().into_owned(),
+                width: 960,
+                height: 540,
+            };
+            if let Err(err) = processor
+                .create_image_collage(&options, folder.name.as_deref())
+                .await
+            {
+                tracing::warn!(%err, library = %cf, "failed to composite the library image");
+                continue;
+            }
+            let info = ItemImageInfo {
+                path: options.output_path.clone(),
+                image_type: ImageType::Primary,
+                date_modified: Utc::now(),
+                width: options.width,
+                height: options.height,
+                blur_hash: None,
+            };
+            if let Err(err) = self.persistence.save_item_images(cf, &[info]).await {
+                tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
     /// editor's "lock this item"). Absent repository (unit-test builds) or a
     /// missing/new row → unlocked.
@@ -2028,15 +2180,23 @@ impl LibraryScanner {
             parent_id: Some(guid_to_db(parent)),
             top_parent_id: Some(guid_to_db(cf)),
             is_folder,
-            date_created: Some(Utc::now()),
+            // "Date Added" is the FILE's creation time (upstream sets
+            // `DateCreated = info.CreationTimeUtc` at resolve): scan wall-clock
+            // made a first scan order the whole library by directory traversal.
+            date_created: Some(file_date_created(path)),
             ..BaseItemEntity::default()
         };
         Some((id, entity))
     }
 
-    /// Video library: every video file becomes a `Movie` directly under the collection
-    /// folder (per-title folders are recursed into). `root` is the library location, used
-    /// to name folder-based movies from their folder.
+    /// Video library: every video file becomes a `Movie` directly under the
+    /// collection folder (per-title folders are recursed into) — except files
+    /// the naming rules classify as EXTRAS (`-trailer` suffixes, `trailers/` /
+    /// `theme-music/` / `extras/` directories …), which become owned rows
+    /// (`OwnerId` + `ExtraType`) attached to the movie they belong to. Owned
+    /// rows are what `/Items/{id}/LocalTrailers`, `/SpecialFeatures`, and the
+    /// hasTrailer/hasThemeSong/… filters read; the browse queries' "unowned"
+    /// predicate keeps them out of the library grid.
     fn plan_movies(
         &self,
         dir: &str,
@@ -2045,12 +2205,61 @@ impl LibraryScanner {
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
+        let mut extras: Vec<(String, ferrofin_model::entities::ExtraType)> = Vec::new();
+        // Movies emitted per directory, for extras owner resolution.
+        let mut movies_by_dir: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+            std::collections::HashMap::new();
+        self.collect_movie_plan(dir, root, cf, naming, out, &mut extras, &mut movies_by_dir);
+        for (path, extra_type) in extras {
+            let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
+                continue; // an extra with no resolvable movie is skipped
+            };
+            let Some((id, mut entity)) =
+                self.base_item(BaseItemKind::Video, cf, cf, file_stem(&path), &path, false)
+            else {
+                continue;
+            };
+            entity.media_type = Some("Video".to_owned());
+            entity.extra_type = Some(extra_type as i32);
+            entity.owner_id = Some(guid_to_db(owner));
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            });
+        }
+    }
+
+    /// The recursive walk behind [`Self::plan_movies`]: emits movie rows,
+    /// collects extras for post-resolution, and records each directory's
+    /// movies for extras ownership.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_movie_plan(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+        extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) {
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_movies(&entry.path, root, cf, naming, out);
+                self.collect_movie_plan(&entry.path, root, cf, naming, out, extras, movies_by_dir);
                 continue;
             }
             if !video_resolver::is_video_file(&entry.path, naming) {
+                continue;
+            }
+            // Extras never become movies (upstream resolves extras first).
+            let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                &entry.path,
+                naming,
+                Some(root),
+            );
+            if let Some(extra_type) = extra.extra_type {
+                extras.push((entry.path.clone(), extra_type));
                 continue;
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
@@ -2072,6 +2281,10 @@ impl LibraryScanner {
             entity.is_movie = true;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
+            movies_by_dir
+                .entry(dir.to_owned())
+                .or_default()
+                .push((id, file_stem(&entry.path)));
             out.push(Planned {
                 id,
                 entity,
@@ -2418,6 +2631,50 @@ fn path_is_under(path: &str, root: &str) -> bool {
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Resolves which movie an extra belongs to: a movie in the extra's own
+/// directory whose file stem prefixes the extra's (`Movie-trailer.mkv` beside
+/// `Movie.mkv`), the directory's single movie, or the parent directory's
+/// single movie (`Movie (2020)/trailers/x.mkv`). Mirrors upstream's ownership
+/// (extras attach to the item owning their folder).
+fn owner_for_extra(
+    path: &str,
+    movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
+) -> Option<Uuid> {
+    let dir = std::path::Path::new(path)
+        .parent()?
+        .to_string_lossy()
+        .into_owned();
+    let stem = file_stem(path);
+    if let Some(movies) = movies_by_dir.get(&dir) {
+        if let Some((id, _)) = movies
+            .iter()
+            .find(|(_, movie_stem)| stem.to_lowercase().starts_with(&movie_stem.to_lowercase()))
+        {
+            return Some(*id);
+        }
+        if let [(id, _)] = movies.as_slice() {
+            return Some(*id);
+        }
+    }
+    let parent = std::path::Path::new(&dir)
+        .parent()?
+        .to_string_lossy()
+        .into_owned();
+    match movies_by_dir.get(&parent).map(Vec::as_slice) {
+        Some([(id, _)]) => Some(*id),
+        _ => None,
+    }
+}
+
+/// The file's creation time (falling back to modification time, then to now)
+/// — what "Date Added" sorts by, as upstream's resolvers stamp it.
+fn file_date_created(path: &str) -> chrono::DateTime<Utc> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
+        .map_or_else(Utc::now, chrono::DateTime::<Utc>::from)
 }
 
 /// The file name without its extension — a lightweight display name until real
@@ -4801,6 +5058,128 @@ mod tests {
         assert_eq!(
             anc, 3,
             "series + season + episode each have cf as an ancestor"
+        );
+    }
+
+    // The post-scan library-image pass composites each library's Primary tile
+    // from its own content, so "My Media" stops rendering the icon-on-blue
+    // fallback (port of CollectionFolderImageProvider).
+    #[tokio::test]
+    async fn scan_composites_library_tile_images() {
+        use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::persistence::ItemRepository;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("Heat (1995).mkv"), b"").unwrap();
+        let mut poster = image::RgbImage::new(32, 48);
+        for (_x, y, px) in poster.enumerate_pixels_mut() {
+            *px = image::Rgb([u8::try_from(y % 256).unwrap_or(0), 90, 200]);
+        }
+        poster.save(media.join("Heat (1995)-poster.jpg")).unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo: Arc<dyn ItemRepository> =
+            Arc::new(crate::FerrofinItemRepository::new(db.clone(), lookup));
+        let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+        );
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_image_processor(image_processor)
+                .with_items(repo.clone())
+                .with_metadata_dir(tmp.path().join("meta"));
+        scanner.scan_all().await.unwrap();
+
+        // The library folder's id, via the virtual-folder projection.
+        let folders = vf.get_virtual_folders().await.unwrap();
+        let cf = folders[0]
+            .item_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap();
+        let infos = repo.get_image_infos(cf).await.unwrap();
+        let primary = infos
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .expect("library tile image row");
+        let bytes = std::fs::read(&primary.path).expect("tile file on disk");
+        assert!(!bytes.is_empty());
+        assert_eq!(primary.width, 960);
+        assert_eq!(primary.height, 540);
+    }
+
+    // Extras (suffix- and directory-classified) become OWNED rows attached to
+    // their movie, never Movie rows — feeding /LocalTrailers and the
+    // hasTrailer/… filters while staying out of the library grid.
+    #[tokio::test]
+    async fn scan_attaches_extras_to_their_movie() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository as _;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Heat (1995)");
+        std::fs::create_dir_all(folder.join("trailers")).unwrap();
+        std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
+        std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
+        std::fs::write(folder.join("trailers").join("alt.mkv"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        // Assert through the repository seams (the same queries the
+        // /LocalTrailers endpoint and browse run).
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let movies = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                ..Default::default()
+            })
+            .await
+            .expect("movies");
+        assert_eq!(movies.len(), 1, "extras never become Movie rows");
+        let movie_id = Uuid::parse_str(&movies[0].id).expect("movie id");
+
+        let trailers = repo
+            .get_item_list(&InternalItemsQuery {
+                owner_ids: vec![movie_id],
+                extra_types: vec![ferrofin_model::entities::ExtraType::Trailer],
+                ..Default::default()
+            })
+            .await
+            .expect("trailers");
+        assert_eq!(
+            trailers.len(),
+            2,
+            "both trailer spellings attach to the movie"
         );
     }
 

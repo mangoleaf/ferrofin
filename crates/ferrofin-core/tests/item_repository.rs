@@ -480,3 +480,106 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].name.as_deref(), Some("Crime Films"));
 }
+
+#[tokio::test]
+async fn user_data_sorts_order_by_play_state() {
+    use ferrofin_db::entities::users::UserEntity;
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let user_id = Uuid::from_u128(0x9);
+    let often = Uuid::from_u128(0x901);
+    let rarely = Uuid::from_u128(0x902);
+    let mut often_row = item(often, BaseItemKind::Movie, "Often");
+    often_row.id = often_row.id.to_uppercase();
+    let mut rarely_row = item(rarely, BaseItemKind::Movie, "Rarely");
+    rarely_row.id = rarely_row.id.to_uppercase();
+    persist
+        .save_items(&[often_row, rarely_row])
+        .await
+        .expect("save");
+    // Seed the user + play state directly (this file's fixtures are raw rows;
+    // the column list mirrors test_support::seed_user).
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+    )
+    .bind(user_id.to_string().to_uppercase())
+    .execute(db.writer())
+    .await
+    .expect("seed user");
+    for (item_id, count, date) in [
+        (often, 9_i64, "2026-08-10 00:00:00.0000000"),
+        (rarely, 1, "2026-01-01 00:00:00.0000000"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId","UserId","CustomDataKey","IsFavorite","LastPlayedDate",
+                "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1,?2,?3,0,?4,?5,0,1)"#,
+        )
+        .bind(item_id.to_string().to_uppercase())
+        .bind(user_id.to_string().to_uppercase())
+        .bind(item_id.to_string())
+        .bind(date)
+        .bind(count)
+        .execute(db.writer())
+        .await
+        .expect("user data");
+    }
+
+    let user: UserEntity = sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(user_id.to_string().to_uppercase())
+        .fetch_one(db.pool())
+        .await
+        .expect("read user");
+    for sort in [ItemSortBy::PlayCount, ItemSortBy::DatePlayed] {
+        let rows = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                order_by: vec![(sort, SortOrder::Descending)],
+                ..Default::default()
+            })
+            .await
+            .expect("query");
+        let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, ["Often", "Rarely"], "sort {sort:?}");
+    }
+}
+
+#[tokio::test]
+async fn premiere_date_sort_falls_back_to_production_year() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    // No PremiereDate anywhere — only filename-derived years.
+    let mut newer = item(Uuid::from_u128(0xB01), BaseItemKind::Movie, "Newer");
+    newer.production_year = Some(2020);
+    let mut older = item(Uuid::from_u128(0xB02), BaseItemKind::Movie, "Older");
+    older.production_year = Some(1999);
+    persist.save_items(&[newer, older]).await.expect("save");
+
+    let rows = repository
+        .get_item_list(&InternalItemsQuery {
+            order_by: vec![(ItemSortBy::PremiereDate, SortOrder::Descending)],
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+    assert_eq!(names, ["Newer", "Older"]);
+}

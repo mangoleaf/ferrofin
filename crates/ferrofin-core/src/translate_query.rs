@@ -1005,8 +1005,7 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
             qb.push(", ");
         }
         first = false;
-        let col = order_column(*by);
-        qb.push(col);
+        push_order_expression(qb, *by, filter);
         qb.push(match order {
             SortOrder::Ascending => " ASC",
             SortOrder::Descending => " DESC",
@@ -1028,13 +1027,63 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
 /// `ItemValues`-correlated cases (`Artist`, `Studio`) fall back to `SortName`,
 /// since they need joins the library manager owns. `Random` uses SQLite
 /// `RANDOM()`.
-fn order_column(by: ItemSortBy) -> &'static str {
+/// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
+/// keys (`DatePlayed`, `PlayCount`, played/favorite state) are correlated
+/// sub-selects scoped to the query's user (upstream `OrderMapper`'s
+/// `UserData`-backed cases); everything else is a plain column.
+fn push_order_expression(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    by: ItemSortBy,
+    filter: &InternalItemsQuery,
+) {
+    // The user-data-correlated keys need the requesting user; without one they
+    // fall through to SortName (matching the C# `(key, null)` arms).
+    if let Some(user_id) = filter.user_id() {
+        let uid = guid_to_db(user_id);
+        let correlated = match by {
+            // MAX over the item and its merged alternates (OrderMapper:
+            // `w.ItemId == e.Id || w.Item.PrimaryVersionId == e.Id`).
+            ItemSortBy::DatePlayed | ItemSortBy::SeriesDatePlayed => Some(r#""LastPlayedDate""#),
+            ItemSortBy::PlayCount => Some(r#""PlayCount""#),
+            ItemSortBy::IsPlayed | ItemSortBy::IsUnplayed => Some(r#""Played""#),
+            ItemSortBy::IsFavoriteOrLiked => Some(r#""IsFavorite""#),
+            _ => None,
+        };
+        if let Some(column) = correlated {
+            qb.push(format!(
+                r#"(SELECT MAX(oud.{column}) FROM "UserData" oud
+                    WHERE oud."UserId" = "#
+            ));
+            qb.push_bind(uid);
+            qb.push(
+                r#" AND (oud."ItemId" = bi."Id" OR oud."ItemId" IN
+                    (SELECT alt."Id" FROM "BaseItems" alt
+                     WHERE alt."PrimaryVersionId" = bi."Id")))"#,
+            );
+            // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
+            if by == ItemSortBy::IsUnplayed {
+                qb.push(" * -1");
+            }
+            return;
+        }
+    }
+    qb.push(order_column(by, filter.user_id().is_some()));
+}
+
+fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
     match by {
         ItemSortBy::Random => "RANDOM()",
         ItemSortBy::Runtime => r#"bi."RunTimeTicks""#,
         ItemSortBy::DateCreated => r#"bi."DateCreated""#,
         ItemSortBy::DateLastContentAdded => r#"bi."DateLastMediaAdded""#,
-        ItemSortBy::PremiereDate => r#"bi."PremiereDate""#,
+        // Falls back to a Jan-1 date synthesized from ProductionYear when
+        // PremiereDate is null (OrderMapper: `PremiereDate ?? MinValue.AddYears
+        // (ProductionYear - 1)`) — filename-year-only libraries still sort.
+        ItemSortBy::PremiereDate => {
+            r#"COALESCE(bi."PremiereDate",
+                CASE WHEN bi."ProductionYear" IS NOT NULL
+                     THEN printf('%04d-01-01 00:00:00.0000000', bi."ProductionYear") END)"#
+        }
         ItemSortBy::StartDate => r#"bi."StartDate""#,
         ItemSortBy::Album => r#"bi."Album""#,
         ItemSortBy::CommunityRating => r#"bi."CommunityRating""#,

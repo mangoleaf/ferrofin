@@ -257,6 +257,44 @@ pub fn derive_item_id_with(
     )))
 }
 
+/// The virtual metadata path identifying a person by name — port of
+/// `Person.GetPath(name)`: the filename-sanitized name (invalid path chars →
+/// space, trimmed, trailing periods dropped), prefixed by its first
+/// alphanumeric character as a subfolder, under the People metadata dir.
+///
+/// This path is the *identity key* for a person's by-name item: Jellyfin
+/// derives the item id from it (`GetItemByNameId<Person>`), so one name maps
+/// to exactly one id — the property Ferrofin's per-(name, type) random ids
+/// broke (favoriting wrote to one credit's id while every other surface
+/// resolved a different one).
+#[must_use]
+pub fn person_path(people_path: &str, name: &str) -> String {
+    // `ManagedFileSystem._invalidPathCharacters`, verbatim.
+    const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if INVALID.contains(&c) || (c as u32) <= 31 {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let valid = sanitized.trim().trim_end_matches('.');
+    match valid.chars().find(|c| c.is_alphanumeric()) {
+        Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
+        None => format!("{people_path}/{valid}"),
+    }
+}
+
+/// The deterministic by-name `Person` item id for `name` — Jellyfin's
+/// `GetItemByNameId<Person>(Person.GetPath(name))`, one id per name.
+#[must_use]
+pub fn person_item_id(mode: &IdDerivation, people_path: &str, name: &str) -> Option<uuid::Uuid> {
+    derive_item_id_with(mode, BaseItemKind::Person, &person_path(people_path, name))
+}
+
 /// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for
 /// call sites that have not been handed a per-database mode.
 #[must_use]
@@ -306,6 +344,38 @@ impl ItemTypeLookupTrait for ItemTypeLookup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn person_path_matches_person_get_path() {
+        use super::person_path;
+        // Plain name: subfoldered by its first alphanumeric char.
+        assert_eq!(
+            person_path("/data/metadata/People", "Steve Carell"),
+            "/data/metadata/People/S/Steve Carell"
+        );
+        // Invalid path characters become spaces (GetValidFilename), trailing
+        // periods drop, and the prefix is the first ALPHANUMERIC char.
+        assert_eq!(
+            person_path("/m/People", "A.C./D:C Jr."),
+            "/m/People/A/A.C. D C Jr"
+        );
+        // A digit prefixes too (IsLetterOrDigit).
+        assert_eq!(person_path("/m/People", "50 Cent"), "/m/People/5/50 Cent");
+    }
+
+    #[test]
+    fn person_item_id_is_one_per_name() {
+        use super::{IdDerivation, person_item_id};
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        let a = person_item_id(&mode, "/data/metadata/People", "Steve Carell");
+        let b = person_item_id(&mode, "/data/metadata/People", "Steve Carell");
+        let c = person_item_id(&mode, "/data/metadata/People", "Uma Thurman");
+        assert!(a.is_some());
+        assert_eq!(a, b, "same name, same id — regardless of credit type");
+        assert_ne!(a, c);
+    }
+
     use super::{
         IdDerivation, ItemTypeLookup, derive_item_id, derive_item_id_with, stored_type_name,
     };

@@ -149,13 +149,16 @@ struct FfmpegPlanner {
     dir: PathBuf,
     /// The source clip ffmpeg reads.
     clip: PathBuf,
+    /// Emit fMP4 segments (`out%d.mp4` + `out-1.mp4` init) instead of mpegts.
+    fmp4: bool,
 }
 
 impl FfmpegPlanner {
-    /// The real mpegts-HLS args writing `out%d.ts` + `out.m3u8` under `dir`.
+    /// The real HLS args writing `out%d.{ts,mp4}` + `out.m3u8` under `dir`.
     fn hls_args(&self, playlist: &Path) -> Vec<String> {
-        let seg_pattern = self.dir.join("out%d.ts");
-        vec![
+        let seg_ext = if self.fmp4 { "mp4" } else { "ts" };
+        let seg_pattern = self.dir.join(format!("out%d.{seg_ext}"));
+        let mut args = vec![
             "-y".into(),
             "-i".into(),
             self.clip.to_string_lossy().into_owned(),
@@ -176,8 +179,17 @@ impl FfmpegPlanner {
             "vod".into(),
             "-hls_segment_filename".into(),
             seg_pattern.to_string_lossy().into_owned(),
-            playlist.to_string_lossy().into_owned(),
-        ]
+        ];
+        if self.fmp4 {
+            args.extend([
+                "-hls_segment_type".into(),
+                "fmp4".into(),
+                "-hls_fmp4_init_filename".into(),
+                "out-1.mp4".into(),
+            ]);
+        }
+        args.push(playlist.to_string_lossy().into_owned());
+        args
     }
 }
 
@@ -192,7 +204,8 @@ impl StreamStatePlanner for FfmpegPlanner {
         let playlist = self.dir.join("out.m3u8");
         // The wait target for a segment request is that segment's file; a plain
         // playlist request has none.
-        let wait_for_path = segment_id.map(|id| self.dir.join(format!("out{id}.ts")));
+        let seg_ext = if self.fmp4 { "mp4" } else { "ts" };
+        let wait_for_path = segment_id.map(|id| self.dir.join(format!("out{id}.{seg_ext}")));
         let state = EncodingJobInfo {
             display: TranscodeDisplayNames::default(),
             base_request: BaseEncodingJobOptions::default(),
@@ -217,7 +230,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             supported_audio_codecs: Vec::new(),
             segment_length_secs: 2,
             wait_for_path,
-            segment_container: Some("ts".to_owned()),
+            segment_container: Some(seg_ext.to_owned()),
             play_session_id: Some("sess".to_owned()),
             device_id: Some("dev".to_owned()),
         };
@@ -229,7 +242,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             run_time_ticks: 6 * 10_000_000,
             segment_length_ms: 2000,
             is_remuxing_video: false,
-            segment_container: "ts".to_owned(),
+            segment_container: seg_ext.to_owned(),
         })
     }
 }
@@ -247,6 +260,7 @@ fn build_manager(dir: &Path, clip: &Path) -> Mgr {
     let planner = FfmpegPlanner {
         dir: dir.to_path_buf(),
         clip: clip.to_path_buf(),
+        fmp4: false,
     };
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -322,4 +336,64 @@ async fn end_to_end_master_variant_and_real_segment() {
         !cache.join("out0.ts").exists(),
         "partial segment should be deleted after stop"
     );
+}
+
+/// Builds a real fMP4-flavored manager over `dir` reading `clip`.
+fn build_manager_fmp4(dir: &Path, clip: &Path) -> Mgr {
+    let planner = FfmpegPlanner {
+        dir: dir.to_path_buf(),
+        clip: clip.to_path_buf(),
+        fmp4: true,
+    };
+    let transcoder = TokioSegmentTranscoder::new();
+    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> = Box::new(EncodingOptions::default);
+    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(cfg, Vec::new()));
+    let paths = Arc::new(TempPaths {
+        transcode: dir.to_string_lossy().into_owned(),
+    });
+    HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths)
+}
+
+/// The fragParsingError regression pin: hls.js requests the fMP4 init and the
+/// first media segment CONCURRENTLY. The init request must start exactly one
+/// ffmpeg (never a cancelled/orphaned spawn plus a second writer over the same
+/// segment files — that tears the fragments), return a complete `ftyp`-headed
+/// init, and the concurrent segment request must be served by that same job.
+#[tokio::test]
+async fn concurrent_init_and_segment_requests_share_one_job() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip(&clip);
+
+    let mgr = build_manager_fmp4(&cache, &clip);
+    let mut req = request();
+    req.segment_container = Some("mp4".to_owned());
+
+    let (init, seg0) = tokio::join!(
+        mgr.dynamic_segment(&req, -1, false),
+        mgr.dynamic_segment(&req, 0, false),
+    );
+    let init = init.expect("init segment served");
+    let seg0 = seg0.expect("segment 0 served");
+
+    // The init is a complete fMP4 header: non-empty, `ftyp` at offset 4.
+    let init_bytes = std::fs::read(&init.path).expect("read init");
+    assert!(init_bytes.len() > 8, "init is {} bytes", init_bytes.len());
+    assert_eq!(&init_bytes[4..8], b"ftyp", "init is not an fMP4 header");
+    let seg_bytes = std::fs::read(&seg0.path).expect("read seg0");
+    assert!(!seg_bytes.is_empty());
+
+    // Exactly one transcode job served both requests.
+    let log = cache.join("out.log");
+    let spawns = std::fs::read_to_string(&log).map_or(1, |s| {
+        // Each ffmpeg run writes one banner line with its version.
+        s.matches("ffmpeg version").count().max(1)
+    });
+    assert_eq!(spawns, 1, "one ffmpeg owns the segment files");
 }
