@@ -22,3 +22,7 @@ __pycache__/
 # local agent tooling — not part of the public project
 .mcp.json
 .claude/
+
+# WASM plugin artifacts are build/CI outputs only — never committed
+# (brain/plans/PLAN_PLUGIN_TIERS.md, artifact policy 2026-08-12)
+*.wasm

@@ -1,0 +1,309 @@
+//! The per-plugin runtime actor: one dedicated OS thread that owns the
+//! plugin's [`Store`] and instance for the life of the server.
+//!
+//! wasmtime stores are single-threaded by design, and guest calls can burn
+//! CPU for up to the configured deadline — both reasons they must never run
+//! on the tokio workers. Each loaded plugin therefore gets one long-lived
+//! thread (cost is per-plugin, not per-call) fed by a bounded command queue:
+//!
+//! - scheduled-task runs block on the queue and await a typed reply;
+//! - events are fire-and-forget `try_send`s — when a slow guest's queue is
+//!   full the event is dropped (with a debug log), never the server's time.
+//!
+//! **Containment:** a trap, deadline overrun, or memory-cap hit fails only
+//! the one call; the actor rebuilds a fresh instance for the next call. After
+//! [`BREAKER_LIMIT`] consecutive failures the plugin is declared dead for the
+//! rest of the process (commands are refused, events discarded) — the same
+//! circuit-breaker shape as the HLS transcode restart breaker.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+
+use tracing::{debug, warn};
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Engine, Store, StoreLimitsBuilder};
+
+use crate::bindings::{HostState, Plugin};
+
+/// Consecutive guest-call failures after which a plugin is declared dead
+/// until restart. Mirrors the HLS transcode breaker's `RESTART_FAILURE_LIMIT`
+/// (3): one flake retries, a pattern trips.
+pub const BREAKER_LIMIT: u32 = 3;
+
+/// How often the epoch ticker advances the engine epoch. One tick is the
+/// resolution of the call deadline; 1 s keeps the ticker negligible while
+/// making `FERROFIN_WASM_CALL_TIMEOUT_SECS` map 1:1 onto ticks.
+pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A command sent to a plugin's runtime thread.
+pub enum Command {
+    /// Run the guest task with the given id and reply with its outcome.
+    RunTask {
+        /// The plugin-local task id (the WIT `task-descriptor.id`).
+        task_id: String,
+        /// Fresh configuration JSON to snapshot before the call.
+        config: String,
+        /// Receives `Ok(())` or the guest/host error text.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Deliver a domain event (fire-and-forget).
+    OnEvent {
+        /// The stable event type name (`LibraryChanged`, …).
+        name: String,
+        /// The event's JSON payload.
+        json: String,
+    },
+}
+
+/// Everything needed to (re)build a plugin's store + instance from scratch.
+pub struct InstanceSpec {
+    /// The shared engine (cheap to clone; one per host).
+    pub engine: Engine,
+    /// The plugin's compiled component.
+    pub component: Component,
+    /// The linker with the host interface registered.
+    pub linker: Arc<Linker<HostState>>,
+    /// Display name for log tagging.
+    pub plugin_name: String,
+    /// Stable id (canonical UUID string) for log tagging.
+    pub plugin_id: String,
+    /// Linear-memory ceiling in bytes.
+    pub memory_limit_bytes: usize,
+    /// Guest-call deadline in epoch ticks (1 tick = [`EPOCH_TICK`]).
+    pub timeout_ticks: u64,
+}
+
+impl InstanceSpec {
+    /// Builds a fresh store and world instance, with the memory limiter and
+    /// an initial config snapshot installed.
+    ///
+    /// # Errors
+    /// Any instantiation failure — including a component built against a
+    /// different `ferrofin:plugin` world version, which surfaces here as a
+    /// missing/mismatched import or export.
+    pub fn instantiate(&self, config_json: String) -> wasmtime::Result<(Store<HostState>, Plugin)> {
+        let state = HostState {
+            plugin_name: self.plugin_name.clone(),
+            plugin_id: self.plugin_id.clone(),
+            config_json,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(self.memory_limit_bytes)
+                .build(),
+            wasi: HostState::empty_wasi(),
+            table: wasmtime::component::ResourceTable::new(),
+        };
+        let mut store = Store::new(&self.engine, state);
+        store.limiter(|state| &mut state.limits);
+        // Instantiation itself runs guest code (start sections, allocators),
+        // so it gets a deadline too.
+        store.set_epoch_deadline(self.timeout_ticks);
+        let plugin = Plugin::instantiate(&mut store, &self.component, &self.linker)?;
+        Ok((store, plugin))
+    }
+}
+
+/// The sending half owned by the host: a bounded queue into the plugin's
+/// runtime thread plus the shared dead flag.
+pub struct RuntimeHandle {
+    sender: SyncSender<Command>,
+    dead: Arc<AtomicBool>,
+    plugin_name: String,
+}
+
+impl RuntimeHandle {
+    /// Whether the breaker has permanently tripped for this plugin.
+    #[must_use]
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Queues a task run and awaits its outcome.
+    ///
+    /// # Errors
+    /// The guest's error text, the breaker being open, or the runtime thread
+    /// being gone.
+    pub async fn run_task(&self, task_id: String, config: String) -> Result<(), String> {
+        if self.is_dead() {
+            return Err(format!(
+                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
+                self.plugin_name
+            ));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::RunTask {
+                task_id,
+                config,
+                reply,
+            })
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        rx.await
+            .map_err(|_| "plugin runtime dropped the task reply".to_owned())?
+    }
+
+    /// Delivers an event without waiting. A full queue or dead plugin drops
+    /// the event (debug-logged) — event delivery must never apply
+    /// back-pressure to the server.
+    pub fn deliver_event(&self, name: &str, json: &str) {
+        if self.is_dead() {
+            return;
+        }
+        match self.sender.try_send(Command::OnEvent {
+            name: name.to_owned(),
+            json: json.to_owned(),
+        }) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                debug!(
+                    plugin = self.plugin_name,
+                    event = name,
+                    "wasm plugin event queue full; event dropped"
+                );
+            }
+        }
+    }
+}
+
+/// Spawns the runtime thread for one plugin and returns its handle.
+///
+/// `store` and `plugin` are the already-instantiated pair from loading (the
+/// loader has just called `descriptor`/`default-config`/`tasks` on them), so
+/// the first command reuses the warm instance instead of paying a rebuild.
+///
+/// # Panics
+/// Only if the OS refuses to spawn a thread (resource exhaustion at startup —
+/// the process is already unviable at that point).
+#[must_use]
+pub fn spawn(
+    spec: InstanceSpec,
+    store: Store<HostState>,
+    plugin: Plugin,
+    queue_capacity: usize,
+) -> RuntimeHandle {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(queue_capacity);
+    let dead = Arc::new(AtomicBool::new(false));
+    let handle = RuntimeHandle {
+        sender,
+        dead: Arc::clone(&dead),
+        plugin_name: spec.plugin_name.clone(),
+    };
+    std::thread::Builder::new()
+        .name(format!("wasm-plugin-{}", spec.plugin_name))
+        .spawn(move || run_loop(&spec, store, plugin, &receiver, &dead))
+        .expect("spawning a wasm plugin runtime thread cannot fail");
+    handle
+}
+
+/// The actor loop: execute commands against the live instance, rebuilding it
+/// after any failure, until the breaker trips or the channel closes.
+fn run_loop(
+    spec: &InstanceSpec,
+    store: Store<HostState>,
+    plugin: Plugin,
+    receiver: &Receiver<Command>,
+    dead: &AtomicBool,
+) {
+    let mut live = Some((store, plugin));
+    let mut consecutive_failures: u32 = 0;
+
+    while let Ok(command) = receiver.recv() {
+        if dead.load(Ordering::Relaxed) {
+            refuse(command, &spec.plugin_name);
+            continue;
+        }
+
+        // Rebuild the instance if the previous call wrecked it.
+        if live.is_none() {
+            match spec.instantiate(String::from("{}")) {
+                Ok(pair) => live = Some(pair),
+                Err(err) => {
+                    warn!(
+                        plugin = spec.plugin_name,
+                        error = %err,
+                        "wasm plugin re-instantiation failed"
+                    );
+                    consecutive_failures += 1;
+                    trip_if_due(spec, dead, consecutive_failures);
+                    refuse(command, &spec.plugin_name);
+                    continue;
+                }
+            }
+        }
+        let (store, instance) = live.as_mut().expect("instance was just ensured");
+
+        let failed = match command {
+            Command::RunTask {
+                task_id,
+                config,
+                reply,
+            } => {
+                store.data_mut().config_json = config;
+                store.set_epoch_deadline(spec.timeout_ticks);
+                match instance.call_run_task(&mut *store, &task_id) {
+                    // Guest-reported failure: an orderly `err(string)`, not a
+                    // trap — the instance is still healthy.
+                    Ok(Err(guest_err)) => {
+                        let _ = reply.send(Err(guest_err));
+                        false
+                    }
+                    Ok(Ok(())) => {
+                        let _ = reply.send(Ok(()));
+                        false
+                    }
+                    Err(trap) => {
+                        let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+                        true
+                    }
+                }
+            }
+            Command::OnEvent { name, json } => {
+                store.set_epoch_deadline(spec.timeout_ticks);
+                match instance.call_on_event(&mut *store, &name, &json) {
+                    Ok(()) => false,
+                    Err(trap) => {
+                        warn!(
+                            plugin = spec.plugin_name,
+                            event = name,
+                            error = %trap,
+                            "wasm plugin trapped handling an event"
+                        );
+                        true
+                    }
+                }
+            }
+        };
+
+        if failed {
+            // A trap (including epoch timeout and memory-cap hits) leaves the
+            // instance suspect: drop it and rebuild lazily on the next call.
+            live = None;
+            consecutive_failures += 1;
+            trip_if_due(spec, dead, consecutive_failures);
+        } else {
+            consecutive_failures = 0;
+        }
+    }
+}
+
+/// Trips the breaker once the consecutive-failure count reaches the limit.
+fn trip_if_due(spec: &InstanceSpec, dead: &AtomicBool, consecutive_failures: u32) {
+    if consecutive_failures >= BREAKER_LIMIT {
+        warn!(
+            plugin = spec.plugin_name,
+            plugin_id = spec.plugin_id,
+            failures = consecutive_failures,
+            "wasm plugin disabled until restart (circuit breaker)"
+        );
+        dead.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Answers a command that will not be executed (dead plugin / broken state).
+fn refuse(command: Command, plugin_name: &str) {
+    if let Command::RunTask { reply, .. } = command {
+        let _ = reply.send(Err(format!(
+            "plugin `{plugin_name}` is disabled until restart (circuit breaker)"
+        )));
+    }
+}

@@ -1,0 +1,93 @@
+/// The Ferrofin WASM plugin contract — Tier 1b of the plugin architecture
+/// (see brain/plans/PLAN_PLUGIN_TIERS.md).
+///
+/// STABILITY: this world is 0.x and UNSTABLE. It freezes (additive evolution
+/// only, like the vendored OpenAPI contract) once two or three real
+/// third-party plugins exist against it. Until then a minor bump may break
+/// guests; the host refuses to load a component built against a different
+/// version and names both versions in its error.
+///
+/// SECURITY MODEL: guests get no filesystem and no network. Every effect a
+/// plugin can have on the outside world goes through the `host` interface
+/// below — this file IS the reviewable attack surface.
+package ferrofin:plugin@0.1.0;
+
+/// Data types shared by both sides of the boundary.
+interface types {
+    /// Log severity, mapped 1:1 onto the host's tracing levels.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// A plugin's identity and presentation, surfaced on the `/Plugins` API.
+    record plugin-descriptor {
+        /// Stable plugin id — a UUID in canonical string form. A component
+        /// whose id does not parse as a UUID is rejected at load.
+        id: string,
+        /// Human-readable display name.
+        name: string,
+        /// Semantic version string of the plugin itself.
+        version: string,
+        /// One-line description shown in the dashboard.
+        description: string,
+    }
+
+    /// A background task the plugin offers to the scheduled-task registry.
+    record task-descriptor {
+        /// Stable key, unique within this plugin (the host namespaces it).
+        id: string,
+        /// Display name in the dashboard task list.
+        name: string,
+        /// One-line description of what the task does.
+        description: string,
+        /// Dashboard category the task is grouped under.
+        category: string,
+    }
+}
+
+/// Capabilities Ferrofin grants to every plugin. Deliberately minimal in
+/// 0.1: log + own-config only. http-fetch, query-items and
+/// write-media-segments land in 0.2 (plan phase E2) as explicit additions.
+interface host {
+    use types.{log-level};
+
+    /// Emits a log line into the server's tracing pipeline, tagged with the
+    /// plugin's id and name.
+    log: func(level: log-level, message: string);
+
+    /// Returns the plugin's persisted configuration JSON (the same bytes the
+    /// `/Plugins/{id}/Configuration` API manages). `{}` until the admin
+    /// saves a value; a plugin never sees another plugin's config.
+    get-config: func() -> string;
+}
+
+/// The contract a Ferrofin plugin component implements.
+world plugin {
+    use types.{plugin-descriptor, task-descriptor};
+
+    import host;
+
+    /// The plugin's identity; called once at load, before anything else.
+    export descriptor: func() -> plugin-descriptor;
+
+    /// The seed configuration JSON written on first run.
+    export default-config: func() -> string;
+
+    /// The background tasks this plugin contributes (may be empty).
+    export tasks: func() -> list<task-descriptor>;
+
+    /// Runs one of the plugin's tasks to completion. `task-id` is the
+    /// `task-descriptor.id` the plugin advertised. An `err` return is
+    /// recorded as a failed task run.
+    export run-task: func(task-id: string) -> result<_, string>;
+
+    /// Delivers one domain event. `event-name` is the server's stable event
+    /// type name (`LibraryChanged`, `PlaybackStart`, …); `event-json` is its
+    /// serialized payload. Called only while the plugin is enabled; a slow
+    /// consumer loses oldest events rather than slowing the server.
+    export on-event: func(event-name: string, event-json: string);
+}
