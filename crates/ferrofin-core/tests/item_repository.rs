@@ -662,3 +662,37 @@ async fn paged_user_data_sort_with_total_count_works() {
         assert_eq!(result.total_record_count, 1, "sort {sort:?}");
     }
 }
+
+#[tokio::test]
+async fn child_counts_exclude_merged_alternate_versions() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let counts = FerrofinItemCountService::new(db.clone());
+    let season = Uuid::from_u128(0xD01);
+    let primary = Uuid::from_u128(0xD02);
+    let alternate = Uuid::from_u128(0xD03);
+    let mut season_row = item(season, BaseItemKind::Season, "Season 1");
+    season_row.id = season_row.id.to_uppercase();
+    let mut primary_row = item(primary, BaseItemKind::Episode, "Pilot");
+    primary_row.id = primary_row.id.to_uppercase();
+    primary_row.parent_id = Some(season.to_string().to_uppercase());
+    let mut alternate_row = item(alternate, BaseItemKind::Episode, "Pilot");
+    alternate_row.id = alternate_row.id.to_uppercase();
+    alternate_row.parent_id = Some(season.to_string().to_uppercase());
+    // The merge-versions link: the duplicate points at its primary.
+    alternate_row.primary_version_id = Some(primary.to_string().to_uppercase());
+    persist
+        .save_items(&[season_row, primary_row, alternate_row])
+        .await
+        .expect("save");
+
+    let out = counts
+        .get_child_count_batch(&[season], None)
+        .await
+        .expect("counts");
+    assert_eq!(
+        out.get(&season).copied(),
+        Some(1),
+        "a merged duplicate must not inflate the episode count"
+    );
+}

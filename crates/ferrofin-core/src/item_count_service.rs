@@ -449,11 +449,15 @@ impl ItemCountService for FerrofinItemCountService {
         // batching, which dominated the by-name browse endpoints.
         let ids: Vec<String> = folder_ids.iter().copied().map(guid_to_db).collect();
         let grouped = |extra_join: &str, extra_where: &str| {
+            // Merged alternate versions (PrimaryVersionId set) are hidden
+            // duplicates of their primary — counting them inflated every
+            // series/season episode total after a merge-versions pass.
             let mut sql = format!(
                 r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
                    FROM "AncestorIds" a
                    JOIN "BaseItems" bi ON bi."Id" = a."ItemId"{extra_join}
-                   WHERE bi."IsFolder" = 0{extra_where} AND a."ParentItemId" IN ("#
+                   WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL{extra_where}
+                     AND a."ParentItemId" IN ("#
             );
             sql.push_str(&placeholders(ids.len()));
             sql.push_str(r#") GROUP BY a."ParentItemId""#);
@@ -525,7 +529,15 @@ impl ItemCountService for FerrofinItemCountService {
             ("BaseItems", &mut hierarchical),
             ("HermitLinkedChildren", &mut linked),
         ] {
-            let sql = grouped_count(table);
+            let mut sql = grouped_count(table);
+            if table == "BaseItems" {
+                // Direct-child counts skip merged alternates too (a season's
+                // ChildCount is its DISTINCT episodes, not every version).
+                sql = sql.replace(
+                    r#"WHERE "ParentId" IN ("#,
+                    r#"WHERE "PrimaryVersionId" IS NULL AND "ParentId" IN ("#,
+                );
+            }
             let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
             for id in &ids {
                 query = query.bind(id.clone());
