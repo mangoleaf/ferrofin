@@ -100,7 +100,11 @@ surface is: `log`, `get-config` (its own config only), `http-fetch` (host-execut
 the destination logged and the response capped at the plugin's memory limit), `query-items`
 (a small read-only item projection, max 1000 rows per call), and `write-media-segments`
 (scoped to the plugin's own provider id — it can never touch another provider's or a user's
-segments). Each plugin runs on its own runtime thread under an enforced
+segments). Plugins can also act as **metadata sources**: the scan offers every item to each
+enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
+ran, and applies results **supplement-only** — a plugin fills fields that are still empty
+and records its own external ids; it can never overwrite a built-in provider or a user
+edit. Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB — a `memory.grow` ceiling, not a
 reservation). A trap or overrun fails that one call and the instance is rebuilt; three
@@ -127,8 +131,9 @@ media-segment writes, then a metadata-provider export) is tracked in
 
 ## Roadmap
 
-- **WASM capability growth** — E3: a metadata-provider export wired into the provider
-  chain, per the plan above (E2's http-fetch / query-items / write-media-segments shipped).
+- **WASM image contribution** — `metadata-lookup` deliberately excludes artwork in 0.x;
+  the image-candidate contract lands when a real plugin needs it (the image pipeline's
+  cache/dimension/blurhash integration deserves its own design pass).
 - **External integrations over REST** — an event push story (webhooks / WebSocket
   subscriptions) for tools that are already separate systems (Jellyseerr-shaped). Planned
   as Tier 2; not part of the in-process plugin model.

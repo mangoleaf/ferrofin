@@ -12,8 +12,8 @@ wit_bindgen::generate!({
 use ferrofin::plugin::host;
 use ferrofin::plugin::types::LogLevel;
 use std::sync::atomic::{AtomicU64, Ordering};
-// PluginDescriptor/TaskDescriptor are hoisted to the crate root by
-// `generate!` (the world `use`s them), so they need no import.
+// PluginDescriptor/TaskDescriptor/ItemSummary/MetadataResult are hoisted to
+// the crate root by `generate!` (the world `use`s them), so no import.
 
 /// Events observed since load (the host delivers only while enabled).
 static EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -66,6 +66,26 @@ impl Guest for HelloPlugin {
     fn on_event(event_name: String, _event_json: String) {
         EVENTS_SEEN.fetch_add(1, Ordering::Relaxed);
         host::log(LogLevel::Debug, &format!("saw event {event_name}"));
+    }
+
+    fn metadata_lookup(
+        item: ItemSummary,
+        _provider_ids: Vec<(String, String)>,
+    ) -> Result<Option<MetadataResult>, String> {
+        // The reference "metadata source": recognizes one demo title. Real
+        // plugins would consult their database (via http-fetch) here.
+        if item.kind == "Movie" && item.name.contains("Bunny") {
+            return Ok(Some(MetadataResult {
+                overview: Some("A big rabbit deals with three tiny bullies. (Metadata \
+                                contributed by the Hello Ferrofin WASM plugin.)"
+                    .to_owned()),
+                production_year: Some(2008),
+                community_rating: Some(7.9),
+                genres: vec!["Animation".to_owned(), "Short".to_owned()],
+                provider_ids: vec![("HelloDb".to_owned(), "bbb-1".to_owned())],
+            }));
+        }
+        Ok(None)
     }
 }
 

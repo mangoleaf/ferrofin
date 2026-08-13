@@ -125,6 +125,7 @@ async fn real_guest_loads_runs_and_reports_rss() {
             seen: std::sync::Mutex::new(None),
         }),
         media_segments: segment_store.clone(),
+        plugins: Arc::new(EnabledStub(b"{}".to_vec())),
     });
     let (report_url, report_server) = one_shot_http("200 OK", b"ok");
     let manager_with_report: Arc<dyn PluginManager> = Arc::new(EnabledStub(
@@ -157,6 +158,43 @@ async fn real_guest_loads_runs_and_reports_rss() {
     let raw = String::from_utf8_lossy(&report_server.join().unwrap()).into_owned();
     assert!(raw.starts_with("POST /hook"), "report posted: {raw}");
     assert!(raw.contains("analyzed 1 movie(s)"), "report body: {raw}");
+
+    // ── E3: the metadata-lookup export through the scanner's seam ──────
+    let providers = host.metadata_providers();
+    assert_eq!(providers.len(), 1);
+    let offer = providers[0]
+        .lookup(&ferrofin_traits::providers::DynamicMetadataLookup {
+            item_id: uuid::Uuid::from_u128(0xB0B),
+            kind: "Movie".to_owned(),
+            name: "Big Buck Bunny".to_owned(),
+            production_year: None,
+            path: None,
+            provider_ids: vec![("Imdb".to_owned(), "tt1254207".to_owned())],
+        })
+        .await
+        .expect("lookup succeeds")
+        .expect("the guest recognizes the demo title");
+    assert_eq!(offer.production_year, Some(2008));
+    assert_eq!(offer.community_rating, Some(7.9));
+    assert_eq!(
+        offer.genres,
+        vec!["Animation".to_owned(), "Short".to_owned()]
+    );
+    assert_eq!(
+        offer.provider_ids,
+        vec![("HelloDb".to_owned(), "bbb-1".to_owned())]
+    );
+    assert!(offer.overview.unwrap_or_default().contains("WASM plugin"));
+    // An unrecognized item is politely declined.
+    let none = providers[0]
+        .lookup(&ferrofin_traits::providers::DynamicMetadataLookup {
+            kind: "Movie".to_owned(),
+            name: "Some Other Film".to_owned(),
+            ..Default::default()
+        })
+        .await
+        .expect("lookup succeeds");
+    assert!(none.is_none());
 
     // The first load pays one-time process costs (cranelift, engine, paging
     // wasmtime's code in). Loading a SECOND host with the same artifact

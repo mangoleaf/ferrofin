@@ -287,6 +287,69 @@ pub trait ProviderManager: Send + Sync {
 
 fn _assert_object_safe_provider_manager(_: &dyn ProviderManager) {}
 
+/// What a [`DynamicMetadataProvider`] is asked about: the item as scanned so
+/// far. Plain data (no entity/DTO) so the seam stays stable for out-of-tree
+/// implementations (the Tier-1b WASM plugin host).
+#[derive(Debug, Clone, Default)]
+pub struct DynamicMetadataLookup {
+    /// The item's id.
+    pub item_id: Uuid,
+    /// The simple kind name (`Movie`, `Series`, `Episode`, …).
+    pub kind: String,
+    /// The item's display name.
+    pub name: String,
+    /// Release year, when known.
+    pub production_year: Option<i32>,
+    /// Filesystem path, when the item has one.
+    pub path: Option<String>,
+    /// External ids known so far, as (provider name, id) pairs.
+    pub provider_ids: Vec<(String, String)>,
+}
+
+/// Metadata a dynamic provider contributes. **Supplement-only**: the scanner
+/// applies each field only where the item still lacks a value — dynamic
+/// providers fill gaps, they never overwrite built-in providers or user
+/// edits.
+#[derive(Debug, Clone, Default)]
+pub struct DynamicMetadataResult {
+    /// Plot/description text.
+    pub overview: Option<String>,
+    /// Release year.
+    pub production_year: Option<i32>,
+    /// Community rating on the 0–10 scale.
+    pub community_rating: Option<f64>,
+    /// Genre names (applied only when the item has none).
+    pub genres: Vec<String>,
+    /// External ids to record, as (provider name, id) pairs.
+    pub provider_ids: Vec<(String, String)>,
+}
+
+/// A dynamically-registered scan metadata source — the seam Tier-1b WASM
+/// plugins implement (`metadata-lookup` in the `ferrofin:plugin` world).
+/// Called per item AFTER the built-in provider chain (TVDB/TMDB/OMDb/NFO),
+/// so built-ins stay authoritative and dynamic sources supplement.
+///
+/// Implementations must be cheap to call with `None`-meaning results: most
+/// items are none of a given provider's business.
+#[async_trait]
+pub trait DynamicMetadataProvider: Send + Sync {
+    /// A stable display name for logs (typically the plugin name).
+    fn name(&self) -> &str;
+
+    /// Offers metadata for one item, or `Ok(None)` when this source has
+    /// nothing to contribute.
+    ///
+    /// # Errors
+    /// Provider-internal failure; the scanner logs it once and continues
+    /// (one bad source never fails a scan).
+    async fn lookup(
+        &self,
+        item: &DynamicMetadataLookup,
+    ) -> Result<Option<DynamicMetadataResult>, ServiceError>;
+}
+
+fn _assert_object_safe_dynamic_metadata_provider(_: &dyn DynamicMetadataProvider) {}
+
 #[cfg(test)]
 mod tests {
     use super::{ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};

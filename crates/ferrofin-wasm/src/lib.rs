@@ -275,6 +275,29 @@ impl WasmPluginHost {
         }
     }
 
+    /// Builds the [`DynamicMetadataProvider`] adapters for every loaded
+    /// plugin — the scanner's dynamic metadata pass (`metadata-lookup` in
+    /// the world). Each adapter self-gates on the plugin's enabled flag via
+    /// the collaborators cell, so it is inert until
+    /// [`set_runtime_collaborators`](Self::set_runtime_collaborators) and
+    /// while the plugin is disabled.
+    ///
+    /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
+    #[must_use]
+    pub fn metadata_providers(
+        &self,
+    ) -> Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>> {
+        self.plugins
+            .iter()
+            .map(|plugin| {
+                Arc::new(WasmMetadataProvider {
+                    plugin: Arc::clone(plugin),
+                    collaborators: Arc::clone(&self.collaborators),
+                }) as Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>
+            })
+            .collect()
+    }
+
     /// Arms the `query-items` / `write-media-segments` host functions with
     /// their backing managers. Called once by the composition root after the
     /// managers exist; a guest calling these before that (i.e. during its
@@ -438,6 +461,74 @@ fn load_one(
         tasks,
         runtime,
     })
+}
+
+/// The [`DynamicMetadataProvider`] adapter for one loaded plugin: converts
+/// the scanner's lookup into the guest's `metadata-lookup` export and back.
+///
+/// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
+struct WasmMetadataProvider {
+    plugin: Arc<LoadedPlugin>,
+    collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
+    fn name(&self) -> &str {
+        &self.plugin.descriptor.name
+    }
+
+    async fn lookup(
+        &self,
+        item: &ferrofin_traits::providers::DynamicMetadataLookup,
+    ) -> Result<Option<ferrofin_traits::providers::DynamicMetadataResult>, ServiceError> {
+        // Inert until the composition root arms the collaborators (a scan
+        // cannot run before that) and while the plugin is disabled.
+        let Some(cx) = self.collaborators.get() else {
+            return Ok(None);
+        };
+        let enabled = cx
+            .plugins
+            .get_plugin(self.plugin.descriptor.id)
+            .await?
+            .is_some_and(|d| d.enabled);
+        if !enabled {
+            return Ok(None);
+        }
+        let config = cx
+            .plugins
+            .get_plugin_configuration(self.plugin.descriptor.id)
+            .await
+            .map_or_else(
+                |_| String::from("{}"),
+                |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+            );
+
+        let wire_item = bindings::types::ItemSummary {
+            id: item.item_id.to_string(),
+            name: item.name.clone(),
+            kind: item.kind.clone(),
+            path: item.path.clone(),
+            parent_id: None,
+            run_time_ticks: None,
+        };
+        let offer = self
+            .plugin
+            .runtime
+            .metadata_lookup(wire_item, item.provider_ids.clone(), config)
+            .await
+            .map_err(ServiceError::backend)?;
+
+        Ok(
+            offer.map(|m| ferrofin_traits::providers::DynamicMetadataResult {
+                overview: m.overview,
+                production_year: m.production_year,
+                community_rating: m.community_rating,
+                genres: m.genres,
+                provider_ids: m.provider_ids,
+            }),
+        )
+    }
 }
 
 /// The [`ScheduledTask`] adapter for one advertised guest task.

@@ -18,7 +18,7 @@ use ferrofin_wasm::capabilities::{
 };
 
 mod common;
-use common::{OneMovieLibrary, RecordingSegments, one_shot_http};
+use common::{EnabledStub, OneMovieLibrary, RecordingSegments, one_shot_http};
 
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
@@ -99,6 +99,7 @@ fn collaborators(
         handle: tokio::runtime::Handle::current(),
         library,
         media_segments: segments,
+        plugins: Arc::new(EnabledStub(b"{}".to_vec())),
     }
 }
 

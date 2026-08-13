@@ -54,6 +54,19 @@ pub enum Command {
         /// The event's JSON payload.
         json: String,
     },
+    /// Ask the guest for metadata on one item (the scan's dynamic pass).
+    MetadataLookup {
+        /// The item as scanned so far.
+        item: crate::bindings::types::ItemSummary,
+        /// The item's known external ids.
+        provider_ids: Vec<(String, String)>,
+        /// Fresh configuration JSON to snapshot before the call.
+        config: String,
+        /// Receives the guest's offer (or its error text).
+        reply: tokio::sync::oneshot::Sender<
+            Result<Option<crate::bindings::types::MetadataResult>, String>,
+        >,
+    },
 }
 
 /// Everything needed to (re)build a plugin's store + instance from scratch.
@@ -147,6 +160,36 @@ impl RuntimeHandle {
             .map_err(|_| "plugin runtime thread has exited".to_owned())?;
         rx.await
             .map_err(|_| "plugin runtime dropped the task reply".to_owned())?
+    }
+
+    /// Asks the guest for metadata on one item and awaits its offer.
+    ///
+    /// # Errors
+    /// The guest's error text, the breaker being open, or the runtime thread
+    /// being gone.
+    pub async fn metadata_lookup(
+        &self,
+        item: crate::bindings::types::ItemSummary,
+        provider_ids: Vec<(String, String)>,
+        config: String,
+    ) -> Result<Option<crate::bindings::types::MetadataResult>, String> {
+        if self.is_dead() {
+            return Err(format!(
+                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
+                self.plugin_name
+            ));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::MetadataLookup {
+                item,
+                provider_ids,
+                config,
+                reply,
+            })
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        rx.await
+            .map_err(|_| "plugin runtime dropped the lookup reply".to_owned())?
     }
 
     /// Delivers an event without waiting. A full queue or dead plugin drops
@@ -264,6 +307,26 @@ fn run_loop(
                     }
                 }
             }
+            Command::MetadataLookup {
+                item,
+                provider_ids,
+                config,
+                reply,
+            } => {
+                store.data_mut().config_json = config;
+                store.set_epoch_deadline(spec.timeout_ticks);
+                match instance.call_metadata_lookup(&mut *store, &item, &provider_ids) {
+                    // An orderly guest err(string) leaves the instance healthy.
+                    Ok(outcome) => {
+                        let _ = reply.send(outcome);
+                        false
+                    }
+                    Err(trap) => {
+                        let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+                        true
+                    }
+                }
+            }
             Command::OnEvent { name, json } => {
                 store.set_epoch_deadline(spec.timeout_ticks);
                 match instance.call_on_event(&mut *store, &name, &json) {
@@ -308,9 +371,14 @@ fn trip_if_due(spec: &InstanceSpec, dead: &AtomicBool, consecutive_failures: u32
 
 /// Answers a command that will not be executed (dead plugin / broken state).
 fn refuse(command: Command, plugin_name: &str) {
-    if let Command::RunTask { reply, .. } = command {
-        let _ = reply.send(Err(format!(
-            "plugin `{plugin_name}` is disabled until restart (circuit breaker)"
-        )));
+    let message = format!("plugin `{plugin_name}` is disabled until restart (circuit breaker)");
+    match command {
+        Command::RunTask { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
+        Command::MetadataLookup { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
+        Command::OnEvent { .. } => {}
     }
 }

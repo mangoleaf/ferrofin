@@ -271,6 +271,10 @@ pub struct LibraryScanner {
     /// metadata + artwork come from TVDB (falling back to TMDB when TVDB has no
     /// match). Paired with [`metadata_dir`](Self::metadata_dir).
     tvdb: Option<Arc<ferrofin_providers::TvdbClient>>,
+    /// Dynamically-registered metadata sources (Tier-1b WASM plugins). Run
+    /// per item AFTER the built-in chain; supplement-only (they fill gaps,
+    /// never overwrite).
+    dynamic_providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
     /// Optional fanart.tv client — appends high-quality artwork for movies (by
     /// Tmdb/Imdb id) and series (by Tvdb id) on top of the primary provider's
     /// images. Keys off the ids persisted during this scan.
@@ -333,6 +337,7 @@ impl LibraryScanner {
             tmdb: None,
             omdb: None,
             tvdb: None,
+            dynamic_providers: Vec::new(),
             fanart: None,
             musicbrainz: None,
             audiodb: None,
@@ -440,6 +445,17 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_tvdb(mut self, tvdb: Arc<ferrofin_providers::TvdbClient>) -> Self {
         self.tvdb = Some(tvdb);
+        self
+    }
+
+    /// Registers dynamically-loaded metadata sources (Tier-1b WASM plugins),
+    /// called per item after the built-in provider chain. Supplement-only.
+    #[must_use]
+    pub fn with_dynamic_providers(
+        mut self,
+        providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
+    ) -> Self {
+        self.dynamic_providers = providers;
         self
     }
 
@@ -626,6 +642,11 @@ impl LibraryScanner {
             if people.is_empty() {
                 people = remote.people;
             }
+            // Dynamic (Tier-1b WASM plugin) metadata sources run last and
+            // supplement whatever the built-in chain left unfilled.
+            let dynamic_ids = self
+                .apply_dynamic_metadata(&mut entity, &remote.provider_ids, locked)
+                .await;
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
             // this entity is rebuilt from disk and would otherwise reset both
@@ -644,6 +665,7 @@ impl LibraryScanner {
                 .iter()
                 .cloned()
                 .chain(tag_provider_ids)
+                .chain(dynamic_ids)
                 .collect();
             for (key, value) in &all_provider_ids {
                 if let Err(err) = self.persistence.save_provider_id(item.id, key, value).await {
@@ -1398,6 +1420,70 @@ impl LibraryScanner {
     /// key crew to persist. No-op when TMDB is unconfigured, the item already has
     /// an overview (a local NFO or a prior scan), or the item isn't a movie/series.
     /// Best-effort — a network/parse failure returns no people and leaves the row.
+    /// Runs every registered [`DynamicMetadataProvider`] for one item and
+    /// applies the results **supplement-only**: a field is taken only when
+    /// the entity still lacks a value, so dynamic sources can never
+    /// overwrite the built-in chain or user edits. Returns the external ids
+    /// the sources contributed (persisted alongside the built-ins').
+    ///
+    /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
+    async fn apply_dynamic_metadata(
+        &self,
+        entity: &mut BaseItemEntity,
+        known_ids: &[(String, String)],
+        locked: bool,
+    ) -> Vec<(String, String)> {
+        // Locked items and provider-less scans skip the pass entirely;
+        // best-effort per source — one bad plugin never fails a scan.
+        if locked || self.dynamic_providers.is_empty() {
+            return Vec::new();
+        }
+        let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
+            item_id: Uuid::parse_str(&entity.id).unwrap_or_default(),
+            kind: entity
+                .type_
+                .rsplit('.')
+                .next()
+                .unwrap_or(&entity.type_)
+                .to_owned(),
+            name: entity.name.clone().unwrap_or_default(),
+            production_year: entity.production_year.and_then(|y| i32::try_from(y).ok()),
+            path: entity.path.clone(),
+            provider_ids: known_ids.to_vec(),
+        };
+        let mut contributed_ids = Vec::new();
+        for provider in &self.dynamic_providers {
+            let result = match provider.lookup(&lookup).await {
+                Ok(Some(result)) => result,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        provider = provider.name(),
+                        item = %lookup.item_id,
+                        %err,
+                        "dynamic metadata provider failed; continuing"
+                    );
+                    continue;
+                }
+            };
+            if entity.overview.as_deref().is_none_or(str::is_empty) {
+                entity.overview = result.overview.filter(|o| !o.is_empty());
+            }
+            if entity.production_year.is_none() {
+                entity.production_year = result.production_year.map(i64::from);
+            }
+            if entity.community_rating.is_none() {
+                entity.community_rating = result.community_rating;
+            }
+            if entity.genres.as_deref().unwrap_or_default().is_empty() && !result.genres.is_empty()
+            {
+                entity.genres = Some(result.genres.join("|"));
+            }
+            contributed_ids.extend(result.provider_ids);
+        }
+        contributed_ids
+    }
+
     async fn fetch_remote_metadata(
         &self,
         entity: &mut BaseItemEntity,
@@ -3467,6 +3553,34 @@ mod tests {
     /// Reads back the scanned movies' `(Name, SortName, ProductionYear)` rows,
     /// name-ordered — the one shared movie read-back, so each test doesn't add
     /// its own raw query (the ferrofin-db sql_boundary ratchet counts them).
+    /// One movie's enrichment columns + its provider ids (concatenated as
+    /// `Key=Value,...`) in a single query — the ONE raw-SQL site shared by
+    /// the metadata tests (the sql_boundary ratchet counts call sites).
+    async fn movie_detail_row(
+        db: &Database,
+        name: &str,
+    ) -> (
+        Option<String>, // Overview
+        Option<i64>,    // ProductionYear
+        Option<f64>,    // CommunityRating
+        Option<String>, // Genres
+        Option<String>, // Studios
+        Option<String>, // provider ids as "Key=Value,Key=Value"
+    ) {
+        sqlx::query_as(
+            r#"SELECT b."Overview", b."ProductionYear", b."CommunityRating",
+                      b."Genres", b."Studios",
+                      (SELECT group_concat(p."ProviderId" || '=' || p."ProviderValue")
+                         FROM "BaseItemProviders" p WHERE p."ItemId" = b."Id")
+               FROM "BaseItems" b
+               WHERE b."Type" LIKE '%Movies.Movie' AND b."Name" = ?1"#,
+        )
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    }
+
     async fn movie_rows(db: &Database) -> Vec<(String, Option<String>, Option<i64>)> {
         sqlx::query_as(
             r#"SELECT "Name","SortName","ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' ORDER BY "Name""#,
@@ -3529,6 +3643,101 @@ mod tests {
                 .iter()
                 .any(|(n, y)| n == "The Matrix" && *y == Some(1999)),
             "flat file should be cleaned (year stripped); got {names:?}"
+        );
+    }
+
+    // The dynamic (Tier-1b WASM) metadata pass is SUPPLEMENT-ONLY: it fills
+    // fields the built-in chain left empty and merges its provider ids, but a
+    // value already present (here: the NFO year) must never be overwritten.
+    #[tokio::test]
+    async fn dynamic_provider_supplements_but_never_overwrites() {
+        struct HelloDb;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for HelloDb {
+            fn name(&self) -> &'static str {
+                "hello-db"
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                assert_eq!(item.kind, "Movie");
+                Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    overview: Some("From the dynamic provider".to_owned()),
+                    production_year: Some(1980), // must NOT overwrite the NFO's 2020
+                    community_rating: Some(6.5),
+                    genres: vec!["Docufiction".to_owned()],
+                    provider_ids: vec![("HelloDb".to_owned(), "x1".to_owned())],
+                }))
+            }
+        }
+        /// A second source whose failure must not fail the scan.
+        struct Broken;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for Broken {
+            fn name(&self) -> &'static str {
+                "broken"
+            }
+            async fn lookup(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Err(ferrofin_traits::error::ServiceError::backend("boom"))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Movie 0001 (2020)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Movie 0001 (2020).mkv"), b"").unwrap();
+        // The NFO supplies the year (2020) but neither overview nor genres.
+        std::fs::write(
+            folder.join("movie.nfo"),
+            b"<movie><title>Movie 0001</title><year>2020</year></movie>",
+        )
+        .unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_dynamic_providers(vec![Arc::new(Broken), Arc::new(HelloDb)]);
+        scanner.scan_all().await.unwrap();
+
+        let (overview, year, rating, genres, _studios, ids) =
+            movie_detail_row(&db, "Movie 0001").await;
+        assert_eq!(overview.as_deref(), Some("From the dynamic provider"));
+        assert_eq!(year, Some(2020), "the NFO year is never overwritten");
+        assert_eq!(rating, Some(6.5));
+        assert_eq!(genres.as_deref(), Some("Docufiction"));
+        assert!(
+            ids.unwrap_or_default().contains("HelloDb=x1"),
+            "dynamic provider ids persist"
         );
     }
 
@@ -4246,14 +4455,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (genres, studios, overview): (Option<String>, Option<String>, Option<String>) =
-            sqlx::query_as(
-                r#"SELECT "Genres", "Studios", "Overview" FROM "BaseItems"
-                   WHERE "Type" LIKE '%Movies.Movie'"#,
-            )
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let (overview, _year, _rating, genres, studios, _ids) =
+            movie_detail_row(&db, "The Matrix").await;
         assert_eq!(genres.as_deref(), Some("Action|SciFi"));
         assert_eq!(studios.as_deref(), Some("Warner"));
         assert_eq!(overview.as_deref(), Some("Neo wakes up."));

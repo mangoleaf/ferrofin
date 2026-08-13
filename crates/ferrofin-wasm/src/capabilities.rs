@@ -34,6 +34,9 @@ pub struct Collaborators {
     pub library: Arc<dyn LibraryManager>,
     /// Media-segment persistence.
     pub media_segments: Arc<dyn MediaSegmentManager>,
+    /// Enabled-flag reads for the dynamic-metadata adapter (and any future
+    /// host path that must self-gate outside a task run).
+    pub plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
 }
 
 /// Executes `http-fetch` for a guest: http/https only, response body capped

@@ -112,6 +112,26 @@ interface types {
         /// Segment end, in ticks.
         end-ticks: s64,
     }
+
+    /// Metadata a plugin contributes for one item from `metadata-lookup`.
+    /// SUPPLEMENT-ONLY: the scanner applies each field only where the item
+    /// still lacks a value — a plugin can fill gaps, never overwrite the
+    /// built-in providers or user edits. Image contribution is deliberately
+    /// absent from 0.x (the image pipeline is a bigger contract; it lands
+    /// when a real plugin needs it).
+    record metadata-result {
+        /// Plot/description text.
+        overview: option<string>,
+        /// Release year.
+        production-year: option<s32>,
+        /// Community rating on Jellyfin's 0–10 scale.
+        community-rating: option<f64>,
+        /// Genre names (applied only when the item has none).
+        genres: list<string>,
+        /// External ids to record, as (provider name, id) pairs — e.g. a
+        /// plugin for a niche database records its own id here.
+        provider-ids: list<tuple<string, string>>,
+    }
 }
 
 /// Capabilities Ferrofin grants to every plugin — the ENTIRE effect surface
@@ -148,7 +168,7 @@ interface host {
 
 /// The contract a Ferrofin plugin component implements.
 world plugin {
-    use types.{plugin-descriptor, task-descriptor};
+    use types.{plugin-descriptor, task-descriptor, item-summary, metadata-result};
 
     import host;
 
@@ -171,4 +191,12 @@ world plugin {
     /// serialized payload. Called only while the plugin is enabled; a slow
     /// consumer loses oldest events rather than slowing the server.
     export on-event: func(event-name: string, event-json: string);
+
+    /// Offers metadata for one library item during a scan, after the
+    /// built-in providers ran. `item` describes the item as scanned so far;
+    /// `provider-ids` are its known external ids. Return `none` when this
+    /// plugin has nothing to offer (the common case — a plugin that is not
+    /// a metadata source returns `none` unconditionally). Results are
+    /// supplement-only (see `metadata-result`).
+    export metadata-lookup: func(item: item-summary, provider-ids: list<tuple<string, string>>) -> result<option<metadata-result>, string>;
 }

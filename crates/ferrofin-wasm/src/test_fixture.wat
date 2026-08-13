@@ -118,6 +118,16 @@
       (i32.store (i32.const 776) (i32.const 6))
       i32.const 768)
 
+    ;; metadata-lookup: (item-summary, list) -> result<option<metadata-result>, string>
+    ;; Always ok(none): result tag 0 @832, option tag 0 @840 (payload is
+    ;; 8-aligned because metadata-result carries an f64).
+    (func (export "metadata-lookup")
+      (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i32)
+      (result i32)
+      (i32.store (i32.const 832) (i32.const 0))
+      (i32.store (i32.const 840) (i32.const 0))
+      i32.const 832)
+
     ;; on-event: (string, string) -> (); "die" traps, else counts
     (func (export "on-event") (param $np i32) (param $nl i32) (param $pp i32) (param $pl i32)
       (if (i32.eq (local.get $nl) (i32.const 3))
@@ -137,6 +147,16 @@
     (field "id" string) (field "name" string)
     (field "description" string) (field "category" string)))
   (export $task "task-descriptor" (type $task0))
+  (type $item0 (record
+    (field "id" string) (field "name" string) (field "kind" string)
+    (field "path" (option string)) (field "parent-id" (option string))
+    (field "run-time-ticks" (option s64))))
+  (export $item "item-summary" (type $item0))
+  (type $meta0 (record
+    (field "overview" (option string)) (field "production-year" (option s32))
+    (field "community-rating" (option f64)) (field "genres" (list string))
+    (field "provider-ids" (list (tuple string string)))))
+  (export $meta "metadata-result" (type $meta0))
 
   (func $descriptor (result $descriptor)
     (canon lift (core func $i "descriptor") (memory $i "memory") string-encoding=utf8))
@@ -150,10 +170,16 @@
   (func $on-event (param "event-name" string) (param "event-json" string)
     (canon lift (core func $i "on-event") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
+  (func $metadata-lookup
+    (param "item" $item) (param "provider-ids" (list (tuple string string)))
+    (result (result (option $meta) (error string)))
+    (canon lift (core func $i "metadata-lookup") (memory $i "memory")
+      (realloc (core func $i "realloc")) string-encoding=utf8))
 
   (export "descriptor" (func $descriptor))
   (export "default-config" (func $default-config))
   (export "tasks" (func $tasks))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))
+  (export "metadata-lookup" (func $metadata-lookup))
 )
