@@ -315,3 +315,110 @@ async fn item_ids_query_returns_only_ids() {
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&a) && ids.contains(&b));
 }
+
+#[tokio::test]
+async fn has_subtitles_filters_on_stream_rows() {
+    use ferrofin_core::FerrofinMediaStreamRepository;
+    use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+    use ferrofin_traits::persistence::MediaStreamRepository;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let subbed = Uuid::from_u128(0x601);
+    let bare = Uuid::from_u128(0x602);
+    persist
+        .save_items(&[
+            item(subbed, BaseItemKind::Movie, "Subbed"),
+            item(bare, BaseItemKind::Movie, "Bare"),
+        ])
+        .await
+        .expect("save");
+    let streams = FerrofinMediaStreamRepository::new(db.clone());
+    streams
+        .save_media_streams(
+            subbed,
+            &[MediaStreamInfoEntity {
+                item_id: subbed.to_string(),
+                stream_index: 0,
+                stream_type: 2, // Subtitle
+                ..MediaStreamInfoEntity::default()
+            }],
+        )
+        .await
+        .expect("save streams");
+
+    let with_subs = repository
+        .get_item_list(&InternalItemsQuery {
+            has_subtitles: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(with_subs.len(), 1);
+    assert_eq!(with_subs[0].name.as_deref(), Some("Subbed"));
+
+    let without = repository
+        .get_item_list(&InternalItemsQuery {
+            has_subtitles: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(without.len(), 1);
+    assert_eq!(without[0].name.as_deref(), Some("Bare"));
+
+    // The ids-only helper backing the DTO builder's HasSubtitles agrees.
+    let flagged = streams
+        .get_item_ids_with_subtitles(&[subbed, bare])
+        .await
+        .expect("flags");
+    assert_eq!(flagged, vec![subbed]);
+}
+
+#[tokio::test]
+async fn video_type_and_3d_filters_match_data_blob() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let bluray = Uuid::from_u128(0x701);
+    let plain = Uuid::from_u128(0x702);
+    let mut bluray_row = item(bluray, BaseItemKind::Movie, "Disc");
+    bluray_row.data = Some(r#"{"VideoType":"BluRay","Video3DFormat":"HalfSideBySide"}"#.to_owned());
+    let mut plain_row = item(plain, BaseItemKind::Movie, "File");
+    plain_row.data = Some(r#"{"VideoType":"VideoFile"}"#.to_owned());
+    persist
+        .save_items(&[bluray_row, plain_row])
+        .await
+        .expect("save");
+
+    let discs = repository
+        .get_item_list(&InternalItemsQuery {
+            video_types: vec![ferrofin_model::entities::VideoType::BluRay],
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(discs.len(), 1);
+    assert_eq!(discs[0].name.as_deref(), Some("Disc"));
+
+    let three_d = repository
+        .get_item_list(&InternalItemsQuery {
+            is_3d: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(three_d.len(), 1);
+    assert_eq!(three_d[0].name.as_deref(), Some("Disc"));
+
+    let flat = repository
+        .get_item_list(&InternalItemsQuery {
+            is_3d: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(flat.len(), 1);
+    assert_eq!(flat[0].name.as_deref(), Some("File"));
+}

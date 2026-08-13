@@ -3,7 +3,8 @@
 //! Ports `GET /Items/Suggestions`: a random-ordered, media/type-filtered page of
 //! non-virtual library items, projected to [`BaseItemDto`]s. The legacy
 //! `GET /Users/{userId}/Suggestions` alias is `ApiExplorerSettings(IgnoreApi)` in
-//! Jellyfin, so it is not in the vendored contract and stays on the `501` stub.
+//! Jellyfin, so it is absent from the vendored contract (no `501` stub exists);
+//! it is registered here directly so clients still calling it don't get a `404`.
 
 use axum::extract::{Query, State};
 use axum::routing::get;
@@ -90,7 +91,21 @@ async fn get_suggestions(
     )))
 }
 
+/// `GET /Users/{userId}/Suggestions` — path-scoped form of
+/// `GET /Items/Suggestions`, still served (hidden) by upstream.
+async fn get_suggestions_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    Query(mut query): Query<SuggestionsQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    query.user_id = Some(user_id);
+    get_suggestions(state, auth, Query(query)).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
-    router.route("/Items/Suggestions", get(get_suggestions))
+    router
+        .route("/Items/Suggestions", get(get_suggestions))
+        .route("/Users/{userId}/Suggestions", get(get_suggestions_for_user))
 }

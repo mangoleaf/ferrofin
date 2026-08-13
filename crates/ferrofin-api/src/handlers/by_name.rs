@@ -63,6 +63,12 @@ pub(crate) struct ByNameListQuery {
     /// Whether a total record count is requested (defaults to `true` in C#).
     #[serde(default)]
     pub enable_total_record_count: Option<bool>,
+    /// Restrict to items the caller has (not) favourited.
+    #[serde(default)]
+    pub is_favorite: Option<bool>,
+    /// Comma-delimited `ItemFilter` flags (`IsFavorite`, …).
+    #[serde(default)]
+    pub filters: Option<String>,
 }
 
 impl ByNameListQuery {
@@ -79,8 +85,27 @@ impl ByNameListQuery {
         if let Some(parent) = self.parent_id {
             ancestor_ids.push(parent);
         }
+        // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite`
+        // is absent (ArtistsController/GenresController do this same dance).
+        let filters = crate::handlers::query_parse::parse_csv_enums_lenient::<
+            ferrofin_model::querying::ItemFilter,
+        >(self.filters.as_deref());
+        let is_favorite = self.is_favorite.or_else(|| {
+            filters
+                .contains(&ferrofin_model::querying::ItemFilter::IsFavorite)
+                .then_some(true)
+        });
+        // Scope the aggregate to the requested kinds (C# sets IncludeItemTypes
+        // on the inner query): the Movies "Genres" tab must list only genres
+        // carried by movies, not by every item under the parent. Lenient parse,
+        // matching upstream's tolerant comma-delimited model binder.
+        let include_item_types = crate::handlers::query_parse::parse_csv_enums_lenient::<
+            ferrofin_model::data::BaseItemKind,
+        >(self.include_item_types.as_deref());
         ferrofin_traits::options::InternalItemsQuery {
             user,
+            is_favorite,
+            include_item_types,
             start_index: self.start_index,
             limit: self.limit,
             search_term: self.search_term.clone(),

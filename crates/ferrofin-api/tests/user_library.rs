@@ -444,7 +444,7 @@ impl UserViewManager for StubUserViews {
     }
     async fn get_latest_items(
         &self,
-        _user_id: Uuid,
+        _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
     ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
         Ok(vec![(

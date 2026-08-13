@@ -120,6 +120,37 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         Ok(map)
     }
 
+    async fn get_item_ids_with_subtitles(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        // Ids-only page query for the DTO builder's `HasSubtitles` — no stream
+        // rows materialize, and `(ItemId, StreamIndex)` is the table's PK so
+        // each id resolves off the index.
+        let mut with_subs = Vec::new();
+        for chunk in item_ids.chunks(500) {
+            let ph = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
+                   WHERE "StreamType" = ?1 AND "ItemId" IN ({ph})"#,
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&sql)
+                .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&row) {
+                    with_subs.push(id);
+                }
+            }
+        }
+        Ok(with_subs)
+    }
+
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,

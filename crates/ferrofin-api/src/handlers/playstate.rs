@@ -522,6 +522,43 @@ async fn on_playback_stopped(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /Users/{userId}/PlayingItems/{itemId}` — path-scoped form of
+/// `POST /PlayingItems/{itemId}`.
+///
+/// Upstream keeps the `/Users/{userId}/…` forms `[Obsolete]` and hidden from
+/// the OpenAPI doc but still serves them; the path `userId` is ignored there
+/// too — the session (and thus the user) comes from the auth token.
+async fn on_playback_start_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    query: Query<LegacyStartQuery>,
+) -> Result<StatusCode, ApiError> {
+    on_playback_start(state, auth, Path(item_id), query).await
+}
+
+/// `POST /Users/{userId}/PlayingItems/{itemId}/Progress` — path-scoped form of
+/// `POST /PlayingItems/{itemId}/Progress`.
+async fn on_playback_progress_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    query: Query<LegacyProgressQuery>,
+) -> Result<StatusCode, ApiError> {
+    on_playback_progress(state, auth, Path(item_id), query).await
+}
+
+/// `DELETE /Users/{userId}/PlayingItems/{itemId}` — path-scoped form of
+/// `DELETE /PlayingItems/{itemId}`.
+async fn on_playback_stopped_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((_user_id, item_id)): Path<(Uuid, Uuid)>,
+    query: Query<LegacyStopQuery>,
+) -> Result<StatusCode, ApiError> {
+    on_playback_stopped(state, auth, Path(item_id), query).await
+}
+
 /// Parses a stored user-entity id string to a [`Uuid`], falling back to nil.
 fn parse_id(raw: &str) -> Uuid {
     Uuid::parse_str(raw).unwrap_or_else(|_| Uuid::nil())
@@ -595,5 +632,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/PlayingItems/{itemId}/Progress",
             post(on_playback_progress),
+        )
+        .route(
+            "/Users/{userId}/PlayingItems/{itemId}",
+            post(on_playback_start_for_user).delete(on_playback_stopped_for_user),
+        )
+        .route(
+            "/Users/{userId}/PlayingItems/{itemId}/Progress",
+            post(on_playback_progress_for_user),
         )
 }

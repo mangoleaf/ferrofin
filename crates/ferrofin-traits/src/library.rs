@@ -819,6 +819,21 @@ pub trait UserDataManager: Send + Sync {
         user_id: Uuid,
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
+
+    /// The user's `(EnableContentDeletion, EnableContentDownloading)`
+    /// permissions, for the DTO builder's per-user `CanDelete`/`CanDownload`
+    /// gating (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`).
+    ///
+    /// `None` means "no policy known" — the caller falls back to the
+    /// file-level fact. The default returns that; the concrete manager reads
+    /// the `Permissions` rows.
+    async fn get_content_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<(bool, bool)>, ServiceError> {
+        let _ = user_id;
+        Ok(None)
+    }
 }
 
 fn _assert_object_safe_user_data_manager(_: &dyn UserDataManager) {}
@@ -844,9 +859,15 @@ pub trait UserViewManager: Send + Sync {
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Gets latest items grouped per parent view.
+    ///
+    /// The query scopes which views contribute (`parent_id`), which kinds the
+    /// underlying rows may be (`include_item_types`), and how many rows per
+    /// view to fetch (`limit`, over-fetched ×2 as in C# `GetLatestItemsInternal`
+    /// so the caller's post-filters don't starve the page). Virtual items are
+    /// always excluded, matching upstream.
     async fn get_latest_items(
         &self,
-        user_id: Uuid,
+        query: &crate::options::LatestItemsQuery,
         options: &DtoOptions,
     ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError>;
 }
@@ -883,6 +904,29 @@ pub trait MediaSourceManager: Send + Sync {
             map.insert(id, self.get_media_streams(id).await?);
         }
         Ok(map)
+    }
+
+    /// The subset of `item_ids` that carry at least one subtitle stream.
+    ///
+    /// Backs the DTO builder's `HasSubtitles` (C# emits it on every video DTO,
+    /// outside the `ItemFields` system, from the stored flag). The default
+    /// derives it from [`Self::get_media_streams_batch`]; the concrete manager
+    /// overrides it with a cheap ids-only `EXISTS` query so list pages don't
+    /// materialize full stream rows.
+    async fn get_item_ids_with_subtitles(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        Ok(map
+            .into_iter()
+            .filter(|(_, streams)| {
+                streams
+                    .iter()
+                    .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle)
+            })
+            .map(|(id, _)| id)
+            .collect())
     }
 
     /// The merged alternate-version rows for a page of primary item ids, keyed

@@ -36,14 +36,15 @@ where
         .collect()
 }
 
-/// Like [`parse_csv_enums`] but silently drops tokens that don't parse instead
-/// of erroring.
+/// Like [`parse_csv_enums`] but case-insensitive, and silently drops tokens
+/// that don't parse instead of erroring.
 ///
-/// This mirrors Jellyfin's tolerant `ItemFields` model binding: clients still
-/// send deprecated field names (e.g. `BasicSyncInfo`) that the server no longer
-/// recognizes, and Jellyfin skips them rather than failing the whole request.
-/// Used only for the `fields` parameter, where forward/backward-compat matters;
-/// identifier-bearing params (item types, ids) stay strict.
+/// This mirrors ASP.NET's enum model binding, which Jellyfin relies on: tokens
+/// bind case-insensitively (`Enum.Parse(…, ignoreCase: true)` — jellyfin-web
+/// really does send `Filters=IsUnPlayed` and `VideoTypes=Bluray`), and an
+/// unrecognized token is logged and dropped rather than failing the request
+/// (`CommaDelimitedCollectionModelBinder`). Used for the enum-set parameters
+/// (fields, filters, …); identifier-bearing params (ids) stay strict.
 pub(crate) fn parse_csv_enums_lenient<T>(raw: Option<&str>) -> Vec<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -54,11 +55,39 @@ where
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter_map(|token| {
-            let de: StrDeserializer<'_, ValueError> = token.into_deserializer();
-            T::deserialize(de).ok()
-        })
+        .filter_map(deserialize_enum_token_ci)
         .collect()
+}
+
+/// Deserializes one enum token, retrying case-insensitively on a miss.
+///
+/// The retry recovers the type's accepted spellings from serde's own
+/// "unknown variant `X`, expected one of `A`, `B`" error message — the only
+/// way to enumerate a derived enum's variants without adding a reflection
+/// dependency or hand-maintained variant lists. The message shape is pinned by
+/// the tests below, so a serde format change fails loudly here, not in an API
+/// handler.
+fn deserialize_enum_token_ci<T>(token: &str) -> Option<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let de: StrDeserializer<'_, ValueError> = token.into_deserializer();
+    match T::deserialize(de) {
+        Ok(v) => Some(v),
+        Err(err) => {
+            // "unknown variant `x`, expected one of `A`, `B`" — every
+            // backtick-quoted word after "expected" is an accepted spelling.
+            let msg = err.to_string();
+            let expected = msg.split("expected").nth(1)?;
+            let canonical = expected
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .find(|variant| variant.eq_ignore_ascii_case(token))?;
+            let de: StrDeserializer<'_, ValueError> = canonical.into_deserializer();
+            T::deserialize(de).ok()
+        }
+    }
 }
 
 /// Splits a comma-delimited value into [`Uuid`]s, skipping empty tokens.
@@ -115,6 +144,27 @@ mod tests {
         // A deprecated/unknown token is dropped, the valid ones survive.
         let kinds: Vec<BaseItemKind> = parse_csv_enums_lenient(Some("Movie,BasicSyncInfo,Series"));
         assert_eq!(kinds, vec![BaseItemKind::Movie, BaseItemKind::Series]);
+    }
+
+    #[test]
+    fn csv_enums_lenient_binds_case_insensitively() {
+        use super::parse_csv_enums_lenient;
+        use ferrofin_model::entities::VideoType;
+        use ferrofin_model::querying::ItemFilter;
+        // jellyfin-web's filter dialog literally sends `IsUnPlayed` (sic) and
+        // `Bluray`; ASP.NET's `Enum.Parse(…, ignoreCase: true)` binds both.
+        let filters: Vec<ItemFilter> = parse_csv_enums_lenient(Some("IsUnPlayed,IsFavorite"));
+        assert_eq!(
+            filters,
+            vec![ItemFilter::IsUnplayed, ItemFilter::IsFavorite]
+        );
+        let types: Vec<VideoType> = parse_csv_enums_lenient(Some("Bluray,dvd"));
+        assert_eq!(types, vec![VideoType::BluRay, VideoType::Dvd]);
+        // This retry parses serde's "unknown variant …, expected one of …"
+        // message to enumerate the accepted spellings; if serde ever changes
+        // that shape, this test is the loud failure.
+        let kinds: Vec<BaseItemKind> = parse_csv_enums_lenient(Some("movie"));
+        assert_eq!(kinds, vec![BaseItemKind::Movie]);
     }
 
     #[test]

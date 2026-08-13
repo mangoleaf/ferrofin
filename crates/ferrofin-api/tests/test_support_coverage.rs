@@ -138,7 +138,10 @@ fn fake_user_views_methods_panic() {
     let f = FakeUserViews;
     let opts = DtoOptions::with_all_fields(false);
     assert_panics(f.get_user_views(Uuid::nil()));
-    assert_panics(f.get_latest_items(Uuid::nil(), &opts));
+    assert_panics(f.get_latest_items(
+        &ferrofin_traits::options::LatestItemsQuery::default(),
+        &opts,
+    ));
 }
 
 #[test]

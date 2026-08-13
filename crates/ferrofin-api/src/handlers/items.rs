@@ -184,9 +184,33 @@ struct ItemsQuery {
     /// Restrict to 4K items.
     #[serde(default, rename = "is4K")]
     is_4k: Option<bool>,
-    /// Restrict to HD items.
-    #[serde(default)]
+    /// Restrict to HD items. The alias covers jellyfin-web's stable filter
+    /// dialog, which sends `IsHD` — the server's key fold only lowercases the
+    /// first character, leaving `isHD`.
+    #[serde(default, alias = "isHD")]
     is_hd: Option<bool>,
+    /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
+    #[serde(default, rename = "is3D")]
+    is_3d: Option<bool>,
+    /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
+    /// (`BluRay`, `Dvd`, `Iso`).
+    #[serde(default)]
+    video_types: Option<String>,
+    /// Restrict to items with (or without) subtitle streams.
+    #[serde(default)]
+    has_subtitles: Option<bool>,
+    /// Restrict to items with (or without) a local trailer extra.
+    #[serde(default)]
+    has_trailer: Option<bool>,
+    /// Restrict to items with (or without) a special-feature extra.
+    #[serde(default)]
+    has_special_feature: Option<bool>,
+    /// Restrict to items with (or without) a theme song extra.
+    #[serde(default)]
+    has_theme_song: Option<bool>,
+    /// Restrict to items with (or without) a theme video extra.
+    #[serde(default)]
+    has_theme_video: Option<bool>,
     /// Exact index number.
     #[serde(default)]
     index_number: Option<i32>,
@@ -267,6 +291,13 @@ async fn get_items(
         is_series: query.is_series,
         is_4k: query.is_4k,
         is_hd: query.is_hd,
+        is_3d: query.is_3d,
+        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
+        has_subtitles: query.has_subtitles,
+        has_trailer: query.has_trailer,
+        has_special_feature: query.has_special_feature,
+        has_theme_song: query.has_theme_song,
+        has_theme_video: query.has_theme_video,
         index_number: query.index_number,
         parent_index_number: query.parent_index_number,
         min_community_rating: query.min_community_rating,
@@ -282,8 +313,10 @@ async fn get_items(
         internal.parent_id = parent;
     }
     // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
-    // fields, rejecting contradictory pairs with a `400`.
-    let filters = parse_csv_enums(query.filters.as_deref())?;
+    // fields, rejecting contradictory pairs with a `400`. Token parsing is
+    // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
+    // `Filters=IsUnPlayed` (sic), and upstream drops unknown tokens.
+    let filters = parse_csv_enums_lenient(query.filters.as_deref());
     internal
         .apply_filters(&filters)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

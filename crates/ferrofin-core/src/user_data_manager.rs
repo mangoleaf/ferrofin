@@ -482,6 +482,23 @@ impl UserDataManager for FerrofinUserDataManager {
         .map_err(db_err)?;
         Ok(())
     }
+
+    async fn get_content_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<(bool, bool)>, ServiceError> {
+        // Kind 10 = EnableContentDeletion, 11 = EnableContentDownloading.
+        let rows: Vec<(i32, bool)> = sqlx::query_as(
+            r#"SELECT "Kind", "Value" FROM "Permissions"
+               WHERE "UserId" = ?1 AND "Kind" IN (10, 11)"#,
+        )
+        .bind(guid_to_db(user_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let has = |kind: i32| rows.iter().any(|(k, v)| *k == kind && *v);
+        Ok(Some((has(10), has(11))))
+    }
 }
 
 #[cfg(test)]

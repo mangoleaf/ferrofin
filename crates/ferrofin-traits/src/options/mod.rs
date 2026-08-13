@@ -28,6 +28,7 @@ mod image_processing_options;
 mod internal_items_query;
 mod internal_people_query;
 mod item_image_info;
+mod latest_items_query;
 
 pub use authorization_info::AuthorizationInfo;
 pub use delete_options::DeleteOptions;
@@ -36,3 +37,4 @@ pub use image_processing_options::{ImageCollageOptions, ImageProcessingOptions};
 pub use internal_items_query::{InternalItemsQuery, SourceType};
 pub use internal_people_query::InternalPeopleQuery;
 pub use item_image_info::ItemImageInfo;
+pub use latest_items_query::LatestItemsQuery;

@@ -947,6 +947,51 @@ async fn enabled_count(state: &AppState) -> Result<usize, ApiError> {
     Ok(count)
 }
 
+/// `POST /Users/{userId}` — path-scoped form of `POST /Users` (update user).
+///
+/// Upstream keeps these `/Users/{userId}/…` forms `[Obsolete]` and hidden from
+/// the OpenAPI doc but still serves them, and jellyfin-web's bundled
+/// `jellyfin-apiclient` still calls them. Each injects the path `userId` into
+/// the query and forwards to the query-scoped handler.
+async fn update_user_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    body: Json<UserDto>,
+) -> Result<StatusCode, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    update_user(state, auth, Query(query), body).await
+}
+
+/// `POST /Users/{userId}/Configuration` — path-scoped form of
+/// `POST /Users/Configuration`.
+async fn update_user_configuration_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    config: Json<UserConfiguration>,
+) -> Result<StatusCode, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    update_user_configuration(state, auth, Query(query), config).await
+}
+
+/// `POST /Users/{userId}/Password` — path-scoped form of `POST /Users/Password`.
+async fn update_user_password_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+    body: Json<UpdateUserPassword>,
+) -> Result<StatusCode, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    update_user_password(state, auth, Query(query), body).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -957,9 +1002,22 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/Users", get(get_users).post(update_user))
         .route("/Users/Public", get(get_public_users))
-        .route("/Users/{userId}", get(get_user_by_id).delete(delete_user))
+        .route(
+            "/Users/{userId}",
+            get(get_user_by_id)
+                .delete(delete_user)
+                .post(update_user_for_user),
+        )
         .route("/Users/New", post(create_user_by_name))
         .route("/Users/{userId}/Policy", post(update_user_policy))
+        .route(
+            "/Users/{userId}/Configuration",
+            post(update_user_configuration_for_user),
+        )
+        .route(
+            "/Users/{userId}/Password",
+            post(update_user_password_for_user),
+        )
         .route("/Users/Configuration", post(update_user_configuration))
         .route("/Users/Password", post(update_user_password))
         .route("/Users/ForgotPassword", post(forgot_password))

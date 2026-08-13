@@ -329,6 +329,16 @@ const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
 ///   binary collation — byte-identical to the C# char compare for ASCII.
 fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Favorite state lives in the by-name item's own `UserData` row (C# joins
+    // `UserData` on the by-name item id) — same predicate the main browse uses.
+    if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_favorite) {
+        crate::translate_query::push_user_data_exists(
+            qb,
+            &guid_to_db(user_id),
+            r#"ud."IsFavorite" = 1"#,
+            want,
+        );
+    }
     if let Some(term) = non_blank(&filter.search_term) {
         let lowered = term.to_lowercase();
         if lowered.contains(SEARCH_WILDCARD_TERMS) {

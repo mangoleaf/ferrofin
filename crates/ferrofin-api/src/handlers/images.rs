@@ -803,6 +803,65 @@ async fn delete_user_image(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// `GET`/`HEAD /Users/{userId}/Images/{imageType}` — path-scoped form of
+/// `GET /UserImage`.
+///
+/// Upstream keeps these `/Users/{userId}/Images/…` forms `[Obsolete]` and
+/// hidden from the OpenAPI doc but still serves them, and jellyfin-web's
+/// bundled `jellyfin-apiclient` still requests avatars this way. Users only
+/// carry a single profile image, so the path's image type/index are accepted
+/// and ignored, as upstream does.
+async fn get_user_image_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Query(mut query): Query<ImageQuery>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    query.user_id = Some(user_id);
+    get_user_image(state, auth, Query(query), request).await
+}
+
+/// `GET`/`HEAD /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed
+/// path-scoped form of `GET /UserImage`.
+async fn get_user_image_by_index_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
+    Query(mut query): Query<ImageQuery>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    query.user_id = Some(user_id);
+    query.image_index = Some(image_index);
+    get_user_image(state, auth, Query(query), request).await
+}
+
+/// `POST /Users/{userId}/Images/{imageType}` — path-scoped form of
+/// `POST /UserImage`.
+async fn post_user_image_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Query(mut query): Query<ImageQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    post_user_image(state, auth, Query(query), headers, body).await
+}
+
+/// `DELETE /Users/{userId}/Images/{imageType}` — path-scoped form of
+/// `DELETE /UserImage`.
+async fn delete_user_image_legacy(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Query(mut query): Query<ImageQuery>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    query.user_id = Some(user_id);
+    delete_user_image(state, auth, Query(query)).await
+}
+
 /// Reads the raw base64 upload body and its image MIME type, then saves it.
 ///
 /// Shared tail of `SetItemImage`/`SetItemImageByIndex`: validates the
@@ -1099,6 +1158,17 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .head(get_user_image)
                 .post(post_user_image)
                 .delete(delete_user_image),
+        )
+        .route(
+            "/Users/{userId}/Images/{imageType}",
+            get(get_user_image_legacy)
+                .head(get_user_image_legacy)
+                .post(post_user_image_legacy)
+                .delete(delete_user_image_legacy),
+        )
+        .route(
+            "/Users/{userId}/Images/{imageType}/{imageIndex}",
+            get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
         )
 }
 
