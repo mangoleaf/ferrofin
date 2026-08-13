@@ -42,7 +42,8 @@ Deep-verified against a real Jellyfin server:
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Live TV** — M3U tuners + XMLTV guide, channels/programs, DB-backed DVR timers &
-  recordings.
+  recordings. Deep-verified at the API level only — **not yet exercised end-to-end with a
+  real tuner/guide by a human**; treat as less battle-tested than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
 - **Scheduled tasks** — all 17 dashboard tasks plus the trigger scheduler.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).

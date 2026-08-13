@@ -18,6 +18,11 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 
 ## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)
 
+> **Live TV / DVR caveat:** the `LiveTv/*` operations below are deep-verified at the API
+> level (harness-driven, fixture tuners/guides) but have **not been exercised end-to-end
+> with a real tuner and guide by a human**. Treat them as less battle-tested until that
+> pass happens.
+
 - ✅ `GET /Albums/{itemId}/InstantMix`
 - ✅ `GET /Artists`
 - ✅ `GET /Artists/AlbumArtists`
