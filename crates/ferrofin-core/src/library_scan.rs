@@ -2755,73 +2755,33 @@ impl LibraryScanner {
         // an album (upstream's `args.Parent.IsRoot` guard), so recurse into it.
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_music_node(&entry.path, cf, cf, naming, out);
+                self.plan_music_node(&entry.path, cf, naming, out);
             }
         }
         // Loose audio directly in the library root still becomes an album, so
         // stray files are browsable rather than invisible.
-        self.plan_music_album(dir, cf, cf, naming, out);
+        self.plan_music_album(dir, cf, naming, out);
     }
 
-    /// Resolves one directory beneath a music library: a `MusicArtist` (its
-    /// children are albums), a `MusicAlbum` (port of `MusicAlbumResolver`), an
-    /// artist release subfolder (transparent — its children resolve under the
-    /// same artist), or nothing.
-    fn plan_music_node(
-        &self,
-        dir: &str,
-        cf: Uuid,
-        parent: Uuid,
-        naming: &NamingOptions,
-        out: &mut Vec<Planned>,
-    ) {
-        // A release subfolder ("albums", "live", "eps", …) is not itself an
-        // album or an artist: pass through it, keeping the current parent.
-        if is_artist_subfolder(dir, naming) {
-            for entry in self.file_system.get_file_system_entries(dir) {
-                if entry.type_ == FileSystemEntryType::Directory {
-                    self.plan_music_node(&entry.path, cf, parent, naming, out);
-                }
-            }
-            return;
-        }
+    /// Resolves one directory beneath a music library: a `MusicAlbum` (port of
+    /// `MusicAlbumResolver`), or a container to walk through — an artist folder
+    /// or one of its release subfolders (`albums`, `live`, …).
+    ///
+    /// An artist folder is walked, not turned into a row: the browsable
+    /// `MusicArtist` item comes from the by-name materializer, keyed by its
+    /// `ItemValues` id, and emitting a second path-keyed row here would list
+    /// every artist twice (the duplicate-identity trap the person work had to
+    /// unwind). Unifying the two identities is the prerequisite for resolving
+    /// the folder itself — see `brain/plans/PLAN_MUSIC_LIBRARY.md`.
+    fn plan_music_node(&self, dir: &str, cf: Uuid, naming: &NamingOptions, out: &mut Vec<Planned>) {
         if self.is_music_album(dir, naming, true) {
-            self.plan_music_album(dir, cf, parent, naming, out);
+            self.plan_music_album(dir, cf, naming, out);
             return;
         }
-        // Not an album — an artist if any child resolves as one (upstream's
-        // `MusicArtistResolver`). Nested artists are impossible here: this arm
-        // only runs while `parent` is still the collection folder.
-        let subdirs: Vec<String> = self
-            .file_system
-            .get_file_system_entries(dir)
-            .into_iter()
-            .filter(|e| e.type_ == FileSystemEntryType::Directory)
-            .map(|e| e.path)
-            .collect();
-        let is_artist = parent == cf
-            && subdirs
-                .iter()
-                .any(|p| is_artist_subfolder(p, naming) || self.is_music_album(p, naming, true));
-        let child_parent = if is_artist {
-            let name = file_stem(dir);
-            let Some((artist_id, mut artist)) =
-                self.base_item(BaseItemKind::MusicArtist, cf, cf, name.clone(), dir, true)
-            else {
-                return;
-            };
-            artist.presentation_unique_key = Some(format!("Artist-{name}"));
-            out.push(Planned {
-                id: artist_id,
-                entity: artist,
-                ancestors: vec![cf],
-            });
-            artist_id
-        } else {
-            parent
-        };
-        for subdir in subdirs {
-            self.plan_music_node(&subdir, cf, child_parent, naming, out);
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_music_node(&entry.path, cf, naming, out);
+            }
         }
     }
 
@@ -2833,7 +2793,6 @@ impl LibraryScanner {
         &self,
         dir: &str,
         cf: Uuid,
-        parent: Uuid,
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
@@ -2845,7 +2804,7 @@ impl LibraryScanner {
         let Some((album_id, mut album)) = self.base_item(
             BaseItemKind::MusicAlbum,
             cf,
-            parent,
+            cf,
             album_name.clone(),
             dir,
             true,
@@ -2856,16 +2815,12 @@ impl LibraryScanner {
         // only known once the tracks are tagged, so the artist folder's name
         // stands in when there is one (`enrich_one_album` owns the rest).
         album.presentation_unique_key = Some(album_name.clone());
-        let mut ancestors = vec![cf];
-        if parent != cf {
-            ancestors.push(parent);
-        }
         out.push(Planned {
             id: album_id,
             entity: album,
-            ancestors: ancestors.clone(),
+            ancestors: vec![cf],
         });
-        ancestors.push(album_id);
+        let ancestors = vec![cf, album_id];
         for track in tracks {
             let Some((id, mut entity)) = self.base_item(
                 BaseItemKind::Audio,
@@ -3020,17 +2975,6 @@ fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
     {
         entity.data = Some(data);
     }
-}
-
-/// Whether `dir`'s own name is one of upstream's artist release subfolders
-/// (`albums`, `live`, `eps`, …) — those group an artist's releases and are
-/// neither an artist nor an album themselves.
-fn is_artist_subfolder(dir: &str, naming: &NamingOptions) -> bool {
-    let name = file_stem(dir);
-    naming
-        .artist_subfolders
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(&name))
 }
 
 /// Whether `path` equals `root` or lies underneath it (component-boundary
@@ -5833,7 +5777,9 @@ mod tests {
 
         let (db, cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
 
-        // The artist folder resolves as a MusicArtist under the library...
+        // The artist folder is walked through, not turned into a row of its
+        // own (the browsable MusicArtist comes from the by-name materializer,
+        // so a path-keyed row here would duplicate every artist).
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
         let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
@@ -5844,19 +5790,9 @@ mod tests {
             })
             .await
             .expect("artists");
-        assert_eq!(artists.len(), 1);
-        let artist_row = (
-            artists[0].id.clone(),
-            artists[0].parent_id.clone().unwrap_or_default(),
-        );
-        assert_eq!(artist_row.1, cf, "artist parents to the collection folder");
-        assert_eq!(artists[0].name.as_deref(), Some("Pink Floyd"));
-        assert_eq!(
-            artists[0].presentation_unique_key.as_deref(),
-            Some("Artist-Pink Floyd")
-        );
+        assert!(artists.is_empty(), "no path-keyed artist rows: {artists:?}");
 
-        // ...and the album beneath it (exactly one — CD2 is not its own album).
+        // Exactly one album — CD2 folds in rather than becoming its own.
         let album_row: (String, String, Option<String>) = sqlx::query_as(
             r#"SELECT "Id","ParentId","Name" FROM "BaseItems"
                WHERE "Type"='MediaBrowser.Controller.Entities.Audio.MusicAlbum'"#,
@@ -5864,7 +5800,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(album_row.1, artist_row.0, "album parents to the artist");
+        assert_eq!(album_row.1, cf, "album parents to the collection folder");
         assert_eq!(album_row.2.as_deref(), Some("The Wall"));
 
         let tracks: Vec<(String, Option<String>)> = sqlx::query_as(
