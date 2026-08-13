@@ -1013,7 +1013,10 @@ async fn get_items_with_filters_returns_query_result() {
 
 /// A `GET /Items` with an unknown enum token is a `400`.
 #[tokio::test]
-async fn get_items_bad_enum_token_is_400() {
+async fn get_items_unknown_enum_token_is_dropped() {
+    // ASP.NET's comma-delimited binder logs and DROPS unknown tokens rather
+    // than failing the request — a 400 here broke real screens (jellyfin-web
+    // sends spellings like IncludeItemTypes=LiveTVChannel for LiveTvChannel).
     let router = create_router(ok_state(Uuid::from_u128(0x52)));
     let response = router
         .oneshot(
@@ -1025,7 +1028,7 @@ async fn get_items_bad_enum_token_is_400() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 /// `GET /Items/Counts` returns the per-kind counts.

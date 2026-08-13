@@ -583,3 +583,82 @@ async fn premiere_date_sort_falls_back_to_production_year() {
     let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
     assert_eq!(names, ["Newer", "Older"]);
 }
+
+#[tokio::test]
+async fn paged_user_data_sort_with_total_count_works() {
+    use ferrofin_db::entities::users::UserEntity;
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    // The EXACT shape the Movies grid sends for a "Play Count" sort: paged,
+    // total-count enabled, multi-key SortBy=PlayCount,SortName,ProductionYear,
+    // recursive under a parent, user attached.
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let user_id = Uuid::from_u128(0x9);
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'bob')"#,
+    )
+    .bind(user_id.to_string().to_uppercase())
+    .execute(db.writer())
+    .await
+    .expect("seed user");
+
+    let library = Uuid::from_u128(0xC1B);
+    let movie = Uuid::from_u128(0xC01);
+    let mut lib_row = item(library, BaseItemKind::CollectionFolder, "Movies");
+    lib_row.id = lib_row.id.to_uppercase();
+    let mut movie_row = item(movie, BaseItemKind::Movie, "Heat");
+    movie_row.id = movie_row.id.to_uppercase();
+    movie_row.parent_id = Some(library.to_string().to_uppercase());
+    persist
+        .save_items(&[lib_row, movie_row])
+        .await
+        .expect("save");
+    sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+        .bind(movie.to_string().to_uppercase())
+        .bind(library.to_string().to_uppercase())
+        .execute(db.writer())
+        .await
+        .expect("ancestor");
+
+    let user: UserEntity = sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(user_id.to_string().to_uppercase())
+        .fetch_one(db.pool())
+        .await
+        .expect("user");
+    for sort in [
+        ItemSortBy::PlayCount,
+        ItemSortBy::DatePlayed,
+        ItemSortBy::SeriesDatePlayed,
+    ] {
+        let result = repository
+            .get_items(&InternalItemsQuery {
+                user: Some(user.clone()),
+                parent_id: library,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Movie],
+                order_by: vec![
+                    (sort, SortOrder::Descending),
+                    (ItemSortBy::SortName, SortOrder::Ascending),
+                    (ItemSortBy::ProductionYear, SortOrder::Ascending),
+                ],
+                start_index: Some(0),
+                limit: Some(100),
+                enable_total_record_count: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("sort {sort:?} failed: {e}"));
+        assert_eq!(result.total_record_count, 1, "sort {sort:?}");
+    }
+}

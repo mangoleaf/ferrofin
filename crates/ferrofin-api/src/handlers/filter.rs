@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::parse_csv_enums;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Items/Filters`.
@@ -68,8 +68,8 @@ async fn get_query_filters_legacy(
 ) -> Result<Json<QueryFiltersLegacy>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let include_item_types: Vec<BaseItemKind> =
-        parse_csv_enums(query.include_item_types.as_deref())?;
-    let media_types: Vec<MediaType> = parse_csv_enums(query.media_types.as_deref())?;
+        parse_csv_enums_lenient(query.include_item_types.as_deref());
+    let media_types: Vec<MediaType> = parse_csv_enums_lenient(query.media_types.as_deref());
 
     // A lone Trailer/Program type set skips the parent lookup; otherwise a parent
     // that is not a folder yields empty filters (the C# `is not Folder` guard).
@@ -161,7 +161,7 @@ async fn get_query_filters(
 ) -> Result<Json<QueryFilters>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let include_item_types: Vec<BaseItemKind> =
-        parse_csv_enums(query.include_item_types.as_deref())?;
+        parse_csv_enums_lenient(query.include_item_types.as_deref());
 
     // Trailer/Program skip the parent; otherwise the parent scopes the aggregate.
     let mut ancestor_ids = Vec::new();

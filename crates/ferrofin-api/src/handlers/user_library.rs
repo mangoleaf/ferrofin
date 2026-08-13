@@ -562,7 +562,7 @@ async fn get_latest_media(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<LatestQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
-    use crate::handlers::query_parse::{parse_csv_enums, parse_csv_enums_lenient};
+    use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
@@ -573,7 +573,7 @@ async fn get_latest_media(
         .is_played
         .or_else(|| user.hide_played_in_latest.then_some(false));
     let include_item_types: Vec<ferrofin_model::data::BaseItemKind> =
-        parse_csv_enums(query.include_item_types.as_deref())?;
+        parse_csv_enums_lenient(query.include_item_types.as_deref());
     let group_items = query.group_items.unwrap_or(true);
     let limit = query.limit.unwrap_or(DEFAULT_LATEST_LIMIT).max(0);
 

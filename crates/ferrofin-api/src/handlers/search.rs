@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::parse_csv_enums;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Search/Hints`.
@@ -108,10 +108,10 @@ async fn get_search_hints(
         .unwrap_or_else(Uuid::nil);
 
     let include_item_types: Vec<BaseItemKind> =
-        parse_csv_enums(query.include_item_types.as_deref())?;
+        parse_csv_enums_lenient(query.include_item_types.as_deref());
     let exclude_item_types: Vec<BaseItemKind> =
-        parse_csv_enums(query.exclude_item_types.as_deref())?;
-    let media_types: Vec<MediaType> = parse_csv_enums(query.media_types.as_deref())?;
+        parse_csv_enums_lenient(query.exclude_item_types.as_deref());
+    let media_types: Vec<MediaType> = parse_csv_enums_lenient(query.media_types.as_deref());
 
     let search_query = SearchQuery {
         user_id,

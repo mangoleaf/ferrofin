@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
 /// The paging/search/sort/filter subset of `GET /Trailers` this port honors.
@@ -87,24 +87,22 @@ struct TrailersQuery {
 ///
 /// Mirrors `RequestHelpers.GetOrderBy`: each column pairs with the order at its
 /// index, falling back to the last supplied order (then ascending).
-fn parse_order_by(
-    sort_by: Option<&str>,
-    sort_order: Option<&str>,
-) -> Result<Vec<(ItemSortBy, SortOrder)>, ApiError> {
-    let columns: Vec<ItemSortBy> = parse_csv_enums(sort_by)?;
-    let orders: Vec<SortOrder> = parse_csv_enums(sort_order)?;
-    Ok(columns
+fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemSortBy, SortOrder)> {
+    let columns: Vec<ItemSortBy> = parse_csv_enums_lenient(sort_by);
+    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
+    columns
         .into_iter()
         .enumerate()
         .map(|(i, column)| {
             let order = orders
                 .get(i)
-                .or_else(|| orders.last())
+                // C# pads missing orders with the FIRST requested order.
+                .or_else(|| orders.first())
                 .copied()
                 .unwrap_or(SortOrder::Ascending);
             (column, order)
         })
-        .collect())
+        .collect()
 }
 
 /// `GET /Trailers` — the obsolete trailer browse.
@@ -132,7 +130,7 @@ async fn get_trailers(
         limit: query.limit,
         recursive: query.recursive.unwrap_or(false),
         search_term: query.search_term.clone(),
-        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref())?,
+        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         genres: parse_pipe_strings(query.genres.as_deref()),
         genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
         item_ids: parse_csv_uuids(query.ids.as_deref())?,
@@ -145,7 +143,7 @@ async fn get_trailers(
     if let Some(parent) = query.parent_id {
         internal.parent_id = parent;
     }
-    let filters = parse_csv_enums(query.filters.as_deref())?;
+    let filters = parse_csv_enums_lenient(query.filters.as_deref());
     internal
         .apply_filters(&filters)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::parse_csv_enums;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Items/Suggestions`.
@@ -62,8 +62,8 @@ async fn get_suggestions(
     Query(query): Query<SuggestionsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    let media_types: Vec<MediaType> = parse_csv_enums(query.media_type.as_deref())?;
-    let include_item_types: Vec<BaseItemKind> = parse_csv_enums(query.r#type.as_deref())?;
+    let media_types: Vec<MediaType> = parse_csv_enums_lenient(query.media_type.as_deref());
+    let include_item_types: Vec<BaseItemKind> = parse_csv_enums_lenient(query.r#type.as_deref());
 
     let internal = InternalItemsQuery {
         user: user.clone(),

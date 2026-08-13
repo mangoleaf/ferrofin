@@ -30,9 +30,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::query_parse::{
-    parse_csv_enums, parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings,
-};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
 /// Resolves the effective user for a request: the explicit `user_id` query
@@ -270,10 +268,10 @@ async fn get_items(
         limit: query.limit,
         recursive: query.recursive.unwrap_or(false),
         search_term: query.search_term.clone(),
-        include_item_types: parse_csv_enums(query.include_item_types.as_deref())?,
-        exclude_item_types: parse_csv_enums(query.exclude_item_types.as_deref())?,
-        media_types: parse_csv_enums(query.media_types.as_deref())?,
-        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref())?,
+        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
+        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
+        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         item_ids: parse_csv_uuids(query.ids.as_deref())?,
         exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
         genres: parse_pipe_strings(query.genres.as_deref()),
@@ -615,9 +613,9 @@ async fn get_resume_items(
         collapse_box_set_items: Some(false),
         include_owned_items: true,
         search_term: query.search_term.clone(),
-        media_types: parse_csv_enums(query.media_types.as_deref())?,
-        include_item_types: parse_csv_enums(query.include_item_types.as_deref())?,
-        exclude_item_types: parse_csv_enums(query.exclude_item_types.as_deref())?,
+        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
+        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
         order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
         enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
         ..InternalItemsQuery::default()
@@ -662,17 +660,14 @@ fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
 fn parse_order_by(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
-) -> Result<
-    Vec<(
-        ferrofin_model::live_tv::ItemSortBy,
-        ferrofin_model::dto::SortOrder,
-    )>,
-    ApiError,
-> {
+) -> Vec<(
+    ferrofin_model::live_tv::ItemSortBy,
+    ferrofin_model::dto::SortOrder,
+)> {
     use ferrofin_model::dto::SortOrder;
-    let columns: Vec<ferrofin_model::live_tv::ItemSortBy> = parse_csv_enums(sort_by)?;
-    let orders: Vec<SortOrder> = parse_csv_enums(sort_order)?;
-    Ok(columns
+    let columns: Vec<ferrofin_model::live_tv::ItemSortBy> = parse_csv_enums_lenient(sort_by);
+    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
+    columns
         .into_iter()
         .enumerate()
         .map(|(i, column)| {
@@ -685,7 +680,7 @@ fn parse_order_by(
                 .unwrap_or(SortOrder::Ascending);
             (column, order)
         })
-        .collect())
+        .collect()
 }
 
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a

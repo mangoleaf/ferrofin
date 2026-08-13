@@ -52,7 +52,7 @@ use uuid::Uuid;
 use crate::auth::{FirstTimeSetupOrAuth, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user;
-use crate::handlers::query_parse::parse_csv_enums;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
 
@@ -82,17 +82,13 @@ struct ThemeMediaQuery {
 /// Ports `RequestHelpers.GetOrderBy`: each sort key is paired with the sort
 /// order at the same index, falling back to [`SortOrder::Ascending`] when fewer
 /// orders than keys are supplied. An unrecognized token is a `400`.
-fn parse_order_by(
-    sort_by: Option<&str>,
-    sort_order: Option<&str>,
-) -> Result<Vec<(ItemSortBy, SortOrder)>, ApiError> {
-    let keys: Vec<ItemSortBy> = parse_csv_enums(sort_by)?;
-    let orders: Vec<SortOrder> = parse_csv_enums(sort_order)?;
-    Ok(keys
-        .into_iter()
+fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemSortBy, SortOrder)> {
+    let keys: Vec<ItemSortBy> = parse_csv_enums_lenient(sort_by);
+    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
+    keys.into_iter()
         .enumerate()
         .map(|(i, key)| (key, orders.get(i).copied().unwrap_or(SortOrder::Ascending)))
-        .collect())
+        .collect()
 }
 
 /// Resolves the theme-media owner for `item_id`, projecting its extras of
@@ -128,7 +124,7 @@ async fn theme_media(
             .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?
     };
 
-    let order_by = parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref())?;
+    let order_by = parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref());
 
     // Walk up the ancestor chain while empty and inheritance is requested.
     let (owner_id, items) = loop {

@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_uuids};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::{current_session, current_session_id};
 use crate::state::AppState;
 
@@ -422,9 +422,9 @@ async fn post_capabilities(
         _ => current_session_id(&state, &auth).await?,
     };
     let playable_media_types: Vec<MediaType> =
-        parse_csv_enums(query.playable_media_types.as_deref())?;
+        parse_csv_enums_lenient(query.playable_media_types.as_deref());
     let supported_commands: Vec<GeneralCommandType> =
-        parse_csv_enums(query.supported_commands.as_deref())?;
+        parse_csv_enums_lenient(query.supported_commands.as_deref());
     let capabilities = ClientCapabilities {
         playable_media_types,
         supported_commands,

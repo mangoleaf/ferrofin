@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::query_parse::parse_csv_enums;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// Collects every `includeSegmentTypes` value from the raw query pairs.
@@ -69,7 +69,7 @@ async fn get_item_segments(
     }
 
     let raw_types = include_segment_types(&pairs);
-    let types: Vec<MediaSegmentType> = parse_csv_enums(raw_types.as_deref())?;
+    let types: Vec<MediaSegmentType> = parse_csv_enums_lenient(raw_types.as_deref());
     let type_filter = if types.is_empty() {
         None
     } else {
@@ -103,7 +103,7 @@ async fn erase_provider_segments(
 ) -> Result<StatusCode, ApiError> {
     let type_filter = match query.type_.as_deref() {
         Some(raw) => Some(
-            parse_csv_enums::<MediaSegmentType>(Some(raw))?
+            parse_csv_enums_lenient::<MediaSegmentType>(Some(raw))
                 .into_iter()
                 .next()
                 .ok_or_else(|| ApiError::BadRequest(format!("invalid segment type {raw:?}")))?,

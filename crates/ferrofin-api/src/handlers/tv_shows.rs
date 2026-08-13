@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::items::{resolve_user, resolve_user_opt};
-use crate::handlers::query_parse::{parse_csv_enums, parse_csv_enums_lenient, parse_csv_uuids};
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
 
 /// Builds a [`DtoOptions`] from the request's `fields` / image parameters.
@@ -56,8 +56,8 @@ fn build_dto_options(
     image_type_limit: Option<i32>,
     enable_image_types: Option<&str>,
     enable_user_data: Option<bool>,
-) -> Result<DtoOptions, ApiError> {
-    let requested_types: Vec<ImageType> = parse_csv_enums(enable_image_types)?;
+) -> DtoOptions {
+    let requested_types: Vec<ImageType> = parse_csv_enums_lenient(enable_image_types);
     let mut options = DtoOptions {
         // Lenient: clients still send deprecated ItemFields (e.g. BasicSyncInfo);
         // Jellyfin drops unknowns rather than 400-ing the request.
@@ -75,7 +75,7 @@ fn build_dto_options(
     if !requested_types.is_empty() {
         options.image_types = requested_types;
     }
-    Ok(options)
+    options
 }
 
 /// The presentation unique key of a series row: its explicit
@@ -162,7 +162,7 @@ async fn get_next_up(
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    )?;
+    );
 
     let next_up_query = NextUpQuery {
         user_id,
@@ -241,7 +241,7 @@ async fn get_upcoming_episodes(
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    )?;
+    );
 
     // C# `DateTime.UtcNow.Date.AddDays(-1)` — midnight yesterday, UTC.
     let min_premiere_date = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
@@ -361,7 +361,7 @@ async fn get_episodes(
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    )?;
+    );
     // C# includes missing episodes only when the user opts in (or an API key).
     let include_missing = user.as_ref().is_some_and(|u| u.display_missing_episodes);
 
@@ -510,7 +510,7 @@ async fn get_seasons(
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    )?;
+    );
 
     // C# `SetSeasonQueryOptions`: also drop missing seasons unless the user
     // opts in; an explicit `isMissing`/`isSpecialSeason` narrows further.
@@ -581,7 +581,7 @@ async fn get_similar_shows(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
-    let options = build_dto_options(query.fields.as_deref(), None, None, None, None)?;
+    let options = build_dto_options(query.fields.as_deref(), None, None, None, None);
 
     let items = state
         .similar_items
