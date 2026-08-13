@@ -177,6 +177,10 @@ pub struct FerrofinTaskManager {
     /// listens for). Interior-mutable so it can be wired after construction;
     /// clones share it.
     events: Arc<Mutex<Option<Arc<dyn ferrofin_traits::events::EventManager>>>>,
+    /// Optional activity-log seam: a run that ends
+    /// [`Failed`](TaskCompletionStatus::Failed) is recorded as a `TaskFailed`
+    /// dashboard Alert (port of upstream's `TaskCompletedLogger`).
+    activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
 }
 
 impl std::fmt::Debug for FerrofinTaskManager {
@@ -278,6 +282,39 @@ impl FerrofinTaskManager {
         *lock(&self.events) = Some(events);
     }
 
+    /// Attaches the activity-log seam so failed runs surface in the
+    /// dashboard's activity feed.
+    pub fn set_activity_manager(
+        &self,
+        activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    ) {
+        *lock(&self.activity) = Some(activity);
+    }
+
+    /// Writes the `TaskFailed` activity entry for a failed run (best-effort,
+    /// spawned — recording never blocks on the write). Only `Failed` outcomes
+    /// are logged, matching upstream's `TaskCompletedLogger`.
+    fn log_failed_task(&self, result: &TaskResult) {
+        if result.status != TaskCompletionStatus::Failed {
+            return;
+        }
+        let Some(activity) = lock(&self.activity).clone() else {
+            return;
+        };
+        let entry = ferrofin_traits::activity::ActivityLogCreate {
+            name: format!("{} failed", result.name.clone().unwrap_or_default()),
+            type_: "TaskFailed".to_owned(),
+            severity: ferrofin_model::activity::LogLevel::Error,
+            overview: result.error_message.clone(),
+            ..Default::default()
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = activity.create_entry(entry).await;
+            });
+        }
+    }
+
     /// Publishes a finished run's [`TaskResult`] as a `TaskCompleted` event
     /// (best-effort, on a spawned task — outcome recording never blocks on
     /// delivery). No-op without an event seam or outside a tokio runtime.
@@ -298,6 +335,7 @@ impl FerrofinTaskManager {
     /// Records a run's outcome and returns the task to [`Idle`](TaskState::Idle).
     fn record_result(&self, key: &str, result: TaskResult) {
         self.publish_task_completed(&result);
+        self.log_failed_task(&result);
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             reg.state = TaskState::Idle;
@@ -873,6 +911,78 @@ mod tests {
         let result: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(result["Key"], "counting");
         assert_eq!(result["Status"], "Completed");
+    }
+
+    /// A failed run must land a `TaskFailed` entry in the activity log (the
+    /// dashboard's Alerts feed); a successful run must not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_run_writes_a_task_failed_activity_entry() {
+        #[derive(Default)]
+        struct RecordingActivity {
+            entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+        }
+        #[async_trait::async_trait]
+        impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
+            async fn get_paged_result(
+                &self,
+                _query: &ferrofin_traits::activity::ActivityLogQuery,
+            ) -> Result<
+                ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
+                ServiceError,
+            > {
+                unimplemented!()
+            }
+            async fn create_entry(
+                &self,
+                entry: ferrofin_traits::activity::ActivityLogCreate,
+            ) -> Result<(), ServiceError> {
+                crate::scheduled_tasks::lock(&self.entries).push(entry);
+                Ok(())
+            }
+            async fn clean(&self, _before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
+                Ok(0)
+            }
+        }
+
+        let mgr = FerrofinTaskManager::new();
+        let activity = Arc::new(RecordingActivity::default());
+        mgr.set_activity_manager(activity.clone());
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: true,
+            hidden: false,
+        }));
+
+        let _ = mgr.run_now("counting").await;
+        // The entry write is spawned; poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let entries = crate::scheduled_tasks::lock(&activity.entries);
+                if !entries.is_empty() {
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].type_, "TaskFailed");
+                    assert_eq!(entries[0].name, "Counting Task failed");
+                    assert_eq!(
+                        entries[0].severity,
+                        ferrofin_model::activity::LogLevel::Error
+                    );
+                    assert!(
+                        entries[0]
+                            .overview
+                            .as_deref()
+                            .unwrap_or("")
+                            .contains("boom")
+                    );
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TaskFailed entry never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// A task that stays running until its gate is released.

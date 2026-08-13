@@ -313,6 +313,13 @@ async fn assert_can_update_user(
     Err(ApiError::Forbidden("user update not allowed".to_owned()))
 }
 
+/// Writes a dashboard activity-log entry (best-effort — the feed must never
+/// fail the request that produced it). Names/types mirror upstream's
+/// `Jellyfin.Server.Implementations.Events.Consumers` loggers.
+async fn log_activity(state: &AppState, entry: ferrofin_traits::activity::ActivityLogCreate) {
+    let _ = state.activity.create_entry(entry).await;
+}
+
 /// `POST /Users/AuthenticateByName` — authenticate by username + password.
 ///
 /// Port of `UserController.AuthenticateUserByName`. The app/device identity is
@@ -345,7 +352,36 @@ async fn authenticate_by_name(
         // available as a request extension here.
         remote_endpoint: None,
     };
-    let result = state.sessions.authenticate_new_session(&request).await?;
+    let username = request.username.clone().unwrap_or_default();
+    let result = match state.sessions.authenticate_new_session(&request).await {
+        Ok(result) => result,
+        Err(e) => {
+            // Port of `AuthenticationFailedLogger`: failed logins land in the
+            // dashboard's Alerts feed (no user id, Error severity).
+            log_activity(
+                &state,
+                ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("Failed login attempt from {username}"),
+                    type_: "AuthenticationFailed".to_owned(),
+                    severity: ferrofin_model::activity::LogLevel::Error,
+                    ..Default::default()
+                },
+            )
+            .await;
+            return Err(e.into());
+        }
+    };
+    // Port of `AuthenticationSucceededLogger`.
+    log_activity(
+        &state,
+        ferrofin_traits::activity::ActivityLogCreate {
+            name: format!("{username} successfully authenticated"),
+            type_: "AuthenticationSucceeded".to_owned(),
+            user_id: Some(result.session.user_id),
+            ..Default::default()
+        },
+    )
+    .await;
     Ok(Json(authentication_result(&state, result).await))
 }
 
@@ -534,9 +570,20 @@ async fn delete_user(
     RequireAuth(_auth): RequireAuth,
     Path(user_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    load_user(&state, user_id).await?;
+    let user = load_user(&state, user_id).await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
     state.users.delete_user(user_id).await?;
+    // Port of `UserDeletedLogger`.
+    log_activity(
+        &state,
+        ferrofin_traits::activity::ActivityLogCreate {
+            name: format!("User {} has been deleted", user.username),
+            type_: "UserDeleted".to_owned(),
+            user_id: Some(user_id),
+            ..Default::default()
+        },
+    )
+    .await;
     // Tell the deleted user's still-open clients (their sessions outlive the
     // token revocation until they disconnect) — port of `UserDeleted`.
     if let Ok(data) = serde_json::to_string(&user_id.to_string()) {
@@ -598,6 +645,17 @@ async fn create_user_by_name(
     // Reload so the DTO reflects the password just set.
     let id = Uuid::parse_str(&new_user.id).unwrap_or_else(|_| Uuid::nil());
     let reloaded = load_user(&state, id).await?;
+    // Port of `UserCreatedLogger`.
+    log_activity(
+        &state,
+        ferrofin_traits::activity::ActivityLogCreate {
+            name: format!("User {} has been created", reloaded.username),
+            type_: "UserCreated".to_owned(),
+            user_id: Some(id),
+            ..Default::default()
+        },
+    )
+    .await;
     Ok(Json(state.users.get_user_dto(&reloaded, None).await?))
 }
 
@@ -764,6 +822,7 @@ async fn update_user_password(
 
     if body.reset_password {
         state.users.reset_password(user_id).await?;
+        log_password_changed(&state, user_id, &user.username).await;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -796,7 +855,23 @@ async fn update_user_password(
         .change_password(user_id, body.new_pw.as_ref().map_or("", Secret::expose))
         .await?;
     state.sessions.revoke_user_tokens(user_id, "").await?;
+    log_password_changed(&state, user_id, &user.username).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Records the `UserPasswordChanged` activity entry (port of
+/// `UserPasswordChangedLogger`).
+async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
+    log_activity(
+        state,
+        ferrofin_traits::activity::ActivityLogCreate {
+            name: format!("Password has been changed for user {username}"),
+            type_: "UserPasswordChanged".to_owned(),
+            user_id: Some(user_id),
+            ..Default::default()
+        },
+    )
+    .await;
 }
 
 /// `POST /Users/ForgotPassword` — begin the forgot-password flow.

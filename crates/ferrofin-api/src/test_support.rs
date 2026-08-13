@@ -1765,6 +1765,34 @@ impl ActivityManager for FakeActivity {
     }
 }
 
+/// A recording [`ActivityManager`]: `create_entry` appends to `entries` so
+/// tests can assert what a handler logged; the query surface is unused.
+#[derive(Default)]
+pub struct RecordingActivity {
+    /// Every entry passed to `create_entry`, in call order.
+    pub entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+}
+
+#[async_trait]
+impl ActivityManager for RecordingActivity {
+    async fn get_paged_result(
+        &self,
+        _query: &ActivityLogQuery,
+    ) -> Result<QueryResult<ActivityLogEntry>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_entry(
+        &self,
+        entry: ferrofin_traits::activity::ActivityLogCreate,
+    ) -> Result<(), ServiceError> {
+        self.entries.lock().unwrap().push(entry);
+        Ok(())
+    }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
+}
+
 /// A fake [`TaskManager`]; every method is unused by INFRA-level tests.
 pub struct FakeTasks;
 

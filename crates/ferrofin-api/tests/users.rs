@@ -499,6 +499,20 @@ impl SessionManager for NoopSessions {
 
 /// Assembles an [`AppState`] from the batch-6 fakes plus panic fakes elsewhere.
 fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
+    state_with_activity(
+        users,
+        config,
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+    )
+}
+
+/// [`state`] with a caller-supplied [`ActivityManager`] so tests can assert
+/// what a handler wrote to the activity log.
+fn state_with_activity(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -529,7 +543,7 @@ fn state(users: Arc<MemUsers>, config: Arc<MemConfig>) -> AppState {
         Arc::new(ferrofin_api::test_support::FakeApiKeys),
         Arc::new(ferrofin_api::test_support::FakeLocalization),
         Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
-        Arc::new(ferrofin_api::test_support::FakeActivity),
+        activity,
         Arc::new(ferrofin_api::test_support::FakeFileSystem),
         Arc::new(ferrofin_api::test_support::FakeTasks),
     )
@@ -1404,6 +1418,35 @@ async fn delete_user_records_deletion() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(*users.deleted.lock().unwrap(), Some(BOB_ID));
+}
+
+#[tokio::test]
+async fn delete_user_writes_a_user_deleted_activity_entry() {
+    // Port of upstream's UserDeletedLogger: the dashboard activity feed gets
+    // "User bob has been deleted" tagged with the deleted user's id.
+    let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
+    let router = create_router(state_with_activity(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        activity.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let entries = activity.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].type_, "UserDeleted");
+    assert_eq!(entries[0].name, "User bob has been deleted");
+    assert_eq!(entries[0].user_id, Some(BOB_ID));
 }
 
 #[tokio::test]

@@ -566,6 +566,9 @@ pub async fn build_app_state(
     // Run outcomes publish `TaskCompleted` → forwarded to admin sessions as
     // the `ScheduledTaskEnded` push the dashboard's task page listens for.
     task_manager.set_event_manager(Arc::clone(&event_manager));
+    // Failed runs also land in the dashboard's activity feed as `TaskFailed`
+    // Alerts (port of upstream's `TaskCompletedLogger`).
+    task_manager.set_activity_manager(Arc::clone(&activity));
     task_manager.register(Arc::new(ferrofin_core::RefreshLibraryTask::new(
         Arc::clone(&library),
     )));
