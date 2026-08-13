@@ -1,5 +1,5 @@
 .env
-fixtures/
+fixtures
 results/*.md
 results/raw/
 !results/raw/.gitkeep

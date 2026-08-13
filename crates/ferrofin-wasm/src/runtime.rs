@@ -6,9 +6,20 @@
 //! on the tokio workers. Each loaded plugin therefore gets one long-lived
 //! thread (cost is per-plugin, not per-call) fed by a bounded command queue:
 //!
-//! - scheduled-task runs block on the queue and await a typed reply;
+//! - scheduled-task runs and metadata lookups `send().await` on the queue
+//!   and await a typed reply;
 //! - events are fire-and-forget `try_send`s — when a slow guest's queue is
 //!   full the event is dropped (with a debug log), never the server's time.
+//!
+//! The async `send().await` suspends (rather than parking a tokio worker)
+//! when the queue is full, which is the right trade — but it is an
+//! *unbounded* wait. A plugin that is slow without ever failing can keep its
+//! queue full and stall a `run-task` call or a scan's per-item
+//! `metadata-lookup` until it drains. That is bounded in practice by the
+//! per-call epoch deadline (each queued call still trips it, driving the
+//! breaker), but a genuinely slow-not-failing metadata plugin can drag a
+//! scan. If that ever bites, give lookups a `try_send` + "plugin busy — skip
+//! this item" fast path rather than making them wait.
 //!
 //! **Containment:** a trap, deadline overrun, or memory-cap hit fails only
 //! the one call; the actor rebuilds a fresh instance for the next call. After

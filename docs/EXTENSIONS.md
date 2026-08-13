@@ -126,8 +126,9 @@ where any installed plugin runs with the server's own privileges — and it is g
 could still abuse: `query-items` exposes your library **catalog** (titles, ids, filesystem
 paths — never file contents), and `http-fetch` performs outbound HTTP on the plugin's
 behalf (destination logged, body bounded). Combined, a hostile plugin could send your movie
-list to a remote host. By default `http-fetch` is refused for **private, loopback, and
-link-local destinations** (your LAN, cloud metadata services, Ferrofin itself), which
+list to a remote host. By default `http-fetch` is refused for **private, loopback, link-local, and CGNAT
+destinations** (your LAN, cloud metadata services, Tailscale/tailnet ranges, Ferrofin
+itself), which
 removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
 Known limitation: the private-address check resolves-then-fetches, so a DNS-rebinding

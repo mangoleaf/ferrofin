@@ -41,17 +41,33 @@ pub struct Collaborators {
 }
 
 /// Whether an address is in a range the private-HTTP policy denies by
-/// default: loopback, link-local (incl. cloud metadata services), RFC1918 /
-/// IPv6 ULA, and unspecified. IPv4-mapped IPv6 unwraps to its IPv4 rule.
+/// default: loopback, link-local (incl. cloud metadata services), RFC1918,
+/// CGNAT (`100.64.0.0/10` — Tailscale's default range), IPv6 ULA, and the
+/// reserved/multicast blocks a public HTTP fetch should never target.
+/// IPv4-mapped IPv6 unwraps to its IPv4 rule.
+///
+/// The CGNAT and reserved-block checks are open-coded because
+/// `Ipv4Addr::is_shared`/`is_reserved` are still nightly-only and we pin
+/// stable.
 #[must_use]
 pub fn is_private_address(addr: std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
             v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_private()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()               // 224.0.0.0/4
+                // CGNAT 100.64.0.0/10 (Tailscale, carrier NAT).
+                || (a == 100 && (64..128).contains(&b))
+                // Benchmarking 198.18.0.0/15.
+                || (a == 198 && (b == 18 || b == 19))
+                // IETF protocol assignments 192.0.0.0/24.
+                || (a == 192 && b == 0 && v4.octets()[2] == 0)
+                // Reserved for future use 240.0.0.0/4 (excl. broadcast, above).
+                || a >= 240
         }
         std::net::IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -59,6 +75,7 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
             }
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 || v6.is_unicast_link_local()
                 || v6.is_unique_local()
         }
@@ -83,7 +100,9 @@ fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<(), String
     }
     if let Some(private) = addrs.iter().find(|a| is_private_address(**a)) {
         return Err(format!(
-            "destination `{host}` resolves to the private/loopback address {private}, which              plugins may not reach by default. If you trust the plugin `{plugin_name}`, add              its id to FERROFIN_WASM_PRIVATE_HTTP_ALLOW"
+            "destination `{host}` resolves to the private/loopback address {private}, which \
+             plugins may not reach by default. If you trust the plugin `{plugin_name}`, add \
+             its id to FERROFIN_WASM_PRIVATE_HTTP_ALLOW"
         ));
     }
     Ok(())
