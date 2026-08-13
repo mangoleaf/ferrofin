@@ -26,3 +26,6 @@ __pycache__/
 # WASM plugin artifacts are build/CI outputs only — never committed
 # (brain/plans/PLAN_PLUGIN_TIERS.md, artifact policy 2026-08-12)
 *.wasm
+
+# toolchain-island build dirs (root /target anchor does not reach them)
+examples/*/target/

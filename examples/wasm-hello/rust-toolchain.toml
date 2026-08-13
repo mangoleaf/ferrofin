@@ -1,0 +1,5 @@
+# Toolchain island for the WASM example guest ONLY — the repo root toolchain
+# deliberately stays server-only (no wasm targets). Same pinned channel.
+[toolchain]
+channel = "1.97.1"
+targets = ["wasm32-wasip2"]
