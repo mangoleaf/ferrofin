@@ -557,6 +557,41 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.reporter.on_job_killed(handle, delete_files).await;
     }
 
+    /// Waits until an arbitrary `target` file of `handle`'s job exists, or the
+    /// job exits (whichever first); returns whether the file exists.
+    ///
+    /// The init-segment sibling of [`Self::wait_for_segment`] — same
+    /// job-alive-bounded poll, but on a caller-chosen path (the fMP4 init is
+    /// not a numbered segment).
+    pub async fn wait_for_file(
+        &self,
+        handle: &TranscodingJobHandle,
+        target: &Path,
+        playlist_path: &Path,
+    ) -> bool {
+        loop {
+            if target.exists() {
+                return true;
+            }
+            let exited = self
+                .with_running(handle, |r| r.child.has_exited())
+                .unwrap_or(true);
+            if exited {
+                if !target.exists() {
+                    let log = playlist_path.with_extension("log");
+                    tracing::warn!(
+                        target_file = %target.display(),
+                        log = %log.display(),
+                        "transcode exited before producing the requested file{}",
+                        stderr_log_tail(&log)
+                    );
+                }
+                return target.exists();
+            }
+            tokio::time::sleep(Duration::from_millis(SEGMENT_READY_POLL_INTERVAL_MS)).await;
+        }
+    }
+
     /// One sweep of the idle reaper: kills every job that has **no active
     /// consumer** (`active_request_count == 0`) and no activity (request or
     /// session ping) within its ping timeout. Returns the killed handles.

@@ -476,40 +476,87 @@ where
         let ext = segment_extension(&plan.segment_container);
         let init_path = init_segment_file(&plan.playlist_path, &ext);
 
+        if init_path.exists() {
+            // A completed/earlier job left it — complete by construction.
+            return Ok(served(&init_path, &ext));
+        }
+
+        // Start the transcode at the RESUME segment, not segment 0. The fMP4
+        // init header (its moov edit list) encodes the job's start offset, so
+        // an init produced from segment 0 is incompatible with the seek-offset
+        // segments a resuming client actually plays. With no resume offset this
+        // is segment 0, as before.
+        //
+        // ffmpeg writes the init header immediately, long before the first
+        // segment completes (30-60s on 4K HEVC, which used to time the client
+        // out) — so the job starts with `wait_for_path = init` and start_ffmpeg
+        // returns the moment the header exists (upstream's WaitForPath for
+        // segmentId == -1). NEVER a select!/cancellation over the start: a
+        // cancelled spawn can orphan an unregistered ffmpeg, and the next
+        // segment request then starts a second writer onto the same segment
+        // files — torn, unparsable fragments (the fragParsingError regression).
+        let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
+        let plan = self.planner.plan(request, is_audio, Some(start)).await?;
+        let playlist_key = plan.playlist_path.to_string_lossy().into_owned();
+        let lock = self.playlist_lock(&playlist_key);
+        let _guard = lock.lock().await;
+
         if !init_path.exists() {
-            // Start the transcode at the RESUME segment, not segment 0. The fMP4
-            // init header (its moov edit list) encodes the job's start offset, so
-            // an init produced from segment 0 is incompatible with the seek-offset
-            // segments a resuming client actually plays — the player maps that
-            // media back to t≈0 and stalls on a black screen. Starting the job
-            // where the client is about to play makes the cached init match those
-            // segments. With no resume offset this is segment 0, as before.
-            // Boxed to break the (depth-1) init→segment async recursion.
-            //
-            // ffmpeg writes the init header immediately, long before the first
-            // segment completes — and a slow first segment (4K HEVC) can take
-            // 30-60s, which times the client out and (for the cast receiver)
-            // used to trigger a retry→kill→restart loop. So race the two: serve
-            // the init the moment it lands on disk, letting the segment encode
-            // continue in the background (C# waits on the init path itself,
-            // DynamicHlsController.GetSegmentResult WaitForPath).
-            let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
-            let produce = Box::pin(self.resolve_dynamic_segment(request, start, is_audio));
-            let init_appears = async {
-                while !init_path.exists() {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            use ferrofin_traits::media_encoding::TranscodeManager as _;
+            if let Some(handle) = self
+                .manager
+                .get_transcoding_job_by_path(&playlist_key, TranscodingJobType::Hls)
+                .await
+                .ok()
+                .flatten()
+            {
+                // A live job owns the files; it writes the init on its own —
+                // wait for it (consumer guard keeps the idle reaper away), and
+                // fall through to the shared stability wait below.
+                let _rg = self
+                    .manager
+                    .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
+                let _ = self
+                    .manager
+                    .wait_for_file(&handle, &init_path, &plan.playlist_path)
+                    .await;
+            } else {
+                if self.restart_breaker_open(&playlist_key) {
+                    return Err(ServiceError::backend(format!(
+                        "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
+                         (source unreadable?); retrying after cooldown — see {}",
+                        plan.playlist_path.with_extension("log").display()
+                    )));
                 }
-            };
-            tokio::select! {
-                () = init_appears => {}
-                result = produce => {
-                    // The segment finished (or failed) before the init showed up.
-                    result?;
+                let mut state = plan.state.clone();
+                state.wait_for_path = Some(init_path.clone());
+                let log_path = plan.playlist_path.with_extension("log");
+                let start_request = StartFfMpegRequest {
+                    program: FFMPEG_PROGRAM,
+                    state: &state,
+                    output_path: &plan.playlist_path,
+                    arguments: plan.arguments.clone(),
+                    log_path,
+                    working_dir: None,
+                };
+                if let Err(e) = self
+                    .manager
+                    .start_ffmpeg(&self.transcoder, start_request)
+                    .await
+                {
+                    self.record_restart_failure(&playlist_key);
+                    return Err(ServiceError::backend(format!(
+                        "failed to start transcode: {e}"
+                    )));
                 }
+                self.clear_restart_failures(&playlist_key);
             }
         }
 
-        if init_path.exists() {
+        // The init is written directly (not via the segments' `temp_file`
+        // rename), so existence alone can race ffmpeg's write — serve it only
+        // once its size is non-zero and stable across two polls.
+        if wait_until_file_stable(&init_path).await {
             Ok(served(&init_path, &ext))
         } else {
             Err(ServiceError::NotFound(
@@ -618,8 +665,9 @@ where
         segment_id: i32,
         is_audio: bool,
     ) -> Result<ServedFile, ServiceError> {
-        self.resolve_dynamic_segment(request, segment_id, is_audio)
-            .await
+        // Boxed: the segment resolver's future grew past the large-future lint
+        // once the init path stopped nesting inside it.
+        Box::pin(self.resolve_dynamic_segment(request, segment_id, is_audio)).await
     }
 
     async fn resolve_transcode_file(
@@ -765,6 +813,24 @@ fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
                 .ok()
         })
         .max()
+}
+
+/// Waits until `path` exists with a non-zero size that is unchanged across two
+/// consecutive 50ms polls, bounded at ~10s. The fMP4 init file is written
+/// directly (not via the segments' `temp_file` rename), so bare existence can
+/// race ffmpeg's write — serving a half-written init is an unparsable fatal
+/// for every HLS client.
+async fn wait_until_file_stable(path: &Path) -> bool {
+    let mut last: Option<u64> = None;
+    for _ in 0..200 {
+        let len = std::fs::metadata(path).ok().map(|m| m.len());
+        match (len, last) {
+            (Some(len), Some(prev)) if len > 0 && len == prev => return true,
+            _ => last = len,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
 }
 
 /// Whether a segment request should wait on the running job rather than kill
