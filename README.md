@@ -59,9 +59,11 @@ tiered matrix (verified · known-partial · not-implemented-by-design) is in
 **[`docs/FEATURES.md`](docs/FEATURES.md)**. In short, working end-to-end: auth/users/QuickConnect,
 library scan + live filesystem watch, browse/query, images, sessions/playstate/remote control,
 WebSocket push, playlists/collections, direct play + live HLS transcode, Live TV (M3U/XMLTV +
-DVR), SyncPlay, all 17 scheduled tasks, metrics/tracing, and backup/restore. The deliberate
-gaps: dynamic plugin loading (Ferrofin uses [compiled-in extensions](docs/EXTENSIONS.md)
-instead), DLNA SSDP discovery, and remote metadata providers (feature-gated off by default).
+DVR), SyncPlay, all 17 scheduled tasks, metrics/tracing, and backup/restore. Runtime plugin
+installation is arriving as sandboxed WASM components (see
+[Plugins](#plugins-compiled-in-extensions--sandboxed-wasm)); the deliberate gaps: .NET-style
+native plugin loading (never — see below), DLNA SSDP discovery, and remote metadata
+providers (feature-gated off by default).
 
 ## Quickstart
 
@@ -117,13 +119,34 @@ and never rewrites Jellyfin's schema objects, so you can stop Ferrofin and start
 on the same database. Existing native Ferrofin databases upgrade in place across releases the
 same way. The round-trip is covered by `suite/roundtrip.sh`.
 
-## Extensions vs. plugins
+## Plugins: compiled-in extensions + sandboxed WASM
 
-Jellyfin plugins are .NET assemblies loaded at runtime; Rust has no equivalent, and Ferrofin
-doesn't fake one. Instead it ships **compiled-in extensions** that surface through the same
-`/Plugins` API — they appear in the dashboard, have settings pages, and enable/disable at
-runtime. Three Jellyfin plugins are ported today (Intro Skipper, File Transformation, Merge
-Versions). Full explanation: **[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**.
+Jellyfin loads plugins as .NET assemblies with **full trust**: any installed plugin runs with
+the server's own privileges — it can read your filesystem, open network connections, and a
+crash takes the server with it. Rust has no stable ABI, so Ferrofin *couldn't* copy that
+model — but we also wouldn't want to. Instead, third-party functionality ships in two
+deliberate forms:
+
+**Compiled-in extensions** are Jellyfin plugins ported into the Ferrofin codebase itself,
+reviewed like any other code and shipped inside the binary. They surface through the same
+`/Plugins` API — dashboard entries, settings pages, runtime enable/disable. Intro Skipper,
+File Transformation, and Merge Versions are ported today. This is the home for anything that
+needs deep server internals. Details: **[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**.
+
+**WASM plugins** (in development) are how plugins Ferrofin's repo has never seen get
+installed: drop a `.wasm` component into `{data_dir}/plugins/` and restart. **Security is
+the reason for this design.** A WASM plugin runs in a sandbox with *no filesystem access, no
+network access, and no view of server memory* — its entire world is the short, reviewable
+list of capabilities Ferrofin explicitly exports to it, plus enforced memory and CPU-time
+limits. A plugin that misbehaves is interrupted and disabled while the server keeps serving;
+a plugin you install from a stranger's repo *cannot* read your media folders or exfiltrate
+your data, because the sandbox has no way to express those operations. One artifact runs on
+every platform and architecture, and plugins can be written in any language that targets the
+WASM component model.
+
+The trade-off is honest: extensions get full power under code review; WASM plugins get
+safe installation without review. What Ferrofin will never do is load untrusted native code
+into the server process.
 
 ## Architecture
 
