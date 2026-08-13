@@ -246,6 +246,10 @@ impl LibraryProgress {
     }
 }
 
+/// How many descendant images feed a library tile collage — upstream
+/// `CollectionFolderImageProvider.GetItemsWithImages` samples 8.
+const LIBRARY_COLLAGE_SOURCES: i32 = 8;
+
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -461,6 +465,14 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_metadata(mut self, tmdb: Arc<TmdbClient>, metadata_dir: PathBuf) -> Self {
         self.tmdb = Some(tmdb);
+        self.metadata_dir = Some(metadata_dir);
+        self
+    }
+
+    /// Sets only the metadata art directory (no TMDB client) — the uploaded-art
+    /// preservation and library-tile passes work without remote providers.
+    #[must_use]
+    pub fn with_metadata_dir(mut self, metadata_dir: PathBuf) -> Self {
         self.metadata_dir = Some(metadata_dir);
         self
     }
@@ -703,6 +715,13 @@ impl LibraryScanner {
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
+        // Library tile images: composite each library's Primary from its own
+        // content (upstream CollectionFolderImageProvider), so the home
+        // screen's "My Media" tiles carry artwork instead of the blue
+        // placeholder. Best-effort — a failure must not fail the scan.
+        if let Err(err) = self.refresh_library_images(folders).await {
+            tracing::warn!(%err, "library image pass failed");
+        }
         // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above. Best-effort — a failure here must not fail the whole scan.
@@ -1662,6 +1681,109 @@ impl LibraryScanner {
         {
             tracing::warn!(%err, item = %item_id, "failed to persist discovered artwork");
         }
+    }
+
+    /// Composites a Primary image for every library whose tile is missing or
+    /// stale, from up to [`LIBRARY_COLLAGE_SOURCES`] random descendants'
+    /// artwork (Backdrop > Primary > Thumb, upstream's preference).
+    ///
+    /// Port of `CollectionFolderImageProvider`: upstream refreshes each
+    /// `CollectionFolder`'s dynamic image on library validation, composing a
+    /// 960×540 collage regenerated when older than 7 days — the numbers are
+    /// upstream's (`BaseDynamicImageProvider`/`HasChangedByDate`). Without
+    /// this, the home screen's "My Media" tiles render the icon-on-blue
+    /// fallback forever.
+    async fn refresh_library_images(
+        &self,
+        folders: &[VirtualFolderInfo],
+    ) -> Result<(), ServiceError> {
+        let (Some(items), Some(processor), Some(meta_root)) = (
+            &self.item_repository,
+            &self.image_processor,
+            &self.metadata_dir,
+        ) else {
+            return Ok(());
+        };
+        for folder in folders {
+            let Some(cf) = collection_folder_id(folder) else {
+                continue;
+            };
+            let out_dir = meta_root.join(guid_to_db(cf));
+            let out = out_dir.join("primary.png");
+            // Regenerate only when missing or older than 7 days (upstream's
+            // HasChangedByDate window).
+            let fresh = std::fs::metadata(&out)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_hours(7 * 24));
+            if fresh {
+                continue;
+            }
+            // Random content sample; over-fetch since not every row has art.
+            let sample = InternalItemsQuery {
+                ancestor_ids: vec![cf],
+                recursive: true,
+                is_folder: Some(false),
+                is_virtual_item: Some(false),
+                limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
+                order_by: vec![(
+                    ferrofin_model::live_tv::ItemSortBy::Random,
+                    ferrofin_model::dto::SortOrder::Descending,
+                )],
+                ..Default::default()
+            };
+            let mut inputs = Vec::new();
+            for id in items.get_item_ids(&sample).await? {
+                if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
+                    break;
+                }
+                let infos = items.get_image_infos(id).await?;
+                let best = infos
+                    .iter()
+                    .find(|i| i.image_type == ImageType::Backdrop)
+                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Primary))
+                    .or_else(|| infos.iter().find(|i| i.image_type == ImageType::Thumb));
+                if let Some(image) = best
+                    && image.is_local_file()
+                    && std::path::Path::new(&image.path).exists()
+                {
+                    inputs.push(image.path.clone());
+                }
+            }
+            if inputs.is_empty() {
+                continue; // an empty library keeps the icon tile
+            }
+            if let Err(err) = std::fs::create_dir_all(&out_dir) {
+                tracing::warn!(%err, library = %cf, "failed to create the library art dir");
+                continue;
+            }
+            let options = ferrofin_traits::options::ImageCollageOptions {
+                input_paths: inputs,
+                output_path: out.to_string_lossy().into_owned(),
+                width: 960,
+                height: 540,
+            };
+            if let Err(err) = processor
+                .create_image_collage(&options, folder.name.as_deref())
+                .await
+            {
+                tracing::warn!(%err, library = %cf, "failed to composite the library image");
+                continue;
+            }
+            let info = ItemImageInfo {
+                path: options.output_path.clone(),
+                image_type: ImageType::Primary,
+                date_modified: Utc::now(),
+                width: options.width,
+                height: options.height,
+                blur_hash: None,
+            };
+            if let Err(err) = self.persistence.save_item_images(cf, &[info]).await {
+                tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            }
+        }
+        Ok(())
     }
 
     /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
@@ -4546,6 +4668,78 @@ mod tests {
             anc, 3,
             "series + season + episode each have cf as an ancestor"
         );
+    }
+
+    // The post-scan library-image pass composites each library's Primary tile
+    // from its own content, so "My Media" stops rendering the icon-on-blue
+    // fallback (port of CollectionFolderImageProvider).
+    #[tokio::test]
+    async fn scan_composites_library_tile_images() {
+        use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::persistence::ItemRepository;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("Heat (1995).mkv"), b"").unwrap();
+        let mut poster = image::RgbImage::new(32, 48);
+        for (_x, y, px) in poster.enumerate_pixels_mut() {
+            *px = image::Rgb([u8::try_from(y % 256).unwrap_or(0), 90, 200]);
+        }
+        poster.save(media.join("Heat (1995)-poster.jpg")).unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo: Arc<dyn ItemRepository> =
+            Arc::new(crate::FerrofinItemRepository::new(db.clone(), lookup));
+        let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+        );
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_image_processor(image_processor)
+                .with_items(repo.clone())
+                .with_metadata_dir(tmp.path().join("meta"));
+        scanner.scan_all().await.unwrap();
+
+        // The library folder's id, via the virtual-folder projection.
+        let folders = vf.get_virtual_folders().await.unwrap();
+        let cf = folders[0]
+            .item_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap();
+        let infos = repo.get_image_infos(cf).await.unwrap();
+        let primary = infos
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .expect("library tile image row");
+        let bytes = std::fs::read(&primary.path).expect("tile file on disk");
+        assert!(!bytes.is_empty());
+        assert_eq!(primary.width, 960);
+        assert_eq!(primary.height, 540);
     }
 
     #[tokio::test]
