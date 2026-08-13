@@ -763,6 +763,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bare_api_key_query_param_authenticates_a_user_token() {
+        // jellyfin-web's browser-initiated downloads carry the USER token as
+        // `?api_key=<token>` with no Authorization header — the only auth the
+        // request has. It must resolve like any header token.
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x21);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let ctx = context(db.clone());
+        let request = RequestContext {
+            query_string: Some("api_key=dev-tok".to_owned()),
+            ..Default::default()
+        };
+        let info = ctx.get_authorization_info(&request).await.unwrap();
+        assert!(info.is_authenticated, "query api_key user token accepted");
+        assert_eq!(info.user_id(), uid);
+    }
+
+    #[tokio::test]
     async fn cached_token_is_served_without_the_database_until_cleared() {
         let db = crate::test_support::test_db().await;
         let uid = Uuid::from_u128(8);

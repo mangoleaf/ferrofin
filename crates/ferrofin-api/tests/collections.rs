@@ -189,8 +189,21 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
-/// A [`UserManager`] resolving the fixed authenticated user.
-struct OkUsers;
+/// A [`UserManager`] resolving the fixed authenticated user with `policy`.
+struct OkUsers {
+    policy: ferrofin_model::users::UserPolicy,
+}
+
+impl Default for OkUsers {
+    fn default() -> Self {
+        Self {
+            policy: ferrofin_model::users::UserPolicy {
+                is_administrator: true,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        }
+    }
+}
 
 #[async_trait]
 impl UserManager for OkUsers {
@@ -254,7 +267,11 @@ impl UserManager for OkUsers {
         _user: &UserEntity,
         _server_id: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        unimplemented!()
+        // The collection routes gate on the caller's policy.
+        Ok(ferrofin_model::dto::UserDto {
+            policy: Some(self.policy.clone()),
+            ..ferrofin_model::dto::UserDto::default()
+        })
     }
     async fn update_configuration(
         &self,
@@ -513,9 +530,18 @@ impl CollectionManager for RecordingCollections {
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.
 fn state(playlists: Arc<RecordingPlaylists>, collections: Arc<RecordingCollections>) -> AppState {
+    state_with_users(playlists, collections, Arc::new(OkUsers::default()))
+}
+
+/// [`state`] with a caller-supplied [`UserManager`] (used to vary the policy).
+fn state_with_users(
+    playlists: Arc<RecordingPlaylists>,
+    collections: Arc<RecordingCollections>,
+    users: Arc<OkUsers>,
+) -> AppState {
     AppState::new(
         Arc::new(ferrofin_api::test_support::FakeLibrary),
-        Arc::new(OkUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -570,6 +596,33 @@ async fn send(app: AppState, method: &str, uri: &str, body: Body) -> (StatusCode
         .to_vec();
     (status, bytes)
 }
+
+#[tokio::test]
+async fn collection_routes_forbid_users_without_management_permission() {
+    // Flip the fixture's policy to a plain user: every management route 403s
+    // (upstream's `[Authorize(Policy = CollectionManagement)]`).
+    let col = Arc::new(RecordingCollections::default());
+    let app = state_with_users(
+        Arc::new(RecordingPlaylists::default()),
+        col.clone(),
+        Arc::new(OkUsers {
+            policy: ferrofin_model::users::UserPolicy::default(),
+        }),
+    );
+    let id = Uuid::new_v4();
+    for (method, uri) in [
+        ("POST", "/Collections?name=Nope".to_owned()),
+        ("POST", format!("/Collections/{id}/Items?ids={id}")),
+        ("DELETE", format!("/Collections/{id}/Items?ids={id}")),
+    ] {
+        let (status, _) = send(app.clone(), method, &uri, Body::empty()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    assert!(col.created.lock().unwrap().is_none());
+    assert!(col.added.lock().unwrap().is_none());
+    assert!(col.removed.lock().unwrap().is_none());
+}
+
 #[tokio::test]
 async fn create_collection_returns_id_and_seeds_caller() {
     let col = Arc::new(RecordingCollections::default());
