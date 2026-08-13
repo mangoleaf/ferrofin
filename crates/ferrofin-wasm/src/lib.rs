@@ -155,7 +155,17 @@ pub struct LoadedPlugin {
     /// The guest's advertised tasks.
     pub tasks: Vec<bindings::types::TaskDescriptor>,
     runtime: RuntimeHandle,
+    /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
+    /// often (`PlaybackProgress` per session per tick); without this each one
+    /// would spawn a task and read the plugin manager just to decide whether
+    /// to deliver. The TTL only delays a dashboard toggle taking effect on
+    /// event delivery — never correctness (events are droppable hints).
+    enabled_cache: std::sync::Mutex<Option<(std::time::Instant, bool)>>,
 }
+
+/// How long the event fan-out trusts a cached enabled flag before refreshing
+/// — the same seconds-scale window as the metadata gate cache.
+const EVENT_ENABLED_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl LoadedPlugin {
     /// Drives `run-task` directly with an empty config snapshot, bypassing
@@ -166,6 +176,23 @@ impl LoadedPlugin {
     #[doc(hidden)]
     pub async fn run_task_for_test(&self, task_id: String) -> Result<(), String> {
         self.runtime.run_task(task_id, String::from("{}")).await
+    }
+
+    /// The cached enabled flag if it is still fresh, else `None` (caller must
+    /// refresh from the plugin manager).
+    fn cached_enabled(&self) -> Option<bool> {
+        self.enabled_cache
+            .lock()
+            .expect("enabled cache lock poisoned")
+            .and_then(|(at, enabled)| (at.elapsed() < EVENT_ENABLED_CACHE_TTL).then_some(enabled))
+    }
+
+    /// Records a freshly-read enabled flag.
+    fn store_enabled(&self, enabled: bool) {
+        *self
+            .enabled_cache
+            .lock()
+            .expect("enabled cache lock poisoned") = Some((std::time::Instant::now(), enabled));
     }
 }
 
@@ -419,15 +446,28 @@ impl WasmPluginHost {
                         if plugin.runtime.is_dead() {
                             return Ok(());
                         }
+                        // Fast path: a fresh enabled flag needs no manager read
+                        // and no spawn — deliver (or skip) synchronously. This
+                        // is what most events hit.
+                        if let Some(enabled) = plugin.cached_enabled() {
+                            if enabled {
+                                plugin.runtime.deliver_event(event_name, payload);
+                            }
+                            return Ok(());
+                        }
+                        // Slow path (once per TTL): refresh the flag off-thread
+                        // (the manager call is async), cache it, then deliver.
                         let plugin = Arc::clone(&plugin);
                         let plugin_manager = Arc::clone(&plugin_manager);
                         let payload = payload.to_owned();
                         tokio::spawn(async move {
-                            match plugin_manager.get_plugin(plugin.descriptor.id).await {
-                                Ok(Some(descriptor)) if descriptor.enabled => {
-                                    plugin.runtime.deliver_event(event_name, &payload);
-                                }
-                                _ => {} // disabled or unknown: skip silently
+                            let enabled = matches!(
+                                plugin_manager.get_plugin(plugin.descriptor.id).await,
+                                Ok(Some(descriptor)) if descriptor.enabled
+                            );
+                            plugin.store_enabled(enabled);
+                            if enabled {
+                                plugin.runtime.deliver_event(event_name, &payload);
                             }
                         });
                         Ok(())
@@ -517,6 +557,7 @@ fn load_one(
         default_config: default_config.into_bytes(),
         tasks,
         runtime,
+        enabled_cache: std::sync::Mutex::new(None),
     })
 }
 

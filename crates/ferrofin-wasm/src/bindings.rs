@@ -109,6 +109,16 @@ impl host::Host for HostState {
     }
 
     fn http_fetch(&mut self, request: types::HttpRequest) -> Result<types::HttpResponse, String> {
+        // Same load-time gate as query-items/write-media-segments: the
+        // collaborators cell is armed only after ALL plugins have loaded, so
+        // an unarmed cell means we are inside a `descriptor`/`default-config`/
+        // `tasks` call. Those metadata exports run at boot even for a plugin
+        // the admin disabled (they must, to appear in `/Plugins`), and
+        // http-fetch is the one capability with outbound reach — deny it there
+        // so "disabled" (and load itself) can never phone home.
+        if self.collaborators.get().is_none() {
+            return Err("http-fetch is not available during plugin load".to_owned());
+        }
         crate::capabilities::http_fetch(
             &self.http,
             &self.plugin_name,

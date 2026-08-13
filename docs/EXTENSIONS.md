@@ -93,6 +93,14 @@ interrogated for its identity (`descriptor`), seed config, and task list, and th
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
 
+**"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
+aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled
+plugin's *identity* exports (`descriptor`/`default-config`/`tasks`) still run at every boot,
+because that is how it appears in `/Plugins` at all. Those exports are metadata-only and
+cannot reach the network — `http-fetch` (like `query-items` and `write-media-segments`) is
+refused during load — so a disabled or newly-dropped-in plugin cannot phone home at startup.
+To stop a plugin's code from running entirely, remove its `.wasm` and restart.
+
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
 explicitly exports, so that one file is the entire reviewable attack surface. Today that

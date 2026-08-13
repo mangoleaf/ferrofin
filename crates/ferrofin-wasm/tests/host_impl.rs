@@ -71,17 +71,50 @@ fn capability_calls_fail_cleanly_before_collaborators_are_armed() {
 }
 
 #[test]
-fn http_fetch_round_trips_through_the_trait() {
-    let (url, server) = one_shot_http("204 No Content", b"");
+fn http_fetch_is_denied_during_plugin_load() {
+    // Unarmed collaborators == inside a descriptor/default-config/tasks call
+    // at load. http-fetch (the one outbound capability) must be refused there,
+    // so a disabled plugin's load-time exports cannot phone home.
+    let (url, _server) = one_shot_http("200 OK", b"leak");
     let mut s = state(Arc::new(std::sync::OnceLock::new()));
-    let response = s
+    let err = s
         .http_fetch(types::HttpRequest {
             method: "GET".to_owned(),
             url,
             headers: Vec::new(),
             body: None,
         })
-        .expect("fetch succeeds");
+        .unwrap_err();
+    assert!(err.contains("not available during plugin load"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_fetch_round_trips_once_collaborators_are_armed() {
+    let (url, server) = one_shot_http("204 No Content", b"");
+    let cell = Arc::new(std::sync::OnceLock::new());
+    cell.set(Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::new(OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: Arc::new(RecordingSegments::default()),
+        plugins: Arc::new(EnabledStub(b"{}".to_vec())),
+    })
+    .ok()
+    .expect("fresh cell");
+    // http-fetch uses a blocking client, so drive it off-runtime like the
+    // plugin thread does.
+    let response = tokio::task::spawn_blocking(move || {
+        state(cell).http_fetch(types::HttpRequest {
+            method: "GET".to_owned(),
+            url,
+            headers: Vec::new(),
+            body: None,
+        })
+    })
+    .await
+    .unwrap()
+    .expect("fetch succeeds");
     assert_eq!(response.status, 204);
     assert!(server.join().unwrap().starts_with(b"GET /hook"));
 }
