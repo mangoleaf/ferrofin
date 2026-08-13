@@ -685,18 +685,10 @@ impl LibraryScanner {
             }
             self.apply_parental_rating_score(&mut entity);
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
-            // supplement whatever the built-in chain left unfilled. Their
-            // contributed ids are filtered against every id already known —
-            // `save_provider_id` is INSERT OR REPLACE, so an unfiltered
-            // ("Tmdb", …) from a plugin would replace the real TMDB id.
-            let known_ids: Vec<(String, String)> = remote
-                .provider_ids
-                .iter()
-                .cloned()
-                .chain(tag_provider_ids)
-                .collect();
-            let dynamic_ids = self
-                .apply_dynamic_metadata(&mut entity, &known_ids, locked)
+            // supplement whatever the built-in chain left unfilled; the
+            // helper merges their (filtered) ids with the built-ins'.
+            let all_provider_ids = self
+                .apply_dynamic_metadata(&mut entity, &remote.provider_ids, tag_provider_ids, locked)
                 .await;
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
@@ -711,8 +703,6 @@ impl LibraryScanner {
             // id-dependent providers (fanart, AudioDb, MusicBrainz) and make
             // re-scans/cross-provider lookups stable. Best-effort: a write
             // failure is logged, not fatal.
-            let all_provider_ids: Vec<(String, String)> =
-                known_ids.into_iter().chain(dynamic_ids).collect();
             for (key, value) in &all_provider_ids {
                 if let Err(err) = self.persistence.save_provider_id(item.id, key, value).await {
                     tracing::warn!(%err, item = %item.id, provider = key, "failed to persist provider id");
@@ -1476,20 +1466,24 @@ impl LibraryScanner {
     /// Runs every registered [`DynamicMetadataProvider`] for one item and
     /// applies the results **supplement-only**: a field is taken only when
     /// the entity still lacks a value, so dynamic sources can never
-    /// overwrite the built-in chain or user edits. Returns the external ids
-    /// the sources contributed (persisted alongside the built-ins').
+    /// overwrite the built-in chain or user edits. Returns the FULL
+    /// provider-id list to persist: the built-ins' (remote + tag) followed
+    /// by the sources' contributions, filtered so a plugin id can never
+    /// replace a built-in one (`save_provider_id` is INSERT OR REPLACE).
     ///
     /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
     async fn apply_dynamic_metadata(
         &self,
         entity: &mut BaseItemEntity,
-        known_ids: &[(String, String)],
+        remote_ids: &[(String, String)],
+        tag_ids: Vec<(String, String)>,
         locked: bool,
     ) -> Vec<(String, String)> {
+        let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
         // Locked items and provider-less scans skip the pass entirely;
         // best-effort per source — one bad plugin never fails a scan.
         if locked || self.dynamic_providers.is_empty() {
-            return Vec::new();
+            return known_ids;
         }
         // An unparseable row id must not reach guests as a nil UUID they
         // could then write segments against — skip the item instead.
@@ -1511,7 +1505,7 @@ impl LibraryScanner {
             name: entity.name.clone().unwrap_or_default(),
             production_year: entity.production_year.and_then(|y| i32::try_from(y).ok()),
             path: entity.path.clone(),
-            provider_ids: known_ids.to_vec(),
+            provider_ids: known_ids.clone(),
         };
         let mut contributed_ids = Vec::new();
         for provider in &self.dynamic_providers {
@@ -1553,7 +1547,9 @@ impl LibraryScanner {
                 }
             }
         }
-        contributed_ids
+        let mut all = known_ids;
+        all.extend(contributed_ids);
+        all
     }
 
     async fn fetch_remote_metadata(
