@@ -74,7 +74,8 @@ pub struct WasmSettings {
     /// default 30 — confirmed 2026-08-07).
     pub call_timeout_secs: u32,
     /// Per-plugin linear-memory cap in MiB (`FERROFIN_WASM_MEMORY_LIMIT_MB`,
-    /// default 128 — provisional until the E1 RSS measurement).
+    /// default 128 — confirmed 2026-08-13 after the measured ~6–7 MiB
+    /// marginal RSS per plugin; a `memory.grow` ceiling, never a reservation).
     pub memory_limit_mb: u32,
     /// Per-plugin event queue depth (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`,
     /// default 256 — inherits the approved bus-capacity setting).
