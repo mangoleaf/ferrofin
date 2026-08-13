@@ -121,8 +121,14 @@ async fn download_images(
 ) -> Vec<ItemImageInfo> {
     let mut infos = Vec::new();
     for image in images {
-        let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(image.image_type)));
-        if !dest.exists() {
+        let stem = image_type_file_stem(image.image_type);
+        // Reuse any on-disk file of this stem regardless of extension — it is
+        // either this download from an earlier scan or a user upload (which
+        // must win over a re-download).
+        let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
+            existing
+        } else {
+            let dest = item_dir.join(format!("{stem}.jpg"));
             let Some(bytes) = tmdb.download(&image.url).await else {
                 continue;
             };
@@ -132,7 +138,8 @@ async fn download_images(
                 tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
                 continue;
             }
-        }
+            dest
+        };
         infos.push(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type: image.image_type,
@@ -143,6 +150,46 @@ async fn download_images(
         });
     }
     infos
+}
+
+/// The image file extensions the art-dir helpers recognize.
+const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
+
+/// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
+/// extension, preferring the canonical `.jpg` first.
+fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
+    ART_FILE_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{stem}.{ext}")))
+        .find(|p| p.exists())
+}
+
+/// Parses an art-dir file back to its [`ImageType`] — the inverse of the
+/// `image_file_stem` naming both the scan's downloads and the image-upload
+/// endpoint write (`primary.jpg`, `backdrop1.jpg`, `logo.png`, …). `None` for
+/// unrecognized stems/extensions.
+fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !ART_FILE_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let base = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    Some(match base {
+        "primary" => ImageType::Primary,
+        "art" => ImageType::Art,
+        "backdrop" => ImageType::Backdrop,
+        "banner" => ImageType::Banner,
+        "logo" => ImageType::Logo,
+        "thumb" => ImageType::Thumb,
+        "disc" => ImageType::Disc,
+        "box" => ImageType::Box,
+        "screenshot" => ImageType::Screenshot,
+        "menu" => ImageType::Menu,
+        "boxrear" => ImageType::BoxRear,
+        "profile" => ImageType::Profile,
+        _ => return None,
+    })
 }
 
 /// One item the plan pass resolved, ready to persist.
@@ -1594,8 +1641,10 @@ impl LibraryScanner {
     /// Discovers and persists the item's artwork: local files next to the
     /// media first (poster/backdrop/logo/…), then a TMDB fallback for
     /// movies/series with none — matching Jellyfin, which fetches remote
-    /// artwork automatically. Best-effort: a failure must not abort the rest
-    /// of the scan.
+    /// artwork automatically. Files already in the item's metadata art dir
+    /// (user uploads, previously downloaded art) fill any type discovery
+    /// didn't produce, so an uploaded image survives every rescan.
+    /// Best-effort: a failure must not abort the rest of the scan.
     async fn persist_artwork(
         &self,
         item_id: Uuid,
@@ -1606,6 +1655,7 @@ impl LibraryScanner {
         if images.is_empty() {
             images = self.fetch_remote_images(entity, art_cache).await;
         }
+        self.append_art_dir_images(entity, &mut images);
         self.fill_image_metadata(&mut images).await;
         if !images.is_empty()
             && let Err(err) = self.persistence.save_item_images(item_id, &images).await
@@ -1626,6 +1676,42 @@ impl LibraryScanner {
             .ok()
             .flatten()
             .is_some_and(|row| row.is_locked)
+    }
+
+    /// Appends rows for art files already sitting in the item's metadata art
+    /// dir (`{meta}/library/{id}` — user uploads and previously downloaded
+    /// artwork) whose image type discovery did not produce, so an uploaded
+    /// image of any type survives the scan's image rewrite. Types discovery
+    /// did produce are left alone (media-adjacent files outrank the metadata
+    /// dir, matching Jellyfin's local-image precedence).
+    fn append_art_dir_images(&self, entity: &BaseItemEntity, images: &mut Vec<ItemImageInfo>) {
+        let Some(meta_root) = &self.metadata_dir else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(meta_root.join(&entity.id)) else {
+            return;
+        };
+        // Snapshot the types discovery produced up front, so several art-dir
+        // files of one type (backdrop.jpg, backdrop1.jpg, …) all append.
+        let discovered: std::collections::HashSet<ImageType> =
+            images.iter().map(|i| i.image_type).collect();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(image_type) = parse_art_file_stem(&path) else {
+                continue;
+            };
+            if discovered.contains(&image_type) {
+                continue;
+            }
+            images.push(ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: file_date_modified(&path),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            });
+        }
     }
 
     async fn fetch_remote_images(
@@ -4405,5 +4491,44 @@ mod tests {
             "tracks parent to the album"
         );
         assert!(tracks.iter().all(|t| t.1.as_deref() == Some("The Wall")));
+    }
+
+    // The art-dir helpers behind uploaded-image survival: stem parsing is the
+    // inverse of the upload endpoint's file naming, and the extension-agnostic
+    // lookup is what lets an uploaded PNG win over a cached JPG re-download.
+    #[test]
+    fn art_dir_stems_parse_and_existing_files_resolve() {
+        use std::path::Path;
+
+        assert_eq!(
+            super::parse_art_file_stem(Path::new("/m/ID/primary.jpg")),
+            Some(ferrofin_model::entities::ImageType::Primary)
+        );
+        assert_eq!(
+            super::parse_art_file_stem(Path::new("/m/ID/backdrop1.png")),
+            Some(ferrofin_model::entities::ImageType::Backdrop)
+        );
+        assert_eq!(
+            super::parse_art_file_stem(Path::new("/m/ID/logo.webp")),
+            Some(ferrofin_model::entities::ImageType::Logo)
+        );
+        // Unrecognized stems and non-image files parse to nothing.
+        assert_eq!(
+            super::parse_art_file_stem(Path::new("/m/ID/chapter1.jpg")),
+            None
+        );
+        assert_eq!(
+            super::parse_art_file_stem(Path::new("/m/ID/primary.txt")),
+            None
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("primary.png"), b"png").unwrap();
+        assert_eq!(
+            super::existing_art_file(tmp.path(), "primary"),
+            Some(tmp.path().join("primary.png")),
+            "a non-jpg upload is found by stem"
+        );
+        assert_eq!(super::existing_art_file(tmp.path(), "backdrop"), None);
     }
 }

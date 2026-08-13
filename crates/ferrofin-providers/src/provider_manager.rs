@@ -795,12 +795,25 @@ impl ProviderManager for LocalProviderManager {
         let ext = mime_types::to_extension(&mime_type.to_ascii_lowercase())
             .unwrap_or(".jpg")
             .trim_start_matches('.');
-        let item_dir = meta_root.join(item_id.to_string());
+        // The scan's art dir for this item (`{meta}/library/{db-format id}`,
+        // same stem naming): writing the upload there makes it the file the
+        // scan re-discovers on every rescan, so an uploaded image replaces the
+        // downloaded artwork durably instead of being wiped by the next scan's
+        // image rewrite.
+        let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
         let stem = image_file_stem(image_type, image_index);
         let dest = item_dir.join(format!("{stem}.{ext}"));
         std::fs::create_dir_all(&item_dir).map_err(|e| {
             ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
         })?;
+        // Purge same-stem files of other extensions (e.g. the scan's cached
+        // `primary.jpg` when a PNG is uploaded) so this upload is the single
+        // candidate the scan finds for the stem.
+        for other in ["jpg", "jpeg", "png", "webp", "gif"] {
+            if other != ext {
+                let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+            }
+        }
         std::fs::write(&dest, content)
             .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
         store
