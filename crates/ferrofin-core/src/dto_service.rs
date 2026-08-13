@@ -1692,13 +1692,12 @@ impl FerrofinDtoService {
                     || options.contains_field(ItemFields::CanDownload) =>
             {
                 let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
-                self.user_data
-                    .get_content_permissions(user_id)
-                    .await?
-                    .map(|(can_delete, can_download)| UserContentPermissions {
+                self.user_data.get_content_permissions(user_id).await?.map(
+                    |(can_delete, can_download)| UserContentPermissions {
                         can_delete,
                         can_download,
-                    })
+                    },
+                )
             }
             _ => None,
         };
