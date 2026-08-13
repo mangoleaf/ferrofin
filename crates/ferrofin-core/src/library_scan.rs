@@ -1613,7 +1613,7 @@ impl LibraryScanner {
                     return RemoteMetadata::default();
                 };
                 let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-                let Some(hit) = tvdb.search(name, year).await.into_iter().next() else {
+                let Some(hit) = pick_series_hit(tvdb.search(name, year).await, year) else {
                     return RemoteMetadata::default();
                 };
                 let Some(details) = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await else {
@@ -2960,6 +2960,20 @@ fn album_name_consensus(tracks: &[BaseItemEntity]) -> Option<String> {
         .filter_map(|t| t.album.as_deref().map(str::trim).filter(|s| !s.is_empty()));
     let first = names.next()?.to_owned();
     names.all(|n| n == first).then_some(first)
+}
+
+/// Picks the TVDB series candidate for a folder-derived `year`.
+///
+/// TVDB's `year` query parameter only biases the ranking — it does not filter —
+/// so a same-titled remake can outrank the year the folder actually names
+/// ("Doctor Who (1963)" matching the 2005 series). An exact year match wins;
+/// otherwise the API's own ordering stands.
+fn pick_series_hit(
+    hits: Vec<ferrofin_providers::TvdbSearchHit>,
+    year: Option<i32>,
+) -> Option<ferrofin_providers::TvdbSearchHit> {
+    year.and_then(|y| hits.iter().find(|h| h.year == Some(y)).cloned())
+        .or_else(|| hits.into_iter().next())
 }
 
 /// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
@@ -5749,6 +5763,36 @@ mod tests {
         assert!(data_of("Avatar (2009)").contains(r#""VideoType":"BluRay""#));
         assert!(data_of("Alien (1979)").contains(r#""VideoType":"Dvd""#));
         assert!(data_of("Heat (1995)").contains(r#""VideoType":"VideoFile""#));
+    }
+
+    #[test]
+    fn series_match_prefers_the_folder_year() {
+        use ferrofin_providers::TvdbSearchHit;
+        let hit = |name: &str, year: i32| TvdbSearchHit {
+            tvdb_id: i64::from(year),
+            name: name.to_owned(),
+            year: Some(year),
+            image_url: None,
+            overview: None,
+        };
+        // TVDB ranks the 2005 revival first; the folder says 1963.
+        let hits = vec![hit("Doctor Who", 2005), hit("Doctor Who", 1963)];
+        assert_eq!(
+            super::pick_series_hit(hits.clone(), Some(1963))
+                .unwrap()
+                .year,
+            Some(1963)
+        );
+        // No year, or no candidate matching it → the API's own ordering stands.
+        assert_eq!(
+            super::pick_series_hit(hits.clone(), None).unwrap().year,
+            Some(2005)
+        );
+        assert_eq!(
+            super::pick_series_hit(hits, Some(1999)).unwrap().year,
+            Some(2005)
+        );
+        assert!(super::pick_series_hit(Vec::new(), Some(1963)).is_none());
     }
 
     #[test]
