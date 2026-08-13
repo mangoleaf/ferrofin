@@ -7,11 +7,18 @@ stable ABI for loading arbitrary compiled Rust code into a running process — a
 deliberately **does not fake one**. `/Plugins` install and uninstall are rejected, not
 stubbed to look like they worked.
 
-Instead, the plugins that matter are **compiled into the server as first-class extensions**,
-and surfaced through the exact same `/Plugins` API that dashboards already speak. To a
-Jellyfin client, a Ferrofin extension looks and behaves like an installed plugin: it appears
-in the dashboard's plugin list, has a settings page, and can be enabled or disabled at
-runtime without a restart.
+Instead, in-process plugins come in **two deliberate forms**, both surfaced through the
+exact same `/Plugins` API that dashboards already speak:
+
+1. **Compiled-in extensions** (this document) — Jellyfin plugins ported into the Ferrofin
+   codebase, reviewed like any other code, shipped inside the binary. Full trust, full
+   access to internal seams.
+2. **WASM plugins** (below) — sandboxed `.wasm` components installed by dropping a file
+   into `{data_dir}/plugins/`, for plugins the Ferrofin repo has never seen.
+
+To a Jellyfin client, both look and behave like installed plugins: they appear in the
+dashboard's plugin list, have settings pages, and can be enabled or disabled at runtime
+without a restart.
 
 ## How a compiled-in extension works
 
@@ -76,15 +83,48 @@ The full workflow (trait seam → extension module → handlers → composition 
 page → tests) is documented for contributors and agents in the `plan-plugin-port` and
 `implement-plugin-port` skills under `.claude/skills/`.
 
+## WASM plugins (Tier 1b)
+
+Runtime-installable plugins are **WebAssembly components** implementing the
+`ferrofin:plugin` world (`crates/ferrofin-wasm/wit/ferrofin-plugin.wit` — the single
+source of truth). Install = drop the `.wasm` file into `{data_dir}/plugins/` and restart,
+matching Jellyfin's restart-after-install flow. On boot each component is compiled,
+interrogated for its identity (`descriptor`), seed config, and task list, and then
+registered through the same plugin manager as compiled-in extensions — same dashboard
+entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
+
+**The sandbox is the point.** A WASM plugin gets *no filesystem, no network, no
+environment, no stdio* — its only capabilities are the functions the WIT `host` interface
+explicitly exports (in 0.1: `log` and `get-config`), so that one file is the entire
+reviewable attack surface. Each plugin runs on its own runtime thread under an enforced
+per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
+(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB — a `memory.grow` ceiling, not a
+reservation). A trap or overrun fails that one call and the instance is rebuilt; three
+consecutive failures trip a circuit breaker that sidelines the plugin until restart. The
+server never goes down with a plugin.
+
+Plugins receive server events (`LibraryChanged`, `PlaybackStart`, task completions, …)
+through the `on-event` export via a bounded per-plugin queue
+(`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`, default 256) — a slow guest loses events rather
+than slowing the server; the database, not the event stream, is the source of truth.
+
+Authoring: any language that targets the WASM component model. The reference plugin is
+`examples/wasm-hello/` — a ~70-line Rust crate (`wit-bindgen` + `wasm32-wasip2`, its own
+toolchain island) that logs a config-driven greeting from a scheduled task and counts
+events. Build it with `cargo build --release --target wasm32-wasip2` inside that
+directory. `.wasm` artifacts are never committed to this repo; CI builds the example from
+source on every run so the WIT contract cannot drift silently.
+
+**Contract stability:** the world is `0.x` and explicitly unstable until a few real
+third-party plugins exist; after that it freezes like the OpenAPI contract (additive
+evolution only). Planned capability growth (host-mediated HTTP, read-only item queries,
+media-segment writes, then a metadata-provider export) is tracked in
+`brain/plans/PLAN_PLUGIN_TIERS.md` phases E2–E3.
+
 ## Roadmap
 
-Compiled-in extensions cover the plugins people actually run, but they require a rebuild to
-add or change. Two future directions extend the model without that cost:
-
-- **WASM component host** — load extensions as WebAssembly components (WIT-typed against the
-  manager traits) so third parties can ship capabilities without a fork or a server rebuild.
-- **External integrations over REST** — an event bus that pushes server events to external
-  services (webhooks / WebSocket), for integrations that live outside the process entirely.
-
-Both are design directions, not shipped features; the compiled-in `Extension` trait is what
-exists today.
+- **WASM capability growth** — E2 (http-fetch, query-items, write-media-segments) and E3
+  (metadata-provider export wired into the provider chain), per the plan above.
+- **External integrations over REST** — an event push story (webhooks / WebSocket
+  subscriptions) for tools that are already separate systems (Jellyseerr-shaped). Planned
+  as Tier 2; not part of the in-process plugin model.
