@@ -2227,13 +2227,12 @@ impl LibraryScanner {
             .and_then(|(_, n)| n)
             .or_else(|| info.as_ref().and_then(|i| i.season_number))
             .map(i64::from);
-        // The series/season display names come from the parent folders (the
-        // filename resolver rarely carries the series name and never the season
-        // name); Jellyfin surfaces both as Episode.SeriesName/SeasonName.
-        entity.series_name = Some(
-            info.and_then(|i| i.series_name)
-                .unwrap_or_else(|| series_name.to_owned()),
-        );
+        // The series/season display names come from the parent entities, never
+        // the filename parse (upstream EpisodeResolver: `episode.SeriesName =
+        // series.Name`). A filename-derived series name is release-group noise
+        // ("Show.2009", "Show - 4x09 - Title") and fragments the parent line on
+        // every episode card.
+        entity.series_name = Some(series_name.to_owned());
         entity.season_name = season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
@@ -2499,15 +2498,30 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
 }
 
-/// Applies matched TheTVDB **episode** fields to the row (fill-if-empty).
+/// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
+/// everything except the title, where the provider outranks the resolver's
+/// filename placeholder).
 fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbEpisodeDetails) {
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
-    // The episode's own title: only overwrite a still-empty name (a filename-
-    // parsed placeholder or an NFO title is kept).
-    if entity.name.as_deref().unwrap_or_default().is_empty() && d.name.is_some() {
-        entity.name.clone_from(&d.name);
+    // The episode's own title is authoritative over the resolver's
+    // filename-derived placeholder (upstream MetadataService.MergeBaseItemData
+    // runs with replaceData=true on a standard scan, so the provider title
+    // replaces the stem the resolver stamped). An NFO `<title>` still wins:
+    // `apply_nfo` ran first and changed the name away from the stem, which is
+    // exactly what the placeholder check detects. The derived sort name follows
+    // the new title, as `apply_nfo` does.
+    let name_is_placeholder = match (entity.name.as_deref(), entity.path.as_deref()) {
+        (Some(name), Some(path)) => name == file_stem(path),
+        (None | Some(""), _) => true,
+        _ => false,
+    };
+    if name_is_placeholder
+        && let Some(title) = d.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(create_sort_name(title));
     }
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
@@ -3196,13 +3210,29 @@ mod tests {
         assert_eq!(blank.overview.as_deref(), Some("Ned is summoned."));
         assert!(blank.premiere_date.is_some());
         assert_eq!(blank.production_year, Some(2011));
-        // Existing title → kept.
+        // The resolver's filename placeholder → replaced (the reported bug:
+        // every episode displayed its file name because this guard used to be
+        // "only if empty", which the placeholder made permanently false).
+        let mut placeholder = BaseItemEntity {
+            name: Some("GoT.S01E01.1080p.Bluray".into()),
+            sort_name: Some("got.s01e01.1080p.bluray".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
+            ..Default::default()
+        };
+        super::apply_tvdb_episode(&mut placeholder, &ep);
+        assert_eq!(placeholder.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(
+            placeholder.sort_name.as_deref(),
+            Some(super::create_sort_name("Winter Is Coming").as_str())
+        );
+        // A name that differs from the stem (an NFO <title>) → kept.
         let mut named = BaseItemEntity {
-            name: Some("S01E01".into()),
+            name: Some("The Real Title".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
             ..Default::default()
         };
         super::apply_tvdb_episode(&mut named, &ep);
-        assert_eq!(named.name.as_deref(), Some("S01E01"));
+        assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
     // merge_series_cast: the series regulars (actors only) lead, the episode's
