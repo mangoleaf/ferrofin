@@ -828,3 +828,183 @@ async fn media_folders_returns_collection_folders() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
     assert_eq!(result.items.len(), 2);
 }
+
+// The remaining path-scoped `/Users/{userId}/…` aliases forward to the modern
+// handlers with the path user folded in; each must execute the real handler
+// body (legacy_routes.rs only proves registration via 401s).
+
+#[tokio::test]
+async fn user_scoped_root_forwards_to_items_root() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/Root"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dto: BaseItemDto = serde_json::from_slice(&body).expect("dto");
+    assert_eq!(dto.id, ROOT_ID);
+    // The alias must be indistinguishable from the modern query form on the wire.
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/Items/Root?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+}
+
+#[tokio::test]
+async fn user_scoped_intros_returns_empty_query_result() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}/Intros"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+    assert!(result.items.is_empty());
+    // The alias must be indistinguishable from the modern query form on the wire.
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/Items/{ITEM_ID}/Intros?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+    // A missing item is still a 404 through the alias.
+    let missing = Uuid::from_u128(0xDEAD);
+    let (status, _) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{missing}/Intros"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn user_scoped_local_trailers_and_special_features_forward() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}/LocalTrailers"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, TRAILER_ID);
+    // The alias must be indistinguishable from the modern query form on the wire.
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/Items/{ITEM_ID}/LocalTrailers?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}/SpecialFeatures"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dtos: Vec<BaseItemDto> = serde_json::from_slice(&body).expect("dtos");
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, SPECIAL_ID);
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/Items/{ITEM_ID}/SpecialFeatures?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+}
+
+#[tokio::test]
+async fn user_scoped_user_data_get_and_post_forward() {
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}/UserData"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let _dto: UserItemDataDto = serde_json::from_slice(&body).expect("dto");
+    // The alias must be indistinguishable from the modern query form on the
+    // wire (each `send` builds a fresh state, so both reads see pristine data).
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/UserItems/{ITEM_ID}/UserData?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+
+    let payload = serde_json::to_vec(&UpdateUserItemDataDto {
+        is_favorite: Some(true),
+        ..UpdateUserItemDataDto::default()
+    })
+    .expect("payload");
+    let (status, body) = send(
+        "POST",
+        &format!("/Users/{USER_ID}/Items/{ITEM_ID}/UserData"),
+        Body::from(payload.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dto: UserItemDataDto = serde_json::from_slice(&body).expect("dto");
+    assert!(dto.is_favorite);
+    // Same payload through the modern route yields the same wire response.
+    let (modern_status, modern_body) = send(
+        "POST",
+        &format!("/UserItems/{ITEM_ID}/UserData?userId={USER_ID}"),
+        Body::from(payload),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+}
+
+#[tokio::test]
+async fn user_scoped_views_and_grouping_options_forward() {
+    let (status, body) = send("GET", &format!("/Users/{USER_ID}/Views"), Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+    assert_eq!(result.items.len(), 2);
+    // The alias yields the exact body of the modern query-scoped route.
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/UserViews?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+
+    let (status, body) = send(
+        "GET",
+        &format!("/Users/{USER_ID}/GroupingOptions"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opts: Vec<SpecialViewOptionDto> = serde_json::from_slice(&body).expect("options");
+    assert_eq!(opts.len(), 2);
+    let (modern_status, modern_body) = send(
+        "GET",
+        &format!("/UserViews/GroupingOptions?userId={USER_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+}

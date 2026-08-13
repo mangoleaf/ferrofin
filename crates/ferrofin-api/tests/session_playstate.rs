@@ -30,12 +30,15 @@ use ferrofin_model::session::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager};
+use ferrofin_traits::media_encoding::{HlsStreamManager, HlsStreamRequest, ServedFile};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
-use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
+use ferrofin_traits::stubs::{
+    DisabledAttachmentExtractor, PlaybackRequest, SyncPlayManager, SyncPlaySession,
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -722,6 +725,74 @@ impl UserDataManager for RecordingUserData {
     }
 }
 
+/// A recording [`HlsStreamManager`]: the keep-alive ping and the stop-encoding
+/// kill record their arguments; methods the playstate handlers never touch
+/// panic, catching a stray call.
+#[derive(Default)]
+struct RecordingHls {
+    /// Every `ping_transcoding_job` call: `(play_session_id, is_user_paused)`.
+    pings: Mutex<Vec<(String, Option<bool>)>>,
+    /// Every `stop_encoding` call: `(device_id, play_session_id)`.
+    stops: Mutex<Vec<(Option<String>, Option<String>)>>,
+}
+
+#[async_trait]
+impl HlsStreamManager for RecordingHls {
+    async fn master_playlist(
+        &self,
+        _r: &HlsStreamRequest,
+        _a: bool,
+    ) -> Result<String, ServiceError> {
+        unimplemented!()
+    }
+    async fn variant_playlist(
+        &self,
+        _r: &HlsStreamRequest,
+        _a: bool,
+    ) -> Result<String, ServiceError> {
+        unimplemented!()
+    }
+    async fn live_playlist(&self, _r: &HlsStreamRequest) -> Result<String, ServiceError> {
+        unimplemented!()
+    }
+    async fn dynamic_segment(
+        &self,
+        _r: &HlsStreamRequest,
+        _s: i32,
+        _a: bool,
+    ) -> Result<ServedFile, ServiceError> {
+        unimplemented!()
+    }
+    async fn resolve_transcode_file(&self, _f: &str, _m: bool) -> Result<ServedFile, ServiceError> {
+        unimplemented!()
+    }
+    async fn transcode_stream(
+        &self,
+        _r: &HlsStreamRequest,
+        _a: bool,
+    ) -> Result<ServedFile, ServiceError> {
+        unimplemented!()
+    }
+    async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError> {
+        self.stops
+            .lock()
+            .unwrap()
+            .push((request.device_id.clone(), request.play_session_id.clone()));
+        Ok(())
+    }
+    async fn ping_transcoding_job(
+        &self,
+        play_session_id: &str,
+        is_user_paused: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        self.pings
+            .lock()
+            .unwrap()
+            .push((play_session_id.to_owned(), is_user_paused));
+        Ok(())
+    }
+}
+
 /// Builds an [`AppState`] with the recording session + user-data fakes.
 fn state(sessions: Arc<RecordingSessions>, user_data: Arc<RecordingUserData>) -> AppState {
     AppState::new(
@@ -780,6 +851,16 @@ async fn send(app: AppState, method: &str, uri: &str, body: Body) -> (StatusCode
         .expect("body")
         .to_vec();
     (status, bytes)
+}
+
+/// Like [`state`], but with the recording HLS fake wired in place of the
+/// disabled transcode runtime (the attachment seam stays disabled).
+fn state_with_hls(
+    sessions: Arc<RecordingSessions>,
+    user_data: Arc<RecordingUserData>,
+    hls: Arc<RecordingHls>,
+) -> AppState {
+    state(sessions, user_data).with_media_encoding(hls, Arc::new(DisabledAttachmentExtractor))
 }
 
 fn recording() -> (Arc<RecordingSessions>, Arc<RecordingUserData>) {
@@ -1303,4 +1384,174 @@ async fn auth_providers_are_listed() {
     assert_eq!(status, StatusCode::OK);
     let providers: Vec<NameIdPair> = serde_json::from_slice(&body).expect("providers");
     assert_eq!(providers[0].id.as_deref(), Some("reset"));
+}
+
+// Playback reports drive the transcode lifecycle: a progress report carrying
+// a play session pings the job keep-alive (with the paused flag), a stop
+// report dispatches the kill scoped to the play session + the caller's device.
+// The [`RecordingHls`] fake proves the wiring; the disabled-runtime test
+// proves a rejected dispatch is swallowed (best-effort) and playstate still
+// records.
+
+#[tokio::test]
+async fn progress_with_session_pings_transcode_and_records() {
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    let info = PlaybackProgressInfo {
+        item_id: ITEM_ID,
+        play_session_id: Some("abc".to_owned()),
+        is_paused: true,
+        ..PlaybackProgressInfo::default()
+    };
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data, hls.clone()),
+        "POST",
+        "/Sessions/Playing/Progress",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().progress, 1);
+    // The keep-alive ping carried the play session and the paused flag.
+    assert_eq!(
+        hls.pings.lock().unwrap().as_slice(),
+        &[("abc".to_owned(), Some(true))]
+    );
+    assert!(hls.stops.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn progress_without_session_does_not_ping_transcode() {
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    let info = PlaybackProgressInfo {
+        item_id: ITEM_ID,
+        ..PlaybackProgressInfo::default()
+    };
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data, hls.clone()),
+        "POST",
+        "/Sessions/Playing/Progress",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().progress, 1);
+    // No play session → nothing to keep alive.
+    assert!(hls.pings.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stopped_with_session_kills_transcode_and_records() {
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    let info = PlaybackStopInfo {
+        item_id: ITEM_ID,
+        play_session_id: Some("abc".to_owned()),
+        ..PlaybackStopInfo::default()
+    };
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data, hls.clone()),
+        "POST",
+        "/Sessions/Playing/Stopped",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().stops, 1);
+    // The kill is scoped to the play session + the caller's device (from auth).
+    assert_eq!(
+        hls.stops.lock().unwrap().as_slice(),
+        &[(Some("dev-1".to_owned()), Some("abc".to_owned()))]
+    );
+    assert!(hls.pings.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn transcode_dispatch_rejection_is_swallowed() {
+    // The default state's disabled HLS runtime rejects both the ping and the
+    // kill; the handlers must swallow that and still record playstate.
+    let (sessions, user_data) = recording();
+    let app = state(sessions.clone(), user_data);
+    let progress = PlaybackProgressInfo {
+        item_id: ITEM_ID,
+        play_session_id: Some("ps-1".to_owned()),
+        is_paused: true,
+        ..PlaybackProgressInfo::default()
+    };
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        "/Sessions/Playing/Progress",
+        Body::from(serde_json::to_vec(&progress).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().progress, 1);
+
+    let stop = PlaybackStopInfo {
+        item_id: ITEM_ID,
+        play_session_id: Some("ps-1".to_owned()),
+        ..PlaybackStopInfo::default()
+    };
+    let (status, _) = send(
+        app,
+        "POST",
+        "/Sessions/Playing/Stopped",
+        Body::from(serde_json::to_vec(&stop).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().stops, 1);
+}
+
+// The path-scoped `/Users/{userId}/PlayingItems/…` aliases forward to the
+// obsolete query forms (the path user is ignored; the session comes from auth).
+
+#[tokio::test]
+async fn user_scoped_playing_items_start_progress_stop_forward() {
+    let user = uuid::Uuid::from_u128(0x11);
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data.clone(), hls.clone()),
+        "POST",
+        &format!("/Users/{user}/PlayingItems/{ITEM_ID}?playMethod=DirectPlay"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().played_starts, 1);
+
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data.clone(), hls.clone()),
+        "POST",
+        &format!(
+            "/Users/{user}/PlayingItems/{ITEM_ID}/Progress?playSessionId=ps-1&positionTicks=7"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().progress, 1);
+    // Forwarding reached the transcode keep-alive too (isPaused defaults false).
+    assert_eq!(
+        hls.pings.lock().unwrap().as_slice(),
+        &[("ps-1".to_owned(), Some(false))]
+    );
+
+    let (status, _) = send(
+        state_with_hls(sessions.clone(), user_data, hls.clone()),
+        "DELETE",
+        &format!("/Users/{user}/PlayingItems/{ITEM_ID}?playSessionId=ps-1&positionTicks=9"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(sessions.calls.lock().unwrap().stops, 1);
+    // The legacy stop form dispatches the transcode kill as well.
+    assert_eq!(
+        hls.stops.lock().unwrap().as_slice(),
+        &[(Some("dev-1".to_owned()), Some("ps-1".to_owned()))]
+    );
 }

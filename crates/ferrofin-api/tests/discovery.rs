@@ -740,3 +740,19 @@ async fn similar_items_returns_two() {
         assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
     }
 }
+
+#[tokio::test]
+async fn user_scoped_suggestions_alias_forwards() {
+    // The legacy `/Users/{userId}/Suggestions` form (hidden from OpenAPI
+    // upstream, still served) folds the path user into the query and forwards.
+    let user = uuid::Uuid::from_u128(0x11);
+    let (status, body) = get(&format!("/Users/{user}/Suggestions?type=Movie")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("suggestions");
+    assert_eq!(result.items.len(), 1);
+    // The alias must be indistinguishable from the modern query form on the wire.
+    let (modern_status, modern_body) =
+        get(&format!("/Items/Suggestions?userId={user}&type=Movie")).await;
+    assert_eq!(modern_status, StatusCode::OK);
+    assert_eq!(body, modern_body);
+}

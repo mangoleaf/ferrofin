@@ -1272,3 +1272,75 @@ async fn untagged_image_is_public_and_client_no_cache_is_mirrored() {
         "client no-cache disables caching, as upstream does"
     );
 }
+
+// The legacy `/Users/{userId}/Images/{imageType}[/{index}]` forms (upstream
+// [Obsolete] + hidden from OpenAPI; jellyfin-web's apiclient still requests
+// avatars this way) forward to the /UserImage handlers — the path's image
+// type/index are accepted and ignored, as users carry one profile image.
+
+#[tokio::test]
+async fn legacy_user_image_routes_forward() {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    let (status, body) = send(&s, "GET", &format!("/Users/{USER_ID}/Images/Primary"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"PROFILE");
+
+    // The indexed form serves the same single profile image.
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Users/{USER_ID}/Images/Primary/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"PROFILE");
+
+    // HEAD is registered on both forms: same status, no body.
+    let (status, body) = send(
+        &s,
+        "HEAD",
+        &format!("/Users/{USER_ID}/Images/Primary"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    let (status, body) = send(
+        &s,
+        "HEAD",
+        &format!("/Users/{USER_ID}/Images/Primary/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_user_image_upload_and_delete_forward() {
+    let s = stubs(String::new(), String::new());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &format!("/Users/{USER_ID}/Images/Primary"),
+        Some(("image/png", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Recorded exactly as the modern /UserImage POST would record it.
+    assert_eq!(
+        s.users.saved.lock().expect("lock").as_slice(),
+        [(USER_ID.to_string(), "image/png".to_owned())]
+    );
+
+    let (status, _) = send(
+        &s,
+        "DELETE",
+        &format!("/Users/{USER_ID}/Images/Primary"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

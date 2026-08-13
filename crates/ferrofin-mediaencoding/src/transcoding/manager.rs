@@ -1049,7 +1049,8 @@ mod start_ffmpeg_tests {
     use crate::transcoding::segment_transcoder::{FakeScript, FakeSegmentTranscoder};
 
     use super::{
-        FileCleaner, FsFileCleaner, NoopSessionReporter, StartFfMpegRequest, TranscodeManagerImpl,
+        FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter, StartFfMpegRequest,
+        TranscodeManagerImpl,
     };
 
     /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`, its
@@ -1365,6 +1366,48 @@ mod start_ffmpeg_tests {
         let killed = m.reap_idle_jobs().await;
         assert_eq!(killed.len(), 1);
         assert_eq!(m.active_job_count(), 0, "idle reaper removed the job");
+    }
+
+    #[tokio::test]
+    async fn ping_refreshes_the_idle_countdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+
+        // Expire the idle window (fake clock via ping_timeout_ms = -1)...
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        // ...then a session ping (PingTimer) restores the HLS window and
+        // restamps activity, so the reaper leaves the job alone.
+        m.ping_transcoding_job("sess", None).await.expect("ping");
+        assert_eq!(
+            m.ping_timeout_for_session("sess"),
+            Some(HLS_PING_TIMEOUT_MS),
+            "ping restored the job-type default timeout"
+        );
+        assert!(m.reap_idle_jobs().await.is_empty());
+        assert_eq!(m.active_job_count(), 1);
+
+        // Re-expire WITHOUT a ping: the countdown runs out and the job dies.
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        let killed = m.reap_idle_jobs().await;
+        assert_eq!(killed.len(), 1);
+        assert_eq!(m.active_job_count(), 0);
     }
 
     #[test]

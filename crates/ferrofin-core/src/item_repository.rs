@@ -1521,6 +1521,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn by_name_favorite_filter_matches_the_genre_rows_user_data() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        // Two movies carrying one genre each; seeding materializes the browsable
+        // by-name Genre rows (id = ItemValueId).
+        let action_movie = Uuid::from_u128(0xFA01);
+        seed_named_item(&db, action_movie, BaseItemKind::Movie, "Action Film").await;
+        seed_item_genre(&db, action_movie, "Action").await;
+        let drama_movie = Uuid::from_u128(0xFA02);
+        seed_named_item(&db, drama_movie, BaseItemKind::Movie, "Drama Film").await;
+        seed_item_genre(&db, drama_movie, "Drama").await;
+
+        let user_id = Uuid::from_u128(0xFA10);
+        let user = seed_user(&db, user_id).await;
+
+        // Favorite the "Action" genre: the state lives in the by-name row's OWN
+        // UserData (C# joins UserData on the by-name item id), so the row is
+        // keyed to the materialized Genre item, not to either movie.
+        let genre_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Name" = 'Action'
+                 AND "Type" = 'MediaBrowser.Controller.Entities.Genre'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("materialized genre row");
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, ?1, 1, 0, 0, 0)"#,
+        )
+        .bind(&genre_id)
+        .bind(guid_to_db(user_id))
+        .execute(db.writer())
+        .await
+        .expect("favorite the genre");
+
+        // isFavorite=true keeps only the favorited genre…
+        let fav = InternalItemsQuery {
+            user: Some(user.clone()),
+            is_favorite: Some(true),
+            ..Default::default()
+        };
+        let got = repository.get_genres(&fav).await.expect("favorites");
+        let names: Vec<_> = got
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Action"]);
+
+        // …and isFavorite=false keeps only the un-favorited one (NOT EXISTS).
+        let not_fav = InternalItemsQuery {
+            user: Some(user),
+            is_favorite: Some(false),
+            ..Default::default()
+        };
+        let got = repository
+            .get_genres(&not_fav)
+            .await
+            .expect("non-favorites");
+        let names: Vec<_> = got
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Drama"]);
+    }
+
+    #[tokio::test]
     async fn value_name_lists_are_distinct_and_ordered() {
         let db = test_db().await;
         let repository = repo(&db);

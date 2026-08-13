@@ -765,6 +765,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_permissions_read_the_permission_rows() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x77);
+        seed_user(&db, user).await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        // No rows: permissions known, both denied (falsy rows == absent rows).
+        let perms = mgr
+            .get_content_permissions(user)
+            .await
+            .expect("read")
+            .expect("policy known");
+        assert_eq!(perms, (false, false));
+
+        // Kind 10 = EnableContentDeletion granted, 11 = downloading denied.
+        sqlx::query(
+            r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
+               VALUES (10, 1, ?1, 0), (11, 0, ?1, 0)"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("seed permissions");
+        let perms = mgr
+            .get_content_permissions(user)
+            .await
+            .expect("read")
+            .expect("policy known");
+        assert_eq!(perms, (true, false));
+    }
+
+    #[tokio::test]
     async fn reset_stream_selections_clears_indices() {
         let db = test_db().await;
         let user = Uuid::from_u128(1);

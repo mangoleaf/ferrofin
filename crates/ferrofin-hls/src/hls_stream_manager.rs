@@ -995,6 +995,12 @@ mod tests {
         let pl = mgr.master_playlist(&req(), false).await.unwrap();
         assert!(pl.contains("#EXTM3U"));
         assert!(pl.contains("main.m3u8?deviceId=dev"));
+        // The FakePlanner supplies neither output bitrates nor a probed source
+        // bitrate, so the 128 kbps floor applies — RFC 8216 requires a positive
+        // BANDWIDTH, and the old `BANDWIDTH=0` broke client ABR math.
+        assert!(!pl.contains("BANDWIDTH=0"), "got: {pl}");
+        assert!(pl.contains("BANDWIDTH=128000"), "got: {pl}");
+        assert!(pl.contains("AVERAGE-BANDWIDTH=128000"), "got: {pl}");
     }
 
     #[tokio::test]

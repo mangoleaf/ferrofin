@@ -1930,6 +1930,14 @@ mod tests {
 
     #[async_trait]
     impl UserDataManager for FakeUserData {
+        async fn get_content_permissions(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<Option<(bool, bool)>, ServiceError> {
+            // Deletion granted, downloading denied — asymmetric on purpose so a
+            // test can prove each side gates independently.
+            Ok(Some((true, false)))
+        }
         async fn save_user_data(
             &self,
             _user_id: Uuid,
@@ -2356,6 +2364,14 @@ mod tests {
 
     #[async_trait]
     impl MediaSourceManager for FakeSources {
+        async fn get_item_ids_with_subtitles(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            // Every video in these fixtures "has subtitles", so the DTO's
+            // HasSubtitles emit path is exercised.
+            Ok(item_ids.to_vec())
+        }
         async fn get_media_streams(
             &self,
             _item_id: Uuid,
@@ -2747,6 +2763,29 @@ mod tests {
         );
         assert_eq!(dto.genre_items.as_ref().unwrap().len(), 2);
         assert_eq!(dto.tags, Some(vec!["imax".to_owned(), "4k".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn video_dto_emits_has_subtitles_and_policy_gated_can_flags() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Subbed").await;
+        let item = fetch_item(&db, id).await;
+        let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x99)).await;
+        let svc = service(db);
+
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        // The subtitle-presence prefetch marks this video (C# emits the flag
+        // outside the ItemFields system, only when true).
+        assert_eq!(dto.has_subtitles, Some(true));
+        // CanDelete/CanDownload gate on the user's content permissions
+        // (EnableContentDeletion granted, EnableContentDownloading denied in
+        // the fake), not just the file-level fact.
+        assert_eq!(dto.can_delete, Some(true));
+        assert_eq!(dto.can_download, Some(false));
     }
 
     #[tokio::test]

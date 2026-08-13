@@ -111,6 +111,8 @@ struct MemUsers {
     changed_password: Mutex<Option<(Uuid, String)>>,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
+    /// Records the last configuration passed to `update_configuration`.
+    updated_configuration: Mutex<Option<(Uuid, UserConfiguration)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
 }
@@ -205,9 +207,10 @@ impl UserManager for MemUsers {
     }
     async fn update_configuration(
         &self,
-        _user_id: Uuid,
-        _config: &UserConfiguration,
+        user_id: Uuid,
+        config: &UserConfiguration,
     ) -> Result<(), ServiceError> {
+        *self.updated_configuration.lock().unwrap() = Some((user_id, config.clone()));
         Ok(())
     }
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
@@ -1568,4 +1571,81 @@ async fn current_user_returns_user_dto() {
     assert_eq!(json["Id"], USER_ID.to_string());
     assert_eq!(json["Name"], "alice");
     assert_eq!(json["HasPassword"], true);
+}
+
+// The path-scoped `/Users/{userId}` update/password/configuration aliases
+// (upstream keeps them [Obsolete] + hidden from OpenAPI, jellyfin-web's
+// apiclient still calls them) must forward to the query-scoped handlers —
+// executing the real bodies, not just the 401 registration check.
+
+#[tokio::test]
+async fn user_scoped_update_user_forwards() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    // Same name → no rename; the configuration write is the observable effect.
+    let body = serde_json::json!({ "Name": "bob", "Configuration": {} });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // The path user id reaches the manager (proving the alias forwarded).
+    let (id, _) = users.updated_configuration.lock().unwrap().clone().unwrap();
+    assert_eq!(id, BOB_ID);
+}
+
+#[tokio::test]
+async fn user_scoped_password_change_forwards() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    // Admin caller changing bob's password: no current-pw proof required.
+    let body = serde_json::json!({ "NewPw": "s3cret" });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Password"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
+    assert_eq!(id, BOB_ID);
+    assert_eq!(pw, "s3cret");
+}
+
+#[tokio::test]
+async fn user_scoped_configuration_forwards() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let body = serde_json::json!({ "AudioLanguagePreference": "fr" });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Configuration"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // The path user id and the parsed configuration reach the manager.
+    let (id, config) = users.updated_configuration.lock().unwrap().clone().unwrap();
+    assert_eq!(id, BOB_ID);
+    assert_eq!(config.audio_language_preference.as_deref(), Some("fr"));
 }
