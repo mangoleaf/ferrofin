@@ -236,8 +236,36 @@ pub async fn build_app_state(
         Arc::new(FerrofinItemCountService::new(db.clone()));
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
+    // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
+    // databases, grandfathered lowercase for pre-parity Ferrofin ones
+    // (`HermitMeta.item_id_derivation`, seeded by migration 0009). Resolved
+    // here because the people repository needs it for per-name person ids.
+    let id_derivation = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
+        db.meta_get("item_id_derivation")
+            .await
+            .context("failed to read the item-id derivation mode")?
+            .as_deref(),
+        Some(paths.program_data_path()),
+    );
+    let people_repository_impl = Arc::new(
+        FerrofinPeopleRepository::new(db.clone())
+            .with_identity(id_derivation.clone(), paths.people_path()),
+    );
+    // One-shot: collapse pre-unification per-(name, type) person items onto
+    // the deterministic per-name id (repointing favorites/images), so a
+    // favorited person reads back from every credit surface.
+    match people_repository_impl.unify_person_identities().await {
+        Ok(0) => {}
+        Ok(collapsed) => {
+            tracing::info!(collapsed, "unified person identities onto per-name ids");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
+        }
+    }
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
-        Arc::new(FerrofinPeopleRepository::new(db.clone()));
+        people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
         Arc::new(FerrofinMediaStreamRepository::new(db.clone()));
     let media_attachment_repository: Arc<
@@ -373,17 +401,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
         Arc::new(FerrofinActivityManager::new(db.clone()));
-    // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
-    // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
-    // databases, grandfathered lowercase for pre-parity Ferrofin ones
-    // (`HermitMeta.item_id_derivation`, seeded by migration 0009).
-    let id_derivation = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
-        db.meta_get("item_id_derivation")
-            .await
-            .context("failed to read the item-id derivation mode")?
-            .as_deref(),
-        Some(paths.program_data_path()),
-    );
     // The playlists media folder lives at `{data}/playlists` (C#
     // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");

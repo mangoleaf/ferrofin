@@ -128,6 +128,9 @@ struct Prefetched {
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
     /// so the whole page gates on one `Permissions` query.
     content_permissions: Option<UserContentPermissions>,
+    /// The per-NAME `Person` item id for each credited name on the page
+    /// (lowercased), so `People[].Id` points at the favoritable by-name item.
+    person_ids_by_name: HashMap<String, Uuid>,
 }
 
 /// The delete/download half of a user's policy (C# `HasPermission` over
@@ -563,7 +566,13 @@ impl FerrofinDtoService {
 
         let mut list = Vec::with_capacity(people.len());
         for person in people {
-            let person_id = Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil());
+            // The by-name item id (one per name, what favorites key on);
+            // pre-unification rows fall back to the credit id.
+            let person_id = prefetched
+                .person_ids_by_name
+                .get(&person.name.to_lowercase())
+                .copied()
+                .unwrap_or_else(|| Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil()));
             // Resolve the person's primary image tag (from the materialized Person
             // item's image rows) so the client renders cast/crew artwork.
             let primary_image_tag = match images_by_person
@@ -1554,21 +1563,51 @@ impl FerrofinDtoService {
         };
         // People for the page, then every credited person's images in one further
         // query — attach_people otherwise runs get_people + load_images per item.
-        let (people, person_images) = if options.contains_field(ItemFields::People) {
-            let people = self.library.get_people_batch(&ids).await?;
-            let person_ids: Vec<Uuid> = people
-                .values()
-                .flatten()
-                .filter_map(|p| Uuid::parse_str(&p.id).ok())
-                .collect();
-            let images = self
-                .load_images_batch(&person_ids)
-                .await
-                .unwrap_or_default();
-            (people, images)
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
+        let (people, person_images, person_ids_by_name) =
+            if options.contains_field(ItemFields::People) {
+                let people = self.library.get_people_batch(&ids).await?;
+                // Resolve each distinct credit NAME to its by-name Person item
+                // (C# AttachPeople: `People[].Id` is the per-name item id, the
+                // one favorites are written against — never the per-credit
+                // `Peoples` row id, which fragments a person across types).
+                let mut names: Vec<String> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for person in people.values().flatten() {
+                    if seen.insert(person.name.to_lowercase()) {
+                        names.push(person.name.clone());
+                    }
+                }
+                let resolved = self
+                    .library
+                    .get_named_items(ferrofin_model::data::BaseItemKind::Person, &names)
+                    .await
+                    .unwrap_or_default();
+                let mut by_name: HashMap<String, Uuid> = HashMap::new();
+                let mut person_ids: Vec<Uuid> = Vec::new();
+                for (name, row) in names.iter().zip(resolved) {
+                    if let Some(row) = row
+                        && let Ok(id) = Uuid::parse_str(&row.id)
+                    {
+                        by_name.insert(name.to_lowercase(), id);
+                        person_ids.push(id);
+                    }
+                }
+                // Pre-unification rows keyed images on the credit id; keep
+                // loading those too so old databases still render cast art.
+                person_ids.extend(
+                    people
+                        .values()
+                        .flatten()
+                        .filter_map(|p| Uuid::parse_str(&p.id).ok()),
+                );
+                let images = self
+                    .load_images_batch(&person_ids)
+                    .await
+                    .unwrap_or_default();
+                (people, images, by_name)
+            } else {
+                (HashMap::new(), HashMap::new(), HashMap::new())
+            };
         // Studio/genre/artist ids for every name on the page in one query. Collect
         // exactly what the attach steps resolve: studios/genres only when their
         // field is requested, artists/album-artists only for the kinds that carry
@@ -1716,6 +1755,7 @@ impl FerrofinDtoService {
             alternates,
             has_subtitles,
             content_permissions,
+            person_ids_by_name,
         })
     }
 

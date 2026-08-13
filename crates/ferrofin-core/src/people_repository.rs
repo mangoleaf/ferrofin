@@ -34,6 +34,7 @@ use ferrofin_traits::options::InternalPeopleQuery;
 use ferrofin_traits::persistence::{PeopleRepository, PersonMetadata, WrittenPerson};
 
 use crate::db_error::db_err;
+use crate::item_type_lookup;
 use crate::item_type_lookup::stored_type_name;
 
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
@@ -44,6 +45,11 @@ const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 #[derive(Clone)]
 pub struct FerrofinPeopleRepository {
     db: Database,
+    /// The per-database id derivation + the People metadata path, together
+    /// yielding the deterministic per-NAME `Person` item id
+    /// ([`item_type_lookup::person_item_id`]). `None` (unit tests) falls back
+    /// to per-(name, type) `Peoples` row ids — the pre-unification behavior.
+    identity: Option<(item_type_lookup::IdDerivation, String)>,
 }
 
 impl std::fmt::Debug for FerrofinPeopleRepository {
@@ -57,7 +63,163 @@ impl FerrofinPeopleRepository {
     /// Creates a people repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self { db, identity: None }
+    }
+
+    /// Wires the id derivation + People metadata path, so person by-name items
+    /// materialize with Jellyfin's one-id-per-name identity.
+    #[must_use]
+    pub fn with_identity(
+        mut self,
+        mode: item_type_lookup::IdDerivation,
+        people_path: String,
+    ) -> Self {
+        self.identity = Some((mode, people_path));
+        self
+    }
+
+    /// The deterministic per-name `Person` item id, in stored (uppercase) form,
+    /// when the identity seam is wired.
+    fn person_item_id(&self, name: &str) -> Option<String> {
+        let (mode, people_path) = self.identity.as_ref()?;
+        item_type_lookup::person_item_id(mode, people_path, name).map(guid_to_db)
+    }
+
+    /// Collapses one duplicate `Person` row onto `target` inside `tx`:
+    /// ensures the target exists, copies still-empty enrichment columns,
+    /// repoints user data + images (clashes keep the target's rows), and
+    /// drops the duplicate.
+    async fn collapse_person_row(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        person_type: &str,
+        name: &str,
+        old_id: &str,
+        target: &str,
+        create_target: bool,
+    ) -> Result<(), ServiceError> {
+        if create_target {
+            let clean = crate::text_util::get_clean_value(name);
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "BaseItems"
+                   ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
+                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+                   VALUES (?1,?2,?3,?4,0,0,0,0,0,0,0)"#,
+            )
+            .bind(target)
+            .bind(person_type)
+            .bind(name)
+            .bind(&clean)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+        }
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET
+                 "Overview" = COALESCE("Overview",
+                    (SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1)),
+                 "PremiereDate" = COALESCE("PremiereDate",
+                    (SELECT "PremiereDate" FROM "BaseItems" WHERE "Id" = ?1)),
+                 "EndDate" = COALESCE("EndDate",
+                    (SELECT "EndDate" FROM "BaseItems" WHERE "Id" = ?1)),
+                 "ProductionLocations" = COALESCE("ProductionLocations",
+                    (SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1))
+               WHERE "Id" = ?2"#,
+        )
+        .bind(old_id)
+        .bind(target)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+        for sql in [
+            r#"UPDATE OR IGNORE "UserData" SET "ItemId" = ?2 WHERE "ItemId" = ?1"#,
+            r#"UPDATE OR IGNORE "BaseItemImageInfos" SET "ItemId" = ?2 WHERE "ItemId" = ?1"#,
+        ] {
+            sqlx::query(sql)
+                .bind(old_id)
+                .bind(target)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        }
+        for sql in [
+            r#"DELETE FROM "UserData" WHERE "ItemId" = ?1"#,
+            r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+            r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#,
+        ] {
+            sqlx::query(sql)
+                .bind(old_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// One-shot startup pass: collapses the pre-unification per-(name, type)
+    /// `Person` items onto the deterministic per-name id, repointing user data
+    /// and images, and records completion in `HermitMeta` so subsequent boots
+    /// skip it. On a database adopted from Jellyfin (already one id per name)
+    /// every group resolves to its existing row and nothing changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when the rewrite transaction fails; the
+    /// marker is only written after a successful pass.
+    pub async fn unify_person_identities(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "person_identity_unified";
+        if self.identity.is_none() {
+            return Ok(0);
+        }
+        let done: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Value" FROM "HermitMeta" WHERE "Key" = ?1 LIMIT 1"#)
+                .bind(META_KEY)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        if done.as_deref() == Some("1") {
+            return Ok(0);
+        }
+
+        let person_type = stored_type_name(BaseItemKind::Person).unwrap_or_default();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Name" FROM "BaseItems" WHERE "Type" = ?1 ORDER BY "Id""#,
+        )
+        .bind(person_type)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let mut collapsed: u64 = 0;
+        let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (old_id, name) in rows {
+            let Some(name) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let Some(target) = self.person_item_id(name) else {
+                continue;
+            };
+            if old_id.eq_ignore_ascii_case(&target) {
+                seen_targets.insert(target);
+                continue;
+            }
+            // The target row must exist BEFORE any child rows repoint at it
+            // (FK BaseItems.Id) — collapse_person_row handles the ordering.
+            let create_target = seen_targets.insert(target.clone());
+            Self::collapse_person_row(&mut tx, person_type, name, &old_id, &target, create_target)
+                .await?;
+            collapsed += 1;
+        }
+        sqlx::query(
+            r#"INSERT INTO "HermitMeta" ("Key", "Value") VALUES (?1, '1')
+               ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
+        )
+        .bind(META_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(collapsed)
     }
 }
 
@@ -364,7 +526,12 @@ impl PeopleRepository for FerrofinPeopleRepository {
                 new_id
             };
 
-            // Materialize the browsable Person item (id = the Peoples id).
+            // Materialize the browsable Person item: ONE row per name with the
+            // deterministic Jellyfin id (Person.GetPath-derived), shared by
+            // every credit type — favorites written against it read back from
+            // every surface. Falls back to the Peoples row id when the
+            // identity seam is not wired (unit tests).
+            let item_id = self.person_item_id(name).unwrap_or_else(|| id.clone());
             if let Some(type_name) = person_type_name {
                 let clean = crate::text_util::get_clean_value(name);
                 sqlx::query(
@@ -373,7 +540,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
                         "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
                        VALUES (?1,?2,?3,?4,0,0,0,0,0,0,0)"#,
                 )
-                .bind(&id)
+                .bind(&item_id)
                 .bind(type_name)
                 .bind(name)
                 .bind(&clean)
@@ -386,14 +553,14 @@ impl PeopleRepository for FerrofinPeopleRepository {
             // yet — new people and those scanned before biographies existed.
             let overview: Option<String> =
                 sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(&id)
+                    .bind(&item_id)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?
                     .flatten();
             let needs_details = overview.is_none_or(|o| o.is_empty());
 
-            if let Ok(pid) = Uuid::parse_str(&id) {
+            if let Ok(pid) = Uuid::parse_str(&item_id) {
                 written.push(WrittenPerson {
                     id: pid,
                     needs_details,
@@ -547,6 +714,107 @@ mod tests {
             person_type: Some(person_type.to_owned()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn identity_wired_repo_materializes_one_person_item_per_name() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), "/data/metadata/People".to_owned());
+        let movie_a = Uuid::from_u128(0x11);
+        let movie_b = Uuid::from_u128(0x12);
+        seed_item(&db, movie_a, BaseItemKind::Movie).await;
+        seed_item(&db, movie_b, BaseItemKind::Movie).await;
+
+        // The same person credited as Actor on one item and Director on the
+        // other: TWO Peoples rows (per credit type, as upstream), but exactly
+        // ONE browsable Person item, at the deterministic per-name id.
+        repo.update_people(movie_a, &[person("Steve Carell", "Actor")])
+            .await
+            .expect("credits a");
+        repo.update_people(movie_b, &[person("Steve Carell", "Director")])
+            .await
+            .expect("credits b");
+
+        let expected = guid_to_db(
+            person_item_id(&mode, "/data/metadata/People", "Steve Carell").expect("derived"),
+        );
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("person items");
+        assert_eq!(rows, vec![expected], "one item row, at the derived id");
+
+        let people_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Peoples""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("peoples");
+        assert_eq!(people_rows, 2, "credit rows stay per (name, type)");
+    }
+
+    #[tokio::test]
+    async fn unify_collapses_duplicate_person_items_and_repoints_user_data() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        use crate::test_support::seed_named_item;
+
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        // Two pre-unification duplicates of one person (random per-type ids)…
+        let dup_a = Uuid::from_u128(0xA1);
+        let dup_b = Uuid::from_u128(0xA2);
+        seed_named_item(&db, dup_a, BaseItemKind::Person, "Uma Thurman").await;
+        seed_named_item(&db, dup_b, BaseItemKind::Person, "Uma Thurman").await;
+        // …one carrying a favorite.
+        let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x9)).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        crate::test_support::seed_user_data(&db, user_id, dup_a, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(dup_a))
+            .execute(db.writer())
+            .await
+            .expect("favorite");
+
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), "/data/metadata/People".to_owned());
+        let collapsed = repo.unify_person_identities().await.expect("unify");
+        assert_eq!(collapsed, 2);
+
+        let target = guid_to_db(
+            person_item_id(&mode, "/data/metadata/People", "Uma Thurman").expect("derived"),
+        );
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("person items");
+        assert_eq!(
+            rows,
+            vec![target.clone()],
+            "duplicates collapsed onto the derived id"
+        );
+        // The favorite followed the survivor.
+        let fav: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
+        )
+        .bind(&target)
+        .fetch_one(db.pool())
+        .await
+        .expect("fav");
+        assert_eq!(fav, 1);
+        // Idempotent: the marker short-circuits the second run.
+        assert_eq!(repo.unify_person_identities().await.expect("again"), 0);
     }
 
     #[tokio::test]
