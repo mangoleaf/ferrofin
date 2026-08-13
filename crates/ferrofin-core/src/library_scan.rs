@@ -2080,9 +2080,14 @@ impl LibraryScanner {
         Some((id, entity))
     }
 
-    /// Video library: every video file becomes a `Movie` directly under the collection
-    /// folder (per-title folders are recursed into). `root` is the library location, used
-    /// to name folder-based movies from their folder.
+    /// Video library: every video file becomes a `Movie` directly under the
+    /// collection folder (per-title folders are recursed into) — except files
+    /// the naming rules classify as EXTRAS (`-trailer` suffixes, `trailers/` /
+    /// `theme-music/` / `extras/` directories …), which become owned rows
+    /// (`OwnerId` + `ExtraType`) attached to the movie they belong to. Owned
+    /// rows are what `/Items/{id}/LocalTrailers`, `/SpecialFeatures`, and the
+    /// hasTrailer/hasThemeSong/… filters read; the browse queries' "unowned"
+    /// predicate keeps them out of the library grid.
     fn plan_movies(
         &self,
         dir: &str,
@@ -2091,12 +2096,61 @@ impl LibraryScanner {
         naming: &NamingOptions,
         out: &mut Vec<Planned>,
     ) {
+        let mut extras: Vec<(String, ferrofin_model::entities::ExtraType)> = Vec::new();
+        // Movies emitted per directory, for extras owner resolution.
+        let mut movies_by_dir: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+            std::collections::HashMap::new();
+        self.collect_movie_plan(dir, root, cf, naming, out, &mut extras, &mut movies_by_dir);
+        for (path, extra_type) in extras {
+            let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
+                continue; // an extra with no resolvable movie is skipped
+            };
+            let Some((id, mut entity)) =
+                self.base_item(BaseItemKind::Video, cf, cf, file_stem(&path), &path, false)
+            else {
+                continue;
+            };
+            entity.media_type = Some("Video".to_owned());
+            entity.extra_type = Some(extra_type as i32);
+            entity.owner_id = Some(guid_to_db(owner));
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            });
+        }
+    }
+
+    /// The recursive walk behind [`Self::plan_movies`]: emits movie rows,
+    /// collects extras for post-resolution, and records each directory's
+    /// movies for extras ownership.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_movie_plan(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+        extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) {
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_movies(&entry.path, root, cf, naming, out);
+                self.collect_movie_plan(&entry.path, root, cf, naming, out, extras, movies_by_dir);
                 continue;
             }
             if !video_resolver::is_video_file(&entry.path, naming) {
+                continue;
+            }
+            // Extras never become movies (upstream resolves extras first).
+            let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                &entry.path,
+                naming,
+                Some(root),
+            );
+            if let Some(extra_type) = extra.extra_type {
+                extras.push((entry.path.clone(), extra_type));
                 continue;
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
@@ -2118,6 +2172,10 @@ impl LibraryScanner {
             entity.is_movie = true;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
+            movies_by_dir
+                .entry(dir.to_owned())
+                .or_default()
+                .push((id, file_stem(&entry.path)));
             out.push(Planned {
                 id,
                 entity,
@@ -2464,6 +2522,41 @@ fn path_is_under(path: &str, root: &str) -> bool {
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Resolves which movie an extra belongs to: a movie in the extra's own
+/// directory whose file stem prefixes the extra's (`Movie-trailer.mkv` beside
+/// `Movie.mkv`), the directory's single movie, or the parent directory's
+/// single movie (`Movie (2020)/trailers/x.mkv`). Mirrors upstream's ownership
+/// (extras attach to the item owning their folder).
+fn owner_for_extra(
+    path: &str,
+    movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
+) -> Option<Uuid> {
+    let dir = std::path::Path::new(path)
+        .parent()?
+        .to_string_lossy()
+        .into_owned();
+    let stem = file_stem(path);
+    if let Some(movies) = movies_by_dir.get(&dir) {
+        if let Some((id, _)) = movies
+            .iter()
+            .find(|(_, movie_stem)| stem.to_lowercase().starts_with(&movie_stem.to_lowercase()))
+        {
+            return Some(*id);
+        }
+        if let [(id, _)] = movies.as_slice() {
+            return Some(*id);
+        }
+    }
+    let parent = std::path::Path::new(&dir)
+        .parent()?
+        .to_string_lossy()
+        .into_owned();
+    match movies_by_dir.get(&parent).map(Vec::as_slice) {
+        Some([(id, _)]) => Some(*id),
+        _ => None,
+    }
 }
 
 /// The file's creation time (falling back to modification time, then to now)
@@ -4782,6 +4875,56 @@ mod tests {
         assert!(!bytes.is_empty());
         assert_eq!(primary.width, 960);
         assert_eq!(primary.height, 540);
+    }
+
+    // Extras (suffix- and directory-classified) become OWNED rows attached to
+    // their movie, never Movie rows — feeding /LocalTrailers and the
+    // hasTrailer/… filters while staying out of the library grid.
+    #[tokio::test]
+    async fn scan_attaches_extras_to_their_movie() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository as _;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Heat (1995)");
+        std::fs::create_dir_all(folder.join("trailers")).unwrap();
+        std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
+        std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
+        std::fs::write(folder.join("trailers").join("alt.mkv"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        // Assert through the repository seams (the same queries the
+        // /LocalTrailers endpoint and browse run).
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let movies = repo
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                ..Default::default()
+            })
+            .await
+            .expect("movies");
+        assert_eq!(movies.len(), 1, "extras never become Movie rows");
+        let movie_id = Uuid::parse_str(&movies[0].id).expect("movie id");
+
+        let trailers = repo
+            .get_item_list(&InternalItemsQuery {
+                owner_ids: vec![movie_id],
+                extra_types: vec![ferrofin_model::entities::ExtraType::Trailer],
+                ..Default::default()
+            })
+            .await
+            .expect("trailers");
+        assert_eq!(
+            trailers.len(),
+            2,
+            "both trailer spellings attach to the movie"
+        );
     }
 
     #[tokio::test]
