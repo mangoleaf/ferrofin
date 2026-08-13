@@ -678,7 +678,9 @@ fn parse_order_by(
         .map(|(i, column)| {
             let order = orders
                 .get(i)
-                .or_else(|| orders.last())
+                // C# RequestHelpers.GetOrderBy pads missing orders with the
+                // FIRST requested order, not the last.
+                .or_else(|| orders.first())
                 .copied()
                 .unwrap_or(SortOrder::Ascending);
             (column, order)
