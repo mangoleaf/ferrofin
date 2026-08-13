@@ -152,6 +152,10 @@ async fn download_images(
     infos
 }
 
+/// The `MediaStreamInfos.StreamType` discriminant for an embedded image
+/// (an attached picture — cover art), matching `media_stream_type_to_disc`.
+const EMBEDDED_IMAGE_STREAM_TYPE: i32 = 3;
+
 /// The image file extensions the art-dir helpers recognize.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 
@@ -745,7 +749,8 @@ impl LibraryScanner {
             // Artwork — locked items skip the rewrite entirely: their image
             // rows are user-owned.
             if !locked {
-                self.persist_artwork(item.id, &entity, &mut art_cache).await;
+                self.persist_artwork(item.id, &entity, &streams, &mut art_cache)
+                    .await;
             }
             // Per-library refresh % for open dashboards (`RefreshProgress`),
             // at the same bounded cadence as the progress log plus each
@@ -1193,6 +1198,9 @@ impl LibraryScanner {
                 artist_mbid,
             )
             .await?;
+            // Last resort: an album with no artwork takes its first track's
+            // embedded cover (upstream's AlbumImageProvider).
+            self.inherit_album_cover(album_uuid, items).await;
         }
         Ok(())
     }
@@ -1785,6 +1793,114 @@ impl LibraryScanner {
         Ok(())
     }
 
+    /// Extracts a track's embedded cover art (ID3 `APIC` / FLAC picture) into
+    /// the item's metadata dir as its `Primary` image, when the probe found an
+    /// embedded-image stream and the file has no local artwork.
+    ///
+    /// Port of upstream's `AudioImageProvider`. Best-effort: no encoder, no
+    /// metadata dir, no image stream, or a failed extraction all yield nothing.
+    /// Idempotent — an already-extracted file is reused without re-running
+    /// ffmpeg.
+    async fn extract_embedded_cover(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+    ) -> Vec<ItemImageInfo> {
+        if image_item_kind(&entity.type_) != ImageItemKind::Audio {
+            return Vec::new();
+        }
+        let (Some(encoder), Some(meta_root), Some(path)) = (
+            &self.media_encoder,
+            &self.metadata_dir,
+            entity.path.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        // `StreamType` 3 is EmbeddedImage (the probe's classification of an
+        // attached picture); without one there is nothing to extract.
+        let Some(index) = streams
+            .iter()
+            .find(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
+            .map(|s| s.stream_index)
+        else {
+            return Vec::new();
+        };
+        let dir = meta_root.join(item_id.to_string());
+        let stem = image_type_file_stem(ImageType::Primary);
+        let dest = dir.join(format!("{stem}.jpg"));
+        if !dest.exists() {
+            let index = i32::try_from(index).ok();
+            let Ok(extracted) = encoder.extract_audio_image(path, index).await else {
+                return Vec::new();
+            };
+            // ffmpeg writes next to the media file; move it into the metadata
+            // dir so the user's library stays untouched.
+            if let Err(err) = std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::copy(&extracted, &dest).map(|_| ()))
+            {
+                tracing::warn!(%err, item = %item_id, "failed to store embedded cover art");
+                let _ = std::fs::remove_file(&extracted);
+                return Vec::new();
+            }
+            let _ = std::fs::remove_file(&extracted);
+        }
+        vec![ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: file_date_modified(&dest),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }]
+    }
+
+    /// Gives an album with no artwork of its own its first track's image
+    /// (upstream's `AlbumImageProvider`, which takes the album's cover from a
+    /// child song). Best-effort; runs in the post-scan music pass, once every
+    /// track's own art exists.
+    async fn inherit_album_cover(&self, album_uuid: Uuid, items: &dyn ItemRepository) {
+        let Ok(existing) = items.get_image_infos(album_uuid).await else {
+            return;
+        };
+        if !existing.is_empty() {
+            return;
+        }
+        let Ok(tracks) = items
+            .get_item_list(&InternalItemsQuery {
+                parent_id: album_uuid,
+                include_item_types: vec![BaseItemKind::Audio],
+                ..Default::default()
+            })
+            .await
+        else {
+            return;
+        };
+        for track in tracks {
+            let Ok(track_id) = Uuid::parse_str(&track.id) else {
+                continue;
+            };
+            let Ok(images) = items.get_image_infos(track_id).await else {
+                continue;
+            };
+            // Keep looking until a track actually has a Primary image.
+            let Some(primary) = images
+                .into_iter()
+                .find(|i| i.image_type == ImageType::Primary)
+            else {
+                continue;
+            };
+            if let Err(err) = self
+                .persistence
+                .save_item_images(album_uuid, std::slice::from_ref(&primary))
+                .await
+            {
+                tracing::warn!(%err, album = %album_uuid, "failed to inherit album cover");
+            }
+            return;
+        }
+    }
+
     /// Discovers and persists the item's artwork: local files next to the
     /// media first (poster/backdrop/logo/…), then a TMDB fallback for
     /// movies/series with none — matching Jellyfin, which fetches remote
@@ -1796,9 +1912,13 @@ impl LibraryScanner {
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
         art_cache: &mut ArtworkCache,
     ) {
         let mut images = discover_local_images(entity);
+        if images.is_empty() {
+            images = self.extract_embedded_cover(item_id, entity, streams).await;
+        }
         if images.is_empty() {
             images = self.fetch_remote_images(entity, art_cache).await;
         }
@@ -3209,6 +3329,12 @@ fn image_item_kind(type_: &str) -> ImageItemKind {
         "Episode" => ImageItemKind::Episode,
         "MusicVideo" => ImageItemKind::MusicVideo,
         "Video" => ImageItemKind::Video,
+        // Music kinds have their own filename tables upstream (an album prefers
+        // its folder name + `cdart`; a song takes no local image of its own).
+        "MusicAlbum" => ImageItemKind::MusicAlbum,
+        "MusicArtist" => ImageItemKind::MusicArtist,
+        "AudioBook" => ImageItemKind::AudioBook,
+        "Audio" => ImageItemKind::Audio,
         _ => ImageItemKind::Generic,
     }
 }
@@ -3885,6 +4011,120 @@ mod tests {
         assert!(e.primary_image_url.is_none());
     }
 
+    // A track's embedded cover becomes its Primary image, stored in the
+    // metadata dir (never next to the user's media), and the album inherits it.
+    #[tokio::test]
+    async fn embedded_cover_art_lands_on_the_track_and_its_album() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let track_path = tmp.path().join("01 - So What.flac");
+        std::fs::write(&track_path, b"audio").unwrap();
+
+        let album_id = uuid::Uuid::new_v4();
+        let track_id = uuid::Uuid::new_v4();
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(album_id),
+                    type_: stored_type_name(BaseItemKind::MusicAlbum)
+                        .unwrap()
+                        .to_owned(),
+                    name: Some("Kind of Blue".into()),
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(track_id),
+                    type_: stored_type_name(BaseItemKind::Audio).unwrap().to_owned(),
+                    name: Some("So What".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
+                    path: Some(track_path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("seed");
+        let track = items.retrieve_item(track_id).await.unwrap().unwrap();
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let meta = tmp.path().join("metadata");
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_probe(
+                    Arc::new(FakeProbe),
+                    Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+                    Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+                        db.clone(),
+                    )),
+                )
+                .with_items(Arc::clone(&items))
+                .with_metadata_dir(meta.clone());
+
+        // The probe's stream rows: an audio stream plus the attached picture.
+        let streams = vec![
+            super::MediaStreamInfoEntity {
+                item_id: ferrofin_db::store::guid_to_db(track_id),
+                stream_index: 0,
+                stream_type: 1,
+                ..Default::default()
+            },
+            super::MediaStreamInfoEntity {
+                item_id: ferrofin_db::store::guid_to_db(track_id),
+                stream_index: 1,
+                stream_type: super::EMBEDDED_IMAGE_STREAM_TYPE,
+                ..Default::default()
+            },
+        ];
+        let images = scanner
+            .extract_embedded_cover(track_id, &track, &streams)
+            .await;
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0].image_type,
+            ferrofin_model::entities::ImageType::Primary
+        );
+        let stored = std::path::Path::new(&images[0].path);
+        assert!(
+            stored.starts_with(&meta),
+            "cover lives under the metadata dir, not the library: {stored:?}"
+        );
+        assert_eq!(std::fs::read(stored).unwrap(), b"COVER");
+        // ffmpeg's scratch file next to the media is cleaned up.
+        assert!(!tmp.path().join("01 - So What.flac.image.jpg").exists());
+
+        // Persist it, then the album inherits it (upstream AlbumImageProvider).
+        persistence
+            .save_item_images(track_id, &images)
+            .await
+            .expect("save track image");
+        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        let album_images = items.get_image_infos(album_id).await.unwrap();
+        assert_eq!(album_images.len(), 1);
+        assert_eq!(album_images[0].path, images[0].path);
+
+        // A track with no image stream extracts nothing.
+        let none = scanner
+            .extract_embedded_cover(track_id, &track, &streams[..1])
+            .await;
+        assert!(none.is_empty());
+    }
+
     use crate::media_stream_repository::FerrofinMediaStreamRepository;
     use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
     use async_trait::async_trait;
@@ -3942,10 +4182,14 @@ mod tests {
         }
         async fn extract_audio_image(
             &self,
-            _path: &str,
+            path: &str,
             _image_stream_index: Option<i32>,
         ) -> Result<String, ServiceError> {
-            unreachable!()
+            // Mirrors the real encoder: ffmpeg writes `{path}.image.jpg` next
+            // to the media file, and the caller relocates it.
+            let out = format!("{path}.image.jpg");
+            std::fs::write(&out, b"COVER").expect("write cover");
+            Ok(out)
         }
         async fn extract_video_image(
             &self,
