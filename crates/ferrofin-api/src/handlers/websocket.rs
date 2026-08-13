@@ -62,8 +62,33 @@ struct SocketCaller {
     user_id: uuid::Uuid,
 }
 
-/// Resolves the caller's session id from the socket's access token, or `None`
-/// when anonymous.
+/// Why a socket ended up anonymous — kept distinct so the logs can tell
+/// "client never sent a token" (expected for pre-auth clients) from "a token
+/// was sent but didn't resolve" (bad client input, or a server bug that would
+/// silently drop SyncPlay/push delivery).
+#[derive(Clone, Copy)]
+enum AnonymousReason {
+    /// No `api_key`/`ApiKey` query parameter and no token header.
+    NoToken,
+    /// A token was presented but the session manager could not resolve it.
+    TokenUnresolved,
+    /// The token resolved to a session that carries no session id.
+    SessionWithoutId,
+}
+
+impl AnonymousReason {
+    /// The value logged in the `reason` field.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoToken => "no-token",
+            Self::TokenUnresolved => "token-unresolved",
+            Self::SessionWithoutId => "session-without-id",
+        }
+    }
+}
+
+/// Resolves the caller's session id from the socket's access token, or the
+/// reason the socket is anonymous.
 ///
 /// The WebSocket carries its token as the `api_key`/`ApiKey` query parameter (the
 /// Jellyfin convention) or, failing that, an `X-Emby-Token`/`X-MediaBrowser-Token`
@@ -81,17 +106,22 @@ async fn resolve_caller(
     state: &AppState,
     headers: &HeaderMap,
     query: Option<&str>,
-) -> Option<SocketCaller> {
+) -> Result<SocketCaller, AnonymousReason> {
     let token = query_param(query, "api_key")
         .or_else(|| query_param(query, "ApiKey"))
-        .or_else(|| header_token(headers))?;
+        .or_else(|| header_token(headers))
+        .ok_or(AnonymousReason::NoToken)?;
     let session = state
         .sessions
         .get_session_by_authentication_token(&token, "", "")
         .await
-        .ok()?;
-    Some(SocketCaller {
-        session_id: session.id?,
+        .map_err(|e| {
+            tracing::warn!(error = %e, "websocket token did not resolve to a session");
+            AnonymousReason::TokenUnresolved
+        })?;
+    let session_id = session.id.ok_or(AnonymousReason::SessionWithoutId)?;
+    Ok(SocketCaller {
+        session_id,
         user_id: session.user_id,
     })
 }
@@ -206,14 +236,18 @@ fn subscription_period(data: Option<&str>) -> Duration {
     skip_all,
     fields(session_id = caller.as_ref().map_or("anonymous", |c| c.session_id.as_str()))
 )]
-async fn handle_socket(mut socket: WebSocket, state: AppState, caller: Option<SocketCaller>) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    caller: Result<SocketCaller, AnonymousReason>,
+) {
     let started = std::time::Instant::now();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
     // closing the loop.
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let registration = match (caller.as_ref(), state.session_bus.as_ref()) {
+    let registration = match (caller.as_ref().ok(), state.session_bus.as_ref()) {
         (Some(c), Some(bus)) => {
             let sink_tx = tx.clone();
             bus.register(
@@ -228,10 +262,18 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, caller: Option<So
         }
         _ => None,
     };
-    tracing::info!(
-        authenticated = registration.is_some(),
-        "websocket connected"
-    );
+    match &caller {
+        Ok(_) => tracing::info!(
+            authenticated = registration.is_some(),
+            "websocket connected"
+        ),
+        Err(reason) => tracing::info!(
+            authenticated = false,
+            reason = reason.as_str(),
+            "websocket connected"
+        ),
+    }
+    let caller = caller.ok();
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_SECS));
     keepalive.tick().await; // consume the immediate first tick
