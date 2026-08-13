@@ -284,6 +284,16 @@ async fn report_playback_progress(
 ) -> Result<StatusCode, ApiError> {
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
+    // Each progress report keeps the session's transcode alive (upstream wires
+    // SessionManager.PlaybackProgress → PingTranscodingJob) — without it the
+    // idle reaper would kill a healthy transcode whose client doesn't send
+    // explicit /Sessions/Playing/Ping calls.
+    if let Some(psid) = info.play_session_id.as_deref().filter(|s| !s.is_empty()) {
+        let _ = state
+            .hls
+            .ping_transcoding_job(psid, Some(info.is_paused))
+            .await;
+    }
     // The controller reports client-driven progress, so `is_automated` is false.
     state.sessions.on_playback_progress(&info, false).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -338,9 +348,11 @@ async fn report_playback_stopped(
     RequireAuth(auth): RequireAuth,
     Json(mut info): Json<PlaybackStopInfo>,
 ) -> Result<StatusCode, ApiError> {
-    // The transcode-job kill (C# `KillTranscodingJobs`) is deferred; the play-
-    // state bookkeeping below is the portable slice.
     info.session_id = Some(current_session_id(&state, &auth).await?);
+    // A stop report kills the session's live transcode and deletes its partial
+    // files (C# PlaystateController → KillTranscodingJobs). Without it the job
+    // encodes to the end of the item for nobody.
+    kill_session_transcodes(&state, &auth, info.play_session_id.as_deref()).await;
     let item_id = info.item_id;
     state.sessions.on_playback_stopped(&info).await?;
     record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
@@ -471,6 +483,13 @@ async fn on_playback_progress(
     };
     info.play_method = validate_play_method(info.play_method);
     info.session_id = Some(current_session_id(&state, &auth).await?);
+    // Keep the session's transcode alive, as the modern progress route does.
+    if let Some(psid) = info.play_session_id.as_deref().filter(|s| !s.is_empty()) {
+        let _ = state
+            .hls
+            .ping_transcoding_job(psid, Some(info.is_paused))
+            .await;
+    }
     state.sessions.on_playback_progress(&info, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -517,6 +536,8 @@ async fn on_playback_stopped(
         ..PlaybackStopInfo::default()
     };
     info.session_id = Some(current_session_id(&state, &auth).await?);
+    // The legacy stop form kills the session's transcode too (same upstream path).
+    kill_session_transcodes(&state, &auth, info.play_session_id.as_deref()).await;
     state.sessions.on_playback_stopped(&info).await?;
     record_metrics_stopped(&state, info.play_session_id.as_deref(), info.position_ticks).await;
     Ok(StatusCode::NO_CONTENT)
@@ -557,6 +578,28 @@ async fn on_playback_stopped_for_user(
     query: Query<LegacyStopQuery>,
 ) -> Result<StatusCode, ApiError> {
     on_playback_stopped(state, auth, Path(item_id), query).await
+}
+
+/// Kills the live transcode job(s) for a stopping playback session — matched by
+/// its `playSessionId` when present, else everything on the caller's device —
+/// deleting their partial files (C# `PlaystateController` →
+/// `_transcodeManager.KillTranscodingJobs(deviceId, playSessionId, _ => true)`).
+///
+/// Best-effort: a stop report must still record playstate even if the kill
+/// dispatch fails, so the error is logged, not returned.
+async fn kill_session_transcodes(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    play_session_id: Option<&str>,
+) {
+    let request = ferrofin_traits::media_encoding::HlsStreamRequest {
+        play_session_id: play_session_id.map(str::to_owned),
+        device_id: auth.device_id.clone(),
+        ..Default::default()
+    };
+    if let Err(error) = state.hls.stop_encoding(&request).await {
+        tracing::warn!(%error, "failed to stop transcodes for a stopped playback session");
+    }
 }
 
 /// Parses a stored user-entity id string to a [`Uuid`], falling back to nil.
