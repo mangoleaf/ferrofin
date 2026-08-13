@@ -382,13 +382,17 @@ pub async fn build_app_state(
     // user/device managers (invalidation on mutation) — the sharing is what
     // makes cached auth revocation-correct. See ferrofin_core::auth_cache.
     let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::default());
+    let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
+        Arc::new(FerrofinActivityManager::new(db.clone()));
     let users: Arc<dyn ferrofin_traits::library::UserManager> = Arc::new(
         FerrofinUserManager::new(db.clone())
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
                 std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
             )
-            .with_auth_cache(Arc::clone(&auth_cache)),
+            .with_auth_cache(Arc::clone(&auth_cache))
+            // A lockout is a dashboard Alert, not just a log line.
+            .with_activity(Arc::clone(&activity)),
     );
     let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
         FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
@@ -399,8 +403,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
-        Arc::new(FerrofinActivityManager::new(db.clone()));
     // The playlists media folder lives at `{data}/playlists` (C#
     // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
@@ -912,6 +914,61 @@ pub async fn build_app_state(
             "TaskCompleted",
             SessionMessageType::ScheduledTaskEnded,
             true,
+        );
+
+        // Session start/end also land in the dashboard's activity feed — the
+        // bulk of what Jellyfin's feed shows (port of the SessionStartedLogger
+        // / SessionEndedLogger event consumers).
+        let log_session_event =
+            |bus: &FerrofinEventManager,
+             event: &'static str,
+             type_: &'static str,
+             template: fn(&str, &str) -> String| {
+                let activity = Arc::clone(&activity);
+                bus.subscribe(
+                    event,
+                    Arc::new(move |payload: &str| {
+                        let Ok(session) =
+                            serde_json::from_str::<ferrofin_model::dto::SessionInfoDto>(payload)
+                        else {
+                            return Ok(());
+                        };
+                        // A session with no user (an API key client) writes nothing,
+                        // matching upstream's user-scoped loggers.
+                        let Some(user_name) = session.user_name.filter(|n| !n.is_empty()) else {
+                            return Ok(());
+                        };
+                        let user_id = (!session.user_id.is_nil()).then_some(session.user_id);
+                        let device = session.device_name.unwrap_or_default();
+                        let entry = ferrofin_traits::activity::ActivityLogCreate {
+                            name: template(&user_name, &device),
+                            type_: type_.to_owned(),
+                            user_id,
+                            short_overview: session
+                                .remote_end_point
+                                .filter(|e| !e.is_empty())
+                                .map(|endpoint| format!("IP address: {endpoint}")),
+                            ..Default::default()
+                        };
+                        let activity = Arc::clone(&activity);
+                        tokio::spawn(async move {
+                            let _ = activity.create_entry(entry).await;
+                        });
+                        Ok(())
+                    }),
+                );
+            };
+        log_session_event(
+            &event_bus,
+            "SessionStarted",
+            "SessionStarted",
+            |user, device| format!("{user} is online from {device}"),
+        );
+        log_session_event(
+            &event_bus,
+            "SessionEnded",
+            "SessionEnded",
+            |user, device| format!("{user} has disconnected from {device}"),
         );
     }
 

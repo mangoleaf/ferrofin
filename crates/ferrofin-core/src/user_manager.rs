@@ -85,6 +85,9 @@ pub struct FerrofinUserManager {
     /// composition root via [`with_server_id`](FerrofinUserManager::with_server_id);
     /// `None` in tests (which then omit `ServerId`, the prior behaviour).
     server_id: Option<String>,
+    /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
+    /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
+    activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
     /// The shared token-resolution cache — cleared on every user mutation
     /// (update/delete, password, policy, configuration) so cached auth can
     /// never outlive a change to what it authorizes.
@@ -132,6 +135,18 @@ impl FerrofinUserManager {
                 attempts,
                 "account locked out after repeated failed logins"
             );
+            // The admin needs to see this without reading the server log.
+            if let Some(activity) = &self.activity {
+                let _ = activity
+                    .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                        name: format!("User {} has been locked out", user.username),
+                        type_: "UserLockedOut".to_owned(),
+                        user_id: Uuid::parse_str(&user.id).ok(),
+                        severity: ferrofin_model::activity::LogLevel::Error,
+                        ..Default::default()
+                    })
+                    .await;
+            }
         }
         sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
             .bind(&user.id)
@@ -161,9 +176,21 @@ impl FerrofinUserManager {
             invalid_provider: InvalidAuthProvider::new(),
             providers,
             server_id: None,
+            activity: None,
             profile_image_dir: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Attaches the activity-log seam so an account lockout is recorded as a
+    /// dashboard Alert.
+    #[must_use]
+    pub fn with_activity(
+        mut self,
+        activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    ) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
@@ -1494,8 +1521,39 @@ mod tests {
 
     #[tokio::test]
     async fn lockout_disables_after_threshold() {
+        #[derive(Default)]
+        struct RecordingActivity {
+            entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+        }
+        #[async_trait::async_trait]
+        impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
+            async fn get_paged_result(
+                &self,
+                _query: &ferrofin_traits::activity::ActivityLogQuery,
+            ) -> Result<
+                ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
+                ServiceError,
+            > {
+                unimplemented!()
+            }
+            async fn create_entry(
+                &self,
+                entry: ferrofin_traits::activity::ActivityLogCreate,
+            ) -> Result<(), ServiceError> {
+                self.entries.lock().unwrap().push(entry);
+                Ok(())
+            }
+            async fn clean(
+                &self,
+                _before: chrono::DateTime<chrono::Utc>,
+            ) -> Result<u64, ServiceError> {
+                Ok(0)
+            }
+        }
+
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db.clone());
+        let activity = Arc::new(RecordingActivity::default());
+        let mgr = FerrofinUserManager::new(db.clone()).with_activity(activity.clone());
         let user = mgr.create_user("dan").await.expect("create");
         mgr.change_password(Uuid::parse_str(&user.id).expect("uuid"), "pw")
             .await
@@ -1520,6 +1578,19 @@ mod tests {
                 .expect("call")
                 .is_none()
         );
+
+        // The lockout is an Error-severity dashboard Alert, not just a log line
+        // (port of `UserLockedOutLogger`).
+        {
+            let entries = activity.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1, "one lockout entry: {entries:?}");
+            assert_eq!(entries[0].type_, "UserLockedOut");
+            assert_eq!(entries[0].name, "User dan has been locked out");
+            assert_eq!(
+                entries[0].severity,
+                ferrofin_model::activity::LogLevel::Error
+            );
+        }
 
         assert!(
             has_permission(db.pool(), &user.id, PermissionKind::IsDisabled)
