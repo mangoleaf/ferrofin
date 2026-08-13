@@ -288,6 +288,9 @@ pub struct LibraryScanner {
     /// Item repository for the post-scan music-enrichment pass (querying the
     /// MusicAlbum/MusicArtist rows + tracks it created). Absent → no music pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
+    /// Studio artwork-repository client for the post-scan studio-thumb pass.
+    /// Absent → Studio rows keep whatever images they already have.
+    studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
     metadata_dir: Option<PathBuf>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
@@ -345,6 +348,7 @@ impl LibraryScanner {
             musicbrainz: None,
             audiodb: None,
             item_repository: None,
+            studios_client: None,
             metadata_dir: None,
             people: None,
             chapters: None,
@@ -455,6 +459,18 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_items(mut self, item_repository: Arc<dyn ItemRepository>) -> Self {
         self.item_repository = Some(item_repository);
+        self
+    }
+
+    /// Attaches the studio artwork-repository client: after each scan, Studio
+    /// by-name rows still without artwork get their repository thumb
+    /// downloaded into the metadata dir (upstream's `StudiosImageProvider`,
+    /// which runs as part of a studio's refresh). Needs
+    /// [`with_items`](Self::with_items) (or `with_music`) and
+    /// [`with_metadata`](Self::with_metadata)'s metadata dir to act.
+    #[must_use]
+    pub fn with_studio_images(mut self, studios: Arc<ferrofin_providers::StudiosClient>) -> Self {
+        self.studios_client = Some(studios);
         self
     }
 
@@ -745,20 +761,32 @@ impl LibraryScanner {
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
+        self.post_scan_passes(folders).await;
+        Ok(planned.len())
+    }
+
+    /// The best-effort enrichment passes that run once the item walk is done.
+    /// Each is independent and logs its own failure — none may fail the scan.
+    async fn post_scan_passes(&self, folders: &[VirtualFolderInfo]) {
         // Library tile images: composite each library's Primary from its own
         // content (upstream CollectionFolderImageProvider), so the home
         // screen's "My Media" tiles carry artwork instead of the blue
-        // placeholder. Best-effort — a failure must not fail the scan.
+        // placeholder.
         if let Err(err) = self.refresh_library_images(folders).await {
             tracing::warn!(%err, "library image pass failed");
         }
-        // Post-scan music enrichment: resolve MusicBrainz ids (and, once wired,
+        // Music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
-        // above. Best-effort — a failure here must not fail the whole scan.
+        // above.
         if let Err(err) = self.enrich_music().await {
             tracing::warn!(%err, "music enrichment pass failed");
         }
-        Ok(planned.len())
+        // Studio thumbs from the artwork repository for the by-name Studio
+        // rows the item-values step materialized, so the TV Networks /
+        // Studios tabs carry artwork.
+        if let Err(err) = self.enrich_studio_images().await {
+            tracing::warn!(%err, "studio image pass failed");
+        }
     }
 
     /// Resolves the folder set a scan covers: all libraries, or — when `only`
@@ -1685,6 +1713,68 @@ impl LibraryScanner {
                 }
             }
         }
+    }
+
+    /// Downloads the artwork-repository thumb for every Studio row still
+    /// without images (port of upstream's `StudiosImageProvider`). Idempotent:
+    /// studios with any image row are skipped, and downloads reuse on-disk
+    /// files. Best-effort per studio — one failure skips that studio only.
+    async fn enrich_studio_images(&self) -> Result<(), ServiceError> {
+        let (Some(studios), Some(repo), Some(meta_root)) = (
+            &self.studios_client,
+            &self.item_repository,
+            &self.metadata_dir,
+        ) else {
+            return Ok(());
+        };
+        let result = repo
+            .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
+            .await?;
+        for row in result.items {
+            let entity = row.item;
+            let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(&entity.id) else {
+                continue;
+            };
+            if !repo.get_image_infos(id).await?.is_empty() {
+                continue;
+            }
+            let Some(url) = studios.thumb_url(name).await else {
+                continue;
+            };
+            let dir = meta_root.join(id.to_string());
+            let stem = image_type_file_stem(ImageType::Thumb);
+            let dest = if let Some(existing) = existing_art_file(&dir, stem) {
+                existing
+            } else {
+                let dest = dir.join(format!("{stem}.jpg"));
+                let Some(bytes) = studios.download(&url).await else {
+                    continue;
+                };
+                if let Err(err) =
+                    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&dest, &bytes))
+                {
+                    tracing::warn!(%err, studio = name, "failed to write studio thumb");
+                    continue;
+                }
+                dest
+            };
+            let mut images = vec![ItemImageInfo {
+                path: dest.to_string_lossy().into_owned(),
+                image_type: ImageType::Thumb,
+                date_modified: file_date_modified(&dest),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }];
+            self.fill_image_metadata(&mut images).await;
+            if let Err(err) = self.persistence.save_item_images(id, &images).await {
+                tracing::warn!(%err, studio = name, "failed to persist studio thumb");
+            }
+        }
+        Ok(())
     }
 
     /// Discovers and persists the item's artwork: local files next to the
@@ -3242,6 +3332,106 @@ mod tests {
     // The post-scan music pass resolves each album's + artist's MusicBrainz ids
     // from the embedded ids on its tracks (no network when they're all present),
     // and aggregates the album-artist onto the album. Seeds through the seams.
+    /// Serves `manifest` for `thumbs.txt` requests and `image` for everything
+    /// else — enough HTTP for the studios client (blocking, own thread).
+    fn spawn_art_server(manifest: &'static str, image: &'static [u8]) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body: Vec<u8> = if req.contains("thumbs.txt") {
+                    manifest.as_bytes().to_vec()
+                } else {
+                    image.to_vec()
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(&body);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // The post-scan studio pass downloads the artwork-repository thumb for a
+    // materialized Studio row without images — and skips it once it has one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_studio_images_downloads_thumbs_for_bare_studios() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        // A movie crediting the studio; saving its item values materializes
+        // the Studio by-name row.
+        let movie_id = uuid::Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(movie_id),
+                type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+                name: Some("Solaris".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed movie");
+        persistence
+            .save_item_values(movie_id, &[(3, "Mosfilm".into())])
+            .await
+            .expect("materialize studio");
+        let studios = items
+            .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
+            .await
+            .expect("studios");
+        assert_eq!(studios.items.len(), 1);
+        let studio_id = uuid::Uuid::parse_str(&studios.items[0].item.id).unwrap();
+
+        let base = spawn_art_server("Mosfilm", b"JPEGDATA");
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_metadata_dir(tmp.path().join("metadata"))
+                .with_studio_images(Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
+                    &base,
+                )));
+
+        scanner.enrich_studio_images().await.expect("enrich");
+
+        let images = items.get_image_infos(studio_id).await.expect("images");
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images[0].image_type,
+            ferrofin_model::entities::ImageType::Thumb
+        );
+        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"JPEGDATA");
+
+        // Idempotent: a second pass leaves the single image row in place.
+        scanner.enrich_studio_images().await.expect("re-enrich");
+        let images = items.get_image_infos(studio_id).await.expect("images");
+        assert_eq!(images.len(), 1);
+    }
+
     #[tokio::test]
     async fn enrich_music_resolves_ids_from_embedded_track_tags() {
         use crate::item_persistence_service::FerrofinItemPersistenceService;

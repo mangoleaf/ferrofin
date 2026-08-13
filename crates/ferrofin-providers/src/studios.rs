@@ -133,6 +133,16 @@ impl StudiosClient {
         *self.manifest.lock().expect("manifest lock") = Some(entries);
     }
 
+    /// Downloads `url`, returning its bytes; `None` on any failure
+    /// (best-effort, like the metadata clients' image downloads).
+    pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
+        let resp = self.http.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.bytes().await.ok().map(|b| b.to_vec())
+    }
+
     /// The thumb URL for `studio_name`, or `None` when the repository has no
     /// matching studio. Port of `FindMatch` + `GetUrl`.
     pub async fn thumb_url(&self, studio_name: &str) -> Option<String> {

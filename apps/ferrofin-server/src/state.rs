@@ -324,7 +324,7 @@ pub async fn build_app_state(
             )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
-            .with_studios(studios_client),
+            .with_studios(Arc::clone(&studios_client)),
     );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
@@ -494,6 +494,9 @@ pub async fn build_app_state(
     // AudioDb artist bio/genre + artist/album artwork (by MusicBrainz id),
     // fetched in the post-scan music pass. Built-in free key.
     .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::new()))
+    // Studio thumbs from the artwork repository, downloaded post-scan for the
+    // by-name Studio rows so the TV Networks / Studios tabs carry artwork.
+    .with_studio_images(Arc::clone(&studios_client))
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
     .with_image_processor(Arc::clone(&image_processor));
