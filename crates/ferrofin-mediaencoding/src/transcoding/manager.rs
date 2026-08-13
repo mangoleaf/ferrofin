@@ -153,6 +153,9 @@ struct RunningJob {
 /// mutable bookkeeping the registry tracks.
 struct RegisteredJob {
     handle: TranscodingJobHandle,
+    /// The playing media in operator terms (`TranscodeDisplayNames::label`),
+    /// so kill/reap logs name what died; empty when never resolved.
+    display: String,
     is_user_paused: bool,
     ping_timeout_ms: i64,
     /// Number of active output requests (`ActiveRequestCount`); a job with zero
@@ -234,6 +237,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     pub fn register_job(&self, handle: TranscodingJobHandle) -> TranscodingJobHandle {
         let job = RegisteredJob {
             ping_timeout_ms: RegisteredJob::ping_timeout_for(handle.job_type),
+            display: String::new(),
             is_user_paused: false,
             // Consumers are counted by begin/end request pairing (the guard);
             // registration itself stamps last_activity, which keeps the idle
@@ -298,7 +302,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     #[tracing::instrument(
         name = "transcode_job",
         skip_all,
-        fields(play_session_id = tracing::field::Empty, device_id = tracing::field::Empty)
+        fields(
+            play_session_id = tracing::field::Empty,
+            device_id = tracing::field::Empty,
+            playing = tracing::field::Empty
+        )
     )]
     pub async fn start_ffmpeg(
         &self,
@@ -322,6 +330,12 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             state.play_session_id.as_deref().unwrap_or(""),
         );
         job_span.record("device_id", state.device_id.as_deref().unwrap_or(""));
+        // What the job is playing, in operator terms ("Library / Series -
+        // Episode") — every event under this span names the media, not just ids.
+        let display = state.display.label();
+        if !display.is_empty() {
+            job_span.record("playing", display.as_str());
+        }
         tracing::info!(
             transcode_type = ?state.transcoding_type,
             program = %program,
@@ -356,8 +370,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             device_id: state.device_id.clone(),
         };
 
-        // 4. Register the job FIRST (OnTranscodeBeginning).
+        // 4. Register the job FIRST (OnTranscodeBeginning), naming what it
+        // plays so a later kill/reap log doesn't reduce to ids.
         self.register_job(handle.clone());
+        self.set_job_display(&handle, &display);
 
         // 5. Spawn; on failure remove the job (OnTranscodeFailedToStart).
         let child = match transcoder.start_transcode(&req).await {
@@ -508,17 +524,22 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
     pub async fn kill_and_remove(&self, handle: &TranscodingJobHandle, delete_files: bool) {
-        let running = {
+        let (display, running) = {
             let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
             let idx = jobs.iter().position(|j| {
                 j.handle.job_type == handle.job_type
                     && j.handle.path.eq_ignore_ascii_case(&handle.path)
             });
-            idx.and_then(|i| jobs.remove(i).running)
+            match idx.map(|i| jobs.remove(i)) {
+                Some(job) => (job.display, job.running),
+                None => (String::new(), None),
+            }
         };
+        let playing_label = display;
         if let Some(running) = running {
             tracing::info!(
                 play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                playing = %playing_label,
                 delete_files,
                 "transcode job killed"
             );
@@ -551,7 +572,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
     pub async fn reap_idle_jobs(&self) -> Vec<TranscodingJobHandle> {
-        let idle: Vec<TranscodingJobHandle> = {
+        let idle: Vec<(TranscodingJobHandle, String)> = {
             let jobs = self.jobs.lock().expect("jobs lock poisoned");
             jobs.iter()
                 .filter(|j| {
@@ -559,19 +580,20 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                         && i64::try_from(j.last_activity.elapsed().as_millis()).unwrap_or(i64::MAX)
                             > j.ping_timeout_ms
                 })
-                .map(|j| j.handle.clone())
+                .map(|j| (j.handle.clone(), j.display.clone()))
                 .collect()
         };
-        for handle in &idle {
+        for (handle, playing_label) in &idle {
             tracing::info!(
                 path = %handle.path,
                 play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
                 device_id = handle.device_id.as_deref().unwrap_or(""),
+                playing = %playing_label,
                 "killing idle transcode job (no consumer within the ping timeout)"
             );
             self.kill_and_remove(handle, true).await;
         }
-        idle
+        idle.into_iter().map(|(handle, _)| handle).collect()
     }
 
     /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
@@ -623,6 +645,26 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }) {
             job.active_request_count = (job.active_request_count - 1).max(0);
             job.last_activity = std::time::Instant::now();
+        }
+    }
+
+    /// Names what the registered job for `handle` is playing (the label the
+    /// kill/reap logs print). A no-op for an empty label or an unknown job.
+    fn set_job_display(&self, handle: &TranscodingJobHandle, display: &str) {
+        if display.is_empty() {
+            return;
+        }
+        if let Some(job) = self
+            .jobs
+            .lock()
+            .expect("jobs lock poisoned")
+            .iter_mut()
+            .find(|j| {
+                j.handle.job_type == handle.job_type
+                    && j.handle.path.eq_ignore_ascii_case(&handle.path)
+            })
+        {
+            display.clone_into(&mut job.display);
         }
     }
 
@@ -1038,6 +1080,7 @@ mod tests {
 /// [`FakeSegmentTranscoder`] seam so no real ffmpeg is involved.
 #[cfg(test)]
 mod start_ffmpeg_tests {
+    use crate::encoding_helper::TranscodeDisplayNames;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1073,6 +1116,7 @@ mod start_ffmpeg_tests {
     /// Builds an HLS `EncodingJobInfo` writing its playlist at `output_path`.
     fn state(output_path: &Path, wait_for: Option<&Path>) -> EncodingJobInfo {
         EncodingJobInfo {
+            display: TranscodeDisplayNames::default(),
             base_request: BaseEncodingJobOptions::default(),
             video_stream: None,
             audio_stream: None,

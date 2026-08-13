@@ -254,6 +254,17 @@ async fn log_playback_activity(
         .and_then(|i| i.name)
         .unwrap_or_default();
     let name = format!("{} {action} {item_name} on {device}", user.username);
+    // The same line goes to the server log so playback/cast session events are
+    // greppable without the dashboard (the cast receiver reports through these
+    // routes with its own Client/Device identity).
+    tracing::info!(
+        user = %user.username,
+        item = %item_name,
+        device = %device,
+        client = auth.client.as_deref().unwrap_or(""),
+        event = type_,
+        "{name}"
+    );
     let _ = state
         .activity
         .create_entry(ferrofin_traits::activity::ActivityLogCreate {

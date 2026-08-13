@@ -810,6 +810,7 @@ fn mime_for_extension(ext: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_mediaencoding::TranscodeDisplayNames;
     use ferrofin_mediaencoding::transcoding::{
         FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
     };
@@ -898,6 +899,7 @@ mod tests {
             self.requests.lock().unwrap().push((is_audio, segment_id));
             let playlist = self.dir.join("out.m3u8");
             let state = EncodingJobInfo {
+                display: TranscodeDisplayNames::default(),
                 base_request: BaseEncodingJobOptions::default(),
                 video_stream: None,
                 audio_stream: None,

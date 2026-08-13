@@ -22,5 +22,5 @@ pub mod transcode_state;
 pub use helper::EncodingHelper;
 pub use transcode_state::{
     BaseEncodingJobOptions, EncoderCapabilities, EncodingJobInfo, NoOptionalEncoders,
-    ProbedEncoders,
+    ProbedEncoders, TranscodeDisplayNames,
 };

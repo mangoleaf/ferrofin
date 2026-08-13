@@ -20,7 +20,7 @@ use std::time::Duration;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingJobInfo, NoopSessionReporter, SegmentTranscoder, SpawnRequest,
-    TokioSegmentTranscoder, TranscodeManagerImpl,
+    TokioSegmentTranscoder, TranscodeDisplayNames, TranscodeManagerImpl,
 };
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
@@ -165,6 +165,7 @@ fn spawn_req(program: &str, args: Vec<String>, out_dir: &Path) -> SpawnRequest {
 /// blocking on `wait_for` until the first segment/target exists.
 fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> EncodingJobInfo {
     EncodingJobInfo {
+        display: TranscodeDisplayNames::default(),
         base_request: BaseEncodingJobOptions::default(),
         video_stream: None,
         audio_stream: None,

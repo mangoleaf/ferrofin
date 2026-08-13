@@ -79,6 +79,7 @@ pub fn build_media_encoding(
     paths: Arc<FerrofinServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
     ffmpeg: &FfmpegPaths,
+    library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
@@ -109,6 +110,10 @@ pub fn build_media_encoding(
         Arc::clone(&subtitles),
         ffmpeg.supports_filter("tonemapx"),
     );
+    let planner = match library {
+        Some(library) => planner.with_library(library),
+        None => planner,
+    };
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
     // The idle reaper kills any transcode whose consumers vanished without a
@@ -661,8 +666,15 @@ mod tests {
             filters: Vec::new(),
             encoders: Vec::new(),
         };
-        let (_hls, _attachments, _subtitles) =
-            build_media_encoding(media_sources, encoder, config, paths, path_manager, &ffmpeg);
+        let (_hls, _attachments, _subtitles) = build_media_encoding(
+            media_sources,
+            encoder,
+            config,
+            paths,
+            path_manager,
+            &ffmpeg,
+            None,
+        );
     }
 
     #[tokio::test]

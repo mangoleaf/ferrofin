@@ -1351,7 +1351,7 @@ mod tests {
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::entities::MediaStreamType;
 
-    use super::super::transcode_state::NoOptionalEncoders;
+    use super::super::transcode_state::{NoOptionalEncoders, TranscodeDisplayNames};
     use super::*;
 
     /// A test [`EncoderCapabilities`] with a fixed set of "available" encoders.
@@ -1394,6 +1394,7 @@ mod tests {
             ..MediaSourceInfo::default()
         };
         EncodingJobInfo {
+            display: TranscodeDisplayNames::default(),
             base_request: BaseEncodingJobOptions::default(),
             video_stream: streams
                 .iter()

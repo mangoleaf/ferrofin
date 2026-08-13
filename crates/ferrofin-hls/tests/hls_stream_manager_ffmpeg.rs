@@ -26,7 +26,9 @@ use ferrofin_hls::{
     DynamicHlsPlaylistGenerator, HlsStreamManagerImpl, StreamStatePlanner, TranscodePlan,
 };
 use ferrofin_mediaencoding::transcoding::{NoopSessionReporter, TokioSegmentTranscoder};
-use ferrofin_mediaencoding::{BaseEncodingJobOptions, EncodingJobInfo, TranscodeManagerImpl};
+use ferrofin_mediaencoding::{
+    BaseEncodingJobOptions, EncodingJobInfo, TranscodeDisplayNames, TranscodeManagerImpl,
+};
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
@@ -192,6 +194,7 @@ impl StreamStatePlanner for FfmpegPlanner {
         // playlist request has none.
         let wait_for_path = segment_id.map(|id| self.dir.join(format!("out{id}.ts")));
         let state = EncodingJobInfo {
+            display: TranscodeDisplayNames::default(),
             base_request: BaseEncodingJobOptions::default(),
             video_stream: None,
             audio_stream: None,

@@ -925,6 +925,8 @@ pub async fn build_app_state(
     let me_media_encoder = Arc::clone(&media_encoder);
     let me_config = Arc::clone(&config_trait);
     let me_path_manager = Arc::clone(&path_manager);
+    // The transcode planner resolves item/library display names for its logs.
+    let me_library = Arc::clone(&library);
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(
@@ -975,6 +977,8 @@ pub async fn build_app_state(
         Arc::clone(&paths),
         me_path_manager,
         ffmpeg,
+        // Transcode logs resolve item/series/library names through the library.
+        Some(me_library),
     );
     let state = state
         .with_media_encoding(hls, attachments)
