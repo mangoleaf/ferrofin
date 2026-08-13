@@ -547,6 +547,12 @@ impl LibraryScanner {
             {
                 items_added.push(item);
             }
+            // A locked item's metadata, cast, and artwork are user-owned: run
+            // no NFO or remote providers for it (Jellyfin skips all providers
+            // when `IsLocked`), and leave its people/images untouched below.
+            // The scan-upsert's `IsLocked` guard backstops the metadata
+            // columns; file-derived facts (the probe) still update.
+            let locked = self.is_item_locked(item.id).await;
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
@@ -555,14 +561,21 @@ impl LibraryScanner {
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
             // `tvshow.nfo` / `<episode>.nfo` and yields the credited cast/crew.
-            let mut people = self.fetch_local_nfo(&mut entity).await;
+            let mut people = if locked {
+                Vec::new()
+            } else {
+                self.fetch_local_nfo(&mut entity).await
+            };
             // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
             // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
             // shows the same detail page Jellyfin does. Best-effort: failures don't
             // abort, and NFO-provided people take precedence.
-            let remote = self
-                .fetch_remote_metadata(&mut entity, &mut art_cache)
-                .await;
+            let remote = if locked {
+                RemoteMetadata::default()
+            } else {
+                self.fetch_remote_metadata(&mut entity, &mut art_cache)
+                    .await
+            };
             if people.is_empty() {
                 people = remote.people;
             }
@@ -624,19 +637,10 @@ impl LibraryScanner {
             if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
                 repo.save_chapters(item.id, &chapters).await?;
             }
-            // Artwork: local files first (poster/backdrop/logo/… next to the
-            // media), then a TMDB fallback for movies/series with none — matching
-            // Jellyfin, which fetches remote artwork automatically. Best-effort: a
-            // failure here must not abort the rest of the scan.
-            let mut images = discover_local_images(&entity);
-            if images.is_empty() {
-                images = self.fetch_remote_images(&entity, &mut art_cache).await;
-            }
-            self.fill_image_metadata(&mut images).await;
-            if !images.is_empty()
-                && let Err(err) = self.persistence.save_item_images(item.id, &images).await
-            {
-                tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
+            // Artwork — locked items skip the rewrite entirely: their image
+            // rows are user-owned.
+            if !locked {
+                self.persist_artwork(item.id, &entity, &mut art_cache).await;
             }
             // Per-library refresh % for open dashboards (`RefreshProgress`),
             // at the same bounded cadence as the progress log plus each
@@ -1585,6 +1589,43 @@ impl LibraryScanner {
                 }
             }
         }
+    }
+
+    /// Discovers and persists the item's artwork: local files next to the
+    /// media first (poster/backdrop/logo/…), then a TMDB fallback for
+    /// movies/series with none — matching Jellyfin, which fetches remote
+    /// artwork automatically. Best-effort: a failure must not abort the rest
+    /// of the scan.
+    async fn persist_artwork(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        art_cache: &mut ArtworkCache,
+    ) {
+        let mut images = discover_local_images(entity);
+        if images.is_empty() {
+            images = self.fetch_remote_images(entity, art_cache).await;
+        }
+        self.fill_image_metadata(&mut images).await;
+        if !images.is_empty()
+            && let Err(err) = self.persistence.save_item_images(item_id, &images).await
+        {
+            tracing::warn!(%err, item = %item_id, "failed to persist discovered artwork");
+        }
+    }
+
+    /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
+    /// editor's "lock this item"). Absent repository (unit-test builds) or a
+    /// missing/new row → unlocked.
+    async fn is_item_locked(&self, id: Uuid) -> bool {
+        let Some(repo) = &self.item_repository else {
+            return false;
+        };
+        repo.retrieve_item(id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.is_locked)
     }
 
     async fn fetch_remote_images(

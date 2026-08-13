@@ -577,25 +577,76 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "Type" = excluded."Type", "UnratedType" = excluded."UnratedType", "Width" = excluded."Width"
 "#;
 
-/// The library scan's upsert: identical to [`UPSERT_SQL`] except for the two
+/// The user-editable metadata columns (everything the metadata editor's
+/// `POST /Items/{id}` writes, plus the `Name`-derived `CleanName`/`SortName`):
+/// the scan's upsert keeps the stored value for each of these when the row is
+/// locked, so a locked item's edits survive every rescan.
+const LOCKED_PRESERVED_COLUMNS: &[&str] = &[
+    "Name",
+    "CleanName",
+    "SortName",
+    "ForcedSortName",
+    "OriginalTitle",
+    "CriticRating",
+    "CommunityRating",
+    "IndexNumber",
+    "ParentIndexNumber",
+    "Overview",
+    "Genres",
+    "Tagline",
+    "Studios",
+    "SeriesName",
+    "EndDate",
+    "PremiereDate",
+    "ProductionYear",
+    "OfficialRating",
+    "CustomRating",
+    "Tags",
+    "ProductionLocations",
+    "PreferredMetadataCountryCode",
+    "PreferredMetadataLanguage",
+    "Album",
+    "Artists",
+    "AlbumArtists",
+];
+
+/// The library scan's upsert: identical to [`UPSERT_SQL`] except for the
 /// columns the scanner does not own on an existing row —
 ///
 /// - `PrimaryVersionId` is left untouched (a scanned entity always carries
 ///   `None`, and overwriting erased every merge-versions link on each scan),
 /// - `DateCreated` keeps its stored first-import value (`coalesce` still fills
-///   it when the stored value is `NULL`).
+///   it when the stored value is `NULL`),
+/// - `IsLocked` can be set by the scan (an NFO `<lockdata>`) but never
+///   cleared (`max`) — otherwise every scan would silently unlock edits,
+/// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
+///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
+///   existing row, so the guard sees the pre-write lock state).
 ///
 /// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
 /// cannot drift between the two statements; the substitutions are asserted in
 /// `scan_upsert_preserves_unowned_columns`.
 fn scan_upsert_sql() -> &'static str {
     static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        UPSERT_SQL
+        let mut sql = UPSERT_SQL
             .replace(
                 r#""DateCreated" = excluded."DateCreated","#,
                 r#""DateCreated" = coalesce("DateCreated", excluded."DateCreated"),"#,
             )
             .replace(r#""PrimaryVersionId" = excluded."PrimaryVersionId","#, "")
+            .replace(
+                r#""IsLocked" = excluded."IsLocked","#,
+                r#""IsLocked" = max("IsLocked", excluded."IsLocked"),"#,
+            );
+        for col in LOCKED_PRESERVED_COLUMNS {
+            sql = sql.replace(
+                &format!(r#""{col}" = excluded."{col}""#),
+                &format!(
+                    r#""{col}" = CASE WHEN "IsLocked" = 1 THEN "{col}" ELSE excluded."{col}" END"#
+                ),
+            );
+        }
+        sql
     });
     &SQL
 }
@@ -836,6 +887,15 @@ mod tests {
         let sql = super::scan_upsert_sql();
         assert!(sql.contains(r#"coalesce("DateCreated", excluded."DateCreated")"#));
         assert!(!sql.contains(r#""PrimaryVersionId" = excluded."PrimaryVersionId""#));
+        assert!(sql.contains(r#""IsLocked" = max("IsLocked", excluded."IsLocked")"#));
+        for col in super::LOCKED_PRESERVED_COLUMNS {
+            assert!(
+                sql.contains(&format!(
+                    r#""{col}" = CASE WHEN "IsLocked" = 1 THEN "{col}""#
+                )),
+                "locked guard missing for column {col}"
+            );
+        }
 
         let db = test_db().await;
         let svc = FerrofinItemPersistenceService::new(db.clone());
@@ -943,5 +1003,88 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(pvid, None);
+    }
+
+    // A locked row keeps its user-edited metadata through a scan save (which
+    // rebuilds the entity from disk), while file-derived columns still update
+    // and the scan can never clear the lock itself. Unlocked rows keep taking
+    // the scanned values.
+    #[tokio::test]
+    async fn scan_upsert_keeps_locked_metadata_and_never_unlocks() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::new_v4();
+
+        // The user's edit: custom title/overview + the editor's LockData flag.
+        let mut item = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .unwrap()
+                .to_owned(),
+            name: Some("My Custom Title".into()),
+            overview: Some("my notes".into()),
+            production_year: Some(1999),
+            is_locked: true,
+            run_time_ticks: Some(100),
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&item))
+            .await
+            .expect("editor save");
+
+        // The next scan rebuilds the row from disk: filename-derived name, TMDB
+        // overview/year, fresh probe runtime, and is_locked=false (the scanned
+        // entity knows nothing of the lock).
+        item.name = Some("Movie.Title.2010.1080p".into());
+        item.overview = Some("tmdb overview".into());
+        item.production_year = Some(2010);
+        item.is_locked = false;
+        item.run_time_ticks = Some(4242);
+        svc.save_scanned_items(std::slice::from_ref(&item))
+            .await
+            .expect("scan save");
+
+        let (name, overview, year, locked, ticks): (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            bool,
+            Option<i64>,
+        ) = sqlx::query_as(
+            r#"SELECT "Name", "Overview", "ProductionYear", "IsLocked", "RunTimeTicks"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("row");
+        assert_eq!(name.as_deref(), Some("My Custom Title"), "locked Name kept");
+        assert_eq!(
+            overview.as_deref(),
+            Some("my notes"),
+            "locked Overview kept"
+        );
+        assert_eq!(year, Some(1999), "locked ProductionYear kept");
+        assert!(locked, "scan must never clear the lock");
+        assert_eq!(ticks, Some(4242), "file-derived RunTimeTicks still updates");
+
+        // Unlocked rows keep scan ownership: same save on a fresh unlocked row
+        // takes the scanned values.
+        let id2 = Uuid::new_v4();
+        item.id = ferrofin_db::store::guid_to_db(id2);
+        svc.save_scanned_items(std::slice::from_ref(&item))
+            .await
+            .expect("scan save unlocked");
+        item.name = Some("Renamed.File.2011".into());
+        svc.save_scanned_items(std::slice::from_ref(&item))
+            .await
+            .expect("rescan unlocked");
+        let name: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id2))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(name.as_deref(), Some("Renamed.File.2011"));
     }
 }

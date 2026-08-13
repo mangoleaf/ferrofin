@@ -61,7 +61,17 @@ pub(crate) async fn update_item(
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let before = item.clone();
     apply_update(&mut item, &request);
+    // Deliberate divergence from Jellyfin: a save that actually changes
+    // metadata locks the item, because Ferrofin's library scan rebuilds rows
+    // from disk and would otherwise revert the edit on its next pass — the
+    // scan preserves the editable columns only for locked rows. A save that
+    // changes nothing keeps the lock exactly as the checkbox sent it, so
+    // un-ticking "Lock this item" (without editing fields) still unlocks.
+    if !item.is_locked && editor_fields_changed(&before, &item) {
+        item.is_locked = true;
+    }
     state.library.update_items(&[item], None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -181,6 +191,44 @@ fn opt_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Ut
             .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
+}
+
+/// Whether any editor-owned field differs between the stored row and the
+/// applied request — the auto-lock trigger.
+///
+/// jellyfin-web round-trips the values it did not edit through the item DTO,
+/// which narrows ratings to `f32` and dates to its own serialization, so the
+/// comparison normalizes both (ratings through `f32`, dates to whole seconds)
+/// to keep an untouched save from reading as a change and spuriously locking.
+#[allow(clippy::cast_possible_truncation)]
+fn editor_fields_changed(before: &BaseItemEntity, after: &BaseItemEntity) -> bool {
+    let rating = |v: Option<f64>| v.map(|x| x as f32);
+    let date = |v: Option<DateTime<Utc>>| v.map(|d| d.timestamp());
+    before.name != after.name
+        || before.forced_sort_name != after.forced_sort_name
+        || before.original_title != after.original_title
+        || rating(before.critic_rating) != rating(after.critic_rating)
+        || rating(before.community_rating) != rating(after.community_rating)
+        || before.index_number != after.index_number
+        || before.parent_index_number != after.parent_index_number
+        || before.overview != after.overview
+        || before.genres != after.genres
+        || before.tagline != after.tagline
+        || before.studios != after.studios
+        || date(before.date_created) != date(after.date_created)
+        || before.series_name != after.series_name
+        || date(before.end_date) != date(after.end_date)
+        || date(before.premiere_date) != date(after.premiere_date)
+        || before.production_year != after.production_year
+        || before.official_rating != after.official_rating
+        || before.custom_rating != after.custom_rating
+        || before.tags != after.tags
+        || before.production_locations != after.production_locations
+        || before.preferred_metadata_country_code != after.preferred_metadata_country_code
+        || before.preferred_metadata_language != after.preferred_metadata_language
+        || before.album != after.album
+        || before.artists != after.artists
+        || before.album_artists != after.album_artists
 }
 
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and

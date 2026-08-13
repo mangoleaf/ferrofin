@@ -291,6 +291,8 @@ struct OkLibrary {
     is_folder: bool,
     top_parent_id: Option<Uuid>,
     scoped_scans: Arc<Mutex<Vec<Uuid>>>,
+    /// Entities passed to `update_items`, for asserting what the edit wrote.
+    updated: Arc<Mutex<Vec<BaseItemEntity>>>,
 }
 
 #[async_trait]
@@ -309,9 +311,10 @@ impl LibraryManager for OkLibrary {
     }
     async fn update_items(
         &self,
-        _items: &[BaseItemEntity],
+        items: &[BaseItemEntity],
         _parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
+        self.updated.lock().unwrap().extend(items.iter().cloned());
         Ok(())
     }
     async fn query_items(
@@ -621,6 +624,7 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
             is_folder: false,
             top_parent_id: None,
             scoped_scans: Arc::default(),
+            updated: Arc::default(),
         }),
         queued,
     )
@@ -712,6 +716,77 @@ async fn update_item_returns_204() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
+/// Posts `body` to `/Items/{item_id}` against a capturing library and returns
+/// the entity the handler wrote.
+async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
+    let updated: Arc<Mutex<Vec<BaseItemEntity>>> = Arc::default();
+    let router = create_router(state_with_library(
+        Arc::new(OkLibrary {
+            item_id,
+            is_folder: false,
+            top_parent_id: None,
+            scoped_scans: Arc::default(),
+            updated: updated.clone(),
+        }),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let written = updated.lock().unwrap();
+    written.first().expect("update written").clone()
+}
+
+/// An edit that changes a field locks the item even when the editor's
+/// LockData checkbox was unticked — Ferrofin's scan rebuilds rows from disk
+/// and preserves the editable columns only for locked rows, so an unlocked
+/// edit would be reverted on the next pass (deliberate upstream divergence).
+#[tokio::test]
+async fn editing_a_field_auto_locks_the_item() {
+    let item_id = Uuid::from_u128(0x59);
+    // The fixture entity's name is "Test Item"; renaming it is a real change.
+    let written = update_and_capture(
+        item_id,
+        format!(
+            r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed","LockData":false}}"#
+        ),
+    )
+    .await;
+    assert_eq!(written.name.as_deref(), Some("Renamed"));
+    assert!(written.is_locked, "a changed save must lock the item");
+}
+
+/// A save that changes nothing honors the checkbox: LockData=false stays
+/// unlocked (this is how an item is un-locked from the editor).
+#[tokio::test]
+async fn unchanged_save_respects_unlock() {
+    let item_id = Uuid::from_u128(0x59);
+    // Round-trip the fixture's stored values verbatim ("Test Item", no other
+    // editable fields set) with the lock checkbox unticked.
+    let written = update_and_capture(
+        item_id,
+        format!(
+            r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Test Item","LockData":false}}"#
+        ),
+    )
+    .await;
+    assert_eq!(written.name.as_deref(), Some("Test Item"));
+    assert!(
+        !written.is_locked,
+        "an unchanged save with LockData=false must not re-lock"
+    );
+}
+
 /// `POST /Items/{itemId}` for a missing item is a `404`.
 #[tokio::test]
 async fn update_missing_item_is_404() {
@@ -775,6 +850,7 @@ async fn refresh_library_folder_queues_scoped_scan() {
             is_folder: true,
             top_parent_id: None, // a CollectionFolder is its own library root
             scoped_scans: scans.clone(),
+            updated: Arc::default(),
         }),
         queued.clone(),
     ));
@@ -810,6 +886,7 @@ async fn refresh_nested_folder_scopes_to_owning_library() {
             is_folder: true,
             top_parent_id: Some(library_id),
             scoped_scans: scans.clone(),
+            updated: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
