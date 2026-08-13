@@ -147,8 +147,10 @@ cannot read a byte of media content, browse the filesystem, or touch anything ou
 capability list. Be precise about what the list does grant, though: a plugin acting as a
 metadata source can read your library's *catalog* (titles, ids, file paths) and can make
 outbound HTTP requests that Ferrofin executes on its behalf (destinations logged, bodies
-bounded) — so an actively malicious plugin could send your movie list somewhere, and you
-should still install plugins you have some reason to trust. What the sandbox removes is the
+bounded, and private/LAN/loopback addresses refused unless you allowlist the plugin) — so
+an actively malicious plugin could send your movie list somewhere public, and you should
+still install plugins you have some reason to trust. The full does/does-not breakdown is
+in [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md). What the sandbox removes is the
 catastrophic tail every full-trust plugin system carries: file access, raw sockets, and the
 run-anything blast radius. One artifact runs on every platform and architecture, and
 plugins can be written in any language that targets the WASM component model.

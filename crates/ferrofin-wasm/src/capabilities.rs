@@ -40,16 +40,69 @@ pub struct Collaborators {
     pub plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
 }
 
-/// Executes `http-fetch` for a guest: http/https only, response body capped
-/// at the plugin's memory limit, destination debug-logged.
+/// Whether an address is in a range the private-HTTP policy denies by
+/// default: loopback, link-local (incl. cloud metadata services), RFC1918 /
+/// IPv6 ULA, and unspecified. IPv4-mapped IPv6 unwraps to its IPv4 rule.
+#[must_use]
+pub fn is_private_address(addr: std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_private()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_address(std::net::IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_unique_local()
+        }
+    }
+}
+
+/// Enforces the private-destination policy for one URL: every address the
+/// host resolves to must be public unless the plugin was allowlisted.
+///
+/// Known limitation (documented in EXTENSIONS.md): check-then-fetch has a
+/// DNS-rebinding TOCTOU window; the upgrade path is pinning the vetted
+/// address on the request itself.
+fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<(), String> {
+    let host = url.host_str().ok_or("url has no host")?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .map_err(|e| format!("could not resolve `{host}`: {e}"))?
+        .map(|sa| sa.ip())
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("`{host}` resolved to no addresses"));
+    }
+    if let Some(private) = addrs.iter().find(|a| is_private_address(**a)) {
+        return Err(format!(
+            "destination `{host}` resolves to the private/loopback address {private}, which              plugins may not reach by default. If you trust the plugin `{plugin_name}`, add              its id to FERROFIN_WASM_PRIVATE_HTTP_ALLOW"
+        ));
+    }
+    Ok(())
+}
+
+/// Executes `http-fetch` for a guest: http/https only, private/loopback
+/// destinations denied unless the plugin is allowlisted
+/// (`private_http_allowed`), response body capped at the plugin's memory
+/// limit, destination debug-logged.
 ///
 /// # Errors
-/// Invalid URL/method/scheme, a transport failure, or an over-cap body —
-/// all as the guest-visible error string of the WIT `result`.
+/// Invalid URL/method/scheme, a denied private destination, a transport
+/// failure, or an over-cap body — all as the guest-visible error string of
+/// the WIT `result`.
 pub fn http_fetch(
     client: &reqwest::blocking::Client,
     plugin_name: &str,
     body_cap_bytes: usize,
+    private_http_allowed: bool,
     request: &HttpRequest,
 ) -> Result<HttpResponse, String> {
     let url: reqwest::Url = request
@@ -61,6 +114,9 @@ pub fn http_fetch(
             "scheme `{}` is not allowed (http/https only)",
             url.scheme()
         ));
+    }
+    if !private_http_allowed {
+        check_destination(&url, plugin_name)?;
     }
     let method: reqwest::Method = request
         .method

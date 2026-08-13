@@ -91,6 +91,7 @@ fn test_config(root: &std::path::Path) -> Config {
         wasm_call_timeout_secs: None,
         wasm_memory_limit_mb: None,
         wasm_event_queue_capacity: None,
+        wasm_private_http_allow: None,
     }
 }
 

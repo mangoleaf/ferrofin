@@ -55,6 +55,9 @@ pub struct HostState {
     /// The shared blocking HTTP client behind `http-fetch` (per host, with
     /// the call timeout baked in at construction).
     pub http: std::sync::Arc<reqwest::blocking::Client>,
+    /// Whether THIS plugin may reach private/loopback destinations
+    /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW` names it or is `*`).
+    pub private_http_allowed: bool,
     /// The manager handles behind `query-items`/`write-media-segments`,
     /// installed by the composition root after loading (empty during load).
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
@@ -110,6 +113,7 @@ impl host::Host for HostState {
             &self.http,
             &self.plugin_name,
             self.memory_limit_bytes,
+            self.private_http_allowed,
             &request,
         )
     }

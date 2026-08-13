@@ -125,6 +125,7 @@ struct FileConfig {
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
+    wasm_private_http_allow: Option<String>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -289,6 +290,13 @@ pub struct Config {
     /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
     /// treated as unset.
     pub wasm_event_queue_capacity: Option<u32>,
+
+    /// WASM plugins allowed to `http-fetch` private/loopback destinations:
+    /// a comma-separated list of plugin UUIDs, or `*` for all. `None`/empty
+    /// = every plugin is denied private ranges (the safe default). Resolved
+    /// `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` env > `wasm_private_http_allow`
+    /// in `config.toml` > deny.
+    pub wasm_private_http_allow: Option<String>,
 }
 
 impl Config {
@@ -471,6 +479,10 @@ impl Config {
                 .or(file.wasm_memory_limit_mb),
             wasm_event_queue_capacity: parse_var(env, "FERROFIN_WASM_EVENT_QUEUE_CAPACITY")
                 .or(file.wasm_event_queue_capacity),
+            wasm_private_http_allow: env
+                .var("FERROFIN_WASM_PRIVATE_HTTP_ALLOW")
+                .or(file.wasm_private_http_allow)
+                .filter(|s| !s.trim().is_empty()),
         })
     }
 
@@ -951,6 +963,16 @@ mod tests {
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.wasm_call_timeout_secs, Some(15), "env beats file");
         assert_eq!(cfg.wasm_memory_limit_mb, Some(256), "file applies");
+
+        // The private-HTTP allowlist resolves env > file, empty = unset.
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.wasm_private_http_allow, None, "deny by default");
+        let env = FakeEnv::new().with("FERROFIN_WASM_PRIVATE_HTTP_ALLOW", "*");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_private_http_allow.as_deref(), Some("*"));
+        let env = FakeEnv::new().with("FERROFIN_WASM_PRIVATE_HTTP_ALLOW", "  ");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_private_http_allow, None, "blank is unset");
     }
 
     #[test]

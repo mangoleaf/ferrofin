@@ -85,6 +85,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         wasm_call_timeout_secs: None,
         wasm_memory_limit_mb: None,
         wasm_event_queue_capacity: None,
+        wasm_private_http_allow: None,
     };
 
     let db = Database::connect(&config.database_url())

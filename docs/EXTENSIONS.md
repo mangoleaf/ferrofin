@@ -100,10 +100,7 @@ surface is: `log`, `get-config` (its own config only), `http-fetch` (host-execut
 the destination logged and the response capped at the plugin's memory limit), `query-items`
 (a small read-only item projection, max 1000 rows per call), and `write-media-segments`
 (scoped to the plugin's own provider id — it can never touch another provider's or a user's
-segments). Note the honest flip side of `query-items` + `http-fetch`: a malicious plugin
-could read your library catalog (titles, ids, paths — never file contents) and POST it to a
-remote host, so plugin trust still matters; the sandbox bounds the blast radius, it does not
-make strangers trustworthy. Plugins can also act as **metadata sources**: the scan offers every item to each
+segments). Plugins can also act as **metadata sources**: the scan offers every item to each
 enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
 ran, and applies results **supplement-only** — a plugin fills fields that are still empty
 and records its own external ids; it can never overwrite a built-in provider or a user
@@ -112,6 +109,34 @@ per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-m
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that
 sidelines the plugin until restart. The server never goes down with a plugin.
+
+### What the sandbox does — and does not — protect against
+
+Be precise about the security model; both halves matter.
+
+**What a WASM plugin can never do**, no matter how malicious, because the sandbox has no
+way to express it: read or write **any file** (your media, `system.json`, the SQLite
+database with its password hashes, host SSH keys — nothing); open **its own network
+connections**; execute host code, spawn processes, or read server memory; exceed its memory
+and CPU-time limits; or take the server down (traps are contained, repeat offenders are
+sidelined). This is the catastrophic tail of the traditional full-trust plugin model —
+where any installed plugin runs with the server's own privileges — and it is gone entirely.
+
+**What the capability surface deliberately grants**, and therefore what a malicious plugin
+could still abuse: `query-items` exposes your library **catalog** (titles, ids, filesystem
+paths — never file contents), and `http-fetch` performs outbound HTTP on the plugin's
+behalf (destination logged, body bounded). Combined, a hostile plugin could send your movie
+list to a remote host. By default `http-fetch` is refused for **private, loopback, and
+link-local destinations** (your LAN, cloud metadata services, Ferrofin itself), which
+removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
+access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
+Known limitation: the private-address check resolves-then-fetches, so a DNS-rebinding
+attacker has a theoretical TOCTOU window; pinning the vetted address on the request is the
+planned hardening. (Referencing plugins by UUID is also acknowledged UX debt — accepting
+plugin names is a planned improvement.)
+
+The one-line summary: **the sandbox bounds the blast radius to your catalog metadata; it
+does not make strangers trustworthy.** Install plugins you have some reason to trust.
 
 **What the memory limit means (and costs).** The 128 MiB is a **per-plugin ceiling, not an
 allocation**: it is the point past which a plugin's `memory.grow` is refused (and the size

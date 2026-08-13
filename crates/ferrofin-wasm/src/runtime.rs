@@ -109,6 +109,8 @@ pub struct InstanceSpec {
     pub timeout_ticks: u64,
     /// The shared blocking HTTP client behind `http-fetch`.
     pub http: Arc<reqwest::blocking::Client>,
+    /// Whether this plugin may reach private/loopback HTTP destinations.
+    pub private_http_allowed: bool,
     /// The manager handles behind the E2 capabilities (installed post-load).
     pub collaborators: Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
 }
@@ -135,6 +137,7 @@ impl InstanceSpec {
                 .build(),
             memory_limit_bytes: self.memory_limit_bytes,
             http: Arc::clone(&self.http),
+            private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),
             table: wasmtime::component::ResourceTable::new(),

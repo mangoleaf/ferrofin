@@ -86,9 +86,16 @@ async fn real_guest_loads_runs_and_reports_rss() {
     let wasm_size_kib = std::fs::metadata(&artifact).unwrap().len() / 1024;
 
     let rss_before = rss_kib();
+    // The analyze task reports to a loopback listener, so the guest's id is
+    // allowlisted for private HTTP — exercising the real grant path (the
+    // deny path is covered in tests/capabilities.rs).
+    let settings = WasmSettings {
+        private_http_allow: vec!["3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01".to_owned()],
+        ..WasmSettings::default()
+    };
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, WasmSettings::default())
+        move || WasmPluginHost::load(&dir, &settings)
     })
     .await
     .unwrap()
@@ -210,7 +217,7 @@ async fn real_guest_loads_runs_and_reports_rss() {
     let rss_before_second = rss_kib();
     let _host2 = tokio::task::spawn_blocking({
         let dir = dir2.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, WasmSettings::default())
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
     })
     .await
     .unwrap()

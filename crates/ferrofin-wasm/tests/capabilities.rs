@@ -14,7 +14,8 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_wasm::bindings::types::{HttpRequest, ItemQuery, MediaSegment};
 use ferrofin_wasm::capabilities::{
-    Collaborators, MAX_QUERY_ROWS, http_fetch, query_items, write_media_segments,
+    Collaborators, MAX_QUERY_ROWS, http_fetch, is_private_address, query_items,
+    write_media_segments,
 };
 
 mod common;
@@ -34,6 +35,7 @@ fn http_fetch_round_trips_method_headers_and_body() {
         &client(),
         "test-plugin",
         1024 * 1024,
+        true, // loopback listener — this test exercises transport, not policy
         &HttpRequest {
             method: "POST".to_owned(),
             url,
@@ -64,6 +66,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         &client(),
         "test-plugin",
         1024,
+        true,
         &HttpRequest {
             method: "GET".to_owned(),
             url: "file:///etc/passwd".to_owned(),
@@ -80,6 +83,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         &client(),
         "test-plugin",
         8,
+        true,
         &HttpRequest {
             method: "GET".to_owned(),
             url,
@@ -269,4 +273,53 @@ async fn write_media_segments_validates_types_and_ranges() {
     .unwrap()
     .unwrap_err();
     assert!(err.contains("invalid segment range"), "got: {err}");
+}
+
+#[test]
+fn http_fetch_denies_private_destinations_unless_allowlisted() {
+    // Loopback, link-local (cloud metadata), RFC1918, and v4-mapped v6 are
+    // all private; public addresses are not.
+    for private in [
+        "127.0.0.1",
+        "169.254.169.254",
+        "10.1.2.3",
+        "172.16.0.1",
+        "192.168.1.1",
+        "::1",
+        "fe80::1",
+        "fd00::1",
+        "::ffff:10.0.0.1",
+    ] {
+        assert!(
+            is_private_address(private.parse().unwrap()),
+            "{private} must be private"
+        );
+    }
+    for public in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+        assert!(
+            !is_private_address(public.parse().unwrap()),
+            "{public} must be public"
+        );
+    }
+
+    // A non-allowlisted plugin cannot reach the loopback listener; the
+    // denial names the address class and the knob that grants access.
+    let (url, _server) = one_shot_http("200 OK", b"nope");
+    let err = http_fetch(
+        &client(),
+        "untrusted-plugin",
+        1024,
+        false,
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url,
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("private/loopback") && err.contains("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
+        "got: {err}"
+    );
 }

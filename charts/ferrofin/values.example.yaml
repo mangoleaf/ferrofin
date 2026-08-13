@@ -149,6 +149,9 @@ ferrofin:
     # FERROFIN_WASM_CALL_TIMEOUT_SECS: "30"     # per-call deadline for a plugin
     # FERROFIN_WASM_MEMORY_LIMIT_MB: "128"      # per-plugin memory cap
     # FERROFIN_WASM_EVENT_QUEUE_CAPACITY: "256" # per-plugin event queue depth
+    # Let SPECIFIC trusted plugins http-fetch private/LAN destinations
+    # (default: denied for all; public internet is always allowed):
+    # FERROFIN_WASM_PRIVATE_HTTP_ALLOW: "<plugin-uuid>,<plugin-uuid>"
 
 # -----------------------------------------------------------------------------
 # Metrics — Ferrofin exposes a Prometheus /metrics endpoint (enable it above via

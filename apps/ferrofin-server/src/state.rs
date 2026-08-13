@@ -492,10 +492,11 @@ pub async fn build_app_state(
             config.wasm_call_timeout_secs,
             config.wasm_memory_limit_mb,
             config.wasm_event_queue_capacity,
+            config.wasm_private_http_allow.as_deref(),
         );
         let wasm_dir = config.data_dir.join("plugins");
         match tokio::task::spawn_blocking(move || {
-            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, wasm_settings)
+            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
         })
         .await
         {
@@ -1141,6 +1142,7 @@ mod tests {
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
+            wasm_private_http_allow: None,
         }
     }
 

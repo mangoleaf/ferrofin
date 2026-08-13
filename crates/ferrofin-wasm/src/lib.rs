@@ -68,7 +68,7 @@ pub const FORWARDED_EVENTS: [&str; 9] = [
 /// All three are `FERROFIN_*` bootstrap knobs (settings-over-constants,
 /// decided 2026-08-06/07); `None`s from the config layer land on the
 /// defaults here.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WasmSettings {
     /// Per-guest-call deadline in seconds (`FERROFIN_WASM_CALL_TIMEOUT_SECS`,
     /// default 30 — confirmed 2026-08-07).
@@ -79,6 +79,12 @@ pub struct WasmSettings {
     /// Per-plugin event queue depth (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`,
     /// default 256 — inherits the approved bus-capacity setting).
     pub event_queue_capacity: u32,
+    /// Plugin ids allowed to reach private/loopback HTTP destinations
+    /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`: comma-separated plugin UUIDs, or
+    /// `*` for every plugin). Default empty: private destinations denied.
+    /// KNOWN UX DEBT: UUIDs are hard to audit later — accepting plugin
+    /// names here too is a planned improvement.
+    pub private_http_allow: Vec<String>,
 }
 
 impl Default for WasmSettings {
@@ -87,7 +93,19 @@ impl Default for WasmSettings {
             call_timeout_secs: 30,
             memory_limit_mb: 128,
             event_queue_capacity: 256,
+            private_http_allow: Vec::new(),
         }
+    }
+}
+
+impl WasmSettings {
+    /// Whether the allowlist grants plugin `id` private-HTTP access.
+    #[must_use]
+    pub fn allows_private_http(&self, id: Uuid) -> bool {
+        self.private_http_allow.iter().any(|entry| {
+            let entry = entry.trim();
+            entry == "*" || Uuid::parse_str(entry).is_ok_and(|u| u == id)
+        })
     }
 }
 
@@ -100,6 +118,7 @@ impl WasmSettings {
         call_timeout_secs: Option<u32>,
         memory_limit_mb: Option<u32>,
         event_queue_capacity: Option<u32>,
+        private_http_allow: Option<&str>,
     ) -> Self {
         let d = Self::default();
         Self {
@@ -112,6 +131,15 @@ impl WasmSettings {
             event_queue_capacity: event_queue_capacity
                 .filter(|&v| v > 0)
                 .unwrap_or(d.event_queue_capacity),
+            private_http_allow: private_http_allow
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|e| !e.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -166,7 +194,7 @@ impl WasmPluginHost {
     /// # Panics
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
-    pub fn load(plugins_dir: &Path, settings: WasmSettings) -> Result<Self, ServiceError> {
+    pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
         let mut config = WasmConfig::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config)
@@ -414,7 +442,7 @@ fn load_one(
     engine: &Engine,
     linker: &Arc<Linker<HostState>>,
     path: &Path,
-    settings: WasmSettings,
+    settings: &WasmSettings,
     http: &Arc<reqwest::blocking::Client>,
     collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
 ) -> Result<LoadedPlugin, wasmtime::Error> {
@@ -431,6 +459,9 @@ fn load_one(
         memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
         timeout_ticks: u64::from(settings.call_timeout_secs),
         http: Arc::clone(http),
+        // Loading calls (`descriptor` etc.) run before the id is known, so
+        // the safe default applies; the real grant is applied below.
+        private_http_allowed: false,
         collaborators: Arc::clone(collaborators),
     };
 
@@ -458,17 +489,20 @@ fn load_one(
         can_uninstall: false,
     };
 
-    // Re-tag the spec with the real identity, then hand the warm instance to
-    // its runtime thread.
+    // Re-tag the spec with the real identity + its private-HTTP grant, then
+    // hand the warm instance to its runtime thread.
     let spec = InstanceSpec {
         plugin_name: wire.name,
         plugin_id: id.to_string(),
+        private_http_allowed: settings.allows_private_http(id),
         ..spec
     };
     // The already-made calls used the placeholder identity in HostState; fix
-    // the live store's copy too so guest log lines carry the real name.
+    // the live store's copy too so guest log lines carry the real name and
+    // the real network grant.
     store.data_mut().plugin_name.clone_from(&spec.plugin_name);
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
+    store.data_mut().private_http_allowed = spec.private_http_allowed;
 
     let runtime = runtime::spawn(
         spec,

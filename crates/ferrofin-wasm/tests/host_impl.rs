@@ -28,6 +28,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
                 .unwrap(),
         ),
         collaborators,
+        private_http_allowed: true, // tests hit a loopback listener
         wasi: HostState::empty_wasi(),
         table: wasmtime::component::ResourceTable::new(),
     }

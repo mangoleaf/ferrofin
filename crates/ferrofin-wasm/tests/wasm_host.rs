@@ -104,6 +104,7 @@ fn tight_settings() -> WasmSettings {
         call_timeout_secs: 1,
         memory_limit_mb: 2,
         event_queue_capacity: 8,
+        private_http_allow: Vec::new(),
     }
 }
 
@@ -113,7 +114,7 @@ fn loads_the_fixture_and_reads_its_identity() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
 
-    let host = WasmPluginHost::load(dir.path(), WasmSettings::default()).unwrap();
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(host.plugins().len(), 1);
 
     let plugin = &host.plugins()[0];
@@ -143,7 +144,7 @@ fn missing_dir_and_garbage_files_load_empty() {
     // Missing directory: an empty host, not an error.
     let host = WasmPluginHost::load(
         std::path::Path::new("/no/such/dir"),
-        WasmSettings::default(),
+        &WasmSettings::default(),
     )
     .unwrap();
     assert!(host.plugins().is_empty());
@@ -154,7 +155,7 @@ fn missing_dir_and_garbage_files_load_empty() {
     // A core module (valid wasm, not a component) is also rejected cleanly.
     let core = wat::parse_str("(module)").unwrap();
     std::fs::write(dir.path().join("core.wasm"), core).unwrap();
-    let host = WasmPluginHost::load(dir.path(), WasmSettings::default()).unwrap();
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert!(host.plugins().is_empty());
 }
 
@@ -163,7 +164,7 @@ fn duplicate_plugin_ids_keep_only_the_first() {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(dir.path(), "a-first", FIXTURE_WAT);
     write_fixture(dir.path(), "b-second", FIXTURE_WAT);
-    let host = WasmPluginHost::load(dir.path(), WasmSettings::default()).unwrap();
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(host.plugins().len(), 1, "same id must load once");
 }
 
@@ -173,7 +174,7 @@ async fn run_task_ok_and_guest_error_round_trip() {
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, WasmSettings::default())
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
     })
     .await
     .unwrap()
@@ -214,7 +215,7 @@ async fn events_published_on_the_manager_reach_the_guest() {
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, WasmSettings::default())
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
     })
     .await
     .unwrap()
@@ -248,7 +249,7 @@ async fn memory_limiter_denies_growth_beyond_the_cap() {
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, tight_settings())
+        move || WasmPluginHost::load(&dir, &tight_settings())
     })
     .await
     .unwrap()
@@ -272,7 +273,7 @@ async fn epoch_deadline_interrupts_a_spinning_guest_and_breaker_trips() {
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, tight_settings())
+        move || WasmPluginHost::load(&dir, &tight_settings())
     })
     .await
     .unwrap()
@@ -311,7 +312,7 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     write_fixture(dir.path(), "hello", FIXTURE_WAT);
     let host = tokio::task::spawn_blocking({
         let dir = dir.path().to_path_buf();
-        move || WasmPluginHost::load(&dir, WasmSettings::default())
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
     })
     .await
     .unwrap()
@@ -344,13 +345,34 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
 
 #[test]
 fn settings_resolve_applies_defaults_and_ignores_zero() {
-    let s = WasmSettings::resolve(None, None, None);
+    let s = WasmSettings::resolve(None, None, None, None);
     assert_eq!(s.call_timeout_secs, 30);
     assert_eq!(s.memory_limit_mb, 128);
     assert_eq!(s.event_queue_capacity, 256);
 
-    let s = WasmSettings::resolve(Some(0), Some(64), Some(16));
+    let s = WasmSettings::resolve(Some(0), Some(64), Some(16), Some("*, some-uuid"));
     assert_eq!(s.call_timeout_secs, 30, "zero timeout is treated as unset");
     assert_eq!(s.memory_limit_mb, 64);
     assert_eq!(s.event_queue_capacity, 16);
+    assert!(
+        s.allows_private_http(uuid::Uuid::from_u128(1)),
+        "wildcard grants any plugin"
+    );
+
+    let s = WasmSettings::resolve(
+        None,
+        None,
+        None,
+        Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff"),
+    );
+    assert!(s.allows_private_http("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff".parse().unwrap()));
+    assert!(
+        !s.allows_private_http(uuid::Uuid::from_u128(2)),
+        "others stay denied"
+    );
+    assert!(
+        !WasmSettings::resolve(None, None, None, None)
+            .allows_private_http(uuid::Uuid::from_u128(2)),
+        "default denies everyone"
+    );
 }
