@@ -4,11 +4,15 @@
     (memory (export "memory") 1)
     (global $bump (mut i32) (i32.const 4096))
     (global $events (mut i32) (i32.const 0))
+    ;; Bump allocator honoring the canonical ABI's align param (arg 2):
+    ;; ret = (bump + align - 1) & ~(align - 1).
     (func $realloc (export "realloc") (param i32 i32 i32 i32) (result i32)
       (local $ret i32)
-      global.get $bump
-      local.set $ret
-      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.set $ret
+        (i32.and
+          (i32.add (global.get $bump) (i32.sub (local.get 2) (i32.const 1)))
+          (i32.xor (i32.sub (local.get 2) (i32.const 1)) (i32.const -1))))
+      (global.set $bump (i32.add (local.get $ret) (local.get 3)))
       local.get $ret)
 
     ;; ── constant strings ────────────────────────────────────────────

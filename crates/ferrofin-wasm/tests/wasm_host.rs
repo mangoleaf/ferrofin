@@ -18,6 +18,8 @@ use ferrofin_traits::events::EventManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
 use ferrofin_wasm::{WasmPluginHost, WasmSettings};
 
+mod common;
+
 use ferrofin_wasm::TEST_FIXTURE_WAT as FIXTURE_WAT;
 
 /// Makes the host's `error!`/`warn!` skip-reasons visible in test output.
@@ -301,6 +303,43 @@ async fn epoch_deadline_interrupts_a_spinning_guest_and_breaker_trips() {
         err.contains("disabled until restart"),
         "breaker should be open after 3 consecutive failures, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "hello", FIXTURE_WAT);
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let providers = host.metadata_providers();
+    assert_eq!(providers.len(), 1);
+    let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
+        kind: "Movie".to_owned(),
+        name: "Anything".to_owned(),
+        ..Default::default()
+    };
+
+    // Unarmed collaborators: inert, not an error.
+    assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
+
+    // Armed: the fixture's metadata-lookup answers ok(none); the second call
+    // takes the (enabled, config) gate from the cache.
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: manager(),
+    });
+    assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
+    assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
 }
 
 #[test]

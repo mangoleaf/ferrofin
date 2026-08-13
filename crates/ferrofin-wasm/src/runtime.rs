@@ -18,7 +18,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use tracing::{debug, warn};
 use wasmtime::component::{Component, Linker};
@@ -30,6 +32,26 @@ use crate::bindings::{HostState, Plugin};
 /// until restart. Mirrors the HLS transcode breaker's `RESTART_FAILURE_LIMIT`
 /// (3): one flake retries, a pattern trips.
 pub const BREAKER_LIMIT: u32 = 3;
+
+/// wasmtime's `memory_size` limit applies to EACH linear memory, and the
+/// store default allows 10,000 of them — which would make the documented
+/// per-plugin ceiling meaningless. Rust wasip2 components link to exactly
+/// one linear memory, so one is what a plugin gets (a multi-memory
+/// component fails instantiation with a clear error; raise deliberately if
+/// such plugins ever appear).
+pub const MEMORIES_PER_PLUGIN: usize = 1;
+
+/// Function-reference tables a component may create. Components carry a few
+/// (call-indirect table + adapter shims); 8 is generous headroom.
+pub const TABLES_PER_PLUGIN: usize = 8;
+
+/// Total table elements per table (~8 bytes of host memory each, so the cap
+/// bounds table growth at a few MiB — the same runaway class as memory).
+pub const TABLE_ELEMENTS_PER_PLUGIN: usize = 500_000;
+
+/// Core-module instances per plugin store. A wasip2 component instantiates
+/// a handful (main module + WASI adapters); 64 is generous headroom.
+pub const INSTANCES_PER_PLUGIN: usize = 64;
 
 /// How often the epoch ticker advances the engine epoch. One tick is the
 /// resolution of the call deadline; 1 s keeps the ticker negligible while
@@ -106,6 +128,10 @@ impl InstanceSpec {
             config_json,
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.memory_limit_bytes)
+                .memories(MEMORIES_PER_PLUGIN)
+                .tables(TABLES_PER_PLUGIN)
+                .table_elements(TABLE_ELEMENTS_PER_PLUGIN)
+                .instances(INSTANCES_PER_PLUGIN)
                 .build(),
             memory_limit_bytes: self.memory_limit_bytes,
             http: Arc::clone(&self.http),
@@ -126,7 +152,7 @@ impl InstanceSpec {
 /// The sending half owned by the host: a bounded queue into the plugin's
 /// runtime thread plus the shared dead flag.
 pub struct RuntimeHandle {
-    sender: SyncSender<Command>,
+    sender: Sender<Command>,
     dead: Arc<AtomicBool>,
     plugin_name: String,
 }
@@ -151,12 +177,16 @@ impl RuntimeHandle {
             ));
         }
         let (reply, rx) = tokio::sync::oneshot::channel();
+        // Async send: a queue full of pending events suspends this future
+        // (bounded wait, the actor is draining) — it never parks the tokio
+        // worker the way a blocking send would.
         self.sender
             .send(Command::RunTask {
                 task_id,
                 config,
                 reply,
             })
+            .await
             .map_err(|_| "plugin runtime thread has exited".to_owned())?;
         rx.await
             .map_err(|_| "plugin runtime dropped the task reply".to_owned())?
@@ -187,6 +217,7 @@ impl RuntimeHandle {
                 config,
                 reply,
             })
+            .await
             .map_err(|_| "plugin runtime thread has exited".to_owned())?;
         rx.await
             .map_err(|_| "plugin runtime dropped the lookup reply".to_owned())?
@@ -203,7 +234,7 @@ impl RuntimeHandle {
             name: name.to_owned(),
             json: json.to_owned(),
         }) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
             Err(TrySendError::Full(_)) => {
                 debug!(
                     plugin = self.plugin_name,
@@ -231,7 +262,7 @@ pub fn spawn(
     plugin: Plugin,
     queue_capacity: usize,
 ) -> RuntimeHandle {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(queue_capacity);
+    let (sender, receiver) = tokio::sync::mpsc::channel(queue_capacity);
     let dead = Arc::new(AtomicBool::new(false));
     let handle = RuntimeHandle {
         sender,
@@ -240,7 +271,10 @@ pub fn spawn(
     };
     std::thread::Builder::new()
         .name(format!("wasm-plugin-{}", spec.plugin_name))
-        .spawn(move || run_loop(&spec, store, plugin, &receiver, &dead))
+        .spawn(move || {
+            let mut receiver = receiver;
+            run_loop(&spec, store, plugin, &mut receiver, &dead);
+        })
         .expect("spawning a wasm plugin runtime thread cannot fail");
     handle
 }
@@ -251,13 +285,13 @@ fn run_loop(
     spec: &InstanceSpec,
     store: Store<HostState>,
     plugin: Plugin,
-    receiver: &Receiver<Command>,
+    receiver: &mut Receiver<Command>,
     dead: &AtomicBool,
 ) {
     let mut live = Some((store, plugin));
     let mut consecutive_failures: u32 = 0;
 
-    while let Ok(command) = receiver.recv() {
+    while let Some(command) = receiver.blocking_recv() {
         if dead.load(Ordering::Relaxed) {
             refuse(command, &spec.plugin_name);
             continue;

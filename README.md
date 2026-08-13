@@ -141,11 +141,17 @@ list of capabilities Ferrofin explicitly exports to it (logging, its own setting
 host-mediated HTTP, read-only library queries, and writing its own media segments), plus
 enforced memory and CPU-time limits (the memory limit is a per-plugin runaway ceiling, not
 a reservation — a typical plugin's real footprint is a few MiB; see
-[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)). A plugin that misbehaves is interrupted and disabled while the server keeps serving;
-a plugin you install from a stranger's repo *cannot* read your media folders or exfiltrate
-your data, because the sandbox has no way to express those operations. One artifact runs on
-every platform and architecture, and plugins can be written in any language that targets the
-WASM component model.
+[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)). A plugin that misbehaves is interrupted and disabled while the server keeps serving. A
+plugin you install from a stranger's repo *cannot open your files or your network* — it
+cannot read a byte of media content, browse the filesystem, or touch anything outside that
+capability list. Be precise about what the list does grant, though: a plugin acting as a
+metadata source can read your library's *catalog* (titles, ids, file paths) and can make
+outbound HTTP requests that Ferrofin executes on its behalf (destinations logged, bodies
+bounded) — so an actively malicious plugin could send your movie list somewhere, and you
+should still install plugins you have some reason to trust. What the sandbox removes is the
+catastrophic tail every full-trust plugin system carries: file access, raw sockets, and the
+run-anything blast radius. One artifact runs on every platform and architecture, and
+plugins can be written in any language that targets the WASM component model.
 
 The trade-off is honest: extensions get full power under code review; WASM plugins get
 safe installation without review. What Ferrofin will never do is load untrusted native code

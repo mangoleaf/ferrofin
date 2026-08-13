@@ -643,9 +643,18 @@ impl LibraryScanner {
                 people = remote.people;
             }
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
-            // supplement whatever the built-in chain left unfilled.
+            // supplement whatever the built-in chain left unfilled. Their
+            // contributed ids are filtered against every id already known —
+            // `save_provider_id` is INSERT OR REPLACE, so an unfiltered
+            // ("Tmdb", …) from a plugin would replace the real TMDB id.
+            let known_ids: Vec<(String, String)> = remote
+                .provider_ids
+                .iter()
+                .cloned()
+                .chain(tag_provider_ids)
+                .collect();
             let dynamic_ids = self
-                .apply_dynamic_metadata(&mut entity, &remote.provider_ids, locked)
+                .apply_dynamic_metadata(&mut entity, &known_ids, locked)
                 .await;
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
@@ -660,13 +669,8 @@ impl LibraryScanner {
             // id-dependent providers (fanart, AudioDb, MusicBrainz) and make
             // re-scans/cross-provider lookups stable. Best-effort: a write
             // failure is logged, not fatal.
-            let all_provider_ids: Vec<(String, String)> = remote
-                .provider_ids
-                .iter()
-                .cloned()
-                .chain(tag_provider_ids)
-                .chain(dynamic_ids)
-                .collect();
+            let all_provider_ids: Vec<(String, String)> =
+                known_ids.into_iter().chain(dynamic_ids).collect();
             for (key, value) in &all_provider_ids {
                 if let Err(err) = self.persistence.save_provider_id(item.id, key, value).await {
                     tracing::warn!(%err, item = %item.id, provider = key, "failed to persist provider id");
@@ -1438,8 +1442,17 @@ impl LibraryScanner {
         if locked || self.dynamic_providers.is_empty() {
             return Vec::new();
         }
+        // An unparseable row id must not reach guests as a nil UUID they
+        // could then write segments against — skip the item instead.
+        let Ok(item_id) = Uuid::parse_str(&entity.id) else {
+            tracing::warn!(
+                id = entity.id,
+                "skipping dynamic metadata: unparseable item id"
+            );
+            return Vec::new();
+        };
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
-            item_id: Uuid::parse_str(&entity.id).unwrap_or_default(),
+            item_id,
             kind: entity
                 .type_
                 .rsplit('.')
@@ -1479,7 +1492,17 @@ impl LibraryScanner {
             {
                 entity.genres = Some(result.genres.join("|"));
             }
-            contributed_ids.extend(result.provider_ids);
+            // Supplement-only holds for ids too: a key the built-in chain
+            // (or an earlier plugin) already recorded is not replaceable.
+            for (key, value) in result.provider_ids {
+                let taken = known_ids
+                    .iter()
+                    .chain(contributed_ids.iter())
+                    .any(|(k, _)| k.eq_ignore_ascii_case(&key));
+                if !taken {
+                    contributed_ids.push((key, value));
+                }
+            }
         }
         contributed_ids
     }
@@ -3742,6 +3765,9 @@ mod tests {
     // fields the built-in chain left empty and merges its provider ids, but a
     // value already present (here: the NFO year) must never be overwritten.
     #[tokio::test]
+    // Three provider structs + full scan harness + layered assertions; the
+    // sequence is the point.
+    #[allow(clippy::too_many_lines)]
     async fn dynamic_provider_supplements_but_never_overwrites() {
         struct HelloDb;
         #[async_trait::async_trait]
@@ -3763,6 +3789,27 @@ mod tests {
                     community_rating: Some(6.5),
                     genres: vec!["Docufiction".to_owned()],
                     provider_ids: vec![("HelloDb".to_owned(), "x1".to_owned())],
+                }))
+            }
+        }
+        /// A later source trying to steal an id an earlier one recorded
+        /// (case-insensitively) — supplement-only applies to ids too.
+        struct IdThief;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for IdThief {
+            fn name(&self) -> &'static str {
+                "id-thief"
+            }
+            async fn lookup(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    provider_ids: vec![("helloDB".to_owned(), "stolen".to_owned())],
+                    ..Default::default()
                 }))
             }
         }
@@ -3818,7 +3865,11 @@ mod tests {
 
         let scanner =
             LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
-                .with_dynamic_providers(vec![Arc::new(Broken), Arc::new(HelloDb)]);
+                .with_dynamic_providers(vec![
+                    Arc::new(Broken),
+                    Arc::new(HelloDb),
+                    Arc::new(IdThief),
+                ]);
         scanner.scan_all().await.unwrap();
 
         let (overview, year, rating, genres, _studios, ids) =
@@ -3827,9 +3878,11 @@ mod tests {
         assert_eq!(year, Some(2020), "the NFO year is never overwritten");
         assert_eq!(rating, Some(6.5));
         assert_eq!(genres.as_deref(), Some("Docufiction"));
+        let ids = ids.unwrap_or_default();
+        assert!(ids.contains("HelloDb=x1"), "dynamic provider ids persist");
         assert!(
-            ids.unwrap_or_default().contains("HelloDb=x1"),
-            "dynamic provider ids persist"
+            !ids.contains("stolen"),
+            "a later source cannot replace an earlier id (got {ids})"
         );
     }
 

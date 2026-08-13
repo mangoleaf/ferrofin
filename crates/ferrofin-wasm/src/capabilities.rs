@@ -20,7 +20,8 @@ use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, 
 
 /// The most rows one `query-items` call may return, regardless of the
 /// guest's requested limit. Documented in the WIT contract; a plugin that
-/// needs more pages by parent/kind. Self-protective cap, not a tuning knob.
+/// needs more should issue narrower queries (by parent id or kind).
+/// Self-protective cap, not a tuning knob.
 pub const MAX_QUERY_ROWS: u32 = 1000;
 
 /// The manager handles a plugin's host functions call into. Installed once

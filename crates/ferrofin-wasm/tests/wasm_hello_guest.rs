@@ -47,10 +47,15 @@ fn build_guest() -> Option<PathBuf> {
         .expect("spawn cargo for the guest build");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // A missing target/toolchain is an environment gap, not a bug.
+        // Only a genuinely-missing target/toolchain is an environment gap
+        // worth a skip; every other failure (network, compile error in the
+        // guest, WIT drift) is a real failure and must fail loudly.
+        let missing_toolchain = stderr.contains("may not be installed")
+            || stderr.contains("rustup target add wasm32-wasip2")
+            || stderr.contains("toolchain '1.97.1' is not installed");
         assert!(
-            stderr.contains("wasm32-wasip2") || stderr.contains("toolchain"),
-            "guest build failed for a reason other than a missing wasm toolchain:\n{stderr}"
+            missing_toolchain,
+            "guest build FAILED (not a toolchain gap — this is a real error):\n{stderr}"
         );
         eprintln!("SKIP: wasm32-wasip2 toolchain unavailable:\n{stderr}");
         return None;

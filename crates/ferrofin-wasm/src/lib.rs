@@ -174,13 +174,20 @@ impl WasmPluginHost {
 
         // One ticker advances the epoch for every plugin of this engine.
         // 1 tick == 1 second == the unit of FERROFIN_WASM_CALL_TIMEOUT_SECS.
+        // The ticker holds only a WEAK engine handle: when the last real
+        // handle drops (host discarded — e.g. repeated loads in tests), the
+        // upgrade fails and the thread exits instead of pinning the engine
+        // and its compiled code forever.
         {
-            let engine = engine.clone();
+            let engine = engine.weak();
             std::thread::Builder::new()
                 .name("wasm-epoch-ticker".to_owned())
                 .spawn(move || {
                     loop {
                         std::thread::sleep(EPOCH_TICK);
+                        let Some(engine) = engine.upgrade() else {
+                            break;
+                        };
                         engine.increment_epoch();
                     }
                 })
@@ -207,6 +214,10 @@ impl WasmPluginHost {
                 .timeout(std::time::Duration::from_secs(u64::from(
                     settings.call_timeout_secs,
                 )))
+                // No transparent redirects: any future destination policy
+                // would be bypassed by a 302, and a guest that wants to
+                // follow one can read the Location header and re-fetch.
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
@@ -221,7 +232,17 @@ impl WasmPluginHost {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|ext| ext == "wasm"))
                 .collect(),
-            Err(_) => Vec::new(), // no plugins dir → no plugins
+            // A missing directory is the normal no-plugins state; anything
+            // else (permissions, I/O) must not masquerade as it.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                warn!(
+                    dir = %plugins_dir.display(),
+                    %err,
+                    "cannot read the wasm plugins directory; continuing without plugins"
+                );
+                Vec::new()
+            }
         };
         paths.sort();
 
@@ -293,6 +314,7 @@ impl WasmPluginHost {
                 Arc::new(WasmMetadataProvider {
                     plugin: Arc::clone(plugin),
                     collaborators: Arc::clone(&self.collaborators),
+                    gate_cache: std::sync::Mutex::new(None),
                 }) as Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>
             })
             .collect()
@@ -470,7 +492,16 @@ fn load_one(
 struct WasmMetadataProvider {
     plugin: Arc<LoadedPlugin>,
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    /// Short-lived (enabled, config) snapshot so a 100k-item scan does one
+    /// flag/config read per interval instead of two per item. The TTL only
+    /// delays a mid-scan dashboard toggle taking effect — never correctness.
+    gate_cache: std::sync::Mutex<Option<(std::time::Instant, bool, String)>>,
 }
+
+/// How long a [`WasmMetadataProvider`] trusts its (enabled, config)
+/// snapshot before re-reading. Seconds-scale: any value ≫ per-item cost and
+/// ≪ human toggle latency works; not worth a setting.
+const METADATA_GATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[async_trait]
 impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
@@ -487,22 +518,37 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
         let Some(cx) = self.collaborators.get() else {
             return Ok(None);
         };
-        let enabled = cx
-            .plugins
-            .get_plugin(self.plugin.descriptor.id)
-            .await?
-            .is_some_and(|d| d.enabled);
+        let cached = self
+            .gate_cache
+            .lock()
+            .expect("gate cache lock poisoned")
+            .clone()
+            .filter(|(at, _, _)| at.elapsed() < METADATA_GATE_CACHE_TTL);
+        let (enabled, config) = if let Some((_, enabled, config)) = cached {
+            (enabled, config)
+        } else {
+            {
+                let enabled = cx
+                    .plugins
+                    .get_plugin(self.plugin.descriptor.id)
+                    .await?
+                    .is_some_and(|d| d.enabled);
+                let config = cx
+                    .plugins
+                    .get_plugin_configuration(self.plugin.descriptor.id)
+                    .await
+                    .map_or_else(
+                        |_| String::from("{}"),
+                        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+                    );
+                *self.gate_cache.lock().expect("gate cache lock poisoned") =
+                    Some((std::time::Instant::now(), enabled, config.clone()));
+                (enabled, config)
+            }
+        };
         if !enabled {
             return Ok(None);
         }
-        let config = cx
-            .plugins
-            .get_plugin_configuration(self.plugin.descriptor.id)
-            .await
-            .map_or_else(
-                |_| String::from("{}"),
-                |bytes| String::from_utf8_lossy(&bytes).into_owned(),
-            );
 
         let wire_item = bindings::types::ItemSummary {
             id: item.item_id.to_string(),

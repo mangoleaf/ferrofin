@@ -100,7 +100,10 @@ surface is: `log`, `get-config` (its own config only), `http-fetch` (host-execut
 the destination logged and the response capped at the plugin's memory limit), `query-items`
 (a small read-only item projection, max 1000 rows per call), and `write-media-segments`
 (scoped to the plugin's own provider id — it can never touch another provider's or a user's
-segments). Plugins can also act as **metadata sources**: the scan offers every item to each
+segments). Note the honest flip side of `query-items` + `http-fetch`: a malicious plugin
+could read your library catalog (titles, ids, paths — never file contents) and POST it to a
+remote host, so plugin trust still matters; the sandbox bounds the blast radius, it does not
+make strangers trustworthy. Plugins can also act as **metadata sources**: the scan offers every item to each
 enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
 ran, and applies results **supplement-only** — a plugin fills fields that are still empty
 and records its own external ids; it can never overwrite a built-in provider or a user
