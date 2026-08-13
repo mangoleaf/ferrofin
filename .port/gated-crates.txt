@@ -19,3 +19,4 @@ ferrofin-api
 ferrofin-chromaprint
 ferrofin-extensions
 ferrofin-metrics
+ferrofin-wasm
