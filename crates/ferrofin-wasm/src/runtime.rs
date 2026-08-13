@@ -72,6 +72,10 @@ pub struct InstanceSpec {
     pub memory_limit_bytes: usize,
     /// Guest-call deadline in epoch ticks (1 tick = [`EPOCH_TICK`]).
     pub timeout_ticks: u64,
+    /// The shared blocking HTTP client behind `http-fetch`.
+    pub http: Arc<reqwest::blocking::Client>,
+    /// The manager handles behind the E2 capabilities (installed post-load).
+    pub collaborators: Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
 }
 
 impl InstanceSpec {
@@ -90,6 +94,9 @@ impl InstanceSpec {
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.memory_limit_bytes)
                 .build(),
+            memory_limit_bytes: self.memory_limit_bytes,
+            http: Arc::clone(&self.http),
+            collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),
             table: wasmtime::component::ResourceTable::new(),
         };

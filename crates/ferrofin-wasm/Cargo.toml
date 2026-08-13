@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
+ferrofin-model.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true
@@ -19,9 +20,12 @@ tracing.workspace = true
 uuid.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
+# `blocking` because host functions run on the plugin's own OS thread (not a
+# tokio worker), where a blocking client is the simplest correct shape.
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
+ferrofin-db.workspace = true
 wat.workspace = true
 tempfile.workspace = true
-ferrofin-model.workspace = true
 tracing-subscriber.workspace = true

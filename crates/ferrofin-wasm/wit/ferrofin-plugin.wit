@@ -47,13 +47,78 @@ interface types {
         /// Dashboard category the task is grouped under.
         category: string,
     }
+
+    /// An outbound HTTP request, executed BY THE HOST on the plugin's behalf
+    /// (guests have no sockets). http/https only.
+    record http-request {
+        /// The HTTP method (`GET`, `POST`, …).
+        method: string,
+        /// The absolute http(s) URL.
+        url: string,
+        /// Request headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// Optional request body.
+        body: option<list<u8>>,
+    }
+
+    /// The host-mediated response. Bodies larger than the plugin's memory
+    /// limit are refused (they could never fit in guest memory anyway).
+    record http-response {
+        /// The HTTP status code.
+        status: u16,
+        /// Response headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// The response body bytes.
+        body: list<u8>,
+    }
+
+    /// A read-only library item projection — deliberately small and stable
+    /// (NOT the wire DTO; this is the plugin contract, versioned with the
+    /// world).
+    record item-summary {
+        /// Canonical UUID string of the item.
+        id: string,
+        /// Display name.
+        name: string,
+        /// The item kind (`Movie`, `Episode`, `Series`, `Audio`, …).
+        kind: string,
+        /// Filesystem path, when the item has one.
+        path: option<string>,
+        /// Canonical UUID of the parent item, when there is one.
+        parent-id: option<string>,
+        /// Runtime in ticks (100 ns units), when known.
+        run-time-ticks: option<s64>,
+    }
+
+    /// Filters for `query-items`. Empty/absent fields mean "no filter".
+    record item-query {
+        /// Item kinds to include (`Movie`, `Episode`, …); empty = all kinds.
+        kinds: list<string>,
+        /// Restrict to children of this parent (canonical UUID string).
+        parent-id: option<string>,
+        /// Case-insensitive name search.
+        search-term: option<string>,
+        /// Maximum number of rows (the host caps this at 1000 per call).
+        limit: option<u32>,
+    }
+
+    /// A media segment to persist (`Intro`, `Outro`, `Recap`, `Preview`,
+    /// `Commercial`). Ticks are 100 ns units.
+    record media-segment {
+        /// The segment type name (one of the five above).
+        segment-type: string,
+        /// Segment start, in ticks.
+        start-ticks: s64,
+        /// Segment end, in ticks.
+        end-ticks: s64,
+    }
 }
 
-/// Capabilities Ferrofin grants to every plugin. Deliberately minimal in
-/// 0.1: log + own-config only. http-fetch, query-items and
-/// write-media-segments land in 0.2 (plan phase E2) as explicit additions.
+/// Capabilities Ferrofin grants to every plugin — the ENTIRE effect surface
+/// a guest has on the world. Every function here is host-mediated, logged,
+/// and bounded; adding one is a security decision, not a convenience.
 interface host {
-    use types.{log-level};
+    use types.{log-level, http-request, http-response, item-summary, item-query, media-segment};
 
     /// Emits a log line into the server's tracing pipeline, tagged with the
     /// plugin's id and name.
@@ -63,6 +128,22 @@ interface host {
     /// `/Plugins/{id}/Configuration` API manages). `{}` until the admin
     /// saves a value; a plugin never sees another plugin's config.
     get-config: func() -> string;
+
+    /// Performs an outbound HTTP request on the plugin's behalf — the ONLY
+    /// network access a guest has. http/https URLs only; the request runs
+    /// under the plugin's call-timeout budget, destinations are debug-logged,
+    /// and a response body larger than the plugin's memory limit is refused.
+    http-fetch: func(request: http-request) -> result<http-response, string>;
+
+    /// Read-only library queries, as a small stable projection (never the
+    /// full DTO). The host caps `limit` at 1000 rows per call.
+    query-items: func(query: item-query) -> result<list<item-summary>, string>;
+
+    /// Replaces THIS plugin's media segments for an item (other providers'
+    /// and user-authored segments are untouched — each plugin writes under
+    /// its own provider id, like every segment provider). An empty list
+    /// erases the plugin's segments for the item.
+    write-media-segments: func(item-id: string, segments: list<media-segment>) -> result<_, string>;
 }
 
 /// The contract a Ferrofin plugin component implements.

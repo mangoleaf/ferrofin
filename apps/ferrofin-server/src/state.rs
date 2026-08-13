@@ -676,6 +676,14 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
+    // Arm the E2 capabilities (query-items / write-media-segments) now that
+    // their backing managers exist — plugin load happened earlier, so a
+    // guest calling them during load got a clean "not available" error.
+    wasm_host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::clone(&library),
+        media_segments: Arc::clone(&media_segments),
+    });
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
         Arc::new(FerrofinCollectionManager::new(
             db.clone(),

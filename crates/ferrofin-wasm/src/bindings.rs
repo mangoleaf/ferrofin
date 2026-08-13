@@ -48,6 +48,16 @@ pub struct HostState {
     pub config_json: String,
     /// The memory ceiling handed to [`wasmtime::Store::limiter`].
     pub limits: StoreLimits,
+    /// The memory ceiling in bytes — also caps `http-fetch` response bodies
+    /// (a body that can't fit in guest memory is refused before the host
+    /// buffers it).
+    pub memory_limit_bytes: usize,
+    /// The shared blocking HTTP client behind `http-fetch` (per host, with
+    /// the call timeout baked in at construction).
+    pub http: std::sync::Arc<reqwest::blocking::Client>,
+    /// The manager handles behind `query-items`/`write-media-segments`,
+    /// installed by the composition root after loading (empty during load).
+    pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
     /// The empty WASI context (see the struct docs).
     pub wasi: wasmtime_wasi::WasiCtx,
     /// The resource table WASI's generated bindings require.
@@ -93,5 +103,37 @@ impl host::Host for HostState {
 
     fn get_config(&mut self) -> String {
         self.config_json.clone()
+    }
+
+    fn http_fetch(&mut self, request: types::HttpRequest) -> Result<types::HttpResponse, String> {
+        crate::capabilities::http_fetch(
+            &self.http,
+            &self.plugin_name,
+            self.memory_limit_bytes,
+            &request,
+        )
+    }
+
+    fn query_items(&mut self, query: types::ItemQuery) -> Result<Vec<types::ItemSummary>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("query-items is not available during plugin load")?;
+        crate::capabilities::query_items(cx, &query)
+    }
+
+    fn write_media_segments(
+        &mut self,
+        item_id: String,
+        segments: Vec<types::MediaSegment>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("write-media-segments is not available during plugin load")?;
+        // Each plugin writes under its own provider id, so replacement can
+        // never touch another provider's (or a user's) segments.
+        let provider_id = format!("wasm:{}", self.plugin_id);
+        crate::capabilities::write_media_segments(cx, &provider_id, &item_id, &segments)
     }
 }

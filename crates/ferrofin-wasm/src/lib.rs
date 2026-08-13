@@ -9,9 +9,11 @@
 //! to `ferrofin-api` a WASM plugin is indistinguishable from a Tier-1a one.
 //!
 //! # Security model
-//! Guests get **no filesystem and no network** — the world imports exactly
-//! one host interface (`log` + `get-config` in 0.1), so
-//! `wit/ferrofin-plugin.wit` is the entire attack surface. Every guest call
+//! Guests get **no filesystem and no direct network** — the world imports
+//! exactly one host interface (`log`, `get-config`, host-mediated
+//! `http-fetch`, read-only `query-items`, provider-scoped
+//! `write-media-segments`), so `wit/ferrofin-plugin.wit` is the entire
+//! attack surface. Every guest call
 //! runs under an epoch deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`) and a
 //! linear-memory cap (`FERROFIN_WASM_MEMORY_LIMIT_MB`); a trap, overrun, or
 //! cap hit fails that call only, and repeated failures trip a breaker that
@@ -19,6 +21,7 @@
 //! server never goes down with a plugin.
 
 pub mod bindings;
+pub mod capabilities;
 pub mod runtime;
 
 /// The hand-written canonical-ABI component implementing the
@@ -140,6 +143,9 @@ impl LoadedPlugin {
 /// The loaded plugin set plus the shared engine machinery.
 pub struct WasmPluginHost {
     plugins: Vec<Arc<LoadedPlugin>>,
+    /// One cell shared by every plugin's `HostState` (and every rebuild):
+    /// filling it arms `query-items`/`write-media-segments` host functions.
+    collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
 }
 
 impl WasmPluginHost {
@@ -194,6 +200,20 @@ impl WasmPluginHost {
             .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
         let linker = Arc::new(linker);
 
+        // One HTTP client per host: the guest-call deadline doubles as the
+        // request timeout, so a hung remote can't outlive the call budget.
+        let http = Arc::new(
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(u64::from(
+                    settings.call_timeout_secs,
+                )))
+                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
+        );
+        let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
+            Arc::new(std::sync::OnceLock::new());
+
         let mut plugins: Vec<Arc<LoadedPlugin>> = Vec::new();
         let mut paths: Vec<_> = match std::fs::read_dir(plugins_dir) {
             Ok(entries) => entries
@@ -206,7 +226,7 @@ impl WasmPluginHost {
         paths.sort();
 
         for path in paths {
-            match load_one(&engine, &linker, &path, settings) {
+            match load_one(&engine, &linker, &path, settings, &http, &collaborators) {
                 Ok(loaded) => {
                     if plugins
                         .iter()
@@ -240,7 +260,10 @@ impl WasmPluginHost {
             }
         }
 
-        Ok(Self { plugins })
+        Ok(Self {
+            plugins,
+            collaborators,
+        })
     }
 
     /// A host with no plugins (no directory scanned, no engine started).
@@ -248,7 +271,16 @@ impl WasmPluginHost {
     pub fn empty() -> Self {
         Self {
             plugins: Vec::new(),
+            collaborators: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Arms the `query-items` / `write-media-segments` host functions with
+    /// their backing managers. Called once by the composition root after the
+    /// managers exist; a guest calling these before that (i.e. during its
+    /// own load) gets a clean error, never a hang. A second call is a no-op.
+    pub fn set_runtime_collaborators(&self, collaborators: capabilities::Collaborators) {
+        let _ = self.collaborators.set(collaborators);
     }
 
     /// The loaded plugins.
@@ -338,6 +370,8 @@ fn load_one(
     linker: &Arc<Linker<HostState>>,
     path: &Path,
     settings: WasmSettings,
+    http: &Arc<reqwest::blocking::Client>,
+    collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
 ) -> Result<LoadedPlugin, wasmtime::Error> {
     let component = Component::from_file(engine, path)?;
     let spec = InstanceSpec {
@@ -351,6 +385,8 @@ fn load_one(
         plugin_id: String::new(), // filled from the descriptor below
         memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
         timeout_ticks: u64::from(settings.call_timeout_secs),
+        http: Arc::clone(http),
+        collaborators: Arc::clone(collaborators),
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;

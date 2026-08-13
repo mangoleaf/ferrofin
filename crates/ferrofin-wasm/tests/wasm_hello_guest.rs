@@ -14,10 +14,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
-use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::EventManager;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
+use ferrofin_traits::plugins::PluginManager;
+use ferrofin_wasm::capabilities::Collaborators;
 use ferrofin_wasm::{WasmPluginHost, WasmSettings};
+
+mod common;
+use common::{EnabledStub, OneMovieLibrary, RecordingSegments, one_shot_http};
 
 /// Resident set size of this process in KiB, from `/proc/self/status`.
 fn rss_kib() -> u64 {
@@ -55,62 +58,10 @@ fn build_guest() -> Option<PathBuf> {
     Some(guest_dir.join("target/wasm32-wasip2/release/ferrofin_wasm_hello.wasm"))
 }
 
-/// Plugin-manager stub: enabled, config carries a custom greeting.
-struct EnabledStub;
-
-#[async_trait::async_trait]
-impl PluginManager for EnabledStub {
-    async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
-        Ok(Vec::new())
-    }
-    async fn get_plugin(&self, id: uuid::Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
-        Ok(Some(PluginDescriptor {
-            id,
-            enabled: true,
-            ..PluginDescriptor::default()
-        }))
-    }
-    async fn enable_plugin(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn disable_plugin(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn remove_plugin(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn get_plugin_configuration(&self, _id: uuid::Uuid) -> Result<Vec<u8>, ServiceError> {
-        Ok(br#"{"Greeting":"Integration says hi"}"#.to_vec())
-    }
-    async fn set_plugin_configuration(
-        &self,
-        _id: uuid::Uuid,
-        _config: Vec<u8>,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn plugin_image(&self, _id: uuid::Uuid) -> Result<Option<PluginImage>, ServiceError> {
-        Ok(None)
-    }
-    async fn get_repositories(
-        &self,
-    ) -> Result<Vec<ferrofin_model::updates::RepositoryInfo>, ServiceError> {
-        Ok(Vec::new())
-    }
-    async fn set_repositories(
-        &self,
-        _repositories: Vec<ferrofin_model::updates::RepositoryInfo>,
-    ) -> Result<(), ServiceError> {
-        Ok(())
-    }
-    async fn list_packages(
-        &self,
-    ) -> Result<Vec<ferrofin_model::updates::PackageInfo>, ServiceError> {
-        Ok(Vec::new())
-    }
-}
-
 #[tokio::test]
+// One linear flow (build → load → greet/events → analyze → RSS); splitting
+// it would scatter the sequence the test proves.
+#[allow(clippy::too_many_lines)]
 async fn real_guest_loads_runs_and_reports_rss() {
     if std::env::var("FERROFIN_WASM_GUEST_TESTS").as_deref() != Ok("1") {
         eprintln!("SKIP: set FERROFIN_WASM_GUEST_TESTS=1 to build+run the real guest");
@@ -146,11 +97,13 @@ async fn real_guest_loads_runs_and_reports_rss() {
         plugin.descriptor.id.to_string(),
         "3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01"
     );
-    assert_eq!(plugin.tasks.len(), 1);
+    assert_eq!(plugin.tasks.len(), 2, "greet + analyze advertised");
 
     // Deliver a couple of events, then run the real task through the real
     // ScheduledTask adapter (enabled-gate + config fetch + actor round-trip).
-    let manager: Arc<dyn PluginManager> = Arc::new(EnabledStub);
+    let manager: Arc<dyn PluginManager> = Arc::new(EnabledStub(
+        br#"{"Greeting":"Integration says hi","ReportUrl":""}"#.to_vec(),
+    ));
     let events = ferrofin_core::FerrofinEventManager::new();
     host.subscribe_events(&events, &manager);
     events.publish("PlaybackStart", "{}").await.unwrap();
@@ -163,6 +116,47 @@ async fn real_guest_loads_runs_and_reports_rss() {
         .await
         .expect("the greet task must succeed");
     let rss_after_run = rss_kib();
+
+    // ── E2: the analyze task drives all three capabilities ─────────────
+    let segment_store = Arc::new(RecordingSegments::default());
+    host.set_runtime_collaborators(Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::new(OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: segment_store.clone(),
+    });
+    let (report_url, report_server) = one_shot_http("200 OK", b"ok");
+    let manager_with_report: Arc<dyn PluginManager> = Arc::new(EnabledStub(
+        format!(r#"{{"Greeting":"hi","ReportUrl":"{report_url}"}}"#).into_bytes(),
+    ));
+    let tasks = host.scheduled_tasks(&manager_with_report);
+    assert_eq!(tasks.len(), 2, "greet + analyze");
+    tasks[1]
+        .execute(&progress)
+        .await
+        .expect("analyze must succeed: query-items + write-media-segments + http-fetch");
+
+    // query-items → the canned movie; write-media-segments → provider-scoped
+    // replace with one Intro segment.
+    let expected_item: uuid::Uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01".parse().unwrap();
+    let expected_provider = "wasm:3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01";
+    {
+        let deleted = segment_store.deleted.lock().unwrap();
+        assert_eq!(
+            deleted.as_slice(),
+            &[(expected_item, expected_provider.to_owned())]
+        );
+        let created = segment_store.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0.item_id, expected_item);
+        assert_eq!(created[0].0.end_ticks, 30 * 10_000_000);
+        assert_eq!(created[0].1, expected_provider);
+    }
+    // http-fetch → the report reached the loopback listener.
+    let raw = String::from_utf8_lossy(&report_server.join().unwrap()).into_owned();
+    assert!(raw.starts_with("POST /hook"), "report posted: {raw}");
+    assert!(raw.contains("analyzed 1 movie(s)"), "report body: {raw}");
 
     // The first load pays one-time process costs (cranelift, engine, paging
     // wasmtime's code in). Loading a SECOND host with the same artifact
