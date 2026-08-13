@@ -2282,6 +2282,8 @@ impl LibraryScanner {
                         continue;
                     };
                     entity.media_type = Some("Audio".to_owned());
+                    // A placeholder the probe's ALBUM tag replaces (see
+                    // `apply_audio_metadata`); kept for tagless files.
                     entity.album = Some(album_name.clone());
                     out.push(Planned {
                         id,
@@ -2536,8 +2538,40 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbE
 /// The port of `AudioFileProber`'s tag→item mapping (multi-values pipe-joined,
 /// matching Ferrofin's `Artists`/`AlbumArtists`/`Genres` column convention).
 fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(String, String)> {
-    if entity.album.is_none() {
-        entity.album.clone_from(&info.album);
+    // The TITLE tag is authoritative for the track name (AudioFileProber:
+    // `audio.Name = trackTitle` unconditionally, bar locked fields — the scan
+    // loop already skips locked items). The resolver's file-stem name is a
+    // placeholder ("03. Artist - Title"), never the display name.
+    if let Some(title) = info
+        .media_source
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(create_sort_name(title));
+    }
+    // The ALBUM tag replaces the plan's folder-stem placeholder (upstream's
+    // `audio.Album ??= trackAlbum` works on a null the resolver left; here the
+    // placeholder marks "no real value yet" so tagless files keep the folder
+    // name). An NFO/edited album — no longer equal to the folder stem — wins.
+    let album_is_placeholder = match (entity.album.as_deref(), entity.path.as_deref()) {
+        (Some(album), Some(path)) => std::path::Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .is_some_and(|dir| album == file_stem(&dir)),
+        (None, _) => true,
+        _ => false,
+    };
+    if album_is_placeholder
+        && let Some(album) = info
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        entity.album = Some(album.to_owned());
     }
     if entity.artists.as_deref().unwrap_or_default().is_empty() && !info.artists.is_empty() {
         entity.artists = Some(info.artists.join("|"));
@@ -3082,6 +3116,23 @@ mod tests {
         super::apply_audio_metadata(&mut pre, &info);
         assert_eq!(pre.production_year, Some(2000));
         assert_eq!(pre.album.as_deref(), Some("Existing"));
+
+        // The TITLE tag replaces the resolver's file-stem name, and the ALBUM
+        // tag replaces the plan's folder-stem placeholder (the reported music
+        // bug: every track/album displayed release-folder noise).
+        info.media_source.name = Some("Scar Tissue".into());
+        let mut tagged = BaseItemEntity {
+            name: Some("03. Red Hot Chili Peppers - Scar Tissue".into()),
+            album: Some("RHCP - Californication (1999) FLAC".into()),
+            path: Some(
+                "/music/RHCP - Californication (1999) FLAC/03. Red Hot Chili Peppers - Scar Tissue.flac"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        super::apply_audio_metadata(&mut tagged, &info);
+        assert_eq!(tagged.name.as_deref(), Some("Scar Tissue"));
+        assert_eq!(tagged.album.as_deref(), Some("Kind of Blue"));
     }
 
     // fanart id selection prefers Tmdb over Imdb; dedup keeps the first image of
