@@ -270,6 +270,19 @@ impl LibraryManager for StubLibrary {
         }
     }
 
+    async fn get_chapter_image(
+        &self,
+        item_id: Uuid,
+        index: i32,
+    ) -> Result<Option<ItemImageInfo>, ServiceError> {
+        // One chapter, at index 0, whose thumbnail is the fixture image.
+        Ok((item_id == ITEM_ID && index == 0).then(|| ItemImageInfo {
+            path: self.image_path.clone(),
+            image_type: ImageType::Chapter,
+            ..ItemImageInfo::default()
+        }))
+    }
+
     async fn swap_images(
         &self,
         item_id: Uuid,
@@ -831,6 +844,35 @@ async fn item_image_by_index_serves_the_file() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"IDX0");
+}
+
+// A chapter thumbnail is not an item image row — it lives on the chapter
+// itself, so serving one has to resolve through the chapter seam (upstream
+// `BaseItem.GetImageInfo(ImageType.Chapter, index)`). Without this the player's
+// chapter thumbnails 404 however well the extraction ran.
+#[tokio::test]
+async fn chapter_image_serves_from_the_chapter_seam() {
+    let img = TempImage::new(b"CHAPTERFRAME");
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Chapter/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"CHAPTERFRAME");
+
+    // An index past the last chapter is still a 404.
+    let (status, _) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Chapter/7"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

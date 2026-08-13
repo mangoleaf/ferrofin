@@ -67,6 +67,11 @@ pub struct FerrofinLibraryManager {
     /// while a scan was running; the running task loops once more over it so
     /// changes landing mid-scan are not missed.
     scan_pending: Arc<std::sync::Mutex<Option<ScanScope>>>,
+    /// Chapter rows, for serving chapter thumbnails. Set by the composition
+    /// root; `None` (unit tests) means an item has no chapter images. The
+    /// repository (not the `ChapterManager`) is held because the manager is
+    /// built on top of this manager — taking it here would be a cycle.
+    chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
 }
 
 /// What a queued scan covers.
@@ -120,7 +125,19 @@ impl FerrofinLibraryManager {
             scanner: None,
             scan_in_flight: Arc::new(AtomicBool::new(false)),
             scan_pending: Arc::new(std::sync::Mutex::new(None)),
+            chapters: None,
         }
+    }
+
+    /// Attaches the chapter seam so chapter thumbnails can be served (their
+    /// paths live on the chapter rows, not in the item's image rows).
+    #[must_use]
+    pub fn with_chapters(
+        mut self,
+        chapters: Arc<dyn ferrofin_traits::persistence::ChapterRepository>,
+    ) -> Self {
+        self.chapters = Some(chapters);
+        self
     }
 
     /// Attaches the filesystem scanner so `queue_library_scan` actually walks the
@@ -164,6 +181,36 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(Vec::new());
         }
         self.items.get_image_infos(item_id).await
+    }
+
+    async fn get_chapter_image(
+        &self,
+        item_id: Uuid,
+        index: i32,
+    ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+        let Some(chapters) = &self.chapters else {
+            return Ok(None);
+        };
+        let Ok(index) = usize::try_from(index) else {
+            return Ok(None);
+        };
+        // Chapters come back in position order, which is the index clients
+        // address them by (upstream `ChapterManager.GetChapter(id, index)`).
+        let rows = chapters.get_chapters(item_id).await?;
+        let Some(chapter) = rows.into_iter().nth(index) else {
+            return Ok(None);
+        };
+        let Some(path) = chapter.image_path.filter(|p| !p.is_empty()) else {
+            return Ok(None);
+        };
+        Ok(Some(ferrofin_traits::options::ItemImageInfo {
+            path,
+            image_type: ferrofin_model::entities::ImageType::Chapter,
+            date_modified: chapter.image_date_modified.unwrap_or_else(chrono::Utc::now),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }))
     }
 
     async fn swap_images(

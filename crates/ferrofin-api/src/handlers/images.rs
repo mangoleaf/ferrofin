@@ -348,12 +348,26 @@ async fn serve_item_image(
     query: &ImageQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let images = state.library.get_item_images(item_id).await?;
-    let image = select_image(&images, image_type, index).ok_or_else(|| {
-        ApiError::NotFound(format!(
-            "item {item_id} has no {image_type:?} image at {index}"
-        ))
-    })?;
+    // Chapter thumbnails live on the chapter rows, not in the item's image
+    // rows (port of `BaseItem.GetImageInfo(ImageType.Chapter, index)`).
+    let chapter_image = if image_type == ImageType::Chapter {
+        state.library.get_chapter_image(item_id, index).await?
+    } else {
+        None
+    };
+    let images = if chapter_image.is_some() {
+        Vec::new()
+    } else {
+        state.library.get_item_images(item_id).await?
+    };
+    let image = chapter_image
+        .as_ref()
+        .or_else(|| select_image(&images, image_type, index))
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "item {item_id} has no {image_type:?} image at {index}"
+            ))
+        })?;
     serve_image_file(state, item_id, image, index, query, request).await
 }
 

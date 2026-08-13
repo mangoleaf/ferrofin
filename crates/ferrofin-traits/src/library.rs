@@ -123,6 +123,22 @@ pub trait LibraryManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The image of the item's `index`-th chapter, if it has one.
+    ///
+    /// Chapter thumbnails are not item image rows — they live on the chapter
+    /// itself (`Chapters.ImagePath`, written by the "Extract Chapter Images"
+    /// task), so serving one resolves through the chapter, exactly as
+    /// `BaseItem.GetImageInfo(ImageType.Chapter, index)` does upstream.
+    /// Defaults to `None` for implementations without chapters.
+    async fn get_chapter_image(
+        &self,
+        item_id: Uuid,
+        index: i32,
+    ) -> Result<Option<ItemImageInfo>, ServiceError> {
+        let _ = (item_id, index);
+        Ok(None)
+    }
+
     /// Reorders an item's images by swapping the two `image_type` images at
     /// `index1` and `index2`.
     ///

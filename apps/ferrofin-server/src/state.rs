@@ -552,7 +552,10 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
-        .with_scanner(Arc::clone(&library_scanner)),
+        .with_scanner(Arc::clone(&library_scanner))
+        // Chapter thumbnails are served from the chapter rows, not the item's
+        // image rows.
+        .with_chapters(Arc::clone(&chapter_repository)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the

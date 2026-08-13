@@ -1115,13 +1115,34 @@ impl FerrofinDtoService {
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
         if options.contains_field(ItemFields::Chapters) {
-            dto.chapters = Some(
-                prefetched
-                    .chapters
-                    .get(&item_id)
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            let mut chapters = prefetched
+                .chapters
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
+            // Each extracted chapter thumbnail needs its cache tag: clients gate
+            // the chapter image request on `ImageTag` (port of
+            // `ImageProcessor.GetImageCacheTag(item, chapter)`), so without it
+            // the thumbnails never load however well the extraction ran.
+            for chapter in &mut chapters {
+                let Some(path) = chapter.image_path.clone().filter(|p| !p.is_empty()) else {
+                    continue;
+                };
+                chapter.image_tag = self
+                    .image_tag(
+                        item_id,
+                        &ItemImageInfo {
+                            path,
+                            image_type: ImageType::Chapter,
+                            date_modified: chapter.image_date_modified,
+                            width: 0,
+                            height: 0,
+                            blur_hash: None,
+                        },
+                    )
+                    .await;
+            }
+            dto.chapters = Some(chapters);
         }
 
         // Media streams.
@@ -2535,6 +2556,48 @@ mod tests {
         }
     }
 
+    /// A [`ChapterManager`] fake with one thumbnailed and one bare chapter.
+    struct ChaptersWithImages;
+
+    #[async_trait]
+    impl ChapterManager for ChaptersWithImages {
+        async fn supports(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: Uuid,
+            _chapters: &[ChapterInfo],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_chapter(
+            &self,
+            _item_id: Uuid,
+            _index: i32,
+        ) -> Result<Option<ChapterInfo>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
+            Ok(vec![
+                ChapterInfo {
+                    start_position_ticks: 0,
+                    name: Some("Opening".to_owned()),
+                    image_path: Some("/meta/chapters/0.jpg".to_owned()),
+                    ..ChapterInfo::default()
+                },
+                ChapterInfo {
+                    start_position_ticks: 100_000_000,
+                    name: Some("No thumbnail".to_owned()),
+                    ..ChapterInfo::default()
+                },
+            ])
+        }
+        async fn delete_chapter_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
     /// A [`TrickplayManager`] fake — no manifest.
     #[derive(Default)]
     struct FakeTrickplay;
@@ -2710,6 +2773,22 @@ mod tests {
         )
     }
 
+    /// [`service`] with a chapter manager that has thumbnailed chapters.
+    fn service_with_chapters(db: Database) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources),
+            Arc::new(ChaptersWithImages),
+            Arc::new(FakeTrickplay),
+            Arc::new(FakeProviders),
+        )
+    }
+
     fn service(db: Database) -> FerrofinDtoService {
         service_with(db, Arc::new(FakeLibrary::default()))
     }
@@ -2744,6 +2823,30 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .expect("fetch item")
+    }
+
+    // Clients gate the chapter-thumbnail request on `ImageTag`; without it the
+    // extracted images are never fetched, however well the extraction ran.
+    #[tokio::test]
+    async fn chapter_dtos_carry_an_image_tag_when_a_thumbnail_exists() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Chaptered").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service_with_chapters(db);
+
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let chapters = dto.chapters.expect("chapters requested by default");
+        assert_eq!(chapters.len(), 2);
+        assert_eq!(
+            chapters[0].image_tag.as_deref(),
+            Some("tag:/meta/chapters/0.jpg")
+        );
+        // A chapter with no extracted image carries no tag.
+        assert_eq!(chapters[1].image_tag, None);
     }
 
     #[tokio::test]
