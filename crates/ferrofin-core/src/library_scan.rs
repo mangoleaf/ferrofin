@@ -299,6 +299,10 @@ pub struct LibraryScanner {
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
+    /// Maps `OfficialRating` strings to the numeric parental score persisted
+    /// in `InheritedParentalRatingValue` (what the Parental Rating sort and
+    /// the max-parental-rating filters read). `None` in minimal unit tests.
+    localization: Option<Arc<crate::localization_manager::LocalizationManager>>,
     /// Emit a scan-progress `info!` every N items (bootstrap knob
     /// `FERROFIN_SCAN_PROGRESS_EVERY`; default [`DEFAULT_SCAN_PROGRESS_EVERY`]). `0`
     /// disables progress logging. Keeps info-level volume at O(items/N) per
@@ -345,6 +349,7 @@ impl LibraryScanner {
             people: None,
             chapters: None,
             image_processor: None,
+            localization: None,
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
         }
@@ -372,6 +377,30 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_progress_every(mut self, every: usize) -> Self {
         self.progress_every = every;
+        self
+    }
+
+    /// Stamps the numeric parental score derived from `OfficialRating` — what
+    /// the Parental Rating sort and the max-rating filters read (upstream
+    /// `BaseItem.OnMetadataChanged` → `GetParentalRatingScore`).
+    fn apply_parental_rating_score(&self, entity: &mut BaseItemEntity) {
+        if let Some(localization) = &self.localization
+            && let Some(rating) = entity.official_rating.as_deref()
+            && let Some(score) = localization.get_rating_score(rating, None)
+        {
+            entity.inherited_parental_rating_value = Some(i64::from(score.score));
+            entity.inherited_parental_rating_sub_value = score.sub_score.map(i64::from);
+        }
+    }
+
+    /// Attaches the localization manager, so scanned items carry the numeric
+    /// parental-rating score derived from their `OfficialRating`.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<crate::localization_manager::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
         self
     }
 
@@ -638,6 +667,7 @@ impl LibraryScanner {
             if people.is_empty() {
                 people = remote.people;
             }
+            self.apply_parental_rating_score(&mut entity);
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
             // this entity is rebuilt from disk and would otherwise reset both
@@ -2041,7 +2071,10 @@ impl LibraryScanner {
             parent_id: Some(guid_to_db(parent)),
             top_parent_id: Some(guid_to_db(cf)),
             is_folder,
-            date_created: Some(Utc::now()),
+            // "Date Added" is the FILE's creation time (upstream sets
+            // `DateCreated = info.CreationTimeUtc` at resolve): scan wall-clock
+            // made a first scan order the whole library by directory traversal.
+            date_created: Some(file_date_created(path)),
             ..BaseItemEntity::default()
         };
         Some((id, entity))
@@ -2431,6 +2464,15 @@ fn path_is_under(path: &str, root: &str) -> bool {
         || path
             .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The file's creation time (falling back to modification time, then to now)
+/// — what "Date Added" sorts by, as upstream's resolvers stamp it.
+fn file_date_created(path: &str) -> chrono::DateTime<Utc> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
+        .map_or_else(Utc::now, chrono::DateTime::<Utc>::from)
 }
 
 /// The file name without its extension — a lightweight display name until real

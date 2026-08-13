@@ -449,6 +449,11 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
     )
     .with_id_derivation(id_derivation)
+    // OfficialRating → numeric parental score on each scanned row (the
+    // Parental Rating sort and max-rating filters read the numeric column).
+    .with_localization(Arc::new(LocalizationManager::new(
+        &server_config.metadata_country_code,
+    )))
     // Probe each media file during the scan (duration/size + per-stream codecs)
     // so the web client can pick direct play and the transcoder has stream info.
     .with_probe(
