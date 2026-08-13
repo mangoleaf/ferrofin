@@ -647,7 +647,17 @@ impl FerrofinDtoService {
                 .iter()
                 .map(|name| NameGuidPair {
                     name: Some(name.clone()),
-                    id: prefetched.value_id(0, name), // 0 = Artist
+                    // Prefer the ALBUM-ARTIST value id: that is the one the
+                    // by-name materializer backs with a browsable MusicArtist
+                    // row, so a performer who is also an album artist links to
+                    // a real page instead of a dangling id. Pure performers
+                    // keep the Artist (0) value id until the artist-hierarchy
+                    // work lands.
+                    id: prefetched
+                        .value_ids
+                        .get(&(1, crate::text_util::get_clean_value(name)))
+                        .copied()
+                        .unwrap_or_else(|| prefetched.value_id(0, name)),
                 })
                 .collect();
             dto.artists = Some(artists);
@@ -1059,6 +1069,12 @@ impl FerrofinDtoService {
         if kinds::is_audio(kind) {
             dto.album = item.album.clone();
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
+            // A track's parent is its album row — jellyfin-web's now-playing
+            // bar and track lists link back through AlbumId.
+            dto.album_id = item
+                .parent_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok());
         }
 
         // Artists / album-artists — only the kinds that implement C#
