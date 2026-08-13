@@ -2538,6 +2538,7 @@ impl LibraryScanner {
                         continue;
                     };
                     e.index_number = num.map(i64::from);
+                    e.sort_name = Some(season_sort_name(e.index_number, &name));
                     e.series_id = Some(guid_to_db(series_id));
                     e.series_name = Some(series_name.to_owned());
                     e.series_presentation_unique_key = Some(series_id.simple().to_string());
@@ -2624,6 +2625,10 @@ impl LibraryScanner {
             };
             e.path = None;
             e.index_number = num.map(i64::from);
+            e.sort_name = Some(season_sort_name(
+                e.index_number,
+                e.name.as_deref().unwrap_or_default(),
+            ));
             e.series_id = Some(guid_to_db(series_id));
             e.series_name = Some(series_name.to_owned());
             e.series_presentation_unique_key = Some(series_id.simple().to_string());
@@ -2740,6 +2745,13 @@ impl LibraryScanner {
         entity.series_id = Some(guid_to_db(series_id));
         entity.series_presentation_unique_key = Some(series_id.simple().to_string());
         entity.season_id = season.map(|(sid, _)| guid_to_db(sid));
+        // Episodes sort by position, not title (`Episode.CreateSortName`) — the
+        // numbers are only known here, after the resolver ran.
+        entity.sort_name = Some(episode_sort_name(
+            entity.parent_index_number,
+            entity.index_number,
+            entity.name.as_deref().unwrap_or_default(),
+        ));
         out.push(Planned {
             id,
             entity,
@@ -3100,7 +3112,7 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
         entity.sort_name = n
             .sort_name
             .clone()
-            .or_else(|| Some(create_sort_name(title)));
+            .or_else(|| Some(derived_sort_name(entity, title)));
     }
     if entity.overview.is_none() {
         entity.overview.clone_from(&n.overview);
@@ -3249,7 +3261,7 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbE
         && let Some(title) = d.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
     {
         entity.name = Some(title.to_owned());
-        entity.sort_name = Some(create_sort_name(title));
+        entity.sort_name = Some(derived_sort_name(entity, title));
     }
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
@@ -3506,6 +3518,38 @@ fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     ))
 }
 
+/// Port of C# `Episode.CreateSortName`: the zero-padded season/episode numbers
+/// ahead of the title (`001 - 0004 - The Title`).
+///
+/// This override REPLACES the generic name-derived sort name — an episode must
+/// sort by its position in the season, never alphabetically by title. Clients
+/// build their play queue from the season's episodes in `SortName` order, so a
+/// title-derived sort name scrambles the queue: "next episode" points at the
+/// wrong item, and at the alphabetically-last episode there is no next at all
+/// (a dead Next button and no autoplay).
+fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
+    let season = parent_index.map_or_else(String::new, |n| format!("{n:03} - "));
+    let episode = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    format!("{season}{episode}{name}")
+}
+
+/// Port of C# `Season.CreateSortName`: the zero-padded season number, or the
+/// name when the season has no number (so `Specials` (0000) sorts first).
+fn season_sort_name(index: Option<i64>, name: &str) -> String {
+    index.map_or_else(|| create_sort_name(name), |n| format!("{n:04}"))
+}
+
+/// The sort name a row derives from `title`, honouring the per-kind
+/// `CreateSortName` overrides (episodes and seasons sort by number, everything
+/// else by the name pipeline).
+fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
+    match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
+        "Episode" => episode_sort_name(entity.parent_index_number, entity.index_number, title),
+        "Season" => season_sort_name(entity.index_number, title),
+        _ => create_sort_name(title),
+    }
+}
+
 /// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`: lowercase the name, apply the
 /// default `SortReplace`/`SortRemove` characters and strip a leading article, then left-pad each
 /// run of digits to 10 so numbers sort naturally (e.g. `Movie 0001 (2020)` →
@@ -3664,6 +3708,53 @@ mod tests {
     }
 
     // Port of C# CreateSortName: lowercase, strip a leading article, zero-pad digit runs to 10.
+    // Port check against C# `Episode.CreateSortName` /
+    // `Season.CreateSortName`: episodes sort by season/episode number ahead of
+    // the title, seasons by their zero-padded number.
+    #[test]
+    fn episode_and_season_sort_names_match_jellyfin() {
+        assert_eq!(
+            super::episode_sort_name(Some(1), Some(4), "The One Where..."),
+            "001 - 0004 - The One Where..."
+        );
+        assert_eq!(
+            super::episode_sort_name(Some(10), Some(123), "Title"),
+            "010 - 0123 - Title"
+        );
+        // A null number renders as nothing at all (the C# ternaries).
+        assert_eq!(super::episode_sort_name(None, Some(2), "T"), "0002 - T");
+        assert_eq!(super::episode_sort_name(Some(1), None, "T"), "001 - T");
+        assert_eq!(super::episode_sort_name(None, None, "T"), "T");
+
+        // Sorting the same season's episodes by this key is episode order,
+        // never alphabetical (the play-queue regression).
+        let mut keys: Vec<String> = [(1, 1, "Zebra"), (1, 2, "Alpha"), (1, 10, "Middle")]
+            .iter()
+            .map(|(s, e, n)| super::episode_sort_name(Some(*s), Some(*e), n))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "001 - 0001 - Zebra",
+                "001 - 0002 - Alpha",
+                "001 - 0010 - Middle"
+            ]
+        );
+
+        assert_eq!(super::season_sort_name(Some(1), "Season 1"), "0001");
+        // Specials (season 0) sort ahead of season 1.
+        assert!(
+            super::season_sort_name(Some(0), "Specials")
+                < super::season_sort_name(Some(1), "Season 1")
+        );
+        // No number → the name pipeline.
+        assert_eq!(
+            super::season_sort_name(None, "Season Unknown"),
+            super::create_sort_name("Season Unknown")
+        );
+    }
+
     #[test]
     fn create_sort_name_matches_jellyfin() {
         assert_eq!(
@@ -4150,16 +4241,26 @@ mod tests {
         // every episode displayed its file name because this guard used to be
         // "only if empty", which the placeholder made permanently false).
         let mut placeholder = BaseItemEntity {
+            // A real Episode row: the type drives the per-kind sort-name rule.
+            type_: crate::item_type_lookup::stored_type_name(
+                ferrofin_model::data::BaseItemKind::Episode,
+            )
+            .unwrap()
+            .to_owned(),
             name: Some("GoT.S01E01.1080p.Bluray".into()),
             sort_name: Some("got.s01e01.1080p.bluray".into()),
             path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
             ..Default::default()
         };
         super::apply_tvdb_episode(&mut placeholder, &ep);
         assert_eq!(placeholder.name.as_deref(), Some("Winter Is Coming"));
+        // The new title must NOT become an alphabetical sort name: an episode
+        // sorts by its position, or the client's play queue scrambles.
         assert_eq!(
             placeholder.sort_name.as_deref(),
-            Some(super::create_sort_name("Winter Is Coming").as_str())
+            Some("001 - 0001 - Winter Is Coming")
         );
         // A name that differs from the stem (an NFO <title>) → kept.
         let mut named = BaseItemEntity {
@@ -5756,6 +5857,67 @@ mod tests {
         let data = entity.data.clone().unwrap();
         assert!(data.contains(r#""VideoType":"Iso""#));
         assert!(data.contains(r#""IsoType":"BluRay""#));
+    }
+
+    // A season's episodes must come back in EPISODE order, not alphabetical
+    // order by title. Clients build the play queue from the season sorted by
+    // SortName, so a title-derived key gives them a scrambled queue: the Next
+    // button lands on the wrong episode, and on the alphabetically-last one it
+    // has nowhere to go (dead button, no autoplay). File stems here are
+    // deliberately inverted against their episode numbers.
+    #[tokio::test]
+    async fn season_episodes_sort_by_number_not_title() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let season = media.join("Show").join("Season 01");
+        std::fs::create_dir_all(&season).unwrap();
+        for (stem, _) in [
+            ("Zebra S01E01", 1),
+            ("Alpha S01E02", 2),
+            ("Middle S01E03", 3),
+        ] {
+            std::fs::write(season.join(format!("{stem}.mkv")), b"").unwrap();
+        }
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let by_kind = async |kind| {
+            repo.get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![kind],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .expect("items")
+        };
+
+        let mut episodes = by_kind(ferrofin_model::data::BaseItemKind::Episode).await;
+        episodes.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        assert_eq!(
+            episodes.iter().map(|e| e.index_number).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)],
+            "SortName order must be episode order: {:?}",
+            episodes.iter().map(|e| &e.sort_name).collect::<Vec<_>>()
+        );
+        assert!(
+            episodes[0]
+                .sort_name
+                .as_deref()
+                .unwrap()
+                .starts_with("001 - 0001 - "),
+            "padded position prefix (Episode.CreateSortName): {:?}",
+            episodes[0].sort_name
+        );
+
+        // The season row keys on its number too (Specials first, then 1..N).
+        let seasons = by_kind(ferrofin_model::data::BaseItemKind::Season).await;
+        assert_eq!(seasons.len(), 1);
+        assert_eq!(seasons[0].sort_name.as_deref(), Some("0001"));
     }
 
     #[tokio::test]
