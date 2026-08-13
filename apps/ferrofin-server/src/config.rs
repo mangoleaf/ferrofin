@@ -122,6 +122,9 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     metrics_sample_interval: Option<u32>,
     scan_progress_every: Option<u32>,
+    wasm_call_timeout_secs: Option<u32>,
+    wasm_memory_limit_mb: Option<u32>,
+    wasm_event_queue_capacity: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -266,6 +269,26 @@ pub struct Config {
     /// `config.toml`, else the default. A logging knob only — mistuning it changes
     /// log density, never scan correctness.
     pub scan_progress_every: Option<u32>,
+
+    /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
+    /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
+    /// `FERROFIN_WASM_CALL_TIMEOUT_SECS` env > `wasm_call_timeout_secs` in
+    /// `config.toml` > default; zero is treated as unset.
+    pub wasm_call_timeout_secs: Option<u32>,
+
+    /// Per-plugin linear-memory cap for WASM plugins, in MiB. `None` = the
+    /// 128 MiB default (a `memory.grow` ceiling, never a reservation).
+    /// Resolved `FERROFIN_WASM_MEMORY_LIMIT_MB` env > `wasm_memory_limit_mb`
+    /// in `config.toml` > default; zero is treated as unset.
+    pub wasm_memory_limit_mb: Option<u32>,
+
+    /// Per-plugin event queue depth for WASM plugins. `None` = the 256
+    /// default. A full queue drops events for that plugin only (events are
+    /// hints; the DB is the truth). Resolved
+    /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
+    /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
+    /// treated as unset.
+    pub wasm_event_queue_capacity: Option<u32>,
 }
 
 impl Config {
@@ -442,6 +465,12 @@ impl Config {
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
+            wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
+                .or(file.wasm_call_timeout_secs),
+            wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
+                .or(file.wasm_memory_limit_mb),
+            wasm_event_queue_capacity: parse_var(env, "FERROFIN_WASM_EVENT_QUEUE_CAPACITY")
+                .or(file.wasm_event_queue_capacity),
         })
     }
 
@@ -886,6 +915,42 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn wasm_settings_resolve_from_env_and_file() {
+        // Unset ⇒ None (ferrofin-wasm applies its 30/128/256 defaults).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.wasm_call_timeout_secs, None);
+        assert_eq!(cfg.wasm_memory_limit_mb, None);
+        assert_eq!(cfg.wasm_event_queue_capacity, None);
+
+        // Env values apply.
+        let env = FakeEnv::new()
+            .with("FERROFIN_WASM_CALL_TIMEOUT_SECS", "10")
+            .with("FERROFIN_WASM_MEMORY_LIMIT_MB", "64")
+            .with("FERROFIN_WASM_EVENT_QUEUE_CAPACITY", "32");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_call_timeout_secs, Some(10));
+        assert_eq!(cfg.wasm_memory_limit_mb, Some(64));
+        assert_eq!(cfg.wasm_event_queue_capacity, Some(32));
+
+        // config.toml supplies them; env beats file.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "wasm_call_timeout_secs = 5\nwasm_memory_limit_mb = 256\n",
+        )
+        .unwrap();
+        let env = FakeEnv::new().with("FERROFIN_WASM_CALL_TIMEOUT_SECS", "15");
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.wasm_call_timeout_secs, Some(15), "env beats file");
+        assert_eq!(cfg.wasm_memory_limit_mb, Some(256), "file applies");
     }
 
     #[test]

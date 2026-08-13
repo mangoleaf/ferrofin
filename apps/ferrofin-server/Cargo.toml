@@ -35,6 +35,7 @@ ferrofin-hls.workspace = true
 ferrofin-drawing.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-extensions.workspace = true
+ferrofin-wasm.workspace = true
 ferrofin-livetv.workspace = true
 ferrofin-metrics.workspace = true
 
