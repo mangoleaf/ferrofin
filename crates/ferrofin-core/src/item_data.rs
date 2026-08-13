@@ -164,6 +164,19 @@ pub fn merge_remote_trailers(
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// Sets a string field on a `Data` column value, returning the new column
+/// text. Every other key is preserved.
+///
+/// Used for the fields Ferrofin has no dedicated column for and Jellyfin only
+/// keeps in the blob (`VideoType`, `IsoType` — what the `videoTypes` browse
+/// filter matches on).
+#[must_use]
+pub fn set_data_field(data: Option<&str>, key: &str, value: &str) -> Option<String> {
+    let mut object = parse_data(data);
+    object.insert(key.to_owned(), Value::String(value.to_owned()));
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —
 /// the presence signal that Jellyfin (or a prior Ferrofin sync) owns this blob.
 #[must_use]

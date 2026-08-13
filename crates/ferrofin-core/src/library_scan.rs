@@ -28,7 +28,7 @@ use ferrofin_db::entities::base_items::{
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::io::FileSystemEntryType;
 use ferrofin_model::media_info::MediaInfo;
@@ -2365,6 +2365,15 @@ impl LibraryScanner {
         extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
         movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) {
+        // A disc rip (`…/Movie (2009)/BDMV/` or `VIDEO_TS/`) is ONE item for the
+        // containing folder, not one per .vob/.m2ts inside — port of
+        // `BaseVideoResolver.ResolveVideo`'s directory arm.
+        if dir != root
+            && let Some(video_type) = self.disc_video_type(dir)
+        {
+            self.plan_disc_movie(dir, cf, video_type, out);
+            return;
+        }
         for entry in self.file_system.get_file_system_entries(dir) {
             if entry.type_ == FileSystemEntryType::Directory {
                 self.collect_movie_plan(&entry.path, root, cf, naming, out, extras, movies_by_dir);
@@ -2402,6 +2411,7 @@ impl LibraryScanner {
             entity.is_movie = true;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
+            set_video_type(&mut entity, file_video_type(&entry.path));
             movies_by_dir
                 .entry(dir.to_owned())
                 .or_default()
@@ -2412,6 +2422,54 @@ impl LibraryScanner {
                 ancestors: vec![cf],
             });
         }
+    }
+
+    /// The disc structure `dir` holds, if any: a `VIDEO_TS` subfolder with
+    /// `.vob` files is a DVD rip, a `BDMV` subfolder a Blu-ray rip. Port of
+    /// `IsDvdDirectory` / `IsBluRayDirectory`.
+    fn disc_video_type(&self, dir: &str) -> Option<VideoType> {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ != FileSystemEntryType::Directory {
+                continue;
+            }
+            let name = file_stem(&entry.path);
+            if name.eq_ignore_ascii_case("BDMV") {
+                return Some(VideoType::BluRay);
+            }
+            if name.eq_ignore_ascii_case("VIDEO_TS")
+                && self
+                    .file_system
+                    .get_file_system_entries(&entry.path)
+                    .iter()
+                    .any(|f| {
+                        f.type_ != FileSystemEntryType::Directory
+                            && std::path::Path::new(&f.path)
+                                .extension()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("vob"))
+                    })
+            {
+                return Some(VideoType::Dvd);
+            }
+        }
+        None
+    }
+
+    /// Emits the single `Movie` row for a disc-rip folder (the folder itself is
+    /// the item, as upstream resolves it).
+    fn plan_disc_movie(&self, dir: &str, cf: Uuid, video_type: VideoType, out: &mut Vec<Planned>) {
+        let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
+        let Some((id, mut entity)) = self.base_item(BaseItemKind::Movie, cf, cf, name, dir, true)
+        else {
+            return;
+        };
+        entity.is_movie = true;
+        entity.media_type = Some("Video".to_owned());
+        set_video_type(&mut entity, video_type);
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        });
     }
 
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
@@ -2902,6 +2960,52 @@ fn album_name_consensus(tracks: &[BaseItemEntity]) -> Option<String> {
         .filter_map(|t| t.album.as_deref().map(str::trim).filter(|s| !s.is_empty()));
     let first = names.next()?.to_owned();
     names.all(|n| n == first).then_some(first)
+}
+
+/// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
+/// everything else a video file (port of `SetVideoType`).
+fn file_video_type(path: &str) -> VideoType {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    if ext.eq_ignore_ascii_case("iso") || ext.eq_ignore_ascii_case("img") {
+        VideoType::Iso
+    } else {
+        VideoType::VideoFile
+    }
+}
+
+/// Writes `video_type` (and, for an image, its `IsoType`) into the row's `Data`
+/// blob — where Jellyfin keeps them, and what the `videoTypes` browse filter
+/// matches on. `IsoType` follows upstream's path-substring heuristic.
+fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
+    let name = match video_type {
+        VideoType::VideoFile => "VideoFile",
+        VideoType::Iso => "Iso",
+        VideoType::Dvd => "Dvd",
+        VideoType::BluRay => "BluRay",
+    };
+    if let Some(data) = crate::item_data::set_data_field(entity.data.as_deref(), "VideoType", name)
+    {
+        entity.data = Some(data);
+    }
+    if video_type != VideoType::Iso {
+        return;
+    }
+    let path = entity.path.as_deref().unwrap_or_default().to_lowercase();
+    let iso_type = if path.contains("dvd") {
+        "Dvd"
+    } else if path.contains("bluray") {
+        "BluRay"
+    } else {
+        return;
+    };
+    if let Some(data) =
+        crate::item_data::set_data_field(entity.data.as_deref(), "IsoType", iso_type)
+    {
+        entity.data = Some(data);
+    }
 }
 
 /// Whether `dir`'s own name is one of upstream's artist release subfolders
@@ -5598,6 +5702,72 @@ mod tests {
             2,
             "both trailer spellings attach to the movie"
         );
+    }
+
+    // A disc rip is one item for its folder (never one per .vob/.m2ts), and
+    // its VideoType lands in Data — what the browse `videoTypes` filter reads.
+    #[tokio::test]
+    async fn disc_rips_resolve_to_one_movie_with_a_video_type() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let bluray = media.join("Avatar (2009)").join("BDMV").join("STREAM");
+        std::fs::create_dir_all(&bluray).unwrap();
+        std::fs::write(bluray.join("00001.m2ts"), b"").unwrap();
+        let dvd = media.join("Alien (1979)").join("VIDEO_TS");
+        std::fs::create_dir_all(&dvd).unwrap();
+        std::fs::write(dvd.join("VTS_01_1.VOB"), b"").unwrap();
+        // A plain file alongside them stays a normal VideoFile movie.
+        let flat = media.join("Heat (1995)");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("Heat (1995).mkv"), b"").unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let movies = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+                ..Default::default()
+            })
+            .await
+            .expect("movies");
+        assert_eq!(movies.len(), 3, "one item per disc folder, not per stream");
+
+        let data_of = |name: &str| {
+            movies
+                .iter()
+                .find(|m| m.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} resolved"))
+                .data
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(data_of("Avatar (2009)").contains(r#""VideoType":"BluRay""#));
+        assert!(data_of("Alien (1979)").contains(r#""VideoType":"Dvd""#));
+        assert!(data_of("Heat (1995)").contains(r#""VideoType":"VideoFile""#));
+    }
+
+    #[test]
+    fn iso_files_carry_their_disc_type() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities::VideoType;
+        assert_eq!(super::file_video_type("/m/Movie.iso"), VideoType::Iso);
+        assert_eq!(super::file_video_type("/m/Movie.img"), VideoType::Iso);
+        assert_eq!(super::file_video_type("/m/Movie.mkv"), VideoType::VideoFile);
+
+        // Upstream's path-substring heuristic fills IsoType.
+        let mut entity = BaseItemEntity {
+            path: Some("/m/bluray/Movie.iso".to_owned()),
+            ..Default::default()
+        };
+        super::set_video_type(&mut entity, VideoType::Iso);
+        let data = entity.data.clone().unwrap();
+        assert!(data.contains(r#""VideoType":"Iso""#));
+        assert!(data.contains(r#""IsoType":"BluRay""#));
     }
 
     #[tokio::test]
