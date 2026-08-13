@@ -791,6 +791,24 @@ pub trait UserDataManager: Send + Sync {
         reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError>;
 
+    /// Records that playback of an item just started for a user.
+    ///
+    /// Port of the user-data half of C# `SessionManager.OnPlaybackStart`:
+    /// increments `PlayCount`, stamps `LastPlayedDate` (the column Next Up's
+    /// recently-watched filter reads — without this stamp a normally-watched
+    /// series never surfaces there), and marks non-resumable kinds played
+    /// outright.
+    /// The default is a no-op so test fakes compile unchanged; the concrete
+    /// manager implements the real write.
+    async fn record_playback_start(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        let _ = (user_id, item_id);
+        Ok(())
+    }
+
     /// Marks an item as played for a user, returning the refreshed data DTO.
     ///
     /// Port of `BaseItem.MarkPlayed`: sets `Played`, resets the resume position,

@@ -483,6 +483,32 @@ impl UserDataManager for FerrofinUserDataManager {
         Ok(())
     }
 
+    async fn record_playback_start(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        // Port of the user-data half of C# SessionManager.OnPlaybackStart:
+        // PlayCount++, LastPlayedDate = now, and non-resumable kinds (photos,
+        // books — anything without position-ticks resume) are played outright.
+        // The LastPlayedDate stamp is what Next Up's recently-watched HAVING
+        // filter reads; the stop-path `update_play_state` deliberately never
+        // writes it, exactly like upstream.
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        row.play_count += 1;
+        row.last_played_date = Some(chrono::Utc::now());
+        if let Some((_, kind)) = self.item_runtime_and_kind(item_id).await?
+            && supports_played_status(kind)
+            && !supports_position_ticks_resume(kind)
+        {
+            row.played = true;
+        }
+        self.upsert_row(&row).await
+    }
+
     async fn get_content_permissions(
         &self,
         user_id: Uuid,
@@ -762,6 +788,27 @@ mod tests {
             .expect("read")
             .expect("some");
         assert_eq!(dto.playback_position_ticks, position);
+    }
+
+    #[tokio::test]
+    async fn record_playback_start_stamps_last_played_and_play_count() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x9);
+        let item = Uuid::from_u128(0x51);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        // Two starts: PlayCount accumulates and LastPlayedDate lands — the
+        // column Next Up's recently-watched filter reads (the bug was that a
+        // normally-watched series never got the stamp, so Next Up was empty).
+        mgr.record_playback_start(user, item).await.expect("start");
+        mgr.record_playback_start(user, item).await.expect("start");
+        let row = mgr.read_row(item, user).await.expect("read").expect("row");
+        assert_eq!(row.play_count, 2);
+        assert!(row.last_played_date.is_some());
+        // A movie resumes by position, so a start alone never marks it played.
+        assert!(!row.played);
     }
 
     #[tokio::test]

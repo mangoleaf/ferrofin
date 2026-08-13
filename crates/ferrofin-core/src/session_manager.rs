@@ -598,6 +598,19 @@ impl SessionManager for FerrofinSessionManager {
             );
         }
 
+        // Record the start on every session user's data (C# OnPlaybackStart:
+        // PlayCount++ and the LastPlayedDate stamp Next Up filters on), then
+        // push the change to the user's other devices.
+        if !info.item_id.is_nil() {
+            for user in self.users_for(&session).await? {
+                let user_id = parse_user_id(&user.id);
+                self.user_data_manager
+                    .record_playback_start(user_id, info.item_id)
+                    .await?;
+                self.push_user_data_changed(user_id, info.item_id).await;
+            }
+        }
+
         let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
         let _ = self.event_manager.publish("PlaybackStart", &payload).await;
         Ok(())
