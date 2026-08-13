@@ -338,6 +338,10 @@ pub async fn build_app_state(
                 analyze_duration: None,
                 probe_size: None,
                 threads: 0,
+                // Frame extraction (chapter images) writes here, never next to
+                // the media file — media mounts are commonly read-only. The
+                // C# `TempDirectory` layout: a `temp` dir under the cache.
+                temp_dir: std::path::PathBuf::from(paths.cache_path()).join("temp"),
             },
         ));
 
