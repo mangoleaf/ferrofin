@@ -789,13 +789,6 @@ impl LibraryScanner {
     /// The best-effort enrichment passes that run once the item walk is done.
     /// Each is independent and logs its own failure — none may fail the scan.
     async fn post_scan_passes(&self, folders: &[VirtualFolderInfo]) {
-        // Library tile images: composite each library's Primary from its own
-        // content (upstream CollectionFolderImageProvider), so the home
-        // screen's "My Media" tiles carry artwork instead of the blue
-        // placeholder.
-        if let Err(err) = self.refresh_library_images(folders).await {
-            tracing::warn!(%err, "library image pass failed");
-        }
         // Music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above.
@@ -807,6 +800,14 @@ impl LibraryScanner {
         // Studios tabs carry artwork.
         if let Err(err) = self.enrich_studio_images().await {
             tracing::warn!(%err, "studio image pass failed");
+        }
+        // Library tile images LAST: the collage composites each library's
+        // Primary from its own content (upstream
+        // CollectionFolderImageProvider), so it has to run after the passes
+        // that fetch that content's artwork — otherwise a first scan sees no
+        // art and the "My Media" tile keeps the icon placeholder.
+        if let Err(err) = self.refresh_library_images(folders).await {
+            tracing::warn!(%err, "library image pass failed");
         }
     }
 
@@ -2086,10 +2087,17 @@ impl LibraryScanner {
                 continue;
             }
             // Random content sample; over-fetch since not every row has art.
-            let sample = InternalItemsQuery {
+            // Upstream samples the collection type's own kinds (a music
+            // library's tile comes from its ALBUMS, whose covers are the art
+            // that exists — sampling leaf tracks found nothing and left the
+            // note-icon placeholder). The leaf fallback keeps a library whose
+            // typed rows have no art from losing its tile.
+            let kinds = collage_item_kinds(folder);
+            let sample = |include_item_types: Vec<BaseItemKind>, is_folder| InternalItemsQuery {
                 ancestor_ids: vec![cf],
                 recursive: true,
-                is_folder: Some(false),
+                include_item_types,
+                is_folder,
                 is_virtual_item: Some(false),
                 limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
                 order_by: vec![(
@@ -2098,8 +2106,12 @@ impl LibraryScanner {
                 )],
                 ..Default::default()
             };
+            let mut candidates = items.get_item_ids(&sample(kinds, None)).await?;
+            if candidates.is_empty() {
+                candidates = items.get_item_ids(&sample(Vec::new(), Some(false))).await?;
+            }
             let mut inputs = Vec::new();
-            for id in items.get_item_ids(&sample).await? {
+            for id in candidates {
                 if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
                     break;
                 }
@@ -3046,6 +3058,30 @@ fn pick_series_hit(
 ) -> Option<ferrofin_providers::TvdbSearchHit> {
     year.and_then(|y| hits.iter().find(|h| h.year == Some(y)).cloned())
         .or_else(|| hits.into_iter().next())
+}
+
+/// The item kinds a library's tile collage samples — port of
+/// `DtoExtensions.GetBaseItemKindsForCollectionType`, which
+/// `CollectionFolderImageProvider` uses to pick the rows whose Primary images
+/// make up the tile. An unknown/absent collection type samples the mixed set.
+fn collage_item_kinds(folder: &VirtualFolderInfo) -> Vec<BaseItemKind> {
+    match folder.collection_type {
+        Some(CollectionTypeOptions::movies) => vec![BaseItemKind::Movie],
+        Some(CollectionTypeOptions::tvshows) => vec![BaseItemKind::Series],
+        Some(CollectionTypeOptions::music) => vec![BaseItemKind::MusicAlbum],
+        Some(CollectionTypeOptions::musicvideos) => vec![BaseItemKind::MusicVideo],
+        Some(CollectionTypeOptions::books) => vec![BaseItemKind::Book, BaseItemKind::AudioBook],
+        Some(CollectionTypeOptions::boxsets) => vec![BaseItemKind::BoxSet],
+        // Ferrofin folds upstream's separate `photos` type into `homevideos`.
+        Some(CollectionTypeOptions::homevideos) => vec![BaseItemKind::Video, BaseItemKind::Photo],
+        _ => vec![
+            BaseItemKind::Video,
+            BaseItemKind::Audio,
+            BaseItemKind::Photo,
+            BaseItemKind::Movie,
+            BaseItemKind::Series,
+        ],
+    }
 }
 
 /// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
@@ -6117,6 +6153,35 @@ mod tests {
     // button lands on the wrong episode, and on the alphabetically-last one it
     // has nowhere to go (dead button, no autoplay). File stems here are
     // deliberately inverted against their episode numbers.
+    // The library tile samples the collection type's own kinds — a music
+    // library's tile comes from its ALBUMS (whose covers exist), not from leaf
+    // tracks (which usually have none), and never from the wrong kind.
+    #[test]
+    fn collage_samples_the_collection_types_kinds() {
+        use ferrofin_model::data::BaseItemKind;
+        let folder = |ct| ferrofin_model::entities_media::VirtualFolderInfo {
+            collection_type: ct,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::collage_item_kinds(&folder(Some(CollectionTypeOptions::music))),
+            vec![BaseItemKind::MusicAlbum]
+        );
+        assert_eq!(
+            super::collage_item_kinds(&folder(Some(CollectionTypeOptions::tvshows))),
+            vec![BaseItemKind::Series]
+        );
+        assert_eq!(
+            super::collage_item_kinds(&folder(Some(CollectionTypeOptions::movies))),
+            vec![BaseItemKind::Movie]
+        );
+        // An untyped (mixed) library samples the mixed set, as upstream does.
+        assert!(
+            super::collage_item_kinds(&folder(None)).contains(&BaseItemKind::Movie)
+                && super::collage_item_kinds(&folder(None)).contains(&BaseItemKind::Audio)
+        );
+    }
+
     #[tokio::test]
     async fn season_episodes_sort_by_number_not_title() {
         use ferrofin_traits::persistence::ItemRepository as _;
