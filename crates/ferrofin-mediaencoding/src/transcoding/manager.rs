@@ -153,11 +153,18 @@ struct RunningJob {
 /// mutable bookkeeping the registry tracks.
 struct RegisteredJob {
     handle: TranscodingJobHandle,
+    /// The playing media in operator terms (`TranscodeDisplayNames::label`),
+    /// so kill/reap logs name what died; empty when never resolved.
+    display: String,
     is_user_paused: bool,
     ping_timeout_ms: i64,
     /// Number of active output requests (`ActiveRequestCount`); a job with zero
     /// begins its idle countdown toward kill.
     active_request_count: i32,
+    /// When this job last showed signs of a consumer: registration, a
+    /// begin/end request, or a session ping. The idle reaper kills a job with
+    /// no active requests once this is older than [`Self::ping_timeout_ms`].
+    last_activity: std::time::Instant,
     /// The live process + cache metadata when this job was spawned via
     /// `start_ffmpeg`; `None` for registry-only jobs (lookup tests).
     running: Option<RunningJob>,
@@ -181,6 +188,23 @@ pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileClean
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
     file_cleaner: C,
+}
+
+/// An active-consumer mark on a transcode job, released on drop.
+///
+/// Returned by [`TranscodeManagerImpl::begin_request_guard`]; holding it keeps
+/// the idle reaper away from the job. Dropping it (including when the awaiting
+/// request future is cancelled by a client disconnect) decrements the count and
+/// restarts the idle countdown.
+pub struct TranscodeRequestGuard<'a, S: SessionReporter, C: FileCleaner> {
+    manager: &'a TranscodeManagerImpl<S, C>,
+    handle: TranscodingJobHandle,
+}
+
+impl<S: SessionReporter, C: FileCleaner> Drop for TranscodeRequestGuard<'_, S, C> {
+    fn drop(&mut self) {
+        self.manager.end_request_sync(&self.handle);
+    }
 }
 
 impl<S: SessionReporter> TranscodeManagerImpl<S, FsFileCleaner> {
@@ -213,8 +237,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     pub fn register_job(&self, handle: TranscodingJobHandle) -> TranscodingJobHandle {
         let job = RegisteredJob {
             ping_timeout_ms: RegisteredJob::ping_timeout_for(handle.job_type),
+            display: String::new(),
             is_user_paused: false,
-            active_request_count: 1,
+            // Consumers are counted by begin/end request pairing (the guard);
+            // registration itself stamps last_activity, which keeps the idle
+            // reaper away until the initiating request attaches its guard.
+            active_request_count: 0,
+            last_activity: std::time::Instant::now(),
             handle: handle.clone(),
             running: None,
         };
@@ -273,7 +302,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     #[tracing::instrument(
         name = "transcode_job",
         skip_all,
-        fields(play_session_id = tracing::field::Empty, device_id = tracing::field::Empty)
+        fields(
+            play_session_id = tracing::field::Empty,
+            device_id = tracing::field::Empty,
+            playing = tracing::field::Empty
+        )
     )]
     pub async fn start_ffmpeg(
         &self,
@@ -297,6 +330,12 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             state.play_session_id.as_deref().unwrap_or(""),
         );
         job_span.record("device_id", state.device_id.as_deref().unwrap_or(""));
+        // What the job is playing, in operator terms ("Library / Series -
+        // Episode") — every event under this span names the media, not just ids.
+        let display = state.display.label();
+        if !display.is_empty() {
+            job_span.record("playing", display.as_str());
+        }
         tracing::info!(
             transcode_type = ?state.transcoding_type,
             program = %program,
@@ -331,8 +370,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             device_id: state.device_id.clone(),
         };
 
-        // 4. Register the job FIRST (OnTranscodeBeginning).
+        // 4. Register the job FIRST (OnTranscodeBeginning), naming what it
+        // plays so a later kill/reap log doesn't reduce to ids.
         self.register_job(handle.clone());
+        self.set_job_display(&handle, &display);
 
         // 5. Spawn; on failure remove the job (OnTranscodeFailedToStart).
         let child = match transcoder.start_transcode(&req).await {
@@ -483,17 +524,22 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ///
     /// Panics if the internal job-registry mutex has been poisoned.
     pub async fn kill_and_remove(&self, handle: &TranscodingJobHandle, delete_files: bool) {
-        let running = {
+        let (display, running) = {
             let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
             let idx = jobs.iter().position(|j| {
                 j.handle.job_type == handle.job_type
                     && j.handle.path.eq_ignore_ascii_case(&handle.path)
             });
-            idx.and_then(|i| jobs.remove(i).running)
+            match idx.map(|i| jobs.remove(i)) {
+                Some(job) => (job.display, job.running),
+                None => (String::new(), None),
+            }
         };
+        let playing_label = display;
         if let Some(running) = running {
             tracing::info!(
                 play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                playing = %playing_label,
                 delete_files,
                 "transcode job killed"
             );
@@ -511,20 +557,115 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.reporter.on_job_killed(handle, delete_files).await;
     }
 
-    /// Runs the kill-timer for `handle`: after `ping_timeout` with no ping, the
-    /// job is killed. Port of `OnTranscodeKillTimerStopped`; `sleep` is injected
-    /// so a fake clock can drive it deterministically in unit tests.
-    pub async fn run_kill_timer<F, Fut>(
+    /// One sweep of the idle reaper: kills every job that has **no active
+    /// consumer** (`active_request_count == 0`) and no activity (request or
+    /// session ping) within its ping timeout. Returns the killed handles.
+    ///
+    /// Port of upstream's per-job `PingTimer` → `OnTranscodeKillTimerStopped`
+    /// collapsed into a periodic scan — same outcome (an HLS job dies ~60s
+    /// after its last consumer vanishes, a progressive one after ~10s), one
+    /// mechanism instead of a timer per job. This is what stops a cast client
+    /// that disconnects without a Stop report from leaving ffmpeg running
+    /// forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn reap_idle_jobs(&self) -> Vec<TranscodingJobHandle> {
+        let idle: Vec<(TranscodingJobHandle, String)> = {
+            let jobs = self.jobs.lock().expect("jobs lock poisoned");
+            jobs.iter()
+                .filter(|j| {
+                    j.active_request_count <= 0
+                        && i64::try_from(j.last_activity.elapsed().as_millis()).unwrap_or(i64::MAX)
+                            > j.ping_timeout_ms
+                })
+                .map(|j| (j.handle.clone(), j.display.clone()))
+                .collect()
+        };
+        for (handle, playing_label) in &idle {
+            tracing::info!(
+                path = %handle.path,
+                play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                device_id = handle.device_id.as_deref().unwrap_or(""),
+                playing = %playing_label,
+                "killing idle transcode job (no consumer within the ping timeout)"
+            );
+            self.kill_and_remove(handle, true).await;
+        }
+        idle.into_iter().map(|(handle, _)| handle).collect()
+    }
+
+    /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
+    /// composition root spawns this once next to the manager.
+    pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            self.reap_idle_jobs().await;
+        }
+    }
+
+    /// Marks a consumer active on the job registered for `path`/`job_type`,
+    /// returning a guard that releases it on drop.
+    ///
+    /// The guard pairing is what upstream does with `OnTranscodeBeginRequest` /
+    /// `Response.OnCompleted → OnTranscodeEndRequest`, made cancellation-safe:
+    /// a segment wait aborted by a client disconnect still decrements, so the
+    /// idle reaper's `active_request_count == 0` check stays truthful.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn begin_request_guard(
         &self,
-        handle: &TranscodingJobHandle,
-        ping_timeout: Duration,
-        sleep: F,
-    ) where
-        F: FnOnce(Duration) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        sleep(ping_timeout).await;
-        self.kill_and_remove(handle, true).await;
+        path: &str,
+        job_type: TranscodingJobType,
+    ) -> Option<TranscodeRequestGuard<'_, S, C>> {
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        let job = jobs
+            .iter_mut()
+            .find(|j| j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path))?;
+        job.active_request_count += 1;
+        job.last_activity = std::time::Instant::now();
+        let handle = job.handle.clone();
+        drop(jobs);
+        Some(TranscodeRequestGuard {
+            manager: self,
+            handle,
+        })
+    }
+
+    /// Synchronous end-request: decrements the job's active-consumer count and
+    /// refreshes its activity stamp (the idle countdown starts *now*).
+    fn end_request_sync(&self, handle: &TranscodingJobHandle) {
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        if let Some(job) = jobs.iter_mut().find(|j| {
+            j.handle.job_type == handle.job_type && j.handle.path.eq_ignore_ascii_case(&handle.path)
+        }) {
+            job.active_request_count = (job.active_request_count - 1).max(0);
+            job.last_activity = std::time::Instant::now();
+        }
+    }
+
+    /// Names what the registered job for `handle` is playing (the label the
+    /// kill/reap logs print). A no-op for an empty label or an unknown job.
+    fn set_job_display(&self, handle: &TranscodingJobHandle, display: &str) {
+        if display.is_empty() {
+            return;
+        }
+        if let Some(job) = self
+            .jobs
+            .lock()
+            .expect("jobs lock poisoned")
+            .iter_mut()
+            .find(|j| {
+                j.handle.job_type == handle.job_type
+                    && j.handle.path.eq_ignore_ascii_case(&handle.path)
+            })
+        {
+            display.clone_into(&mut job.display);
+        }
     }
 
     /// Removes the registered job for `path`/`job_type` (no child teardown).
@@ -657,8 +798,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
             if let Some(paused) = is_user_paused {
                 job.is_user_paused = paused;
             }
-            // Refresh the kill-timer window for the job type (PingTimer).
+            // Refresh the kill-timer window for the job type (PingTimer): the
+            // idle countdown restarts from this ping.
             job.ping_timeout_ms = RegisteredJob::ping_timeout_for(job.handle.job_type);
+            job.last_activity = std::time::Instant::now();
         }
         Ok(())
     }
@@ -717,8 +860,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
             .find(|j| j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path));
         Ok(job.map(|j| {
             // A new consumer arrived: bump the active-request count so the idle
-            // kill timer does not fire (OnTranscodeBeginRequest).
+            // reaper does not fire (OnTranscodeBeginRequest).
             j.active_request_count += 1;
+            j.last_activity = std::time::Instant::now();
             j.handle.clone()
         }))
     }
@@ -731,8 +875,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManager for TranscodeManagerIm
         if let Some(registered) = jobs.iter_mut().find(|j| {
             j.handle.job_type == job.job_type && j.handle.path.eq_ignore_ascii_case(&job.path)
         }) {
-            // Mirror OnTranscodeEndRequest decrementing ActiveRequestCount.
+            // Mirror OnTranscodeEndRequest decrementing ActiveRequestCount; the
+            // idle countdown starts from this moment.
             registered.active_request_count = (registered.active_request_count - 1).max(0);
+            registered.last_activity = std::time::Instant::now();
         }
         Ok(())
     }
@@ -934,10 +1080,10 @@ mod tests {
 /// [`FakeSegmentTranscoder`] seam so no real ffmpeg is involved.
 #[cfg(test)]
 mod start_ffmpeg_tests {
+    use crate::encoding_helper::TranscodeDisplayNames;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_traits::media_encoding::{TranscodeManager, TranscodingJobType};
@@ -946,7 +1092,8 @@ mod start_ffmpeg_tests {
     use crate::transcoding::segment_transcoder::{FakeScript, FakeSegmentTranscoder};
 
     use super::{
-        FileCleaner, FsFileCleaner, NoopSessionReporter, StartFfMpegRequest, TranscodeManagerImpl,
+        FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter, StartFfMpegRequest,
+        TranscodeManagerImpl,
     };
 
     /// Builds a `StartFfMpegRequest` for `state`/`output_path` with `args`, its
@@ -969,6 +1116,7 @@ mod start_ffmpeg_tests {
     /// Builds an HLS `EncodingJobInfo` writing its playlist at `output_path`.
     fn state(output_path: &Path, wait_for: Option<&Path>) -> EncodingJobInfo {
         EncodingJobInfo {
+            display: TranscodeDisplayNames::default(),
             base_request: BaseEncodingJobOptions::default(),
             video_stream: None,
             audio_stream: None,
@@ -1221,7 +1369,7 @@ mod start_ffmpeg_tests {
     }
 
     #[tokio::test]
-    async fn kill_timer_fires_kill_after_timeout_with_fake_clock() {
+    async fn idle_reaper_kills_only_expired_consumerless_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("s");
         let playlist = out_dir.join("out.m3u8");
@@ -1237,17 +1385,73 @@ mod start_ffmpeg_tests {
             .await
             .unwrap();
 
-        // Fake clock: records the requested duration, returns instantly.
-        let slept = Arc::new(Mutex::new(None));
-        let slept2 = Arc::clone(&slept);
-        m.run_kill_timer(&handle, Duration::from_mins(1), move |d| {
-            *slept2.lock().unwrap() = Some(d);
-            async {}
-        })
-        .await;
+        // Registration counts as recent activity: nothing to reap yet.
+        assert!(m.reap_idle_jobs().await.is_empty());
+        assert_eq!(m.active_job_count(), 1);
 
-        assert_eq!(*slept.lock().unwrap(), Some(Duration::from_mins(1)));
-        assert_eq!(m.active_job_count(), 0, "kill timer removed the job");
+        // Expire the idle window (a fake clock via ping_timeout_ms = -1, which
+        // any non-negative elapsed time exceeds)...
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        // ...but an active consumer (the guard) still protects the job.
+        let guard = m
+            .begin_request_guard(&handle.path, handle.job_type)
+            .expect("job registered");
+        assert!(m.reap_idle_jobs().await.is_empty());
+        drop(guard);
+
+        // The guard drop restarted the countdown; re-expire and reap.
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        let killed = m.reap_idle_jobs().await;
+        assert_eq!(killed.len(), 1);
+        assert_eq!(m.active_job_count(), 0, "idle reaper removed the job");
+    }
+
+    #[tokio::test]
+    async fn ping_refreshes_the_idle_countdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+
+        // Expire the idle window (fake clock via ping_timeout_ms = -1)...
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        // ...then a session ping (PingTimer) restores the HLS window and
+        // restamps activity, so the reaper leaves the job alone.
+        m.ping_transcoding_job("sess", None).await.expect("ping");
+        assert_eq!(
+            m.ping_timeout_for_session("sess"),
+            Some(HLS_PING_TIMEOUT_MS),
+            "ping restored the job-type default timeout"
+        );
+        assert!(m.reap_idle_jobs().await.is_empty());
+        assert_eq!(m.active_job_count(), 1);
+
+        // Re-expire WITHOUT a ping: the countdown runs out and the job dies.
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        let killed = m.reap_idle_jobs().await;
+        assert_eq!(killed.len(), 1);
+        assert_eq!(m.active_job_count(), 0);
     }
 
     #[test]

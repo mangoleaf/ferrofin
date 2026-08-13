@@ -230,10 +230,12 @@ impl LibraryManager for ByNameLibrary {
         Ok(row.into_iter().collect())
     }
     /// Backs the `get_people_items` default for `GET /Persons`.
-    async fn get_people(
-        &self,
-        _q: &InternalPeopleQuery,
-    ) -> Result<Vec<PeopleEntity>, ServiceError> {
+    async fn get_people(&self, q: &InternalPeopleQuery) -> Result<Vec<PeopleEntity>, ServiceError> {
+        // Nobody is favorited in this fixture: a favorites-scoped query (the
+        // handler must fold `Filters=IsFavorite` onto `is_favorite`) is empty.
+        if q.is_favorite == Some(true) {
+            return Ok(Vec::new());
+        }
         Ok(vec![PeopleEntity {
             id: PERSON_ID.to_string(),
             name: "Uma".to_owned(),
@@ -607,6 +609,22 @@ async fn persons_list_resolves_people_items() {
     assert_eq!(one.status(), StatusCode::OK);
     assert_eq!(json_body(one).await["Name"], "Uma");
     assert_eq!(get("/Persons/Nobody").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn persons_filters_is_favorite_scopes_to_favorites() {
+    // The Favorites screen sends `Filters=IsFavorite` (never `isFavorite=`);
+    // the regression was the handler dropping the param and returning the
+    // whole people table. Nobody is favorited here, so the result is empty.
+    let response = get("/Persons?filters=IsFavorite").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["Items"].as_array().map(Vec::len), Some(0));
+    // An explicit `isFavorite` wins over the flag set (C# precedence).
+    let response = get("/Persons?filters=IsFavorite&isFavorite=false").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["Items"][0]["Name"], "Uma");
 }
 
 #[tokio::test]

@@ -627,6 +627,26 @@ pub trait MediaStreamRepository: Send + Sync {
         Ok(map)
     }
 
+    /// The subset of `item_ids` with at least one subtitle stream row.
+    ///
+    /// Backs the DTO builder's per-page `HasSubtitles` (C# stores the flag on
+    /// the video entity; here it derives from `MediaStreamInfos`, which both
+    /// Jellyfin and Ferrofin scans populate). The default filters the full
+    /// stream batch; the concrete repository overrides it with an ids-only
+    /// query so list pages don't materialize stream rows.
+    async fn get_item_ids_with_subtitles(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let map = self.get_media_streams_batch(item_ids).await?;
+        // Stored `StreamType` discriminant 2 = Subtitle.
+        Ok(map
+            .into_iter()
+            .filter(|(_, rows)| rows.iter().any(|r| r.stream_type == 2))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
     /// Gets the distinct language codes for a stream type across the library.
     async fn get_media_stream_languages(
         &self,

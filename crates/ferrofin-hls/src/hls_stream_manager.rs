@@ -343,13 +343,13 @@ where
         let ext = segment_extension(&plan.segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, &ext);
 
-        // Fast path: the segment already exists (a live job produced it) → begin
-        // the request (keep-alive) and serve it. Port of the `File.Exists` try-1.
+        // Fast path: the segment already exists (a live job produced it) → mark
+        // the consumer active (keep-alive) and serve it. Port of the
+        // `File.Exists` try-1; the guard drop restarts the idle countdown.
         if segment_path.exists() {
-            let _ = self
+            let _guard = self
                 .manager
-                .on_transcode_begin_request(&playlist_key, TranscodingJobType::Hls)
-                .await;
+                .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
             return Ok(served(&segment_path, &ext));
         }
 
@@ -378,18 +378,24 @@ where
             .ok()
             .flatten()
         {
+            // `current` sees in-progress `.tmp` segments too, so a live job that
+            // is still encoding its first segment reads as progress, not absence.
             let current = current_transcoding_index(&playlist_path, &ext);
-            let read_ahead =
-                current.is_some_and(|c| segment_id > c && segment_id - c <= SEGMENT_WAIT_GAP);
-            if read_ahead
-                && self
+            if should_wait_for_running_job(current, segment_id) {
+                // The wait is an active consumer: the guard keeps the idle
+                // reaper away and self-releases if the client disconnects.
+                let _guard = self
+                    .manager
+                    .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
+                if self
                     .manager
                     .wait_for_segment(&handle, &playlist_path, segment_id)
                     .await
-                && segment_path.exists()
-            {
-                self.clear_restart_failures(&playlist_key);
-                return Ok(served(&segment_path, &ext));
+                    && segment_path.exists()
+                {
+                    self.clear_restart_failures(&playlist_key);
+                    return Ok(served(&segment_path, &ext));
+                }
             }
             // A seek (or the running job died mid-wait): drop the stale job before
             // restarting so the two don't write the same files. Keep its produced
@@ -430,6 +436,10 @@ where
             }
         };
 
+        // Consumer mark for the wait on the freshly-started job (see above).
+        let _guard = self
+            .manager
+            .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
         if self
             .manager
             .wait_for_segment(&handle, &playlist_path, segment_id)
@@ -474,10 +484,29 @@ where
             // media back to t≈0 and stalls on a black screen. Starting the job
             // where the client is about to play makes the cached init match those
             // segments. With no resume offset this is segment 0, as before.
-            // Producing the segment writes the header alongside; we only need the
-            // header. Boxed to break the (depth-1) init→segment async recursion.
+            // Boxed to break the (depth-1) init→segment async recursion.
+            //
+            // ffmpeg writes the init header immediately, long before the first
+            // segment completes — and a slow first segment (4K HEVC) can take
+            // 30-60s, which times the client out and (for the cast receiver)
+            // used to trigger a retry→kill→restart loop. So race the two: serve
+            // the init the moment it lands on disk, letting the segment encode
+            // continue in the background (C# waits on the init path itself,
+            // DynamicHlsController.GetSegmentResult WaitForPath).
             let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
-            Box::pin(self.resolve_dynamic_segment(request, start, is_audio)).await?;
+            let produce = Box::pin(self.resolve_dynamic_segment(request, start, is_audio));
+            let init_appears = async {
+                while !init_path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            };
+            tokio::select! {
+                () = init_appears => {}
+                result = produce => {
+                    // The segment finished (or failed) before the init showed up.
+                    result?;
+                }
+            }
         }
 
         if init_path.exists() {
@@ -541,12 +570,32 @@ where
         is_audio: bool,
     ) -> Result<String, ServiceError> {
         // The master playlist points at the single variant `main.m3u8`. Full
-        // adaptive-bitrate master generation (`DynamicHlsHelper`) is deferred;
-        // the single-stream master lists one variant carrying the request query.
+        // adaptive-bitrate master generation (`DynamicHlsHelper` — CODECS,
+        // RESOLUTION, subtitle #EXT-X-MEDIA groups) is deferred; the
+        // single-stream master lists one variant carrying the request query.
+        //
+        // BANDWIDTH is real, though: RFC 8216 requires a positive value, and the
+        // old `BANDWIDTH=0` fed zero into client ABR bitrate math (NaN/Infinity
+        // in hls.js; the Cast receiver's player also keys segment budgeting off
+        // it). Negotiated output bitrate first, the source's probed bitrate as
+        // the copy-stream fallback (upstream sums the output streams the same
+        // way in DynamicHlsHelper.AppendPlaylist).
+        let plan = self.planner.plan(request, is_audio, None).await?;
+        let state = &plan.state;
+        let output =
+            state.output_video_bitrate.unwrap_or(0) + state.output_audio_bitrate.unwrap_or(0);
+        let bandwidth = if output > 0 {
+            output
+        } else {
+            state.media_source.bitrate.unwrap_or(0)
+        }
+        // A copy stream of an unprobed source still needs a positive value.
+        .max(128_000);
         let variant_url = format!("main.m3u8{}", request.query_string);
-        let _ = is_audio;
         Ok(format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=0\n{variant_url}\n"
+            "#EXTM3U\n#EXT-X-VERSION:7\n\
+             #EXT-X-STREAM-INF:BANDWIDTH={bandwidth},AVERAGE-BANDWIDTH={bandwidth}\n\
+             {variant_url}\n"
         ))
     }
 
@@ -704,12 +753,34 @@ fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
+            // `-hls_flags temp_file` writes the in-progress segment as
+            // `<name>.tmp` and renames on completion; counting it keeps the
+            // encoder's front visible during the (possibly long) first-segment
+            // encode — otherwise a retry arriving in that window reads "no
+            // progress" and kills a healthy job.
+            let name = name.strip_suffix(".tmp").unwrap_or(name);
             name.strip_prefix(&stem)?
                 .strip_suffix(&suffix)?
                 .parse::<i32>()
                 .ok()
         })
         .max()
+}
+
+/// Whether a segment request should wait on the running job rather than kill
+/// and restart it (`GetDynamicSegment`'s current-index decision).
+///
+/// `None` (no segment on disk yet, not even a `.tmp`) means the job only just
+/// spawned: wait — a client retry during the first-segment encode must not
+/// kill a healthy job (the cast-receiver kill/restart storm). Otherwise wait
+/// when the request is at or just ahead of the encoder's front (upstream also
+/// waits on `segment_id == current`); behind it, or more than
+/// [`SEGMENT_WAIT_GAP`] ahead, is a real seek → restart.
+fn should_wait_for_running_job(current: Option<i32>, segment_id: i32) -> bool {
+    match current {
+        None => true,
+        Some(c) => segment_id >= c && segment_id - c <= SEGMENT_WAIT_GAP,
+    }
 }
 
 /// Builds a [`ServedFile`] for `path`, choosing the MIME type from `ext`.
@@ -739,6 +810,7 @@ fn mime_for_extension(ext: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_mediaencoding::TranscodeDisplayNames;
     use ferrofin_mediaencoding::transcoding::{
         FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
     };
@@ -827,6 +899,7 @@ mod tests {
             self.requests.lock().unwrap().push((is_audio, segment_id));
             let playlist = self.dir.join("out.m3u8");
             let state = EncodingJobInfo {
+                display: TranscodeDisplayNames::default(),
                 base_request: BaseEncodingJobOptions::default(),
                 video_stream: None,
                 audio_stream: None,
@@ -924,6 +997,12 @@ mod tests {
         let pl = mgr.master_playlist(&req(), false).await.unwrap();
         assert!(pl.contains("#EXTM3U"));
         assert!(pl.contains("main.m3u8?deviceId=dev"));
+        // The FakePlanner supplies neither output bitrates nor a probed source
+        // bitrate, so the 128 kbps floor applies — RFC 8216 requires a positive
+        // BANDWIDTH, and the old `BANDWIDTH=0` broke client ABR math.
+        assert!(!pl.contains("BANDWIDTH=0"), "got: {pl}");
+        assert!(pl.contains("BANDWIDTH=128000"), "got: {pl}");
+        assert!(pl.contains("AVERAGE-BANDWIDTH=128000"), "got: {pl}");
     }
 
     #[tokio::test]
@@ -1170,5 +1249,27 @@ mod tests {
         std::fs::write(dir.path().join("abc12320.ts"), b"x").unwrap();
         std::fs::write(dir.path().join("abc12321.ts"), b"x").unwrap();
         assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(21));
+        // An in-progress `temp_file` segment counts as the encoder's front —
+        // during the first-segment encode the job must not read as "no progress".
+        std::fs::write(dir.path().join("abc12322.ts.tmp"), b"x").unwrap();
+        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(22));
+    }
+
+    #[test]
+    fn wait_vs_restart_decision_matches_upstream() {
+        use super::should_wait_for_running_job;
+        // Job just spawned, nothing on disk (not even a .tmp): wait, never kill
+        // — a retry in the first-segment window used to kill/restart-loop the
+        // cast receiver's playback.
+        assert!(should_wait_for_running_job(None, 0));
+        assert!(should_wait_for_running_job(None, 5));
+        // At the encoder's front: wait (upstream waits on ==, Ferrofin used to
+        // restart here).
+        assert!(should_wait_for_running_job(Some(3), 3));
+        // Just ahead (within the read-ahead gap): wait.
+        assert!(should_wait_for_running_job(Some(3), 5));
+        // Behind the front (backward seek) or far ahead (forward seek): restart.
+        assert!(!should_wait_for_running_job(Some(3), 2));
+        assert!(!should_wait_for_running_job(Some(3), 6));
     }
 }

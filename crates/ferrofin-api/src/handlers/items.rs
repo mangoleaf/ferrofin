@@ -184,9 +184,33 @@ struct ItemsQuery {
     /// Restrict to 4K items.
     #[serde(default, rename = "is4K")]
     is_4k: Option<bool>,
-    /// Restrict to HD items.
-    #[serde(default)]
+    /// Restrict to HD items. The alias covers jellyfin-web's stable filter
+    /// dialog, which sends `IsHD` — the server's key fold only lowercases the
+    /// first character, leaving `isHD`.
+    #[serde(default, alias = "isHD")]
     is_hd: Option<bool>,
+    /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
+    #[serde(default, rename = "is3D")]
+    is_3d: Option<bool>,
+    /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
+    /// (`BluRay`, `Dvd`, `Iso`).
+    #[serde(default)]
+    video_types: Option<String>,
+    /// Restrict to items with (or without) subtitle streams.
+    #[serde(default)]
+    has_subtitles: Option<bool>,
+    /// Restrict to items with (or without) a local trailer extra.
+    #[serde(default)]
+    has_trailer: Option<bool>,
+    /// Restrict to items with (or without) a special-feature extra.
+    #[serde(default)]
+    has_special_feature: Option<bool>,
+    /// Restrict to items with (or without) a theme song extra.
+    #[serde(default)]
+    has_theme_song: Option<bool>,
+    /// Restrict to items with (or without) a theme video extra.
+    #[serde(default)]
+    has_theme_video: Option<bool>,
     /// Exact index number.
     #[serde(default)]
     index_number: Option<i32>,
@@ -267,6 +291,13 @@ async fn get_items(
         is_series: query.is_series,
         is_4k: query.is_4k,
         is_hd: query.is_hd,
+        is_3d: query.is_3d,
+        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
+        has_subtitles: query.has_subtitles,
+        has_trailer: query.has_trailer,
+        has_special_feature: query.has_special_feature,
+        has_theme_song: query.has_theme_song,
+        has_theme_video: query.has_theme_video,
         index_number: query.index_number,
         parent_index_number: query.parent_index_number,
         min_community_rating: query.min_community_rating,
@@ -282,11 +313,20 @@ async fn get_items(
         internal.parent_id = parent;
     }
     // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
-    // fields, rejecting contradictory pairs with a `400`.
-    let filters = parse_csv_enums(query.filters.as_deref())?;
+    // fields, rejecting contradictory pairs with a `400`. Token parsing is
+    // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
+    // `Filters=IsUnPlayed` (sic), and upstream drops unknown tokens.
+    let filters = parse_csv_enums_lenient(query.filters.as_deref());
     internal
         .apply_filters(&filters)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // A BoxSet/Playlist-typed browse under a normal library is re-rooted: box
+    // sets live outside the library tree, so the parent becomes a
+    // linked-child-ancestor constraint instead (C# ItemsController's
+    // `linkedChildAncestorIds` redirect). Without this, the library's
+    // Collections tab can never list anything.
+    redirect_container_browse(&state, &mut internal).await;
 
     let result = state.library.query_items(&internal).await?;
     // Honour the requested `Fields` (Path, Genres, …) — Jellyfin's GetItems builds its
@@ -644,6 +684,66 @@ fn parse_order_by(
             (column, order)
         })
         .collect())
+}
+
+/// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
+/// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
+/// `linkedChildAncestorIds` block).
+///
+/// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
+/// a parent is set, and that parent is neither itself a box set/playlist nor
+/// the matching `boxsets`/`playlists` library. Best-effort: an unresolvable
+/// parent leaves the query untouched (the plain parent scoping then returns
+/// empty, as before).
+async fn redirect_container_browse(
+    state: &AppState,
+    internal: &mut ferrofin_traits::options::InternalItemsQuery,
+) {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::entities::CollectionTypeOptions;
+
+    // Playlists have no `CollectionTypeOptions` variant (upstream's options
+    // enum has none either — the playlists "library" is the manual playlists
+    // folder, caught by the container check below), so its target type is None.
+    let target_collection_type = match internal.include_item_types.as_slice() {
+        [BaseItemKind::BoxSet] => Some(CollectionTypeOptions::boxsets),
+        [BaseItemKind::Playlist] => None,
+        _ => return,
+    };
+    if internal.parent_id.is_nil() {
+        return;
+    }
+    let Ok(Some(parent)) = state.library.get_item_by_id(internal.parent_id).await else {
+        return;
+    };
+    // The parent is itself a container of the requested kind → a direct
+    // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
+    let short = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
+    if short == "BoxSet" || short == "Playlist" || short == "ManualPlaylistsFolder" {
+        return;
+    }
+    // A browse of the boxsets/playlists library itself keeps plain parent
+    // scoping (C# `itemCollectionType != targetCollectionType`).
+    let parent_collection_type = state
+        .virtual_folders
+        .get_virtual_folders()
+        .await
+        .ok()
+        .and_then(|folders| {
+            folders
+                .into_iter()
+                .find(|vf| {
+                    vf.item_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
+                })
+                .and_then(|vf| vf.collection_type)
+        });
+    if target_collection_type.is_some() && parent_collection_type == target_collection_type {
+        return;
+    }
+    internal.linked_child_ancestor_ids = vec![internal.parent_id];
+    internal.set_parent(None);
 }
 
 /// Registers this controller's real routes onto `router`.

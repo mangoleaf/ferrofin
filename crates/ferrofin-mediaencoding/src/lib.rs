@@ -29,7 +29,7 @@ pub use encoder::{
 };
 pub use encoding_helper::{
     BaseEncodingJobOptions, EncoderCapabilities, EncodingHelper, EncodingJobInfo,
-    NoOptionalEncoders, ProbedEncoders,
+    NoOptionalEncoders, ProbedEncoders, TranscodeDisplayNames,
 };
 pub use subtitles::{SubtitleEncoder, SubtitleEncoderImpl, SubtitleIo};
 pub use transcoding::{

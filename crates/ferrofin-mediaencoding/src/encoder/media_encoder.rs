@@ -49,6 +49,11 @@ pub struct MediaEncoderConfig {
     pub probe_size: Option<String>,
     /// The `-threads` count passed to ffmpeg/ffprobe. `0` lets ffmpeg decide.
     pub threads: i32,
+    /// Where single-frame extractions write their temporary output (the C#
+    /// `TempDirectory`). Empty (the `Default`) falls back to the OS temp dir.
+    /// Must be a server-writable path: media directories are often read-only
+    /// mounts, so extraction output can never go next to the input file.
+    pub temp_dir: std::path::PathBuf,
 }
 
 /// The resolved ffmpeg/ffprobe binary paths.
@@ -351,7 +356,24 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         threed_format: Option<Video3DFormat>,
         offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError> {
-        let output_path = format!("{input_file}.image.jpg");
+        // Write the frame into the server's temp dir (the C# `TempDirectory` +
+        // `Guid.NewGuid()` shape), never next to the input: media is routinely
+        // a read-only mount, and even a writable library must not accumulate
+        // extraction droppings beside the files.
+        let temp_dir = if self.config.temp_dir.as_os_str().is_empty() {
+            std::env::temp_dir()
+        } else {
+            self.config.temp_dir.clone()
+        };
+        std::fs::create_dir_all(&temp_dir)
+            .map_err(|e| MediaEncodingError::process(format!("create temp dir: {e}")))?;
+        let output_path = temp_dir
+            .join(format!(
+                "ferrofin-extract-{}.jpg",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .to_string_lossy()
+            .into_owned();
         let input_path = self.get_input_argument(input_file, media_source);
         let image_stream_index = if video_stream.stream_type == MediaStreamType::Video {
             None
@@ -370,10 +392,35 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
-        self.transcoder
+        let stderr = self
+            .transcoder
             .get_process_output(&ffmpeg, &args, true, None)
             .await
             .map_err(MediaEncodingError::process)?;
+        // The process runner mirrors the C# `GetProcessOutput` and ignores the
+        // exit code, so a failed ffmpeg (unreadable input, no frame at the
+        // offset) surfaces only as a missing output file — check it here so
+        // the caller gets the real story instead of an ENOENT from its own
+        // move of a file that never existed.
+        if !std::path::Path::new(&output_path).exists() {
+            let tail: String = stderr
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<Vec<_>>()
+                .iter()
+                .rev()
+                .collect();
+            return Err(MediaEncodingError::process(format!(
+                "ffmpeg produced no frame from `{input_file}`: {}",
+                if tail.trim().is_empty() {
+                    "(no stderr)"
+                } else {
+                    tail.trim()
+                }
+            ))
+            .into());
+        }
         Ok(output_path)
     }
 
@@ -543,5 +590,109 @@ mod tests {
     async fn set_ffmpeg_path_true_for_valid_binary() {
         let enc = encoder();
         assert!(enc.set_ffmpeg_path().await.unwrap());
+    }
+
+    /// A [`Transcoder`] fake that "extracts a frame": it parses the quoted
+    /// output path off the argument tail (the shape `extract_image_arguments`
+    /// emits) and writes a stub file there, like a successful ffmpeg run.
+    struct FrameWritingTranscoder;
+
+    #[async_trait]
+    impl Transcoder for FrameWritingTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+        ) -> Result<String, String> {
+            let out = arguments
+                .rsplit('"')
+                .nth(1)
+                .expect("quoted output path is the last argument");
+            std::fs::write(out, b"jpg").expect("write frame");
+            Ok(String::new())
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    fn video_stream() -> ferrofin_model::entities_media::MediaStream {
+        ferrofin_model::entities_media::MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            index: 0,
+            ..ferrofin_model::entities_media::MediaStream::default()
+        }
+    }
+
+    // The extraction writes into the configured temp dir — NEVER next to the
+    // input file, which is routinely on a read-only mount (the production
+    // chapter-image task failed on every item because of exactly that).
+    #[tokio::test]
+    async fn extract_video_image_writes_to_the_temp_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(FrameWritingTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let out = enc
+            .extract_video_image(
+                "/read-only/media/episode.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            )
+            .await
+            .expect("extraction succeeds");
+        assert!(
+            std::path::Path::new(&out).starts_with(tmp.path()),
+            "frame must land in the temp dir, got {out}"
+        );
+        assert!(std::path::Path::new(&out).exists());
+        assert!(
+            !out.starts_with("/read-only/media"),
+            "must not write next to the input"
+        );
+    }
+
+    // The process runner ignores ffmpeg's exit code (C# GetProcessOutput
+    // parity), so a run that produced no file must be surfaced here as a real
+    // error — not deferred to the caller's move of a nonexistent file.
+    #[tokio::test]
+    async fn extract_video_image_errors_when_no_frame_was_produced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(NoopTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let err = enc
+            .extract_video_image(
+                "/read-only/media/episode.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("no frame → error");
+        assert!(
+            err.to_string().contains("produced no frame"),
+            "error names the real failure, got: {err}"
+        );
     }
 }

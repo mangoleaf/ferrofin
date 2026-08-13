@@ -338,6 +338,10 @@ pub async fn build_app_state(
                 analyze_duration: None,
                 probe_size: None,
                 threads: 0,
+                // Frame extraction (chapter images) writes here, never next to
+                // the media file — media mounts are commonly read-only. The
+                // C# `TempDirectory` layout: a `temp` dir under the cache.
+                temp_dir: std::path::PathBuf::from(paths.cache_path()).join("temp"),
             },
         ));
 
@@ -973,6 +977,8 @@ pub async fn build_app_state(
     let me_media_encoder = Arc::clone(&media_encoder);
     let me_config = Arc::clone(&config_trait);
     let me_path_manager = Arc::clone(&path_manager);
+    // The transcode planner resolves item/library display names for its logs.
+    let me_library = Arc::clone(&library);
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(
@@ -1023,6 +1029,8 @@ pub async fn build_app_state(
         Arc::clone(&paths),
         me_path_manager,
         ffmpeg,
+        // Transcode logs resolve item/series/library names through the library.
+        Some(me_library),
     );
     let state = state
         .with_media_encoding(hls, attachments)

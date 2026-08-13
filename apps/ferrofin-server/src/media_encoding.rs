@@ -44,6 +44,12 @@ use uuid::Uuid;
 use crate::bootstrap::FfmpegPaths;
 use crate::planner::FerrofinStreamStatePlanner;
 
+/// How often the transcode idle reaper sweeps for consumerless jobs.
+///
+/// A job dies within (its ping timeout + one sweep); 10s adds at most a sixth
+/// of the 60s HLS timeout as latency while keeping the scan negligible.
+const IDLE_REAPER_SWEEP_SECS: u64 = 10;
+
 /// Builds the concrete media-encoding pair injected via
 /// [`AppState::with_media_encoding`](ferrofin_api::AppState::with_media_encoding).
 ///
@@ -73,6 +79,7 @@ pub fn build_media_encoding(
     paths: Arc<FerrofinServerApplicationPaths>,
     path_manager: Arc<dyn PathManager>,
     ffmpeg: &FfmpegPaths,
+    library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
 ) -> (
     Arc<dyn HlsStreamManager>,
     Arc<dyn AttachmentExtractor>,
@@ -103,8 +110,23 @@ pub fn build_media_encoding(
         Arc::clone(&subtitles),
         ffmpeg.supports_filter("tonemapx"),
     );
+    let planner = match library {
+        Some(library) => planner.with_library(library),
+        None => planner,
+    };
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    // The idle reaper kills any transcode whose consumers vanished without a
+    // stop report (a disconnected cast receiver, a killed browser tab): no
+    // active segment request and no session ping within the job's ping timeout
+    // → the job dies and its partial files are cleaned up. Spawned only when a
+    // runtime exists so the sync composition unit test can still call this.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(
+            Arc::clone(&manager)
+                .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),
+        );
+    }
     // The generator reads live encoding options per request; First-Light returns
     // the defaults (the persisted named-config accessor is not yet threaded
     // through `ServerConfigurationManager`).
@@ -644,8 +666,15 @@ mod tests {
             filters: Vec::new(),
             encoders: Vec::new(),
         };
-        let (_hls, _attachments, _subtitles) =
-            build_media_encoding(media_sources, encoder, config, paths, path_manager, &ffmpeg);
+        let (_hls, _attachments, _subtitles) = build_media_encoding(
+            media_sources,
+            encoder,
+            config,
+            paths,
+            path_manager,
+            &ffmpeg,
+            None,
+        );
     }
 
     #[tokio::test]

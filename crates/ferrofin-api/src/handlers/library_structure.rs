@@ -42,16 +42,43 @@ use crate::state::AppState;
 /// `LibraryStructureController` action ends with. Best-effort: a watcher or
 /// queue failure must not fail the admin request whose mutation already
 /// succeeded.
-async fn after_structure_change(state: &AppState, refresh_library: bool) {
+async fn after_structure_change(state: &AppState, refresh_library: bool, scope: Option<Uuid>) {
     if let Err(err) = state.library_monitor.stop().await {
         tracing::warn!(%err, "failed to stop library monitor");
     }
     if let Err(err) = state.library_monitor.start().await {
         tracing::warn!(%err, "failed to restart library monitor");
     }
-    if refresh_library && let Err(err) = state.library.queue_library_scan().await {
-        tracing::warn!(%err, "failed to queue the requested library refresh");
+    if refresh_library {
+        // A freshly-added library scans scoped: a full pass re-probes every
+        // existing item (hours on a big install) and plans the new library's
+        // items LAST, so an interrupted scan leaves it empty — observed live
+        // as "music library scanning is broken".
+        let result = match scope {
+            Some(library_id) => state.library.queue_library_scan_scoped(library_id).await,
+            None => state.library.queue_library_scan().await,
+        };
+        if let Err(err) = result {
+            tracing::warn!(%err, "failed to queue the requested library refresh");
+        }
     }
+}
+
+/// Resolves a just-mutated virtual folder's `CollectionFolder` id by name, for
+/// scoping the follow-up scan. Best-effort (`None` falls back to a full scan).
+async fn library_id_by_name(state: &AppState, name: &str) -> Option<Uuid> {
+    state
+        .virtual_folders
+        .get_virtual_folders()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|vf| vf.name.as_deref() == Some(name))
+        .and_then(|vf| {
+            vf.item_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+        })
 }
 
 /// `GET /Library/VirtualFolders` — the configured virtual folders.
@@ -156,7 +183,8 @@ async fn add_virtual_folder(
         .virtual_folders
         .add_virtual_folder(&name, query.collection_type, &options)
         .await?;
-    after_structure_change(&state, query.refresh_library).await;
+    let scope = library_id_by_name(&state, &name).await;
+    after_structure_change(&state, query.refresh_library, scope).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -196,7 +224,7 @@ async fn remove_virtual_folder(
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
     state.virtual_folders.remove_virtual_folder(&name).await?;
-    after_structure_change(&state, query.refresh_library).await;
+    after_structure_change(&state, query.refresh_library, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -252,7 +280,7 @@ async fn rename_virtual_folder(
         .virtual_folders
         .rename_virtual_folder(&name, &new_name)
         .await?;
-    after_structure_change(&state, query.refresh_library).await;
+    after_structure_change(&state, query.refresh_library, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -327,7 +355,7 @@ async fn add_media_path(
         .virtual_folders
         .add_media_path(&name, &path_info)
         .await?;
-    after_structure_change(&state, query.refresh_library).await;
+    after_structure_change(&state, query.refresh_library, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -376,7 +404,7 @@ async fn update_media_path(
         .update_media_path(&name, &path_info)
         .await?;
     // No `refreshLibrary` flag on this route (matching the C# action).
-    after_structure_change(&state, false).await;
+    after_structure_change(&state, false, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -412,7 +440,7 @@ async fn remove_media_path(
         .virtual_folders
         .remove_media_path(&name, &path)
         .await?;
-    after_structure_change(&state, query.refresh_library).await;
+    after_structure_change(&state, query.refresh_library, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -486,7 +514,7 @@ async fn update_library_options(
         .update_library_options(&name, &options)
         .await?;
     // Restart the watcher so an `EnableRealtimeMonitor` toggle applies live.
-    after_structure_change(&state, false).await;
+    after_structure_change(&state, false, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

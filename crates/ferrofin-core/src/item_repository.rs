@@ -329,6 +329,16 @@ const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
 ///   binary collation — byte-identical to the C# char compare for ASCII.
 fn append_by_name_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
     let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Favorite state lives in the by-name item's own `UserData` row (C# joins
+    // `UserData` on the by-name item id) — same predicate the main browse uses.
+    if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_favorite) {
+        crate::translate_query::push_user_data_exists(
+            qb,
+            &guid_to_db(user_id),
+            r#"ud."IsFavorite" = 1"#,
+            want,
+        );
+    }
     if let Some(term) = non_blank(&filter.search_term) {
         let lowered = term.to_lowercase();
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
@@ -934,8 +944,11 @@ impl FerrofinItemRepository {
         filter: &InternalItemsQuery,
         value_type: ItemValueType,
     ) -> Result<Vec<String>, ServiceError> {
+        // One entry per CLEANED value (upstream GetQueryFiltersLegacy groups by
+        // CleanValue and keeps MIN(Value)), so "Sci-Fi"/"Sci-fi" case variants
+        // collapse instead of doubling the filter dialog's list.
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT iv."Value" FROM "ItemValues" AS iv
+            r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
                JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
                JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
                WHERE iv."Type" = "#,
@@ -944,7 +957,7 @@ impl FerrofinItemRepository {
         qb.push(r#" AND bi."Id" <> "#);
         qb.push_bind(PLACEHOLDER_ID);
         append_predicates(&mut qb, filter);
-        qb.push(r#" ORDER BY iv."Value""#);
+        qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
         qb.build_query_scalar()
             .fetch_all(self.db.pool())
             .await
@@ -1508,6 +1521,78 @@ mod tests {
         let w = repository.get_genres(&wild).await.expect("wild");
         assert_eq!(w.items.len(), 1);
         assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    }
+
+    #[tokio::test]
+    async fn by_name_favorite_filter_matches_the_genre_rows_user_data() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        // Two movies carrying one genre each; seeding materializes the browsable
+        // by-name Genre rows (id = ItemValueId).
+        let action_movie = Uuid::from_u128(0xFA01);
+        seed_named_item(&db, action_movie, BaseItemKind::Movie, "Action Film").await;
+        seed_item_genre(&db, action_movie, "Action").await;
+        let drama_movie = Uuid::from_u128(0xFA02);
+        seed_named_item(&db, drama_movie, BaseItemKind::Movie, "Drama Film").await;
+        seed_item_genre(&db, drama_movie, "Drama").await;
+
+        let user_id = Uuid::from_u128(0xFA10);
+        let user = seed_user(&db, user_id).await;
+
+        // Favorite the "Action" genre: the state lives in the by-name row's OWN
+        // UserData (C# joins UserData on the by-name item id), so the row is
+        // keyed to the materialized Genre item, not to either movie.
+        let genre_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Name" = 'Action'
+                 AND "Type" = 'MediaBrowser.Controller.Entities.Genre'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("materialized genre row");
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+                "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, ?1, 1, 0, 0, 0)"#,
+        )
+        .bind(&genre_id)
+        .bind(guid_to_db(user_id))
+        .execute(db.writer())
+        .await
+        .expect("favorite the genre");
+
+        // isFavorite=true keeps only the favorited genre…
+        let fav = InternalItemsQuery {
+            user: Some(user.clone()),
+            is_favorite: Some(true),
+            ..Default::default()
+        };
+        let got = repository.get_genres(&fav).await.expect("favorites");
+        let names: Vec<_> = got
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Action"]);
+
+        // …and isFavorite=false keeps only the un-favorited one (NOT EXISTS).
+        let not_fav = InternalItemsQuery {
+            user: Some(user),
+            is_favorite: Some(false),
+            ..Default::default()
+        };
+        let got = repository
+            .get_genres(&not_fav)
+            .await
+            .expect("non-favorites");
+        let names: Vec<_> = got
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.clone())
+            .collect();
+        assert_eq!(names, vec!["Drama"]);
     }
 
     #[tokio::test]

@@ -116,6 +116,11 @@ pub struct FerrofinStreamStatePlanner {
     /// (jellyfin-ffmpeg builds only). Selects the fast single-pass software
     /// HDR→SDR tonemap over the vanilla zscale chain; probed once at startup.
     supports_tonemapx: bool,
+    /// Resolves item/series/library display names onto the plan's
+    /// [`TranscodeDisplayNames`] so transcode logs name what they play.
+    /// Optional: `None` (the composition unit test) leaves the names empty —
+    /// they are logging metadata, never load-bearing.
+    library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -149,7 +154,46 @@ impl FerrofinStreamStatePlanner {
             paths,
             subtitles,
             supports_tonemapx,
+            library: None,
         }
+    }
+
+    /// Wires the library seam so transcode logs carry item/series/library
+    /// display names (the composition root calls this; unit tests skip it).
+    #[must_use]
+    pub fn with_library(
+        mut self,
+        library: Arc<dyn ferrofin_traits::library::LibraryManager>,
+    ) -> Self {
+        self.library = Some(library);
+        self
+    }
+
+    /// Resolves the human-readable names for the playing item — its own title,
+    /// its series (episodes), and its library — for the transcode logs.
+    /// Best-effort by design: any miss leaves the field empty.
+    async fn display_names(
+        &self,
+        item_id: uuid::Uuid,
+    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
+        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
+        let Some(library) = &self.library else {
+            return names;
+        };
+        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
+            return names;
+        };
+        names.item_name = item.name.clone();
+        names.series_name = item.series_name.clone();
+        if let Some(top) = item
+            .top_parent_id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            && let Ok(Some(folder)) = library.get_item_by_id(top).await
+        {
+            names.library_name = folder.name;
+        }
+        names
     }
 
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
@@ -536,6 +580,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // A probe state used only for the copy decision (the final state is
         // populated below with the resolved output codecs).
         let mut probe_state = EncodingJobInfo {
+            display: self.display_names(request.item_id).await,
             base_request: base_request.clone(),
             video_stream: video_stream.clone(),
             audio_stream: audio_stream.clone(),

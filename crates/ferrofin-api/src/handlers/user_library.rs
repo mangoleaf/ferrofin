@@ -572,8 +572,10 @@ async fn get_latest_media(
     let is_played = query
         .is_played
         .or_else(|| user.hide_played_in_latest.then_some(false));
-    let include_item_types = parse_csv_enums(query.include_item_types.as_deref())?;
+    let include_item_types: Vec<ferrofin_model::data::BaseItemKind> =
+        parse_csv_enums(query.include_item_types.as_deref())?;
     let group_items = query.group_items.unwrap_or(true);
+    let limit = query.limit.unwrap_or(DEFAULT_LATEST_LIMIT).max(0);
 
     // Honour the requested `fields` (Jellyfin's GetLatestMedia builds DtoOptions from them);
     // was hardcoded to all fields, which over-populated the response vs Jellyfin's fields=Path.
@@ -581,20 +583,24 @@ async fn get_latest_media(
         fields: parse_csv_enums_lenient(query.fields.as_deref()),
         ..DtoOptions::default()
     };
+    // Parent/type scoping and the virtual-item exclusion are pushed into the
+    // manager's SQL (C# GetLatestItemsInternal); played state is post-filtered
+    // below over the flat rows.
+    let latest_query = ferrofin_traits::options::LatestItemsQuery {
+        user_id: user_uuid,
+        parent_id: query.parent_id,
+        include_item_types: include_item_types.clone(),
+        limit,
+    };
     let groups = state
         .user_views
-        .get_latest_items(user_uuid, &options)
+        .get_latest_items(&latest_query, &options)
         .await?;
 
-    // Flatten the per-view groups, honouring the parent/type/played filters the
-    // portable seam can apply to the flat rows.
+    // Flatten the per-view groups. The type filter re-runs here defensively —
+    // the fake managers in tests don't all push it into SQL.
     let mut resolved: Vec<ferrofin_db::entities::base_items::BaseItemEntity> = Vec::new();
-    for (view, items) in groups {
-        if let Some(parent) = query.parent_id
-            && view.id != parent.to_string()
-        {
-            continue;
-        }
+    for (_view, items) in groups {
         for item in items {
             if !include_item_types.is_empty()
                 && !include_item_types
@@ -626,8 +632,7 @@ async fn get_latest_media(
     }
 
     // C# caps the flat item list at `limit` (default 20) before grouping.
-    let limit = usize::try_from(query.limit.unwrap_or(DEFAULT_LATEST_LIMIT).max(0)).unwrap_or(0);
-    resolved.truncate(limit);
+    resolved.truncate(usize::try_from(limit).unwrap_or(0));
 
     // groupItems (default true): collapse each grouping parent's run of ≥2 items
     // (episodes → their series, audio → its album) into the parent with a
@@ -763,6 +768,88 @@ async fn get_latest_media_for_user(
     get_latest_media(state, auth, Query(query)).await
 }
 
+/// `GET /Users/{userId}/Items/Root` — path-scoped form of `GET /Items/Root`.
+///
+/// Like the other `/Users/{userId}/…` forms, this is absent from the 10.11
+/// contract (upstream keeps it `[Obsolete]` + hidden from the OpenAPI doc) but
+/// still served, and jellyfin-web's bundled `jellyfin-apiclient` still calls it.
+async fn get_root_folder_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<BaseItemDto>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    get_root_folder(state, auth, Query(query)).await
+}
+
+/// `GET /Users/{userId}/Items/{itemId}/Intros` — path-scoped form of
+/// `GET /Items/{itemId}/Intros` (jellyfin-web calls it before every playback).
+async fn get_intros_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    get_intros(state, auth, Path(item_id), Query(query)).await
+}
+
+/// `GET /Users/{userId}/Items/{itemId}/LocalTrailers` — path-scoped form of
+/// `GET /Items/{itemId}/LocalTrailers`.
+async fn get_local_trailers_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    get_local_trailers(state, auth, Path(item_id), Query(query)).await
+}
+
+/// `GET /Users/{userId}/Items/{itemId}/SpecialFeatures` — path-scoped form of
+/// `GET /Items/{itemId}/SpecialFeatures`.
+async fn get_special_features_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    get_special_features(state, auth, Path(item_id), Query(query)).await
+}
+
+/// `GET /Users/{userId}/Items/{itemId}/UserData` — path-scoped form of
+/// `GET /UserItems/{itemId}/UserData`.
+async fn get_item_user_data_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    get_item_user_data(state, auth, Path(item_id), Query(query)).await
+}
+
+/// `POST /Users/{userId}/Items/{itemId}/UserData` — path-scoped form of
+/// `POST /UserItems/{itemId}/UserData`.
+async fn update_item_user_data_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    update: Json<UpdateUserItemDataDto>,
+) -> Result<Json<UserItemDataDto>, ApiError> {
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
+    update_item_user_data(state, auth, Path(item_id), Query(query), update).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -782,6 +869,23 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Users/{userId}/Items/Latest",
             get(get_latest_media_for_user),
+        )
+        .route("/Users/{userId}/Items/Root", get(get_root_folder_for_user))
+        .route(
+            "/Users/{userId}/Items/{itemId}/Intros",
+            get(get_intros_for_user),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/LocalTrailers",
+            get(get_local_trailers_for_user),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/SpecialFeatures",
+            get(get_special_features_for_user),
+        )
+        .route(
+            "/Users/{userId}/Items/{itemId}/UserData",
+            get(get_item_user_data_for_user).post(update_item_user_data_for_user),
         )
         .route(
             "/UserItems/{itemId}/Rating",

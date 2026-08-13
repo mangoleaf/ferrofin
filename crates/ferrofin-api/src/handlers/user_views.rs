@@ -159,11 +159,44 @@ async fn get_grouping_options(
     Ok(Json(options))
 }
 
+/// `GET /Users/{userId}/Views` — path-scoped form of `GET /UserViews`.
+///
+/// Not in the 10.11 contract (upstream keeps it `[Obsolete]` + hidden from the
+/// OpenAPI doc) but still served upstream and still called by older clients.
+async fn get_user_views_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = UserViewsQuery {
+        user_id: Some(user_id),
+    };
+    get_user_views(state, auth, Query(query)).await
+}
+
+/// `GET /Users/{userId}/GroupingOptions` — path-scoped form of
+/// `GET /UserViews/GroupingOptions`.
+async fn get_grouping_options_for_user(
+    state: State<AppState>,
+    auth: RequireAuth,
+    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
+    let query = UserViewsQuery {
+        user_id: Some(user_id),
+    };
+    get_grouping_options(state, auth, Query(query)).await
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/UserViews", get(get_user_views))
         .route("/UserViews/GroupingOptions", get(get_grouping_options))
+        .route("/Users/{userId}/Views", get(get_user_views_for_user))
+        .route(
+            "/Users/{userId}/GroupingOptions",
+            get(get_grouping_options_for_user),
+        )
 }
 
 #[cfg(test)]

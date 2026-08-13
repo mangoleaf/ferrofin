@@ -30,6 +30,7 @@ use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
+use ferrofin_model::entities::VideoType;
 use ferrofin_model::live_tv::ItemSortBy;
 use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
@@ -282,6 +283,7 @@ pub(crate) fn append_predicates<'a>(
     append_name_predicates(qb, filter, &tags, &exclude_tags);
 
     append_user_data_predicates(qb, filter);
+    append_media_attribute_predicates(qb, filter);
     append_item_value_predicates(qb, filter, &tags, &exclude_tags);
     append_people_predicates(qb, filter);
 
@@ -616,6 +618,94 @@ fn append_name_predicates(
     }
 }
 
+/// Appends the media-attribute predicates: subtitle presence, owned-extra
+/// presence (trailer / theme song / theme video / special feature), video
+/// types, and 3D.
+///
+/// Ports of C# `TranslateQuery`'s `HasSubtitles` (`MediaStreams.Any(Subtitle)`),
+/// the `ExtraIds`-backed extra filters, and the `Data`-substring `VideoType` /
+/// `Video3DFormat` matches. The folder roll-up branches (a series "has
+/// subtitles" when any episode does) are deferred with the other
+/// series/box-set aggregation.
+fn append_media_attribute_predicates(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    filter: &InternalItemsQuery,
+) {
+    // Subtitle presence: an `EXISTS` over the item's stream rows
+    // (`StreamType` 2 = Subtitle).
+    if let Some(want) = filter.has_subtitles {
+        qb.push(if want {
+            " AND EXISTS "
+        } else {
+            " AND NOT EXISTS "
+        })
+        .push(
+            r#"(SELECT 1 FROM "MediaStreamInfos" ms
+                WHERE ms."ItemId" = bi."Id" AND ms."StreamType" = 2)"#,
+        );
+    }
+
+    // Owned extras: `ExtraType` discriminants match `extra_type_from_disc`
+    // (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo).
+    let mut extra_exists = |want: bool, cond: &str| {
+        qb.push(if want {
+            " AND EXISTS "
+        } else {
+            " AND NOT EXISTS "
+        })
+        .push(format!(
+            r#"(SELECT 1 FROM "BaseItems" x
+                WHERE x."OwnerId" = bi."Id" AND {cond})"#
+        ));
+    };
+    if let Some(want) = filter.has_trailer {
+        extra_exists(want, r#"x."ExtraType" = 2"#);
+    }
+    if let Some(want) = filter.has_theme_song {
+        extra_exists(want, r#"x."ExtraType" = 8"#);
+    }
+    if let Some(want) = filter.has_theme_video {
+        extra_exists(want, r#"x."ExtraType" = 9"#);
+    }
+    // A "special feature" is any owned extra that is not unknown/trailer/theme
+    // (C# `BaseItem.DisplayExtraTypes` complement used by `HasSpecialFeature`).
+    if let Some(want) = filter.has_special_feature {
+        extra_exists(
+            want,
+            r#"x."ExtraType" IS NOT NULL AND x."ExtraType" NOT IN (0, 2, 8, 9)"#,
+        );
+    }
+
+    // Video types / 3D live inside the serialized `Data` blob, matched by
+    // substring exactly as C# does (`"VideoType":"BluRay"` / `Video3DFormat`).
+    if !filter.video_types.is_empty() {
+        qb.push(" AND (");
+        for (i, vt) in filter.video_types.iter().enumerate() {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            let name = match vt {
+                VideoType::VideoFile => "VideoFile",
+                VideoType::Iso => "Iso",
+                VideoType::Dvd => "Dvd",
+                VideoType::BluRay => "BluRay",
+            };
+            qb.push(r#"bi."Data" LIKE "#)
+                .push_bind(format!("%\"VideoType\":\"{name}\"%"))
+                .push(r#" OR bi."Data" LIKE "#)
+                .push_bind(format!("%\"IsoType\":\"{name}\"%"));
+        }
+        qb.push(")");
+    }
+    if let Some(want) = filter.is_3d {
+        if want {
+            qb.push(r#" AND bi."Data" LIKE '%Video3DFormat%'"#);
+        } else {
+            qb.push(r#" AND (bi."Data" IS NULL OR bi."Data" NOT LIKE '%Video3DFormat%')"#);
+        }
+    }
+}
+
 /// Appends the `UserData`-backed predicates (favorite / favorite-or-liked / liked
 /// / played) as `EXISTS` sub-selects scoped to the query's user.
 ///
@@ -655,7 +745,12 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
 
 /// Appends `AND [NOT] EXISTS (SELECT 1 FROM UserData ud WHERE ud.ItemId = bi.Id
 /// AND ud.UserId = <uid> AND <cond>)`.
-fn push_user_data_exists(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, cond: &str, want: bool) {
+pub(crate) fn push_user_data_exists(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    user_id: &str,
+    cond: &str,
+    want: bool,
+) {
     qb.push(if want {
         " AND EXISTS "
     } else {
@@ -864,6 +959,24 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
             qb,
             r#"a."ParentItemId""#,
             &to_guid_strings(&filter.ancestor_ids),
+        );
+        qb.push(")");
+    }
+    // Keep folder-like items (box sets, playlists) whose manual linked
+    // children descend from any of the requested ancestors — the Collections
+    // tab's re-rooted query (C# TranslateQuery `LinkedChildAncestorIds` over
+    // `context.LinkedChildren`; the manual links live in Ferrofin's
+    // `HermitLinkedChildren`).
+    if !filter.linked_child_ancestor_ids.is_empty() {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "HermitLinkedChildren" lc
+                JOIN "AncestorIds" la ON la."ItemId" = lc."ChildId"
+                WHERE lc."ParentId" = bi."Id" AND "#,
+        );
+        push_in_list(
+            qb,
+            r#"la."ParentItemId""#,
+            &to_guid_strings(&filter.linked_child_ancestor_ids),
         );
         qb.push(")");
     }

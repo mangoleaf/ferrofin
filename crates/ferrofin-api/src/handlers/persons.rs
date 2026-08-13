@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::querying::QueryResult;
+use ferrofin_model::querying::{ItemFilter, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalPeopleQuery};
 use uuid::Uuid;
 
@@ -22,6 +22,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::by_name::{ByNameItemQuery, project_item_rows};
 use crate::handlers::items::resolve_user;
+use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Persons`.
@@ -55,6 +56,9 @@ struct PersonsQuery {
     /// Restrict to people the caller has (not) favourited.
     #[serde(default)]
     is_favorite: Option<bool>,
+    /// Comma-delimited [`ItemFilter`] flags (`IsFavorite`, …).
+    #[serde(default)]
+    filters: Option<String>,
     /// Restrict to people appearing in this item.
     #[serde(default)]
     appears_in_item_id: Option<Uuid>,
@@ -99,6 +103,12 @@ async fn get_persons(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite` is
+    // absent (PersonsController: `!isFavorite.HasValue && isFavoriteInFilters`).
+    let filters = parse_csv_enums_lenient::<ItemFilter>(query.filters.as_deref());
+    let is_favorite = query
+        .is_favorite
+        .or_else(|| filters.contains(&ItemFilter::IsFavorite).then_some(true));
     let people_query = InternalPeopleQuery {
         start_index: query.start_index,
         limit: query.limit.unwrap_or(0),
@@ -111,7 +121,7 @@ async fn get_persons(
         name_less_than: query.name_less_than.clone(),
         name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
         user_id: Some(user_id),
-        is_favorite: query.is_favorite,
+        is_favorite,
         ..InternalPeopleQuery::default()
     };
     let result = state.library.get_people_items(&people_query).await?;

@@ -221,6 +221,41 @@ impl BaseEncodingJobOptions {
     }
 }
 
+/// Human-readable identity of what a transcode is playing, for logs/spans.
+///
+/// Resolved by the planner from the item row (best-effort: empty in unit
+/// tests and whenever the library seam is not wired). Operators read these on
+/// every transcode event — "which library / which show / which episode" —
+/// without resolving ids against the database by hand.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscodeDisplayNames {
+    /// The playing item's display name (movie title / episode title).
+    pub item_name: Option<String>,
+    /// The parent series name, for episodes.
+    pub series_name: Option<String>,
+    /// The owning library's display name.
+    pub library_name: Option<String>,
+}
+
+impl TranscodeDisplayNames {
+    /// One log-friendly label: `library / series - item`, skipping absent
+    /// parts; empty when nothing resolved.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let title = match (&self.series_name, &self.item_name) {
+            (Some(series), Some(item)) => format!("{series} - {item}"),
+            (Some(series), None) => series.clone(),
+            (None, Some(item)) => item.clone(),
+            (None, None) => String::new(),
+        };
+        match (&self.library_name, title.is_empty()) {
+            (Some(lib), false) => format!("{lib} / {title}"),
+            (Some(lib), true) => lib.clone(),
+            (None, _) => title,
+        }
+    }
+}
+
 /// The state of a single transcode job — the software-path subset.
 ///
 /// Port of the fields of `EncodingJobInfo` (the base of `StreamState`) that the
@@ -229,6 +264,8 @@ impl BaseEncodingJobOptions {
 /// represented by this same struct.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodingJobInfo {
+    /// Human-readable identity for logs — resolved item/series/library names.
+    pub display: TranscodeDisplayNames,
     /// The per-request options (`BaseRequest`).
     pub base_request: BaseEncodingJobOptions,
     /// The selected video stream (`VideoStream`).
@@ -490,4 +527,33 @@ fn split_options(value: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod display_names_tests {
+    use super::TranscodeDisplayNames;
+
+    #[test]
+    fn label_composes_library_series_and_item() {
+        let full = TranscodeDisplayNames {
+            item_name: Some("Pilot".to_owned()),
+            series_name: Some("Archer".to_owned()),
+            library_name: Some("Shows".to_owned()),
+        };
+        assert_eq!(full.label(), "Shows / Archer - Pilot");
+
+        let movie = TranscodeDisplayNames {
+            item_name: Some("Heat".to_owned()),
+            library_name: Some("Movies".to_owned()),
+            ..TranscodeDisplayNames::default()
+        };
+        assert_eq!(movie.label(), "Movies / Heat");
+
+        let bare = TranscodeDisplayNames {
+            item_name: Some("Heat".to_owned()),
+            ..TranscodeDisplayNames::default()
+        };
+        assert_eq!(bare.label(), "Heat");
+        assert_eq!(TranscodeDisplayNames::default().label(), "");
+    }
 }

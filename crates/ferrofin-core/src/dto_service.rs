@@ -120,6 +120,24 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a merged item reports its
     /// extra selectable sources without a per-item query.
     alternates: HashMap<Uuid, Vec<BaseItemEntity>>,
+    /// The page's video item ids that carry a subtitle stream. Backs the
+    /// unconditional `HasSubtitles` on video DTOs (C# emits it outside the
+    /// `ItemFields` system) via one ids-only query per page.
+    has_subtitles: std::collections::HashSet<Uuid>,
+    /// The requesting user's content permissions (populated only when the
+    /// `CanDelete`/`CanDownload` fields are requested and a user is present),
+    /// so the whole page gates on one `Permissions` query.
+    content_permissions: Option<UserContentPermissions>,
+}
+
+/// The delete/download half of a user's policy (C# `HasPermission` over
+/// `EnableContentDeletion` / `EnableContentDownloading`).
+#[derive(Debug, Clone, Copy)]
+struct UserContentPermissions {
+    /// `PermissionKind::EnableContentDeletion` (10).
+    can_delete: bool,
+    /// `PermissionKind::EnableContentDownloading` (11).
+    can_download: bool,
 }
 
 impl Prefetched {
@@ -826,22 +844,23 @@ impl FerrofinDtoService {
         self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id, prefetched)
             .await?;
 
-        // Can-delete / can-download collapse to thin defaults (the C# logic needs
-        // the domain tree; see the module docs).
+        let perms = prefetched.content_permissions.as_ref();
+        // Can-delete / can-download: the file-level fact gated by the user's
+        // policy (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`). The
+        // per-library `EnableContentDeletionFromFolders` refinement needs the
+        // un-ported collection-folder walk and is deferred; admin or the global
+        // permission covers the real cases.
         if options.contains_field(ItemFields::CanDelete) {
-            // Jellyfin's `BaseItem.CanDelete(user)` is true for a real (non-virtual)
-            // file item when the user's policy grants deletion (globally or for the
-            // item's library). The user policy is not plumbed into this DTO builder,
-            // so we report the file-level fact only; full per-user-policy fidelity
-            // needs the policy threaded through here (a separate WI). By-name items
-            // (Genre/Studio/Person/…) have no file — C# `CanDelete()` returns false
-            // (default `IsFileProtocol`, plus explicit overrides on Genre/Studio/Person).
-            dto.can_delete = Some(!item.is_virtual_item && !kinds::is_item_by_name(kind));
+            // By-name items (Genre/Studio/Person/…) have no file — C# `CanDelete()`
+            // returns false (default `IsFileProtocol`, plus explicit overrides).
+            let file_deletable = !item.is_virtual_item && !kinds::is_item_by_name(kind);
+            dto.can_delete = Some(file_deletable && perms.is_none_or(|p| p.can_delete));
         }
         if options.contains_field(ItemFields::CanDownload) {
             // C# `CanDownload()` is false by default and only true for playable media;
             // a by-name item is not a folder but still isn't downloadable.
-            dto.can_download = Some(!item.is_folder && !kinds::is_item_by_name(kind));
+            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind);
+            dto.can_download = Some(file_downloadable && perms.is_none_or(|p| p.can_download));
         }
 
         Ok(dto)
@@ -1044,6 +1063,11 @@ impl FerrofinDtoService {
         if kinds::is_video(kind) {
             dto.video_type = Some(VideoType::VideoFile);
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
+            // C# only assigns when true, so the key is absent otherwise (the
+            // `skip_serializing_if` on the DTO matches that omission).
+            if prefetched.has_subtitles.contains(&item_id) {
+                dto.has_subtitles = Some(true);
+            }
 
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
@@ -1644,6 +1668,39 @@ impl FerrofinDtoService {
             }
             _ => HashMap::new(),
         };
+        // Subtitle presence for the page's videos in one ids-only query — C#
+        // emits `HasSubtitles` on every video DTO regardless of `ItemFields`.
+        let video_ids: Vec<Uuid> = items
+            .iter()
+            .filter(|i| kinds::is_video(row_kind(i)))
+            .map(row_id)
+            .collect();
+        let has_subtitles = if video_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.media_sources
+                .get_item_ids_with_subtitles(&video_ids)
+                .await?
+                .into_iter()
+                .collect()
+        };
+        // One Permissions read gates the whole page's CanDelete/CanDownload
+        // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item).
+        let content_permissions = match user {
+            Some(user)
+                if options.contains_field(ItemFields::CanDelete)
+                    || options.contains_field(ItemFields::CanDownload) =>
+            {
+                let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+                self.user_data.get_content_permissions(user_id).await?.map(
+                    |(can_delete, can_download)| UserContentPermissions {
+                        can_delete,
+                        can_download,
+                    },
+                )
+            }
+            _ => None,
+        };
         Ok(Prefetched {
             images,
             user_data,
@@ -1657,6 +1714,8 @@ impl FerrofinDtoService {
             child_counts,
             played_counts,
             alternates,
+            has_subtitles,
+            content_permissions,
         })
     }
 
@@ -1871,6 +1930,14 @@ mod tests {
 
     #[async_trait]
     impl UserDataManager for FakeUserData {
+        async fn get_content_permissions(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<Option<(bool, bool)>, ServiceError> {
+            // Deletion granted, downloading denied — asymmetric on purpose so a
+            // test can prove each side gates independently.
+            Ok(Some((true, false)))
+        }
         async fn save_user_data(
             &self,
             _user_id: Uuid,
@@ -2297,6 +2364,14 @@ mod tests {
 
     #[async_trait]
     impl MediaSourceManager for FakeSources {
+        async fn get_item_ids_with_subtitles(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            // Every video in these fixtures "has subtitles", so the DTO's
+            // HasSubtitles emit path is exercised.
+            Ok(item_ids.to_vec())
+        }
         async fn get_media_streams(
             &self,
             _item_id: Uuid,
@@ -2688,6 +2763,29 @@ mod tests {
         );
         assert_eq!(dto.genre_items.as_ref().unwrap().len(), 2);
         assert_eq!(dto.tags, Some(vec!["imax".to_owned(), "4k".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn video_dto_emits_has_subtitles_and_policy_gated_can_flags() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Subbed").await;
+        let item = fetch_item(&db, id).await;
+        let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x99)).await;
+        let svc = service(db);
+
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        // The subtitle-presence prefetch marks this video (C# emits the flag
+        // outside the ItemFields system, only when true).
+        assert_eq!(dto.has_subtitles, Some(true));
+        // CanDelete/CanDownload gate on the user's content permissions
+        // (EnableContentDeletion granted, EnableContentDownloading denied in
+        // the fake), not just the file-level fact.
+        assert_eq!(dto.can_delete, Some(true));
+        assert_eq!(dto.can_download, Some(false));
     }
 
     #[tokio::test]

@@ -482,6 +482,49 @@ impl UserDataManager for FerrofinUserDataManager {
         .map_err(db_err)?;
         Ok(())
     }
+
+    async fn record_playback_start(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        // Port of the user-data half of C# SessionManager.OnPlaybackStart:
+        // PlayCount++, LastPlayedDate = now, and non-resumable kinds (photos,
+        // books — anything without position-ticks resume) are played outright.
+        // The LastPlayedDate stamp is what Next Up's recently-watched HAVING
+        // filter reads; the stop-path `update_play_state` deliberately never
+        // writes it, exactly like upstream.
+        let mut row = self
+            .read_row(item_id, user_id)
+            .await?
+            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        row.play_count += 1;
+        row.last_played_date = Some(chrono::Utc::now());
+        if let Some((_, kind)) = self.item_runtime_and_kind(item_id).await?
+            && supports_played_status(kind)
+            && !supports_position_ticks_resume(kind)
+        {
+            row.played = true;
+        }
+        self.upsert_row(&row).await
+    }
+
+    async fn get_content_permissions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<(bool, bool)>, ServiceError> {
+        // Kind 10 = EnableContentDeletion, 11 = EnableContentDownloading.
+        let rows: Vec<(i32, bool)> = sqlx::query_as(
+            r#"SELECT "Kind", "Value" FROM "Permissions"
+               WHERE "UserId" = ?1 AND "Kind" IN (10, 11)"#,
+        )
+        .bind(guid_to_db(user_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let has = |kind: i32| rows.iter().any(|(k, v)| *k == kind && *v);
+        Ok(Some((has(10), has(11))))
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +788,59 @@ mod tests {
             .expect("read")
             .expect("some");
         assert_eq!(dto.playback_position_ticks, position);
+    }
+
+    #[tokio::test]
+    async fn record_playback_start_stamps_last_played_and_play_count() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x9);
+        let item = Uuid::from_u128(0x51);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        // Two starts: PlayCount accumulates and LastPlayedDate lands — the
+        // column Next Up's recently-watched filter reads (the bug was that a
+        // normally-watched series never got the stamp, so Next Up was empty).
+        mgr.record_playback_start(user, item).await.expect("start");
+        mgr.record_playback_start(user, item).await.expect("start");
+        let row = mgr.read_row(item, user).await.expect("read").expect("row");
+        assert_eq!(row.play_count, 2);
+        assert!(row.last_played_date.is_some());
+        // A movie resumes by position, so a start alone never marks it played.
+        assert!(!row.played);
+    }
+
+    #[tokio::test]
+    async fn content_permissions_read_the_permission_rows() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x77);
+        seed_user(&db, user).await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        // No rows: permissions known, both denied (falsy rows == absent rows).
+        let perms = mgr
+            .get_content_permissions(user)
+            .await
+            .expect("read")
+            .expect("policy known");
+        assert_eq!(perms, (false, false));
+
+        // Kind 10 = EnableContentDeletion granted, 11 = downloading denied.
+        sqlx::query(
+            r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
+               VALUES (10, 1, ?1, 0), (11, 0, ?1, 0)"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("seed permissions");
+        let perms = mgr
+            .get_content_permissions(user)
+            .await
+            .expect("read")
+            .expect("policy known");
+        assert_eq!(perms, (true, false));
     }
 
     #[tokio::test]

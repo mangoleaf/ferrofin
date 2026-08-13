@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::UserViewManager;
-use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, LatestItemsQuery};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
@@ -190,21 +190,38 @@ impl UserViewManager for FerrofinUserViewManager {
 
     async fn get_latest_items(
         &self,
-        user_id: Uuid,
+        query: &LatestItemsQuery,
         options: &DtoOptions,
     ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
         let _ = options;
-        let views = self.get_user_views(user_id).await?;
+        let views = self.get_user_views(query.user_id).await?;
+        let limit = if query.limit > 0 {
+            query.limit
+        } else {
+            DEFAULT_LATEST_LIMIT
+        };
         let mut result = Vec::with_capacity(views.len());
         for view in views {
             let Ok(view_id) = Uuid::parse_str(&view.id) else {
                 continue;
             };
+            // A parent-scoped request keeps only that view's group. Stored ids
+            // are uppercase-hyphenated (`guid_to_db`), so compare as Uuids.
+            if let Some(parent) = query.parent_id
+                && view_id != parent
+            {
+                continue;
+            }
             let latest_query = InternalItemsQuery {
                 parent_id: view_id,
                 recursive: true,
                 is_folder: Some(false),
-                limit: Some(DEFAULT_LATEST_LIMIT),
+                // C# also excludes virtual rows (NFO-declared missing episodes).
+                is_virtual_item: Some(false),
+                include_item_types: query.include_item_types.clone(),
+                // C# fetches `limit * 2` before grouping so the caller's
+                // played/type post-filters don't starve the page.
+                limit: Some(limit.saturating_mul(2)),
                 order_by: vec![(ItemSortBy::DateCreated, SortOrder::Descending)],
                 ..Default::default()
             };
@@ -277,12 +294,44 @@ mod tests {
         seed_named_item(&db, view, BaseItemKind::CollectionFolder, "Movies").await;
         let mgr = manager(&db);
 
+        let query = LatestItemsQuery {
+            user_id: Uuid::from_u128(9),
+            ..LatestItemsQuery::default()
+        };
         let grouped = mgr
-            .get_latest_items(Uuid::from_u128(9), &DtoOptions::default())
+            .get_latest_items(&query, &DtoOptions::default())
             .await
             .expect("latest");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].0.id, view.to_string());
+    }
+
+    #[tokio::test]
+    async fn latest_items_parent_scoping_is_case_insensitive() {
+        let db = test_db().await;
+        // Ids with hex letters, so the stored uppercase form actually differs
+        // from `Uuid::to_string()` (an all-digit id can't catch a casing bug).
+        let movies = Uuid::from_u128(0xABCD_EF01);
+        let shows = Uuid::from_u128(0xABCD_EF02);
+        seed_named_item(&db, movies, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, shows, BaseItemKind::CollectionFolder, "Shows").await;
+        let mgr = manager(&db);
+
+        // Stored view ids are uppercase-hyphenated (`guid_to_db`); the request's
+        // `parentId` must still match — the regression was a string compare of
+        // the uppercase row id against `Uuid::to_string()` (lowercase), which
+        // silently emptied every parent-scoped "Latest" row.
+        let query = LatestItemsQuery {
+            user_id: Uuid::from_u128(9),
+            parent_id: Some(movies),
+            ..LatestItemsQuery::default()
+        };
+        let grouped = mgr
+            .get_latest_items(&query, &DtoOptions::default())
+            .await
+            .expect("latest");
+        assert_eq!(grouped.len(), 1);
+        assert!(grouped[0].0.id.eq_ignore_ascii_case(&movies.to_string()));
     }
 
     #[tokio::test]

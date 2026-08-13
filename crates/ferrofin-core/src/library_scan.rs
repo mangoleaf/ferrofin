@@ -2313,13 +2313,12 @@ impl LibraryScanner {
             .and_then(|(_, n)| n)
             .or_else(|| info.as_ref().and_then(|i| i.season_number))
             .map(i64::from);
-        // The series/season display names come from the parent folders (the
-        // filename resolver rarely carries the series name and never the season
-        // name); Jellyfin surfaces both as Episode.SeriesName/SeasonName.
-        entity.series_name = Some(
-            info.and_then(|i| i.series_name)
-                .unwrap_or_else(|| series_name.to_owned()),
-        );
+        // The series/season display names come from the parent entities, never
+        // the filename parse (upstream EpisodeResolver: `episode.SeriesName =
+        // series.Name`). A filename-derived series name is release-group noise
+        // ("Show.2009", "Show - 4x09 - Title") and fragments the parent line on
+        // every episode card.
+        entity.series_name = Some(series_name.to_owned());
         entity.season_name = season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
@@ -2369,6 +2368,8 @@ impl LibraryScanner {
                         continue;
                     };
                     entity.media_type = Some("Audio".to_owned());
+                    // A placeholder the probe's ALBUM tag replaces (see
+                    // `apply_audio_metadata`); kept for tagless files.
                     entity.album = Some(album_name.clone());
                     out.push(Planned {
                         id,
@@ -2500,15 +2501,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     if entity.end_date.is_none() {
         entity.end_date = n.end_date;
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !n.genres.is_empty() {
-        entity.genres = Some(n.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !n.studios.is_empty() {
-        entity.studios = Some(n.studios.join("|"));
-    }
-    if entity.tags.as_deref().unwrap_or_default().is_empty() && !n.tags.is_empty() {
-        entity.tags = Some(n.tags.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &n.genres);
+    merge_multi_value(&mut entity.studios, &n.studios);
+    merge_multi_value(&mut entity.tags, &n.tags);
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -2538,12 +2533,8 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.official_rating.is_none() {
         entity.official_rating.clone_from(&d.official_rating);
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !d.genres.is_empty() {
-        entity.genres = Some(d.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !d.studios.is_empty() {
-        entity.studios = Some(d.studios.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &d.genres);
+    merge_multi_value(&mut entity.studios, &d.studios);
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
@@ -2568,12 +2559,8 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     if entity.official_rating.is_none() {
         entity.official_rating.clone_from(&d.official_rating);
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !d.genres.is_empty() {
-        entity.genres = Some(d.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !d.studios.is_empty() {
-        entity.studios = Some(d.studios.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &d.genres);
+    merge_multi_value(&mut entity.studios, &d.studios);
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
@@ -2585,15 +2572,30 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
 }
 
-/// Applies matched TheTVDB **episode** fields to the row (fill-if-empty).
+/// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
+/// everything except the title, where the provider outranks the resolver's
+/// filename placeholder).
 fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbEpisodeDetails) {
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
-    // The episode's own title: only overwrite a still-empty name (a filename-
-    // parsed placeholder or an NFO title is kept).
-    if entity.name.as_deref().unwrap_or_default().is_empty() && d.name.is_some() {
-        entity.name.clone_from(&d.name);
+    // The episode's own title is authoritative over the resolver's
+    // filename-derived placeholder (upstream MetadataService.MergeBaseItemData
+    // runs with replaceData=true on a standard scan, so the provider title
+    // replaces the stem the resolver stamped). An NFO `<title>` still wins:
+    // `apply_nfo` ran first and changed the name away from the stem, which is
+    // exactly what the placeholder check detects. The derived sort name follows
+    // the new title, as `apply_nfo` does.
+    let name_is_placeholder = match (entity.name.as_deref(), entity.path.as_deref()) {
+        (Some(name), Some(path)) => name == file_stem(path),
+        (None | Some(""), _) => true,
+        _ => false,
+    };
+    if name_is_placeholder
+        && let Some(title) = d.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(create_sort_name(title));
     }
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
@@ -2608,8 +2610,40 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbE
 /// The port of `AudioFileProber`'s tag→item mapping (multi-values pipe-joined,
 /// matching Ferrofin's `Artists`/`AlbumArtists`/`Genres` column convention).
 fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(String, String)> {
-    if entity.album.is_none() {
-        entity.album.clone_from(&info.album);
+    // The TITLE tag is authoritative for the track name (AudioFileProber:
+    // `audio.Name = trackTitle` unconditionally, bar locked fields — the scan
+    // loop already skips locked items). The resolver's file-stem name is a
+    // placeholder ("03. Artist - Title"), never the display name.
+    if let Some(title) = info
+        .media_source
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(create_sort_name(title));
+    }
+    // The ALBUM tag replaces the plan's folder-stem placeholder (upstream's
+    // `audio.Album ??= trackAlbum` works on a null the resolver left; here the
+    // placeholder marks "no real value yet" so tagless files keep the folder
+    // name). An NFO/edited album — no longer equal to the folder stem — wins.
+    let album_is_placeholder = match (entity.album.as_deref(), entity.path.as_deref()) {
+        (Some(album), Some(path)) => std::path::Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .is_some_and(|dir| album == file_stem(&dir)),
+        (None, _) => true,
+        _ => false,
+    };
+    if album_is_placeholder
+        && let Some(album) = info
+            .album
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        entity.album = Some(album.to_owned());
     }
     if entity.artists.as_deref().unwrap_or_default().is_empty() && !info.artists.is_empty() {
         entity.artists = Some(info.artists.join("|"));
@@ -2642,6 +2676,31 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// Unions a provider's multi-value names into a pipe-joined column, preserving
+/// existing order and deduplicating case-insensitively.
+///
+/// Upstream runs the whole provider chain and merges each field's values;
+/// Ferrofin's old fill-if-empty froze coverage at whichever provider answered
+/// first — the reason the genre filter offered fewer genres than Jellyfin and
+/// tags existed only for NFO'd items.
+fn merge_multi_value(existing: &mut Option<String>, incoming: &[String]) {
+    if incoming.is_empty() {
+        return;
+    }
+    let mut values = split_pipe(existing.as_deref());
+    let mut seen: std::collections::HashSet<String> =
+        values.iter().map(|v| v.to_lowercase()).collect();
+    for value in incoming {
+        let value = value.trim();
+        if !value.is_empty() && seen.insert(value.to_lowercase()) {
+            values.push(value.to_owned());
+        }
+    }
+    if !values.is_empty() {
+        *existing = Some(values.join("|"));
+    }
 }
 
 /// Splits a pipe-joined multi-value field (artists/album_artists) into trimmed,
@@ -2739,7 +2798,7 @@ fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
 
 /// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
 /// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
-fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
+pub(crate) fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
     let split = |field: Option<&str>| -> Vec<String> {
         field
             .unwrap_or_default()
@@ -3154,6 +3213,23 @@ mod tests {
         super::apply_audio_metadata(&mut pre, &info);
         assert_eq!(pre.production_year, Some(2000));
         assert_eq!(pre.album.as_deref(), Some("Existing"));
+
+        // The TITLE tag replaces the resolver's file-stem name, and the ALBUM
+        // tag replaces the plan's folder-stem placeholder (the reported music
+        // bug: every track/album displayed release-folder noise).
+        info.media_source.name = Some("Scar Tissue".into());
+        let mut tagged = BaseItemEntity {
+            name: Some("03. Red Hot Chili Peppers - Scar Tissue".into()),
+            album: Some("RHCP - Californication (1999) FLAC".into()),
+            path: Some(
+                "/music/RHCP - Californication (1999) FLAC/03. Red Hot Chili Peppers - Scar Tissue.flac"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        super::apply_audio_metadata(&mut tagged, &info);
+        assert_eq!(tagged.name.as_deref(), Some("Scar Tissue"));
+        assert_eq!(tagged.album.as_deref(), Some("Kind of Blue"));
     }
 
     // fanart id selection prefers Tmdb over Imdb; dedup keeps the first image of
@@ -3282,13 +3358,29 @@ mod tests {
         assert_eq!(blank.overview.as_deref(), Some("Ned is summoned."));
         assert!(blank.premiere_date.is_some());
         assert_eq!(blank.production_year, Some(2011));
-        // Existing title → kept.
+        // The resolver's filename placeholder → replaced (the reported bug:
+        // every episode displayed its file name because this guard used to be
+        // "only if empty", which the placeholder made permanently false).
+        let mut placeholder = BaseItemEntity {
+            name: Some("GoT.S01E01.1080p.Bluray".into()),
+            sort_name: Some("got.s01e01.1080p.bluray".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
+            ..Default::default()
+        };
+        super::apply_tvdb_episode(&mut placeholder, &ep);
+        assert_eq!(placeholder.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(
+            placeholder.sort_name.as_deref(),
+            Some(super::create_sort_name("Winter Is Coming").as_str())
+        );
+        // A name that differs from the stem (an NFO <title>) → kept.
         let mut named = BaseItemEntity {
-            name: Some("S01E01".into()),
+            name: Some("The Real Title".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
             ..Default::default()
         };
         super::apply_tvdb_episode(&mut named, &ep);
-        assert_eq!(named.name.as_deref(), Some("S01E01"));
+        assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
     // merge_series_cast: the series regulars (actors only) lead, the episode's
