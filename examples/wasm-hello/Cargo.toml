@@ -1,0 +1,33 @@
+# The reference Tier-1b WASM plugin — a `ferrofin:plugin` world guest.
+#
+# This crate is a TOOLCHAIN ISLAND: it is excluded from the server workspace
+# (its own [workspace] table below) and carries its own rust-toolchain.toml
+# adding the wasm32-wasip2 target, so the server's "server-only" root
+# toolchain contract stays intact. Build it with:
+#
+#     cargo build --release --target wasm32-wasip2
+#
+# The artifact (target/wasm32-wasip2/release/ferrofin_wasm_hello.wasm) is a
+# component: drop it into {data_dir}/plugins/ and restart the server. It is
+# never committed (repo-wide `*.wasm` gitignore); CI and the ferrofin-wasm
+# integration test build it from source.
+[package]
+name = "ferrofin-wasm-hello"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.60"
+
+[profile.release]
+# Small artifacts load faster and make the RSS measurement representative.
+opt-level = "s"
+lto = true
+strip = true

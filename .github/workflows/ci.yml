@@ -25,10 +25,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
+          # Builds the WASM example guest for the end-to-end plugin-host test.
+          targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
+        # FERROFIN_WASM_GUEST_TESTS=1 builds+runs the real wasm-hello guest so
+        # the ferrofin:plugin WIT contract can't drift silently.
+      - run: FERROFIN_WASM_GUEST_TESTS=1 cargo test --workspace
 
   # Best-effort perf gate (plans 04/08): non-blocking (`continue-on-error`)
   # because shared runners are noisy — the MANDATORY gate is the local

@@ -81,6 +81,18 @@ returns empty results. Never send user PII to these services.
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |
 
+## WASM plugins (Tier 1b)
+
+Limits for sandboxed WASM plugins loaded from `{data_dir}/plugins/*.wasm`
+(see `EXTENSIONS.md`). Zero is treated as unset; defaults apply.
+
+| Variable | Purpose |
+|---|---|
+| `FERROFIN_WASM_CALL_TIMEOUT_SECS` | Per-guest-call deadline in seconds (default 30). A plugin call past the deadline is interrupted; repeated failures sideline the plugin until restart. |
+| `FERROFIN_WASM_MEMORY_LIMIT_MB` | Per-plugin linear-memory cap in MiB (default 128). A `memory.grow` ceiling, never a reservation — small plugins use a few MiB. Also caps `http-fetch` response bodies. |
+| `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` | Per-plugin event queue depth (default 256). A full queue drops events for that plugin only. |
+| `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` | Plugins allowed to `http-fetch` private/loopback/link-local destinations: comma-separated plugin UUIDs, or `*` for all. Default: denied for every plugin (public destinations are always allowed). Plugin UUIDs appear in `/Plugins` and the load log line. (Accepting plugin names here is a planned improvement.) |
+
 ## Build- and test-time only
 
 Not runtime config, listed for completeness:
@@ -88,3 +100,5 @@ Not runtime config, listed for completeness:
 - `FERROFIN_REFRESH_PLUGIN_ASSETS=1` — re-fetch vendored extension settings pages during
   `cargo build -p ferrofin-extensions`.
 - `FERROFIN_FFMPEG_TESTS=1` — run the env-gated real-ffmpeg integration tests.
+- `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
+  wasm32-wasip2 target) and run the end-to-end WASM plugin tests.

@@ -35,11 +35,14 @@ ferrofin-hls.workspace = true
 ferrofin-drawing.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-extensions.workspace = true
+ferrofin-wasm.workspace = true
 ferrofin-livetv.workspace = true
 ferrofin-metrics.workspace = true
 
 axum = { workspace = true, features = ["ws", "macros"] }
-tower.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
+tower.workspace = true
+# wasm_plugins integration test: compile the inline-WAT fixture component.
+wat.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
 tokio = { workspace = true }
 async-trait.workspace = true
@@ -66,6 +69,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # First-Light integration test: drive the real router via tower oneshot and
 # assert JSON bodies.
 tower.workspace = true
+# wasm_plugins integration test: compile the inline-WAT fixture component.
+wat.workspace = true
 # `testing` unlocks the in-memory span exporter for the tracing→OTel bridge smoke test.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true

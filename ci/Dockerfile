@@ -6,7 +6,9 @@
 FROM rust:1.97.1-bookworm
 
 # rustfmt + clippy (lint) and llvm-tools-preview (coverage instrumentation).
-RUN rustup component add rustfmt clippy llvm-tools-preview
+# wasm32-wasip2 builds the WASM example plugin (crates/ferrofin-wasm's
+# FERROFIN_WASM_GUEST_TESTS=1 end-to-end test — the WIT contract anchor).
+RUN rustup component add rustfmt clippy llvm-tools-preview  && rustup target add wasm32-wasip2
 
 # cargo-nextest (test runner) + cargo-llvm-cov (coverage). We deliberately avoid
 # cargo-binstall / GitHub release downloads here: those 503 / rate-limit from CI

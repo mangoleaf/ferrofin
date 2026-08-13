@@ -66,9 +66,11 @@ Wired and working, with a documented limitation or lighter verification:
 
 Precise about what's absent — this is what keeps the rest of the matrix credible:
 
-- **Dynamic plugin loading** — no runtime assembly loading; Ferrofin ships compiled-in
-  extensions instead (see [`EXTENSIONS.md`](EXTENSIONS.md)). `/Plugins` install/uninstall is
-  intentionally rejected.
+- **.NET-style native plugin loading** — never (no stable Rust ABI; full-trust loading is
+  rejected by design). In-process plugins ship as compiled-in extensions (Tier 1a) or
+  sandboxed, runtime-installed WASM components (Tier 1b) — see
+  [`EXTENSIONS.md`](EXTENSIONS.md). `/Plugins` catalog install/uninstall over HTTP is
+  rejected; WASM install is drop-file-and-restart.
 - **DLNA server discovery (SSDP)** — no SSDP broadcast/discovery.
 
 ## Regenerating this

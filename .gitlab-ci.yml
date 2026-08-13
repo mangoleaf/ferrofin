@@ -290,8 +290,14 @@ lint:
   variables:
     CARGO_TERM_COLOR: always
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    # Build+run the real WASM example guest (ferrofin-wasm's end-to-end test)
+    # so the WIT contract can't drift silently.
+    FERROFIN_WASM_GUEST_TESTS: "1"
   before_script:
     - !reference [.sccache-setup, script]
+    # No-op once the ci-image bakes it (ci/Dockerfile); covers the window where
+    # an MR pipeline still runs on the pre-wasm image.
+    - rustup target add wasm32-wasip2
   script:
     - cargo fmt --all --check
     - cargo clippy --all-targets --all-features -- -D warnings

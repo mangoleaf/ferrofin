@@ -18,6 +18,7 @@ members = [
     "crates/ferrofin-chromaprint",
     "crates/ferrofin-core",
     "crates/ferrofin-extensions",
+    "crates/ferrofin-wasm",
     "crates/ferrofin-metrics",
     "crates/ferrofin-api",
     "apps/ferrofin-server",
@@ -70,6 +71,7 @@ ferrofin-livetv = { path = "crates/ferrofin-livetv" }
 ferrofin-chromaprint = { path = "crates/ferrofin-chromaprint" }
 ferrofin-core = { path = "crates/ferrofin-core" }
 ferrofin-extensions = { path = "crates/ferrofin-extensions" }
+ferrofin-wasm = { path = "crates/ferrofin-wasm" }
 ferrofin-metrics = { path = "crates/ferrofin-metrics" }
 ferrofin-api = { path = "crates/ferrofin-api" }
 
@@ -113,6 +115,13 @@ tracing-opentelemetry = "0.33"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }
+
+# ── WASM plugin host (Tier 1b — see brain/plans/PLAN_PLUGIN_TIERS.md) ──
+# Component-model runtime for sandboxed third-party plugins. Always compiled
+# in (decision 2026-08-07); MSRV 1.94 ≤ our pinned toolchain.
+wasmtime = "47"
+wasmtime-wasi = "47"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
+wat = "1.256"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1", features = ["v4", "serde"] }

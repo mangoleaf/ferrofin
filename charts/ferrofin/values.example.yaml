@@ -142,6 +142,17 @@ ferrofin:
     # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<otel-collector>.<namespace>.svc.cluster.local:4317"
     # OTEL_TRACES_SAMPLER_ARG: "0.25"
 
+    # WASM plugins (sandboxed, runtime-installed): place .wasm components at
+    # {data_dir}/plugins/ — i.e. under the DATA volume above — and restart the
+    # pod. The defaults below are generous; a well-behaved plugin uses a few
+    # MiB (the memory limit is a ceiling, never a reservation). Zero = unset.
+    # FERROFIN_WASM_CALL_TIMEOUT_SECS: "30"     # per-call deadline for a plugin
+    # FERROFIN_WASM_MEMORY_LIMIT_MB: "128"      # per-plugin memory cap
+    # FERROFIN_WASM_EVENT_QUEUE_CAPACITY: "256" # per-plugin event queue depth
+    # Let SPECIFIC trusted plugins http-fetch private/LAN destinations
+    # (default: denied for all; public internet is always allowed):
+    # FERROFIN_WASM_PRIVATE_HTTP_ALLOW: "<plugin-uuid>,<plugin-uuid>"
+
 # -----------------------------------------------------------------------------
 # Metrics — Ferrofin exposes a Prometheus /metrics endpoint (enable it above via
 # FERROFIN_ENABLE_METRICS). Turn on the ServiceMonitor if you run the Prometheus

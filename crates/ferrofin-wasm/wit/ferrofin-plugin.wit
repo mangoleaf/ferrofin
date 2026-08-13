@@ -1,0 +1,202 @@
+/// The Ferrofin WASM plugin contract — Tier 1b of the plugin architecture
+/// (see brain/plans/PLAN_PLUGIN_TIERS.md).
+///
+/// STABILITY: this world is 0.x and UNSTABLE. It freezes (additive evolution
+/// only, like the vendored OpenAPI contract) once two or three real
+/// third-party plugins exist against it. Until then a minor bump may break
+/// guests; the host refuses to load a component built against a different
+/// version and names both versions in its error.
+///
+/// SECURITY MODEL: guests get no filesystem and no network. Every effect a
+/// plugin can have on the outside world goes through the `host` interface
+/// below — this file IS the reviewable attack surface.
+package ferrofin:plugin@0.1.0;
+
+/// Data types shared by both sides of the boundary.
+interface types {
+    /// Log severity, mapped 1:1 onto the host's tracing levels.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// A plugin's identity and presentation, surfaced on the `/Plugins` API.
+    record plugin-descriptor {
+        /// Stable plugin id — a UUID in canonical string form. A component
+        /// whose id does not parse as a UUID is rejected at load.
+        id: string,
+        /// Human-readable display name.
+        name: string,
+        /// Semantic version string of the plugin itself.
+        version: string,
+        /// One-line description shown in the dashboard.
+        description: string,
+    }
+
+    /// A background task the plugin offers to the scheduled-task registry.
+    record task-descriptor {
+        /// Stable key, unique within this plugin (the host namespaces it).
+        id: string,
+        /// Display name in the dashboard task list.
+        name: string,
+        /// One-line description of what the task does.
+        description: string,
+        /// Dashboard category the task is grouped under.
+        category: string,
+    }
+
+    /// An outbound HTTP request, executed BY THE HOST on the plugin's behalf
+    /// (guests have no sockets). http/https only.
+    record http-request {
+        /// The HTTP method (`GET`, `POST`, …).
+        method: string,
+        /// The absolute http(s) URL.
+        url: string,
+        /// Request headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// Optional request body.
+        body: option<list<u8>>,
+    }
+
+    /// The host-mediated response. Bodies larger than the plugin's memory
+    /// limit are refused (they could never fit in guest memory anyway).
+    record http-response {
+        /// The HTTP status code.
+        status: u16,
+        /// Response headers as (name, value) pairs.
+        headers: list<tuple<string, string>>,
+        /// The response body bytes.
+        body: list<u8>,
+    }
+
+    /// A read-only library item projection — deliberately small and stable
+    /// (NOT the wire DTO; this is the plugin contract, versioned with the
+    /// world).
+    record item-summary {
+        /// Canonical UUID string of the item.
+        id: string,
+        /// Display name.
+        name: string,
+        /// The item kind (`Movie`, `Episode`, `Series`, `Audio`, …).
+        kind: string,
+        /// Filesystem path, when the item has one.
+        path: option<string>,
+        /// Canonical UUID of the parent item, when there is one.
+        parent-id: option<string>,
+        /// Runtime in ticks (100 ns units), when known.
+        run-time-ticks: option<s64>,
+    }
+
+    /// Filters for `query-items`. Empty/absent fields mean "no filter".
+    record item-query {
+        /// Item kinds to include (`Movie`, `Episode`, …); empty = all kinds.
+        kinds: list<string>,
+        /// Restrict to children of this parent (canonical UUID string).
+        parent-id: option<string>,
+        /// Case-insensitive name search.
+        search-term: option<string>,
+        /// Maximum number of rows (the host caps this at 1000 per call).
+        limit: option<u32>,
+    }
+
+    /// A media segment to persist (`Intro`, `Outro`, `Recap`, `Preview`,
+    /// `Commercial`). Ticks are 100 ns units.
+    record media-segment {
+        /// The segment type name (one of the five above).
+        segment-type: string,
+        /// Segment start, in ticks.
+        start-ticks: s64,
+        /// Segment end, in ticks.
+        end-ticks: s64,
+    }
+
+    /// Metadata a plugin contributes for one item from `metadata-lookup`.
+    /// SUPPLEMENT-ONLY: the scanner applies each field only where the item
+    /// still lacks a value — a plugin can fill gaps, never overwrite the
+    /// built-in providers or user edits. Image contribution is deliberately
+    /// absent from 0.x (the image pipeline is a bigger contract; it lands
+    /// when a real plugin needs it).
+    record metadata-result {
+        /// Plot/description text.
+        overview: option<string>,
+        /// Release year.
+        production-year: option<s32>,
+        /// Community rating on Jellyfin's 0–10 scale.
+        community-rating: option<f64>,
+        /// Genre names (applied only when the item has none).
+        genres: list<string>,
+        /// External ids to record, as (provider name, id) pairs — e.g. a
+        /// plugin for a niche database records its own id here.
+        provider-ids: list<tuple<string, string>>,
+    }
+}
+
+/// Capabilities Ferrofin grants to every plugin — the ENTIRE effect surface
+/// a guest has on the world. Every function here is host-mediated, logged,
+/// and bounded; adding one is a security decision, not a convenience.
+interface host {
+    use types.{log-level, http-request, http-response, item-summary, item-query, media-segment};
+
+    /// Emits a log line into the server's tracing pipeline, tagged with the
+    /// plugin's id and name.
+    log: func(level: log-level, message: string);
+
+    /// Returns the plugin's persisted configuration JSON (the same bytes the
+    /// `/Plugins/{id}/Configuration` API manages). `{}` until the admin
+    /// saves a value; a plugin never sees another plugin's config.
+    get-config: func() -> string;
+
+    /// Performs an outbound HTTP request on the plugin's behalf — the ONLY
+    /// network access a guest has. http/https URLs only; the request runs
+    /// under the plugin's call-timeout budget, destinations are debug-logged,
+    /// and a response body larger than the plugin's memory limit is refused.
+    http-fetch: func(request: http-request) -> result<http-response, string>;
+
+    /// Read-only library queries, as a small stable projection (never the
+    /// full DTO). The host caps `limit` at 1000 rows per call.
+    query-items: func(query: item-query) -> result<list<item-summary>, string>;
+
+    /// Replaces THIS plugin's media segments for an item (other providers'
+    /// and user-authored segments are untouched — each plugin writes under
+    /// its own provider id, like every segment provider). An empty list
+    /// erases the plugin's segments for the item.
+    write-media-segments: func(item-id: string, segments: list<media-segment>) -> result<_, string>;
+}
+
+/// The contract a Ferrofin plugin component implements.
+world plugin {
+    use types.{plugin-descriptor, task-descriptor, item-summary, metadata-result};
+
+    import host;
+
+    /// The plugin's identity; called once at load, before anything else.
+    export descriptor: func() -> plugin-descriptor;
+
+    /// The seed configuration JSON written on first run.
+    export default-config: func() -> string;
+
+    /// The background tasks this plugin contributes (may be empty).
+    export tasks: func() -> list<task-descriptor>;
+
+    /// Runs one of the plugin's tasks to completion. `task-id` is the
+    /// `task-descriptor.id` the plugin advertised. An `err` return is
+    /// recorded as a failed task run.
+    export run-task: func(task-id: string) -> result<_, string>;
+
+    /// Delivers one domain event. `event-name` is the server's stable event
+    /// type name (`LibraryChanged`, `PlaybackStart`, …); `event-json` is its
+    /// serialized payload. Called only while the plugin is enabled; a slow
+    /// consumer loses oldest events rather than slowing the server.
+    export on-event: func(event-name: string, event-json: string);
+
+    /// Offers metadata for one library item during a scan, after the
+    /// built-in providers ran. `item` describes the item as scanned so far;
+    /// `provider-ids` are its known external ids. Return `none` when this
+    /// plugin has nothing to offer (the common case — a plugin that is not
+    /// a metadata source returns `none` unconditionally). Results are
+    /// supplement-only (see `metadata-result`).
+    export metadata-lookup: func(item: item-summary, provider-ids: list<tuple<string, string>>) -> result<option<metadata-result>, string>;
+}

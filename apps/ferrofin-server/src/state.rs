@@ -507,6 +507,40 @@ pub async fn build_app_state(
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
     // clients over the WebSocket so open views refresh after a scan.
+    // Tier-1b: runtime-installed WASM plugins from `{data_dir}/plugins/*.wasm`
+    // (see brain/plans/PLAN_PLUGIN_TIERS.md). Loading compiles components —
+    // CPU-heavy, so it runs on the blocking pool. A load failure degrades to
+    // "no WASM plugins", never a failed boot; per-file failures are logged
+    // and skipped inside the loader.
+    let wasm_host = {
+        let wasm_settings = ferrofin_wasm::WasmSettings::resolve(
+            config.wasm_call_timeout_secs,
+            config.wasm_memory_limit_mb,
+            config.wasm_event_queue_capacity,
+            config.wasm_private_http_allow.as_deref(),
+        );
+        let wasm_dir = config.data_dir.join("plugins");
+        match tokio::task::spawn_blocking(move || {
+            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
+        })
+        .await
+        {
+            Ok(Ok(host)) => host,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "wasm plugin host unavailable; continuing without it");
+                ferrofin_wasm::WasmPluginHost::empty()
+            }
+            Err(join_err) => {
+                tracing::warn!(%join_err, "wasm plugin load task panicked; continuing without it");
+                ferrofin_wasm::WasmPluginHost::empty()
+            }
+        }
+    };
+    // The scan's dynamic metadata pass: every loaded WASM plugin is offered
+    // each item after the built-in provider chain (supplement-only; inert
+    // until the collaborators are armed below and while a plugin is
+    // disabled).
+    scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
     scanner = scanner.with_events(Arc::clone(&event_manager));
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
@@ -617,6 +651,8 @@ pub async fn build_app_state(
     ];
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
+    // Loaded WASM plugins surface on `/Plugins` exactly like compiled-in ones.
+    registered_plugins.extend(wasm_host.registered_plugins());
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> =
         Arc::new(ferrofin_core::FerrofinPluginManager::new(
             registered_plugins,
@@ -670,6 +706,23 @@ pub async fn build_app_state(
         merge_versions: Arc::clone(&merge_versions),
     };
     ferrofin_extensions::register_tasks(&extensions, &extension_cx, &task_manager);
+    // Tier-1b WASM plugin tasks and event delivery. Tasks self-gate on the
+    // plugin's enabled flag (the Tier-1a pattern); event delivery is
+    // non-blocking (spawn + bounded per-plugin queue), so a slow guest can
+    // never hold up publication.
+    for task in wasm_host.scheduled_tasks(&plugins) {
+        task_manager.register(task);
+    }
+    wasm_host.subscribe_events(&event_bus, &plugins);
+    // Arm the E2 capabilities (query-items / write-media-segments) now that
+    // their backing managers exist — plugin load happened earlier, so a
+    // guest calling them during load got a clean "not available" error.
+    wasm_host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::clone(&library),
+        media_segments: Arc::clone(&media_segments),
+        plugins: Arc::clone(&plugins),
+    });
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
         Arc::new(FerrofinCollectionManager::new(
             db.clone(),
@@ -1114,6 +1167,10 @@ mod tests {
             enable_metrics: None,
             metrics_sample_interval: None,
             scan_progress_every: None,
+            wasm_call_timeout_secs: None,
+            wasm_memory_limit_mb: None,
+            wasm_event_queue_capacity: None,
+            wasm_private_http_allow: None,
         }
     }
 

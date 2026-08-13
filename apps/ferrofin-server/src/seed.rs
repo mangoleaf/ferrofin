@@ -167,6 +167,10 @@ mod tests {
             enable_metrics: None,
             metrics_sample_interval: None,
             scan_progress_every: None,
+            wasm_call_timeout_secs: None,
+            wasm_memory_limit_mb: None,
+            wasm_event_queue_capacity: None,
+            wasm_private_http_allow: None,
         }
     }
 
