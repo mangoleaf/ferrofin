@@ -321,6 +321,13 @@ async fn get_items(
         .apply_filters(&filters)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    // A BoxSet/Playlist-typed browse under a normal library is re-rooted: box
+    // sets live outside the library tree, so the parent becomes a
+    // linked-child-ancestor constraint instead (C# ItemsController's
+    // `linkedChildAncestorIds` redirect). Without this, the library's
+    // Collections tab can never list anything.
+    redirect_container_browse(&state, &mut internal).await;
+
     let result = state.library.query_items(&internal).await?;
     // Honour the requested `Fields` (Path, Genres, …) — Jellyfin's GetItems builds its
     // DtoOptions from them. Lenient parse: clients still send deprecated field names, which
@@ -677,6 +684,66 @@ fn parse_order_by(
             (column, order)
         })
         .collect())
+}
+
+/// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
+/// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
+/// `linkedChildAncestorIds` block).
+///
+/// Applies only when the request is for exactly `[BoxSet]` or `[Playlist]`,
+/// a parent is set, and that parent is neither itself a box set/playlist nor
+/// the matching `boxsets`/`playlists` library. Best-effort: an unresolvable
+/// parent leaves the query untouched (the plain parent scoping then returns
+/// empty, as before).
+async fn redirect_container_browse(
+    state: &AppState,
+    internal: &mut ferrofin_traits::options::InternalItemsQuery,
+) {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::entities::CollectionTypeOptions;
+
+    // Playlists have no `CollectionTypeOptions` variant (upstream's options
+    // enum has none either — the playlists "library" is the manual playlists
+    // folder, caught by the container check below), so its target type is None.
+    let target_collection_type = match internal.include_item_types.as_slice() {
+        [BaseItemKind::BoxSet] => Some(CollectionTypeOptions::boxsets),
+        [BaseItemKind::Playlist] => None,
+        _ => return,
+    };
+    if internal.parent_id.is_nil() {
+        return;
+    }
+    let Ok(Some(parent)) = state.library.get_item_by_id(internal.parent_id).await else {
+        return;
+    };
+    // The parent is itself a container of the requested kind → a direct
+    // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
+    let short = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
+    if short == "BoxSet" || short == "Playlist" || short == "ManualPlaylistsFolder" {
+        return;
+    }
+    // A browse of the boxsets/playlists library itself keeps plain parent
+    // scoping (C# `itemCollectionType != targetCollectionType`).
+    let parent_collection_type = state
+        .virtual_folders
+        .get_virtual_folders()
+        .await
+        .ok()
+        .and_then(|folders| {
+            folders
+                .into_iter()
+                .find(|vf| {
+                    vf.item_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
+                })
+                .and_then(|vf| vf.collection_type)
+        });
+    if target_collection_type.is_some() && parent_collection_type == target_collection_type {
+        return;
+    }
+    internal.linked_child_ancestor_ids = vec![internal.parent_id];
+    internal.set_parent(None);
 }
 
 /// Registers this controller's real routes onto `router`.

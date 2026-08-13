@@ -422,3 +422,61 @@ async fn video_type_and_3d_filters_match_data_blob() {
     assert_eq!(flat.len(), 1);
     assert_eq!(flat[0].name.as_deref(), Some("File"));
 }
+
+#[tokio::test]
+async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let library = Uuid::from_u128(0x11B);
+    let movie = Uuid::from_u128(0x801);
+    let in_lib_set = Uuid::from_u128(0x802);
+    let foreign_set = Uuid::from_u128(0x803);
+    // Production ids are stored UPPERCASE-hyphenated (`guid_to_db`), and the
+    // ancestor predicates bind that form — seed the same casing end to end.
+    let upper = |row: ferrofin_db::entities::base_items::BaseItemEntity| {
+        let mut row = row;
+        row.id = row.id.to_uppercase();
+        row
+    };
+    persist
+        .save_items(&[
+            upper(item(library, BaseItemKind::CollectionFolder, "Movies")),
+            upper(item(movie, BaseItemKind::Movie, "Heat")),
+            upper(item(in_lib_set, BaseItemKind::BoxSet, "Crime Films")),
+            upper(item(foreign_set, BaseItemKind::BoxSet, "Empty Elsewhere")),
+        ])
+        .await
+        .expect("save");
+    // The movie descends from the library; the in-library box set links it.
+    sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+        .bind(movie.to_string().to_uppercase())
+        .bind(library.to_string().to_uppercase())
+        .execute(db.writer())
+        .await
+        .expect("ancestor");
+    sqlx::query(
+        r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType")
+           VALUES (?1, ?2, 0)"#,
+    )
+    .bind(in_lib_set.to_string().to_uppercase())
+    .bind(movie.to_string().to_uppercase())
+    .execute(db.writer())
+    .await
+    .expect("link");
+
+    // The Collections-tab query: box sets whose linked children descend from
+    // the library — the re-rooted form of `parentId=<library>` (a box set
+    // never lives under the library itself).
+    let rows = repository
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::BoxSet],
+            linked_child_ancestor_ids: vec![library],
+            recursive: true,
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name.as_deref(), Some("Crime Films"));
+}

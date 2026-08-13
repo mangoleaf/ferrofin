@@ -962,6 +962,24 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
         );
         qb.push(")");
     }
+    // Keep folder-like items (box sets, playlists) whose manual linked
+    // children descend from any of the requested ancestors — the Collections
+    // tab's re-rooted query (C# TranslateQuery `LinkedChildAncestorIds` over
+    // `context.LinkedChildren`; the manual links live in Ferrofin's
+    // `HermitLinkedChildren`).
+    if !filter.linked_child_ancestor_ids.is_empty() {
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "HermitLinkedChildren" lc
+                JOIN "AncestorIds" la ON la."ItemId" = lc."ChildId"
+                WHERE lc."ParentId" = bi."Id" AND "#,
+        );
+        push_in_list(
+            qb,
+            r#"la."ParentItemId""#,
+            &to_guid_strings(&filter.linked_child_ancestor_ids),
+        );
+        qb.push(")");
+    }
 }
 
 /// Appends the `ORDER BY` clause from `filter.order_by`, mapping each
