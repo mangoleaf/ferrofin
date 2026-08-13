@@ -48,7 +48,8 @@ keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
 chromaprint      health       │          ├─ drawing
                  metrics      │          ├─ providers
                               │          ├─ livetv
-                              │          └─ extensions
+                              │          ├─ extensions
+                              │          └─ wasm (plugin host)
                               └──────────────► core ─► api ─► server (bin)
 ```
 
@@ -70,7 +71,8 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
 | `ferrofin-providers` | metadata providers (local NFO always on; remote TMDB/TVDB/MusicBrainz/OMDb/fanart feature-gated) |
 | `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
-| `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (replaces the .NET plugin host — see `docs/EXTENSIONS.md`) |
+| `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
+| `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
 | `ferrofin-core` | the concrete manager implementations — the workhorse |
 | `ferrofin-api` | axum router + handlers (the HTTP layer) |
 | `apps/ferrofin-server` | the binary: config → DB → ffmpeg → wire everything → serve |
@@ -204,6 +206,15 @@ FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_tran
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
 ```
 
+Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
+`wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
+toolchain stays server-only). It skips with a message when the target is absent; CI always
+runs it:
+
+```bash
+FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
+```
+
 ### Perf regression gate (mandatory for perf-touching changes)
 Body-diff correctness is not a latency signal — a 100× slowdown can land "green." Any
 change touching `ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO
@@ -242,9 +253,18 @@ metrics/tracing, trickplay/chapters/lyrics/media segments, and backup/restore. S
 `docs/FEATURES.md` for the tiered status matrix.
 
 The real remaining gaps are **by design**, not un-ported routes:
-- **Dynamic plugin loading** — no Rust equivalent to .NET runtime assembly loading. Ferrofin
-  ships **compiled-in extensions** instead (`docs/EXTENSIONS.md`); `/Plugins` install/uninstall
-  is intentionally rejected.
+- **.NET-style native plugin loading** — never (no stable Rust ABI, and full-trust loading is
+  the security model Ferrofin rejects). In-process plugins come in two tiers instead
+  (`docs/EXTENSIONS.md`): **compiled-in extensions** (Tier 1a, `ferrofin-extensions`) and
+  **sandboxed WASM plugins** (Tier 1b, `ferrofin-wasm` — drop a `ferrofin:plugin` component
+  into `{data_dir}/plugins/` and restart; no fs/network, capability-gated host API, enforced
+  memory/time limits). `/Plugins` catalog install/uninstall over HTTP is still rejected —
+  WASM install is file-drop + restart. When someone asks for a plugin, answer by tier:
+  deep-hook ports go in `ferrofin-extensions` (PR), self-contained sources can be WASM;
+  never invent a third mechanism. `.wasm` artifacts are NEVER committed (repo-wide
+  gitignore); test fixtures are inline WAT, and the reference guest `examples/wasm-hello/`
+  is a workspace-excluded toolchain island built from source by CI
+  (`FERROFIN_WASM_GUEST_TESTS=1`).
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
 - **Remote metadata providers** (TMDB/TVDB/MusicBrainz/OMDb/fanart) are feature-gated **off**

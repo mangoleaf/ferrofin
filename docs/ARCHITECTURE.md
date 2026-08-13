@@ -50,7 +50,8 @@ injects them into the API's `AppState`.
 | `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate |
 | `ferrofin-providers` | MediaBrowser.Providers + Xbmc/LocalMetadata | local NFO always on; remote providers (TMDB/TVDB/MusicBrainz/…) feature-gated |
 | `ferrofin-livetv` | Jellyfin.LiveTv | M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
-| `ferrofin-extensions` | (new — replaces the .NET plugin host) | compiled-in extensions behind an `Extension` trait; see `docs/PLUGINS_UPSTREAM.md` |
+| `ferrofin-extensions` | (new — Tier 1a of the plugin design) | compiled-in extensions behind an `Extension` trait; see `docs/PLUGINS_UPSTREAM.md` |
+| `ferrofin-wasm` | (new — Tier 1b of the plugin design) | sandboxed runtime-installed WASM plugin host (wasmtime + the `ferrofin:plugin` WIT world); see `docs/EXTENSIONS.md` |
 | `ferrofin-core` | Emby.Server.Implementations + Jellyfin.Server.Implementations | the concrete manager implementations — the workhorse |
 | `ferrofin-api` | Jellyfin.Api | axum router + handlers; depends only on `traits`+`model` |
 | `ferrofin-server` (bin) | Jellyfin.Server | composition root: config → DB → ffmpeg discovery → wiring → serve |

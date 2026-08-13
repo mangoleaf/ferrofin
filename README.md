@@ -133,7 +133,7 @@ reviewed like any other code and shipped inside the binary. They surface through
 File Transformation, and Merge Versions are ported today. This is the home for anything that
 needs deep server internals. Details: **[`docs/EXTENSIONS.md`](docs/EXTENSIONS.md)**.
 
-**WASM plugins** (in development) are how plugins Ferrofin's repo has never seen get
+**WASM plugins** are how plugins Ferrofin's repo has never seen get
 installed: drop a `.wasm` component into `{data_dir}/plugins/` and restart. **Security is
 the reason for this design.** A WASM plugin runs in a sandbox with *no filesystem access, no
 network access, and no view of server memory* — its entire world is the short, reviewable
@@ -164,7 +164,8 @@ keyframes        networking   ├─ traits ─┬─ mediaencoding ─ hls
 chromaprint      health       │          ├─ drawing
                  metrics      │          ├─ providers
                               │          ├─ livetv
-                              │          └─ extensions
+                              │          ├─ extensions
+                              │          └─ wasm (plugin host)
                               └──────────────► core ─► api ─► server (bin)
 ```
 
