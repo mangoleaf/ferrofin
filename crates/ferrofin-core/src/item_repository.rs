@@ -944,8 +944,11 @@ impl FerrofinItemRepository {
         filter: &InternalItemsQuery,
         value_type: ItemValueType,
     ) -> Result<Vec<String>, ServiceError> {
+        // One entry per CLEANED value (upstream GetQueryFiltersLegacy groups by
+        // CleanValue and keeps MIN(Value)), so "Sci-Fi"/"Sci-fi" case variants
+        // collapse instead of doubling the filter dialog's list.
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT iv."Value" FROM "ItemValues" AS iv
+            r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv
                JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
                JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId"
                WHERE iv."Type" = "#,
@@ -954,7 +957,7 @@ impl FerrofinItemRepository {
         qb.push(r#" AND bi."Id" <> "#);
         qb.push_bind(PLACEHOLDER_ID);
         append_predicates(&mut qb, filter);
-        qb.push(r#" ORDER BY iv."Value""#);
+        qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
         qb.build_query_scalar()
             .fetch_all(self.db.pool())
             .await

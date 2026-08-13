@@ -2415,15 +2415,9 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     if entity.end_date.is_none() {
         entity.end_date = n.end_date;
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !n.genres.is_empty() {
-        entity.genres = Some(n.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !n.studios.is_empty() {
-        entity.studios = Some(n.studios.join("|"));
-    }
-    if entity.tags.as_deref().unwrap_or_default().is_empty() && !n.tags.is_empty() {
-        entity.tags = Some(n.tags.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &n.genres);
+    merge_multi_value(&mut entity.studios, &n.studios);
+    merge_multi_value(&mut entity.tags, &n.tags);
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -2453,12 +2447,8 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.official_rating.is_none() {
         entity.official_rating.clone_from(&d.official_rating);
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !d.genres.is_empty() {
-        entity.genres = Some(d.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !d.studios.is_empty() {
-        entity.studios = Some(d.studios.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &d.genres);
+    merge_multi_value(&mut entity.studios, &d.studios);
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
@@ -2483,12 +2473,8 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     if entity.official_rating.is_none() {
         entity.official_rating.clone_from(&d.official_rating);
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !d.genres.is_empty() {
-        entity.genres = Some(d.genres.join("|"));
-    }
-    if entity.studios.as_deref().unwrap_or_default().is_empty() && !d.studios.is_empty() {
-        entity.studios = Some(d.studios.join("|"));
-    }
+    merge_multi_value(&mut entity.genres, &d.genres);
+    merge_multi_value(&mut entity.studios, &d.studios);
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
@@ -2606,6 +2592,31 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
         .collect()
 }
 
+/// Unions a provider's multi-value names into a pipe-joined column, preserving
+/// existing order and deduplicating case-insensitively.
+///
+/// Upstream runs the whole provider chain and merges each field's values;
+/// Ferrofin's old fill-if-empty froze coverage at whichever provider answered
+/// first — the reason the genre filter offered fewer genres than Jellyfin and
+/// tags existed only for NFO'd items.
+fn merge_multi_value(existing: &mut Option<String>, incoming: &[String]) {
+    if incoming.is_empty() {
+        return;
+    }
+    let mut values = split_pipe(existing.as_deref());
+    let mut seen: std::collections::HashSet<String> =
+        values.iter().map(|v| v.to_lowercase()).collect();
+    for value in incoming {
+        let value = value.trim();
+        if !value.is_empty() && seen.insert(value.to_lowercase()) {
+            values.push(value.to_owned());
+        }
+    }
+    if !values.is_empty() {
+        *existing = Some(values.join("|"));
+    }
+}
+
 /// Splits a pipe-joined multi-value field (artists/album_artists) into trimmed,
 /// non-empty names.
 fn split_pipe(field: Option<&str>) -> Vec<String> {
@@ -2701,7 +2712,7 @@ fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
 
 /// Collects an item's genres/studios/tags as `(ItemValueType discriminant, value)`
 /// pairs for the `ItemValues` filter tables (Genre = 2, Studios = 3, Tags = 4).
-fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
+pub(crate) fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
     let split = |field: Option<&str>| -> Vec<String> {
         field
             .unwrap_or_default()

@@ -277,7 +277,19 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
-        self.persistence.save_items(items).await
+        self.persistence.save_items(items).await?;
+        // Re-index each item's genre/tag/studio/artist links: the filter
+        // facets and by-name browses read `ItemValues`, not the row columns,
+        // so a metadata edit that only saved the row was invisible to them
+        // until the next full scan.
+        for item in items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            let values = crate::library_scan::item_values_of(item);
+            self.persistence.save_item_values(id, &values).await?;
+        }
+        Ok(())
     }
 
     async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
@@ -839,6 +851,28 @@ mod tests {
             Arc::new(FerrofinItemPersistenceService::new(db.clone())),
             Arc::new(FerrofinPeopleRepository::new(db.clone())),
         )
+    }
+
+    #[tokio::test]
+    async fn update_items_reindexes_the_filter_facets() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x77);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Solaris").await;
+        let mgr = manager(&db);
+
+        // A metadata edit sets genres/tags on the row; the filter facets read
+        // `ItemValues`, so the update must re-index them without a rescan.
+        let mut row = mgr.get_item_by_id(id).await.expect("read").expect("row");
+        row.genres = Some("Sci-Fi".to_owned());
+        row.tags = Some("4K|Christmas".to_owned());
+        mgr.update_items(&[row], None).await.expect("update");
+
+        let facets = mgr
+            .get_query_filters_legacy(&InternalItemsQuery::default())
+            .await
+            .expect("facets");
+        assert_eq!(facets.genres, vec!["Sci-Fi".to_owned()]);
+        assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
     }
 
     #[tokio::test]
