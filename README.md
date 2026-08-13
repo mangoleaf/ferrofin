@@ -137,8 +137,9 @@ needs deep server internals. Details: **[`docs/EXTENSIONS.md`](docs/EXTENSIONS.m
 installed: drop a `.wasm` component into `{data_dir}/plugins/` and restart. **Security is
 the reason for this design.** A WASM plugin runs in a sandbox with *no filesystem access, no
 network access, and no view of server memory* — its entire world is the short, reviewable
-list of capabilities Ferrofin explicitly exports to it, plus enforced memory and CPU-time
-limits. A plugin that misbehaves is interrupted and disabled while the server keeps serving;
+list of capabilities Ferrofin explicitly exports to it (logging, its own settings,
+host-mediated HTTP, read-only library queries, and writing its own media segments), plus
+enforced memory and CPU-time limits. A plugin that misbehaves is interrupted and disabled while the server keeps serving;
 a plugin you install from a stranger's repo *cannot* read your media folders or exfiltrate
 your data, because the sandbox has no way to express those operations. One artifact runs on
 every platform and architecture, and plugins can be written in any language that targets the

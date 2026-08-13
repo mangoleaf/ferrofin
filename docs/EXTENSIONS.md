@@ -93,10 +93,14 @@ interrogated for its identity (`descriptor`), seed config, and task list, and th
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.
 
-**The sandbox is the point.** A WASM plugin gets *no filesystem, no network, no
+**The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
-explicitly exports (in 0.1: `log` and `get-config`), so that one file is the entire
-reviewable attack surface. Each plugin runs on its own runtime thread under an enforced
+explicitly exports, so that one file is the entire reviewable attack surface. Today that
+surface is: `log`, `get-config` (its own config only), `http-fetch` (host-executed HTTP with
+the destination logged and the response capped at the plugin's memory limit), `query-items`
+(a small read-only item projection, max 1000 rows per call), and `write-media-segments`
+(scoped to the plugin's own provider id — it can never touch another provider's or a user's
+segments). Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB — a `memory.grow` ceiling, not a
 reservation). A trap or overrun fails that one call and the instance is rebuilt; three
@@ -123,8 +127,8 @@ media-segment writes, then a metadata-provider export) is tracked in
 
 ## Roadmap
 
-- **WASM capability growth** — E2 (http-fetch, query-items, write-media-segments) and E3
-  (metadata-provider export wired into the provider chain), per the plan above.
+- **WASM capability growth** — E3: a metadata-provider export wired into the provider
+  chain, per the plan above (E2's http-fetch / query-items / write-media-segments shipped).
 - **External integrations over REST** — an event push story (webhooks / WebSocket
   subscriptions) for tools that are already separate systems (Jellyseerr-shaped). Planned
   as Tier 2; not part of the in-process plugin model.
