@@ -106,10 +106,20 @@ ran, and applies results **supplement-only** — a plugin fills fields that are 
 and records its own external ids; it can never overwrite a built-in provider or a user
 edit. Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
-(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB — a `memory.grow` ceiling, not a
-reservation). A trap or overrun fails that one call and the instance is rebuilt; three
-consecutive failures trip a circuit breaker that sidelines the plugin until restart. The
-server never goes down with a plugin.
+(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
+and the instance is rebuilt; three consecutive failures trip a circuit breaker that
+sidelines the plugin until restart. The server never goes down with a plugin.
+
+**What the memory limit means (and costs).** The 128 MiB is a **per-plugin ceiling, not an
+allocation**: it is the point past which a plugin's `memory.grow` is refused (and the size
+past which an `http-fetch` response is rejected). Nothing reserves that memory. Measured
+real usage (printed by the `wasm_hello_guest` test on every CI run): with no plugins
+installed the host costs almost nothing; the **first** loaded plugin pages in wasmtime's
+JIT machinery, ~58 MiB **once per server process**; each **additional** plugin adds only a
+few MiB (the 49 KiB reference plugin measures ~6 MiB as an upper bound). So ten
+well-behaved plugins cost on the order of 120 MiB total — not 10 × 128 MiB. Raise the
+limit only for plugins that legitimately hold large working sets (e.g. interpreter-language
+guests bundling their runtime).
 
 Plugins receive server events (`LibraryChanged`, `PlaybackStart`, task completions, …)
 through the `on-event` export via a bounded per-plugin queue
