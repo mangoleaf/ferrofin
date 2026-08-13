@@ -21,6 +21,14 @@
 pub mod bindings;
 pub mod runtime;
 
+/// The hand-written canonical-ABI component implementing the
+/// `ferrofin:plugin@0.1.0` world, as WAT text — the shared test fixture for
+/// this crate's host tests and the server-level HTTP test (compiled at test
+/// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
+/// API: test support only.
+#[doc(hidden)]
+pub const TEST_FIXTURE_WAT: &str = include_str!("test_fixture.wat");
+
 use std::path::Path;
 use std::sync::Arc;
 

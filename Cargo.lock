@@ -1384,6 +1384,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "wat",
 ]
 
 [[package]]
