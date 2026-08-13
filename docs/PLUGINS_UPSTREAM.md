@@ -59,4 +59,10 @@ Conventions:
   cannot demote 3D/non-file videos (width ordering only). No `IndexNumberEnd`
   column, so that episode-key component is always empty. Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
-  sequentially in Ferrofin.
+  sequentially in Ferrofin. The episode merge key is scoped to the series
+  *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
+  does: a show present in two libraries (hot/cold tiers) has two series rows
+  with one name, and the name-scoped key merged episodes across them —
+  hiding each alternate from its own series' list and skewing season counts.
+  The bulk episode task self-heals links whose key no longer matches their
+  primary's (unlink + regroup within the series).

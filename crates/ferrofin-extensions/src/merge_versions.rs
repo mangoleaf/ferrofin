@@ -20,6 +20,13 @@
 //!   [`MergeVersionsManager`] trait.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
+//! - The episode merge key is scoped to the series *row*
+//!   (`SeriesPresentationUniqueKey`), not the series name: upstream's
+//!   name-scoped key merges episodes across the two series a show gets when it
+//!   exists in two libraries (e.g. hot/cold storage tiers), hiding each
+//!   alternate from its own series' episode list and skewing season counts.
+//!   The bulk episode task also self-heals: links whose key no longer matches
+//!   their primary's are unlinked and regrouped within their own series.
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
@@ -292,6 +299,12 @@ impl MergeVersionsService {
                 include_item_types: vec![kind],
                 is_virtual_item: Some(false),
                 recursive: true,
+                // The general query hides merged alternates (`PrimaryVersionId
+                // IS NULL`); the bulk scans must see them — upstream's query
+                // does — or already-linked versions are invisible to the
+                // existing-primary probe, the movies' any-unmerged filter, and
+                // the episode self-heal pass.
+                include_owned_items: true,
                 ..Default::default()
             })
             .await?;
@@ -514,8 +527,9 @@ impl MergeVersionsManager for MergeVersionsService {
             ));
         }
 
-        // Group by the (case-insensitive) upstream 12.0 merge key.
-        let mut groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+        // The (case-insensitive) merge key per episode — the upstream 12.0 key
+        // scoped to the series row (see `episode_merge_key`).
+        let mut key_of: HashMap<Uuid, String> = HashMap::new();
         for ep in &episodes {
             let Ok(id) = Uuid::parse_str(&ep.id) else {
                 continue;
@@ -526,7 +540,46 @@ impl MergeVersionsManager for MergeVersionsService {
                     .find(|(name, _)| *name == provider)
                     .and_then(|(_, map)| map.get(&id).cloned())
             });
-            groups.entry(key.to_lowercase()).or_default().push(id);
+            key_of.insert(id, key.to_lowercase());
+        }
+
+        // Self-heal before grouping: unlink any alternate whose key no longer
+        // matches its primary's (e.g. groups created by the old name-scoped
+        // key, which merged episodes across the series rows of two libraries).
+        // Without this pass those links never converge — `expand_group`
+        // re-accretes them into every new group, and a fully-linked stale
+        // group has nothing left to merge, so it is never revisited.
+        let mut healed = 0usize;
+        for ep in &episodes {
+            let (Ok(id), Some(pid)) = (
+                Uuid::parse_str(&ep.id),
+                ep.primary_version_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok()),
+            ) else {
+                continue;
+            };
+            if let (Some(key), Some(primary_key)) = (key_of.get(&id), key_of.get(&pid))
+                && key != primary_key
+            {
+                self.persistence.set_primary_version_id(id, None).await?;
+                healed += 1;
+            }
+        }
+        if healed > 0 {
+            tracing::info!(
+                healed,
+                "merge versions: unlinked episode versions whose merge key no longer matches"
+            );
+        }
+
+        let mut groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+        for ep in &episodes {
+            if let Ok(id) = Uuid::parse_str(&ep.id)
+                && let Some(key) = key_of.get(&id)
+            {
+                groups.entry(key.clone()).or_default().push(id);
+            }
         }
         let duplicates: Vec<Vec<Uuid>> = groups.into_values().filter(|ids| ids.len() > 1).collect();
         tracing::info!(
@@ -575,21 +628,35 @@ fn percent(index: usize, total: usize) -> f64 {
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
 /// fields. The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
 fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<String>) -> String {
+    // Every branch is scoped to the series *identity* (presentation key), not
+    // the series name — a deliberate divergence from upstream, which groups by
+    // name. Two libraries holding the same show produce two series rows with
+    // the same name, and a name-scoped key merged episodes across them: the
+    // group's primary can live in only one of the two series, so the other
+    // series showed missing episodes and undercounted seasons, while players
+    // offered every library's copy as a "version". Scoping to the series row
+    // keeps merging within one library's series, where a version list of the
+    // same series' releases is what the user expects.
+    let series = ep
+        .series_presentation_unique_key
+        .as_deref()
+        .or(ep.series_id.as_deref())
+        .or(ep.series_name.as_deref())
+        .unwrap_or_default();
     for provider in ["Tvdb", "Tmdb", "Imdb"] {
         if let Some(value) = provider_id(provider)
             && !value.trim().is_empty()
         {
-            return format!("provider:{provider}:{value}");
+            return format!("{series}|provider:{provider}:{value}");
         }
     }
-    let series = ep.series_name.as_deref().unwrap_or_default();
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
         // No `IndexNumberEnd` column exists in Ferrofin's schema; the trailing
         // component is empty, exactly as the C# renders a null.
-        return format!("number:{series}:{parent}:{index}:");
+        return format!("{series}|number:{parent}:{index}:");
     }
     format!(
-        "title:{series}:{}:{}:{}",
+        "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
         ep.production_year
@@ -954,27 +1021,50 @@ mod tests {
             "Tmdb" => Some("222".to_owned()),
             _ => None,
         });
-        assert_eq!(key, "provider:Tvdb:111");
+        assert_eq!(key, "Show|provider:Tvdb:111");
         let key = episode_merge_key(&ep, |p| (p == "Imdb").then(|| "tt1".to_owned()));
-        assert_eq!(key, "provider:Imdb:tt1");
+        assert_eq!(key, "Show|provider:Imdb:tt1");
         // A blank provider id falls through to the next source.
         let key = episode_merge_key(&ep, |p| match p {
             "Tvdb" => Some("  ".to_owned()),
             "Tmdb" => Some("222".to_owned()),
             _ => None,
         });
-        assert_eq!(key, "provider:Tmdb:222");
+        assert_eq!(key, "Show|provider:Tmdb:222");
     }
 
     #[test]
     fn episode_merge_key_falls_back_to_numbers_then_title() {
         let ep = episode("Show", "Season 1", "Pilot", Some((1, 2)));
-        assert_eq!(episode_merge_key(&ep, |_| None), "number:Show:1:2:");
+        assert_eq!(episode_merge_key(&ep, |_| None), "Show|number:1:2:");
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
-            "title:Show:Season 1:Pilot:2020"
+            "Show|title:Season 1:Pilot:2020"
         );
+    }
+
+    // Same show name + numbers in two different series rows (a show present in
+    // two libraries) must produce different keys — the series identity, not
+    // its name, scopes the group. The series presentation key outranks the
+    // name in every branch, including the provider one.
+    #[test]
+    fn episode_merge_key_scopes_to_the_series_row() {
+        let mut hot = episode("Show", "Season 1", "Pilot", Some((1, 1)));
+        hot.series_presentation_unique_key = Some("hotkey".to_owned());
+        let mut cold = episode("Show", "Season 1", "Pilot", Some((1, 1)));
+        cold.series_presentation_unique_key = Some("coldkey".to_owned());
+        assert_ne!(
+            episode_merge_key(&hot, |_| None),
+            episode_merge_key(&cold, |_| None)
+        );
+        // Even a shared Tvdb episode id must not merge across series rows.
+        let tvdb = |p: &str| (p == "Tvdb").then(|| "999".to_owned());
+        assert_ne!(
+            episode_merge_key(&hot, tvdb),
+            episode_merge_key(&cold, tvdb)
+        );
+        assert_eq!(episode_merge_key(&hot, tvdb), "hotkey|provider:Tvdb:999");
     }
 
     #[test]
@@ -1171,12 +1261,76 @@ mod tests {
 
         svc.merge_episodes(None).await.expect("merge episodes");
 
-        // a+b share `number:show:1:1:` (case-insensitive); `other` differs.
+        // a+b share `show|number:1:1:` (case-insensitive); `other` differs.
         assert!(
             primary_of(&db, &svc, a).await.is_some() != primary_of(&db, &svc, b).await.is_some(),
             "one of a/b is the primary, the other the alternate"
         );
         assert_eq!(primary_of(&db, &svc, other).await, None);
+    }
+
+    /// Sets the series-row identity the scoped merge key reads.
+    async fn set_series_key(db: &Database, id: Uuid, key: &str) {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let mut item = FerrofinItemRepository::new(db.clone(), lookup)
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row");
+        item.series_presentation_unique_key = Some(key.to_owned());
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[item])
+            .await
+            .expect("save series key");
+    }
+
+    // The merge key is scoped to the series ROW: the same show in two
+    // libraries (two series rows, one name) must not merge across them, and
+    // the bulk task must unlink legacy cross-series links (which the old
+    // name-scoped key created) so each library's series regroups internally.
+    #[tokio::test]
+    async fn merge_episodes_scopes_to_series_row_and_heals_cross_series_links() {
+        let db = test_db().await;
+        let (hot1, hot2) = (Uuid::from_u128(0x471), Uuid::from_u128(0x472));
+        let (cold1, cold2) = (Uuid::from_u128(0x473), Uuid::from_u128(0x474));
+        for (id, width) in [(hot1, 1920), (hot2, 640), (cold1, 1920), (cold2, 640)] {
+            seed(&db, id, BaseItemKind::Episode, None, width).await;
+            set_episode_fields(&db, id, "Show", "Season 1", "Pilot", Some((1, 1)), 2020).await;
+        }
+        for id in [hot1, hot2] {
+            set_series_key(&db, id, "aaaahotseries").await;
+        }
+        for id in [cold1, cold2] {
+            set_series_key(&db, id, "bbbbcoldseries").await;
+        }
+        // The legacy name-scoped key merged all four across both series.
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for id in [hot2, cold1, cold2] {
+            persistence
+                .set_primary_version_id(id, Some(hot1))
+                .await
+                .expect("seed stale link");
+        }
+
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.merge_episodes(None).await.expect("merge episodes");
+
+        // Hot series: hot2 stays (or is re-linked) under hot1.
+        assert_eq!(
+            primary_of(&db, &svc, hot2).await,
+            Some(hot1.to_string()),
+            "same-series link survives"
+        );
+        assert_eq!(primary_of(&db, &svc, hot1).await, None);
+        // Cold series: unlinked from hot1 and regrouped among themselves —
+        // the widest (cold1) is primary, cold2 its alternate.
+        assert_eq!(
+            primary_of(&db, &svc, cold2).await,
+            Some(cold1.to_string()),
+            "cold pair regroups within its own series"
+        );
+        assert_eq!(primary_of(&db, &svc, cold1).await, None);
     }
 
     #[tokio::test]
