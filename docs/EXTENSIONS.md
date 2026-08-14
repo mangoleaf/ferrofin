@@ -101,10 +101,12 @@ size is capped while streaming (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`, default 128 M
 checksum must match (the manifest's `sha256` extension field preferred, else the
 Jellyfin-standard MD5 — integrity, not authenticity: HTTPS is the trust root); and the
 artifact must validate as a real `ferrofin:plugin` component whose self-reported id equals
-the catalog guid. **Published versions are immutable**: the sha256 of every installed
-artifact is recorded, and re-installing a known version whose bytes changed is refused —
-a compromised repository must publish a visibly new version to ship different code, and
-can never silently swap the artifact under one the admin already vetted. Install,
+the catalog guid. **Re-installing a version you already vetted is safe**: the sha256 of every
+installed artifact is recorded, and re-installing a known version whose bytes changed is
+refused — a compromised repository cannot silently swap the artifact under a version this
+server already installed. (It can still publish a *new* malicious version; there is no
+code signing, and the repository remains the trust root — install from repositories you
+trust.) Install,
 uninstall, enable/disable, configuration
 writes, and repository changes require an **administrator** (Jellyfin's
 `RequiresElevation`) — a plugin's config JSON is handed to the guest, so a

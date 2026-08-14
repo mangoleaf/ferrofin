@@ -127,7 +127,7 @@ pub fn merge_plugin_registrations(
     registered: &mut Vec<RegisteredPlugin>,
     incoming: Vec<RegisteredPlugin>,
 ) {
-    let taken_ids: std::collections::HashSet<Uuid> =
+    let mut taken_ids: std::collections::HashSet<Uuid> =
         registered.iter().map(|p| p.descriptor.id).collect();
     let mut taken_pages: std::collections::HashMap<String, Uuid> = registered
         .iter()
@@ -139,10 +139,10 @@ pub fn merge_plugin_registrations(
         .collect();
     for mut plugin in incoming {
         let id = plugin.descriptor.id;
-        if taken_ids.contains(&id) {
+        if !taken_ids.insert(id) {
             tracing::warn!(
                 plugin = %id,
-                "wasm plugin id collides with a compiled-in plugin; skipping it"
+                "wasm plugin id collides with an already-registered plugin; skipping it"
             );
             continue;
         }
@@ -551,11 +551,7 @@ impl PluginManager for FerrofinPluginManager {
             .iter()
             .map(|p| {
                 let mut d = p.descriptor.clone();
-                d.enabled = state
-                    .enabled
-                    .get(&d.id.to_string())
-                    .copied()
-                    .unwrap_or(d.enabled);
+                d.enabled = Self::effective_enabled(&state, p);
                 d
             })
             .collect())
@@ -567,11 +563,7 @@ impl PluginManager for FerrofinPluginManager {
         };
         let state = self.state.lock().expect("plugin state lock poisoned");
         let mut d = plugin.descriptor.clone();
-        d.enabled = state
-            .enabled
-            .get(&id.to_string())
-            .copied()
-            .unwrap_or(d.enabled);
+        d.enabled = Self::effective_enabled(&state, plugin);
         Ok(Some(d))
     }
 
@@ -1598,13 +1590,16 @@ mod tests {
             // Claims the previous incoming plugin's page name: later loses.
             RegisteredPlugin::new(descriptor(Uuid::from_u128(3), "Later", true), None)
                 .with_config_page(page("pagesquat-own")),
+            // Reuses an INCOMING plugin's id: the rule holds within the
+            // incoming batch too, not just against the pre-existing registry.
+            RegisteredPlugin::new(descriptor(Uuid::from_u128(2), "IncomingDup", true), None),
         ];
         super::merge_plugin_registrations(&mut registered, incoming);
         let ids: Vec<Uuid> = registered.iter().map(|p| p.descriptor.id).collect();
         assert_eq!(
             ids,
             vec![base_id, Uuid::from_u128(2), Uuid::from_u128(3)],
-            "id squatter skipped, others kept"
+            "both id squatters skipped (vs registry AND within the batch), others kept"
         );
         assert_eq!(
             registered[1].config_pages.len(),
