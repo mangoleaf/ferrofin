@@ -10,6 +10,7 @@
 //! window (`start == 0`) is a single `fpcalc` call, while a credits window
 //! (`start > 0`) is decoded to a temp WAV by ffmpeg first, then fingerprinted.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -27,13 +28,31 @@ pub trait Fingerprinter: Send + Sync {
 pub struct FpcalcFingerprinter {
     fpcalc: String,
     ffmpeg: String,
+    /// Where the credits window's intermediate WAV is written. Defaults to the
+    /// system temp dir; the composition root points it at the extension cache
+    /// so the decode does not depend on the size of a container's `/tmp`
+    /// (a full or read-only `/tmp` made every credits fingerprint fail, and
+    /// with it every "Skip Credits" button).
+    scratch_dir: Option<PathBuf>,
 }
 
 impl FpcalcFingerprinter {
     /// Builds the fingerprinter over the resolved `fpcalc` and `ffmpeg` paths.
     #[must_use]
     pub fn new(fpcalc: String, ffmpeg: String) -> Self {
-        Self { fpcalc, ffmpeg }
+        Self {
+            fpcalc,
+            ffmpeg,
+            scratch_dir: None,
+        }
+    }
+
+    /// Writes the credits window's intermediate WAV under `dir` instead of the
+    /// system temp dir.
+    #[must_use]
+    pub fn with_scratch_dir(mut self, dir: PathBuf) -> Self {
+        self.scratch_dir = Some(dir);
+        self
     }
 }
 
@@ -51,11 +70,17 @@ impl Fingerprinter for FpcalcFingerprinter {
             parse_fpcalc(&out)
         } else {
             // Credits window: decode [start, end] to a temp WAV, then fingerprint.
-            let tmp = tempfile::Builder::new()
-                .prefix("ferrofin-fp-")
-                .suffix(".wav")
-                .tempfile()
-                .map_err(|e| format!("temp wav: {e}"))?;
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("ferrofin-fp-").suffix(".wav");
+            let tmp = match &self.scratch_dir {
+                Some(dir) => {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| format!("scratch dir {}: {e}", dir.display()))?;
+                    builder.tempfile_in(dir)
+                }
+                None => builder.tempfile(),
+            }
+            .map_err(|e| format!("temp wav: {e}"))?;
             let tmp_path = tmp.path().to_string_lossy().into_owned();
             run(
                 &self.ffmpeg,
@@ -69,6 +94,11 @@ impl Fingerprinter for FpcalcFingerprinter {
                     path,
                     "-ac",
                     "1",
+                    // Chromaprint resamples to 11025 Hz mono internally, so
+                    // decoding at that rate loses nothing and cuts the
+                    // intermediate WAV ~4× (a 480 s window: ~42 MB → ~10 MB).
+                    "-ar",
+                    "11025",
                     "-vn",
                     "-sn",
                     "-dn",
@@ -251,11 +281,40 @@ echo "FINGERPRINT=1,2,3""#
         assert_eq!(length(), "300");
 
         // A failing decode fails the fingerprint rather than fingerprinting junk.
-        let fp = FpcalcFingerprinter::new(fpcalc, broken_ffmpeg);
+        let fp = FpcalcFingerprinter::new(fpcalc.clone(), broken_ffmpeg);
         assert!(
             fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
                 .await
                 .is_err()
+        );
+
+        // The credits decode writes its intermediate WAV under the configured
+        // scratch dir (created on demand) instead of the system temp dir — a
+        // container's /tmp is routinely small or read-only, and a failed decode
+        // there costs every "Skip Credits" segment. Nothing is left behind.
+        let scratch = dir.path().join("scratch/nested");
+        let ffmpeg_probe = stub(
+            dir.path(),
+            "ffmpeg-probe",
+            &format!(
+                r#"for a in "$@"; do case "$a" in *.wav) echo "$a" > {root}/wav-path ;; esac; done"#
+            ),
+        );
+        let fp = FpcalcFingerprinter::new(fpcalc, ffmpeg_probe).with_scratch_dir(scratch.clone());
+        fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+            .await
+            .expect("fp");
+        let wav = std::fs::read_to_string(dir.path().join("wav-path")).expect("wav path");
+        assert!(
+            std::path::Path::new(wav.trim()).starts_with(&scratch),
+            "decoded under the scratch dir: {wav}"
+        );
+        assert!(
+            std::fs::read_dir(&scratch)
+                .expect("scratch dir")
+                .next()
+                .is_none(),
+            "the intermediate WAV is cleaned up"
         );
     }
 }

@@ -688,10 +688,17 @@ pub async fn build_app_state(
     // loads but reports unavailable at run time.
     let fingerprinter: Option<Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>> =
         ferrofin_extensions::fingerprint::discover_fpcalc().map(|fpcalc| {
-            Arc::new(ferrofin_extensions::fingerprint::FpcalcFingerprinter::new(
-                fpcalc,
-                ffmpeg.ffmpeg.to_string_lossy().into_owned(),
-            )) as Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>
+            Arc::new(
+                ferrofin_extensions::fingerprint::FpcalcFingerprinter::new(
+                    fpcalc,
+                    ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+                )
+                // Decode the credits window under the server's cache dir, not
+                // the system temp dir: a container's /tmp is routinely small or
+                // read-only, and the failed decode silently cost every
+                // "Skip Credits" segment.
+                .with_scratch_dir(std::path::PathBuf::from(paths.cache_path()).join("extensions")),
+            ) as Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>
         });
     // The Merge Versions extension's bulk merge/split service — shared by its
     // scheduled tasks (via the context below) and the `/MergeVersions/*` routes

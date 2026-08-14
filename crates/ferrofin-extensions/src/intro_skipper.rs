@@ -639,13 +639,13 @@ impl DetectSegmentsTask {
         config: &IntroSkipperConfig,
         fingerprinter: &dyn Fingerprinter,
     ) -> usize {
-        let mut written = 0;
+        let mut intros = 0;
         if config.scan_introduction {
             let mut best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Introduction)
                 .await;
             apply_intro_offsets(&mut best, config);
-            written += self
+            intros = self
                 .write_segments(
                     &best,
                     MediaSegmentType::Intro,
@@ -653,11 +653,12 @@ impl DetectSegmentsTask {
                 )
                 .await;
         }
+        let mut credits = 0;
         if config.scan_credits {
             let best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Credits)
                 .await;
-            written += self
+            credits = self
                 .write_segments(
                     &best,
                     MediaSegmentType::Outro,
@@ -665,7 +666,16 @@ impl DetectSegmentsTask {
                 )
                 .await;
         }
-        written
+        // Per-mode counts, so "intros land but credits never do" is one log
+        // line instead of an investigation (the two windows fingerprint by
+        // different routes — the credits one decodes an intermediate WAV).
+        tracing::info!(
+            episodes = episodes.len(),
+            intros,
+            credits,
+            "intro skipper: season analyzed"
+        );
+        intros + credits
     }
 
     /// Fingerprints each episode's window for `mode`, compares every pair, and
@@ -703,7 +713,16 @@ impl DetectSegmentsTask {
                     start,
                     fp,
                 }),
-                Err(err) => tracing::debug!(%err, path = ep.path, "fingerprint failed"),
+                // Warn, not debug: a window that never fingerprints silently
+                // removes a whole segment type (the credits decode failing on a
+                // full container /tmp looked exactly like "Skip Credits is not
+                // implemented").
+                Err(err) => tracing::warn!(
+                    %err,
+                    path = ep.path,
+                    ?mode,
+                    "intro skipper: fingerprint failed — no segment for this window"
+                ),
             }
         }
 
