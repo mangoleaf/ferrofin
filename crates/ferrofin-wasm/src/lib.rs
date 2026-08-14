@@ -223,61 +223,10 @@ impl WasmPluginHost {
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
     pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let mut config = WasmConfig::new();
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config)
-            .map_err(|e| ServiceError::backend(format!("wasm engine init failed: {e:#}")))?;
-
-        // One ticker advances the epoch for every plugin of this engine.
-        // 1 tick == 1 second == the unit of FERROFIN_WASM_CALL_TIMEOUT_SECS.
-        // The ticker holds only a WEAK engine handle: when the last real
-        // handle drops (host discarded — e.g. repeated loads in tests), the
-        // upgrade fails and the thread exits instead of pinning the engine
-        // and its compiled code forever.
-        {
-            let engine = engine.weak();
-            std::thread::Builder::new()
-                .name("wasm-epoch-ticker".to_owned())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(EPOCH_TICK);
-                        let Some(engine) = engine.upgrade() else {
-                            break;
-                        };
-                        engine.increment_epoch();
-                    }
-                })
-                .expect("spawning the wasm epoch ticker cannot fail");
-        }
-
-        let mut linker: Linker<HostState> = Linker::new(&engine);
-        bindings::Plugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-            &mut linker,
-            |state| state,
-        )
-        .map_err(|e| ServiceError::backend(format!("wasm linker setup failed: {e:#}")))?;
-        // Locked-down WASI so std guests link (the ctx grants nothing — see
-        // HostState). Failure here is the same misconfiguration class as the
-        // world linker above.
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
-        let linker = Arc::new(linker);
-
-        // One HTTP client per host: the guest-call deadline doubles as the
-        // request timeout, so a hung remote can't outlive the call budget.
-        let http = Arc::new(
-            reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(u64::from(
-                    settings.call_timeout_secs,
-                )))
-                // No transparent redirects: any future destination policy
-                // would be bypassed by a 302, and a guest that wants to
-                // follow one can read the Location header and re-fetch.
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
-        );
+        let (engine, linker) = build_runtime_parts(settings)?;
+        // load() runs on a blocking thread (spawn_blocking at the composition
+        // root), so eager client construction is safe here.
+        let http = build_guest_http_client(settings)?;
         let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
             Arc::new(std::sync::OnceLock::new());
 
@@ -559,6 +508,179 @@ fn load_one(
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
+}
+
+/// Builds the shared wasm runtime pieces: an epoch-ticked engine (weak-held
+/// by its ticker thread) and the world+WASI linker. Shared by
+/// [`WasmPluginHost::load`] and [`WasmArtifactValidator`] so they can never
+/// drift. The guest HTTP client is built separately
+/// ([`build_guest_http_client`]) because `reqwest::blocking::Client`
+/// construction panics inside an async runtime context — callers must build
+/// it on a blocking thread.
+fn build_runtime_parts(
+    settings: &WasmSettings,
+) -> Result<(Engine, Arc<Linker<HostState>>), ServiceError> {
+    let _ = settings; // engine construction has no tunables today
+    let mut config = WasmConfig::new();
+    config.epoch_interruption(true);
+    let engine = Engine::new(&config)
+        .map_err(|e| ServiceError::backend(format!("wasm engine init failed: {e:#}")))?;
+
+    // One ticker advances the epoch for every plugin of this engine.
+    // 1 tick == 1 second == the unit of FERROFIN_WASM_CALL_TIMEOUT_SECS.
+    // The ticker holds only a WEAK engine handle: when the last real handle
+    // drops, the upgrade fails and the thread exits instead of pinning the
+    // engine and its compiled code forever.
+    {
+        let engine = engine.weak();
+        std::thread::Builder::new()
+            .name("wasm-epoch-ticker".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
+                    engine.increment_epoch();
+                }
+            })
+            .expect("spawning the wasm epoch ticker cannot fail");
+    }
+
+    let mut linker: Linker<HostState> = Linker::new(&engine);
+    bindings::Plugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state| state,
+    )
+    .map_err(|e| ServiceError::backend(format!("wasm linker setup failed: {e:#}")))?;
+    // Locked-down WASI so std guests link (the ctx grants nothing — see
+    // HostState).
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
+    let linker = Arc::new(linker);
+
+    Ok((engine, linker))
+}
+
+/// The guest HTTP client: call-timeout bound, redirects off. MUST be built
+/// on a blocking thread — `reqwest::blocking::Client` construction (and
+/// drop) panics inside an async runtime context.
+fn build_guest_http_client(
+    settings: &WasmSettings,
+) -> Result<Arc<reqwest::blocking::Client>, ServiceError> {
+    Ok(Arc::new(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(u64::from(
+                settings.call_timeout_secs,
+            )))
+            // No transparent redirects: any destination policy would be
+            // bypassed by a 302 — a guest can follow Location itself.
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
+    ))
+}
+
+/// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
+/// world version from `wit/ferrofin-plugin.wit` (a test guards against
+/// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.1.0";
+
+/// The install-time artifact validator: proves a downloaded `.wasm` is a
+/// loadable `ferrofin:plugin` component and reports its self-declared id,
+/// in a throwaway store with the standard limits. The store's capability
+/// cell is never armed and `http-fetch` is denied during load, so the
+/// artifact is **network-mute** while being validated — a malicious
+/// component cannot phone home from its `descriptor` export.
+pub struct WasmArtifactValidator {
+    engine: Engine,
+    linker: Arc<Linker<HostState>>,
+    /// Built lazily on the first validation's blocking thread —
+    /// `reqwest::blocking::Client` construction panics in async contexts,
+    /// and `new()` is called from the (async) composition root.
+    http: Arc<std::sync::OnceLock<Arc<reqwest::blocking::Client>>>,
+    settings: WasmSettings,
+}
+
+impl WasmArtifactValidator {
+    /// Builds a validator with its own engine (same construction as the
+    /// plugin host, via the shared builder). Safe to call from async
+    /// contexts — the blocking HTTP client is deferred to first use.
+    ///
+    /// # Errors
+    /// Engine/linker construction failure (a wasmtime misconfiguration).
+    pub fn new(settings: &WasmSettings) -> Result<Self, ServiceError> {
+        let (engine, linker) = build_runtime_parts(settings)?;
+        Ok(Self {
+            engine,
+            linker,
+            http: Arc::new(std::sync::OnceLock::new()),
+            settings: settings.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator {
+    fn supported_abi(&self) -> &str {
+        PLUGIN_ABI
+    }
+
+    async fn validate(&self, bytes: &[u8]) -> Result<Uuid, ServiceError> {
+        let engine = self.engine.clone();
+        let linker = Arc::clone(&self.linker);
+        let http_cell = Arc::clone(&self.http);
+        let settings = self.settings.clone();
+        let bytes = bytes.to_vec();
+        // Compilation + the descriptor call are CPU-bound guest work — off
+        // the async workers, exactly like the plugin runtime threads.
+        tokio::task::spawn_blocking(move || {
+            // Blocking thread: safe place to build the blocking client.
+            let http = if let Some(client) = http_cell.get() {
+                Arc::clone(client)
+            } else {
+                let client = build_guest_http_client(&settings)?;
+                let _ = http_cell.set(Arc::clone(&client));
+                client
+            };
+            let component = Component::new(&engine, &bytes).map_err(|e| {
+                ServiceError::invalid_input(format!(
+                    "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
+                ))
+            })?;
+            let spec = InstanceSpec {
+                engine,
+                component,
+                linker,
+                plugin_name: "install-validation".to_owned(),
+                plugin_id: String::new(),
+                memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
+                timeout_ticks: u64::from(settings.call_timeout_secs),
+                http,
+                private_http_allowed: false,
+                // Never armed: query-items/write-media-segments/http-fetch
+                // all refuse during validation.
+                collaborators: Arc::new(std::sync::OnceLock::new()),
+            };
+            let (mut store, instance) = spec.instantiate(String::from("{}")).map_err(|e| {
+                ServiceError::invalid_input(format!(
+                    "artifact does not instantiate as a {PLUGIN_ABI} plugin: {e:#}"
+                ))
+            })?;
+            let wire = instance.call_descriptor(&mut store).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact descriptor call failed: {e:#}"))
+            })?;
+            wire.id.parse::<Uuid>().map_err(|_| {
+                ServiceError::invalid_input(format!(
+                    "artifact descriptor id `{}` is not a valid UUID",
+                    wire.id
+                ))
+            })
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("validation task failed: {e}")))?
+    }
 }
 
 /// The [`DynamicMetadataProvider`] adapter for one loaded plugin: converts

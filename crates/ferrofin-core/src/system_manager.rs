@@ -77,6 +77,11 @@ pub trait LifecycleController: Send + Sync {
     /// Whether a restart is currently pending (`HasPendingRestart`).
     fn has_pending_restart(&self) -> bool;
 
+    /// Flags that a restart is required WITHOUT stopping (e.g. a plugin was
+    /// installed/uninstalled and activates on the next restart). Surfaces as
+    /// `SystemInfo.HasPendingRestart` until the restart happens.
+    fn mark_restart_required(&self);
+
     /// Whether the application is currently shutting down.
     fn is_shutting_down(&self) -> bool;
 }
@@ -376,6 +381,9 @@ mod tests {
         }
         fn has_pending_restart(&self) -> bool {
             self.pending.load(Ordering::SeqCst)
+        }
+        fn mark_restart_required(&self) {
+            self.pending.store(true, Ordering::SeqCst);
         }
         fn is_shutting_down(&self) -> bool {
             false

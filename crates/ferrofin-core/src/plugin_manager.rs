@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
+use ferrofin_traits::plugins::{
+    PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager,
+};
+
+use crate::system_manager::LifecycleController;
 
 /// A compiled-in plugin registered with the manager at the composition root.
 ///
@@ -104,6 +108,122 @@ impl RegisteredPlugin {
     }
 }
 
+/// The most bytes a plugin download may be. A `.wasm` component is tens of
+/// MB at worst (interpreter-language guests bundling their runtime); this is
+/// a runaway/abuse guard, not a tuning knob.
+const MAX_PLUGIN_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Requires an `https://` URL, exempting loopback hosts (dev/test servers).
+/// The manifest checksum proves integrity, not authenticity — transport
+/// security is the trust root for plugin downloads.
+fn require_https(url: &str) -> Result<(), ServiceError> {
+    let parsed: reqwest::Url = url
+        .parse()
+        .map_err(|e| ServiceError::invalid_input(format!("invalid sourceUrl `{url}`: {e}")))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    // reqwest re-exports Url but not url::Host; host_str + IpAddr parse
+    // covers `localhost`, `127.x`, and bracketed `[::1]` alike.
+    let loopback = parsed.host_str().is_some_and(|h| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if parsed.scheme() == "http" && loopback {
+        return Ok(());
+    }
+    Err(ServiceError::invalid_input(format!(
+        "plugin downloads require https (got `{url}`); http is allowed for loopback only"
+    )))
+}
+
+/// Lowercase-hex SHA-256 of `bytes` (the manifest `sha256` extension field).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Downloads a plugin artifact (HTTPS required — loopback exempt for dev;
+/// the checksum is integrity-only, so the transport is the trust root),
+/// enforces the size cap, and verifies the checksum: the `sha256` extension
+/// wins when the manifest provides it, else the Jellyfin-standard MD5.
+async fn download_and_verify(
+    source_url: &str,
+    name: &str,
+    chosen: &ferrofin_model::updates::VersionInfo,
+) -> Result<Vec<u8>, ServiceError> {
+    require_https(source_url)?;
+    let response = reqwest::get(source_url)
+        .await
+        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
+    if !response.status().is_success() {
+        return Err(ServiceError::backend(format!(
+            "downloading {source_url}: HTTP {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_PLUGIN_DOWNLOAD_BYTES)
+    {
+        return Err(ServiceError::invalid_input(format!(
+            "plugin artifact exceeds the {MAX_PLUGIN_DOWNLOAD_BYTES}-byte limit"
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
+    if bytes.len() as u64 > MAX_PLUGIN_DOWNLOAD_BYTES {
+        return Err(ServiceError::invalid_input(format!(
+            "plugin artifact exceeds the {MAX_PLUGIN_DOWNLOAD_BYTES}-byte limit"
+        )));
+    }
+
+    if let Some(expected) = chosen.sha256.as_deref().filter(|c| !c.is_empty()) {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ServiceError::invalid_input(format!(
+                "sha256 mismatch for {name} v{}: manifest {expected}, artifact {actual}",
+                chosen.version
+            )));
+        }
+    } else if let Some(expected) = chosen.checksum.as_deref().filter(|c| !c.is_empty()) {
+        let actual = ferrofin_common::extensions::md5_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ServiceError::invalid_input(format!(
+                "checksum mismatch for {name} v{}: manifest {expected}, artifact {actual}",
+                chosen.version
+            )));
+        }
+    } else {
+        return Err(ServiceError::invalid_input(format!(
+            "package {name} v{} declares no checksum",
+            chosen.version
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// Sort key for version strings: numeric segments compared numerically
+/// (`10.2.0` > `9.9.9`), with non-numeric tails breaking ties textually.
+fn version_sort_key(version: &str) -> (Vec<u64>, String) {
+    let nums = version
+        .split(['.', '-', '+'])
+        .map_while(|seg| seg.parse::<u64>().ok())
+        .collect();
+    (nums, version.to_owned())
+}
+
 /// The on-disk mutable plugin state (persisted to `{plugins_dir}/state.json`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct PersistedState {
@@ -117,7 +237,6 @@ struct PersistedState {
 }
 
 /// The registry-backed plugin manager.
-#[derive(Debug)]
 pub struct FerrofinPluginManager {
     /// The compiled-in plugins (immutable after construction).
     plugins: Vec<RegisteredPlugin>,
@@ -125,6 +244,24 @@ pub struct FerrofinPluginManager {
     plugins_dir: PathBuf,
     /// The mutable enabled/repository state, mirrored to `state.json`.
     state: Mutex<PersistedState>,
+    /// Where installed WASM plugins are staged (`{data_dir}/plugins`) — the
+    /// directory the WASM host loads from at boot. `None` = installs rejected.
+    wasm_plugins_dir: Option<PathBuf>,
+    /// Validates downloaded artifacts before commit (implemented by the WASM
+    /// host crate; see the trait docs for why it is a seam).
+    validator: Option<Arc<dyn PluginArtifactValidator>>,
+    /// Flags restart-required after an install/uninstall.
+    lifecycle: Option<Arc<dyn LifecycleController>>,
+}
+
+impl std::fmt::Debug for FerrofinPluginManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FerrofinPluginManager")
+            .field("plugins", &self.plugins.len())
+            .field("plugins_dir", &self.plugins_dir)
+            .field("installer_armed", &self.validator.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FerrofinPluginManager {
@@ -142,7 +279,26 @@ impl FerrofinPluginManager {
             plugins,
             plugins_dir,
             state: Mutex::new(state),
+            wasm_plugins_dir: None,
+            validator: None,
+            lifecycle: None,
         }
+    }
+
+    /// Arms runtime installation: the staging directory the WASM host loads
+    /// from, the artifact validator, and the lifecycle handle used to flag
+    /// restart-required. Without this, `install_package` rejects.
+    #[must_use]
+    pub fn with_installer(
+        mut self,
+        wasm_plugins_dir: PathBuf,
+        validator: Arc<dyn PluginArtifactValidator>,
+        lifecycle: Arc<dyn LifecycleController>,
+    ) -> Self {
+        self.wasm_plugins_dir = Some(wasm_plugins_dir);
+        self.validator = Some(validator);
+        self.lifecycle = Some(lifecycle);
+        self
     }
 
     /// A manager with no plugins — the null shape used before any plugin is wired.
@@ -235,14 +391,135 @@ impl PluginManager for FerrofinPluginManager {
     }
 
     async fn remove_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
+        // A runtime-installed WASM plugin is a file we staged — deletable.
+        // (Look for the file FIRST: a freshly-installed plugin is not in the
+        // in-memory registry until the restart that loads it.)
+        if let Some(wasm_dir) = &self.wasm_plugins_dir {
+            let artifact = wasm_dir.join(format!("{id}.wasm"));
+            if artifact.exists() {
+                std::fs::remove_file(&artifact).map_err(|e| {
+                    ServiceError::backend(format!("removing {}: {e}", artifact.display()))
+                })?;
+                // Best-effort cleanup of the plugin's config dir + enabled
+                // override; the file removal above is the load-bearing part.
+                let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
+                {
+                    let mut state = self.state.lock().expect("plugin state lock poisoned");
+                    state.enabled.remove(&id.to_string());
+                    let snapshot = state.clone();
+                    drop(state);
+                    let _ = self.persist(&snapshot);
+                }
+                if let Some(lifecycle) = &self.lifecycle {
+                    lifecycle.mark_restart_required();
+                }
+                tracing::info!(plugin = %id, "wasm plugin uninstalled; restart required");
+                return Ok(());
+            }
+        }
         if self.find(id).is_none() {
             return Err(ServiceError::not_found(format!("plugin {id}")));
         }
-        // Tier-1 plugins are compiled into the binary; there is nothing to remove
-        // at runtime (that needs the Tier-2 dynamic host).
+        // Compiled-in plugins have nothing to remove at runtime.
         Err(ServiceError::invalid_input(
             "compiled-in plugins cannot be uninstalled at runtime",
         ))
+    }
+
+    async fn install_package(
+        &self,
+        name: &str,
+        assembly_guid: Option<Uuid>,
+        version: Option<&str>,
+        repository_url: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let (Some(wasm_dir), Some(validator)) = (&self.wasm_plugins_dir, &self.validator) else {
+            return Err(ServiceError::invalid_input(
+                "runtime plugin installation is not available on this server",
+            ));
+        };
+
+        // 1. Resolve the package (guid beats name — names collide across
+        //    repositories) and the version (pinned, else newest).
+        let catalog = self.list_packages().await?;
+        let package = catalog
+            .iter()
+            .find(|p| match assembly_guid {
+                Some(guid) => p.id == guid,
+                None => p.name.eq_ignore_ascii_case(name),
+            })
+            .ok_or_else(|| ServiceError::not_found(format!("package {name}")))?;
+        let mut candidates: Vec<&ferrofin_model::updates::VersionInfo> = package
+            .versions
+            .iter()
+            .filter(|v| repository_url.is_none_or(|r| v.repository_url == r))
+            .filter(|v| version.is_none_or(|want| v.version == want))
+            .collect();
+        candidates.sort_by_cached_key(|v| version_sort_key(&v.version));
+        let chosen = candidates
+            .last()
+            .ok_or_else(|| {
+                ServiceError::not_found(format!(
+                    "package {name} has no matching version (version={version:?},                      repository={repository_url:?})"
+                ))
+            })?;
+        let source_url = chosen
+            .source_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_input(format!(
+                    "package {name} v{} declares no sourceUrl",
+                    chosen.version
+                ))
+            })?;
+
+        // 2. ABI gate: the manifest must target this server's plugin ABI.
+        let abi = validator.supported_abi();
+        match chosen.target_abi.as_deref() {
+            Some(target) if target == abi => {}
+            other => {
+                return Err(ServiceError::invalid_input(format!(
+                    "package {name} v{} targets ABI {:?}, this server supports {abi}",
+                    chosen.version, other
+                )));
+            }
+        }
+
+        // 3–4. Download (HTTPS required, size-capped) and verify integrity.
+        let bytes = download_and_verify(source_url, name, chosen).await?;
+
+        // 5. Validate the artifact is a real plugin component and that its
+        //    self-reported id matches the catalog guid (otherwise enable/
+        //    disable/uninstall would target a different identity than the
+        //    loader registers on boot).
+        let reported = validator.validate(&bytes).await?;
+        if reported != package.id {
+            return Err(ServiceError::invalid_input(format!(
+                "artifact reports plugin id {reported}, catalog says {} — refusing",
+                package.id
+            )));
+        }
+
+        // 6. Commit: atomic write into the WASM host's load directory.
+        //    Upgrades are the same filename → overwrite. Known v1 edge: a
+        //    manually-copied duplicate under another filename would win or
+        //    lose the boot-time duplicate-id skip alphabetically.
+        std::fs::create_dir_all(wasm_dir)
+            .map_err(|e| ServiceError::backend(format!("create {}: {e}", wasm_dir.display())))?;
+        Self::atomic_write(&wasm_dir.join(format!("{}.wasm", package.id)), &bytes)?;
+
+        // 7. Activate on next restart (Jellyfin's model).
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.mark_restart_required();
+        }
+        tracing::info!(
+            package = name,
+            version = chosen.version,
+            plugin = %package.id,
+            "wasm plugin installed; restart required to activate"
+        );
+        Ok(())
     }
 
     async fn get_plugin_configuration(&self, id: Uuid) -> Result<Vec<u8>, ServiceError> {
@@ -348,6 +625,7 @@ impl PluginManager for FerrofinPluginManager {
                     target_abi: None,
                     source_url: None,
                     checksum: None,
+                    sha256: None,
                     timestamp: None,
                     repository_name: "Ferrofin built-in".to_owned(),
                     repository_url: String::new(),
@@ -583,5 +861,306 @@ mod tests {
                 .expect("some")
                 .has_image
         );
+    }
+    // ── repository install/uninstall ────────────────────────────────────
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::system_manager::LifecycleController as _;
+
+    /// A tiny multi-request loopback HTTP server: binds first (so the base
+    /// URL can be embedded in the manifest), then serves `manifest` at
+    /// `/manifest.json` and `artifact` at `/plugin.wasm` until dropped.
+    fn repo_server(
+        manifest_for: impl FnOnce(&str) -> String,
+        artifact: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manifest = manifest_for(&format!("http://{addr}"));
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let (body, kind): (&[u8], &str) = if request.contains("/plugin.wasm") {
+                            (&artifact, "application/wasm")
+                        } else {
+                            (manifest.as_bytes(), "application/json")
+                        };
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = stream.write_all(body);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{addr}"), stop_tx)
+    }
+
+    /// Validator stub: reports a fixed id (or an error).
+    struct StubValidator {
+        id: Result<Uuid, String>,
+        abi: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl ferrofin_traits::plugins::PluginArtifactValidator for StubValidator {
+        fn supported_abi(&self) -> &str {
+            self.abi
+        }
+        async fn validate(&self, _bytes: &[u8]) -> Result<Uuid, ServiceError> {
+            self.id.clone().map_err(ServiceError::invalid_input)
+        }
+    }
+
+    struct FlagLifecycle(AtomicBool);
+    #[async_trait::async_trait]
+    impl crate::system_manager::LifecycleController for FlagLifecycle {
+        async fn stop(&self, _restart: bool) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        fn has_pending_restart(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn mark_restart_required(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn is_shutting_down(&self) -> bool {
+            false
+        }
+    }
+
+    const PKG_ID: Uuid = Uuid::from_u128(0xABCD_EF01);
+
+    fn manifest_json(base: &str, checksum: &str, sha256: Option<&str>, abi: &str) -> String {
+        let sha = sha256.map_or(String::new(), |s| format!(r#""sha256":"{s}","#));
+        format!(
+            r#"[{{"name":"HelloPkg","description":"d","overview":"o","owner":"me","category":"General",
+                "guid":"{PKG_ID}",
+                "versions":[
+                  {{"version":"0.9.0","targetAbi":"{abi}","sourceUrl":"{base}/plugin.wasm","checksum":"{checksum}",{sha}"repositoryName":"test","repositoryUrl":"{base}/manifest.json"}},
+                  {{"version":"0.10.0","targetAbi":"{abi}","sourceUrl":"{base}/plugin.wasm","checksum":"{checksum}",{sha}"repositoryName":"test","repositoryUrl":"{base}/manifest.json"}}
+                ]}}]"#
+        )
+    }
+
+    struct InstallRig {
+        mgr: FerrofinPluginManager,
+        lifecycle: Arc<FlagLifecycle>,
+        wasm_dir: std::path::PathBuf,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        _stop: std::sync::mpsc::Sender<()>,
+        base: String,
+    }
+
+    async fn install_rig(
+        artifact: &[u8],
+        sha256: Option<&str>,
+        checksum: &str,
+        abi: &str,
+        validator_id: Result<Uuid, String>,
+    ) -> InstallRig {
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let wasm_dir = wasm_root.path().join("plugins");
+        let (base, stop2) = repo_server(
+            |base| manifest_json(base, checksum, sha256, abi),
+            artifact.to_vec(),
+        );
+        let lifecycle = Arc::new(FlagLifecycle(AtomicBool::new(false)));
+        let mgr = FerrofinPluginManager::new(Vec::new(), state_dir.path().to_path_buf())
+            .with_installer(
+                wasm_dir.clone(),
+                Arc::new(StubValidator {
+                    id: validator_id,
+                    abi: "ferrofin:plugin@0.1.0",
+                }),
+                lifecycle.clone(),
+            );
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        InstallRig {
+            mgr,
+            lifecycle,
+            wasm_dir,
+            _dirs: (state_dir, wasm_root),
+            _stop: stop2,
+            base,
+        }
+    }
+
+    #[tokio::test]
+    async fn install_downloads_verifies_stages_and_flags_restart() {
+        let artifact = b"pretend-wasm-bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+
+        rig.mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .expect("install succeeds");
+
+        let staged = rig.wasm_dir.join(format!("{PKG_ID}.wasm"));
+        assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
+        assert!(rig.lifecycle.has_pending_restart(), "restart flagged");
+
+        // Uninstall removes the staged file and re-flags restart.
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        assert!(!staged.exists(), "artifact removed");
+        // Unknown id after removal → NotFound (not in registry either).
+        assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
+        let _ = &rig.base;
+    }
+
+    #[tokio::test]
+    async fn install_resolves_by_guid_and_prefers_numerically_newest() {
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+        // Wrong name + right guid still resolves (guid wins).
+        rig.mgr
+            .install_package("totally-wrong-name", Some(PKG_ID), None, None)
+            .await
+            .expect("guid resolution");
+        // 0.10.0 beats 0.9.0 numerically (would lose lexicographically).
+        assert_eq!(
+            super::version_sort_key("0.10.0").0,
+            vec![0, 10, 0],
+            "numeric key"
+        );
+        assert!(super::version_sort_key("0.10.0") > super::version_sort_key("0.9.0"));
+    }
+
+    #[tokio::test]
+    async fn install_rejections_cover_every_gate() {
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+
+        // Checksum mismatch.
+        let rig = install_rig(
+            &artifact,
+            None,
+            "00000000",
+            "ferrofin:plugin@0.1.0",
+            Ok(PKG_ID),
+        )
+        .await;
+        let err = rig
+            .mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        assert!(!rig.lifecycle.has_pending_restart());
+
+        // sha256 preferred over (correct) md5 — and mismatching.
+        let rig = install_rig(
+            &artifact,
+            Some("deadbeef"),
+            &md5,
+            "ferrofin:plugin@0.1.0",
+            Ok(PKG_ID),
+        )
+        .await;
+        let err = rig
+            .mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sha256 mismatch"), "{err}");
+
+        // ABI mismatch.
+        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@9.9.9", Ok(PKG_ID)).await;
+        let err = rig
+            .mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("targets ABI"), "{err}");
+
+        // Validator says the artifact is bogus.
+        let rig = install_rig(
+            &artifact,
+            None,
+            &md5,
+            "ferrofin:plugin@0.1.0",
+            Err("not a component".to_owned()),
+        )
+        .await;
+        let err = rig
+            .mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a component"), "{err}");
+
+        // Identity mismatch: artifact reports a different id than the catalog.
+        let rig = install_rig(
+            &artifact,
+            None,
+            &md5,
+            "ferrofin:plugin@0.1.0",
+            Ok(Uuid::from_u128(7)),
+        )
+        .await;
+        let err = rig
+            .mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{err}");
+
+        // Unknown package.
+        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+        let err = rig
+            .mgr
+            .install_package("NoSuchPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("package"), "{err}");
+
+        // Installer not armed at all.
+        let dir = tempfile::tempdir().unwrap();
+        let bare = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        let err = bare
+            .install_package("x", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
+    }
+
+    #[test]
+    fn https_is_required_except_loopback() {
+        assert!(super::require_https("https://example.com/p.wasm").is_ok());
+        assert!(super::require_https("http://127.0.0.1:9/p.wasm").is_ok());
+        assert!(super::require_https("http://localhost:9/p.wasm").is_ok());
+        assert!(super::require_https("http://[::1]:9/p.wasm").is_ok());
+        assert!(super::require_https("http://example.com/p.wasm").is_err());
+        assert!(super::require_https("http://192.168.1.10/p.wasm").is_err());
+        assert!(super::require_https("ftp://example.com/p.wasm").is_err());
     }
 }

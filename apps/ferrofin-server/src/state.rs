@@ -127,6 +127,11 @@ impl LifecycleController for FerrofinLifecycleController {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn mark_restart_required(&self) {
+        self.restart_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -658,11 +663,33 @@ pub async fn build_app_state(
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
     // Loaded WASM plugins surface on `/Plugins` exactly like compiled-in ones.
     registered_plugins.extend(wasm_host.registered_plugins());
-    let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> =
-        Arc::new(ferrofin_core::FerrofinPluginManager::new(
+    // The lifecycle controller is built early so the plugin manager can flag
+    // restart-required after a repository install/uninstall; the system
+    // manager receives the same handle further down.
+    let lifecycle: Arc<dyn ferrofin_core::system_manager::LifecycleController> =
+        Arc::new(FerrofinLifecycleController::new(shutdown));
+    // The install-time artifact validator (component + descriptor checks) —
+    // built from the same settings as the host so limits match.
+    let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
+        ferrofin_wasm::WasmArtifactValidator::new(&ferrofin_wasm::WasmSettings::resolve(
+            config.wasm_call_timeout_secs,
+            config.wasm_memory_limit_mb,
+            config.wasm_event_queue_capacity,
+            config.wasm_private_http_allow.as_deref(),
+        ))
+        .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
+    );
+    let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
+        ferrofin_core::FerrofinPluginManager::new(
             registered_plugins,
             config.config_dir.join("plugins"),
-        ));
+        )
+        .with_installer(
+            config.data_dir.join("plugins"),
+            Arc::clone(&wasm_validator),
+            Arc::clone(&lifecycle),
+        ),
+    );
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
             Arc::clone(&plugins),
@@ -1017,8 +1044,6 @@ pub async fn build_app_state(
     let app_host_trait: Arc<dyn ferrofin_traits::system::ServerApplicationHost> =
         Arc::clone(&app_host) as Arc<_>;
 
-    let lifecycle: Arc<dyn LifecycleController> =
-        Arc::new(FerrofinLifecycleController::new(shutdown));
     let system: Arc<dyn ferrofin_traits::system::SystemManager> = Arc::new(
         FerrofinSystemManager::new(
             Arc::clone(&app_host_trait),

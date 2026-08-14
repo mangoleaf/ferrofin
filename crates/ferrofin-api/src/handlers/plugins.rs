@@ -367,26 +367,65 @@ struct PackageInfoQuery {
     assembly_guid: Option<String>,
 }
 
-/// `POST /Packages/Installed/{name}` — install a package.
+/// Query parameters for `POST /Packages/Installed/{name}` — what jellyfin-web
+/// sends alongside the path name (all optional per the contract).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallPackageQuery {
+    /// The package guid; wins over the name when present.
+    #[serde(default)]
+    assembly_guid: Option<String>,
+    /// A specific version to install; newest when absent.
+    #[serde(default)]
+    version: Option<String>,
+    /// Restrict resolution to one repository's versions.
+    #[serde(default)]
+    repository_url: Option<String>,
+}
+
+/// `POST /Packages/Installed/{name}` — install a package from the configured
+/// repositories.
 ///
-/// Runtime installation needs a dynamic plugin host (Tier 2); compiled-in plugins
-/// cannot be installed at runtime, so this is an honest `400` rather than a faked
-/// success.
+/// The manager downloads, verifies (checksum + component validation), and
+/// stages the WASM plugin; it activates on the next restart
+/// (`SystemInfo.HasPendingRestart` flips true, matching Jellyfin's flow).
 #[utoipa::path(
     post,
     path = "/Packages/Installed/{name}",
-    params(("name" = String, Path, description = "Package name")),
-    responses((status = 400, description = "Runtime installation is not supported")),
+    params(
+        ("name" = String, Path, description = "Package name"),
+        ("assemblyGuid" = Option<String>, Query, description = "Package guid (wins over name)"),
+        ("version" = Option<String>, Query, description = "Version to install (newest when absent)"),
+        ("repositoryUrl" = Option<String>, Query, description = "Restrict to one repository"),
+    ),
+    responses(
+        (status = 204, description = "Package installed; restart required to activate"),
+        (status = 404, description = "No such package or version"),
+    ),
     tag = "ferrofin"
 )]
 async fn install_package(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
+    Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
-    Err(ApiError::BadRequest(
-        "runtime plugin installation is not supported; plugins are compiled in".to_owned(),
-    ))
+    let assembly_guid = match query.assembly_guid.as_deref().filter(|g| !g.is_empty()) {
+        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
+            ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
+        })?),
+        None => None,
+    };
+    state
+        .plugins
+        .install_package(
+            &name,
+            assembly_guid,
+            query.version.as_deref().filter(|v| !v.is_empty()),
+            query.repository_url.as_deref().filter(|r| !r.is_empty()),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /Packages/Installing/{packageId}` — cancel a running install.

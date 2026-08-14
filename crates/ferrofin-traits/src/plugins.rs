@@ -5,7 +5,10 @@
 //! to Ferrofin's Tier-1 model: plugins are Rust crates compiled into the server and
 //! registered at the composition root. There is no runtime assembly loading
 //! (that is Tier 2 — a WASM/`libloading` boundary, see `PLAN_FERROFIN_PLUGINS.md`),
-//! so `remove_plugin` and package *installation* are not supported here.
+//! `remove_plugin` and package installation ARE supported for runtime-installed
+//! WASM (Tier-1b) plugins: `install_package` downloads a repository package,
+//! verifies + validates it, and stages it for the next restart; compiled-in
+//! plugins still reject both.
 //!
 //! The trait traffics only in plain data ([`PluginDescriptor`], [`PluginImage`],
 //! and the `ferrofin-model` `RepositoryInfo`/`PackageInfo` wire DTOs) so it stays
@@ -99,12 +102,35 @@ pub trait PluginManager: Send + Sync {
     async fn set_repositories(&self, repositories: Vec<RepositoryInfo>)
     -> Result<(), ServiceError>;
 
-    /// Lists the packages available from the enabled repositories.
-    ///
-    /// Tier-1 does not fetch remote repository manifests, so this returns `[]`
-    /// until repository browsing lands (faithful — an empty catalog, never a
-    /// faked package).
+    /// Lists the packages available from the enabled repositories, merged
+    /// with catalog entries for the compiled-in plugins.
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError>;
+
+    /// Installs a package from the configured repositories: resolve →
+    /// download → verify checksum → validate the artifact → stage into the
+    /// WASM plugins directory. The plugin activates on the next restart
+    /// (the implementation marks restart-required).
+    ///
+    /// `assembly_guid` wins over `name` when present (names collide across
+    /// repositories); `repository_url` filters candidate versions; `version`
+    /// pins one, else the newest is chosen.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] for an unknown package/version;
+    /// [`ServiceError::InvalidInput`] for checksum/ABI/validation failures;
+    /// backend errors for download or filesystem problems. The default
+    /// implementation rejects (a manager without an installer).
+    async fn install_package(
+        &self,
+        _name: &str,
+        _assembly_guid: Option<Uuid>,
+        _version: Option<&str>,
+        _repository_url: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::invalid_input(
+            "runtime plugin installation is not available on this server",
+        ))
+    }
 
     /// The plugin configuration pages — the dashboard `GET /web/ConfigurationPages`
     /// list, projected from plugins that ship a settings page. Defaults to empty
@@ -123,6 +149,31 @@ pub trait PluginManager: Send + Sync {
 }
 
 fn _assert_object_safe_plugin_manager(_: &dyn PluginManager) {}
+
+/// Validates a downloaded plugin artifact before it is committed to disk.
+///
+/// Implemented by the WASM host crate (which owns wasmtime and the plugin
+/// ABI); injected into the plugin manager at the composition root. This seam
+/// exists because `ferrofin-core` must not depend on `ferrofin-wasm` (the
+/// dependency arrow points the other way).
+#[async_trait]
+pub trait PluginArtifactValidator: Send + Sync {
+    /// The plugin ABI this server supports (e.g. `ferrofin:plugin@0.1.0`),
+    /// used for the manifest `targetAbi` gate and error messages.
+    fn supported_abi(&self) -> &str;
+
+    /// Checks that `bytes` is a loadable component of the supported world
+    /// and returns its self-reported descriptor id. Runs in a throwaway
+    /// sandbox with the standard limits and no capabilities armed — the
+    /// artifact cannot reach the network or the library during validation.
+    ///
+    /// # Errors
+    /// [`ServiceError::InvalidInput`] describing why the artifact is not a
+    /// valid plugin (not a component, wrong world, bad descriptor, …).
+    async fn validate(&self, bytes: &[u8]) -> Result<Uuid, ServiceError>;
+}
+
+fn _assert_object_safe_plugin_artifact_validator(_: &dyn PluginArtifactValidator) {}
 
 /// One step of a web-file transformation pipeline.
 ///

@@ -222,3 +222,243 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
     // Keep the temp dir (DB + plugin file) alive to the end.
     drop(Arc::new(temp));
 }
+
+/// A tiny multi-request loopback HTTP server for the repository flow:
+/// `/manifest.json` and `/plugin.wasm` until the sender drops.
+fn repo_server(
+    manifest_for: impl FnOnce(&str) -> String,
+    artifact: Vec<u8>,
+) -> (String, std::sync::mpsc::Sender<()>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let manifest = manifest_for(&format!("http://{addr}"));
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).ok();
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let body: &[u8] = if request.contains("/plugin.wasm") {
+                        &artifact
+                    } else {
+                        manifest.as_bytes()
+                    };
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.write_all(body);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{addr}"), stop_tx)
+}
+
+/// The full Jellyfin repository-install flow over the real router, with the
+/// REAL artifact validator: add a repository → the catalog lists its package
+/// → install → the .wasm is staged in {data_dir}/plugins and SystemInfo
+/// reports HasPendingRestart (the plugin activates on the next boot).
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn repository_install_stages_plugin_and_flags_restart() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    // The "repository": the shared WAT fixture as the released artifact.
+    let artifact = wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).expect("fixture compiles");
+    let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+    let (repo_base, _stop) = repo_server(
+        |base| {
+            format!(
+                r#"[{{"name":"HelloFixture","description":"d","overview":"o","owner":"tester",
+                    "category":"General","guid":"{PLUGIN_ID}",
+                    "versions":[{{"version":"1.2.3","targetAbi":"{abi}",
+                      "sourceUrl":"{base}/plugin.wasm","checksum":"{md5}",
+                      "repositoryName":"loop","repositoryUrl":"{base}/manifest.json"}}]}}]"#,
+                abi = ferrofin_wasm::PLUGIN_ABI,
+            )
+        },
+        artifact.clone(),
+    );
+
+    let config = Config {
+        data_dir: root.join("data"),
+        config_dir: root.join("config"),
+        cache_dir: root.join("cache"),
+        web_dir: root.join("web"),
+        bind_addr: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        https_port: 0,
+        published_url: None,
+        base_url: String::new(),
+        omdb_api_key: String::new(),
+        studios_repo_url: String::new(),
+        tvdb_api_key: String::new(),
+        tvdb_subscriber_pin: String::new(),
+        fanart_personal_api_key: String::new(),
+        musicbrainz_base_url: String::new(),
+        ffmpeg_path: None,
+        ffprobe_path: None,
+        library_roots: Vec::new(),
+        server_name: "ferrofin-repo-install-test".to_owned(),
+        log_level: "info".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        db_pool: None,
+        enable_metrics: None,
+        metrics_sample_interval: None,
+        scan_progress_every: None,
+        wasm_call_timeout_secs: None,
+        wasm_memory_limit_mb: None,
+        wasm_event_queue_capacity: None,
+        wasm_private_http_allow: None,
+    };
+    let db = Database::connect(&config.database_url())
+        .await
+        .expect("open db");
+    db.run_migrations().await.expect("migrations");
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        ffmpeg: std::path::PathBuf::from("ffmpeg"),
+        ffprobe: std::path::PathBuf::from("ffprobe"),
+        filters: Vec::new(),
+        encoders: Vec::new(),
+    };
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+        .await
+        .expect("wire app state");
+    ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
+        .await
+        .expect("seed admin");
+    let router = ferrofin_api::create_router(wired.state.clone());
+
+    // Authenticate.
+    let auth = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(header::AUTHORIZATION, CLIENT_AUTH)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(auth.status(), StatusCode::OK);
+    let token = body_json(auth).await["AccessToken"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bearer = format!("{CLIENT_AUTH}, Token=\"{token}\"");
+
+    // 1. Register the repository (what the admin does in the dashboard).
+    let set_repos = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Repositories")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!([{
+                        "Name": "loop", "Url": format!("{repo_base}/manifest.json"), "Enabled": true
+                    }])
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set_repos.status(), StatusCode::NO_CONTENT);
+
+    // 2. The catalog lists the repository's package.
+    let packages = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/Packages")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(packages.status(), StatusCode::OK);
+    let packages = body_json(packages).await;
+    assert!(
+        packages
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "HelloFixture"),
+        "catalog lists the repo package: {packages}"
+    );
+
+    // 3. Install (jellyfin-web's call, guid included).
+    let install = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Packages/Installed/HelloFixture?assemblyGuid={PLUGIN_ID}&version=1.2.3"
+                ))
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(install.status(), StatusCode::NO_CONTENT, "install succeeds");
+
+    // 4. The artifact is staged where the WASM host loads from…
+    let staged = root
+        .join("data")
+        .join("plugins")
+        .join(format!("{PLUGIN_ID}.wasm"));
+    assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
+
+    // …and the server reports a pending restart (Jellyfin's activation model).
+    let info = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/System/Info")
+                .header(header::AUTHORIZATION, bearer.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(info.status(), StatusCode::OK);
+    let info = body_json(info).await;
+    assert_eq!(
+        info["HasPendingRestart"], true,
+        "restart-required surfaces in SystemInfo: {info}"
+    );
+
+    drop(Arc::new(temp));
+}
