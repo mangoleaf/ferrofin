@@ -27,6 +27,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
                 .build()
                 .unwrap(),
         ),
+        http_timeout: std::time::Duration::from_secs(5),
         collaborators,
         private_http_allowed: true, // tests hit a loopback listener
         wasi: HostState::empty_wasi(),

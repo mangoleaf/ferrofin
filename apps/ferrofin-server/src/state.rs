@@ -662,53 +662,12 @@ pub async fn build_app_state(
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
     // Loaded WASM plugins surface on `/Plugins` exactly like compiled-in ones.
-    // A WASM plugin must not squat a compiled-in id: two registry entries with
-    // one id would duplicate the dashboard row and make config/enable/uninstall
-    // address the wrong plugin. The install path refuses such packages, but a
-    // hand-dropped `.wasm` bypasses it — this filter is the choke point that
-    // covers both doors.
-    let taken: std::collections::HashSet<uuid::Uuid> =
-        registered_plugins.iter().map(|p| p.descriptor.id).collect();
-    // Same guard one field over: dashboard page names are a global namespace
-    // (`?name=…`, case-insensitive, first-match-wins in the page lookup), so
-    // a guest-chosen page name must not collide with an already-registered
-    // one — a compiled-in page, another plugin's page, or another plugin's
-    // synthesized fallback. A colliding page is dropped (the plugin loses its
-    // Settings button rather than serving someone else's HTML to the admin).
-    let mut taken_pages: std::collections::HashSet<String> = registered_plugins
-        .iter()
-        .flat_map(|p| p.config_pages.iter())
-        .map(|page| page.name.to_lowercase())
-        .collect();
-    registered_plugins.extend(
-        wasm_host
-            .registered_plugins()
-            .into_iter()
-            .filter(|p| {
-                let free = !taken.contains(&p.descriptor.id);
-                if !free {
-                    tracing::warn!(
-                        plugin = %p.descriptor.id,
-                        "wasm plugin id collides with a compiled-in plugin; skipping it"
-                    );
-                }
-                free
-            })
-            .map(|mut p| {
-                let plugin = p.descriptor.id;
-                p.config_pages.retain(|page| {
-                    let free = taken_pages.insert(page.name.to_lowercase());
-                    if !free {
-                        tracing::warn!(
-                            %plugin,
-                            page = %page.name,
-                            "wasm plugin page name collides with an existing page; dropping it"
-                        );
-                    }
-                    free
-                });
-                p
-            }),
+    // Guid + page-name collision rules live in one testable place —
+    // `merge_plugin_registrations` (ferrofin-core) — covering both the
+    // repository-install and hand-dropped-file doors.
+    ferrofin_core::merge_plugin_registrations(
+        &mut registered_plugins,
+        wasm_host.registered_plugins(),
     );
     // The lifecycle controller is built early so the plugin manager can flag
     // restart-required after a repository install/uninstall; the system

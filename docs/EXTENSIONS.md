@@ -101,7 +101,11 @@ size is capped while streaming (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`, default 128 M
 checksum must match (the manifest's `sha256` extension field preferred, else the
 Jellyfin-standard MD5 — integrity, not authenticity: HTTPS is the trust root); and the
 artifact must validate as a real `ferrofin:plugin` component whose self-reported id equals
-the catalog guid. Install, uninstall, enable/disable, configuration
+the catalog guid. **Published versions are immutable**: the sha256 of every installed
+artifact is recorded, and re-installing a known version whose bytes changed is refused —
+a compromised repository must publish a visibly new version to ship different code, and
+can never silently swap the artifact under one the admin already vetted. Install,
+uninstall, enable/disable, configuration
 writes, and repository changes require an **administrator** (Jellyfin's
 `RequiresElevation`) — a plugin's config JSON is handed to the guest, so a
 config write is guest input. On boot each component is compiled,
@@ -125,9 +129,11 @@ globals), surfaced on `GET /web/ConfigurationPages` tagged with the plugin's id
 `ApiClient.updatePluginConfiguration` (the `/Plugins/{id}/Configuration` JSON
 the plugin reads back through `get-config`). A plugin that ships **no** page
 still gets one: Ferrofin synthesizes a generic JSON editor over its config, so
-every WASM plugin is configurable from the dashboard. One caveat belongs in the
-trust section below: page content runs in the admin's browser, not in the
-sandbox.
+every WASM plugin is configurable from the dashboard. **Disabling a plugin removes its pages** from
+discovery and fetch alike — the kill switch disarms the browser-side surface
+too, matching Jellyfin (a disabled plugin is never instantiated there). One
+caveat belongs in the trust section below: page content runs in the admin's
+browser, not in the sandbox.
 
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
@@ -167,10 +173,11 @@ destinations** (your LAN, cloud metadata services, Tailscale/tailnet ranges, Fer
 itself), which
 removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
-Known limitation: the private-address check resolves-then-fetches, so a DNS-rebinding
-attacker has a theoretical TOCTOU window; pinning the vetted address on the request is the
-planned hardening. (Referencing plugins by UUID is also acknowledged UX debt — accepting
-plugin names is a planned improvement.)
+The private-address check also **pins the vetted address on the connection
+itself** (the request resolves to the address that was checked, not a second
+DNS answer), closing the classic DNS-rebinding TOCTOU. (Referencing plugins by
+UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
+planned improvement.)
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust

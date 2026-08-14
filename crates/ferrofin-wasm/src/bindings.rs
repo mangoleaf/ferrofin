@@ -55,6 +55,9 @@ pub struct HostState {
     /// The shared blocking HTTP client behind `http-fetch` (per host, with
     /// the call timeout baked in at construction).
     pub http: std::sync::Arc<reqwest::blocking::Client>,
+    /// The per-call timeout, needed when `http-fetch` builds a one-off
+    /// DNS-pinned client (the shared client's timeout is not readable).
+    pub http_timeout: std::time::Duration,
     /// Whether THIS plugin may reach private/loopback destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW` names it or is `*`).
     pub private_http_allowed: bool,
@@ -124,6 +127,7 @@ impl host::Host for HostState {
             &self.plugin_name,
             self.memory_limit_bytes,
             self.private_http_allowed,
+            self.http_timeout,
             &request,
         )
     }

@@ -84,11 +84,10 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
 
 /// Enforces the private-destination policy for one URL: every address the
 /// host resolves to must be public unless the plugin was allowlisted.
-///
-/// Known limitation (documented in EXTENSIONS.md): check-then-fetch has a
-/// DNS-rebinding TOCTOU window; the upgrade path is pinning the vetted
-/// address on the request itself.
-fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<(), String> {
+/// Returns the vetted address so the caller can PIN the connection to it —
+/// re-resolving at request time would reopen the DNS-rebinding TOCTOU
+/// window this check exists to close.
+fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<std::net::IpAddr, String> {
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
@@ -105,7 +104,7 @@ fn check_destination(url: &reqwest::Url, plugin_name: &str) -> Result<(), String
              its id to FERROFIN_WASM_PRIVATE_HTTP_ALLOW"
         ));
     }
-    Ok(())
+    Ok(addrs[0])
 }
 
 /// Executes `http-fetch` for a guest: http/https only, private/loopback
@@ -122,6 +121,7 @@ pub fn http_fetch(
     plugin_name: &str,
     body_cap_bytes: usize,
     private_http_allowed: bool,
+    call_timeout: std::time::Duration,
     request: &HttpRequest,
 ) -> Result<HttpResponse, String> {
     let url: reqwest::Url = request
@@ -134,9 +134,36 @@ pub fn http_fetch(
             url.scheme()
         ));
     }
-    if !private_http_allowed {
-        check_destination(&url, plugin_name)?;
-    }
+    // For a HOSTNAME destination under the private-address policy, the
+    // vetted address must also be the CONNECTED address: a one-off client
+    // pinned via `resolve()` closes the DNS-rebinding TOCTOU (a short-TTL
+    // record alternating public/private would otherwise win the re-resolve
+    // race). IP-literal URLs never touch DNS, and an allowlisted plugin is
+    // exempt from the policy entirely — both use the shared client.
+    let pinned: Option<reqwest::blocking::Client> = if private_http_allowed {
+        None
+    } else {
+        let vetted = check_destination(&url, plugin_name)?;
+        let is_name = url
+            .host_str()
+            .is_some_and(|h| h.parse::<std::net::IpAddr>().is_err());
+        if is_name {
+            let host = url.host_str().unwrap_or_default();
+            Some(
+                reqwest::blocking::Client::builder()
+                    .timeout(call_timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+                    // Port 0 = "keep the URL's port"; only the address pins.
+                    .resolve(host, std::net::SocketAddr::new(vetted, 0))
+                    .build()
+                    .map_err(|e| format!("building pinned http client: {e}"))?,
+            )
+        } else {
+            None
+        }
+    };
+    let client = pinned.as_ref().unwrap_or(client);
     let method: reqwest::Method = request
         .method
         .parse()

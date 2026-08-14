@@ -108,6 +108,65 @@ impl RegisteredPlugin {
     }
 }
 
+/// Merges runtime-loaded (WASM) plugin registrations into an existing
+/// registry, enforcing its two global identifier namespaces:
+///
+/// - **plugin ids** — a registration whose id is already taken (a
+///   compiled-in extension, or an earlier WASM plugin) is skipped whole:
+///   two entries with one id would duplicate the dashboard row and make
+///   config/enable/uninstall address the wrong plugin. The repository
+///   install path refuses such packages up front; this covers the
+///   hand-dropped-file door with the same rule.
+/// - **page names** — dashboard pages are fetched by name
+///   (case-insensitive, first match wins), so a page whose name is already
+///   registered is dropped: the plugin loses its Settings button rather
+///   than serving another plugin's HTML to the admin. Collisions cannot be
+///   attributed (first-wins says nothing about who is malicious), so the
+///   warning names both parties.
+pub fn merge_plugin_registrations(
+    registered: &mut Vec<RegisteredPlugin>,
+    incoming: Vec<RegisteredPlugin>,
+) {
+    let taken_ids: std::collections::HashSet<Uuid> =
+        registered.iter().map(|p| p.descriptor.id).collect();
+    let mut taken_pages: std::collections::HashMap<String, Uuid> = registered
+        .iter()
+        .flat_map(|p| {
+            p.config_pages
+                .iter()
+                .map(|page| (page.name.to_lowercase(), p.descriptor.id))
+        })
+        .collect();
+    for mut plugin in incoming {
+        let id = plugin.descriptor.id;
+        if taken_ids.contains(&id) {
+            tracing::warn!(
+                plugin = %id,
+                "wasm plugin id collides with a compiled-in plugin; skipping it"
+            );
+            continue;
+        }
+        plugin
+            .config_pages
+            .retain(|page| match taken_pages.entry(page.name.to_lowercase()) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    tracing::warn!(
+                        page = %page.name,
+                        held_by = %existing.get(),
+                        dropped_from = %id,
+                        "plugin page name is already registered; dropping the later copy"
+                    );
+                    false
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(id);
+                    true
+                }
+            });
+        registered.push(plugin);
+    }
+}
+
 /// The default cap on a plugin artifact download, in MiB
 /// (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` overrides it). Sized generously for
 /// interpreter-language guests bundling their runtime; an abuse guard, not a
@@ -299,6 +358,13 @@ struct PersistedState {
     /// The configured package repositories.
     #[serde(default)]
     repositories: Vec<RepositoryInfo>,
+    /// sha256 of every artifact ever installed, keyed plugin-guid → version.
+    /// A published version is immutable: re-installing a known version whose
+    /// artifact digest changed is refused (a compromised repository must
+    /// publish a NEW version to ship different code — a visible act — and
+    /// can never silently swap bytes under a version the admin vetted).
+    #[serde(default)]
+    installed_digests: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// The registry-backed plugin manager.
@@ -390,6 +456,16 @@ impl FerrofinPluginManager {
         self.plugins.iter().find(|p| p.descriptor.id == id)
     }
 
+    /// A plugin's effective enabled flag: the persisted override when the
+    /// admin has toggled it, else the descriptor default.
+    fn effective_enabled(state: &PersistedState, plugin: &RegisteredPlugin) -> bool {
+        state
+            .enabled
+            .get(&plugin.descriptor.id.to_string())
+            .copied()
+            .unwrap_or(plugin.descriptor.enabled)
+    }
+
     /// The path to a plugin's config file.
     fn config_path(&self, id: Uuid) -> PathBuf {
         self.plugins_dir.join(id.to_string()).join("config.json")
@@ -414,6 +490,45 @@ impl FerrofinPluginManager {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|e| ServiceError::backend(format!("serialize plugin state: {e}")))?;
         Self::atomic_write(&self.plugins_dir.join("state.json"), &bytes)
+    }
+
+    /// Refuses an install of `version` when it was installed before with
+    /// different bytes — a published version is immutable (see the
+    /// `installed_digests` field docs).
+    fn refuse_mutated_version(
+        &self,
+        guid: Uuid,
+        name: &str,
+        version: &str,
+        digest: &str,
+    ) -> Result<(), ServiceError> {
+        let state = self.state.lock().expect("plugin state lock poisoned");
+        if let Some(previous) = state
+            .installed_digests
+            .get(&guid.to_string())
+            .and_then(|versions| versions.get(version))
+            && !previous.eq_ignore_ascii_case(digest)
+        {
+            return Err(ServiceError::invalid_input(format!(
+                "artifact for {name} v{version} differs from the one previously installed \
+                 (sha256 {previous} != {digest}); a published version is immutable — refusing"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Records an installed artifact's digest (best-effort persist — the
+    /// staged artifact is the load-bearing outcome).
+    fn record_installed_digest(&self, guid: Uuid, version: &str, digest: String) {
+        let mut state = self.state.lock().expect("plugin state lock poisoned");
+        state
+            .installed_digests
+            .entry(guid.to_string())
+            .or_default()
+            .insert(version.to_owned(), digest);
+        let snapshot = state.clone();
+        drop(state);
+        let _ = self.persist(&snapshot);
     }
 
     /// Flips a plugin's enabled flag, persisting the change.
@@ -593,6 +708,13 @@ impl PluginManager for FerrofinPluginManager {
         )
         .await?;
 
+        // 4b. A published version is immutable: if this guid+version was
+        //     installed before, the artifact must be byte-identical, so a
+        //     compromised repository cannot silently swap the code under a
+        //     version the admin already vetted.
+        let digest = sha256_hex(&bytes);
+        self.refuse_mutated_version(package.id, name, &chosen.version, &digest)?;
+
         // 5. Validate the artifact is a real plugin component and that its
         //    self-reported id matches the catalog guid (otherwise enable/
         //    disable/uninstall would target a different identity than the
@@ -612,6 +734,9 @@ impl PluginManager for FerrofinPluginManager {
         std::fs::create_dir_all(wasm_dir)
             .map_err(|e| ServiceError::backend(format!("create {}: {e}", wasm_dir.display())))?;
         Self::atomic_write(&wasm_dir.join(format!("{}.wasm", package.id)), &bytes)?;
+
+        // Record the installed digest (see step 4b).
+        self.record_installed_digest(package.id, &chosen.version, digest);
 
         // 7. Activate on next restart (Jellyfin's model).
         if let Some(lifecycle) = &self.lifecycle {
@@ -770,8 +895,24 @@ impl PluginManager for FerrofinPluginManager {
     async fn get_configuration_pages(
         &self,
     ) -> Result<Vec<ferrofin_model::plugins::ConfigurationPageInfo>, ServiceError> {
+        // A DISABLED plugin's pages are hidden entirely — matching Jellyfin,
+        // where a disabled plugin is never instantiated so `IHasWebPages`
+        // yields nothing. This matters beyond fidelity: a settings page is
+        // HTML/JS served to the admin's browser (outside the WASM sandbox),
+        // and Disable is the kill switch an admin reaches for — it must
+        // disarm this surface too.
+        let enabled_flags: Vec<bool> = {
+            let state = self.state.lock().expect("plugin state lock poisoned");
+            self.plugins
+                .iter()
+                .map(|p| Self::effective_enabled(&state, p))
+                .collect()
+        };
         let mut pages = Vec::new();
-        for plugin in &self.plugins {
+        for (plugin, enabled) in self.plugins.iter().zip(enabled_flags) {
+            if !enabled {
+                continue;
+            }
             // A page declared main-menu-enabled can be vetoed by the plugin's
             // own stored configuration (the Intro Skipper convention:
             // `EnableInMainMenu = Configuration.EnableMainMenu ?? true`).
@@ -797,13 +938,21 @@ impl PluginManager for FerrofinPluginManager {
     }
 
     async fn get_configuration_page(&self, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
-        Ok(self.plugins.iter().find_map(|plugin| {
-            plugin
-                .config_pages
-                .iter()
-                .find(|page| page.name.eq_ignore_ascii_case(name))
-                .map(|page| page.bytes.clone())
-        }))
+        // Same disabled-plugin gate as `get_configuration_pages`: this
+        // endpoint is unauthenticated (matching Jellyfin), so a disabled
+        // plugin's page must not remain fetchable by name.
+        let state = self.state.lock().expect("plugin state lock poisoned");
+        Ok(self
+            .plugins
+            .iter()
+            .filter(|plugin| Self::effective_enabled(&state, plugin))
+            .find_map(|plugin| {
+                plugin
+                    .config_pages
+                    .iter()
+                    .find(|page| page.name.eq_ignore_ascii_case(name))
+                    .map(|page| page.bytes.clone())
+            }))
     }
 }
 
@@ -1391,6 +1540,148 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redirect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_hide_their_configuration_pages() {
+        let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Paged", true), None)
+            .with_config_page(super::PluginConfigPage {
+                name: "paged-settings".to_owned(),
+                bytes: b"<div data-role=\"page\">x</div>".to_vec(),
+                enable_in_main_menu: false,
+            });
+        let (mgr, _dir) = manager(vec![plugin]);
+        // Enabled: listed and fetchable.
+        assert_eq!(mgr.get_configuration_pages().await.unwrap().len(), 1);
+        assert!(
+            mgr.get_configuration_page("PAGED-SETTINGS")
+                .await
+                .unwrap()
+                .is_some(),
+            "case-insensitive fetch while enabled"
+        );
+        // Disabled: gone from discovery AND from the (unauthenticated)
+        // content endpoint — Disable must disarm the browser-side surface.
+        mgr.disable_plugin(PKG_ID).await.unwrap();
+        assert!(mgr.get_configuration_pages().await.unwrap().is_empty());
+        assert!(
+            mgr.get_configuration_page("paged-settings")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Re-enabled: back.
+        mgr.enable_plugin(PKG_ID).await.unwrap();
+        assert_eq!(mgr.get_configuration_pages().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_registrations_enforces_both_identifier_namespaces() {
+        let page = |name: &str| super::PluginConfigPage {
+            name: name.to_owned(),
+            bytes: b"x".to_vec(),
+            enable_in_main_menu: false,
+        };
+        let base_id = Uuid::from_u128(1);
+        let mut registered = vec![
+            RegisteredPlugin::new(descriptor(base_id, "Compiled", true), None)
+                .with_config_page(page("introskipper")),
+        ];
+        let incoming = vec![
+            // Same id as a compiled-in plugin: skipped whole.
+            RegisteredPlugin::new(descriptor(base_id, "Squatter", true), None),
+            // Page name collides with a compiled-in page (case-insensitively):
+            // the plugin survives, the page is dropped.
+            RegisteredPlugin::new(descriptor(Uuid::from_u128(2), "PageSquat", true), None)
+                .with_config_page(page("IntroSkipper"))
+                .with_config_page(page("pagesquat-own")),
+            // Claims the previous incoming plugin's page name: later loses.
+            RegisteredPlugin::new(descriptor(Uuid::from_u128(3), "Later", true), None)
+                .with_config_page(page("pagesquat-own")),
+        ];
+        super::merge_plugin_registrations(&mut registered, incoming);
+        let ids: Vec<Uuid> = registered.iter().map(|p| p.descriptor.id).collect();
+        assert_eq!(
+            ids,
+            vec![base_id, Uuid::from_u128(2), Uuid::from_u128(3)],
+            "id squatter skipped, others kept"
+        );
+        assert_eq!(
+            registered[1].config_pages.len(),
+            1,
+            "colliding page dropped"
+        );
+        assert_eq!(registered[1].config_pages[0].name, "pagesquat-own");
+        assert!(
+            registered[2].config_pages.is_empty(),
+            "later claimant of a taken name loses the page, keeps the plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinstalling_a_known_version_with_different_bytes_is_refused() {
+        // Install v0.10.0 from a repo serving artifact A…
+        let artifact_a = b"artifact-A".to_vec();
+        let md5_a = ferrofin_common::extensions::md5_hex(&artifact_a);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let wasm_dir = wasm_root.path().join("plugins");
+        let installer = |base_url: String| {
+            let mgr = FerrofinPluginManager::new(Vec::new(), state_dir.path().to_path_buf())
+                .with_installer(
+                    wasm_dir.clone(),
+                    Arc::new(StubValidator {
+                        id: Ok(PKG_ID),
+                        abi: TEST_ABI,
+                    }),
+                    Arc::new(FlagLifecycle(AtomicBool::new(false))),
+                );
+            (mgr, base_url)
+        };
+        {
+            let (base, _stop) = repo_server(
+                |base| manifest_json(base, &md5_a, None, TEST_ABI),
+                artifact_a,
+            );
+            let (mgr, base) = installer(base);
+            mgr.set_repositories(vec![RepositoryInfo {
+                name: Some("test".to_owned()),
+                url: Some(format!("{base}/manifest.json")),
+                enabled: true,
+            }])
+            .await
+            .unwrap();
+            mgr.install_package("HelloPkg", None, None, None)
+                .await
+                .expect("first install");
+        }
+        // …then the repo swaps the bytes under the SAME version. A fresh
+        // manager (state.json persisted the digest) must refuse — and a NEW
+        // version with new bytes must still install.
+        let artifact_b = b"artifact-B-tampered".to_vec();
+        let md5_b = ferrofin_common::extensions::md5_hex(&artifact_b);
+        let (base, _stop) = repo_server(
+            |base| manifest_json(base, &md5_b, None, TEST_ABI),
+            artifact_b,
+        );
+        let (mgr, base) = installer(base);
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let err = mgr
+            .install_package("HelloPkg", None, Some("0.10.0"), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
+        // The 0.9.0 entry in the manifest was never installed before, so its
+        // (new) bytes are fine — version pinning is per version, not global.
+        mgr.install_package("HelloPkg", None, Some("0.9.0"), None)
+            .await
+            .expect("a never-installed version accepts new bytes");
     }
 
     #[tokio::test]
