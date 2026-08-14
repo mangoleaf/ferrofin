@@ -406,6 +406,21 @@ async fn plugin_mutations_require_an_administrator() {
             format!("/Packages/Installing/{}", Uuid::from_u128(7)),
             Body::empty(),
         ),
+        (
+            "POST",
+            format!("/Plugins/{}/Configuration", known_id()),
+            Body::from("{}"),
+        ),
+        (
+            "POST",
+            format!("/Plugins/{}/1.0.0/Enable", known_id()),
+            Body::empty(),
+        ),
+        (
+            "POST",
+            format!("/Plugins/{}/1.0.0/Disable", known_id()),
+            Body::empty(),
+        ),
     ] {
         let resp = router()
             .oneshot(authed(method, &uri, body))

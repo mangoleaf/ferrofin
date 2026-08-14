@@ -352,27 +352,27 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `GET /MusicGenres/InstantMix` — not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre).
 - ⚠️ `GET /MusicGenres/{genreName}` — not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200).
 - ⚠️ `GET /Packages` — expected-extension: no external plugin package repository (compiled-in extensions).
-- ⚠️ `POST /Packages/Installed/{name}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `DELETE /Packages/Installing/{packageId}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `GET /Packages/{name}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
+- ⚠️ `POST /Packages/Installed/{name}` — real (2026-08-14): repository install of WASM plugins — download → verify → validate → stage, restart-required activation; admin-only.
+- ⚠️ `DELETE /Packages/Installing/{packageId}` — real: always 404 — installs are synchronous, so no tracked installation exists to cancel; admin-only.
+- ⚠️ `GET /Packages/{name}` — real: resolves from the aggregated repository catalog (plus synthesized entries for compiled-in plugins).
 - ⚠️ `GET /Persons/{name}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified.
 - ⚠️ `GET /Playback/BitrateTest` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
 - ⚠️ `GET /Playlists/{itemId}/InstantMix` — expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.
 - ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect.
 - ⚠️ `GET /Plugins` — expected-extension: Ferrofin uses compiled-in extensions, not external-repo plugins.
-- ⚠️ `DELETE /Plugins/{pluginId}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `GET /Plugins/{pluginId}/Configuration` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `POST /Plugins/{pluginId}/Configuration` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `POST /Plugins/{pluginId}/Manifest` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `DELETE /Plugins/{pluginId}/{version}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `POST /Plugins/{pluginId}/{version}/Disable` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
-- ⚠️ `POST /Plugins/{pluginId}/{version}/Enable` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
+- ⚠️ `DELETE /Plugins/{pluginId}` — real: uninstalls a staged WASM plugin (restart-required); compiled-in extensions honestly reject (400); admin-only.
+- ⚠️ `GET /Plugins/{pluginId}/Configuration` — real: returns the plugin's config JSON (stored values overlaid on defaults).
+- ⚠️ `POST /Plugins/{pluginId}/Configuration` — real: validates and persists the plugin's config JSON; admin-only.
+- ⚠️ `POST /Plugins/{pluginId}/Manifest` — real: plugin manifest read.
+- ⚠️ `DELETE /Plugins/{pluginId}/{version}` — real: uninstalls a staged WASM plugin (restart-required); compiled-in extensions honestly reject (400); admin-only.
+- ⚠️ `POST /Plugins/{pluginId}/{version}/Disable` — real: toggles the enabled flag (admin-only); a freshly repository-installed plugin 404s until its activating restart (see the accepted-divergence entry).
+- ⚠️ `POST /Plugins/{pluginId}/{version}/Enable` — real: toggles the enabled flag (admin-only); a freshly repository-installed plugin 404s until its activating restart (see the accepted-divergence entry).
 - ⚠️ `POST /Plugins/{pluginId}/{version}/Enable`+`Disable` (freshly repository-installed WASM plugin) — accepted-divergence: between install and the activating restart, Ferrofin 404s enable/disable (the plugin isn't in the registry until the boot that loads it) while Jellyfin already lists it restart-pending; uninstall works throughout (file-first path). Cosmetic pre-restart window only.
-- ⚠️ `GET /Plugins/{pluginId}/{version}/Image` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
+- ⚠️ `GET /Plugins/{pluginId}/{version}/Image` — real: serves the plugin's bundled image.
 - ⚠️ `GET /Providers/Lyrics/{lyricId}` — deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).
 - ⚠️ `GET /Providers/Subtitles/Subtitles/{subtitleId}` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
 - ⚠️ `GET /Repositories` — expected-extension: no external plugin repositories configured (compiled-in extensions).
-- ⚠️ `POST /Repositories` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
+- ⚠️ `POST /Repositories` — real: replaces the configured package repositories; admin-only.
 - ⚠️ `GET /ScheduledTasks` — instance: LastExecutionResult depends on whether/when a task last ran.
 - ⚠️ `GET /Search/Hints` — deferred: search path is correct; the missing Genre hint is because remote metadata (TMDB) is feature-gated off and the synthetic fixture carries no NFO <genre>.
 - ⚠️ `GET /Shows/{itemId}/Similar` — deferred: weighted similarity scorer not ported.
@@ -673,9 +673,9 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ✅ | · | ✅ |  |
 | `GET /MusicGenres/{name}/InstantMix` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Packages` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: no external plugin package repository (compiled-in extensions). |
-| `POST /Packages/Installed/{name}` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `DELETE /Packages/Installing/{packageId}` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `GET /Packages/{name}` | registered | REAL | ✅ | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
+| `POST /Packages/Installed/{name}` | registered | REAL | · | · | · | real (2026-08-14): repository install of WASM plugins — download → verify → validate → stage, restart-required activation; admin-only. |
+| `DELETE /Packages/Installing/{packageId}` | registered | REAL | · | · | · | real: always 404 — installs are synchronous, so no tracked installation exists to cancel; admin-only. |
+| `GET /Packages/{name}` | registered | REAL | ✅ | · | · | real: resolves from the aggregated repository catalog (plus synthesized entries for compiled-in plugins). |
 | `GET /Persons` | registered | REAL | ✅ | ✅ | ✅ | ok |
 | `GET /Persons/{name}` | registered | REAL | ✅ | · | ⚠️ | accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified. |
 | `GET /Persons/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
@@ -699,14 +699,14 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Plugins` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: Ferrofin uses compiled-in extensions, not external-repo plugins. |
-| `DELETE /Plugins/{pluginId}` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `GET /Plugins/{pluginId}/Configuration` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `POST /Plugins/{pluginId}/Configuration` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `POST /Plugins/{pluginId}/Manifest` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `DELETE /Plugins/{pluginId}/{version}` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `POST /Plugins/{pluginId}/{version}/Disable` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `POST /Plugins/{pluginId}/{version}/Enable` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
-| `GET /Plugins/{pluginId}/{version}/Image` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
+| `DELETE /Plugins/{pluginId}` | registered | REAL | · | · | · | real: uninstalls a staged WASM plugin (restart-required); compiled-in extensions honestly reject (400); admin-only. |
+| `GET /Plugins/{pluginId}/Configuration` | registered | REAL | · | · | · | real: returns the plugin's config JSON (stored values overlaid on defaults). |
+| `POST /Plugins/{pluginId}/Configuration` | registered | REAL | · | · | · | real: validates and persists the plugin's config JSON; admin-only. |
+| `POST /Plugins/{pluginId}/Manifest` | registered | REAL | · | · | · | real: plugin manifest read. |
+| `DELETE /Plugins/{pluginId}/{version}` | registered | REAL | · | · | · | real: uninstalls a staged WASM plugin (restart-required); compiled-in extensions honestly reject (400); admin-only. |
+| `POST /Plugins/{pluginId}/{version}/Disable` | registered | REAL | · | · | · | real: toggles the enabled flag (admin-only); a freshly repository-installed plugin 404s until its activating restart (see the accepted-divergence entry). |
+| `POST /Plugins/{pluginId}/{version}/Enable` | registered | REAL | · | · | · | real: toggles the enabled flag (admin-only); a freshly repository-installed plugin 404s until its activating restart (see the accepted-divergence entry). |
+| `GET /Plugins/{pluginId}/{version}/Image` | registered | REAL | · | · | · | real: serves the plugin's bundled image. |
 | `GET /Providers/Lyrics/{lyricId}` | registered | REAL | · | · | · | deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness). |
 | `GET /Providers/Subtitles/Subtitles/{subtitleId}` | registered | REAL | · | · | · | not-testable-this-way: binary/subtitle file output — not a JSON body to diff. |
 | `POST /QuickConnect/Authorize` | registered | REAL | · | · | ✅ | ok |
@@ -714,7 +714,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /QuickConnect/Enabled` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /QuickConnect/Initiate` | registered | REAL | · | · | ✅ | ok |
 | `GET /Repositories` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: no external plugin repositories configured (compiled-in extensions). |
-| `POST /Repositories` | registered | REAL | · | · | · | deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent). |
+| `POST /Repositories` | registered | REAL | · | · | · | real: replaces the configured package repositories; admin-only. |
 | `GET /ScheduledTasks` | registered | REAL | ✅ | ✅ | ⚠️ | instance: LastExecutionResult depends on whether/when a task last ran. |
 | `DELETE /ScheduledTasks/Running/{taskId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /ScheduledTasks/Running/{taskId}` | registered | REAL | · | · | ✅ | ok |

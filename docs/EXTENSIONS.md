@@ -101,8 +101,10 @@ size is capped while streaming (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`, default 128 M
 checksum must match (the manifest's `sha256` extension field preferred, else the
 Jellyfin-standard MD5 — integrity, not authenticity: HTTPS is the trust root); and the
 artifact must validate as a real `ferrofin:plugin` component whose self-reported id equals
-the catalog guid. Install, uninstall, and repository changes require an **administrator**
-(Jellyfin's `RequiresElevation`). On boot each component is compiled,
+the catalog guid. Install, uninstall, enable/disable, configuration
+writes, and repository changes require an **administrator** (Jellyfin's
+`RequiresElevation`) — a plugin's config JSON is handed to the guest, so a
+config write is guest input. On boot each component is compiled,
 interrogated for its identity (`descriptor`), seed config, and task list, and then
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.

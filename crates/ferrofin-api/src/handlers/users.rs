@@ -285,7 +285,10 @@ fn auth_info(parts: &Parts) -> AuthorizationInfo {
 /// Reuses [`UserManager::get_user_dto`](ferrofin_traits::library::UserManager::get_user_dto)
 /// (whose policy projection reads the `Permissions` table) rather than adding a
 /// dedicated permission accessor, matching C# `user.HasPermission(IsAdministrator)`.
-async fn is_administrator(state: &AppState, user: &UserEntity) -> Result<bool, ApiError> {
+pub(crate) async fn is_administrator(
+    state: &AppState,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
     Ok(state
         .users
         .get_user_dto(user, None)

@@ -503,6 +503,21 @@ impl PluginManager for FerrofinPluginManager {
                 None => p.name.eq_ignore_ascii_case(name),
             })
             .ok_or_else(|| ServiceError::not_found(format!("package {name}")))?;
+
+        // A repository must not squat a compiled-in plugin's identity: the
+        // registry knowing this id *without* a staged artifact means it
+        // belongs to a compiled-in extension. (An installed WASM plugin is
+        // registered after its activating restart too, but always has its
+        // staged file — that case is a legitimate upgrade.)
+        if self.find(package.id).is_some()
+            && !wasm_dir.join(format!("{}.wasm", package.id)).exists()
+        {
+            return Err(ServiceError::invalid_input(format!(
+                "plugin id {} belongs to a compiled-in extension — refusing",
+                package.id
+            )));
+        }
+
         let mut candidates: Vec<&ferrofin_model::updates::VersionInfo> = package
             .versions
             .iter()
@@ -539,17 +554,12 @@ impl PluginManager for FerrofinPluginManager {
         }
 
         // 3–4. Download (HTTPS required, size-capped) and verify integrity.
-        // The http-loopback exemption is granted by the *admin's* repository
-        // configuration (a loopback repo = a dev rig), never by the remote
-        // manifest's own sourceUrl — see `require_https`.
-        let loopback_ok = {
-            let state = self.state.lock().expect("plugin state lock poisoned");
-            state
-                .repositories
-                .iter()
-                .filter(|r| r.enabled)
-                .any(|r| r.url.as_deref().is_some_and(is_loopback_url))
-        };
+        // The http-loopback exemption is granted only when *this version's
+        // own repository* is loopback (a dev rig) — `repository_url` is
+        // stamped by `list_packages` from the repo actually fetched, so a
+        // remote manifest can neither claim it nor ride a loopback repo
+        // configured alongside it. See `require_https`.
+        let loopback_ok = is_loopback_url(&chosen.repository_url);
         let bytes = download_and_verify(
             source_url,
             name,
@@ -661,7 +671,19 @@ impl PluginManager for FerrofinPluginManager {
             };
             match reqwest::get(url).await {
                 Ok(resp) => match resp.json::<Vec<PackageInfo>>().await {
-                    Ok(list) => packages.extend(list),
+                    // Stamp provenance from the repository we actually
+                    // fetched from — the manifest's own repositoryName/Url
+                    // claims are attacker-controlled, and the install path's
+                    // repositoryUrl filter + loopback exemption rely on
+                    // these fields being true (Jellyfin stamps them the
+                    // same way in `InstallationManager.GetPackages`).
+                    Ok(list) => packages.extend(list.into_iter().map(|mut p| {
+                        for v in &mut p.versions {
+                            v.repository_name = repo.name.clone().unwrap_or_default();
+                            url.clone_into(&mut v.repository_url);
+                        }
+                        p
+                    })),
                     Err(e) => {
                         tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
                     }
@@ -1344,5 +1366,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("redirect"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn repository_cannot_squat_a_compiled_in_id_but_upgrades_pass() {
+        // A manifest claiming a compiled-in extension's guid must be
+        // refused (otherwise the restart registers two plugins with one id
+        // and `find()` silently addresses the wrong one)…
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let wasm_dir = wasm_root.path().join("plugins");
+        let (base, _stop) = repo_server(
+            |base| manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0"),
+            artifact.clone(),
+        );
+        let mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(
+                descriptor(PKG_ID, "Compiled-in", true),
+                None,
+            )],
+            state_dir.path().to_path_buf(),
+        )
+        .with_installer(
+            wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: "ferrofin:plugin@0.1.0",
+            }),
+            Arc::new(FlagLifecycle(AtomicBool::new(false))),
+        );
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let err = mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("compiled-in"), "{err}");
+
+        // …but the same registry state WITH a staged artifact is a loaded
+        // WASM plugin being upgraded — that must keep working.
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        std::fs::write(wasm_dir.join(format!("{PKG_ID}.wasm")), b"old").unwrap();
+        mgr.install_package("HelloPkg", None, None, None)
+            .await
+            .expect("upgrade of an installed wasm plugin");
+        assert_eq!(
+            std::fs::read(wasm_dir.join(format!("{PKG_ID}.wasm"))).unwrap(),
+            artifact,
+            "upgrade replaced the staged artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_packages_stamps_repository_provenance() {
+        // The manifest lies about its own provenance; the stamped values
+        // must come from the repository actually fetched.
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let (base, _stop) = repo_server(
+            |base| {
+                manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0")
+                    .replace("\"repositoryName\":\"test\"", "\"repositoryName\":\"liar\"")
+                    .replace(
+                        &format!("\"repositoryUrl\":\"{base}/manifest.json\""),
+                        "\"repositoryUrl\":\"https://evil.example\"",
+                    )
+            },
+            artifact,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        let repo_url = format!("{base}/manifest.json");
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("honest".to_owned()),
+            url: Some(repo_url.clone()),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let packages = mgr.list_packages().await.unwrap();
+        let pkg = packages.iter().find(|p| p.id == PKG_ID).unwrap();
+        for v in &pkg.versions {
+            assert_eq!(v.repository_name, "honest");
+            assert_eq!(v.repository_url, repo_url);
+        }
     }
 }

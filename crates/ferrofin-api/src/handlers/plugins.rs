@@ -7,12 +7,16 @@
 //! plugins staged in `{data_dir}/plugins`. Installing from a configured
 //! repository and uninstalling a staged WASM plugin are real (restart-required
 //! activation, Jellyfin's model); only uninstalling a *compiled-in* plugin is
-//! rejected. The mutating routes (install/uninstall/repository-set/cancel)
-//! require an administrator, porting Jellyfin's `RequiresElevation` policy.
+//! rejected. Every mutating route (install/uninstall/repository-set/cancel/
+//! enable/disable/configuration-write) requires an administrator, porting
+//! Jellyfin's `RequiresElevation` policy; a WASM plugin's config JSON is
+//! handed straight to the guest, so config writes are guest input. Reads
+//! stay plain-auth.
 //!
 //! - `GET /Plugins` — installed plugins
-//! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config JSON
-//! - `POST /Plugins/{id}/{version}/{Enable,Disable}` — toggle a plugin
+//! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config
+//!   JSON (write admin)
+//! - `POST /Plugins/{id}/{version}/{Enable,Disable}` — toggle a plugin (admin)
 //! - `DELETE /Plugins/{id}` / `/Plugins/{id}/{version}` — uninstall (admin;
 //!   removes a staged WASM plugin, rejects a compiled-in one)
 //! - `GET /Plugins/{id}/{version}/Image` — a plugin's bundled image
@@ -43,6 +47,12 @@ use crate::state::AppState;
 ///
 /// Without this gate, any authenticated account (a guest profile, a stolen
 /// playback token) could stage arbitrary code for the next boot.
+///
+/// Deliberate posture divergence: other admin controllers note that
+/// elevation is "deferred to the composition root", but this controller
+/// gates **in-handler** — staging executable code is not mutating metadata,
+/// and the gate must hold even if the composition changes. Don't "fix" this
+/// back for consistency.
 async fn require_admin(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
@@ -51,12 +61,7 @@ async fn require_admin(
         return Ok(());
     }
     if let Some(user) = &auth.user
-        && state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .is_some_and(|p| p.is_administrator)
+        && super::users::is_administrator(state, user).await?
     {
         return Ok(());
     }
@@ -143,10 +148,11 @@ async fn get_plugin_configuration(
 )]
 async fn update_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state
         .plugins
         .set_plugin_configuration(plugin_id, body.to_vec())
@@ -170,9 +176,10 @@ async fn update_plugin_configuration(
 )]
 async fn enable_plugin(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((plugin_id, _version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.enable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -193,9 +200,10 @@ async fn enable_plugin(
 )]
 async fn disable_plugin(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((plugin_id, _version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.disable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
