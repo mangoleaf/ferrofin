@@ -2721,7 +2721,7 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "verified 2026-08-14: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted). Unit + server HTTP tests; catalog content is instance-specific, so not harness-diffed.",
+      "classification": "instance: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted); manifest fetch is size-capped + timed out. Catalog content is repository-config-specific \u2014 harness instances configure none \u2014 so nothing to diff. Verified 2026-08-14 by unit + server HTTP tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -2757,7 +2757,7 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: resolves a package by name/assemblyGuid from the aggregated repository catalog. Unit + server HTTP tests.",
+      "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog \u2014 catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3057,7 +3057,7 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: returns the plugin's config JSON (stored values overlaid on current defaults, matching C# partial-deserialize semantics). Unit + handler tests.",
+      "classification": "instance: the two servers share no plugin id (Ferrofin ships compiled-in extensions + WASM plugins; stock Jellyfin ships neither), so there is no config to fetch on both sides. Real read (stored values overlaid on defaults, C# partial-deserialize semantics); verified 2026-08-14 by unit + handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3069,7 +3069,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: validates and persists the plugin's config JSON; admin-only (a WASM plugin's config is handed to the guest, so a write is guest input). Unit + handler tests incl. 403.",
+      "classification": "instance: no shared plugin id across the two servers, so no config write to diff. Real write (JSON-validated, persisted; admin-only \u2014 a WASM plugin's config is guest input); verified 2026-08-14 by unit + handler tests incl. 403.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3081,7 +3081,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: returns the plugin's manifest (GetPluginManifest port). Handler tests.",
+      "classification": "instance: no shared plugin id across the two servers, so no manifest to fetch on both sides. Real read (GetPluginManifest port); verified 2026-08-14 by handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3129,7 +3129,7 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId,version",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: serves the plugin's bundled image bytes with its content type. Handler tests.",
+      "classification": "instance: no shared plugin id across the two servers, so no image to fetch on both sides. Real read (bundled image bytes + content type); verified 2026-08-14 by handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3213,7 +3213,7 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "verified 2026-08-14: returns the admin-configured package repositories (instance-specific content). Unit + handler tests.",
+      "classification": "instance: returns the admin-configured package repositories \u2014 instance-local state (harness instances configure none), nothing to diff. Verified 2026-08-14 by unit + handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3225,7 +3225,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "verified 2026-08-14: replaces the configured package repositories; admin-only (RequiresElevation port). Unit + handler tests incl. 403 for non-admin.",
+      "classification": "instance: replaces the configured package repositories (admin-only, RequiresElevation port) \u2014 instance-local state, nothing to diff. Verified 2026-08-14 by unit + handler tests incl. 403 for non-admin.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {

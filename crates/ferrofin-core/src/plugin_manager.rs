@@ -151,6 +151,47 @@ fn require_https(url: &str, loopback_ok: bool) -> Result<(), ServiceError> {
     )))
 }
 
+/// Cap on a repository *manifest* download. Deliberately hardcoded (unlike
+/// the artifact cap): a JSON catalog is not a tuning surface, and 16 MiB is
+/// orders of magnitude above any real manifest — this only exists so a
+/// hostile repository can't OOM the server with a multi-GB body.
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How long a repository fetch may take end-to-end (manifest) or sit idle
+/// between bytes (artifact). Without it reqwest never times out, and a
+/// repository that accepts the connection and says nothing pins the task.
+const REPO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads a response body in chunks, failing as soon as the running total
+/// exceeds `cap_bytes` — `Content-Length` is advisory (absent on chunked
+/// responses, and a hostile server can lie), so the streamed count is the
+/// enforcement for every repository download.
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap_bytes: u64,
+    url: &str,
+) -> Result<Vec<u8>, ServiceError> {
+    if response.content_length().is_some_and(|len| len > cap_bytes) {
+        return Err(ServiceError::invalid_input(format!(
+            "download from {url} exceeds the {cap_bytes}-byte limit"
+        )));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ServiceError::backend(format!("downloading {url}: {e}")))?
+    {
+        if (bytes.len() + chunk.len()) as u64 > cap_bytes {
+            return Err(ServiceError::invalid_input(format!(
+                "download from {url} exceeds the {cap_bytes}-byte limit"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// Lowercase-hex SHA-256 of `bytes` (the manifest `sha256` extension field).
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
@@ -189,11 +230,15 @@ async fn download_and_verify(
             attempt.error("insecure redirect target (plugin downloads require https)")
         }
     });
+    // Idle timeouts, not a total deadline: a legitimate 100 MiB artifact on
+    // a slow link needs minutes of transfer, but must never sit silent.
     let client = reqwest::Client::builder()
         .redirect(policy)
+        .connect_timeout(REPO_FETCH_TIMEOUT)
+        .read_timeout(REPO_FETCH_TIMEOUT)
         .build()
         .map_err(|e| ServiceError::backend(format!("building download client: {e}")))?;
-    let mut response = client
+    let response = client
         .get(source_url)
         .send()
         .await
@@ -204,28 +249,7 @@ async fn download_and_verify(
             response.status()
         )));
     }
-    let too_big = || {
-        ServiceError::invalid_input(format!(
-            "plugin artifact exceeds the {cap_bytes}-byte limit"
-        ))
-    };
-    // The declared length fast-fails an honest oversized artifact; the
-    // running count below is the enforcement (Content-Length is advisory —
-    // absent on chunked responses, and a hostile server can lie).
-    if response.content_length().is_some_and(|len| len > cap_bytes) {
-        return Err(too_big());
-    }
-    let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?
-    {
-        if (bytes.len() + chunk.len()) as u64 > cap_bytes {
-            return Err(too_big());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+    let bytes = read_capped(response, cap_bytes, source_url).await?;
 
     if let Some(expected) = chosen.sha256.as_deref().filter(|c| !c.is_empty()) {
         let actual = sha256_hex(&bytes);
@@ -665,32 +689,47 @@ impl PluginManager for FerrofinPluginManager {
                 .collect()
         };
         let mut packages: Vec<PackageInfo> = Vec::new();
+        // Manifests are small JSON documents: a total deadline plus a
+        // streamed size cap, so a hostile/hung repository can neither OOM
+        // the server nor pin the task (GET /Packages is plain-auth).
+        let client = reqwest::Client::builder()
+            .timeout(REPO_FETCH_TIMEOUT)
+            .build()
+            .map_err(|e| ServiceError::backend(format!("building repository client: {e}")))?;
         for repo in repos {
             let Some(url) = repo.url.as_deref().filter(|u| !u.is_empty()) else {
                 continue;
             };
             let repo_name = repo.name.clone().unwrap_or_default();
-            match reqwest::get(url).await {
-                Ok(resp) => match resp.json::<Vec<PackageInfo>>().await {
-                    // Stamp provenance from the repository we actually
-                    // fetched from — the manifest's own repositoryName/Url
-                    // claims are attacker-controlled, and the install path's
-                    // repositoryUrl filter + loopback exemption rely on
-                    // these fields being true (Jellyfin stamps them the
-                    // same way in `InstallationManager.GetPackages`).
-                    Ok(list) => packages.extend(list.into_iter().map(|mut p| {
-                        for v in &mut p.versions {
-                            v.repository_name.clone_from(&repo_name);
-                            url.clone_into(&mut v.repository_url);
-                        }
-                        p
-                    })),
+            let body = match client.get(url).send().await {
+                Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, url).await {
+                    Ok(body) => body,
                     Err(e) => {
-                        tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
+                        tracing::warn!(url, error = %e, "failed to read plugin repository manifest");
+                        continue;
                     }
                 },
                 Err(e) => {
                     tracing::warn!(url, error = %e, "failed to fetch plugin repository manifest");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<Vec<PackageInfo>>(&body) {
+                // Stamp provenance from the repository we actually fetched
+                // from — the manifest's own repositoryName/Url claims are
+                // attacker-controlled, and the install path's repositoryUrl
+                // filter + loopback exemption rely on these fields being
+                // true (Jellyfin stamps them the same way in
+                // `InstallationManager.GetPackages`).
+                Ok(list) => packages.extend(list.into_iter().map(|mut p| {
+                    for v in &mut p.versions {
+                        v.repository_name.clone_from(&repo_name);
+                        url.clone_into(&mut v.repository_url);
+                    }
+                    p
+                })),
+                Err(e) => {
+                    tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
                 }
             }
         }
@@ -1422,6 +1461,59 @@ mod tests {
             std::fs::read(wasm_dir.join(format!("{PKG_ID}.wasm"))).unwrap(),
             artifact,
             "upgrade replaced the staged artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_enforces_the_streamed_limit() {
+        // Body larger than the cap, served WITHOUT content-length — only
+        // the running streamed count can catch it.
+        let (base, _stop) = raw_server(|_| {
+            Box::new(|_| {
+                let mut out =
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n"
+                        .to_vec();
+                out.extend_from_slice(&[b'x'; 2048]);
+                out
+            })
+        });
+        let resp = reqwest::get(format!("{base}/big")).await.unwrap();
+        let err = super::read_capped(resp, 1024, &base).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        // Under the cap passes through intact.
+        let resp = reqwest::get(format!("{base}/big")).await.unwrap();
+        let ok = super::read_capped(resp, 4096, &base).await.unwrap();
+        assert_eq!(ok.len(), 2048);
+    }
+
+    #[tokio::test]
+    async fn oversized_manifest_is_skipped_not_fatal() {
+        // A repository serving a manifest over MAX_MANIFEST_BYTES is skipped
+        // with a warning; the catalog call itself still succeeds.
+        let big = usize::try_from(super::MAX_MANIFEST_BYTES).unwrap() + 1;
+        let (base, _stop) = raw_server(move |_| {
+            Box::new(move |_| {
+                let mut out = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {big}\r\nconnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                out.extend_from_slice(&vec![b'['; big]);
+                out
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("huge".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let packages = mgr.list_packages().await.expect("catalog still succeeds");
+        assert!(
+            packages.is_empty(),
+            "oversized manifest contributed nothing"
         );
     }
 
