@@ -86,6 +86,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         wasm_memory_limit_mb: None,
         wasm_event_queue_capacity: None,
         wasm_private_http_allow: None,
+        max_plugin_download_mb: None,
     };
 
     let db = Database::connect(&config.database_url())
@@ -330,6 +331,7 @@ async fn repository_install_stages_plugin_and_flags_restart() {
         wasm_memory_limit_mb: None,
         wasm_event_queue_capacity: None,
         wasm_private_http_allow: None,
+        max_plugin_download_mb: None,
     };
     let db = Database::connect(&config.database_url())
         .await

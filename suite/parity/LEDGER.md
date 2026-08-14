@@ -367,6 +367,7 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 - ⚠️ `DELETE /Plugins/{pluginId}/{version}` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
 - ⚠️ `POST /Plugins/{pluginId}/{version}/Disable` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
 - ⚠️ `POST /Plugins/{pluginId}/{version}/Enable` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
+- ⚠️ `POST /Plugins/{pluginId}/{version}/Enable`+`Disable` (freshly repository-installed WASM plugin) — accepted-divergence: between install and the activating restart, Ferrofin 404s enable/disable (the plugin isn't in the registry until the boot that loads it) while Jellyfin already lists it restart-pending; uninstall works throughout (file-first path). Cosmetic pre-restart window only.
 - ⚠️ `GET /Plugins/{pluginId}/{version}/Image` — deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).
 - ⚠️ `GET /Providers/Lyrics/{lyricId}` — deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).
 - ⚠️ `GET /Providers/Subtitles/Subtitles/{subtitleId}` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.

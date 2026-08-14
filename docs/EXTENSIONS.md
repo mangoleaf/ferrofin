@@ -4,8 +4,8 @@ Jellyfin's plugin system loads **.NET assemblies at runtime**: you drop a `.dll`
 plugins directory and the server reflects over it, instantiates the plugin type, and calls
 into it through shared .NET interfaces. That mechanism has no Rust equivalent — there is no
 stable ABI for loading arbitrary compiled Rust code into a running process — and Ferrofin
-deliberately **does not fake one**. `/Plugins` install and uninstall are rejected, not
-stubbed to look like they worked.
+deliberately **does not fake one**. What the `/Plugins` install API installs instead is a
+sandboxed WASM component, never a native assembly.
 
 Instead, in-process plugins come in **two deliberate forms**, both surfaced through the
 exact same `/Plugins` API that dashboards already speak:
@@ -13,8 +13,9 @@ exact same `/Plugins` API that dashboards already speak:
 1. **Compiled-in extensions** (this document) — Jellyfin plugins ported into the Ferrofin
    codebase, reviewed like any other code, shipped inside the binary. Full trust, full
    access to internal seams.
-2. **WASM plugins** (below) — sandboxed `.wasm` components installed by dropping a file
-   into `{data_dir}/plugins/`, for plugins the Ferrofin repo has never seen.
+2. **WASM plugins** (below) — sandboxed `.wasm` components installed from a plugin
+   repository via the dashboard (or by dropping a file into `{data_dir}/plugins/`), for
+   plugins the Ferrofin repo has never seen.
 
 To a Jellyfin client, both look and behave like installed plugins: they appear in the
 dashboard's plugin list, have settings pages, and can be enabled or disabled at runtime
@@ -87,8 +88,21 @@ page → tests) is documented for contributors and agents in the `plan-plugin-po
 
 Runtime-installable plugins are **WebAssembly components** implementing the
 `ferrofin:plugin` world (`crates/ferrofin-wasm/wit/ferrofin-plugin.wit` — the single
-source of truth). Install = drop the `.wasm` file into `{data_dir}/plugins/` and restart,
-matching Jellyfin's restart-after-install flow. On boot each component is compiled,
+source of truth). Install matches Jellyfin's repository flow: an admin adds a plugin
+repository URL (Dashboard → Plugins → Repositories), picks the plugin from the catalog,
+and the server downloads, verifies, and stages it into `{data_dir}/plugins/`; a restart
+activates it (`SystemInfo.HasPendingRestart` flips true). Dropping the `.wasm` file into
+`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path).
+The repository install pipeline is deliberately strict, in order: the manifest's
+`targetAbi` must equal this server's plugin ABI; the download must be **HTTPS**
+(cleartext-to-loopback allowed only when the *configured repository* is itself loopback —
+a remote manifest can't point the server at localhost), redirects re-checked per hop; the
+size is capped while streaming (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`, default 128 MiB); the
+checksum must match (the manifest's `sha256` extension field preferred, else the
+Jellyfin-standard MD5 — integrity, not authenticity: HTTPS is the trust root); and the
+artifact must validate as a real `ferrofin:plugin` component whose self-reported id equals
+the catalog guid. Install, uninstall, and repository changes require an **administrator**
+(Jellyfin's `RequiresElevation`). On boot each component is compiled,
 interrogated for its identity (`descriptor`), seed config, and task list, and then
 registered through the same plugin manager as compiled-in extensions — same dashboard
 entry, same enable/disable toggle, same `/Plugins/{id}/Configuration` storage.

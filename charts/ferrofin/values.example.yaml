@@ -142,13 +142,16 @@ ferrofin:
     # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<otel-collector>.<namespace>.svc.cluster.local:4317"
     # OTEL_TRACES_SAMPLER_ARG: "0.25"
 
-    # WASM plugins (sandboxed, runtime-installed): place .wasm components at
-    # {data_dir}/plugins/ — i.e. under the DATA volume above — and restart the
-    # pod. The defaults below are generous; a well-behaved plugin uses a few
-    # MiB (the memory limit is a ceiling, never a reservation). Zero = unset.
+    # WASM plugins (sandboxed, runtime-installed): install from a plugin
+    # repository in the dashboard (Plugins → Repositories → Catalog), or place
+    # .wasm components at {data_dir}/plugins/ — under the DATA volume above —
+    # and restart the pod. The defaults below are generous; a well-behaved
+    # plugin uses a few MiB (the memory limit is a ceiling, never a
+    # reservation). Zero = unset.
     # FERROFIN_WASM_CALL_TIMEOUT_SECS: "30"     # per-call deadline for a plugin
     # FERROFIN_WASM_MEMORY_LIMIT_MB: "128"      # per-plugin memory cap
     # FERROFIN_WASM_EVENT_QUEUE_CAPACITY: "256" # per-plugin event queue depth
+    # FERROFIN_MAX_PLUGIN_DOWNLOAD_MB: "128"    # repository-install artifact size cap
     # Let SPECIFIC trusted plugins http-fetch private/LAN destinations
     # (default: denied for all; public internet is always allowed):
     # FERROFIN_WASM_PRIVATE_HTTP_ALLOW: "<plugin-uuid>,<plugin-uuid>"

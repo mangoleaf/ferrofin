@@ -688,7 +688,8 @@ pub async fn build_app_state(
             config.data_dir.join("plugins"),
             Arc::clone(&wasm_validator),
             Arc::clone(&lifecycle),
-        ),
+        )
+        .with_download_cap_mb(config.max_plugin_download_mb),
     );
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
@@ -1256,6 +1257,7 @@ mod tests {
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
             wasm_private_http_allow: None,
+            max_plugin_download_mb: None,
         }
     }
 

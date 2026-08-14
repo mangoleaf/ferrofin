@@ -126,6 +126,7 @@ struct FileConfig {
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
     wasm_private_http_allow: Option<String>,
+    max_plugin_download_mb: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -297,6 +298,14 @@ pub struct Config {
     /// `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` env > `wasm_private_http_allow`
     /// in `config.toml` > deny.
     pub wasm_private_http_allow: Option<String>,
+
+    /// Size cap on a plugin artifact downloaded during a repository install,
+    /// in MiB. `None` = the 128 MiB default (sized for interpreter-language
+    /// guests bundling their runtime; an abuse guard, not a tuning knob).
+    /// Resolved `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` env >
+    /// `max_plugin_download_mb` in `config.toml` > default; zero is treated
+    /// as unset.
+    pub max_plugin_download_mb: Option<u32>,
 }
 
 impl Config {
@@ -483,6 +492,8 @@ impl Config {
                 .var("FERROFIN_WASM_PRIVATE_HTTP_ALLOW")
                 .or(file.wasm_private_http_allow)
                 .filter(|s| !s.trim().is_empty()),
+            max_plugin_download_mb: parse_var(env, "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB")
+                .or(file.max_plugin_download_mb),
         })
     }
 
@@ -936,6 +947,12 @@ mod tests {
         assert_eq!(cfg.wasm_call_timeout_secs, None);
         assert_eq!(cfg.wasm_memory_limit_mb, None);
         assert_eq!(cfg.wasm_event_queue_capacity, None);
+        assert_eq!(cfg.max_plugin_download_mb, None);
+
+        // The plugin-download cap resolves from env like the others.
+        let env = FakeEnv::new().with("FERROFIN_MAX_PLUGIN_DOWNLOAD_MB", "256");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.max_plugin_download_mb, Some(256));
 
         // Env values apply.
         let env = FakeEnv::new()

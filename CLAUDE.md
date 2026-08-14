@@ -258,8 +258,11 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`docs/EXTENSIONS.md`): **compiled-in extensions** (Tier 1a, `ferrofin-extensions`) and
   **sandboxed WASM plugins** (Tier 1b, `ferrofin-wasm` — drop a `ferrofin:plugin` component
   into `{data_dir}/plugins/` and restart; no fs/network, capability-gated host API, enforced
-  memory/time limits). `/Plugins` catalog install/uninstall over HTTP is still rejected —
-  WASM install is file-drop + restart. When someone asks for a plugin, answer by tier:
+  memory/time limits). WASM plugins also install from a **configured plugin repository
+  over HTTP** (`POST /Packages/Installed/{name}`, admin-only): the server downloads
+  (HTTPS-required, size-capped), verifies the checksum, validates the component + identity,
+  stages the file, and flags restart-required — Jellyfin's exact flow; uninstall of a
+  staged WASM plugin is real too. When someone asks for a plugin, answer by tier:
   deep-hook ports go in `ferrofin-extensions` (PR), self-contained sources can be WASM;
   never invent a third mechanism. `.wasm` artifacts are NEVER committed (repo-wide
   gitignore); test fixtures are inline WAT, and the reference guest `examples/wasm-hello/`

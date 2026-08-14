@@ -108,35 +108,46 @@ impl RegisteredPlugin {
     }
 }
 
-/// The most bytes a plugin download may be. A `.wasm` component is tens of
-/// MB at worst (interpreter-language guests bundling their runtime); this is
-/// a runaway/abuse guard, not a tuning knob.
-const MAX_PLUGIN_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+/// The default cap on a plugin artifact download, in MiB
+/// (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` overrides it). Sized generously for
+/// interpreter-language guests bundling their runtime; an abuse guard, not a
+/// tuning knob.
+const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 
-/// Requires an `https://` URL, exempting loopback hosts (dev/test servers).
-/// The manifest checksum proves integrity, not authenticity — transport
-/// security is the trust root for plugin downloads.
-fn require_https(url: &str) -> Result<(), ServiceError> {
+/// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
+fn is_loopback_url(url: &str) -> bool {
+    // reqwest re-exports Url but not url::Host; host_str + IpAddr parse
+    // covers `localhost`, `127.x`, and bracketed `[::1]` alike.
+    url.parse::<reqwest::Url>().is_ok_and(|parsed| {
+        parsed.host_str().is_some_and(|h| {
+            h.eq_ignore_ascii_case("localhost")
+                || h.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    })
+}
+
+/// Requires an `https://` URL. The manifest checksum proves integrity, not
+/// authenticity — transport security is the trust root for plugin downloads.
+///
+/// `loopback_ok` exempts http-to-loopback, and is granted only when the
+/// *admin-configured* repository is itself loopback (a dev/test rig): a
+/// remote manifest must not be able to point `sourceUrl` at localhost and
+/// use the server as a blind local fetcher.
+fn require_https(url: &str, loopback_ok: bool) -> Result<(), ServiceError> {
     let parsed: reqwest::Url = url
         .parse()
         .map_err(|e| ServiceError::invalid_input(format!("invalid sourceUrl `{url}`: {e}")))?;
     if parsed.scheme() == "https" {
         return Ok(());
     }
-    // reqwest re-exports Url but not url::Host; host_str + IpAddr parse
-    // covers `localhost`, `127.x`, and bracketed `[::1]` alike.
-    let loopback = parsed.host_str().is_some_and(|h| {
-        h.eq_ignore_ascii_case("localhost")
-            || h.trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if parsed.scheme() == "http" && loopback {
+    if loopback_ok && parsed.scheme() == "http" && is_loopback_url(url) {
         return Ok(());
     }
     Err(ServiceError::invalid_input(format!(
-        "plugin downloads require https (got `{url}`); http is allowed for loopback only"
+        "plugin downloads require https (got `{url}`); http is allowed for loopback repositories only"
     )))
 }
 
@@ -152,17 +163,39 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Downloads a plugin artifact (HTTPS required — loopback exempt for dev;
-/// the checksum is integrity-only, so the transport is the trust root),
-/// enforces the size cap, and verifies the checksum: the `sha256` extension
-/// wins when the manifest provides it, else the Jellyfin-standard MD5.
+/// Downloads a plugin artifact (HTTPS required on every redirect hop —
+/// loopback exempt for dev repositories; the checksum is integrity-only, so
+/// the transport is the trust root), enforces `cap_bytes` on the *streamed*
+/// byte count, and verifies the checksum: the `sha256` extension wins when
+/// the manifest provides it, else the Jellyfin-standard MD5.
 async fn download_and_verify(
     source_url: &str,
     name: &str,
     chosen: &ferrofin_model::updates::VersionInfo,
+    loopback_ok: bool,
+    cap_bytes: u64,
 ) -> Result<Vec<u8>, ServiceError> {
-    require_https(source_url)?;
-    let response = reqwest::get(source_url)
+    require_https(source_url, loopback_ok)?;
+    // GitHub release assets 302 to a CDN, so redirects must be followed —
+    // but the default policy would happily follow https → http → an internal
+    // host. Re-run the transport check on every hop instead. (10 = reqwest's
+    // own default hop limit.)
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else if require_https(attempt.url().as_str(), loopback_ok).is_ok() {
+            attempt.follow()
+        } else {
+            attempt.error("insecure redirect target (plugin downloads require https)")
+        }
+    });
+    let client = reqwest::Client::builder()
+        .redirect(policy)
+        .build()
+        .map_err(|e| ServiceError::backend(format!("building download client: {e}")))?;
+    let mut response = client
+        .get(source_url)
+        .send()
         .await
         .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
     if !response.status().is_success() {
@@ -171,22 +204,27 @@ async fn download_and_verify(
             response.status()
         )));
     }
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_PLUGIN_DOWNLOAD_BYTES)
-    {
-        return Err(ServiceError::invalid_input(format!(
-            "plugin artifact exceeds the {MAX_PLUGIN_DOWNLOAD_BYTES}-byte limit"
-        )));
+    let too_big = || {
+        ServiceError::invalid_input(format!(
+            "plugin artifact exceeds the {cap_bytes}-byte limit"
+        ))
+    };
+    // The declared length fast-fails an honest oversized artifact; the
+    // running count below is the enforcement (Content-Length is advisory —
+    // absent on chunked responses, and a hostile server can lie).
+    if response.content_length().is_some_and(|len| len > cap_bytes) {
+        return Err(too_big());
     }
-    let bytes = response
-        .bytes()
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?;
-    if bytes.len() as u64 > MAX_PLUGIN_DOWNLOAD_BYTES {
-        return Err(ServiceError::invalid_input(format!(
-            "plugin artifact exceeds the {MAX_PLUGIN_DOWNLOAD_BYTES}-byte limit"
-        )));
+        .map_err(|e| ServiceError::backend(format!("downloading {source_url}: {e}")))?
+    {
+        if (bytes.len() + chunk.len()) as u64 > cap_bytes {
+            return Err(too_big());
+        }
+        bytes.extend_from_slice(&chunk);
     }
 
     if let Some(expected) = chosen.sha256.as_deref().filter(|c| !c.is_empty()) {
@@ -211,17 +249,20 @@ async fn download_and_verify(
             chosen.version
         )));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Sort key for version strings: numeric segments compared numerically
-/// (`10.2.0` > `9.9.9`), with non-numeric tails breaking ties textually.
-fn version_sort_key(version: &str) -> (Vec<u64>, String) {
-    let nums = version
-        .split(['.', '-', '+'])
+/// (`10.2.0` > `9.9.9`); a prerelease (`1.0.0-rc1`) sorts *below* the
+/// release it precedes (the semver rule), and remaining ties break textually.
+fn version_sort_key(version: &str) -> (Vec<u64>, bool, String) {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let nums = core
+        .split('.')
         .map_while(|seg| seg.parse::<u64>().ok())
         .collect();
-    (nums, version.to_owned())
+    let is_release = !version.contains('-');
+    (nums, is_release, version.to_owned())
 }
 
 /// The on-disk mutable plugin state (persisted to `{plugins_dir}/state.json`).
@@ -252,6 +293,8 @@ pub struct FerrofinPluginManager {
     validator: Option<Arc<dyn PluginArtifactValidator>>,
     /// Flags restart-required after an install/uninstall.
     lifecycle: Option<Arc<dyn LifecycleController>>,
+    /// The plugin-download size cap, in bytes (`FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`).
+    max_download_bytes: u64,
 }
 
 impl std::fmt::Debug for FerrofinPluginManager {
@@ -282,6 +325,7 @@ impl FerrofinPluginManager {
             wasm_plugins_dir: None,
             validator: None,
             lifecycle: None,
+            max_download_bytes: u64::from(DEFAULT_PLUGIN_DOWNLOAD_MB) * 1024 * 1024,
         }
     }
 
@@ -298,6 +342,16 @@ impl FerrofinPluginManager {
         self.wasm_plugins_dir = Some(wasm_plugins_dir);
         self.validator = Some(validator);
         self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Overrides the plugin-download size cap, in MiB. `None`/zero keeps the
+    /// default ([`DEFAULT_PLUGIN_DOWNLOAD_MB`]).
+    #[must_use]
+    pub fn with_download_cap_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|mb| *mb > 0) {
+            self.max_download_bytes = u64::from(mb) * 1024 * 1024;
+        }
         self
     }
 
@@ -324,7 +378,7 @@ impl FerrofinPluginManager {
             .ok_or_else(|| ServiceError::backend("plugin path has no parent"))?;
         std::fs::create_dir_all(parent)
             .map_err(|e| ServiceError::backend(format!("create {}: {e}", parent.display())))?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes)
             .map_err(|e| ServiceError::backend(format!("write {}: {e}", tmp.display())))?;
         std::fs::rename(&tmp, path)
@@ -456,13 +510,11 @@ impl PluginManager for FerrofinPluginManager {
             .filter(|v| version.is_none_or(|want| v.version == want))
             .collect();
         candidates.sort_by_cached_key(|v| version_sort_key(&v.version));
-        let chosen = candidates
-            .last()
-            .ok_or_else(|| {
-                ServiceError::not_found(format!(
-                    "package {name} has no matching version (version={version:?},                      repository={repository_url:?})"
-                ))
-            })?;
+        let chosen = candidates.last().ok_or_else(|| {
+            ServiceError::not_found(format!(
+                "package {name} has no matching version (version={version:?}, repository={repository_url:?})"
+            ))
+        })?;
         let source_url = chosen
             .source_url
             .as_deref()
@@ -487,7 +539,25 @@ impl PluginManager for FerrofinPluginManager {
         }
 
         // 3–4. Download (HTTPS required, size-capped) and verify integrity.
-        let bytes = download_and_verify(source_url, name, chosen).await?;
+        // The http-loopback exemption is granted by the *admin's* repository
+        // configuration (a loopback repo = a dev rig), never by the remote
+        // manifest's own sourceUrl — see `require_https`.
+        let loopback_ok = {
+            let state = self.state.lock().expect("plugin state lock poisoned");
+            state
+                .repositories
+                .iter()
+                .filter(|r| r.enabled)
+                .any(|r| r.url.as_deref().is_some_and(is_loopback_url))
+        };
+        let bytes = download_and_verify(
+            source_url,
+            name,
+            chosen,
+            loopback_ok,
+            self.max_download_bytes,
+        )
+        .await?;
 
         // 5. Validate the artifact is a real plugin component and that its
         //    self-reported id matches the catalog guid (otherwise enable/
@@ -573,9 +643,8 @@ impl PluginManager for FerrofinPluginManager {
         // Fetch and aggregate the enabled repositories' plugin manifests (each a
         // JSON `PackageInfo[]`), mirroring `InstallationManager.GetAvailablePackages`.
         // A repository that is unreachable or serves malformed JSON is skipped with
-        // a warning rather than failing the whole catalog. (Runtime installation of
-        // what this lists is still unsupported — Ferrofin has no dynamic plugin host —
-        // so this populates the browse catalog only.)
+        // a warning rather than failing the whole catalog. What this lists is
+        // installable via `install_package` when the installer is armed.
         let repos: Vec<RepositoryInfo> = {
             let state = self.state.lock().expect("plugin state lock poisoned");
             state
@@ -869,18 +938,17 @@ mod tests {
 
     use crate::system_manager::LifecycleController as _;
 
-    /// A tiny multi-request loopback HTTP server: binds first (so the base
-    /// URL can be embedded in the manifest), then serves `manifest` at
-    /// `/manifest.json` and `artifact` at `/plugin.wasm` until dropped.
-    fn repo_server(
-        manifest_for: impl FnOnce(&str) -> String,
-        artifact: Vec<u8>,
+    /// A tiny loopback HTTP server: binds first (so the base URL can be
+    /// embedded in responses), then answers each request with whatever raw
+    /// bytes `respond(request)` returns, until dropped.
+    fn raw_server(
+        respond_for: impl FnOnce(&str) -> Box<dyn Fn(&str) -> Vec<u8> + Send>,
     ) -> (String, std::sync::mpsc::Sender<()>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
-        let manifest = manifest_for(&format!("http://{addr}"));
+        let respond = respond_for(&format!("http://{addr}"));
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             loop {
@@ -893,19 +961,7 @@ mod tests {
                         let mut buf = [0u8; 4096];
                         let n = stream.read(&mut buf).unwrap_or(0);
                         let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        let (body, kind): (&[u8], &str) = if request.contains("/plugin.wasm") {
-                            (&artifact, "application/wasm")
-                        } else {
-                            (manifest.as_bytes(), "application/json")
-                        };
-                        let _ = stream.write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                                body.len()
-                            )
-                            .as_bytes(),
-                        );
-                        let _ = stream.write_all(body);
+                        let _ = stream.write_all(&respond(&request));
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -915,6 +971,35 @@ mod tests {
             }
         });
         (format!("http://{addr}"), stop_tx)
+    }
+
+    /// An HTTP/1.1 200 response with a content-length header.
+    fn http_ok(kind: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The standard rig server: `manifest` at `/manifest.json`, `artifact`
+    /// at `/plugin.wasm`.
+    fn repo_server(
+        manifest_for: impl FnOnce(&str) -> String,
+        artifact: Vec<u8>,
+    ) -> (String, std::sync::mpsc::Sender<()>) {
+        raw_server(move |base| {
+            let manifest = manifest_for(base);
+            Box::new(move |request| {
+                if request.contains("/plugin.wasm") {
+                    http_ok("application/wasm", &artifact)
+                } else {
+                    http_ok("application/json", manifest.as_bytes())
+                }
+            })
+        })
     }
 
     /// Validator stub: reports a fixed id (or an error).
@@ -969,7 +1054,6 @@ mod tests {
         wasm_dir: std::path::PathBuf,
         _dirs: (tempfile::TempDir, tempfile::TempDir),
         _stop: std::sync::mpsc::Sender<()>,
-        base: String,
     }
 
     async fn install_rig(
@@ -1009,7 +1093,6 @@ mod tests {
             wasm_dir,
             _dirs: (state_dir, wasm_root),
             _stop: stop2,
-            base,
         }
     }
 
@@ -1033,7 +1116,6 @@ mod tests {
         assert!(!staged.exists(), "artifact removed");
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
-        let _ = &rig.base;
     }
 
     #[tokio::test]
@@ -1155,12 +1237,112 @@ mod tests {
 
     #[test]
     fn https_is_required_except_loopback() {
-        assert!(super::require_https("https://example.com/p.wasm").is_ok());
-        assert!(super::require_https("http://127.0.0.1:9/p.wasm").is_ok());
-        assert!(super::require_https("http://localhost:9/p.wasm").is_ok());
-        assert!(super::require_https("http://[::1]:9/p.wasm").is_ok());
-        assert!(super::require_https("http://example.com/p.wasm").is_err());
-        assert!(super::require_https("http://192.168.1.10/p.wasm").is_err());
-        assert!(super::require_https("ftp://example.com/p.wasm").is_err());
+        assert!(super::require_https("https://example.com/p.wasm", false).is_ok());
+        assert!(super::require_https("http://127.0.0.1:9/p.wasm", true).is_ok());
+        assert!(super::require_https("http://localhost:9/p.wasm", true).is_ok());
+        assert!(super::require_https("http://[::1]:9/p.wasm", true).is_ok());
+        assert!(super::require_https("http://example.com/p.wasm", true).is_err());
+        assert!(super::require_https("http://192.168.1.10/p.wasm", true).is_err());
+        assert!(super::require_https("ftp://example.com/p.wasm", true).is_err());
+        // The exemption is opt-in (granted only by an admin-configured
+        // loopback repository) — a remote manifest pointing sourceUrl at
+        // localhost gets refused.
+        assert!(super::require_https("http://127.0.0.1:9/p.wasm", false).is_err());
+        assert!(super::require_https("http://localhost:9/p.wasm", false).is_err());
+    }
+
+    #[test]
+    fn prerelease_sorts_below_its_release() {
+        assert!(super::version_sort_key("1.0.0") > super::version_sort_key("1.0.0-rc1"));
+        assert!(super::version_sort_key("1.0.1-rc1") > super::version_sort_key("1.0.0"));
+        assert!(super::version_sort_key("0.10.0") > super::version_sort_key("0.9.9"));
+    }
+
+    #[tokio::test]
+    async fn download_cap_enforced_on_streamed_bytes_not_content_length() {
+        // The server omits content-length entirely (body ends at EOF), so
+        // only the running streamed count can enforce the cap.
+        let artifact = vec![0u8; 2 * 1024 * 1024];
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let (base, _stop) = raw_server(|base| {
+            let manifest = manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0");
+            Box::new(move |request| {
+                if request.contains("/plugin.wasm") {
+                    let mut out =
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/wasm\r\nconnection: close\r\n\r\n"
+                            .to_vec();
+                    out.extend_from_slice(&vec![0u8; 2 * 1024 * 1024]);
+                    out
+                } else {
+                    http_ok("application/json", manifest.as_bytes())
+                }
+            })
+        });
+        let mgr = FerrofinPluginManager::new(Vec::new(), state_dir.path().to_path_buf())
+            .with_installer(
+                wasm_root.path().join("plugins"),
+                Arc::new(StubValidator {
+                    id: Ok(PKG_ID),
+                    abi: "ferrofin:plugin@0.1.0",
+                }),
+                Arc::new(FlagLifecycle(AtomicBool::new(false))),
+            )
+            .with_download_cap_mb(Some(1));
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let err = mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn insecure_redirects_are_refused() {
+        // The artifact endpoint 302s to a cleartext non-loopback host; the
+        // per-hop redirect policy must refuse to follow it.
+        let artifact = b"bytes".to_vec();
+        let md5 = ferrofin_common::extensions::md5_hex(&artifact);
+        let state_dir = tempfile::tempdir().unwrap();
+        let wasm_root = tempfile::tempdir().unwrap();
+        let (base, _stop) = raw_server(|base| {
+            let manifest = manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0");
+            Box::new(move |request| {
+                if request.contains("/plugin.wasm") {
+                    b"HTTP/1.1 302 Found\r\nlocation: http://192.0.2.1/evil.wasm\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    http_ok("application/json", manifest.as_bytes())
+                }
+            })
+        });
+        let mgr = FerrofinPluginManager::new(Vec::new(), state_dir.path().to_path_buf())
+            .with_installer(
+                wasm_root.path().join("plugins"),
+                Arc::new(StubValidator {
+                    id: Ok(PKG_ID),
+                    abi: "ferrofin:plugin@0.1.0",
+                }),
+                Arc::new(FlagLifecycle(AtomicBool::new(false))),
+            );
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("test".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let err = mgr
+            .install_package("HelloPkg", None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("redirect"), "{err}");
     }
 }

@@ -378,3 +378,45 @@ async fn packages_are_empty_and_install_rejected() {
         .expect("resp");
     assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn plugin_mutations_require_an_administrator() {
+    // A plain authenticated user (no admin policy, not an API key) must get
+    // 403 from every plugin-mutating route — install would otherwise let any
+    // account stage arbitrary code for the next boot.
+    use ferrofin_api::test_support::user_authed_state_with_plugins;
+    let fake = Arc::new(RecordingPlugins::default());
+    let router = || create_router(user_authed_state_with_plugins(fake.clone()));
+
+    for (method, uri, body) in [
+        ("POST", "/Repositories".to_owned(), Body::from("[]")),
+        (
+            "POST",
+            "/Packages/Installed/Anything".to_owned(),
+            Body::empty(),
+        ),
+        ("DELETE", format!("/Plugins/{}", known_id()), Body::empty()),
+        (
+            "DELETE",
+            format!("/Plugins/{}/1.0.0", known_id()),
+            Body::empty(),
+        ),
+        (
+            "DELETE",
+            format!("/Packages/Installing/{}", Uuid::from_u128(7)),
+            Body::empty(),
+        ),
+    ] {
+        let resp = router()
+            .oneshot(authed(method, &uri, body))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    // The reads stay plain-auth: the catalog is browseable by any account.
+    let resp = router()
+        .oneshot(authed("GET", "/Repositories", Body::empty()))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+}

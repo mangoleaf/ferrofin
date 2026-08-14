@@ -69,8 +69,9 @@ Precise about what's absent — this is what keeps the rest of the matrix credib
 - **.NET-style native plugin loading** — never (no stable Rust ABI; full-trust loading is
   rejected by design). In-process plugins ship as compiled-in extensions (Tier 1a) or
   sandboxed, runtime-installed WASM components (Tier 1b) — see
-  [`EXTENSIONS.md`](EXTENSIONS.md). `/Plugins` catalog install/uninstall over HTTP is
-  rejected; WASM install is drop-file-and-restart.
+  [`EXTENSIONS.md`](EXTENSIONS.md). WASM plugins install from configured plugin
+  repositories over the dashboard's catalog (download → verify → stage → restart,
+  Jellyfin's flow); uninstalling a compiled-in plugin is still rejected.
 - **DLNA server discovery (SSDP)** — no SSDP broadcast/discovery.
 
 ## Regenerating this
