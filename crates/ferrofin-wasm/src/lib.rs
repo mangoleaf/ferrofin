@@ -25,7 +25,7 @@ pub mod capabilities;
 pub mod runtime;
 
 /// The hand-written canonical-ABI component implementing the
-/// `ferrofin:plugin@0.1.0` world, as WAT text — the shared test fixture for
+/// `ferrofin:plugin@0.2.0` world, as WAT text — the shared test fixture for
 /// this crate's host tests and the server-level HTTP test (compiled at test
 /// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
 /// API: test support only.
@@ -41,7 +41,9 @@ use uuid::Uuid;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config as WasmConfig, Engine};
 
-use ferrofin_core::{FerrofinEventManager, RegisteredPlugin, ScheduledTask, TaskProgress};
+use ferrofin_core::{
+    FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 
@@ -154,6 +156,10 @@ pub struct LoadedPlugin {
     pub default_config: Vec<u8>,
     /// The guest's advertised tasks.
     pub tasks: Vec<bindings::types::TaskDescriptor>,
+    /// The guest's authored dashboard settings pages (may be empty — the
+    /// host synthesizes a generic JSON editor in that case; see
+    /// [`fallback_config_page`]).
+    pub config_pages: Vec<bindings::types::ConfigPage>,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -223,61 +229,10 @@ impl WasmPluginHost {
     /// Only if the OS refuses to spawn the epoch-ticker thread (startup-time
     /// resource exhaustion — the process is already unviable).
     pub fn load(plugins_dir: &Path, settings: &WasmSettings) -> Result<Self, ServiceError> {
-        let mut config = WasmConfig::new();
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config)
-            .map_err(|e| ServiceError::backend(format!("wasm engine init failed: {e:#}")))?;
-
-        // One ticker advances the epoch for every plugin of this engine.
-        // 1 tick == 1 second == the unit of FERROFIN_WASM_CALL_TIMEOUT_SECS.
-        // The ticker holds only a WEAK engine handle: when the last real
-        // handle drops (host discarded — e.g. repeated loads in tests), the
-        // upgrade fails and the thread exits instead of pinning the engine
-        // and its compiled code forever.
-        {
-            let engine = engine.weak();
-            std::thread::Builder::new()
-                .name("wasm-epoch-ticker".to_owned())
-                .spawn(move || {
-                    loop {
-                        std::thread::sleep(EPOCH_TICK);
-                        let Some(engine) = engine.upgrade() else {
-                            break;
-                        };
-                        engine.increment_epoch();
-                    }
-                })
-                .expect("spawning the wasm epoch ticker cannot fail");
-        }
-
-        let mut linker: Linker<HostState> = Linker::new(&engine);
-        bindings::Plugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-            &mut linker,
-            |state| state,
-        )
-        .map_err(|e| ServiceError::backend(format!("wasm linker setup failed: {e:#}")))?;
-        // Locked-down WASI so std guests link (the ctx grants nothing — see
-        // HostState). Failure here is the same misconfiguration class as the
-        // world linker above.
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
-        let linker = Arc::new(linker);
-
-        // One HTTP client per host: the guest-call deadline doubles as the
-        // request timeout, so a hung remote can't outlive the call budget.
-        let http = Arc::new(
-            reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(u64::from(
-                    settings.call_timeout_secs,
-                )))
-                // No transparent redirects: any future destination policy
-                // would be bypassed by a 302, and a guest that wants to
-                // follow one can read the Location header and re-fetch.
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
-        );
+        let (engine, linker) = build_runtime_parts(settings)?;
+        // load() runs on a blocking thread (spawn_blocking at the composition
+        // root), so eager client construction is safe here.
+        let http = build_guest_http_client(settings)?;
         let collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>> =
             Arc::new(std::sync::OnceLock::new());
 
@@ -330,7 +285,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.1.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.2.0 \
                          component); skipping this file"
                     );
                 }
@@ -398,8 +353,12 @@ impl WasmPluginHost {
         self.plugins
             .iter()
             .map(|p| {
-                RegisteredPlugin::new(p.descriptor.clone(), None)
-                    .with_default_config(p.default_config.clone())
+                let mut registered = RegisteredPlugin::new(p.descriptor.clone(), None)
+                    .with_default_config(p.default_config.clone());
+                for page in config_pages_for(&p.descriptor, &p.config_pages) {
+                    registered = registered.with_config_page(page);
+                }
+                registered
             })
             .collect()
     }
@@ -519,6 +478,7 @@ fn load_one(
         wasmtime::Error::msg(format!("plugin default-config is not valid JSON: {e}"))
     })?;
     let tasks = instance.call_tasks(&mut store)?;
+    let config_pages = instance.call_config_pages(&mut store)?;
 
     let descriptor = PluginDescriptor {
         id,
@@ -556,9 +516,311 @@ fn load_one(
         descriptor,
         default_config: default_config.into_bytes(),
         tasks,
+        config_pages,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
+}
+
+/// Builds the shared wasm runtime pieces: an epoch-ticked engine (weak-held
+/// by its ticker thread) and the world+WASI linker. Shared by
+/// [`WasmPluginHost::load`] and [`WasmArtifactValidator`] so they can never
+/// drift. The guest HTTP client is built separately
+/// ([`build_guest_http_client`]) because `reqwest::blocking::Client`
+/// construction panics inside an async runtime context — callers must build
+/// it on a blocking thread.
+fn build_runtime_parts(
+    settings: &WasmSettings,
+) -> Result<(Engine, Arc<Linker<HostState>>), ServiceError> {
+    let _ = settings; // engine construction has no tunables today
+    let mut config = WasmConfig::new();
+    config.epoch_interruption(true);
+    let engine = Engine::new(&config)
+        .map_err(|e| ServiceError::backend(format!("wasm engine init failed: {e:#}")))?;
+
+    // One ticker advances the epoch for every plugin of this engine.
+    // 1 tick == 1 second == the unit of FERROFIN_WASM_CALL_TIMEOUT_SECS.
+    // The ticker holds only a WEAK engine handle: when the last real handle
+    // drops, the upgrade fails and the thread exits instead of pinning the
+    // engine and its compiled code forever.
+    {
+        let engine = engine.weak();
+        std::thread::Builder::new()
+            .name("wasm-epoch-ticker".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK);
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
+                    engine.increment_epoch();
+                }
+            })
+            .expect("spawning the wasm epoch ticker cannot fail");
+    }
+
+    let mut linker: Linker<HostState> = Linker::new(&engine);
+    bindings::Plugin::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        &mut linker,
+        |state| state,
+    )
+    .map_err(|e| ServiceError::backend(format!("wasm linker setup failed: {e:#}")))?;
+    // Locked-down WASI so std guests link (the ctx grants nothing — see
+    // HostState).
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|e| ServiceError::backend(format!("wasi linker setup failed: {e:#}")))?;
+    let linker = Arc::new(linker);
+
+    Ok((engine, linker))
+}
+
+/// The guest HTTP client: call-timeout bound, redirects off. MUST be built
+/// on a blocking thread — `reqwest::blocking::Client` construction (and
+/// drop) panics inside an async runtime context.
+fn build_guest_http_client(
+    settings: &WasmSettings,
+) -> Result<Arc<reqwest::blocking::Client>, ServiceError> {
+    Ok(Arc::new(
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(u64::from(
+                settings.call_timeout_secs,
+            )))
+            // No transparent redirects: any destination policy would be
+            // bypassed by a 302 — a guest can follow Location itself.
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| ServiceError::backend(format!("wasm http client init: {e:#}")))?,
+    ))
+}
+
+/// Projects a plugin's authored settings pages into the shared registry
+/// shape — or, when the guest ships none, a synthesized generic JSON editor
+/// over its configuration, so every WASM plugin is configurable from the
+/// dashboard (jellyfin-web only shows a Settings button for plugins with a
+/// page carrying their `PluginId`).
+fn config_pages_for(
+    descriptor: &PluginDescriptor,
+    authored: &[bindings::types::ConfigPage],
+) -> Vec<PluginConfigPage> {
+    // Guest page bytes are held resident and cloned per (anonymous) request
+    // to `GET /web/ConfigurationPage`, so they must be bounded at load —
+    // otherwise a hostile plugin turns that endpoint into an unauthenticated
+    // memory amplifier. Hardcoded like the manifest cap: real plugin pages
+    // are tens of KB, so these are abuse guards, not tuning knobs.
+    const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_PLUGIN_PAGES_BYTES: usize = 16 * 1024 * 1024;
+    let mut total = 0usize;
+    let kept: Vec<PluginConfigPage> = authored
+        .iter()
+        .filter(|page| {
+            let within = page.content.len() <= MAX_PAGE_BYTES
+                && total + page.content.len() <= MAX_PLUGIN_PAGES_BYTES;
+            if within {
+                total += page.content.len();
+            } else {
+                tracing::warn!(
+                    plugin = %descriptor.id,
+                    page = %page.name,
+                    bytes = page.content.len(),
+                    "wasm plugin settings page exceeds the size cap; dropping it"
+                );
+            }
+            within
+        })
+        .map(|page| PluginConfigPage {
+            name: page.name.clone(),
+            bytes: page.content.clone(),
+            enable_in_main_menu: page.enable_in_main_menu,
+        })
+        .collect();
+    if kept.is_empty() {
+        // No usable authored page (none shipped, or all oversized) — the
+        // synthesized editor keeps the plugin configurable either way.
+        return vec![fallback_config_page(descriptor)];
+    }
+    kept
+}
+
+/// The synthesized settings page: the canonical jellyfin-web plugin-page
+/// shape (`data-role="page"` root + inline script using the `ApiClient` /
+/// `Dashboard` globals) wrapping a JSON editor over the plugin's config —
+/// loaded via `ApiClient.getPluginConfiguration` and saved via
+/// `ApiClient.updatePluginConfiguration`, exactly like an authored page.
+///
+/// The page name is `wasm-settings-{id}` — unique per plugin and stable, so
+/// dashboard bookmarks survive restarts.
+fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
+    // The id is a validated UUID (safe to embed raw); the display name is
+    // guest-supplied and must be escaped for the HTML context.
+    let id = descriptor.id;
+    let title = escape_html(&descriptor.name);
+    let html = format!(
+        r#"<div id="wasmConfig-{id}" data-role="page" class="page type-interior pluginConfigurationPage">
+  <div data-role="content"><div class="content-primary">
+    <form class="wasmConfigForm">
+      <h1>{title}</h1>
+      <p>This plugin ships no settings page of its own; edit its configuration JSON directly.</p>
+      <div class="inputContainer">
+        <textarea is="emby-textarea" class="textarea-mono wasmConfigJson" rows="16" spellcheck="false" style="width:100%;font-family:monospace;"></textarea>
+      </div>
+      <button is="emby-button" type="submit" class="raised button-submit block"><span>Save</span></button>
+    </form>
+  </div></div>
+  <script type="text/javascript">
+  (function () {{
+    var pluginId = '{id}';
+    var page = document.querySelector('#wasmConfig-{id}');
+    page.addEventListener('pageshow', function () {{
+      Dashboard.showLoadingMsg();
+      ApiClient.getPluginConfiguration(pluginId).then(function (config) {{
+        page.querySelector('.wasmConfigJson').value = JSON.stringify(config, null, 2);
+        Dashboard.hideLoadingMsg();
+      }}).catch(Dashboard.processErrorResponse);
+    }});
+    page.querySelector('.wasmConfigForm').addEventListener('submit', function (e) {{
+      e.preventDefault();
+      var parsed;
+      try {{
+        parsed = JSON.parse(page.querySelector('.wasmConfigJson').value);
+      }} catch (err) {{
+        Dashboard.alert('Configuration must be valid JSON: ' + err.message);
+        return false;
+      }}
+      Dashboard.showLoadingMsg();
+      ApiClient.updatePluginConfiguration(pluginId, parsed).then(
+        Dashboard.processPluginConfigurationUpdateResult
+      ).catch(Dashboard.processErrorResponse);
+      return false;
+    }});
+  }})();
+  </script>
+</div>
+"#
+    );
+    PluginConfigPage {
+        name: format!("wasm-settings-{id}"),
+        bytes: html.into_bytes(),
+        enable_in_main_menu: false,
+    }
+}
+
+/// Minimal HTML text-context escaping for guest-supplied strings embedded
+/// in the synthesized page.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
+/// world version from `wit/ferrofin-plugin.wit` (a test guards against
+/// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.2.0";
+
+/// The install-time artifact validator: proves a downloaded `.wasm` is a
+/// loadable `ferrofin:plugin` component and reports its self-declared id,
+/// in a throwaway store with the standard limits. The store's capability
+/// cell is never armed and `http-fetch` is denied during load, so the
+/// artifact is **network-mute** while being validated — a malicious
+/// component cannot phone home from its `descriptor` export.
+pub struct WasmArtifactValidator {
+    engine: Engine,
+    linker: Arc<Linker<HostState>>,
+    /// Built lazily on the first validation's blocking thread —
+    /// `reqwest::blocking::Client` construction panics in async contexts,
+    /// and `new()` is called from the (async) composition root.
+    http: Arc<std::sync::OnceLock<Arc<reqwest::blocking::Client>>>,
+    settings: WasmSettings,
+}
+
+impl WasmArtifactValidator {
+    /// Builds a validator with its own engine (same construction as the
+    /// plugin host, via the shared builder). Safe to call from async
+    /// contexts — the blocking HTTP client is deferred to first use.
+    ///
+    /// # Errors
+    /// Engine/linker construction failure (a wasmtime misconfiguration).
+    pub fn new(settings: &WasmSettings) -> Result<Self, ServiceError> {
+        let (engine, linker) = build_runtime_parts(settings)?;
+        Ok(Self {
+            engine,
+            linker,
+            http: Arc::new(std::sync::OnceLock::new()),
+            settings: settings.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator {
+    fn supported_abi(&self) -> &str {
+        PLUGIN_ABI
+    }
+
+    async fn validate(&self, bytes: &[u8]) -> Result<Uuid, ServiceError> {
+        let engine = self.engine.clone();
+        let linker = Arc::clone(&self.linker);
+        let http_cell = Arc::clone(&self.http);
+        let settings = self.settings.clone();
+        let bytes = bytes.to_vec();
+        // Compilation + the descriptor call are CPU-bound guest work — off
+        // the async workers, exactly like the plugin runtime threads.
+        tokio::task::spawn_blocking(move || {
+            // Blocking thread: safe place to build the blocking client.
+            let http = if let Some(client) = http_cell.get() {
+                Arc::clone(client)
+            } else {
+                let client = build_guest_http_client(&settings)?;
+                let _ = http_cell.set(Arc::clone(&client));
+                client
+            };
+            let component = Component::new(&engine, &bytes).map_err(|e| {
+                ServiceError::invalid_input(format!(
+                    "artifact is not a valid WebAssembly component for {PLUGIN_ABI}: {e:#}"
+                ))
+            })?;
+            let spec = InstanceSpec {
+                engine,
+                component,
+                linker,
+                plugin_name: "install-validation".to_owned(),
+                plugin_id: String::new(),
+                memory_limit_bytes: settings.memory_limit_mb as usize * 1024 * 1024,
+                timeout_ticks: u64::from(settings.call_timeout_secs),
+                http,
+                private_http_allowed: false,
+                // Never armed: query-items/write-media-segments/http-fetch
+                // all refuse during validation.
+                collaborators: Arc::new(std::sync::OnceLock::new()),
+            };
+            let (mut store, instance) = spec.instantiate(String::from("{}")).map_err(|e| {
+                ServiceError::invalid_input(format!(
+                    "artifact does not instantiate as a {PLUGIN_ABI} plugin: {e:#}"
+                ))
+            })?;
+            let wire = instance.call_descriptor(&mut store).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact descriptor call failed: {e:#}"))
+            })?;
+            wire.id.parse::<Uuid>().map_err(|_| {
+                ServiceError::invalid_input(format!(
+                    "artifact descriptor id `{}` is not a valid UUID",
+                    wire.id
+                ))
+            })
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("validation task failed: {e}")))?
+    }
 }
 
 /// The [`DynamicMetadataProvider`] adapter for one loaded plugin: converts
@@ -709,5 +971,81 @@ impl ScheduledTask for WasmTask {
             .run_task(self.task.id.clone(), config)
             .await
             .map_err(ServiceError::backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor() -> PluginDescriptor {
+        PluginDescriptor {
+            id: Uuid::from_u128(7),
+            name: "Evil <img src=x onerror=alert(1)> & \"Co\"".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: "d".to_owned(),
+            enabled: true,
+            has_image: false,
+            can_uninstall: false,
+        }
+    }
+
+    #[test]
+    fn authored_pages_pass_through_unchanged() {
+        let authored = vec![bindings::types::ConfigPage {
+            name: "mypage".to_owned(),
+            content: b"<div data-role=\"page\">x</div>".to_vec(),
+            enable_in_main_menu: true,
+        }];
+        let pages = config_pages_for(&descriptor(), &authored);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, "mypage");
+        assert!(pages[0].enable_in_main_menu);
+        assert_eq!(pages[0].bytes, authored[0].content);
+    }
+
+    #[test]
+    fn oversized_pages_are_dropped_and_the_fallback_covers_a_total_loss() {
+        let d = descriptor();
+        let big = bindings::types::ConfigPage {
+            name: "big".to_owned(),
+            content: vec![0u8; 4 * 1024 * 1024 + 1],
+            enable_in_main_menu: false,
+        };
+        let small = bindings::types::ConfigPage {
+            name: "small".to_owned(),
+            content: b"<div data-role=\"page\">ok</div>".to_vec(),
+            enable_in_main_menu: false,
+        };
+        // Mixed: the oversized page is dropped, the small one survives.
+        let pages = config_pages_for(&d, &[big.clone(), small]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, "small");
+        // All oversized: the synthesized editor takes over.
+        let pages = config_pages_for(&d, &[big]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, format!("wasm-settings-{}", d.id));
+    }
+
+    #[test]
+    fn missing_pages_synthesize_the_json_editor() {
+        let d = descriptor();
+        let pages = config_pages_for(&d, &[]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, format!("wasm-settings-{}", d.id));
+        assert!(!pages[0].enable_in_main_menu);
+        let html = String::from_utf8(pages[0].bytes.clone()).unwrap();
+        // The canonical jellyfin-web page shape + the save round-trip calls.
+        assert!(html.contains("data-role=\"page\""), "{html}");
+        assert!(html.contains("ApiClient.getPluginConfiguration"), "{html}");
+        assert!(
+            html.contains("ApiClient.updatePluginConfiguration"),
+            "{html}"
+        );
+        assert!(html.contains(&d.id.to_string()), "plugin id embedded");
+        // Guest-supplied name is escaped for the HTML context.
+        assert!(!html.contains("<img"), "unescaped guest name: {html}");
+        assert!(html.contains("&lt;img"), "{html}");
+        assert!(html.contains("&amp;"), "{html}");
     }
 }

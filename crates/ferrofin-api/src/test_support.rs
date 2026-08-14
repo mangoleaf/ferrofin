@@ -321,6 +321,26 @@ impl AuthService for AuthedAuthService {
     }
 }
 
+/// A fake [`AuthService`] that authenticates as an **API key** (no user).
+/// API keys satisfy the admin-gated plugin routes (Jellyfin's
+/// `RequiresElevation` treats them as elevated), so this exercises handler
+/// logic behind the gate without a user/policy lookup.
+pub struct ApiKeyAuthService;
+
+#[async_trait]
+impl AuthService for ApiKeyAuthService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            is_authenticated: true,
+            is_api_key: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
 /// A fake [`LibraryManager`]; every method is unused by INFRA-level tests.
 pub struct FakeLibrary;
 
@@ -2056,12 +2076,28 @@ pub fn authed_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> A
 /// Builds an authenticating [`AppState`] with the given plugin manager injected,
 /// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
 ///
-/// Every other manager is the [`fake_state`] double; authentication always
-/// succeeds ([`AuthedAuthService`]) so the `RequireAuth`-guarded plugin routes
-/// reach their handler.
+/// Every other manager is the [`fake_state`] double; authentication succeeds
+/// as an **API key** ([`ApiKeyAuthService`]) so both the plain-auth reads and
+/// the admin-gated mutators reach their handler.
 #[must_use]
 pub fn authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+) -> AppState {
+    plugin_state(plugins, Arc::new(ApiKeyAuthService))
+}
+
+/// Like [`authed_state_with_plugins`], but authenticated as a plain user with
+/// **no** admin policy — for proving the plugin-mutating routes 403.
+#[must_use]
+pub fn user_authed_state_with_plugins(
+    plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+) -> AppState {
+    plugin_state(plugins, Arc::new(AuthedAuthService))
+}
+
+fn plugin_state(
+    plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    auth: Arc<dyn AuthService>,
 ) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
@@ -2079,7 +2115,7 @@ pub fn authed_state_with_plugins(
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AuthedAuthService),
+        auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),

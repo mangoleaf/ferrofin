@@ -148,6 +148,7 @@ impl InstanceSpec {
                 .build(),
             memory_limit_bytes: self.memory_limit_bytes,
             http: Arc::clone(&self.http),
+            http_timeout: std::time::Duration::from_secs(self.timeout_ticks),
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),

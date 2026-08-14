@@ -35,6 +35,67 @@ impl Guest for HelloPlugin {
         r#"{"Greeting":"Hello from WASM","ReportUrl":""}"#.to_owned()
     }
 
+    fn config_pages() -> Vec<ConfigPage> {
+        // A real authored settings page: the canonical jellyfin-web plugin
+        // page shape (data-role="page" root + inline script against the
+        // ApiClient/Dashboard globals). It loads the config with
+        // getPluginConfiguration, lets the admin edit the greeting, and
+        // saves with updatePluginConfiguration — the full round trip.
+        let id = "3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01";
+        let html = format!(
+            r#"<div id="helloFerrofinConfig" data-role="page" class="page type-interior pluginConfigurationPage">
+  <div data-role="content"><div class="content-primary">
+    <form class="helloFerrofinForm">
+      <h1>Hello Ferrofin</h1>
+      <div class="inputContainer">
+        <label class="inputLabel" for="helloGreeting">Greeting</label>
+        <input is="emby-input" id="helloGreeting" type="text" />
+        <div class="fieldDescription">Logged by the "Say hello" task.</div>
+      </div>
+      <div class="inputContainer">
+        <label class="inputLabel" for="helloReportUrl">Report URL</label>
+        <input is="emby-input" id="helloReportUrl" type="text" />
+        <div class="fieldDescription">Optional endpoint the "Analyze library" task reports to.</div>
+      </div>
+      <button is="emby-button" type="submit" class="raised button-submit block"><span>Save</span></button>
+    </form>
+  </div></div>
+  <script type="text/javascript">
+  (function () {{
+    var pluginId = '{id}';
+    var page = document.querySelector('#helloFerrofinConfig');
+    page.addEventListener('pageshow', function () {{
+      Dashboard.showLoadingMsg();
+      ApiClient.getPluginConfiguration(pluginId).then(function (config) {{
+        page.querySelector('#helloGreeting').value = config.Greeting || '';
+        page.querySelector('#helloReportUrl').value = config.ReportUrl || '';
+        Dashboard.hideLoadingMsg();
+      }}).catch(Dashboard.processErrorResponse);
+    }});
+    page.querySelector('.helloFerrofinForm').addEventListener('submit', function (e) {{
+      e.preventDefault();
+      Dashboard.showLoadingMsg();
+      ApiClient.getPluginConfiguration(pluginId).then(function (config) {{
+        config.Greeting = page.querySelector('#helloGreeting').value;
+        config.ReportUrl = page.querySelector('#helloReportUrl').value;
+        ApiClient.updatePluginConfiguration(pluginId, config).then(
+          Dashboard.processPluginConfigurationUpdateResult
+        ).catch(Dashboard.processErrorResponse);
+      }}).catch(Dashboard.processErrorResponse);
+      return false;
+    }});
+  }})();
+  </script>
+</div>
+"#
+        );
+        vec![ConfigPage {
+            name: "hello-ferrofin".to_owned(),
+            content: html.into_bytes(),
+            enable_in_main_menu: false,
+        }]
+    }
+
     fn tasks() -> Vec<TaskDescriptor> {
         vec![
             TaskDescriptor {

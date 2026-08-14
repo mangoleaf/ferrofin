@@ -36,6 +36,7 @@ fn http_fetch_round_trips_method_headers_and_body() {
         "test-plugin",
         1024 * 1024,
         true, // loopback listener — this test exercises transport, not policy
+        std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "POST".to_owned(),
             url,
@@ -67,6 +68,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         "test-plugin",
         1024,
         true,
+        std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
             url: "file:///etc/passwd".to_owned(),
@@ -84,6 +86,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         "test-plugin",
         8,
         true,
+        std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
             url,
@@ -325,6 +328,7 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "untrusted-plugin",
         1024,
         false,
+        std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
             url,

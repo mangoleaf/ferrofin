@@ -31,6 +31,8 @@
     (data (i32.const 352) "ok")                                   ;; task 2 id (2)
     (data (i32.const 360) "Okay")                                 ;; task 2 name (4)
     (data (i32.const 368) "Always ok")                            ;; task 2 description (9)
+    (data (i32.const 384) "fixture-page")                         ;; page name (12)
+    (data (i32.const 400) "<div data-role=\22page\22>fixture</div>") ;; page html (35)
 
     ;; descriptor: () -> record of 4 strings (8 i32s at the ret area)
     (func (export "descriptor") (result i32)
@@ -72,6 +74,18 @@
       (i32.store (i32.const 704) (i32.const 640))
       (i32.store (i32.const 708) (i32.const 2))
       i32.const 704)
+
+    ;; config-pages: () -> list<config-page>; one element (name ptr/len,
+    ;; content ptr/len, enable-in-main-menu bool) at 960, list pair at 984
+    (func (export "config-pages") (result i32)
+      (i32.store (i32.const 960) (i32.const 384))
+      (i32.store (i32.const 964) (i32.const 12))
+      (i32.store (i32.const 968) (i32.const 400))
+      (i32.store (i32.const 972) (i32.const 35))
+      (i32.store (i32.const 976) (i32.const 0))
+      (i32.store (i32.const 984) (i32.const 960))
+      (i32.store (i32.const 988) (i32.const 1))
+      i32.const 984)
 
     ;; run-task: (string) -> result<_, string>
     ;; ret area: tag @768, err ptr @772, err len @776
@@ -151,6 +165,10 @@
     (field "id" string) (field "name" string)
     (field "description" string) (field "category" string)))
   (export $task "task-descriptor" (type $task0))
+  (type $page0 (record
+    (field "name" string) (field "content" (list u8))
+    (field "enable-in-main-menu" bool)))
+  (export $page "config-page" (type $page0))
   (type $item0 (record
     (field "id" string) (field "name" string) (field "kind" string)
     (field "path" (option string)) (field "parent-id" (option string))
@@ -168,6 +186,8 @@
     (canon lift (core func $i "default-config") (memory $i "memory") string-encoding=utf8))
   (func $tasks (result (list $task))
     (canon lift (core func $i "tasks") (memory $i "memory") string-encoding=utf8))
+  (func $config-pages (result (list $page))
+    (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
   (func $run-task (param "task-id" string) (result (result (error string)))
     (canon lift (core func $i "run-task") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
@@ -183,6 +203,7 @@
   (export "descriptor" (func $descriptor))
   (export "default-config" (func $default-config))
   (export "tasks" (func $tasks))
+  (export "config-pages" (func $config-pages))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))
   (export "metadata-lookup" (func $metadata-lookup))

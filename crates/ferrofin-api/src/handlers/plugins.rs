@@ -2,23 +2,30 @@
 //!
 //! Ports the plugin/package/repository API over the
 //! [`PluginManager`](ferrofin_traits::plugins::PluginManager) seam
-//! (`AppState::plugins`), backed by the registry of **compile-time** plugins the
-//! composition root registers (see `docs/PLUGINS_UPSTREAM.md`). Reads
-//! (`GetPlugins`, config, repositories, image, manifest) and the enable/disable +
-//! repository-set mutators are real; the operations that need a *runtime* plugin
-//! host — installing a package and uninstalling a compiled-in plugin — return an
-//! honest rejection rather than faking success (never a `501`).
+//! (`AppState::plugins`), backed by the registry of compile-time plugins the
+//! composition root registers (see `docs/PLUGINS_UPSTREAM.md`) plus the WASM
+//! plugins staged in `{data_dir}/plugins`. Installing from a configured
+//! repository and uninstalling a staged WASM plugin are real (restart-required
+//! activation, Jellyfin's model); only uninstalling a *compiled-in* plugin is
+//! rejected. Every mutating route (install/uninstall/repository-set/cancel/
+//! enable/disable/configuration-write) requires an administrator, porting
+//! Jellyfin's `RequiresElevation` policy; a WASM plugin's config JSON is
+//! handed straight to the guest, so config writes are guest input. Reads
+//! stay plain-auth.
 //!
 //! - `GET /Plugins` — installed plugins
-//! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config JSON
-//! - `POST /Plugins/{id}/{version}/{Enable,Disable}` — toggle a plugin
-//! - `DELETE /Plugins/{id}` / `/Plugins/{id}/{version}` — uninstall (rejected: compiled-in)
+//! - `GET|POST /Plugins/{id}/Configuration` — read/write a plugin's config
+//!   JSON (write admin)
+//! - `POST /Plugins/{id}/{version}/{Enable,Disable}` — toggle a plugin (admin)
+//! - `DELETE /Plugins/{id}` / `/Plugins/{id}/{version}` — uninstall (admin;
+//!   removes a staged WASM plugin, rejects a compiled-in one)
 //! - `GET /Plugins/{id}/{version}/Image` — a plugin's bundled image
 //! - `POST /Plugins/{id}/Manifest` — a plugin's manifest (read; `GetPluginManifest`)
-//! - `GET /Repositories`, `POST /Repositories` — package-repository list
-//! - `GET /Packages`, `GET /Packages/{name}` — available packages (empty catalog)
-//! - `POST /Packages/Installed/{name}` — install (rejected: no runtime host)
-//! - `DELETE /Packages/Installing/{packageId}` — cancel an install (none active)
+//! - `GET /Repositories`, `POST /Repositories` — package-repository list (POST admin)
+//! - `GET /Packages`, `GET /Packages/{name}` — the aggregated repository catalog
+//! - `POST /Packages/Installed/{name}` — install from a repository (admin)
+//! - `DELETE /Packages/Installing/{packageId}` — cancel an install (admin;
+//!   none tracked — installs are synchronous)
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -34,6 +41,34 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
+/// endpoints: an API key, or a user whose policy grants `IsAdministrator`.
+///
+/// Without this gate, any authenticated account (a guest profile, a stolen
+/// playback token) could stage arbitrary code for the next boot.
+///
+/// Deliberate posture divergence: other admin controllers note that
+/// elevation is "deferred to the composition root", but this controller
+/// gates **in-handler** — staging executable code is not mutating metadata,
+/// and the gate must hold even if the composition changes. Don't "fix" this
+/// back for consistency.
+async fn require_admin(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
+    if auth.is_api_key {
+        return Ok(());
+    }
+    if let Some(user) = &auth.user
+        && super::users::is_administrator(state, user).await?
+    {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(
+        "administrator access required".to_owned(),
+    ))
+}
 
 /// Projects a manager [`PluginDescriptor`] into the `PluginInfo` wire DTO.
 ///
@@ -113,10 +148,11 @@ async fn get_plugin_configuration(
 )]
 async fn update_plugin_configuration(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state
         .plugins
         .set_plugin_configuration(plugin_id, body.to_vec())
@@ -140,9 +176,10 @@ async fn update_plugin_configuration(
 )]
 async fn enable_plugin(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((plugin_id, _version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.enable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -163,9 +200,10 @@ async fn enable_plugin(
 )]
 async fn disable_plugin(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((plugin_id, _version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.disable_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -186,9 +224,10 @@ async fn disable_plugin(
 )]
 async fn uninstall_plugin(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(plugin_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.remove_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -209,9 +248,10 @@ async fn uninstall_plugin(
 )]
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((plugin_id, _version)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.remove_plugin(plugin_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -299,9 +339,10 @@ async fn get_repositories(
 )]
 async fn set_repositories(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Json(repositories): Json<Vec<RepositoryInfo>>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     state.plugins.set_repositories(repositories).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -367,26 +408,66 @@ struct PackageInfoQuery {
     assembly_guid: Option<String>,
 }
 
-/// `POST /Packages/Installed/{name}` — install a package.
+/// Query parameters for `POST /Packages/Installed/{name}` — what jellyfin-web
+/// sends alongside the path name (all optional per the contract).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallPackageQuery {
+    /// The package guid; wins over the name when present.
+    #[serde(default)]
+    assembly_guid: Option<String>,
+    /// A specific version to install; newest when absent.
+    #[serde(default)]
+    version: Option<String>,
+    /// Restrict resolution to one repository's versions.
+    #[serde(default)]
+    repository_url: Option<String>,
+}
+
+/// `POST /Packages/Installed/{name}` — install a package from the configured
+/// repositories.
 ///
-/// Runtime installation needs a dynamic plugin host (Tier 2); compiled-in plugins
-/// cannot be installed at runtime, so this is an honest `400` rather than a faked
-/// success.
+/// The manager downloads, verifies (checksum + component validation), and
+/// stages the WASM plugin; it activates on the next restart
+/// (`SystemInfo.HasPendingRestart` flips true, matching Jellyfin's flow).
 #[utoipa::path(
     post,
     path = "/Packages/Installed/{name}",
-    params(("name" = String, Path, description = "Package name")),
-    responses((status = 400, description = "Runtime installation is not supported")),
+    params(
+        ("name" = String, Path, description = "Package name"),
+        ("assemblyGuid" = Option<String>, Query, description = "Package guid (wins over name)"),
+        ("version" = Option<String>, Query, description = "Version to install (newest when absent)"),
+        ("repositoryUrl" = Option<String>, Query, description = "Restrict to one repository"),
+    ),
+    responses(
+        (status = 204, description = "Package installed; restart required to activate"),
+        (status = 404, description = "No such package or version"),
+    ),
     tag = "ferrofin"
 )]
 async fn install_package(
-    State(_state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
-    Path(_name): Path<String>,
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path(name): Path<String>,
+    Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
-    Err(ApiError::BadRequest(
-        "runtime plugin installation is not supported; plugins are compiled in".to_owned(),
-    ))
+    require_admin(&state, &auth).await?;
+    let assembly_guid = match query.assembly_guid.as_deref().filter(|g| !g.is_empty()) {
+        Some(raw) => Some(uuid::Uuid::parse_str(raw).map_err(|_| {
+            ApiError::BadRequest(format!("assemblyGuid `{raw}` is not a valid GUID"))
+        })?),
+        None => None,
+    };
+    state
+        .plugins
+        .install_package(
+            &name,
+            assembly_guid,
+            query.version.as_deref().filter(|v| !v.is_empty()),
+            query.repository_url.as_deref().filter(|r| !r.is_empty()),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /Packages/Installing/{packageId}` — cancel a running install.
@@ -400,10 +481,11 @@ async fn install_package(
     tag = "ferrofin"
 )]
 async fn cancel_package_installation(
-    State(_state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
     Path(package_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &auth).await?;
     Err(ApiError::NotFound(format!("installation {package_id}")))
 }
 

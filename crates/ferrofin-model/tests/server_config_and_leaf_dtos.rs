@@ -109,6 +109,7 @@ fn package_info_and_version_info_use_camel_case() {
         target_abi: Some("10.9.0.0".into()),
         source_url: None,
         checksum: None,
+        sha256: None,
         timestamp: None,
         repository_name: "main".into(),
         repository_url: "https://repo".into(),

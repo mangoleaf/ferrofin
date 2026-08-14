@@ -1,15 +1,14 @@
 //! `DashboardController` — plugin configuration-page discovery.
 //!
 //! Ports the two dashboard reads:
-//! - `GET /web/ConfigurationPages` — the plugin configuration pages. Ferrofin ships
-//!   no dynamic plugin host, so the page list is always empty (the C# projects
-//!   these from installed plugins' `IHasWebPages`).
-//! - `GET /web/ConfigurationPage` — a single page's HTML/JS resource. With no
-//!   plugins there is never a matching page, so this returns `404` (the same
-//!   `NotFound` the C# returns for an unknown page name).
-//!
-//! `GET /web/ConfigurationPages` is elevation-gated; both collapse to the
-//! contract's routing here.
+//! - `GET /web/ConfigurationPages` — the plugin configuration pages, projected
+//!   from each registered plugin's `config_pages` (the C# projects these from
+//!   `IHasWebPages`). jellyfin-web matches a page to its plugin strictly by
+//!   `PluginId` and labels it with `DisplayName`, so both are always set.
+//! - `GET /web/ConfigurationPage` — a single page's HTML/JS resource by
+//!   (case-insensitive) name, MIME-typed from the name's extension; unknown
+//!   names return `404` like the C#. Also registered under the lowercase
+//!   `configurationpage` spelling jellyfin-web actually requests.
 
 use axum::extract::{Query, State};
 use axum::http::header;

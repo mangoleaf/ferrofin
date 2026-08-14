@@ -257,7 +257,9 @@ pub use notify_watcher::NotifyFileSystemWatcher;
 pub use path_manager::FerrofinPathManager;
 pub use people_repository::FerrofinPeopleRepository;
 pub use playback_metrics::FerrofinPlaybackMetrics;
-pub use plugin_manager::{FerrofinPluginManager, PluginConfigPage, RegisteredPlugin};
+pub use plugin_manager::{
+    FerrofinPluginManager, PluginConfigPage, RegisteredPlugin, merge_plugin_registrations,
+};
 pub use quick_connect_manager::FerrofinQuickConnect;
 pub use scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask, ScheduledTask, TaskProgress};
 pub use search_manager::FerrofinSearchManager;

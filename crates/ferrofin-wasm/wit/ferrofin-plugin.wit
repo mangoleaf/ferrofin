@@ -10,7 +10,7 @@
 /// SECURITY MODEL: guests get no filesystem and no network. Every effect a
 /// plugin can have on the outside world goes through the `host` interface
 /// below — this file IS the reviewable attack surface.
-package ferrofin:plugin@0.1.0;
+package ferrofin:plugin@0.2.0;
 
 /// Data types shared by both sides of the boundary.
 interface types {
@@ -34,6 +34,29 @@ interface types {
         version: string,
         /// One-line description shown in the dashboard.
         description: string,
+    }
+
+    /// A dashboard settings page (or one of its resources) the plugin ships.
+    /// The server surfaces pages on `GET /web/ConfigurationPages` (tagged
+    /// with the plugin's id, which is how jellyfin-web finds a plugin's
+    /// Settings button) and serves the bytes at
+    /// `GET /web/ConfigurationPage?name=…`.
+    ///
+    /// TRUST NOTE: page content is HTML/JS executed in the ADMIN'S BROWSER
+    /// with the admin's session — the server-side sandbox does not apply to
+    /// it. This is Jellyfin's own settings-page model, and it is the single
+    /// strongest reason to install only plugins you trust.
+    record config-page {
+        /// The name the dashboard fetches this page by
+        /// (`?name=<this>`, case-insensitive, unique server-wide). A
+        /// resource keeps its file extension (`myplugin.js`) — the server
+        /// picks the content type from it; extensionless names serve as
+        /// HTML.
+        name: string,
+        /// The raw page/resource bytes.
+        content: list<u8>,
+        /// Whether the dashboard drawer links this page directly.
+        enable-in-main-menu: bool,
     }
 
     /// A background task the plugin offers to the scheduled-task registry.
@@ -168,7 +191,7 @@ interface host {
 
 /// The contract a Ferrofin plugin component implements.
 world plugin {
-    use types.{plugin-descriptor, task-descriptor, item-summary, metadata-result};
+    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result};
 
     import host;
 
@@ -177,6 +200,12 @@ world plugin {
 
     /// The seed configuration JSON written on first run.
     export default-config: func() -> string;
+
+    /// The dashboard settings pages this plugin ships (may be empty — the
+    /// host then synthesizes a generic JSON editor over the plugin's
+    /// config, so every plugin stays configurable from the dashboard).
+    /// Called once at load; network-mute like the other identity exports.
+    export config-pages: func() -> list<config-page>;
 
     /// The background tasks this plugin contributes (may be empty).
     export tasks: func() -> list<task-descriptor>;

@@ -1070,6 +1070,7 @@ mod tests {
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
             wasm_private_http_allow: None,
+            max_plugin_download_mb: None,
         }
     }
 }

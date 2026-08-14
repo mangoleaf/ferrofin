@@ -2,7 +2,7 @@
 //! **inline WAT fixtures** compiled at test time via the `wat` crate — no
 //! `.wasm` binaries in the repo (artifact policy, PLAN_PLUGIN_TIERS.md).
 //!
-//! The fixture component implements the `ferrofin:plugin@0.1.0` world by
+//! The fixture component implements the `ferrofin:plugin@0.2.0` world by
 //! hand at the canonical-ABI level. Its `run-task` export dispatches on the
 //! task id so one component covers every containment path:
 //! `ok` succeeds · `boom` returns an orderly guest error · `trap` hits

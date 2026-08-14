@@ -72,6 +72,13 @@ pub struct VersionInfo {
     #[serde(rename = "checksum", skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
 
+    /// Ferrofin extension: a SHA-256 checksum, preferred over the MD5
+    /// `checksum` when both are present. Absent from Jellyfin manifests and
+    /// skipped when unset, so the wire shape stays Jellyfin-identical unless
+    /// a repository opts in.
+    #[serde(rename = "sha256", skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+
     /// Gets or sets a timestamp of when the binary was built.
     #[serde(rename = "timestamp", skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
@@ -178,6 +185,7 @@ mod tests {
             target_abi: Some("10.9.0.0".to_owned()),
             source_url: Some("https://example.com/x.zip".to_owned()),
             checksum: Some("deadbeef".to_owned()),
+            sha256: None,
             timestamp: Some("2024-01-01".to_owned()),
             repository_name: "MyRepo".to_owned(),
             repository_url: "https://repo".to_owned(),
