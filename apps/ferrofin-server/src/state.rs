@@ -662,7 +662,23 @@ pub async fn build_app_state(
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
     // Loaded WASM plugins surface on `/Plugins` exactly like compiled-in ones.
-    registered_plugins.extend(wasm_host.registered_plugins());
+    // A WASM plugin must not squat a compiled-in id: two registry entries with
+    // one id would duplicate the dashboard row and make config/enable/uninstall
+    // address the wrong plugin. The install path refuses such packages, but a
+    // hand-dropped `.wasm` bypasses it — this filter is the choke point that
+    // covers both doors.
+    let taken: std::collections::HashSet<uuid::Uuid> =
+        registered_plugins.iter().map(|p| p.descriptor.id).collect();
+    registered_plugins.extend(wasm_host.registered_plugins().into_iter().filter(|p| {
+        let free = !taken.contains(&p.descriptor.id);
+        if !free {
+            tracing::warn!(
+                plugin = %p.descriptor.id,
+                "wasm plugin id collides with a compiled-in plugin; skipping it"
+            );
+        }
+        free
+    }));
     // The lifecycle controller is built early so the plugin manager can flag
     // restart-required after a repository install/uninstall; the system
     // manager receives the same handle further down.

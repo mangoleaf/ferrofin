@@ -669,6 +669,7 @@ impl PluginManager for FerrofinPluginManager {
             let Some(url) = repo.url.as_deref().filter(|u| !u.is_empty()) else {
                 continue;
             };
+            let repo_name = repo.name.clone().unwrap_or_default();
             match reqwest::get(url).await {
                 Ok(resp) => match resp.json::<Vec<PackageInfo>>().await {
                     // Stamp provenance from the repository we actually
@@ -679,7 +680,7 @@ impl PluginManager for FerrofinPluginManager {
                     // same way in `InstallationManager.GetPackages`).
                     Ok(list) => packages.extend(list.into_iter().map(|mut p| {
                         for v in &mut p.versions {
-                            v.repository_name = repo.name.clone().unwrap_or_default();
+                            v.repository_name.clone_from(&repo_name);
                             url.clone_into(&mut v.repository_url);
                         }
                         p

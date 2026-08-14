@@ -2721,7 +2721,7 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "expected-extension: no external plugin package repository (compiled-in extensions).",
+      "classification": "verified 2026-08-14: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted). Unit + server HTTP tests; catalog content is instance-specific, so not harness-diffed.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -2733,7 +2733,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: repository install of WASM plugins is real (2026-08-14: ABI gate \u2192 HTTPS-per-hop download \u2192 streamed size cap \u2192 sha256/md5 verify \u2192 component+identity validation \u2192 guid-squat refusal \u2192 atomic stage \u2192 restart-required; admin-only; end-to-end server test). Divergence vs Jellyfin: the install is SYNCHRONOUS \u2014 none of the PackageInstalling/Completed/Failed/Cancelled WebSocket messages are emitted (no dashboard progress; a slow repo holds the POST open), and the plugin appears in /Plugins only after the activating restart. Async install + Package* push is the recorded follow-up (WebSocket-push backlog).",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -2745,7 +2745,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: always 404 \u2014 installs are synchronous, so no tracked installation exists to cancel (Jellyfin tracks async installs). Admin-only.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -2757,7 +2757,7 @@
       "schema_valid": null,
       "note": "H=404 J=404",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: resolves a package by name/assemblyGuid from the aggregated repository catalog. Unit + server HTTP tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3033,7 +3033,7 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins.",
+      "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) \u2014 the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests).",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3045,7 +3045,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: real uninstall for a staged WASM plugin (file + config + enabled override removed, restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3057,7 +3057,7 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: returns the plugin's config JSON (stored values overlaid on current defaults, matching C# partial-deserialize semantics). Unit + handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3069,7 +3069,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: validates and persists the plugin's config JSON; admin-only (a WASM plugin's config is handed to the guest, so a write is guest input). Unit + handler tests incl. 403.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3081,7 +3081,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: returns the plugin's manifest (GetPluginManifest port). Handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3093,7 +3093,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: real uninstall for a staged WASM plugin (restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3105,7 +3105,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3117,7 +3117,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3129,7 +3129,7 @@
       "schema_valid": null,
       "note": "unresolved path param: pluginId,version",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: serves the plugin's bundled image bytes with its content type. Handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3213,7 +3213,7 @@
       "schema_valid": true,
       "note": "H=200 J=200",
       "deep_verified": false,
-      "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions).",
+      "classification": "verified 2026-08-14: returns the admin-configured package repositories (instance-specific content). Unit + handler tests.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {
@@ -3225,7 +3225,7 @@
       "schema_valid": null,
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": null,
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent).",
+      "classification": "verified 2026-08-14: replaces the configured package repositories; admin-only (RequiresElevation port). Unit + handler tests incl. 403 for non-admin.",
       "last_verified": "PLAN_OSS_RELEASE Phase 1 flagged-row sweep 2026-08-11"
     },
     {

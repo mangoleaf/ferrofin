@@ -60,15 +60,15 @@
     },
     "GET /Plugins": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins."
+      "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) — the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests)."
     },
     "GET /Packages": {
-      "category": "expected-extension",
-      "classification": "expected-extension: no external plugin package repository (compiled-in extensions)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted). Unit + server HTTP tests; catalog content is instance-specific, so not harness-diffed."
     },
     "GET /Repositories": {
-      "category": "expected-extension",
-      "classification": "expected-extension: no external plugin repositories configured (compiled-in extensions)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: returns the admin-configured package repositories (instance-specific content). Unit + handler tests."
     },
     "GET /web/ConfigurationPages": {
       "category": "expected-extension",
@@ -467,52 +467,52 @@
       "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "POST /Packages/Installed/{name}": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: repository install of WASM plugins is real (2026-08-14: ABI gate → HTTPS-per-hop download → streamed size cap → sha256/md5 verify → component+identity validation → guid-squat refusal → atomic stage → restart-required; admin-only; end-to-end server test). Divergence vs Jellyfin: the install is SYNCHRONOUS — none of the PackageInstalling/Completed/Failed/Cancelled WebSocket messages are emitted (no dashboard progress; a slow repo holds the POST open), and the plugin appears in /Plugins only after the activating restart. Async install + Package* push is the recorded follow-up (WebSocket-push backlog)."
     },
     "DELETE /Packages/Installing/{packageId}": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: always 404 — installs are synchronous, so no tracked installation exists to cancel (Jellyfin tracks async installs). Admin-only."
     },
     "GET /Packages/{name}": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: resolves a package by name/assemblyGuid from the aggregated repository catalog. Unit + server HTTP tests."
     },
     "GET /Playback/BitrateTest": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
     },
     "DELETE /Plugins/{pluginId}": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: real uninstall for a staged WASM plugin (file + config + enabled override removed, restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only."
     },
     "GET /Plugins/{pluginId}/Configuration": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: returns the plugin's config JSON (stored values overlaid on current defaults, matching C# partial-deserialize semantics). Unit + handler tests."
     },
     "POST /Plugins/{pluginId}/Configuration": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: validates and persists the plugin's config JSON; admin-only (a WASM plugin's config is handed to the guest, so a write is guest input). Unit + handler tests incl. 403."
     },
     "POST /Plugins/{pluginId}/Manifest": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: returns the plugin's manifest (GetPluginManifest port). Handler tests."
     },
     "DELETE /Plugins/{pluginId}/{version}": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: real uninstall for a staged WASM plugin (restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only."
     },
     "POST /Plugins/{pluginId}/{version}/Disable": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window."
     },
     "POST /Plugins/{pluginId}/{version}/Enable": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: real enabled-flag toggle (admin-only), but a freshly repository-installed WASM plugin 404s until its activating restart (not in the registry until the boot that loads it) while Jellyfin already lists it restart-pending. Cosmetic pre-restart window."
     },
     "GET /Plugins/{pluginId}/{version}/Image": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: serves the plugin's bundled image bytes with its content type. Handler tests."
     },
     "GET /Providers/Lyrics/{lyricId}": {
       "category": "deferred-remote-or-feature-gated",
@@ -523,8 +523,8 @@
       "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
     },
     "POST /Repositories": {
-      "category": "deferred-plugin-host",
-      "classification": "deferred-plugin-host: the dynamic plugin host is not ported (no Rust assembly-loading equivalent)."
+      "category": "verified",
+      "classification": "verified 2026-08-14: replaces the configured package repositories; admin-only (RequiresElevation port). Unit + handler tests incl. 403 for non-admin."
     },
     "POST /SkipButtonCss/InjectCss": {
       "category": "expected-extension",
