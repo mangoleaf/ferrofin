@@ -669,16 +669,47 @@ pub async fn build_app_state(
     // covers both doors.
     let taken: std::collections::HashSet<uuid::Uuid> =
         registered_plugins.iter().map(|p| p.descriptor.id).collect();
-    registered_plugins.extend(wasm_host.registered_plugins().into_iter().filter(|p| {
-        let free = !taken.contains(&p.descriptor.id);
-        if !free {
-            tracing::warn!(
-                plugin = %p.descriptor.id,
-                "wasm plugin id collides with a compiled-in plugin; skipping it"
-            );
-        }
-        free
-    }));
+    // Same guard one field over: dashboard page names are a global namespace
+    // (`?name=…`, case-insensitive, first-match-wins in the page lookup), so
+    // a guest-chosen page name must not collide with an already-registered
+    // one — a compiled-in page, another plugin's page, or another plugin's
+    // synthesized fallback. A colliding page is dropped (the plugin loses its
+    // Settings button rather than serving someone else's HTML to the admin).
+    let mut taken_pages: std::collections::HashSet<String> = registered_plugins
+        .iter()
+        .flat_map(|p| p.config_pages.iter())
+        .map(|page| page.name.to_lowercase())
+        .collect();
+    registered_plugins.extend(
+        wasm_host
+            .registered_plugins()
+            .into_iter()
+            .filter(|p| {
+                let free = !taken.contains(&p.descriptor.id);
+                if !free {
+                    tracing::warn!(
+                        plugin = %p.descriptor.id,
+                        "wasm plugin id collides with a compiled-in plugin; skipping it"
+                    );
+                }
+                free
+            })
+            .map(|mut p| {
+                let plugin = p.descriptor.id;
+                p.config_pages.retain(|page| {
+                    let free = taken_pages.insert(page.name.to_lowercase());
+                    if !free {
+                        tracing::warn!(
+                            %plugin,
+                            page = %page.name,
+                            "wasm plugin page name collides with an existing page; dropping it"
+                        );
+                    }
+                    free
+                });
+                p
+            }),
+    );
     // The lifecycle controller is built early so the plugin manager can flag
     // restart-required after a repository install/uninstall; the system
     // manager receives the same handle further down.

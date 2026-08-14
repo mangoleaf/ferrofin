@@ -70,7 +70,7 @@ impl Guest for HelloPlugin {
         page.querySelector('#helloGreeting').value = config.Greeting || '';
         page.querySelector('#helloReportUrl').value = config.ReportUrl || '';
         Dashboard.hideLoadingMsg();
-      }});
+      }}).catch(Dashboard.processErrorResponse);
     }});
     page.querySelector('.helloFerrofinForm').addEventListener('submit', function (e) {{
       e.preventDefault();
@@ -80,8 +80,8 @@ impl Guest for HelloPlugin {
         config.ReportUrl = page.querySelector('#helloReportUrl').value;
         ApiClient.updatePluginConfiguration(pluginId, config).then(
           Dashboard.processPluginConfigurationUpdateResult
-        );
-      }});
+        ).catch(Dashboard.processErrorResponse);
+      }}).catch(Dashboard.processErrorResponse);
       return false;
     }});
   }})();

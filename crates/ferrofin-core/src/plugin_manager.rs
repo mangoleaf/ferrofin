@@ -1096,6 +1096,12 @@ mod tests {
         }
     }
 
+    /// The ABI string the stub validator and the test manifests agree on —
+    /// deliberately NOT the real `ferrofin_wasm::PLUGIN_ABI` (these tests
+    /// prove "manifest must match whatever the validator says", not a
+    /// specific version).
+    const TEST_ABI: &str = "ferrofin:plugin@0.0.0-test";
+
     const PKG_ID: Uuid = Uuid::from_u128(0xABCD_EF01);
 
     fn manifest_json(base: &str, checksum: &str, sha256: Option<&str>, abi: &str) -> String {
@@ -1138,7 +1144,7 @@ mod tests {
                 wasm_dir.clone(),
                 Arc::new(StubValidator {
                     id: validator_id,
-                    abi: "ferrofin:plugin@0.1.0",
+                    abi: TEST_ABI,
                 }),
                 lifecycle.clone(),
             );
@@ -1162,7 +1168,7 @@ mod tests {
     async fn install_downloads_verifies_stages_and_flags_restart() {
         let artifact = b"pretend-wasm-bytes".to_vec();
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
-        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+        let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
 
         rig.mgr
             .install_package("HelloPkg", None, None, None)
@@ -1184,7 +1190,7 @@ mod tests {
     async fn install_resolves_by_guid_and_prefers_numerically_newest() {
         let artifact = b"bytes".to_vec();
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
-        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+        let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
         // Wrong name + right guid still resolves (guid wins).
         rig.mgr
             .install_package("totally-wrong-name", Some(PKG_ID), None, None)
@@ -1205,14 +1211,7 @@ mod tests {
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
 
         // Checksum mismatch.
-        let rig = install_rig(
-            &artifact,
-            None,
-            "00000000",
-            "ferrofin:plugin@0.1.0",
-            Ok(PKG_ID),
-        )
-        .await;
+        let rig = install_rig(&artifact, None, "00000000", TEST_ABI, Ok(PKG_ID)).await;
         let err = rig
             .mgr
             .install_package("HelloPkg", None, None, None)
@@ -1222,14 +1221,7 @@ mod tests {
         assert!(!rig.lifecycle.has_pending_restart());
 
         // sha256 preferred over (correct) md5 — and mismatching.
-        let rig = install_rig(
-            &artifact,
-            Some("deadbeef"),
-            &md5,
-            "ferrofin:plugin@0.1.0",
-            Ok(PKG_ID),
-        )
-        .await;
+        let rig = install_rig(&artifact, Some("deadbeef"), &md5, TEST_ABI, Ok(PKG_ID)).await;
         let err = rig
             .mgr
             .install_package("HelloPkg", None, None, None)
@@ -1251,7 +1243,7 @@ mod tests {
             &artifact,
             None,
             &md5,
-            "ferrofin:plugin@0.1.0",
+            TEST_ABI,
             Err("not a component".to_owned()),
         )
         .await;
@@ -1263,14 +1255,7 @@ mod tests {
         assert!(err.to_string().contains("not a component"), "{err}");
 
         // Identity mismatch: artifact reports a different id than the catalog.
-        let rig = install_rig(
-            &artifact,
-            None,
-            &md5,
-            "ferrofin:plugin@0.1.0",
-            Ok(Uuid::from_u128(7)),
-        )
-        .await;
+        let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(Uuid::from_u128(7))).await;
         let err = rig
             .mgr
             .install_package("HelloPkg", None, None, None)
@@ -1279,7 +1264,7 @@ mod tests {
         assert!(err.to_string().contains("refusing"), "{err}");
 
         // Unknown package.
-        let rig = install_rig(&artifact, None, &md5, "ferrofin:plugin@0.1.0", Ok(PKG_ID)).await;
+        let rig = install_rig(&artifact, None, &md5, TEST_ABI, Ok(PKG_ID)).await;
         let err = rig
             .mgr
             .install_package("NoSuchPkg", None, None, None)
@@ -1329,7 +1314,7 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let wasm_root = tempfile::tempdir().unwrap();
         let (base, _stop) = raw_server(|base| {
-            let manifest = manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0");
+            let manifest = manifest_json(base, &md5, None, TEST_ABI);
             Box::new(move |request| {
                 if request.contains("/plugin.wasm") {
                     let mut out =
@@ -1347,7 +1332,7 @@ mod tests {
                 wasm_root.path().join("plugins"),
                 Arc::new(StubValidator {
                     id: Ok(PKG_ID),
-                    abi: "ferrofin:plugin@0.1.0",
+                    abi: TEST_ABI,
                 }),
                 Arc::new(FlagLifecycle(AtomicBool::new(false))),
             )
@@ -1375,7 +1360,7 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let wasm_root = tempfile::tempdir().unwrap();
         let (base, _stop) = raw_server(|base| {
-            let manifest = manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0");
+            let manifest = manifest_json(base, &md5, None, TEST_ABI);
             Box::new(move |request| {
                 if request.contains("/plugin.wasm") {
                     b"HTTP/1.1 302 Found\r\nlocation: http://192.0.2.1/evil.wasm\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -1390,7 +1375,7 @@ mod tests {
                 wasm_root.path().join("plugins"),
                 Arc::new(StubValidator {
                     id: Ok(PKG_ID),
-                    abi: "ferrofin:plugin@0.1.0",
+                    abi: TEST_ABI,
                 }),
                 Arc::new(FlagLifecycle(AtomicBool::new(false))),
             );
@@ -1419,7 +1404,7 @@ mod tests {
         let wasm_root = tempfile::tempdir().unwrap();
         let wasm_dir = wasm_root.path().join("plugins");
         let (base, _stop) = repo_server(
-            |base| manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0"),
+            |base| manifest_json(base, &md5, None, TEST_ABI),
             artifact.clone(),
         );
         let mgr = FerrofinPluginManager::new(
@@ -1433,7 +1418,7 @@ mod tests {
             wasm_dir.clone(),
             Arc::new(StubValidator {
                 id: Ok(PKG_ID),
-                abi: "ferrofin:plugin@0.1.0",
+                abi: TEST_ABI,
             }),
             Arc::new(FlagLifecycle(AtomicBool::new(false))),
         );
@@ -1525,7 +1510,7 @@ mod tests {
         let md5 = ferrofin_common::extensions::md5_hex(&artifact);
         let (base, _stop) = repo_server(
             |base| {
-                manifest_json(base, &md5, None, "ferrofin:plugin@0.1.0")
+                manifest_json(base, &md5, None, TEST_ABI)
                     .replace("\"repositoryName\":\"test\"", "\"repositoryName\":\"liar\"")
                     .replace(
                         &format!("\"repositoryUrl\":\"{base}/manifest.json\""),

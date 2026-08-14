@@ -603,17 +603,43 @@ fn config_pages_for(
     descriptor: &PluginDescriptor,
     authored: &[bindings::types::ConfigPage],
 ) -> Vec<PluginConfigPage> {
-    if authored.is_empty() {
-        return vec![fallback_config_page(descriptor)];
-    }
-    authored
+    // Guest page bytes are held resident and cloned per (anonymous) request
+    // to `GET /web/ConfigurationPage`, so they must be bounded at load —
+    // otherwise a hostile plugin turns that endpoint into an unauthenticated
+    // memory amplifier. Hardcoded like the manifest cap: real plugin pages
+    // are tens of KB, so these are abuse guards, not tuning knobs.
+    const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_PLUGIN_PAGES_BYTES: usize = 16 * 1024 * 1024;
+    let mut total = 0usize;
+    let kept: Vec<PluginConfigPage> = authored
         .iter()
+        .filter(|page| {
+            let within = page.content.len() <= MAX_PAGE_BYTES
+                && total + page.content.len() <= MAX_PLUGIN_PAGES_BYTES;
+            if within {
+                total += page.content.len();
+            } else {
+                tracing::warn!(
+                    plugin = %descriptor.id,
+                    page = %page.name,
+                    bytes = page.content.len(),
+                    "wasm plugin settings page exceeds the size cap; dropping it"
+                );
+            }
+            within
+        })
         .map(|page| PluginConfigPage {
             name: page.name.clone(),
             bytes: page.content.clone(),
             enable_in_main_menu: page.enable_in_main_menu,
         })
-        .collect()
+        .collect();
+    if kept.is_empty() {
+        // No usable authored page (none shipped, or all oversized) — the
+        // synthesized editor keeps the plugin configurable either way.
+        return vec![fallback_config_page(descriptor)];
+    }
+    kept
 }
 
 /// The synthesized settings page: the canonical jellyfin-web plugin-page
@@ -650,7 +676,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
       ApiClient.getPluginConfiguration(pluginId).then(function (config) {{
         page.querySelector('.wasmConfigJson').value = JSON.stringify(config, null, 2);
         Dashboard.hideLoadingMsg();
-      }});
+      }}).catch(Dashboard.processErrorResponse);
     }});
     page.querySelector('.wasmConfigForm').addEventListener('submit', function (e) {{
       e.preventDefault();
@@ -664,7 +690,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
       Dashboard.showLoadingMsg();
       ApiClient.updatePluginConfiguration(pluginId, parsed).then(
         Dashboard.processPluginConfigurationUpdateResult
-      );
+      ).catch(Dashboard.processErrorResponse);
       return false;
     }});
   }})();
@@ -976,6 +1002,29 @@ mod tests {
         assert_eq!(pages[0].name, "mypage");
         assert!(pages[0].enable_in_main_menu);
         assert_eq!(pages[0].bytes, authored[0].content);
+    }
+
+    #[test]
+    fn oversized_pages_are_dropped_and_the_fallback_covers_a_total_loss() {
+        let d = descriptor();
+        let big = bindings::types::ConfigPage {
+            name: "big".to_owned(),
+            content: vec![0u8; 4 * 1024 * 1024 + 1],
+            enable_in_main_menu: false,
+        };
+        let small = bindings::types::ConfigPage {
+            name: "small".to_owned(),
+            content: b"<div data-role=\"page\">ok</div>".to_vec(),
+            enable_in_main_menu: false,
+        };
+        // Mixed: the oversized page is dropped, the small one survives.
+        let pages = config_pages_for(&d, &[big.clone(), small]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, "small");
+        // All oversized: the synthesized editor takes over.
+        let pages = config_pages_for(&d, &[big]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, format!("wasm-settings-{}", d.id));
     }
 
     #[test]
