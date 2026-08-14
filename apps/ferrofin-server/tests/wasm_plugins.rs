@@ -1,7 +1,7 @@
 //! Server-level integration test for Tier-1b WASM plugins: the full vertical,
 //! over real HTTP semantics (`tower` oneshot against the real router).
 //!
-//! A `ferrofin:plugin@0.1.0` component (the shared inline-WAT fixture from
+//! A `ferrofin:plugin@0.2.0` component (the shared inline-WAT fixture from
 //! `ferrofin-wasm` — no committed `.wasm`, no wasm toolchain needed) is
 //! dropped into `{data_dir}/plugins/` before boot. The test then proves the
 //! plan's E1 claim — "to the API a WASM plugin is indistinguishable from a
@@ -160,6 +160,45 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
     let cfg = router.clone().oneshot(get(&config_uri)).await.unwrap();
     assert_eq!(cfg.status(), StatusCode::OK, "plugin config is fetchable");
     assert_eq!(body_json(cfg).await["a"], 1, "guest default config served");
+
+    // 2b. The guest's authored settings page surfaces on the dashboard
+    //     discovery endpoint tagged with the plugin id (this is exactly how
+    //     jellyfin-web decides to show a Settings button), and its bytes are
+    //     served under both spellings jellyfin-web uses.
+    let pages = router
+        .clone()
+        .oneshot(get("/web/ConfigurationPages"))
+        .await
+        .unwrap();
+    assert_eq!(pages.status(), StatusCode::OK);
+    let pages = body_json(pages).await;
+    let page = pages
+        .as_array()
+        .expect("page list")
+        .iter()
+        .find(|p| p["Name"] == "fixture-page")
+        .unwrap_or_else(|| panic!("fixture page missing from /web/ConfigurationPages: {pages}"))
+        .clone();
+    assert_eq!(
+        page["PluginId"].as_str().map(|s| s.replace('-', "")),
+        Some(PLUGIN_ID.replace('-', "")),
+        "page is tagged with the plugin id jellyfin-web matches on"
+    );
+    assert_eq!(page["DisplayName"], "Hello", "labeled with the plugin name");
+    let body = router
+        .clone()
+        .oneshot(get("/web/configurationpage?name=fixture-page"))
+        .await
+        .unwrap();
+    assert_eq!(body.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(body.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        "<div data-role=\"page\">fixture</div>",
+        "authored page bytes served verbatim"
+    );
 
     // 3. The guest's tasks are in the scheduled-task registry.
     let tasks = router

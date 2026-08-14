@@ -117,6 +117,18 @@ cannot reach the network — `http-fetch` (like `query-items` and `write-media-s
 refused during load — so a disabled or newly-dropped-in plugin cannot phone home at startup.
 To stop a plugin's code from running entirely, remove its `.wasm` and restart.
 
+**Settings pages.** A plugin ships its own dashboard settings page(s) via the
+`config-pages` export: raw HTML in the standard jellyfin-web plugin-page shape
+(`data-role="page"` root + inline script against the `ApiClient`/`Dashboard`
+globals), surfaced on `GET /web/ConfigurationPages` tagged with the plugin's id
+— exactly how jellyfin-web decides to show the Settings button — and saved with
+`ApiClient.updatePluginConfiguration` (the `/Plugins/{id}/Configuration` JSON
+the plugin reads back through `get-config`). A plugin that ships **no** page
+still gets one: Ferrofin synthesizes a generic JSON editor over its config, so
+every WASM plugin is configurable from the dashboard. One caveat belongs in the
+trust section below: page content runs in the admin's browser, not in the
+sandbox.
+
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
 explicitly exports, so that one file is the entire reviewable attack surface. Today that
@@ -160,7 +172,15 @@ attacker has a theoretical TOCTOU window; pinning the vetted address on the requ
 planned hardening. (Referencing plugins by UUID is also acknowledged UX debt — accepting
 plugin names is a planned improvement.)
 
-The one-line summary: **the sandbox bounds the blast radius to your catalog metadata; it
+**Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
+executes in the **admin's browser with the admin's session** — the same trust
+model as every Jellyfin plugin page, and the WASM sandbox does not apply to it:
+a malicious page could drive any admin API your session can. The synthesized
+fallback page is host-authored (guest strings are escaped), so a plugin that
+ships no page adds no browser-side surface.
+
+The one-line summary: **the sandbox bounds the blast radius to your catalog
+metadata — except a plugin's own settings page, which runs in your browser; it
 does not make strangers trustworthy.** Install plugins you have some reason to trust.
 
 **What the memory limit means (and costs).** The 128 MiB is a **per-plugin ceiling, not an

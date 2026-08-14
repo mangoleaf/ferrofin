@@ -25,7 +25,7 @@ pub mod capabilities;
 pub mod runtime;
 
 /// The hand-written canonical-ABI component implementing the
-/// `ferrofin:plugin@0.1.0` world, as WAT text — the shared test fixture for
+/// `ferrofin:plugin@0.2.0` world, as WAT text — the shared test fixture for
 /// this crate's host tests and the server-level HTTP test (compiled at test
 /// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
 /// API: test support only.
@@ -41,7 +41,9 @@ use uuid::Uuid;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config as WasmConfig, Engine};
 
-use ferrofin_core::{FerrofinEventManager, RegisteredPlugin, ScheduledTask, TaskProgress};
+use ferrofin_core::{
+    FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 
@@ -154,6 +156,10 @@ pub struct LoadedPlugin {
     pub default_config: Vec<u8>,
     /// The guest's advertised tasks.
     pub tasks: Vec<bindings::types::TaskDescriptor>,
+    /// The guest's authored dashboard settings pages (may be empty — the
+    /// host synthesizes a generic JSON editor in that case; see
+    /// [`fallback_config_page`]).
+    pub config_pages: Vec<bindings::types::ConfigPage>,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -279,7 +285,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.1.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.2.0 \
                          component); skipping this file"
                     );
                 }
@@ -347,8 +353,12 @@ impl WasmPluginHost {
         self.plugins
             .iter()
             .map(|p| {
-                RegisteredPlugin::new(p.descriptor.clone(), None)
-                    .with_default_config(p.default_config.clone())
+                let mut registered = RegisteredPlugin::new(p.descriptor.clone(), None)
+                    .with_default_config(p.default_config.clone());
+                for page in config_pages_for(&p.descriptor, &p.config_pages) {
+                    registered = registered.with_config_page(page);
+                }
+                registered
             })
             .collect()
     }
@@ -468,6 +478,7 @@ fn load_one(
         wasmtime::Error::msg(format!("plugin default-config is not valid JSON: {e}"))
     })?;
     let tasks = instance.call_tasks(&mut store)?;
+    let config_pages = instance.call_config_pages(&mut store)?;
 
     let descriptor = PluginDescriptor {
         id,
@@ -505,6 +516,7 @@ fn load_one(
         descriptor,
         default_config: default_config.into_bytes(),
         tasks,
+        config_pages,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
@@ -582,10 +594,112 @@ fn build_guest_http_client(
     ))
 }
 
+/// Projects a plugin's authored settings pages into the shared registry
+/// shape — or, when the guest ships none, a synthesized generic JSON editor
+/// over its configuration, so every WASM plugin is configurable from the
+/// dashboard (jellyfin-web only shows a Settings button for plugins with a
+/// page carrying their `PluginId`).
+fn config_pages_for(
+    descriptor: &PluginDescriptor,
+    authored: &[bindings::types::ConfigPage],
+) -> Vec<PluginConfigPage> {
+    if authored.is_empty() {
+        return vec![fallback_config_page(descriptor)];
+    }
+    authored
+        .iter()
+        .map(|page| PluginConfigPage {
+            name: page.name.clone(),
+            bytes: page.content.clone(),
+            enable_in_main_menu: page.enable_in_main_menu,
+        })
+        .collect()
+}
+
+/// The synthesized settings page: the canonical jellyfin-web plugin-page
+/// shape (`data-role="page"` root + inline script using the `ApiClient` /
+/// `Dashboard` globals) wrapping a JSON editor over the plugin's config —
+/// loaded via `ApiClient.getPluginConfiguration` and saved via
+/// `ApiClient.updatePluginConfiguration`, exactly like an authored page.
+///
+/// The page name is `wasm-settings-{id}` — unique per plugin and stable, so
+/// dashboard bookmarks survive restarts.
+fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
+    // The id is a validated UUID (safe to embed raw); the display name is
+    // guest-supplied and must be escaped for the HTML context.
+    let id = descriptor.id;
+    let title = escape_html(&descriptor.name);
+    let html = format!(
+        r#"<div id="wasmConfig-{id}" data-role="page" class="page type-interior pluginConfigurationPage">
+  <div data-role="content"><div class="content-primary">
+    <form class="wasmConfigForm">
+      <h1>{title}</h1>
+      <p>This plugin ships no settings page of its own; edit its configuration JSON directly.</p>
+      <div class="inputContainer">
+        <textarea is="emby-textarea" class="textarea-mono wasmConfigJson" rows="16" spellcheck="false" style="width:100%;font-family:monospace;"></textarea>
+      </div>
+      <button is="emby-button" type="submit" class="raised button-submit block"><span>Save</span></button>
+    </form>
+  </div></div>
+  <script type="text/javascript">
+  (function () {{
+    var pluginId = '{id}';
+    var page = document.querySelector('#wasmConfig-{id}');
+    page.addEventListener('pageshow', function () {{
+      Dashboard.showLoadingMsg();
+      ApiClient.getPluginConfiguration(pluginId).then(function (config) {{
+        page.querySelector('.wasmConfigJson').value = JSON.stringify(config, null, 2);
+        Dashboard.hideLoadingMsg();
+      }});
+    }});
+    page.querySelector('.wasmConfigForm').addEventListener('submit', function (e) {{
+      e.preventDefault();
+      var parsed;
+      try {{
+        parsed = JSON.parse(page.querySelector('.wasmConfigJson').value);
+      }} catch (err) {{
+        Dashboard.alert('Configuration must be valid JSON: ' + err.message);
+        return false;
+      }}
+      Dashboard.showLoadingMsg();
+      ApiClient.updatePluginConfiguration(pluginId, parsed).then(
+        Dashboard.processPluginConfigurationUpdateResult
+      );
+      return false;
+    }});
+  }})();
+  </script>
+</div>
+"#
+    );
+    PluginConfigPage {
+        name: format!("wasm-settings-{id}"),
+        bytes: html.into_bytes(),
+        enable_in_main_menu: false,
+    }
+}
+
+/// Minimal HTML text-context escaping for guest-supplied strings embedded
+/// in the synthesized page.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
 /// world version from `wit/ferrofin-plugin.wit` (a test guards against
 /// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
-pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.1.0";
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.2.0";
 
 /// The install-time artifact validator: proves a downloaded `.wasm` is a
 /// loadable `ferrofin:plugin` component and reports its self-declared id,
@@ -831,5 +945,58 @@ impl ScheduledTask for WasmTask {
             .run_task(self.task.id.clone(), config)
             .await
             .map_err(ServiceError::backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor() -> PluginDescriptor {
+        PluginDescriptor {
+            id: Uuid::from_u128(7),
+            name: "Evil <img src=x onerror=alert(1)> & \"Co\"".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: "d".to_owned(),
+            enabled: true,
+            has_image: false,
+            can_uninstall: false,
+        }
+    }
+
+    #[test]
+    fn authored_pages_pass_through_unchanged() {
+        let authored = vec![bindings::types::ConfigPage {
+            name: "mypage".to_owned(),
+            content: b"<div data-role=\"page\">x</div>".to_vec(),
+            enable_in_main_menu: true,
+        }];
+        let pages = config_pages_for(&descriptor(), &authored);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, "mypage");
+        assert!(pages[0].enable_in_main_menu);
+        assert_eq!(pages[0].bytes, authored[0].content);
+    }
+
+    #[test]
+    fn missing_pages_synthesize_the_json_editor() {
+        let d = descriptor();
+        let pages = config_pages_for(&d, &[]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].name, format!("wasm-settings-{}", d.id));
+        assert!(!pages[0].enable_in_main_menu);
+        let html = String::from_utf8(pages[0].bytes.clone()).unwrap();
+        // The canonical jellyfin-web page shape + the save round-trip calls.
+        assert!(html.contains("data-role=\"page\""), "{html}");
+        assert!(html.contains("ApiClient.getPluginConfiguration"), "{html}");
+        assert!(
+            html.contains("ApiClient.updatePluginConfiguration"),
+            "{html}"
+        );
+        assert!(html.contains(&d.id.to_string()), "plugin id embedded");
+        // Guest-supplied name is escaped for the HTML context.
+        assert!(!html.contains("<img"), "unescaped guest name: {html}");
+        assert!(html.contains("&lt;img"), "{html}");
+        assert!(html.contains("&amp;"), "{html}");
     }
 }

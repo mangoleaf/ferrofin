@@ -158,7 +158,7 @@ fn _assert_object_safe_plugin_manager(_: &dyn PluginManager) {}
 /// dependency arrow points the other way).
 #[async_trait]
 pub trait PluginArtifactValidator: Send + Sync {
-    /// The plugin ABI this server supports (e.g. `ferrofin:plugin@0.1.0`),
+    /// The plugin ABI this server supports (e.g. `ferrofin:plugin@0.2.0`),
     /// used for the manifest `targetAbi` gate and error messages.
     fn supported_abi(&self) -> &str;
 
