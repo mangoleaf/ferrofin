@@ -88,6 +88,10 @@ pub struct FerrofinUserManager {
     /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
     /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
     activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
+    /// Server configuration, read to resolve a user's cast receiver against
+    /// the configured applications (upstream does this at DTO time). `None`
+    /// in tests, which then echo the stored value.
+    config: Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The shared token-resolution cache — cleared on every user mutation
     /// (update/delete, password, policy, configuration) so cached auth can
     /// never outlive a change to what it authorizes.
@@ -177,9 +181,44 @@ impl FerrofinUserManager {
             providers,
             server_id: None,
             activity: None,
+            config: None,
             profile_image_dir: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Attaches the server configuration, used to resolve each user's cast
+    /// receiver id against the configured receiver applications.
+    #[must_use]
+    pub fn with_configuration(
+        mut self,
+        config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Resolves the `CastReceiverId` a user DTO reports.
+    ///
+    /// Port of `UserManager.GetUserDto`: an empty stored value (the norm — a
+    /// user only persists one after explicitly choosing it, and an adopted
+    /// Jellyfin database leaves it null) resolves to the FIRST configured
+    /// receiver application, as does a stored value no longer in the list.
+    /// jellyfin-web refuses to initialize the Cast SDK when this is empty
+    /// ("Not initializing chromecast: CastReceiverId is undefined") — the cast
+    /// menu then lists no devices at all.
+    async fn resolve_cast_receiver_id(&self, stored: Option<String>) -> Option<String> {
+        let Some(config) = &self.config else {
+            return stored;
+        };
+        let Ok(configured) = config.configuration().await else {
+            return stored;
+        };
+        let apps = configured.cast_receiver_applications;
+        let stored = stored.filter(|s| !s.is_empty());
+        stored
+            .filter(|id| apps.iter().any(|app| app.id == *id))
+            .or_else(|| apps.first().map(|app| app.id.clone()))
     }
 
     /// Attaches the activity-log seam so an account lockout is recorded as a
@@ -820,7 +859,9 @@ impl UserManager for FerrofinUserManager {
             grouped_folders,
             my_media_excludes,
             latest_items_excludes,
-            cast_receiver_id: user.cast_receiver_id.clone(),
+            cast_receiver_id: self
+                .resolve_cast_receiver_id(user.cast_receiver_id.clone())
+                .await,
         };
 
         let policy = build_user_policy(pool, user, &perms, &prefs).await?;
@@ -1315,6 +1356,55 @@ mod tests {
         assert!(!valid_username("trailing "));
         assert!(!valid_username("has\ttab"));
         assert!(!valid_username("bad/slash"));
+    }
+
+    // jellyfin-web refuses to initialize the Cast SDK when CastReceiverId is
+    // empty, and then the cast menu lists no devices at all. A user row's value
+    // is usually null (only set when the user explicitly picks one, and an
+    // adopted Jellyfin database leaves it null), so the DTO resolves it against
+    // the configured receivers — upstream `UserManager.GetUserDto`.
+    #[tokio::test]
+    async fn cast_receiver_id_resolves_against_the_configured_receivers() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(dir.path()),
+            )
+            .await
+            .expect("config"),
+        );
+        let mgr = FerrofinUserManager::new(db.clone()).with_configuration(config);
+
+        // Null (the norm) → the first configured receiver.
+        assert_eq!(
+            mgr.resolve_cast_receiver_id(None).await.as_deref(),
+            Some("F007D354")
+        );
+        // Empty string counts as unset too.
+        assert_eq!(
+            mgr.resolve_cast_receiver_id(Some(String::new()))
+                .await
+                .as_deref(),
+            Some("F007D354")
+        );
+        // An explicit, still-configured pick is preserved.
+        assert_eq!(
+            mgr.resolve_cast_receiver_id(Some("6F511C87".to_owned()))
+                .await
+                .as_deref(),
+            Some("6F511C87")
+        );
+        // A receiver no longer in the list falls back to the first.
+        assert_eq!(
+            mgr.resolve_cast_receiver_id(Some("GONE".to_owned()))
+                .await
+                .as_deref(),
+            Some("F007D354")
+        );
+        // Without a configuration seam the stored value is echoed unchanged.
+        let bare = FerrofinUserManager::new(db);
+        assert_eq!(bare.resolve_cast_receiver_id(None).await, None);
     }
 
     #[tokio::test]
