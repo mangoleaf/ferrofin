@@ -776,11 +776,22 @@ fn append_people_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Internal
         qb.push(")");
     }
     if !filter.person_ids.is_empty() {
+        // `PersonIds` carries browsable `Person` *item* ids (deterministic,
+        // per-name), but the map's `PeopleId` is the per-(name,type) `Peoples`
+        // row id — a different value. So match a credit either directly (the id
+        // *is* a `PeopleId`, e.g. grains that coincide) OR by bridging the
+        // requested item id → its `Person` name → the credited `Peoples.Name`.
+        // Without the name bridge a person's filmography comes back empty.
+        let ids = to_guid_strings(&filter.person_ids);
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm WHERE pm."ItemId" = bi."Id" AND "#,
+            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
+                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
+                WHERE pm."ItemId" = bi."Id" AND ("#,
         );
-        push_in_list(qb, r#"pm."PeopleId""#, &to_guid_strings(&filter.person_ids));
-        qb.push(")");
+        push_in_list(qb, r#"pm."PeopleId""#, &ids);
+        qb.push(r#" OR pp."Name" IN (SELECT "Name" FROM "BaseItems" WHERE "#);
+        push_in_list(qb, r#""Id""#, &ids);
+        qb.push(")))");
     }
 }
 

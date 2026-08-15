@@ -1185,6 +1185,34 @@ mod tests {
                 .len(),
             1
         );
+
+        // Production grain: the browsable `Person` item has a DIFFERENT id from
+        // the `Peoples` row (per-name deterministic vs per-(name,type) row id).
+        // The client opens the person by its item id — the filmography must still
+        // resolve via the name bridge, not just when the two ids coincide.
+        let person_item = Uuid::from_u128(0xB0FF);
+        assert_ne!(person_item, person);
+        sqlx::query(
+            r#"INSERT INTO "BaseItems"
+               ("Id","Type","Name","IsFolder","IsInMixedFolder","IsLocked",
+                "IsMovie","IsRepeat","IsSeries","IsVirtualItem")
+               VALUES (?1,'MediaBrowser.Controller.Entities.Person','Al Pacino',
+                       0,0,0,0,0,0,0)"#,
+        )
+        .bind(guid_to_db(person_item))
+        .execute(db.writer())
+        .await
+        .expect("person item");
+        let by_item_id = InternalItemsQuery {
+            person_ids: vec![person_item],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository
+            .get_item_list(&by_item_id)
+            .await
+            .expect("by item id");
+        assert_eq!(rows.len(), 1, "person item id resolves filmography via name");
+        assert_eq!(rows[0].id, guid_to_db(movie_a));
     }
 
     #[tokio::test]
