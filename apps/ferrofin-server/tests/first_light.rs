@@ -62,37 +62,10 @@ struct Harness {
 /// Builds a bootstrap [`Config`] whose data/config/cache dirs live under `root`.
 fn test_config(root: &std::path::Path) -> Config {
     Config {
-        data_dir: root.join("data"),
-        config_dir: root.join("config"),
-        cache_dir: root.join("cache"),
-        web_dir: root.join("web"),
-        bind_addr: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        https_port: 0,
-        published_url: None,
-        base_url: String::new(),
-        omdb_api_key: String::new(),
-        studios_repo_url: String::new(),
-        tvdb_api_key: String::new(),
-        tvdb_subscriber_pin: String::new(),
-        fanart_personal_api_key: String::new(),
-        musicbrainz_base_url: String::new(),
-        ffmpeg_path: None,
-        ffprobe_path: None,
-        library_roots: Vec::new(),
         server_name: "ferrofin-first-light".to_owned(),
-        log_level: "info".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
-        db_pool: None,
-        enable_metrics: None,
-        metrics_sample_interval: None,
-        scan_progress_every: None,
-        wasm_call_timeout_secs: None,
-        wasm_memory_limit_mb: None,
-        wasm_event_queue_capacity: None,
-        wasm_private_http_allow: None,
-        max_plugin_download_mb: None,
+        ..Config::test_stub(root)
     }
 }
 

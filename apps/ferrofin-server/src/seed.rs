@@ -141,37 +141,9 @@ mod tests {
     /// throwaway values (seeding only reads `admin_user` / `admin_password`).
     fn seed_config(admin_user: &str, admin_password: &str) -> Config {
         Config {
-            data_dir: std::path::PathBuf::from("/tmp/ferrofin"),
-            config_dir: std::path::PathBuf::from("/tmp/ferrofin/config"),
-            cache_dir: std::path::PathBuf::from("/tmp/ferrofin/cache"),
-            web_dir: std::path::PathBuf::from("/tmp/ferrofin/web"),
-            bind_addr: "127.0.0.1".parse().unwrap(),
-            port: 8096,
-            https_port: 8920,
-            published_url: None,
-            base_url: String::new(),
-            omdb_api_key: String::new(),
-            studios_repo_url: String::new(),
-            tvdb_api_key: String::new(),
-            tvdb_subscriber_pin: String::new(),
-            fanart_personal_api_key: String::new(),
-            musicbrainz_base_url: String::new(),
-            ffmpeg_path: None,
-            ffprobe_path: None,
-            library_roots: Vec::new(),
-            server_name: "ferrofin-test".to_owned(),
-            log_level: "info".to_owned(),
             admin_user: admin_user.to_owned(),
             admin_password: admin_password.to_owned(),
-            db_pool: None,
-            enable_metrics: None,
-            metrics_sample_interval: None,
-            scan_progress_every: None,
-            wasm_call_timeout_secs: None,
-            wasm_memory_limit_mb: None,
-            wasm_event_queue_capacity: None,
-            wasm_private_http_allow: None,
-            max_plugin_download_mb: None,
+            ..Config::test_stub(std::path::Path::new("/tmp/ferrofin"))
         }
     }
 

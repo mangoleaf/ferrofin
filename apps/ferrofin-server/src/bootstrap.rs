@@ -1040,37 +1040,8 @@ mod tests {
 
     fn config_with_ffmpeg(ffmpeg: Option<&str>) -> Config {
         Config {
-            data_dir: PathBuf::from("/tmp/ferrofin"),
-            config_dir: PathBuf::from("/tmp/ferrofin/config"),
-            cache_dir: PathBuf::from("/tmp/ferrofin/cache"),
-            web_dir: PathBuf::from("/tmp/ferrofin/web"),
-            bind_addr: "0.0.0.0".parse().unwrap(),
-            port: 8096,
-            https_port: 8920,
-            published_url: None,
-            base_url: String::new(),
-            omdb_api_key: String::new(),
-            studios_repo_url: String::new(),
-            tvdb_api_key: String::new(),
-            tvdb_subscriber_pin: String::new(),
-            fanart_personal_api_key: String::new(),
-            musicbrainz_base_url: String::new(),
             ffmpeg_path: ffmpeg.map(PathBuf::from),
-            ffprobe_path: None,
-            library_roots: Vec::new(),
-            server_name: "ferrofin".to_owned(),
-            log_level: "info".to_owned(),
-            admin_user: "admin".to_owned(),
-            admin_password: String::new(),
-            db_pool: None,
-            enable_metrics: None,
-            metrics_sample_interval: None,
-            scan_progress_every: None,
-            wasm_call_timeout_secs: None,
-            wasm_memory_limit_mb: None,
-            wasm_event_queue_capacity: None,
-            wasm_private_http_allow: None,
-            max_plugin_download_mb: None,
+            ..Config::test_stub(Path::new("/tmp/ferrofin"))
         }
     }
 }
