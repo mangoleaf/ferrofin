@@ -173,6 +173,41 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         "authored page bytes served verbatim"
     );
 
+    // 2c. The plugin's own URL space routes into the guest: authenticated
+    //     and ANONYMOUS callers both reach handle-request (assets load via
+    //     plain script tags), and the guest's response comes back verbatim.
+    let ping = router
+        .clone()
+        .oneshot(get(&format!("/Plugins/{PLUGIN_ID}/web/ping")))
+        .await
+        .unwrap();
+    assert_eq!(ping.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(ping.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"pong", "guest response body verbatim");
+    let anon = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Plugins/{PLUGIN_ID}/web/ping"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::OK, "anonymous reaches the guest");
+    // Unknown plugin id in the same space → 404, not a guest call.
+    let unknown = router
+        .clone()
+        .oneshot(get(&format!(
+            "/Plugins/{}/web/ping",
+            uuid::Uuid::from_u128(0xdead)
+        )))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
     // 3. The guest's tasks are in the scheduled-task registry.
     let tasks = router
         .clone()

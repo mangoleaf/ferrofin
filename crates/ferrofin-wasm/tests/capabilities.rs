@@ -361,3 +361,56 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "got: {err}"
     );
 }
+
+#[test]
+fn state_kv_round_trips_caps_and_deletes() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+
+    // Unset key → None; no path → clean error.
+    assert_eq!(get_state(Some(&path), "missing"), None);
+    assert!(
+        set_state(None, "k", Some(b"v".to_vec()))
+            .unwrap_err()
+            .contains("not available")
+    );
+
+    // Round trip + overwrite + delete.
+    set_state(Some(&path), "cursor", Some(b"42".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"42".to_vec()));
+    set_state(Some(&path), "cursor", Some(b"43".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"43".to_vec()));
+    set_state(Some(&path), "cursor", None).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), None);
+
+    // Caps: oversized key / value / total are refused, state intact.
+    let big_key = "k".repeat(257);
+    assert!(
+        set_state(Some(&path), &big_key, Some(b"v".to_vec()))
+            .unwrap_err()
+            .contains("key")
+    );
+    assert!(
+        set_state(Some(&path), "big", Some(vec![0u8; 1024 * 1024 + 1]))
+            .unwrap_err()
+            .contains("value")
+    );
+    for i in 0..7 {
+        set_state(
+            Some(&path),
+            &format!("blob{i}"),
+            Some(vec![0u8; 1024 * 1024]),
+        )
+        .unwrap();
+    }
+    // The 8th megabyte (plus key bytes) crosses the 8 MiB total cap.
+    assert!(
+        set_state(Some(&path), "blob7", Some(vec![0u8; 1024 * 1024]))
+            .unwrap_err()
+            .contains("total")
+    );
+    // A corrupt file reads as empty rather than erroring.
+    std::fs::write(&path, b"not json").unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), None);
+}

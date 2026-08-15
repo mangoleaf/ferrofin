@@ -585,8 +585,10 @@ impl PluginManager for FerrofinPluginManager {
                 std::fs::remove_file(&artifact).map_err(|e| {
                     ServiceError::backend(format!("removing {}: {e}", artifact.display()))
                 })?;
-                // Best-effort cleanup of the plugin's config dir + enabled
-                // override; the file removal above is the load-bearing part.
+                // Best-effort cleanup of the plugin's KV state, config dir
+                // + enabled override; the artifact removal above is the
+                // load-bearing part.
+                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
                 {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
