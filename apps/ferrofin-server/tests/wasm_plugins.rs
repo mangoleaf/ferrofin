@@ -208,6 +208,24 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         .unwrap();
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
+    // 2d. The guest's declared web transform is registered into the
+    //     transformation pipeline and actually rewrites matching content.
+    assert!(
+        wired
+            .file_transformations
+            .needs_transformation("fixture.txt")
+            .await,
+        "fixture transform registered for its pattern"
+    );
+    assert_eq!(
+        wired
+            .file_transformations
+            .run_transformation("fixture.txt", "xxAAAyy".to_owned())
+            .await,
+        "xxBBByy",
+        "declared literal search/replace applied"
+    );
+
     // 3. The guest's tasks are in the scheduled-task registry.
     let tasks = router
         .clone()

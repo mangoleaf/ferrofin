@@ -96,6 +96,44 @@ impl Guest for HelloPlugin {
         }]
     }
 
+    fn web_transforms() -> Vec<WebTransform> {
+        // The reference plugin injects nothing — client-side injection is
+        // the largest trust grant a plugin has; see the WIT trust note. A
+        // real UI plugin would return e.g. an index.html <script> insertion.
+        Vec::new()
+    }
+
+    fn handle_request(request: PluginRequest) -> PluginResponse {
+        // The plugin's own URL space (/Plugins/{id}/web/…). Reachable
+        // ANONYMOUSLY — gate anything sensitive on the resolved identity.
+        match (request.method.as_str(), request.path.as_str()) {
+            ("GET", "/hello") => {
+                let greeting =
+                    config_value("Greeting").unwrap_or_else(|| "Hello from WASM".to_owned());
+                json_response(200, &format!("{{\"greeting\":\"{greeting}\"}}"))
+            }
+            // A visit counter demonstrating the KV state store.
+            ("POST", "/count") => {
+                let count = host::get_state("visits")
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    + 1;
+                if let Err(e) = host::set_state("visits", Some(count.to_string().as_bytes())) {
+                    host::log(LogLevel::Warn, &format!("state write failed: {e}"));
+                }
+                json_response(200, &format!("{{\"visits\":{count}}}"))
+            }
+            // Admin-only example: reset the counter.
+            ("POST", "/count/reset") if request.is_admin => {
+                let _ = host::set_state("visits", None);
+                json_response(204, "")
+            }
+            ("POST", "/count/reset") => json_response(403, "{\"error\":\"admin only\"}"),
+            _ => json_response(404, "{\"error\":\"not found\"}"),
+        }
+    }
+
     fn tasks() -> Vec<TaskDescriptor> {
         vec![
             TaskDescriptor {
@@ -174,6 +212,15 @@ fn run_analyze() -> Result<(), String> {
         parent_id: None,
         search_term: None,
         limit: Some(10),
+        // 0.3.0: user scoping + per-user filters/sorting — unused here.
+        user_id: None,
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        genres: vec![],
+        sort_by: Some("DateCreated".to_owned()),
+        sort_descending: true,
+        ids: vec![],
     })?;
     host::log(LogLevel::Info, &format!("found {} movie(s)", movies.len()));
 
@@ -207,6 +254,15 @@ fn run_analyze() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Builds a JSON `plugin-response` (the host caps body sizes).
+fn json_response(status: u16, body: &str) -> PluginResponse {
+    PluginResponse {
+        status,
+        headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+        body: body.as_bytes().to_vec(),
+    }
 }
 
 /// Reads a top-level string value out of the config JSON without a JSON
