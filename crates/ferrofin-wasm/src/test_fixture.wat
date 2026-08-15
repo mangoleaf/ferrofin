@@ -164,6 +164,13 @@
       (i32.store (i32.const 1060) (i32.const 1))    ;; list len
       i32.const 1056)
 
+    ;; declared-egress: () -> list<string>; empty (the fixture fetches
+    ;; loopback under the private grant in tests, never public hosts)
+    (func (export "declared-egress") (result i32)
+      (i32.store (i32.const 1120) (i32.const 0))
+      (i32.store (i32.const 1124) (i32.const 0))
+      i32.const 1120)
+
     ;; handle-request: (plugin-request) -> plugin-response
     ;; plugin-request flattens to exactly 16 params (the direct-passing
     ;; limit): method p0/p1, path p2/p3, query p4/p5, headers p6/p7,
@@ -255,6 +262,8 @@
     (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
   (func $web-transforms (result (list $wt))
     (canon lift (core func $i "web-transforms") (memory $i "memory") string-encoding=utf8))
+  (func $declared-egress (result (list string))
+    (canon lift (core func $i "declared-egress") (memory $i "memory") string-encoding=utf8))
   (func $handle-request (param "request" $req) (result $resp)
     (canon lift (core func $i "handle-request") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
@@ -275,6 +284,7 @@
   (export "tasks" (func $tasks))
   (export "config-pages" (func $config-pages))
   (export "web-transforms" (func $web-transforms))
+  (export "declared-egress" (func $declared-egress))
   (export "handle-request" (func $handle-request))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))

@@ -36,6 +36,7 @@ fn http_fetch_round_trips_method_headers_and_body() {
         "test-plugin",
         1024 * 1024,
         true, // loopback listener — this test exercises transport, not policy
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
         std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "POST".to_owned(),
@@ -68,6 +69,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         "test-plugin",
         1024,
         true,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
         std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
@@ -86,6 +88,7 @@ fn http_fetch_rejects_non_http_schemes_and_oversized_bodies() {
         "test-plugin",
         8,
         true,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
         std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
@@ -347,6 +350,7 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "untrusted-plugin",
         1024,
         false,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
         std::time::Duration::from_secs(5),
         &HttpRequest {
             method: "GET".to_owned(),
@@ -413,4 +417,75 @@ fn state_kv_round_trips_caps_and_deletes() {
     // A corrupt file reads as empty rather than erroring.
     std::fs::write(&path, b"not json").unwrap();
     assert_eq!(get_state(Some(&path), "cursor"), None);
+}
+
+#[test]
+fn egress_policy_matching_rules() {
+    use ferrofin_wasm::capabilities::EgressPolicy;
+    let p = EgressPolicy::parse(&[
+        "API.TheMovieDB.org".to_owned(),
+        "*.fanart.tv".to_owned(),
+        "203.0.113.7".to_owned(),
+        "  ".to_owned(),
+    ]);
+    assert!(p.allows("api.themoviedb.org"), "exact, case-insensitive");
+    assert!(p.allows("ASSETS.FANART.TV"), "subdomain wildcard");
+    assert!(p.allows("203.0.113.7"), "declared IP literal");
+    assert!(!p.allows("fanart.tv"), "wildcard does not match the apex");
+    assert!(!p.allows("evil.com"));
+    assert!(
+        !p.allows("api.themoviedb.org.evil.com"),
+        "no suffix confusion"
+    );
+    assert!(
+        !EgressPolicy::default().allows("example.com"),
+        "deny by default"
+    );
+    assert!(EgressPolicy::parse(&["*".to_owned()]).allows("anything.example"));
+}
+
+#[test]
+fn undeclared_destination_is_refused_before_dns() {
+    use ferrofin_wasm::capabilities::EgressPolicy;
+    // `.invalid` never resolves — if the deny happened after DNS this would
+    // be a resolution error, not the allowlist message.
+    let err = http_fetch(
+        &client(),
+        "test-plugin",
+        1024,
+        false,
+        &EgressPolicy::parse(&["api.example.com".to_owned()]),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url: "https://undeclared.invalid/x".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("declared egress allowlist"),
+        "denied pre-DNS by the allowlist, got: {err}"
+    );
+
+    // The admin's private grant supersedes the declared list (it is the
+    // larger explicit trust): loopback fetch works with an EMPTY policy.
+    let (url, _server) = one_shot_http("200 OK", b"ok");
+    let response = http_fetch(
+        &client(),
+        "trusted-plugin",
+        1024,
+        true,
+        &EgressPolicy::default(),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url,
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .expect("private-granted plugin exempt from the declared list");
+    assert_eq!(response.status, 200);
 }

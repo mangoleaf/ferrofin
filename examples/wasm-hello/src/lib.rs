@@ -96,6 +96,14 @@ impl Guest for HelloPlugin {
         }]
     }
 
+    fn declared_egress() -> Vec<String> {
+        // The analyze task POSTs to a USER-CONFIGURED ReportUrl, so the
+        // destination cannot be named in advance — `*` is the honest
+        // declaration (the host logs it loudly at load). A plugin with
+        // fixed API endpoints should list them exactly instead.
+        vec!["*".to_owned()]
+    }
+
     fn web_transforms() -> Vec<WebTransform> {
         // The reference plugin injects nothing — client-side injection is
         // the largest trust grant a plugin has; see the WIT trust note. A

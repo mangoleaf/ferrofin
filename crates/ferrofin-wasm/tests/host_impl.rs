@@ -29,6 +29,9 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         ),
         http_timeout: std::time::Duration::from_secs(5),
         state_path: None,
+        egress: std::sync::Arc::new(ferrofin_wasm::capabilities::EgressPolicy::parse(&[
+            "*".to_owned()
+        ])),
         collaborators,
         private_http_allowed: true, // tests hit a loopback listener
         wasi: HostState::empty_wasi(),

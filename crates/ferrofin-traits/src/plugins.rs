@@ -163,14 +163,26 @@ pub trait PluginArtifactValidator: Send + Sync {
     fn supported_abi(&self) -> &str;
 
     /// Checks that `bytes` is a loadable component of the supported world
-    /// and returns its self-reported descriptor id. Runs in a throwaway
-    /// sandbox with the standard limits and no capabilities armed — the
-    /// artifact cannot reach the network or the library during validation.
+    /// and returns its self-reported identity + declared egress. Runs in a
+    /// throwaway sandbox with the standard limits and no capabilities armed
+    /// — the artifact cannot reach the network or the library during
+    /// validation.
     ///
     /// # Errors
     /// [`ServiceError::InvalidInput`] describing why the artifact is not a
     /// valid plugin (not a component, wrong world, bad descriptor, …).
-    async fn validate(&self, bytes: &[u8]) -> Result<Uuid, ServiceError>;
+    async fn validate(&self, bytes: &[u8]) -> Result<ValidatedArtifact, ServiceError>;
+}
+
+/// What install-time validation learns about an artifact.
+#[derive(Debug, Clone)]
+pub struct ValidatedArtifact {
+    /// The plugin's self-reported descriptor id.
+    pub id: Uuid,
+    /// The plugin's declared public-egress allowlist, verbatim — recorded
+    /// at install so an upgrade that GROWS a plugin's reach is loudly
+    /// visible in the server log.
+    pub declared_egress: Vec<String>,
 }
 
 fn _assert_object_safe_plugin_artifact_validator(_: &dyn PluginArtifactValidator) {}

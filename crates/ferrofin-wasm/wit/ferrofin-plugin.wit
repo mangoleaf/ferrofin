@@ -319,6 +319,23 @@ world plugin {
     /// Called once at load; network-mute like the other identity exports.
     export config-pages: func() -> list<config-page>;
 
+    /// The plugin's PUBLIC-EGRESS ALLOWLIST — every internet destination
+    /// its `http-fetch` may ever contact, declared in the artifact itself
+    /// so anyone can audit a plugin's reach before installing (the same
+    /// values live in the plugin repo's Cargo.toml, in plain sight).
+    ///
+    /// Entries: an exact host (`api.themoviedb.org`), a subdomain wildcard
+    /// (`*.fanart.tv`), an IP literal, or `*` (ANY public host — for
+    /// plugins whose destinations are user-configured, e.g. webhooks; the
+    /// host logs a loud warning for `*` plugins at load). DENY BY DEFAULT:
+    /// an empty list means this plugin has no public network reach at all.
+    ///
+    /// The check runs on the URL's host string BEFORE any DNS resolution
+    /// (a denied fetch must not leak data through the DNS query itself).
+    /// Private/LAN destinations are a separate, admin-granted layer and
+    /// are not granted by this list.
+    export declared-egress: func() -> list<string>;
+
     /// The web-file transformations this plugin declares (may be empty).
     /// Called once at load; applied by the host to served `/web` files
     /// while the plugin is enabled. See the `web-transform` trust note.

@@ -66,6 +66,8 @@ pub struct HostState {
     /// Whether THIS plugin may reach private/loopback destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW` names it or is `*`).
     pub private_http_allowed: bool,
+    /// The plugin's declared public-egress allowlist (deny-by-default).
+    pub egress: std::sync::Arc<crate::capabilities::EgressPolicy>,
     /// The manager handles behind `query-items`/`write-media-segments`,
     /// installed by the composition root after loading (empty during load).
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
@@ -132,6 +134,7 @@ impl host::Host for HostState {
             &self.plugin_name,
             self.memory_limit_bytes,
             self.private_http_allowed,
+            &self.egress,
             self.http_timeout,
             &request,
         )

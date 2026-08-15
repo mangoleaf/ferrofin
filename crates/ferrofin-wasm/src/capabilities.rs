@@ -46,6 +46,53 @@ pub struct Collaborators {
     pub tv: Arc<dyn ferrofin_traits::tv::TvSeriesManager>,
 }
 
+/// A plugin's declared public-egress allowlist, parsed once at load from
+/// its `declared-egress` export. DENY BY DEFAULT: an empty policy grants no
+/// public destination at all.
+#[derive(Debug, Clone, Default)]
+pub struct EgressPolicy {
+    /// The plugin declared `*` — any public host (logged loudly at load).
+    pub allow_any: bool,
+    /// Exact hosts (lowercased) the plugin may contact.
+    pub hosts: Vec<String>,
+    /// `*.suffix` wildcard entries, stored as the lowercased suffix
+    /// including the leading dot (`.fanart.tv`).
+    pub suffixes: Vec<String>,
+}
+
+impl EgressPolicy {
+    /// Parses the guest's declared entries (invalid/empty entries dropped).
+    #[must_use]
+    pub fn parse(declared: &[String]) -> Self {
+        let mut policy = Self::default();
+        for entry in declared {
+            let entry = entry.trim().to_lowercase();
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "*" {
+                policy.allow_any = true;
+            } else if let Some(suffix) = entry.strip_prefix("*.") {
+                policy.suffixes.push(format!(".{suffix}"));
+            } else {
+                policy.hosts.push(entry);
+            }
+        }
+        policy
+    }
+
+    /// Whether `host` (a URL host string — name or IP literal) is declared.
+    #[must_use]
+    pub fn allows(&self, host: &str) -> bool {
+        if self.allow_any {
+            return true;
+        }
+        let host = host.to_lowercase();
+        self.hosts.contains(&host)
+            || self.suffixes.iter().any(|s| host.ends_with(s.as_str()))
+    }
+}
+
 /// Whether an address is in a range the private-HTTP policy denies by
 /// default: loopback, link-local (incl. cloud metadata services), RFC1918,
 /// CGNAT (`100.64.0.0/10` — Tailscale's default range), IPv6 ULA, and the
@@ -127,6 +174,7 @@ pub fn http_fetch(
     plugin_name: &str,
     body_cap_bytes: usize,
     private_http_allowed: bool,
+    egress: &EgressPolicy,
     call_timeout: std::time::Duration,
     request: &HttpRequest,
 ) -> Result<HttpResponse, String> {
@@ -138,6 +186,19 @@ pub fn http_fetch(
         return Err(format!(
             "scheme `{}` is not allowed (http/https only)",
             url.scheme()
+        ));
+    }
+    // The declared-egress gate runs on the HOST STRING, before any DNS
+    // resolution — a denied fetch must not leak data through the query
+    // itself. A plugin the admin granted private-network access is exempt
+    // (that grant is the larger, explicit trust); everyone else may only
+    // contact what their artifact declares. Deny-by-default.
+    let host = url.host_str().ok_or("url has no host")?;
+    if !private_http_allowed && !egress.allows(host) {
+        return Err(format!(
+            "destination `{host}` is not in the plugin's declared egress allowlist \
+             (the plugin `{plugin_name}` declares its reachable hosts in its own \
+             manifest; an empty list means no public network access)"
         ));
     }
     // For a HOSTNAME destination under the private-address policy, the

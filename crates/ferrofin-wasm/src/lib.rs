@@ -467,6 +467,8 @@ fn load_one(
         private_http_allowed: false,
         collaborators: Arc::clone(collaborators),
         state_path: None, // id-derived; set below once the descriptor is read
+        // Load-time calls can't fetch at all; the real policy is read below.
+        egress: Arc::new(capabilities::EgressPolicy::default()),
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
@@ -484,6 +486,21 @@ fn load_one(
     let tasks = instance.call_tasks(&mut store)?;
     let config_pages = instance.call_config_pages(&mut store)?;
     let web_transforms = instance.call_web_transforms(&mut store)?;
+    let declared_egress = instance.call_declared_egress(&mut store)?;
+    let egress = Arc::new(capabilities::EgressPolicy::parse(&declared_egress));
+    if egress.allow_any {
+        warn!(
+            plugin = %path.display(),
+            "plugin declares UNRESTRICTED public egress (`*`) — it may contact \
+             any internet host; install only if you trust it"
+        );
+    } else if !declared_egress.is_empty() {
+        info!(
+            plugin = %path.display(),
+            hosts = ?declared_egress,
+            "plugin declared public-egress allowlist"
+        );
+    }
 
     let descriptor = PluginDescriptor {
         id,
@@ -503,6 +520,7 @@ fn load_one(
         plugin_id: id.to_string(),
         private_http_allowed: settings.allows_private_http(id),
         state_path: Some(state_path.clone()),
+        egress: Arc::clone(&egress),
         ..spec
     };
     // The already-made calls used the placeholder identity in HostState; fix
@@ -512,6 +530,7 @@ fn load_one(
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
     store.data_mut().private_http_allowed = spec.private_http_allowed;
     store.data_mut().state_path = Some(state_path);
+    store.data_mut().egress = egress;
 
     let runtime = runtime::spawn(
         spec,
@@ -776,7 +795,10 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
         PLUGIN_ABI
     }
 
-    async fn validate(&self, bytes: &[u8]) -> Result<Uuid, ServiceError> {
+    async fn validate(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
         let engine = self.engine.clone();
         let linker = Arc::clone(&self.linker);
         let http_cell = Arc::clone(&self.http);
@@ -809,6 +831,7 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                 http,
                 private_http_allowed: false,
                 state_path: None, // validation is throwaway — no persistence
+                egress: Arc::new(capabilities::EgressPolicy::default()),
                 // Never armed: query-items/write-media-segments/http-fetch
                 // all refuse during validation.
                 collaborators: Arc::new(std::sync::OnceLock::new()),
@@ -821,11 +844,18 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
             let wire = instance.call_descriptor(&mut store).map_err(|e| {
                 ServiceError::invalid_input(format!("artifact descriptor call failed: {e:#}"))
             })?;
-            wire.id.parse::<Uuid>().map_err(|_| {
+            let id = wire.id.parse::<Uuid>().map_err(|_| {
                 ServiceError::invalid_input(format!(
                     "artifact descriptor id `{}` is not a valid UUID",
                     wire.id
                 ))
+            })?;
+            let declared_egress = instance.call_declared_egress(&mut store).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact declared-egress call failed: {e:#}"))
+            })?;
+            Ok(ferrofin_traits::plugins::ValidatedArtifact {
+                id,
+                declared_egress,
             })
         })
         .await
