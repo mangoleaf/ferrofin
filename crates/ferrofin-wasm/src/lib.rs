@@ -187,6 +187,21 @@ impl LoadedPlugin {
         self.runtime.run_task(task_id, String::from("{}")).await
     }
 
+    /// Drives `handle-request` directly with an empty config — the same
+    /// test seam as [`run_task_for_test`], for exercising the request
+    /// path's containment (traps, the breaker) without the HTTP layer.
+    ///
+    /// [`run_task_for_test`]: Self::run_task_for_test
+    #[doc(hidden)]
+    pub async fn handle_request_for_test(
+        &self,
+        request: bindings::types::PluginRequest,
+    ) -> Result<bindings::types::PluginResponse, String> {
+        self.runtime
+            .handle_request(request, String::from("{}"))
+            .await
+    }
+
     /// The cached enabled flag if it is still fresh, else `None` (caller must
     /// refresh from the plugin manager).
     fn cached_enabled(&self) -> Option<bool> {
@@ -479,6 +494,10 @@ fn load_one(
             wire.id
         ))
     })?;
+    // State is available from here on (the plan allows it at load — it is
+    // local, with no exfil channel): the id names the file.
+    let state_path = path.with_file_name(format!("{id}.state.json"));
+    store.data_mut().state_path = Some(state_path.clone());
     let default_config = instance.call_default_config(&mut store)?;
     serde_json::from_str::<serde_json::Value>(&default_config).map_err(|e| {
         wasmtime::Error::msg(format!("plugin default-config is not valid JSON: {e}"))
@@ -514,7 +533,6 @@ fn load_one(
 
     // Re-tag the spec with the real identity + its private-HTTP grant, then
     // hand the warm instance to its runtime thread.
-    let state_path = path.with_file_name(format!("{id}.state.json"));
     let spec = InstanceSpec {
         plugin_name: wire.name,
         plugin_id: id.to_string(),
@@ -529,7 +547,6 @@ fn load_one(
     store.data_mut().plugin_name.clone_from(&spec.plugin_name);
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
     store.data_mut().private_http_allowed = spec.private_http_allowed;
-    store.data_mut().state_path = Some(state_path);
     store.data_mut().egress = egress;
 
     let runtime = runtime::spawn(

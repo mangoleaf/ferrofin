@@ -195,3 +195,48 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     // The provider id is derived from the plugin id — never guest-supplied.
     assert_eq!(created[0].1, "wasm:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff99");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_and_next_up_flow_through_the_host_trait() {
+    // HostState holds a blocking reqwest client — build and drive it all on
+    // a blocking thread (the same rule as the plugin runtime threads).
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        use ferrofin_wasm::bindings::host::Host as _;
+        // Unarmed collaborators: next-up refuses during load, state works
+        // (it is local, no exfil channel — allowed at load by design).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = state(Arc::new(std::sync::OnceLock::new()));
+        s.state_path = Some(dir.path().join("p.state.json"));
+        let err = s.next_up("00000000-0000-0000-0000-000000000001".into(), 5);
+        assert!(err.unwrap_err().contains("during plugin load"));
+        s.set_state("k".into(), Some(b"v".to_vec())).unwrap();
+        assert_eq!(s.get_state("k".into()), Some(b"v".to_vec()));
+        s.set_state("k".into(), None).unwrap();
+        assert_eq!(s.get_state("k".into()), None);
+
+        // Armed: next-up reaches the stub queue and enriches via user data.
+        let cell = Arc::new(std::sync::OnceLock::new());
+        cell.set(Collaborators {
+            users: std::sync::Arc::new(common::StubUsers),
+            user_data: std::sync::Arc::new(common::StubUserData),
+            tv: std::sync::Arc::new(common::StubTv),
+            handle,
+            library: Arc::new(OneMovieLibrary {
+                seen: std::sync::Mutex::new(None),
+            }),
+            media_segments: Arc::new(RecordingSegments::default()),
+            plugins: Arc::new(EnabledStub(b"{}".to_vec())),
+        })
+        .ok()
+        .unwrap();
+        let mut s = state(cell);
+        let items = s
+            .next_up("00000000-0000-0000-0000-000000000001".into(), 5)
+            .expect("next-up through the trait");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Big Buck Bunny");
+    })
+    .await
+    .unwrap();
+}

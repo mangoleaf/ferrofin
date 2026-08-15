@@ -159,7 +159,8 @@ declare nothing and physically cannot phone home. The check runs on the URL's ho
 string *before any DNS resolution* (a denied fetch must not leak data through the DNS
 query itself); private/LAN destinations remain a separate, admin-granted layer
 (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`), which supersedes the declared list for plugins
-the admin explicitly trusted. Install-time validation records each plugin's declared
+the admin explicitly trusted — note the blast radius: naming a plugin there (or `*`)
+exempts it from the declared-egress model entirely, public destinations included. Install-time validation records each plugin's declared
 list, and an upgrade that GROWS it is warned about by name — a plugin's reach changing
 is a decision-worthy event.
 
@@ -176,7 +177,9 @@ plugins like Home Screen Sections possible):
   sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
-  text). This is how a plugin injects its client-side hooks into jellyfin-web. Plugins can also act as **metadata sources**: the scan offers every item to each
+  text). This is how a plugin injects its client-side hooks into jellyfin-web.
+
+Plugins can also act as **metadata sources**: the scan offers every item to each
 enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
 ran, and applies results **supplement-only** — a plugin fills fields that are still empty
 and records its own external ids; it can never overwrite a built-in provider or a user

@@ -489,3 +489,126 @@ fn undeclared_destination_is_refused_before_dns() {
     .expect("private-granted plugin exempt from the declared list");
     assert_eq!(response.status, 200);
 }
+
+fn recorded_query_rig() -> (Collaborators, std::sync::Arc<common::OneMovieLibrary>) {
+    let library = std::sync::Arc::new(common::OneMovieLibrary {
+        seen: std::sync::Mutex::new(None),
+    });
+    (
+        Collaborators {
+            users: std::sync::Arc::new(common::StubUsers),
+            user_data: std::sync::Arc::new(common::StubUserData),
+            tv: std::sync::Arc::new(common::StubTv),
+            handle: tokio::runtime::Handle::current(),
+            library: library.clone(),
+            media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+            plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+        },
+        library,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn user_scoped_query_applies_user_and_enriches_summaries() {
+    let (cx, library) = recorded_query_rig();
+    let user = uuid::Uuid::from_u128(0x1234);
+    let mut query = base_item_query();
+    query.user_id = Some(user.to_string());
+    query.is_played = Some(true);
+    query.is_favorite = Some(false);
+    query.sort_by = Some("DatePlayed".to_owned());
+    query.sort_descending = true;
+    let items =
+        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::query_items(&cx, &query))
+            .await
+            .unwrap()
+            .expect("user-scoped query");
+
+    // Per-user enrichment came from the batch read.
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].played, Some(true));
+    assert_eq!(items[0].is_favorite, Some(true));
+    assert_eq!(items[0].playback_position_ticks, Some(1230));
+    // The internal query carried the user (parental limits) + filters + sort.
+    let seen = library
+        .seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("query recorded");
+    assert!(seen.user.is_some(), "user entity set on the internal query");
+    assert_eq!(seen.is_played, Some(true));
+    assert_eq!(seen.is_favorite, Some(false));
+    assert_eq!(seen.order_by.len(), 1);
+
+    // An unknown sort key is a clean guest error.
+    let (cx, _) = recorded_query_rig();
+    let mut bad = base_item_query();
+    bad.sort_by = Some("Bogus".to_owned());
+    let err =
+        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::query_items(&cx, &bad))
+            .await
+            .unwrap()
+            .unwrap_err();
+    assert!(err.contains("sort-by"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn next_up_projects_through_the_entity_path() {
+    let (cx, _library) = recorded_query_rig();
+    let user = uuid::Uuid::from_u128(0x5678).to_string();
+    let items =
+        tokio::task::spawn_blocking(move || ferrofin_wasm::capabilities::next_up(&cx, &user, 5))
+            .await
+            .unwrap()
+            .expect("next-up");
+    assert_eq!(items.len(), 1, "the stub queue's one episode came back");
+    assert_eq!(items[0].name, "Big Buck Bunny");
+    assert_eq!(items[0].played, Some(true), "user enrichment applied");
+
+    // A malformed user id errors cleanly.
+    let (cx, _) = recorded_query_rig();
+    let err = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::capabilities::next_up(&cx, "not-a-uuid", 5)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(err.contains("UUID"), "{err}");
+}
+
+fn base_item_query() -> ferrofin_wasm::bindings::types::ItemQuery {
+    ferrofin_wasm::bindings::types::ItemQuery {
+        kinds: vec![],
+        parent_id: None,
+        search_term: None,
+        limit: Some(10),
+        user_id: None,
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        genres: vec![],
+        sort_by: None,
+        sort_descending: false,
+        ids: vec![],
+    }
+}
+
+#[test]
+fn set_state_refuses_to_wipe_on_a_corrupt_file() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    set_state(Some(&path), "k", Some(b"v".to_vec())).unwrap();
+    std::fs::write(&path, b"definitely not json").unwrap();
+    // Reads stay lenient…
+    assert_eq!(get_state(Some(&path), "k"), None);
+    // …but a WRITE must not silently rebuild from empty.
+    let err = set_state(Some(&path), "k2", Some(b"x".to_vec())).unwrap_err();
+    assert!(err.contains("corrupt"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"definitely not json",
+        "the damaged file was left untouched for recovery"
+    );
+}

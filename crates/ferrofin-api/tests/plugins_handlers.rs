@@ -435,3 +435,98 @@ async fn plugin_mutations_require_an_administrator() {
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Captures what the transport forwards to a plugin and answers with
+/// deliberately hostile headers, to pin the two filters.
+#[derive(Default)]
+struct RecordingRequestHandler {
+    seen: std::sync::Mutex<Option<ferrofin_traits::plugins::PluginWebRequest>>,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::plugins::PluginRequestHandler for RecordingRequestHandler {
+    async fn handle(
+        &self,
+        plugin_id: Uuid,
+        request: ferrofin_traits::plugins::PluginWebRequest,
+    ) -> Result<Option<ferrofin_traits::plugins::PluginWebResponse>, ServiceError> {
+        if plugin_id != known_id() {
+            return Ok(None);
+        }
+        *self.seen.lock().unwrap() = Some(request);
+        Ok(Some(ferrofin_traits::plugins::PluginWebResponse {
+            status: 201,
+            headers: vec![
+                ("x-plugin".to_owned(), "ok".to_owned()),
+                // Framing/hop-by-hop must be dropped by the transport.
+                ("content-length".to_owned(), "9999".to_owned()),
+                ("transfer-encoding".to_owned(), "chunked".to_owned()),
+                ("connection".to_owned(), "close".to_owned()),
+            ],
+            body: b"made-it".to_vec(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn plugin_route_strips_credentials_and_reserved_headers() {
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let state = authed_state_with_plugins(Arc::new(RecordingPlugins::default()))
+        .with_plugin_request_handler(handler.clone());
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Plugins/{}/web/hook?x=1&api_key=SECRET&y=2",
+                    known_id()
+                ))
+                .header("Authorization", "Token super-secret")
+                .header("Cookie", "session=abc")
+                .header("X-Emby-Token", "tok")
+                .header("x-custom", "kept")
+                .body(Body::from("payload"))
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(
+        resp.headers().get("x-plugin").is_some(),
+        "benign guest header forwarded"
+    );
+    assert!(
+        resp.headers().get("transfer-encoding").is_none()
+            && resp.headers().get("connection").is_none(),
+        "framing/hop-by-hop headers dropped"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"made-it");
+
+    let seen = handler.seen.lock().unwrap().clone().expect("captured");
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/hook");
+    assert_eq!(seen.query, "x=1&y=2", "api_key stripped from the query");
+    let names: Vec<&str> = seen.headers.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        !names.contains(&"authorization")
+            && !names.contains(&"cookie")
+            && !names.contains(&"x-emby-token"),
+        "credential headers never reach the guest: {names:?}"
+    );
+    assert!(names.contains(&"x-custom"), "other headers pass through");
+    assert_eq!(seen.body.as_deref(), Some(&b"payload"[..]));
+
+    // No dispatcher wired (default state) -> the URL space 404s.
+    let resp = router(Arc::new(RecordingPlugins::default()))
+        .oneshot(authed(
+            "GET",
+            &format!("/Plugins/{}/web/hook", known_id()),
+            Body::empty(),
+        ))
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

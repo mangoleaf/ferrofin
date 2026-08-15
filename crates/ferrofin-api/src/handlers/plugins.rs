@@ -489,6 +489,28 @@ async fn cancel_package_installation(
     Err(ApiError::NotFound(format!("installation {package_id}")))
 }
 
+/// Credential-bearing request headers a guest must never see (the WIT
+/// guarantees the resolved identity fields are the only auth facts).
+const CREDENTIAL_HEADERS: [&str; 5] = [
+    "authorization",
+    "cookie",
+    "x-emby-token",
+    "x-emby-authorization",
+    "x-mediabrowser-token",
+];
+
+/// Framing and hop-by-hop response headers belong to the transport, not
+/// the guest — forwarding them fights hyper's own framing.
+const RESERVED_RESPONSE_HEADERS: [&str; 7] = [
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+];
+
 /// Max inbound body for a plugin-routed request — an abuse guard on an
 /// anonymous surface, not a tuning knob (plugin APIs move JSON, not media).
 const PLUGIN_REQUEST_BODY_MAX: usize = 1024 * 1024;
@@ -527,12 +549,25 @@ async fn plugin_web_request(
                 "request body exceeds the {PLUGIN_REQUEST_BODY_MAX}-byte plugin route limit"
             ))
         })?;
+    // The WIT guarantees a guest NEVER sees credentials: strip the auth
+    // headers and the `api_key` query parameter before forwarding — the
+    // resolved identity fields are the only auth facts a plugin gets.
+    let query = raw_query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split('=').next().unwrap_or_default();
+            !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
     let web_request = ferrofin_traits::plugins::PluginWebRequest {
         method: method.to_string(),
         path: format!("/{rest}"),
-        query: raw_query.unwrap_or_default(),
+        query,
         headers: headers
             .iter()
+            .filter(|(n, _)| !CREDENTIAL_HEADERS.contains(&n.as_str()))
             .map(|(n, v)| {
                 (
                     n.to_string(),
@@ -554,6 +589,12 @@ async fn plugin_web_request(
     );
     for (name, value) in reply.headers {
         // Invalid guest-supplied header names/values are dropped, not fatal.
+        if RESERVED_RESPONSE_HEADERS
+            .iter()
+            .any(|r| name.eq_ignore_ascii_case(r))
+        {
+            continue;
+        }
         if let (Ok(n), Ok(v)) = (
             axum::http::HeaderName::try_from(name.as_str()),
             axum::http::HeaderValue::try_from(value.as_str()),

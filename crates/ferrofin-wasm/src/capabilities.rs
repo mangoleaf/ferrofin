@@ -87,9 +87,10 @@ impl EgressPolicy {
         if self.allow_any {
             return true;
         }
-        let host = host.to_lowercase();
-        self.hosts.contains(&host)
-            || self.suffixes.iter().any(|s| host.ends_with(s.as_str()))
+        // url.host_str() brackets IPv6 literals (`[2001:db8::1]`) — strip
+        // so a declared v6 literal can match.
+        let host = host.trim_matches(['[', ']']).to_lowercase();
+        self.hosts.contains(&host) || self.suffixes.iter().any(|s| host.ends_with(s.as_str()))
     }
 }
 
@@ -540,18 +541,56 @@ const STATE_VALUE_MAX: usize = 1024 * 1024;
 /// Max total logical bytes (keys + values) for one plugin's state.
 const STATE_TOTAL_MAX: usize = 8 * 1024 * 1024;
 
-/// Reads a plugin's state map from disk (missing/corrupt file = empty).
-fn read_state(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+/// Hex-encodes a state value (values are stored as hex strings — a JSON
+/// `Vec<u8>` would serialize as a number array, ~4× the logical size).
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decodes a hex-encoded state value (`None` on malformed input).
+fn from_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Reads a plugin's state map from disk, leniently: missing OR corrupt
+/// file = empty. Only safe for READS — see [`read_state_for_write`].
+fn read_state(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
+/// Reads the state map for a WRITE: only a genuinely-absent file may read
+/// as empty — any other failure (permissions, fd exhaustion, torn write)
+/// must ERROR, or a transient fault would silently wipe the plugin's
+/// state on the rewrite and report success.
+fn read_state_for_write(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("plugin state file is corrupt; refusing to overwrite: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
+        Err(e) => Err(format!("reading plugin state: {e}")),
+    }
+}
+
 /// Executes `get-state` for a guest.
 #[must_use]
 pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
-    read_state(path?).remove(key)
+    read_state(path?).get(key).and_then(|v| from_hex(v))
 }
 
 /// Executes `set-state` for a guest: `None` deletes; writes are atomic
@@ -573,16 +612,17 @@ pub fn set_state(
     {
         return Err(format!("state value exceeds {STATE_VALUE_MAX} bytes"));
     }
-    let mut map = read_state(path);
+    let mut map = read_state_for_write(path)?;
     match value {
         Some(v) => {
-            map.insert(key.to_owned(), v);
+            map.insert(key.to_owned(), to_hex(&v));
         }
         None => {
             map.remove(key);
         }
     }
-    let total: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+    // Logical size: hex stores two chars per byte.
+    let total: usize = map.iter().map(|(k, v)| k.len() + v.len() / 2).sum();
     if total > STATE_TOTAL_MAX {
         return Err(format!(
             "plugin state would exceed {STATE_TOTAL_MAX} bytes in total"

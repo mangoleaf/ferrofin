@@ -379,3 +379,115 @@ fn settings_resolve_applies_defaults_and_ignores_zero() {
         "default denies everyone"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_request_answers_traps_and_trips_the_breaker() {
+    use ferrofin_wasm::bindings::types::PluginRequest;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("fixture.wasm"),
+        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
+    )
+    .unwrap();
+    // load() builds a blocking HTTP client — off the async workers.
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::WasmPluginHost::load(
+            &load_dir,
+            &ferrofin_wasm::WasmSettings::resolve(Some(2), None, None, None),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin = &host.plugins()[0];
+    let request = |path: &str| PluginRequest {
+        method: "GET".to_owned(),
+        path: path.to_owned(),
+        query: String::new(),
+        headers: vec![],
+        body: None,
+        user_id: None,
+        is_admin: false,
+        is_authenticated: false,
+    };
+
+    // Happy path: the guest's response comes back whole.
+    let response = plugin
+        .handle_request_for_test(request("/ping"))
+        .await
+        .expect("guest answers");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"pong");
+
+    // A trapping path fails that call, the instance rebuilds…
+    for _ in 0..2 {
+        let err = plugin
+            .handle_request_for_test(request("/boom"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("plugin call failed"), "{err}");
+        // …and a good call still works between traps (fresh instance).
+        assert!(plugin.handle_request_for_test(request("/ok")).await.is_ok());
+    }
+    // Three consecutive traps trip the breaker for good.
+    for _ in 0..3 {
+        let _ = plugin.handle_request_for_test(request("/boom")).await;
+    }
+    let err = plugin
+        .handle_request_for_test(request("/ping"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("disabled until restart"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatcher_routes_by_id_and_gates_on_enabled() {
+    use ferrofin_traits::plugins::{PluginRequestHandler as _, PluginWebRequest};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("fixture.wasm"),
+        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
+    )
+    .unwrap();
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::WasmPluginHost::load(
+            &load_dir,
+            &ferrofin_wasm::WasmSettings::resolve(None, None, None, None),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let dispatcher = ferrofin_wasm::WasmRequestDispatcher::new(
+        &host,
+        std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+    );
+    let request = PluginWebRequest {
+        method: "GET".to_owned(),
+        path: "/ping".to_owned(),
+        query: String::new(),
+        headers: vec![],
+        body: None,
+        user_id: None,
+        is_admin: false,
+        is_authenticated: false,
+    };
+    // Known + enabled → the guest's response.
+    let reply = dispatcher
+        .handle(plugin_id, request.clone())
+        .await
+        .expect("dispatch")
+        .expect("known plugin");
+    assert_eq!(reply.status, 200);
+    // Unknown id → None (the transport 404s) without touching a guest.
+    assert!(
+        dispatcher
+            .handle(uuid::Uuid::from_u128(0xbeef), request)
+            .await
+            .expect("dispatch")
+            .is_none()
+    );
+}

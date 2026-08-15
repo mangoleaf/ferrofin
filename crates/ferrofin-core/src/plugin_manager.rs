@@ -472,6 +472,13 @@ impl FerrofinPluginManager {
             .unwrap_or(plugin.descriptor.enabled)
     }
 
+    /// The state-directory path — a test seam (`state.json` assertions).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn plugins_dir_for_test(&self) -> &std::path::Path {
+        &self.plugins_dir
+    }
+
     /// The path to a plugin's config file.
     fn config_path(&self, id: Uuid) -> PathBuf {
         self.plugins_dir.join(id.to_string()).join("config.json")
@@ -626,6 +633,7 @@ impl PluginManager for FerrofinPluginManager {
                 {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
+                    state.installed_egress.remove(&id.to_string());
                     let snapshot = state.clone();
                     drop(state);
                     let _ = self.persist(&snapshot);
@@ -1367,10 +1375,32 @@ mod tests {
         let staged = rig.wasm_dir.join(format!("{PKG_ID}.wasm"));
         assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
         assert!(rig.lifecycle.has_pending_restart(), "restart flagged");
+        // The validator-reported egress allowlist was recorded (upgrade
+        // growth diffs against it).
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["installed_egress"][PKG_ID.to_string()][0],
+            "api.example.com",
+            "declared egress persisted: {persisted}"
+        );
 
-        // Uninstall removes the staged file and re-flags restart.
+        // Uninstall removes the staged file and re-flags restart — and the
+        // egress record goes with it (a reinstall must not diff stale).
         rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
         assert!(!staged.exists(), "artifact removed");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["installed_egress"]
+                .get(PKG_ID.to_string())
+                .is_none(),
+            "egress record cleared on uninstall: {persisted}"
+        );
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
     }
