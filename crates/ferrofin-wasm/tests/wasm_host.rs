@@ -332,6 +332,9 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // Armed: the fixture's metadata-lookup answers ok(none); the second call
     // takes the (enabled, config) gate from the cache.
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: std::sync::Arc::new(common::OneMovieLibrary {
             seen: std::sync::Mutex::new(None),

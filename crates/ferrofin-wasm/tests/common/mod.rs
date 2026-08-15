@@ -307,3 +307,186 @@ impl MediaSegmentManager for RecordingSegments {
         Ok(Vec::new())
     }
 }
+
+// ── stubs for the user/tv collaborator seams (0.3.0 capabilities) ──
+#[allow(unused_imports)]
+use ferrofin_db::entities::base_items::BaseItemEntity as _StubBI;
+use ferrofin_db::entities::users::UserEntity;
+#[allow(unused_imports)]
+use ferrofin_model::configuration::UserConfiguration;
+#[allow(unused_imports)]
+use ferrofin_model::dto::NameIdPair;
+#[allow(unused_imports)]
+use ferrofin_model::dto::{BaseItemDto, UpdateUserItemDataDto, UserDto, UserItemDataDto};
+#[allow(unused_imports)]
+use ferrofin_model::querying::QueryResult;
+#[allow(unused_imports)]
+use ferrofin_model::users::UserPolicy;
+#[allow(unused_imports)]
+use ferrofin_traits::options::DtoOptions;
+#[allow(unused_imports)]
+use ferrofin_traits::tv::NextUpQuery;
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubUsers;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::UserManager for StubUsers {
+    async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn initialize(&self) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_by_id(&self, _id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_by_name(&self, _name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn rename_user(
+        &self,
+        _user_id: Uuid,
+        _old_name: &str,
+        _new_name: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn create_user(&self, _name: &str) -> Result<UserEntity, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn delete_user(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn reset_password(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn change_password(
+        &self,
+        _user_id: Uuid,
+        _new_password: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn authenticate_user(
+        &self,
+        _username: &str,
+        _password: &str,
+        _remote_endpoint: &str,
+        _is_user_session: bool,
+    ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_dto(
+        &self,
+        _user: &UserEntity,
+        _server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_configuration(
+        &self,
+        _user_id: Uuid,
+        _config: &UserConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_policy(
+        &self,
+        _user_id: Uuid,
+        _policy: &UserPolicy,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn clear_profile_image(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubUserData;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::UserDataManager for StubUserData {
+    async fn save_user_data(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _user_data: &UpdateUserItemDataDto,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_data_dto(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Option<UserItemDataDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_data_batch(
+        &self,
+        _item_ids: &[Uuid],
+        _user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_play_state(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _reported_position_ticks: Option<i64>,
+    ) -> Result<bool, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn mark_played(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn mark_unplayed(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn reset_playback_stream_selections(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubTv;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::tv::TvSeriesManager for StubTv {
+    async fn get_next_up(
+        &self,
+        _query: &NextUpQuery,
+        _options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+}

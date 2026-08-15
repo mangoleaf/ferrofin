@@ -170,6 +170,9 @@ pub struct Inner {
     /// registration is accepted and dropped (nothing serves transformable
     /// files without the composition root's web mount anyway).
     pub file_transformations: Option<Arc<dyn ferrofin_traits::plugins::FileTransformationService>>,
+    /// Dispatches `/Plugins/{id}/web/…` requests into the owning runtime
+    /// plugin. `None` (no WASM host wired) ⇒ those routes 404.
+    pub plugin_routes: Option<Arc<dyn ferrofin_traits::plugins::PluginRequestHandler>>,
 
     /// The playback-decision metrics recorder (feeds the benchmark suite's
     /// playback metrics). `None` until the composition root wires it via
@@ -262,6 +265,7 @@ impl AppState {
             session_bus: None,
             live_tv: None,
             file_transformations: None,
+            plugin_routes: None,
             playback_metrics: None,
             merge_versions: None,
             music,
@@ -476,6 +480,21 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_file_transformations must be called before the state is shared");
         inner.file_transformations = Some(service);
+        self
+    }
+
+    /// Injects the plugin-request dispatcher (the WASM host's URL space).
+    ///
+    /// # Panics
+    /// If called after the state has been shared (composition-root only).
+    #[must_use]
+    pub fn with_plugin_request_handler(
+        mut self,
+        handler: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_plugin_request_handler must be called before the state is shared");
+        inner.plugin_routes = Some(handler);
         self
     }
 

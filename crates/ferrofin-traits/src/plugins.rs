@@ -190,6 +190,60 @@ pub trait FileTransformer: Send + Sync {
 
 fn _assert_object_safe_file_transformer(_: &dyn FileTransformer) {}
 
+/// One HTTP request routed into a plugin's own URL space
+/// (`/Plugins/{id}/web/…`), with the caller's identity already resolved —
+/// a plugin never sees credentials or tokens.
+#[derive(Debug, Clone)]
+pub struct PluginWebRequest {
+    /// The HTTP method (`GET`, `POST`, …).
+    pub method: String,
+    /// The path RELATIVE to the plugin's prefix, leading `/` included.
+    pub path: String,
+    /// The raw query string (`""` when absent).
+    pub query: String,
+    /// Request headers as (name, value) pairs.
+    pub headers: Vec<(String, String)>,
+    /// The request body (the transport layer caps its size).
+    pub body: Option<Vec<u8>>,
+    /// The authenticated caller's user id, when there is one.
+    pub user_id: Option<uuid::Uuid>,
+    /// Whether the caller is an administrator (or an API key).
+    pub is_admin: bool,
+    /// Whether the caller presented valid credentials at all.
+    pub is_authenticated: bool,
+}
+
+/// A plugin's response to a [`PluginWebRequest`].
+#[derive(Debug, Clone)]
+pub struct PluginWebResponse {
+    /// The HTTP status code.
+    pub status: u16,
+    /// Response headers as (name, value) pairs.
+    pub headers: Vec<(String, String)>,
+    /// The response body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Dispatches requests from the per-plugin URL space to the plugin that
+/// owns it. Implemented by the WASM host (the API layer depends only on
+/// this seam); absent or unknown/disabled plugin ⇒ the route 404s.
+#[async_trait]
+pub trait PluginRequestHandler: Send + Sync {
+    /// Handles one request for `plugin_id`. `Ok(None)` means "no such
+    /// plugin (or it is disabled)" — the transport turns that into `404`.
+    ///
+    /// # Errors
+    /// Backend failures (the plugin trapping, the runtime being gone).
+    async fn handle(
+        &self,
+        plugin_id: uuid::Uuid,
+        request: PluginWebRequest,
+    ) -> Result<Option<PluginWebResponse>, ServiceError>;
+}
+
+/// Object-safety guard.
+fn _assert_plugin_request_handler_object_safe(_: &dyn PluginRequestHandler) {}
+
 /// The web-file transformation pipeline — the File Transformation plugin's
 /// `IWebFileTransformation{Read,Write}Service`, as one object-safe seam.
 ///

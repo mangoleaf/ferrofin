@@ -58,6 +58,11 @@ pub struct HostState {
     /// The per-call timeout, needed when `http-fetch` builds a one-off
     /// DNS-pinned client (the shared client's timeout is not readable).
     pub http_timeout: std::time::Duration,
+    /// Where this plugin's key/value state persists
+    /// (`{plugins_dir}/{id}.state.json`). `None` until the plugin's id is
+    /// known (during the identity calls at load) and in throwaway
+    /// validation stores — state ops fail cleanly there.
+    pub state_path: Option<std::path::PathBuf>,
     /// Whether THIS plugin may reach private/loopback destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW` names it or is `*`).
     pub private_http_allowed: bool,
@@ -130,6 +135,22 @@ impl host::Host for HostState {
             self.http_timeout,
             &request,
         )
+    }
+
+    fn get_state(&mut self, key: String) -> Option<Vec<u8>> {
+        crate::capabilities::get_state(self.state_path.as_deref(), &key)
+    }
+
+    fn set_state(&mut self, key: String, value: Option<Vec<u8>>) -> Result<(), String> {
+        crate::capabilities::set_state(self.state_path.as_deref(), &key, value)
+    }
+
+    fn next_up(&mut self, user_id: String, limit: u32) -> Result<Vec<types::ItemSummary>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("next-up is not available during plugin load")?;
+        crate::capabilities::next_up(cx, &user_id, limit)
     }
 
     fn query_items(&mut self, query: types::ItemQuery) -> Result<Vec<types::ItemSummary>, String> {

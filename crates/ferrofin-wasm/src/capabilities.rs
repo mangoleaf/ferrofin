@@ -38,6 +38,12 @@ pub struct Collaborators {
     /// Enabled-flag reads for the dynamic-metadata adapter (and any future
     /// host path that must self-gate outside a task run).
     pub plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    /// User lookups, so a user-scoped query applies parental limits.
+    pub users: Arc<dyn ferrofin_traits::library::UserManager>,
+    /// Per-user item data (played/favorite/resume) for enriched summaries.
+    pub user_data: Arc<dyn ferrofin_traits::library::UserDataManager>,
+    /// The NextUp algorithm behind the `next-up` host function.
+    pub tv: Arc<dyn ferrofin_traits::tv::TvSeriesManager>,
 }
 
 /// Whether an address is in a range the private-HTTP policy denies by
@@ -235,29 +241,170 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
     internal.search_term = query.search_term.clone().filter(|s| !s.is_empty());
     let limit = query.limit.unwrap_or(MAX_QUERY_ROWS).min(MAX_QUERY_ROWS);
     internal.limit = Some(i32::try_from(limit).unwrap_or(i32::MAX));
+    internal.is_played = query.is_played;
+    internal.is_favorite = query.is_favorite;
+    internal.is_resumable = query.is_resumable;
+    internal.genres.clone_from(&query.genres);
+    for id in &query.ids {
+        internal.item_ids.push(
+            id.parse()
+                .map_err(|_| format!("item id `{id}` is not a valid UUID"))?,
+        );
+    }
+    if let Some(sort) = query.sort_by.as_deref().filter(|s| !s.is_empty()) {
+        let key = parse_sort_by(sort)?;
+        let order = if query.sort_descending {
+            ferrofin_model::dto::SortOrder::Descending
+        } else {
+            ferrofin_model::dto::SortOrder::Ascending
+        };
+        internal.order_by = vec![(key, order)];
+    }
+    // A user-scoped query applies the user's parental limits and unlocks
+    // the per-user summary fields below.
+    let user_id: Option<Uuid> = match query.user_id.as_deref().filter(|u| !u.is_empty()) {
+        Some(raw) => {
+            let uid: Uuid = raw
+                .parse()
+                .map_err(|_| format!("user-id `{raw}` is not a valid UUID"))?;
+            let user = cx
+                .handle
+                .block_on(cx.users.get_user_by_id(uid))
+                .map_err(|e| format!("user lookup failed: {e}"))?
+                .ok_or_else(|| format!("no such user {uid}"))?;
+            internal.set_user(user);
+            Some(uid)
+        }
+        None => None,
+    };
 
     let entities = cx
         .handle
         .block_on(cx.library.get_item_list(&internal))
         .map_err(|e| format!("item query failed: {e}"))?;
 
+    // Per-user enrichment: one batch read for all returned items.
+    let user_data = match user_id {
+        Some(uid) => {
+            let ids: Vec<Uuid> = entities
+                .iter()
+                .filter_map(|e| Uuid::parse_str(&e.id).ok())
+                .collect();
+            cx.handle
+                .block_on(cx.user_data.get_user_data_batch(&ids, uid))
+                .map_err(|e| format!("user data read failed: {e}"))?
+        }
+        None => std::collections::HashMap::new(),
+    };
+
     Ok(entities
         .into_iter()
-        .map(|e| ItemSummary {
-            id: Uuid::parse_str(&e.id)
-                .map(|u| u.to_string())
-                .unwrap_or(e.id),
-            name: e.name.unwrap_or_default(),
-            kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
-                .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
-            path: e.path,
-            parent_id: e
-                .parent_id
-                .and_then(|p| Uuid::parse_str(&p).ok())
-                .map(|u| u.to_string()),
-            run_time_ticks: e.run_time_ticks,
+        .map(|e| {
+            let ud = Uuid::parse_str(&e.id).ok().and_then(|u| user_data.get(&u));
+            summarize(&e, ud)
         })
         .collect())
+}
+
+/// Maps a WIT `sort-by` string onto the repository sort key.
+fn parse_sort_by(sort: &str) -> Result<ferrofin_model::live_tv::ItemSortBy, String> {
+    use ferrofin_model::live_tv::ItemSortBy;
+    Ok(match sort {
+        "SortName" => ItemSortBy::SortName,
+        "DateCreated" => ItemSortBy::DateCreated,
+        "DatePlayed" => ItemSortBy::DatePlayed,
+        "PremiereDate" => ItemSortBy::PremiereDate,
+        "CommunityRating" => ItemSortBy::CommunityRating,
+        "Random" => ItemSortBy::Random,
+        other => return Err(format!("unknown sort-by `{other}`")),
+    })
+}
+
+/// Projects one entity (+ optional per-user data) into the WIT summary.
+fn summarize(
+    e: &ferrofin_db::entities::base_items::BaseItemEntity,
+    user_data: Option<&ferrofin_model::dto::UserItemDataDto>,
+) -> ItemSummary {
+    ItemSummary {
+        id: Uuid::parse_str(&e.id).map_or_else(|_| e.id.clone(), |u| u.to_string()),
+        name: e.name.clone().unwrap_or_default(),
+        kind: ferrofin_core::item_type_lookup::kind_from_type_name(&e.type_)
+            .map_or_else(|| e.type_.clone(), |k| format!("{k:?}")),
+        path: e.path.clone(),
+        parent_id: e
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            .map(|u| u.to_string()),
+        run_time_ticks: e.run_time_ticks,
+        genres: e
+            .genres
+            .as_deref()
+            .map(|g| {
+                g.split('|')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        premiere_date: e.premiere_date.map(|d| d.to_rfc3339()),
+        date_created: e.date_created.map(|d| d.to_rfc3339()),
+        community_rating: e.community_rating,
+        production_year: e.production_year.and_then(|y| i32::try_from(y).ok()),
+        is_folder: e.is_folder,
+        played: user_data.map(|u| u.played),
+        is_favorite: user_data.map(|u| u.is_favorite),
+        playback_position_ticks: user_data.map(|u| u.playback_position_ticks),
+    }
+}
+
+/// Executes `next-up` for a guest: the user's next episodes, in order.
+///
+/// # Errors
+/// Invalid user id, or a manager failure — as the guest-visible string.
+pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<ItemSummary>, String> {
+    let uid: Uuid = user_id
+        .parse()
+        .map_err(|_| format!("user-id `{user_id}` is not a valid UUID"))?;
+    let query = ferrofin_traits::tv::NextUpQuery {
+        user_id: uid,
+        limit: Some(i32::try_from(limit.min(MAX_QUERY_ROWS)).unwrap_or(i32::MAX)),
+        ..Default::default()
+    };
+    let result = cx
+        .handle
+        .block_on(
+            cx.tv
+                .get_next_up(&query, &ferrofin_traits::options::DtoOptions::default()),
+        )
+        .map_err(|e| format!("next-up failed: {e}"))?;
+    // The NextUp trait returns wire DTOs; re-fetch the entities by id so the
+    // projection stays entity-based (one code path for summaries).
+    let ids: Vec<String> = result.items.iter().map(|d| d.id.to_string()).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ordered = query_items(
+        cx,
+        &ItemQuery {
+            kinds: Vec::new(),
+            parent_id: None,
+            search_term: None,
+            limit: Some(MAX_QUERY_ROWS),
+            user_id: Some(uid.to_string()),
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            genres: Vec::new(),
+            sort_by: None,
+            sort_descending: false,
+            ids: ids.clone(),
+        },
+    )?;
+    // Restore NextUp's ordering (the id-fetch does not preserve it).
+    let by_id: std::collections::HashMap<String, ItemSummary> =
+        ordered.into_iter().map(|s| (s.id.clone(), s)).collect();
+    Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
 }
 
 /// Executes `write-media-segments` for a guest: replaces the segments this
@@ -322,4 +469,66 @@ fn parse_segment_type(name: &str) -> Result<MediaSegmentType, String> {
             "unknown segment-type `{other}` (expected Intro/Outro/Recap/Preview/Commercial)"
         )),
     }
+}
+
+/// The plugin key/value state caps — hardcoded abuse guards in the
+/// manifest-cap tradition (state is for settings/cursors, not blobs).
+const STATE_KEY_MAX: usize = 256;
+/// Max bytes for one state value.
+const STATE_VALUE_MAX: usize = 1024 * 1024;
+/// Max total logical bytes (keys + values) for one plugin's state.
+const STATE_TOTAL_MAX: usize = 8 * 1024 * 1024;
+
+/// Reads a plugin's state map from disk (missing/corrupt file = empty).
+fn read_state(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Executes `get-state` for a guest.
+#[must_use]
+pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
+    read_state(path?).remove(key)
+}
+
+/// Executes `set-state` for a guest: `None` deletes; writes are atomic
+/// (temp + rename) and capped (key/value/total).
+///
+/// # Errors
+/// Cap violations or I/O failures, as the guest-visible string.
+pub fn set_state(
+    path: Option<&std::path::Path>,
+    key: &str,
+    value: Option<Vec<u8>>,
+) -> Result<(), String> {
+    let path = path.ok_or("state is not available in this context")?;
+    if key.len() > STATE_KEY_MAX {
+        return Err(format!("state key exceeds {STATE_KEY_MAX} bytes"));
+    }
+    if let Some(v) = &value
+        && v.len() > STATE_VALUE_MAX
+    {
+        return Err(format!("state value exceeds {STATE_VALUE_MAX} bytes"));
+    }
+    let mut map = read_state(path);
+    match value {
+        Some(v) => {
+            map.insert(key.to_owned(), v);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+    let total: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > STATE_TOTAL_MAX {
+        return Err(format!(
+            "plugin state would exceed {STATE_TOTAL_MAX} bytes in total"
+        ));
+    }
+    let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
 }

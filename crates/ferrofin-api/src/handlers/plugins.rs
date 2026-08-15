@@ -489,6 +489,83 @@ async fn cancel_package_installation(
     Err(ApiError::NotFound(format!("installation {package_id}")))
 }
 
+/// Max inbound body for a plugin-routed request — an abuse guard on an
+/// anonymous surface, not a tuning knob (plugin APIs move JSON, not media).
+const PLUGIN_REQUEST_BODY_MAX: usize = 1024 * 1024;
+
+/// `ANY /Plugins/{pluginId}/web/{*path}` — a runtime plugin's own URL space.
+///
+/// Reachable WITHOUT authentication (plugin pages load assets via plain
+/// `<script src>` tags, exactly like upstream plugin controllers marked
+/// `[AllowAnonymous]`); the caller's resolved identity is forwarded so the
+/// GUEST gates sensitive paths. The guest runs sandboxed, deadline-bound and
+/// breaker-protected; unknown or disabled plugins 404.
+async fn plugin_web_request(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    method: axum::http::Method,
+    Path((plugin_id, rest)): Path<(Uuid, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    headers: axum::http::HeaderMap,
+    request: axum::extract::Request,
+) -> Result<Response, ApiError> {
+    let Some(dispatch) = state.plugin_routes.clone() else {
+        return Err(ApiError::NotFound("no runtime plugin host".to_owned()));
+    };
+    // The caller's identity, resolved by the auth middleware — forwarded as
+    // plain facts, never the token. Admin is a policy read, same as the
+    // admin gate above, but non-fatal here.
+    let auth = request
+        .extensions()
+        .get::<ferrofin_traits::options::AuthorizationInfo>()
+        .cloned()
+        .unwrap_or_default();
+    let is_admin = require_admin(&state, &auth).await.is_ok();
+    let body = axum::body::to_bytes(request.into_body(), PLUGIN_REQUEST_BODY_MAX)
+        .await
+        .map_err(|_| {
+            ApiError::BadRequest(format!(
+                "request body exceeds the {PLUGIN_REQUEST_BODY_MAX}-byte plugin route limit"
+            ))
+        })?;
+    let web_request = ferrofin_traits::plugins::PluginWebRequest {
+        method: method.to_string(),
+        path: format!("/{rest}"),
+        query: raw_query.unwrap_or_default(),
+        headers: headers
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect(),
+        body: (!body.is_empty()).then(|| body.to_vec()),
+        user_id: auth.user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok()),
+        is_admin,
+        is_authenticated: auth.is_authenticated,
+    };
+    let Some(reply) = dispatch.handle(plugin_id, web_request).await? else {
+        return Err(ApiError::NotFound(format!("plugin {plugin_id}")));
+    };
+    let mut response = axum::http::Response::builder().status(
+        axum::http::StatusCode::from_u16(reply.status)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+    );
+    for (name, value) in reply.headers {
+        // Invalid guest-supplied header names/values are dropped, not fatal.
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::try_from(name.as_str()),
+            axum::http::HeaderValue::try_from(value.as_str()),
+        ) {
+            response = response.header(n, v);
+        }
+    }
+    Ok(response
+        .body(axum::body::Body::from(reply.body))
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -519,5 +596,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Packages/Installing/{packageId}",
             delete(cancel_package_installation),
+        )
+        // The runtime plugins' own URL space (any method — the guest routes).
+        .route(
+            "/Plugins/{pluginId}/web/{*path}",
+            axum::routing::any(plugin_web_request),
         )
 }

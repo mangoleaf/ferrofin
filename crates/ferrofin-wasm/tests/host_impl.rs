@@ -28,6 +28,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
                 .unwrap(),
         ),
         http_timeout: std::time::Duration::from_secs(5),
+        state_path: None,
         collaborators,
         private_http_allowed: true, // tests hit a loopback listener
         wasi: HostState::empty_wasi(),
@@ -59,6 +60,14 @@ fn capability_calls_fail_cleanly_before_collaborators_are_armed() {
             parent_id: None,
             search_term: None,
             limit: None,
+            user_id: None,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            genres: Vec::new(),
+            sort_by: None,
+            sort_descending: false,
+            ids: Vec::new(),
         })
         .unwrap_err();
     assert!(err.contains("not available during plugin load"), "{err}");
@@ -94,6 +103,9 @@ async fn http_fetch_round_trips_once_collaborators_are_armed() {
     let (url, server) = one_shot_http("204 No Content", b"");
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
@@ -125,6 +137,9 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     let segments = Arc::new(RecordingSegments::default());
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
@@ -146,6 +161,14 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
                 parent_id: None,
                 search_term: None,
                 limit: Some(5),
+                user_id: None,
+                is_played: None,
+                is_favorite: None,
+                is_resumable: None,
+                genres: Vec::new(),
+                sort_by: None,
+                sort_descending: false,
+                ids: Vec::new(),
             })
             .expect("query succeeds");
         assert_eq!(rows.len(), 1);

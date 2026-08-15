@@ -32,6 +32,10 @@
     (data (i32.const 360) "Okay")                                 ;; task 2 name (4)
     (data (i32.const 368) "Always ok")                            ;; task 2 description (9)
     (data (i32.const 384) "fixture-page")                         ;; page name (12)
+    (data (i32.const 448) "fixture.txt")                          ;; transform pattern (11)
+    (data (i32.const 464) "AAA")                                  ;; transform search (3)
+    (data (i32.const 468) "BBB")                                  ;; transform replace (3)
+    (data (i32.const 472) "pong")                                 ;; handler body (4)
     (data (i32.const 400) "<div data-role=\22page\22>fixture</div>") ;; page html (35)
 
     ;; descriptor: () -> record of 4 strings (8 i32s at the ret area)
@@ -137,14 +141,48 @@
       i32.const 768)
 
     ;; metadata-lookup: (item-summary, list) -> result<option<metadata-result>, string>
+    ;; item-summary's flat size now exceeds 16, so the canonical ABI passes
+    ;; the args INDIRECTLY: one pointer to the arg area. We ignore the args.
     ;; Always ok(none): result tag 0 @832, option tag 0 @840 (payload is
     ;; 8-aligned because metadata-result carries an f64).
     (func (export "metadata-lookup")
-      (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i32 i32)
+      (param i32)
       (result i32)
       (i32.store (i32.const 832) (i32.const 0))
       (i32.store (i32.const 840) (i32.const 0))
       i32.const 832)
+
+    ;; web-transforms: () -> list<web-transform>; one element at 1024
+    (func (export "web-transforms") (result i32)
+      (i32.store (i32.const 1024) (i32.const 448))  ;; pattern ptr
+      (i32.store (i32.const 1028) (i32.const 11))   ;; pattern len
+      (i32.store (i32.const 1032) (i32.const 464))  ;; search ptr
+      (i32.store (i32.const 1036) (i32.const 3))    ;; search len
+      (i32.store (i32.const 1040) (i32.const 468))  ;; replace ptr
+      (i32.store (i32.const 1044) (i32.const 3))    ;; replace len
+      (i32.store (i32.const 1056) (i32.const 1024)) ;; list ptr
+      (i32.store (i32.const 1060) (i32.const 1))    ;; list len
+      i32.const 1056)
+
+    ;; handle-request: (plugin-request) -> plugin-response
+    ;; plugin-request flattens to exactly 16 params (the direct-passing
+    ;; limit): method p0/p1, path p2/p3, query p4/p5, headers p6/p7,
+    ;; body tag/ptr/len p8-p10, user-id tag/ptr/len p11-p13,
+    ;; is-admin p14, is-authenticated p15.
+    ;; A 5-byte path ("/boom") traps (containment tests); anything else
+    ;; answers 200 "pong" with no headers. Ret area @1088: status,
+    ;; headers ptr/len, body ptr/len.
+    (func (export "handle-request")
+      (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
+      (result i32)
+      (if (i32.eq (local.get 3) (i32.const 5))
+        (then unreachable))
+      (i32.store (i32.const 1088) (i32.const 200))
+      (i32.store (i32.const 1092) (i32.const 0))
+      (i32.store (i32.const 1096) (i32.const 0))
+      (i32.store (i32.const 1100) (i32.const 472))
+      (i32.store (i32.const 1104) (i32.const 4))
+      i32.const 1088)
 
     ;; on-event: (string, string) -> (); "die" traps, else counts
     (func (export "on-event") (param $np i32) (param $nl i32) (param $pp i32) (param $pl i32)
@@ -172,8 +210,33 @@
   (type $item0 (record
     (field "id" string) (field "name" string) (field "kind" string)
     (field "path" (option string)) (field "parent-id" (option string))
-    (field "run-time-ticks" (option s64))))
+    (field "run-time-ticks" (option s64))
+    (field "genres" (list string))
+    (field "premiere-date" (option string))
+    (field "date-created" (option string))
+    (field "community-rating" (option f64))
+    (field "production-year" (option s32))
+    (field "is-folder" bool)
+    (field "played" (option bool))
+    (field "is-favorite" (option bool))
+    (field "playback-position-ticks" (option s64))))
   (export $item "item-summary" (type $item0))
+  (type $req0 (record
+    (field "method" string) (field "path" string) (field "query" string)
+    (field "headers" (list (tuple string string)))
+    (field "body" (option (list u8)))
+    (field "user-id" (option string))
+    (field "is-admin" bool) (field "is-authenticated" bool)))
+  (export $req "plugin-request" (type $req0))
+  (type $resp0 (record
+    (field "status" u16)
+    (field "headers" (list (tuple string string)))
+    (field "body" (list u8))))
+  (export $resp "plugin-response" (type $resp0))
+  (type $wt0 (record
+    (field "path-pattern" string) (field "search" string)
+    (field "replace" string)))
+  (export $wt "web-transform" (type $wt0))
   (type $meta0 (record
     (field "overview" (option string)) (field "production-year" (option s32))
     (field "community-rating" (option f64)) (field "genres" (list string))
@@ -188,6 +251,11 @@
     (canon lift (core func $i "tasks") (memory $i "memory") string-encoding=utf8))
   (func $config-pages (result (list $page))
     (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
+  (func $web-transforms (result (list $wt))
+    (canon lift (core func $i "web-transforms") (memory $i "memory") string-encoding=utf8))
+  (func $handle-request (param "request" $req) (result $resp)
+    (canon lift (core func $i "handle-request") (memory $i "memory")
+      (realloc (core func $i "realloc")) string-encoding=utf8))
   (func $run-task (param "task-id" string) (result (result (error string)))
     (canon lift (core func $i "run-task") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
@@ -204,6 +272,8 @@
   (export "default-config" (func $default-config))
   (export "tasks" (func $tasks))
   (export "config-pages" (func $config-pages))
+  (export "web-transforms" (func $web-transforms))
+  (export "handle-request" (func $handle-request))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))
   (export "metadata-lookup" (func $metadata-lookup))

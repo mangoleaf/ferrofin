@@ -25,7 +25,7 @@ pub mod capabilities;
 pub mod runtime;
 
 /// The hand-written canonical-ABI component implementing the
-/// `ferrofin:plugin@0.2.0` world, as WAT text — the shared test fixture for
+/// `ferrofin:plugin@0.3.0` world, as WAT text — the shared test fixture for
 /// this crate's host tests and the server-level HTTP test (compiled at test
 /// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
 /// API: test support only.
@@ -160,6 +160,9 @@ pub struct LoadedPlugin {
     /// host synthesizes a generic JSON editor in that case; see
     /// [`fallback_config_page`]).
     pub config_pages: Vec<bindings::types::ConfigPage>,
+    /// The guest's declared web-file transformations (applied by the host
+    /// while the plugin is enabled; see the WIT trust note).
+    pub web_transforms: Vec<bindings::types::WebTransform>,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -285,7 +288,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.2.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.3.0 \
                          component); skipping this file"
                     );
                 }
@@ -463,6 +466,7 @@ fn load_one(
         // the safe default applies; the real grant is applied below.
         private_http_allowed: false,
         collaborators: Arc::clone(collaborators),
+        state_path: None, // id-derived; set below once the descriptor is read
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
@@ -479,6 +483,7 @@ fn load_one(
     })?;
     let tasks = instance.call_tasks(&mut store)?;
     let config_pages = instance.call_config_pages(&mut store)?;
+    let web_transforms = instance.call_web_transforms(&mut store)?;
 
     let descriptor = PluginDescriptor {
         id,
@@ -492,10 +497,12 @@ fn load_one(
 
     // Re-tag the spec with the real identity + its private-HTTP grant, then
     // hand the warm instance to its runtime thread.
+    let state_path = path.with_file_name(format!("{id}.state.json"));
     let spec = InstanceSpec {
         plugin_name: wire.name,
         plugin_id: id.to_string(),
         private_http_allowed: settings.allows_private_http(id),
+        state_path: Some(state_path.clone()),
         ..spec
     };
     // The already-made calls used the placeholder identity in HostState; fix
@@ -504,6 +511,7 @@ fn load_one(
     store.data_mut().plugin_name.clone_from(&spec.plugin_name);
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
     store.data_mut().private_http_allowed = spec.private_http_allowed;
+    store.data_mut().state_path = Some(state_path);
 
     let runtime = runtime::spawn(
         spec,
@@ -517,6 +525,7 @@ fn load_one(
         default_config: default_config.into_bytes(),
         tasks,
         config_pages,
+        web_transforms,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
@@ -725,7 +734,7 @@ fn escape_html(text: &str) -> String {
 /// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
 /// world version from `wit/ferrofin-plugin.wit` (a test guards against
 /// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
-pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.2.0";
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.3.0";
 
 /// The install-time artifact validator: proves a downloaded `.wasm` is a
 /// loadable `ferrofin:plugin` component and reports its self-declared id,
@@ -799,6 +808,7 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                 timeout_ticks: u64::from(settings.call_timeout_secs),
                 http,
                 private_http_allowed: false,
+                state_path: None, // validation is throwaway — no persistence
                 // Never armed: query-items/write-media-segments/http-fetch
                 // all refuse during validation.
                 collaborators: Arc::new(std::sync::OnceLock::new()),
@@ -895,6 +905,17 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
             path: item.path.clone(),
             parent_id: None,
             run_time_ticks: None,
+            // The scan offer carries identity only — the plugin queries for
+            // anything richer; per-user fields never apply to a scan.
+            genres: Vec::new(),
+            premiere_date: None,
+            date_created: None,
+            community_rating: None,
+            production_year: None,
+            is_folder: false,
+            played: None,
+            is_favorite: None,
+            playback_position_ticks: None,
         };
         let offer = self
             .plugin
@@ -916,6 +937,160 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
 }
 
 /// The [`ScheduledTask`] adapter for one advertised guest task.
+/// Caps on declared web transforms — hardcoded abuse guards (a transform
+/// is a script/style injection snippet, not a payload channel).
+const MAX_TRANSFORMS_PER_PLUGIN: usize = 16;
+/// Max bytes for one transform's search or replace text.
+const MAX_TRANSFORM_TEXT: usize = 256 * 1024;
+
+/// A declared literal search/replace applied to served `/web` files.
+struct LiteralTransform {
+    search: String,
+    replace: String,
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
+    async fn transform(&self, _path: &str, contents: String) -> String {
+        contents.replace(&self.search, &self.replace)
+    }
+}
+
+impl WasmPluginHost {
+    /// Registers every ENABLED plugin's declared web transforms into the
+    /// server's transformation pipeline (capped; see the WIT trust note —
+    /// this is client-side script injection, the largest grant a plugin
+    /// has). A disabled plugin's transforms are not registered; toggling
+    /// takes effect on the next restart, like everything decided at boot.
+    pub async fn register_web_transforms(
+        &self,
+        service: &Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
+        plugin_manager: &Arc<dyn PluginManager>,
+    ) {
+        for plugin in &self.plugins {
+            if plugin.web_transforms.is_empty() {
+                continue;
+            }
+            let enabled = plugin_manager
+                .get_plugin(plugin.descriptor.id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|d| d.enabled);
+            if !enabled {
+                continue;
+            }
+            for transform in plugin.web_transforms.iter().take(MAX_TRANSFORMS_PER_PLUGIN) {
+                if transform.search.len() > MAX_TRANSFORM_TEXT
+                    || transform.replace.len() > MAX_TRANSFORM_TEXT
+                {
+                    warn!(
+                        plugin = %plugin.descriptor.id,
+                        pattern = transform.path_pattern,
+                        "wasm plugin web transform exceeds the size cap; skipping it"
+                    );
+                    continue;
+                }
+                info!(
+                    plugin = %plugin.descriptor.id,
+                    pattern = transform.path_pattern,
+                    "registering wasm plugin web transform"
+                );
+                service
+                    .add_transformation(
+                        plugin.descriptor.id,
+                        &transform.path_pattern,
+                        Arc::new(LiteralTransform {
+                            search: transform.search.clone(),
+                            replace: transform.replace.clone(),
+                        }),
+                    )
+                    .await;
+            }
+            if plugin.web_transforms.len() > MAX_TRANSFORMS_PER_PLUGIN {
+                warn!(
+                    plugin = %plugin.descriptor.id,
+                    declared = plugin.web_transforms.len(),
+                    "wasm plugin declared more than the transform cap; extras skipped"
+                );
+            }
+        }
+    }
+}
+
+/// The [`PluginRequestHandler`] implementation: routes requests from
+/// `/Plugins/{id}/web/…` to the owning plugin's `handle-request` export.
+/// Unknown or DISABLED plugins yield `Ok(None)` (the transport 404s) — the
+/// kill switch disarms this surface exactly like settings pages.
+pub struct WasmRequestDispatcher {
+    plugins_by_id: std::collections::HashMap<Uuid, Arc<LoadedPlugin>>,
+    plugin_manager: Arc<dyn PluginManager>,
+}
+
+impl WasmRequestDispatcher {
+    /// Builds the dispatcher over the host's loaded plugins.
+    #[must_use]
+    pub fn new(host: &WasmPluginHost, plugin_manager: Arc<dyn PluginManager>) -> Self {
+        Self {
+            plugins_by_id: host
+                .plugins()
+                .iter()
+                .map(|p| (p.descriptor.id, Arc::clone(p)))
+                .collect(),
+            plugin_manager,
+        }
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::PluginRequestHandler for WasmRequestDispatcher {
+    async fn handle(
+        &self,
+        plugin_id: Uuid,
+        request: ferrofin_traits::plugins::PluginWebRequest,
+    ) -> Result<Option<ferrofin_traits::plugins::PluginWebResponse>, ServiceError> {
+        let Some(plugin) = self.plugins_by_id.get(&plugin_id) else {
+            return Ok(None);
+        };
+        let enabled = self
+            .plugin_manager
+            .get_plugin(plugin_id)
+            .await?
+            .is_some_and(|d| d.enabled);
+        if !enabled {
+            return Ok(None);
+        }
+        let config = self
+            .plugin_manager
+            .get_plugin_configuration(plugin_id)
+            .await
+            .map_or_else(
+                |_| String::from("{}"),
+                |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+            );
+        let wire = bindings::types::PluginRequest {
+            method: request.method,
+            path: request.path,
+            query: request.query,
+            headers: request.headers,
+            body: request.body,
+            user_id: request.user_id.map(|u| u.to_string()),
+            is_admin: request.is_admin,
+            is_authenticated: request.is_authenticated,
+        };
+        let response = plugin
+            .runtime
+            .handle_request(wire, config)
+            .await
+            .map_err(ServiceError::backend)?;
+        Ok(Some(ferrofin_traits::plugins::PluginWebResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        }))
+    }
+}
+
 struct WasmTask {
     /// Registry key: `wasm-{plugin-uuid}-{task-id}` (stable across restarts).
     key: String,

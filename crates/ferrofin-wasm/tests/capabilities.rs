@@ -107,6 +107,9 @@ fn collaborators(
         library,
         media_segments: segments,
         plugins: Arc::new(EnabledStub(b"{}".to_vec())),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
     }
 }
 
@@ -125,7 +128,15 @@ async fn query_items_maps_filters_in_and_the_projection_out() {
                 kinds: vec!["Movie".to_owned()],
                 parent_id: None,
                 search_term: Some("bunny".to_owned()),
-                limit: Some(9999), // above the cap → clamped
+                limit: Some(9999),
+                user_id: None,
+                is_played: None,
+                is_favorite: None,
+                is_resumable: None,
+                genres: Vec::new(),
+                sort_by: None,
+                sort_descending: false,
+                ids: Vec::new(), // above the cap → clamped
             },
         )
     })
@@ -170,6 +181,14 @@ async fn query_items_rejects_unknown_kinds() {
                 parent_id: None,
                 search_term: None,
                 limit: None,
+                user_id: None,
+                is_played: None,
+                is_favorite: None,
+                is_resumable: None,
+                genres: Vec::new(),
+                sort_by: None,
+                sort_descending: false,
+                ids: Vec::new(),
             },
         )
     })

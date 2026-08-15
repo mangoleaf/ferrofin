@@ -763,15 +763,6 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    // Arm the E2 capabilities (query-items / write-media-segments) now that
-    // their backing managers exist — plugin load happened earlier, so a
-    // guest calling them during load got a clean "not available" error.
-    wasm_host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
-        handle: tokio::runtime::Handle::current(),
-        library: Arc::clone(&library),
-        media_segments: Arc::clone(&media_segments),
-        plugins: Arc::clone(&plugins),
-    });
     let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
         Arc::new(FerrofinCollectionManager::new(
             db.clone(),
@@ -1071,6 +1062,20 @@ pub async fn build_app_state(
             Arc::clone(&dto),
             Arc::clone(&config_trait),
         ));
+    // Arm the guest capabilities (query-items / write-media-segments /
+    // next-up) now that every backing manager exists — plugin load happened
+    // earlier, so a guest calling these during load got a clean
+    // "not available" error, and the server is not yet serving, so nothing
+    // can race the arming.
+    wasm_host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library: Arc::clone(&library),
+        media_segments: Arc::clone(&media_segments),
+        plugins: Arc::clone(&plugins),
+        users: Arc::clone(&users),
+        user_data: Arc::clone(&user_data),
+        tv: Arc::clone(&tv_series),
+    });
 
     // ---- host + system + auth + quick-connect -----------------------------
     let app_host = Arc::new(FerrofinServerApplicationHost::new(
@@ -1247,12 +1252,22 @@ pub async fn build_app_state(
         Arc::clone(&plugins),
     )
     .await;
+    // Runtime (WASM) plugins' declared web transforms — enabled plugins
+    // only; the WIT trust note applies (client-side injection).
+    wasm_host
+        .register_web_transforms(&file_transformations, &plugins)
+        .await;
 
     // ---- playback-decision metrics (feeds the benchmark suite) -------------
     let playback_metrics: Arc<dyn ferrofin_traits::metrics::PlaybackMetrics> =
         Arc::new(ferrofin_core::FerrofinPlaybackMetrics::new(db.clone()));
 
+    // The runtime plugins' URL space (`/Plugins/{id}/web/…`).
+    let plugin_routes: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler> = Arc::new(
+        ferrofin_wasm::WasmRequestDispatcher::new(&wasm_host, Arc::clone(&plugins)),
+    );
     let state = state
+        .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
         .with_sync_play(sync_play)
         .with_live_tv(live_tv)
