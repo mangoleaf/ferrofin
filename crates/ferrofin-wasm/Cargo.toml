@@ -13,6 +13,7 @@ workspace = true
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
 ferrofin-db.workspace = true
+ferrofin-providers.workspace = true
 chrono.workspace = true
 ferrofin-model.workspace = true
 async-trait.workspace = true

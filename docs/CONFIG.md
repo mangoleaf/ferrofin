@@ -92,6 +92,10 @@ Limits for sandboxed WASM plugins loaded from `{data_dir}/plugins/*.wasm`
 | `FERROFIN_WASM_MEMORY_LIMIT_MB` | Per-plugin linear-memory cap in MiB (default 128). A `memory.grow` ceiling, never a reservation — small plugins use a few MiB. Also caps `http-fetch` response bodies. |
 | `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` | Per-plugin event queue depth (default 256). A full queue drops events for that plugin only. |
 | `FERROFIN_WASM_STATE_LIMIT_MB` | Per-plugin key/value state cap in MiB (default 8). Settings and cursors fit easily; raise for stats-heavy plugins (e.g. playback reporting). |
+| `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` | Cap on one plugin-artwork download in MiB (default 20). Posters/backdrops are single-digit MiB; anything larger is not artwork. |
+| `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` | Wall-clock bound on one plugin-artwork download in seconds (default 30). A CDN GET, not a transfer job. |
+| `FERROFIN_WASM_WRITE_CONTENT_MB` | Cap on one plugin `write-lyrics`/`write-subtitles` payload in MiB (default 2). Settings-class writes, not media. |
+| `FERROFIN_WASM_SUBTITLE_EXTRACT_MB` | Cap on one plugin-extracted subtitle track in MiB (default 10). Generous for SRT text. |
 | `FERROFIN_WASM_ANALYSIS_CONCURRENCY` | Concurrent media-decode budget shared by all analysis plugins (`extract-audio`/`extract-frames`). Default: a quarter of the visible cores, at least one — analysis must never starve transcodes; a small NAS may want `1`, a big host more. |
 | `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` | Plugins allowed to `http-fetch` private/loopback/link-local destinations: comma-separated plugin UUIDs, or `*` for all. Default: denied for every plugin (public destinations are always allowed). Plugin UUIDs appear in `/Plugins` and the load log line. (Accepting plugin names here is a planned improvement.) |
 

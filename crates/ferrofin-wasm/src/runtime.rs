@@ -160,6 +160,10 @@ pub struct InstanceSpec {
     pub egress: Arc<crate::capabilities::EgressPolicy>,
     /// The operator-configured total state cap, in bytes.
     pub state_total_cap: usize,
+    /// The operator-configured lyric/subtitle write cap, in bytes.
+    pub write_content_cap: usize,
+    /// The operator-configured extracted-subtitle-track cap, in bytes.
+    pub subtitle_extract_cap: usize,
 }
 
 impl InstanceSpec {
@@ -188,6 +192,8 @@ impl InstanceSpec {
             state_path: self.state_path.clone(),
             egress: Arc::clone(&self.egress),
             state_total_cap: self.state_total_cap,
+            write_content_cap: self.write_content_cap,
+            subtitle_extract_cap: self.subtitle_extract_cap,
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),

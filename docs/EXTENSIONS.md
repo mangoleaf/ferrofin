@@ -210,11 +210,49 @@ provider**: its name appears in each library's *Metadata downloaders* / *Image f
 checkboxes, and the per-library selection and order are enforced during the scan — for
 named plugins and for the built-ins alike (TheTVDB vs TheMovieDb authority for a series
 follows the saved order; a fetcher a library unchecked never runs for its items).
+A declared provider name that collides with a built-in fetcher or another loaded
+plugin (case-insensitively) is refused at load — it would ride that fetcher's
+checkbox/order and be impossible to toggle apart.
 Artwork rides the `remote-images` export: for items still missing a Primary/Backdrop
-after the built-in chain, the host asks each eligible plugin for **image candidates
-(URLs)** and downloads the winner itself through that plugin's declared egress
-(20 MiB cap, 30 s timeout, redirects off, private addresses refused) — raw image bytes
-never enter guest memory, and an undeclared image host is refused before DNS. Each plugin runs on its own runtime thread under an enforced
+after the built-in chain, the host asks each **named** plugin (only those declaring
+`provider-info`) for **image candidates (URLs)** and downloads the winner itself through
+that plugin's declared egress (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB` cap, default 20;
+`FERROFIN_WASM_IMAGE_TIMEOUT_SECS` timeout, default 30; redirects off, private addresses
+refused) — raw image bytes never enter guest memory, an undeclared image host is refused
+before DNS, and bytes that are not a recognizable image are dropped rather than persisted.
+
+> **Upgrade note (0.5):** per-library fetcher enforcement is new, and this release also
+> advertises five fetcher names that older Ferrofin builds did not (TheTVDB, FanArt,
+> MusicBrainz, TheAudioDB, Embedded Image Extractor). A library whose options were last
+> saved by an older build cannot have those names in its saved checked-lists, so they
+> stop running for that library after the upgrade. One-time fix per library: open its
+> settings in the dashboard and hit **Save** — the UI re-saves the full current list.
+> Libraries migrated from a real Jellyfin database are unaffected (the names match), as
+> are libraries created after the upgrade.
+
+**Scoped writes (the 0.5 write family)** — all collaborator-armed, denied during load,
+and size-capped:
+
+- **`set-user-data`** — updates played/favorite/resume-position for a named user+item.
+  TRUST NOTE: this mutates **real watch state for ANY user** — the strongest write a
+  plugin has (it exists for scrobble-sync plugins like Trakt). Every call is logged with
+  the plugin, user, and item named; install plugins that declare it in their
+  documentation and that you trust. A finer-grained per-plugin grant is planned (same
+  status as the egress-`*` UX).
+- **`write-lyrics` / `write-subtitles`** — save a sidecar next to the media file
+  (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). The host sanitizes the
+  file name: the format is allowlisted to real lyric/subtitle extensions and the
+  language reduced to a plain tag, so a plugin can never choose a path or drop a
+  scanner-authoritative file (`.nfo`, `.strm`) next to your media.
+- **`create-collection` / `update-collection`** — plugin-owned collections only
+  (≤ 1000 item ids per call). The host records ownership in a `host:`-reserved state
+  key the guest cannot read or write; updating a collection the plugin did not create
+  is refused before any manager call.
+- **`extract-subtitle-track`** — one embedded subtitle stream as SRT bytes
+  (≤ `FERROFIN_WASM_SUBTITLE_EXTRACT_MB`, default 10 MiB), same host-owned,
+  item-addressed pipeline and shared decode budget as the other extraction functions.
+
+Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that

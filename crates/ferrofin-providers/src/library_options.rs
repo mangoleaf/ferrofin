@@ -46,6 +46,22 @@ pub mod fetcher_names {
     pub const LOCAL_IMAGES: &str = "Local Images";
     /// Cover art extracted from the media file itself.
     pub const EMBEDDED_IMAGES: &str = "Embedded Image Extractor";
+
+    /// Every built-in fetcher name — the reserved set a dynamically
+    /// registered (WASM) provider name must not collide with: a plugin
+    /// declaring `"TheMovieDb"` would ride TMDB's checkbox/order and
+    /// appear twice in the dashboard lists.
+    pub const ALL: &[&str] = &[
+        NFO,
+        TMDB,
+        OMDB,
+        TVDB,
+        FANART,
+        MUSICBRAINZ,
+        AUDIODB,
+        LOCAL_IMAGES,
+        EMBEDDED_IMAGES,
+    ];
 }
 
 /// A capability a provider exposes (one provider may expose several).

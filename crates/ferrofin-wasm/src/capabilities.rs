@@ -296,19 +296,13 @@ pub fn http_fetch(
     })
 }
 
-/// Cap on one downloaded remote-artwork candidate. Hardcoded abuse guard:
-/// posters/backdrops are single-digit MiB; anything larger is not artwork.
-pub const IMAGE_DOWNLOAD_MAX: usize = 20 * 1024 * 1024;
-
-/// Wall-clock bound for one artwork download (a CDN GET, not a transfer
-/// job — generous for any real poster/backdrop).
-pub const IMAGE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Downloads one remote-artwork candidate ON THE PLUGIN'S BEHALF — the
 /// guest only names URLs; bytes never enter guest memory. The download runs
 /// through the exact same gate as `http-fetch`: declared-egress allowlist
 /// checked pre-DNS, private-address vetting with the DNS-rebinding pin,
-/// redirects off.
+/// redirects off. `size_cap` bounds the body
+/// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`) and `timeout` the whole GET
+/// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`).
 ///
 /// # Errors
 /// The same refusals as [`http_fetch`], a non-200 status, or an over-cap
@@ -317,10 +311,12 @@ pub fn download_image(
     plugin_name: &str,
     private_http_allowed: bool,
     egress: &EgressPolicy,
+    size_cap: usize,
+    timeout: std::time::Duration,
     url: &str,
 ) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(IMAGE_DOWNLOAD_TIMEOUT)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -328,10 +324,10 @@ pub fn download_image(
     let response = http_fetch(
         &client,
         plugin_name,
-        IMAGE_DOWNLOAD_MAX,
+        size_cap,
         private_http_allowed,
         egress,
-        IMAGE_DOWNLOAD_TIMEOUT,
+        timeout,
         &HttpRequest {
             method: String::from("GET"),
             url: url.to_owned(),
@@ -777,15 +773,14 @@ pub fn extract_frames(
         .collect())
 }
 
-/// Cap on one extracted subtitle track (SRT text; 10 MiB is generous).
-const SUBTITLE_TRACK_MAX: usize = 10 * 1024 * 1024;
-
-/// Executes `extract-subtitle-track`.
+/// Executes `extract-subtitle-track`. `size_cap` bounds the extracted
+/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`).
 ///
 /// # Errors
 /// Unknown item, decode failure, or an over-cap track.
 pub fn extract_subtitle_track(
     cx: &Collaborators,
+    size_cap: usize,
     item_id: &str,
     stream_index: u32,
 ) -> Result<Vec<u8>, String> {
@@ -797,10 +792,8 @@ pub fn extract_subtitle_track(
             cx.extractor.extract_subtitle(&path, stream_index).await
         })
         .map_err(|e| format!("subtitle extraction failed: {e}"))?;
-    if bytes.len() > SUBTITLE_TRACK_MAX {
-        return Err(format!(
-            "extracted track exceeds the {SUBTITLE_TRACK_MAX}-byte cap"
-        ));
+    if bytes.len() > size_cap {
+        return Err(format!("extracted track exceeds the {size_cap}-byte cap"));
     }
     Ok(bytes)
 }
@@ -891,6 +884,24 @@ pub fn set_state_capped(
     total_cap: usize,
 ) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
+    let map = state_after_set(path, key, value, total_cap)?;
+    let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+}
+
+/// The would-be state map after setting `key` to `value`, refused at the
+/// same caps as [`set_state_capped`] — WITHOUT writing. `create-collection`
+/// pre-flights its ledger append through this, so a cap refusal happens
+/// before the collection exists rather than after (which would orphan an
+/// unowned, unmanageable collection).
+fn state_after_set(
+    path: &std::path::Path,
+    key: &str,
+    value: Option<Vec<u8>>,
+    total_cap: usize,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     if key.len() > STATE_KEY_MAX {
         return Err(format!("state key exceeds {STATE_KEY_MAX} bytes"));
     }
@@ -915,14 +926,9 @@ pub fn set_state_capped(
             "plugin state would exceed {total_cap} bytes in total"
         ));
     }
-    let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+    Ok(map)
 }
 
-/// Cap on lyric/subtitle payloads (settings-class writes, not media).
-const WRITE_CONTENT_MAX: usize = 2 * 1024 * 1024;
 /// Cap on collection membership operations per call.
 const COLLECTION_IDS_MAX: usize = 1000;
 /// The host-reserved state key listing collection ids a plugin owns.
@@ -967,18 +973,20 @@ pub fn set_user_data(
         .map_err(|e| format!("user-data write failed: {e}"))
 }
 
-/// Executes `write-lyrics`.
+/// Executes `write-lyrics`. `size_cap` bounds the payload
+/// (`FERROFIN_WASM_WRITE_CONTENT_MB` — settings-class writes, not media).
 ///
 /// # Errors
 /// Cap/format violations or a manager failure.
 pub fn write_lyrics(
     cx: &Collaborators,
+    size_cap: usize,
     item_id: &str,
     format: &str,
     content: &[u8],
 ) -> Result<(), String> {
-    if content.len() > WRITE_CONTENT_MAX {
-        return Err(format!("lyrics exceed the {WRITE_CONTENT_MAX}-byte cap"));
+    if content.len() > size_cap {
+        return Err(format!("lyrics exceed the {size_cap}-byte cap"));
     }
     let iid = parse_uuid("item-id", item_id)?;
     let text = std::str::from_utf8(content).map_err(|_| "lyrics must be UTF-8".to_owned())?;
@@ -988,19 +996,21 @@ pub fn write_lyrics(
         .map_err(|e| format!("lyric write failed: {e}"))
 }
 
-/// Executes `write-subtitles`.
+/// Executes `write-subtitles`. `size_cap` bounds the payload
+/// (`FERROFIN_WASM_WRITE_CONTENT_MB`).
 ///
 /// # Errors
 /// Cap violations or a manager failure.
 pub fn write_subtitles(
     cx: &Collaborators,
+    size_cap: usize,
     item_id: &str,
     language: &str,
     format: &str,
     content: &[u8],
 ) -> Result<(), String> {
-    if content.len() > WRITE_CONTENT_MAX {
-        return Err(format!("subtitles exceed the {WRITE_CONTENT_MAX}-byte cap"));
+    if content.len() > size_cap {
+        return Err(format!("subtitles exceed the {size_cap}-byte cap"));
     }
     let iid = parse_uuid("item-id", item_id)?;
     let response = ferrofin_traits::subtitles::SubtitleResponse {
@@ -1041,6 +1051,14 @@ pub fn create_collection(
         .iter()
         .map(|s| parse_uuid("item id", s))
         .collect::<Result<_, _>>()?;
+    // Pre-flight the ledger append with a same-size placeholder (every
+    // canonical UUID renders to 36 chars), so a refusal — no state in this
+    // context, or the state cap — happens BEFORE the collection exists.
+    let p = state_path.ok_or("state is not available in this context")?;
+    let mut prospective = owned_collections(state_path);
+    prospective.push(Uuid::nil().to_string());
+    let bytes = serde_json::to_vec(&prospective).map_err(|e| format!("ledger: {e}"))?;
+    state_after_set(p, OWNED_COLLECTIONS_KEY, Some(bytes), total_cap)?;
     let options = ferrofin_traits::collections::CollectionCreationOptions {
         name: name.to_owned(),
         parent_id: None,
@@ -1079,9 +1097,13 @@ pub fn update_collection(
         return Err(format!("at most {COLLECTION_IDS_MAX} items per call"));
     }
     let cid = parse_uuid("collection-id", collection_id)?;
+    // Compare the canonical rendering, not the raw guest string, so a
+    // valid-but-unhyphenated UUID is not spuriously refused (the ledger
+    // stores canonical ids).
+    let canonical = cid.to_string();
     if !owned_collections(state_path)
         .iter()
-        .any(|c| c.eq_ignore_ascii_case(collection_id))
+        .any(|c| c.eq_ignore_ascii_case(&canonical))
     {
         return Err(format!(
             "collection {collection_id} is not owned by this plugin — plugins may only \

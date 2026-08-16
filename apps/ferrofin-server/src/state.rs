@@ -338,7 +338,11 @@ pub async fn build_app_state(
             config.wasm_event_queue_capacity,
             config.wasm_private_http_allow.as_deref(),
         )
-        .with_state_limit_mb(config.wasm_state_limit_mb);
+        .with_state_limit_mb(config.wasm_state_limit_mb)
+        .with_image_download_mb(config.wasm_image_download_mb)
+        .with_image_timeout_secs(config.wasm_image_timeout_secs)
+        .with_write_content_mb(config.wasm_write_content_mb)
+        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb);
         let wasm_dir = config.data_dir.join("plugins");
         match tokio::task::spawn_blocking(move || {
             ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
@@ -695,7 +699,11 @@ pub async fn build_app_state(
                 config.wasm_event_queue_capacity,
                 config.wasm_private_http_allow.as_deref(),
             )
-            .with_state_limit_mb(config.wasm_state_limit_mb),
+            .with_state_limit_mb(config.wasm_state_limit_mb)
+            .with_image_download_mb(config.wasm_image_download_mb)
+            .with_image_timeout_secs(config.wasm_image_timeout_secs)
+            .with_write_content_mb(config.wasm_write_content_mb)
+            .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb),
         )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );

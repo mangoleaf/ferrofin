@@ -105,6 +105,10 @@ fn tight_settings() -> WasmSettings {
         memory_limit_mb: 2,
         event_queue_capacity: 8,
         state_limit_mb: 8,
+        image_download_mb: 20,
+        image_timeout_secs: 30,
+        write_content_mb: 2,
+        subtitle_extract_mb: 10,
         private_http_allow: Vec::new(),
     }
 }
@@ -167,6 +171,75 @@ fn duplicate_plugin_ids_keep_only_the_first() {
     write_fixture(dir.path(), "b-second", FIXTURE_WAT);
     let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(host.plugins().len(), 1, "same id must load once");
+}
+
+/// The fixture WAT, re-identified (`id` must stay 36 chars) and upgraded
+/// from `provider-info: none` to `some({name, supported-kinds: []})` — the
+/// canonical-ABI ret area gains the payload (name ptr/len, empty list) and
+/// the name string lands in otherwise-unused memory at 1280.
+fn named_provider_fixture(id: &str, provider_name: &str) -> String {
+    assert_eq!(id.len(), 36, "must byte-replace the 36-char fixture id");
+    FIXTURE_WAT
+        .replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
+        .replace(
+            "(data (i32.const 488) \"Movie\")",
+            &format!(
+                "(data (i32.const 488) \"Movie\")\n    (data (i32.const 1280) \"{provider_name}\")"
+            ),
+        )
+        .replace(
+            "    (func (export \"provider-info\") (result i32)\n      \
+             (i32.store (i32.const 1184) (i32.const 0))\n      i32.const 1184)",
+            &format!(
+                "    (func (export \"provider-info\") (result i32)\n      \
+                 (i32.store (i32.const 1184) (i32.const 1))\n      \
+                 (i32.store (i32.const 1188) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1192) (i32.const {len}))\n      \
+                 (i32.store (i32.const 1196) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1200) (i32.const 0))\n      \
+                 i32.const 1184)",
+                len = provider_name.len()
+            ),
+        )
+}
+
+#[test]
+fn colliding_provider_names_are_refused_at_load() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    // Loads: a well-behaved named provider (also proves the patched WAT is a
+    // valid some(provider-descriptor), so the two skips below are the name
+    // check and not an ABI decode failure).
+    write_fixture(
+        dir.path(),
+        "a-acme",
+        &named_provider_fixture("11111111-1111-1111-1111-111111111111", "AcmeDb"),
+    );
+    // Skipped: rides a built-in fetcher's checkbox/order (case-insensitive).
+    write_fixture(
+        dir.path(),
+        "b-tmdb",
+        &named_provider_fixture("22222222-2222-2222-2222-222222222222", "themoviedb"),
+    );
+    // Skipped: the name is already taken by the first plugin.
+    write_fixture(
+        dir.path(),
+        "c-acme-again",
+        &named_provider_fixture("33333333-3333-3333-3333-333333333333", "acmedb"),
+    );
+
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert_eq!(
+        host.plugins().len(),
+        1,
+        "reserved/taken provider names must be skipped"
+    );
+    let info = host.plugins()[0]
+        .provider_info
+        .as_ref()
+        .expect("the surviving plugin is the named provider");
+    assert_eq!(info.name, "AcmeDb");
+    assert!(info.supported_kinds.is_empty());
 }
 
 #[tokio::test]

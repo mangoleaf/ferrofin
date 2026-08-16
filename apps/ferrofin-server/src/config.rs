@@ -129,6 +129,10 @@ struct FileConfig {
     max_plugin_download_mb: Option<u32>,
     wasm_analysis_concurrency: Option<u32>,
     wasm_state_limit_mb: Option<u32>,
+    wasm_image_download_mb: Option<u32>,
+    wasm_image_timeout_secs: Option<u32>,
+    wasm_write_content_mb: Option<u32>,
+    wasm_subtitle_extract_mb: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -307,6 +311,30 @@ pub struct Config {
     /// `FERROFIN_WASM_STATE_LIMIT_MB` env > `wasm_state_limit_mb` in
     /// `config.toml` > default.
     pub wasm_state_limit_mb: Option<u32>,
+
+    /// Cap on one plugin-artwork download, in MiB. `None`/zero = 20 MiB
+    /// (posters/backdrops are single-digit MiB; anything larger is not
+    /// artwork). Resolved `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` env >
+    /// `wasm_image_download_mb` in `config.toml` > default.
+    pub wasm_image_download_mb: Option<u32>,
+
+    /// Wall-clock bound on one plugin-artwork download, in seconds.
+    /// `None`/zero = 30 s (a CDN GET, not a transfer job). Resolved
+    /// `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` env > `wasm_image_timeout_secs`
+    /// in `config.toml` > default.
+    pub wasm_image_timeout_secs: Option<u32>,
+
+    /// Cap on one plugin `write-lyrics`/`write-subtitles` payload, in MiB.
+    /// `None`/zero = 2 MiB (settings-class writes, not media). Resolved
+    /// `FERROFIN_WASM_WRITE_CONTENT_MB` env > `wasm_write_content_mb` in
+    /// `config.toml` > default.
+    pub wasm_write_content_mb: Option<u32>,
+
+    /// Cap on one plugin-extracted subtitle track, in MiB. `None`/zero =
+    /// 10 MiB (generous for SRT text). Resolved
+    /// `FERROFIN_WASM_SUBTITLE_EXTRACT_MB` env >
+    /// `wasm_subtitle_extract_mb` in `config.toml` > default.
+    pub wasm_subtitle_extract_mb: Option<u32>,
 
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
@@ -515,6 +543,14 @@ impl Config {
                 .or(file.wasm_analysis_concurrency),
             wasm_state_limit_mb: parse_var(env, "FERROFIN_WASM_STATE_LIMIT_MB")
                 .or(file.wasm_state_limit_mb),
+            wasm_image_download_mb: parse_var(env, "FERROFIN_WASM_IMAGE_DOWNLOAD_MB")
+                .or(file.wasm_image_download_mb),
+            wasm_image_timeout_secs: parse_var(env, "FERROFIN_WASM_IMAGE_TIMEOUT_SECS")
+                .or(file.wasm_image_timeout_secs),
+            wasm_write_content_mb: parse_var(env, "FERROFIN_WASM_WRITE_CONTENT_MB")
+                .or(file.wasm_write_content_mb),
+            wasm_subtitle_extract_mb: parse_var(env, "FERROFIN_WASM_SUBTITLE_EXTRACT_MB")
+                .or(file.wasm_subtitle_extract_mb),
         })
     }
 
@@ -597,6 +633,10 @@ impl Config {
             max_plugin_download_mb: None,
             wasm_analysis_concurrency: None,
             wasm_state_limit_mb: None,
+            wasm_image_download_mb: None,
+            wasm_image_timeout_secs: None,
+            wasm_write_content_mb: None,
+            wasm_subtitle_extract_mb: None,
         }
     }
 }
@@ -1035,6 +1075,24 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_WASM_STATE_LIMIT_MB", "64");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.wasm_state_limit_mb, Some(64));
+
+        // And the four write/extraction/artwork caps (unset ⇒ None ⇒ the
+        // ferrofin-wasm 20/30/2/10 defaults).
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.wasm_image_download_mb, None);
+        assert_eq!(cfg.wasm_image_timeout_secs, None);
+        assert_eq!(cfg.wasm_write_content_mb, None);
+        assert_eq!(cfg.wasm_subtitle_extract_mb, None);
+        let env = FakeEnv::new()
+            .with("FERROFIN_WASM_IMAGE_DOWNLOAD_MB", "40")
+            .with("FERROFIN_WASM_IMAGE_TIMEOUT_SECS", "60")
+            .with("FERROFIN_WASM_WRITE_CONTENT_MB", "4")
+            .with("FERROFIN_WASM_SUBTITLE_EXTRACT_MB", "20");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_image_download_mb, Some(40));
+        assert_eq!(cfg.wasm_image_timeout_secs, Some(60));
+        assert_eq!(cfg.wasm_write_content_mb, Some(4));
+        assert_eq!(cfg.wasm_subtitle_extract_mb, Some(20));
 
         // Env values apply.
         let env = FakeEnv::new()

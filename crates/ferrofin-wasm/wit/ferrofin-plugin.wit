@@ -459,11 +459,13 @@ interface host {
     set-user-data: func(user-id: string, item-id: string, update: user-data-update) -> result<_, string>;
 
     /// Saves lyrics for an audio item (replacing existing ones). `format`
-    /// is the lyric file extension (`lrc`, `txt`); content ≤ 2 MiB.
+    /// is the lyric file extension (`lrc`, `txt`); content ≤ 2 MiB by
+    /// default (the operator can raise it).
     write-lyrics: func(item-id: string, format: string, content: list<u8>) -> result<_, string>;
 
     /// Saves a subtitle file for an item. `language` is a three-letter ISO
-    /// code, `format` the file extension (`srt`, `ass`); content ≤ 2 MiB.
+    /// code, `format` the file extension (`srt`, `ass`); content ≤ 2 MiB
+    /// by default (the operator can raise it).
     write-subtitles: func(item-id: string, language: string, format: string, content: list<u8>) -> result<_, string>;
 
     /// Creates a collection OWNED BY THIS PLUGIN, seeded with `item-ids`
@@ -475,7 +477,8 @@ interface host {
     update-collection: func(collection-id: string, add: list<string>, remove: list<string>) -> result<_, string>;
 
     /// Extracts one embedded subtitle stream of a library item as SRT
-    /// bytes (≤ 10 MiB). `stream-index` is the SUBTITLE-relative index
+    /// bytes (≤ 10 MiB by default; operator-tunable). `stream-index` is
+    /// the SUBTITLE-relative index
     /// (0 = first subtitle stream). Same rules as the other extraction
     /// fns: host-owned pipeline, item-addressed, load-denied.
     extract-subtitle-track: func(item-id: string, stream-index: u32) -> result<list<u8>, string>;

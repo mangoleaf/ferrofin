@@ -61,6 +61,12 @@ pub struct HostState {
     /// The operator-configured total state cap, in bytes
     /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 MiB).
     pub state_total_cap: usize,
+    /// The operator-configured cap on one `write-lyrics`/`write-subtitles`
+    /// payload, in bytes (`FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB).
+    pub write_content_cap: usize,
+    /// The operator-configured cap on one extracted subtitle track, in
+    /// bytes (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`, default 10 MiB).
+    pub subtitle_extract_cap: usize,
     /// Where this plugin's key/value state persists
     /// (`{plugins_dir}/{id}.state.json`). `None` until the plugin's id is
     /// known (during the identity calls at load) and in throwaway
@@ -197,7 +203,7 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("write-lyrics is not available during plugin load")?;
-        crate::capabilities::write_lyrics(cx, &item_id, &format, &content)
+        crate::capabilities::write_lyrics(cx, self.write_content_cap, &item_id, &format, &content)
     }
 
     fn write_subtitles(
@@ -211,7 +217,14 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("write-subtitles is not available during plugin load")?;
-        crate::capabilities::write_subtitles(cx, &item_id, &language, &format, &content)
+        crate::capabilities::write_subtitles(
+            cx,
+            self.write_content_cap,
+            &item_id,
+            &language,
+            &format,
+            &content,
+        )
     }
 
     fn create_collection(&mut self, name: String, item_ids: Vec<String>) -> Result<String, String> {
@@ -256,7 +269,12 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("extract-subtitle-track is not available during plugin load")?;
-        crate::capabilities::extract_subtitle_track(cx, &item_id, stream_index)
+        crate::capabilities::extract_subtitle_track(
+            cx,
+            self.subtitle_extract_cap,
+            &item_id,
+            stream_index,
+        )
     }
 
     fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {

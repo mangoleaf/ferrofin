@@ -263,6 +263,17 @@ const EMBEDDED_IMAGE_STREAM_TYPE: i32 = 3;
 /// The image file extensions the art-dir helpers recognize.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 
+/// Magic-byte sniff for the artwork formats plugins may return (the
+/// [`ART_FILE_EXTENSIONS`] set) — enough to keep an arbitrary blob from
+/// persisting as a permanent zero-dimension image.
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\xFF\xD8\xFF") // JPEG
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
 /// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
 /// extension, preferring the canonical `.jpg` first.
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
@@ -1464,20 +1475,26 @@ impl LibraryScanner {
                 continue;
             };
             let policy = policy_of(policies, artist.top_parent_id.as_deref());
-            if !policy.metadata_enabled("MusicArtist", fetcher_names::MUSICBRAINZ) {
-                continue;
-            }
+            // The MusicBrainz checkbox gates the REMOTE surface only (the
+            // name search and the persisted provider-id row) — an mbid
+            // already present in the local tags stays usable, so AudioDb/
+            // fanart below still run for tagged libraries (the same
+            // remote-resolve-only gate as `enrich_one_album`).
+            let mb_enabled = policy.metadata_enabled("MusicArtist", fetcher_names::MUSICBRAINZ);
             let mbid = match artist_mbid.get(name) {
                 Some(id) => Some(id.clone()),
-                None => mb.search_artist(name).await,
+                None if mb_enabled => mb.search_artist(name).await,
+                None => None,
             };
             let Some(id) = mbid else {
                 continue;
             };
-            let _ = self
-                .persistence
-                .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
-                .await;
+            if mb_enabled {
+                let _ = self
+                    .persistence
+                    .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
+                    .await;
+            }
 
             // AudioDb bio/genre + AudioDb/fanart artist artwork, keyed by the
             // resolved MusicBrainz artist id.
@@ -2356,20 +2373,17 @@ impl LibraryScanner {
             path: entity.path.clone(),
             provider_ids: Vec::new(),
         };
-        // Same admin control as the metadata pass, over the image-fetcher
-        // checkboxes/order.
+        // Artwork is a NAMED-provider surface (the plan scopes it to plugins
+        // that declared provider-info — everything else always returns `[]`,
+        // so asking would be a wasted guest round-trip per item per scan),
+        // under the same admin control as the metadata pass: the library's
+        // image-fetcher checkboxes/order.
         let mut sources: Vec<_> = self
             .dynamic_providers
             .iter()
-            .filter(|p| !p.library_gated() || policy.image_enabled(&lookup.kind, p.name()))
+            .filter(|p| p.library_gated() && policy.image_enabled(&lookup.kind, p.name()))
             .collect();
-        sources.sort_by_key(|p| {
-            if p.library_gated() {
-                policy.image_rank(&lookup.kind, p.name())
-            } else {
-                usize::MAX
-            }
-        });
+        sources.sort_by_key(|p| policy.image_rank(&lookup.kind, p.name()));
         for provider in sources {
             if wanted.is_empty() {
                 return;
@@ -2388,6 +2402,18 @@ impl LibraryScanner {
             };
             for (kind, bytes) in contributed {
                 if !wanted.contains(&kind) {
+                    continue;
+                }
+                // Sniff before persisting: an undecodable blob would land as
+                // a permanent 0×0 "image" (art on disk always wins, so the
+                // slot never recovers).
+                if !looks_like_image(&bytes) {
+                    tracing::warn!(
+                        provider = provider.name(),
+                        item = %entity.id,
+                        kind = ?kind,
+                        "plugin artwork bytes are not a recognized image format; skipping"
+                    );
                     continue;
                 }
                 let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(kind)));
@@ -5524,6 +5550,11 @@ mod tests {
     async fn dynamic_provider_supplies_missing_artwork_but_never_overwrites() {
         use ferrofin_model::entities::ImageType;
 
+        // PNG magic + a distinguishable payload: the artwork pass sniffs the
+        // format before persisting, so plain b"FIRST" would be rejected.
+        const PNG_FIRST: &[u8] = b"\x89PNG\r\n\x1a\nFIRST";
+        const PNG_SECOND: &[u8] = b"\x89PNG\r\n\x1a\nSECOND";
+
         struct ArtDb {
             calls: std::sync::Mutex<u32>,
         }
@@ -5531,6 +5562,10 @@ mod tests {
         impl ferrofin_traits::providers::DynamicMetadataProvider for ArtDb {
             fn name(&self) -> &'static str {
                 "art-db"
+            }
+            fn library_gated(&self) -> bool {
+                // The artwork pass only asks named (provider-info) plugins.
+                true
             }
             async fn lookup(
                 &self,
@@ -5557,14 +5592,19 @@ mod tests {
                     "first pass must ask for the missing Primary"
                 );
                 // Different bytes per call: a re-download would be visible.
-                Ok(vec![(
-                    ImageType::Primary,
-                    if call == 1 {
-                        b"FIRST".to_vec()
-                    } else {
-                        b"SECOND".to_vec()
-                    },
-                )])
+                // The Backdrop is garbage (no image magic) — the sniff must
+                // drop it instead of persisting a permanent 0×0 row.
+                Ok(vec![
+                    (
+                        ImageType::Primary,
+                        if call == 1 {
+                            PNG_FIRST.to_vec()
+                        } else {
+                            PNG_SECOND.to_vec()
+                        },
+                    ),
+                    (ImageType::Backdrop, b"not an image".to_vec()),
+                ])
             }
         }
 
@@ -5613,15 +5653,14 @@ mod tests {
             .map(|e| e.unwrap().path().join("primary.jpg"))
             .find(|p| p.exists())
             .expect("dynamic Primary written to disk");
-        assert_eq!(std::fs::read(&primary).unwrap(), b"FIRST");
+        assert_eq!(std::fs::read(&primary).unwrap(), PNG_FIRST);
         // …and as a persisted Primary image row pointing at that file
         // (read back through the repository, not raw SQL — boundary rule).
-        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
-            crate::item_repository::FerrofinItemRepository::new(
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
                 db.clone(),
                 Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
-            ),
-        );
+            ));
         let item_id = uuid::Uuid::parse_str(
             &primary
                 .parent()
@@ -5633,20 +5672,25 @@ mod tests {
         .expect("art dir is the item id");
         let rows = items.get_image_infos(item_id).await.unwrap();
         assert!(
-            rows.iter().any(|i| i.image_type == ImageType::Primary
-                && i.path == primary.to_string_lossy()),
+            rows.iter()
+                .any(|i| i.image_type == ImageType::Primary && i.path == primary.to_string_lossy()),
             "Primary image row persists; got {rows:?}"
         );
         assert!(
             !rows.iter().any(|i| i.image_type == ImageType::Backdrop),
-            "no Backdrop was contributed, none may appear; got {rows:?}"
+            "the contributed Backdrop was not a real image — the sniff must \
+             reject it, on disk and in the DB; got {rows:?}"
+        );
+        assert!(
+            !primary.with_file_name("backdrop.jpg").exists(),
+            "rejected bytes must never reach disk"
         );
 
         // Re-scan: art on disk wins; the provider's new bytes are ignored.
         scanner.scan_all().await.unwrap();
         assert_eq!(
             std::fs::read(&primary).unwrap(),
-            b"FIRST",
+            PNG_FIRST,
             "existing artwork must never be overwritten by a re-scan"
         );
     }

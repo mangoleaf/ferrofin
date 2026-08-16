@@ -86,6 +86,22 @@ pub struct WasmSettings {
     /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 — settings/cursors fit
     /// easily; stats-heavy plugins may need more).
     pub state_limit_mb: u32,
+    /// Cap on one downloaded remote-artwork candidate, in MiB
+    /// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`, default 20 — posters/backdrops
+    /// are single-digit MiB; anything larger is not artwork).
+    pub image_download_mb: u32,
+    /// Wall-clock bound for one artwork download, in seconds
+    /// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`, default 30 — a CDN GET, not a
+    /// transfer job).
+    pub image_timeout_secs: u32,
+    /// Cap on one `write-lyrics`/`write-subtitles` payload, in MiB
+    /// (`FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 — settings-class
+    /// writes, not media).
+    pub write_content_mb: u32,
+    /// Cap on one extracted subtitle track, in MiB
+    /// (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`, default 10 — generous for SRT
+    /// text).
+    pub subtitle_extract_mb: u32,
     /// Plugin ids allowed to reach private/loopback HTTP destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`: comma-separated plugin UUIDs, or
     /// `*` for every plugin). Default empty: private destinations denied.
@@ -101,6 +117,10 @@ impl Default for WasmSettings {
             memory_limit_mb: 128,
             event_queue_capacity: 256,
             state_limit_mb: 8,
+            image_download_mb: 20,
+            image_timeout_secs: 30,
+            write_content_mb: 2,
+            subtitle_extract_mb: 10,
             private_http_allow: Vec::new(),
         }
     }
@@ -113,6 +133,46 @@ impl WasmSettings {
     pub fn with_state_limit_mb(mut self, mb: Option<u32>) -> Self {
         if let Some(mb) = mb.filter(|&v| v > 0) {
             self.state_limit_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the artwork-download size cap
+    /// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_image_download_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.image_download_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the artwork-download timeout
+    /// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_image_timeout_secs(mut self, secs: Option<u32>) -> Self {
+        if let Some(secs) = secs.filter(|&v| v > 0) {
+            self.image_timeout_secs = secs;
+        }
+        self
+    }
+
+    /// Overrides the lyric/subtitle write cap
+    /// (`FERROFIN_WASM_WRITE_CONTENT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_write_content_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.write_content_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the extracted-subtitle-track cap
+    /// (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_subtitle_extract_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.subtitle_extract_mb = mb;
         }
         self
     }
@@ -140,7 +200,6 @@ impl WasmSettings {
     ) -> Self {
         let d = Self::default();
         Self {
-            state_limit_mb: d.state_limit_mb,
             call_timeout_secs: call_timeout_secs
                 .filter(|&v| v > 0)
                 .unwrap_or(d.call_timeout_secs),
@@ -159,6 +218,8 @@ impl WasmSettings {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // The remaining caps resolve through their `with_*` builders.
+            ..d
         }
     }
 }
@@ -255,6 +316,9 @@ pub struct WasmPluginHost {
     /// One cell shared by every plugin's `HostState` (and every rebuild):
     /// filling it arms `query-items`/`write-media-segments` host functions.
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    /// The resolved host settings — kept for host-side work done outside a
+    /// guest store (the artwork download cap/timeout).
+    settings: WasmSettings,
 }
 
 impl WasmPluginHost {
@@ -318,6 +382,31 @@ impl WasmPluginHost {
                         );
                         continue;
                     }
+                    // A declared provider name is what the dashboard lists
+                    // and what the per-library gate matches on
+                    // (case-insensitively) — a collision with a built-in
+                    // fetcher or another plugin would ride that fetcher's
+                    // checkbox/order and be impossible to toggle apart.
+                    if let Some(info) = &loaded.provider_info {
+                        let reserved = ferrofin_providers::library_options::fetcher_names::ALL
+                            .iter()
+                            .any(|r| r.eq_ignore_ascii_case(&info.name));
+                        let taken = plugins.iter().any(|p| {
+                            p.provider_info
+                                .as_ref()
+                                .is_some_and(|i| i.name.eq_ignore_ascii_case(&info.name))
+                        });
+                        if reserved || taken {
+                            error!(
+                                path = %path.display(),
+                                provider = info.name,
+                                "wasm plugin declares a provider name that collides with \
+                                 a built-in fetcher or an already-loaded plugin; \
+                                 skipping this file"
+                            );
+                            continue;
+                        }
+                    }
                     info!(
                         plugin = loaded.descriptor.name,
                         plugin_id = %loaded.descriptor.id,
@@ -342,6 +431,7 @@ impl WasmPluginHost {
         Ok(Self {
             plugins,
             collaborators,
+            settings: settings.clone(),
         })
     }
 
@@ -351,6 +441,7 @@ impl WasmPluginHost {
         Self {
             plugins: Vec::new(),
             collaborators: Arc::new(std::sync::OnceLock::new()),
+            settings: WasmSettings::default(),
         }
     }
 
@@ -373,6 +464,10 @@ impl WasmPluginHost {
                     plugin: Arc::clone(plugin),
                     collaborators: Arc::clone(&self.collaborators),
                     gate_cache: std::sync::Mutex::new(None),
+                    image_download_cap: self.settings.image_download_mb as usize * 1024 * 1024,
+                    image_download_timeout: std::time::Duration::from_secs(u64::from(
+                        self.settings.image_timeout_secs,
+                    )),
                 }) as Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>
             })
             .collect()
@@ -514,6 +609,8 @@ fn load_one(
         // Load-time calls can't fetch at all; the real policy is read below.
         egress: Arc::new(capabilities::EgressPolicy::default()),
         state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
+        write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
+        subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
@@ -888,6 +985,8 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                 state_path: None, // validation is throwaway — no persistence
                 egress: Arc::new(capabilities::EgressPolicy::default()),
                 state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
+                write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
+                subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
                 // Never armed: query-items/write-media-segments/http-fetch
                 // all refuse during validation.
                 collaborators: Arc::new(std::sync::OnceLock::new()),
@@ -930,6 +1029,10 @@ struct WasmMetadataProvider {
     /// flag/config read per interval instead of two per item. The TTL only
     /// delays a mid-scan dashboard toggle taking effect — never correctness.
     gate_cache: std::sync::Mutex<Option<(std::time::Instant, bool, String)>>,
+    /// Operator cap on one artwork candidate (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`).
+    image_download_cap: usize,
+    /// Operator bound on one artwork GET (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`).
+    image_download_timeout: std::time::Duration,
 }
 
 /// How long a [`WasmMetadataProvider`] trusts its (enabled, config)
@@ -1083,11 +1186,14 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
             };
             let plugin = Arc::clone(&self.plugin);
             let url = candidate.url.clone();
+            let (cap, timeout) = (self.image_download_cap, self.image_download_timeout);
             let downloaded = tokio::task::spawn_blocking(move || {
                 capabilities::download_image(
                     &plugin.descriptor.name,
                     plugin.private_http_allowed,
                     &plugin.egress,
+                    cap,
+                    timeout,
                     &url,
                 )
             })

@@ -434,26 +434,30 @@ fn state_kv_round_trips_caps_and_deletes() {
 #[test]
 fn download_image_enforces_egress_status_and_returns_bytes() {
     use ferrofin_wasm::capabilities::{EgressPolicy, download_image};
+    const CAP: usize = 20 * 1024 * 1024;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Undeclared destination: refused before any connection.
     let policy = EgressPolicy::parse(&["cdn.example.com".to_owned()]);
-    let err = download_image("p", false, &policy, "http://127.0.0.1:9/x").unwrap_err();
+    let err =
+        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
     assert!(err.contains("declared egress"), "got: {err}");
 
     // Declared but loopback/private: still refused without the grant.
     let policy = EgressPolicy::parse(&["127.0.0.1".to_owned()]);
-    let err = download_image("p", false, &policy, "http://127.0.0.1:9/x").unwrap_err();
+    let err =
+        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
     assert!(err.contains("private"), "got: {err}");
 
     // With the private grant: a non-200 answer loses the slot…
     let (url, server) = one_shot_http("404 Not Found", b"nope");
-    let err = download_image("p", true, &EgressPolicy::default(), &url).unwrap_err();
+    let err = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap_err();
     assert!(err.contains("404"), "got: {err}");
     server.join().unwrap();
 
     // …and a 200 yields the raw bytes via a GET.
     let (url, server) = one_shot_http("200 OK", b"IMAGEBYTES");
-    let bytes = download_image("p", true, &EgressPolicy::default(), &url).unwrap();
+    let bytes = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap();
     assert_eq!(bytes, b"IMAGEBYTES");
     let request = server.join().unwrap();
     assert!(request.starts_with(b"GET "), "artwork fetch must be a GET");
@@ -730,10 +734,13 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         assert_eq!(frames[0].width, 320, "dimension clamped to the cap");
 
         // Subtitle extraction rides the same item-addressed path.
-        let srt = ferrofin_wasm::capabilities::extract_subtitle_track(&cx, ITEM, 0).expect("srt");
+        let srt =
+            ferrofin_wasm::capabilities::extract_subtitle_track(&cx, 10 * 1024 * 1024, ITEM, 0)
+                .expect("srt");
         assert!(String::from_utf8_lossy(&srt).contains("stream 0"));
         let err = ferrofin_wasm::capabilities::extract_subtitle_track(
             &cx,
+            10 * 1024 * 1024,
             &uuid::Uuid::from_u128(0xdead).to_string(),
             0,
         )
@@ -768,6 +775,7 @@ async fn write_family_caps_ownership_and_plumbing() {
         create_collection, set_user_data, update_collection, write_lyrics, write_subtitles,
     };
     const ITEM: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01";
+    const WRITE_CAP: usize = 2 * 1024 * 1024;
     const USER: &str = "00000000-0000-0000-0000-000000000001";
 
     let lyrics = std::sync::Arc::new(common::StubLyrics::default());
@@ -811,17 +819,18 @@ async fn write_family_caps_ownership_and_plumbing() {
         assert!(err.contains("item-id"), "{err}");
 
         // Lyrics: UTF-8 + cap + recorded write.
-        let err = write_lyrics(&cx, ITEM, "lrc", &vec![0u8; 2 * 1024 * 1024 + 1]).unwrap_err();
+        let err =
+            write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", &vec![0u8; 2 * 1024 * 1024 + 1]).unwrap_err();
         assert!(err.contains("cap"), "{err}");
-        let err = write_lyrics(&cx, ITEM, "lrc", &[0xFF, 0xFE]).unwrap_err();
+        let err = write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", &[0xFF, 0xFE]).unwrap_err();
         assert!(err.contains("UTF-8"), "{err}");
-        write_lyrics(&cx, ITEM, "lrc", b"[00:01.00] hi").unwrap();
+        write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", b"[00:01.00] hi").unwrap();
         let w = lyrics.writes.lock().unwrap().clone();
         assert_eq!(w.len(), 1);
         assert!(w[0].2.starts_with("lrc:"), "{:?}", w[0]);
 
         // Subtitles: cap + recorded language/format/size.
-        write_subtitles(&cx, ITEM, "eng", "srt", b"1\n00:00:01 --> 2\nhi").unwrap();
+        write_subtitles(&cx, WRITE_CAP, ITEM, "eng", "srt", b"1\n00:00:01 --> 2\nhi").unwrap();
         let w = subtitles.writes.lock().unwrap().clone();
         assert_eq!(
             w[0].2,
