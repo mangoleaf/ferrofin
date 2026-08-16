@@ -113,7 +113,12 @@ def compare_raw(baseline_file, factor, names):
     bp = raw.get("params", {})
     err = sys.stderr
     fmt = lambda n: "—" if n is None else f"{n:.1f}"  # noqa: E731 — tiny table formatter
-    print(f"perf-gate: factor {factor}×, baseline @ {bp.get('rate', bp.get('vus', '?'))}/s × {bp.get('secs', '?')}s", file=err)
+    if "rate" not in bp:
+        print("perf-gate: baseline predates the open-loop migration (captured with "
+              "closed-loop VUs) — numbers are methodology-incomparable; run "
+              "./perf-gate.sh --rebaseline once", file=err)
+        sys.exit(2)
+    print(f"perf-gate: factor {factor}×, baseline @ {bp['rate']}/s × {bp.get('secs', '?')}s", file=err)
     print("endpoint".ljust(24) + "".join(f"{p} base→cur (×)".ljust(22) for p in PCTS) + "200%  verdict", file=err)
 
     regressed = []
@@ -160,8 +165,13 @@ def rebaseline_merged(run):
             continue
         variants[p["variant"]] = {"op": o["op"], "h_p50": p["h_p50"], "h_p95": p["h_p95"],
                                   "h_p99": p["h_p99"], "deep_verified": o["parity"]["deep_verified"]}
+        # H2: cold sentinels carry their fresh-process first-request latency —
+        # gated separately from warm (cold-vs-cold only, gross regressions).
+        if (p.get("cold") or {}).get("h_first") is not None:
+            variants[p["variant"]]["h_cold_first"] = p["cold"]["h_first"]
     doc = _read_baseline_file(BASELINE)
-    doc["merged"] = {"factor": FACTOR, "ferrofin": run["meta"]["ferrofin"], "variants": variants}
+    doc["merged"] = {"factor": FACTOR, "engine": "open-loop",
+                     "ferrofin": run["meta"]["ferrofin"], "variants": variants}
     BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
     print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['ferrofin']} [merged]")
 
@@ -171,6 +181,9 @@ def check_merged(run):
     merged = doc.get("merged")
     if not merged:
         sys.exit("gate: no merged baseline — run `suite/run.sh gate --rebaseline` once to establish one")
+    if merged.get("engine") != "open-loop":
+        sys.exit("gate: merged baseline predates the open-loop migration — "
+                 "methodology-incomparable; run `suite/run.sh gate --rebaseline` once")
     base = merged["variants"]
     fails = []
     for o in run["operations"]:
@@ -187,6 +200,15 @@ def check_merged(run):
         if b.get("deep_verified") and not par["deep_verified"]:
             fails.append(f"{op} ({p['variant']}): parity regressed — was deep_verified, now "
                          f"{par['depth']}/unverified")
+        # Cold gates cold-vs-cold only (never against warm): same gross-factor
+        # rule; cold first-requests are high-variance, so only a clear breach
+        # (factor AND absolute delta) fails.
+        cold_now = (p.get("cold") or {}).get("h_first")
+        cold_base = b.get("h_cold_first")
+        if (cold_now is not None and cold_base and cold_now > cold_base * FACTOR
+                and (cold_now - cold_base) > MIN_DELTA_MS):
+            fails.append(f"{p['variant']} cold_first: {cold_now} > {cold_base}×{FACTOR} "
+                         f"(={round(cold_base * FACTOR, 1)})")
 
     if fails:
         print(f"PERF/PARITY GATE FAILED ({len(fails)} regressions vs baseline):", file=sys.stderr)

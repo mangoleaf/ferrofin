@@ -34,6 +34,9 @@ DEFAULTS = {
     # warm/cold
     "BENCH_WARMUP_SECS": 90,
     "BENCH_COLD_REQUESTS": 10,
+    "BENCH_COLD_ENDPOINTS": "info_public user_me items_sortname items_mixed item_detail "
+                            "persons studios suggestions movie_recommendations "
+                            "items_filters2 image_primary",
     # saturation sweep
     "BENCH_KNEE_P99_MS": 250.0,
     # login storm

@@ -135,6 +135,22 @@ bench() {  # $1=service $2=port $3=TARGET
   # journeys leave play-state fields the fresh perf scan legitimately lacks.)
   mkdir -p ../results/raw
   python3 ../fingerprint.py capture "$base" "../results/raw/perf-fingerprints-$target.json" "$ctok" "$cuid" || true
+
+  # H2: cold-request leg, LAST (it restarts the server, destroying warm state
+  # everything above depends on). The server is restarted before EACH sentinel:
+  # hitting one endpoint warms shared state (DB pool, page cache, JIT) for the
+  # next, so per-endpoint cold needs a fresh process each time. Cold and warm
+  # are published side by side, labeled — never blended.
+  if [ -n "${BENCH_COLD_ENDPOINTS:-}" ]; then
+    rm -f "results/raw/$target-cold-requests.json"
+    for name in $BENCH_COLD_ENDPOINTS; do
+      docker compose restart "$svc" >/dev/null 2>&1
+      for _ in $(seq 1 240); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && break; sleep 0.5; done
+      # A failed probe leaves its endpoint missing — merge.py's manifest check
+      # fails the run rather than shipping a record with a silent cold hole.
+      python3 cold_probe.py --target "$target" --base "$base" --endpoint "$name" || true
+    done
+  fi
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 

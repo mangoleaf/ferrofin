@@ -54,6 +54,20 @@ Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 - **Cold start** — container launch → first `200 /System/Info/Public`
 - **Peak RSS** under load
 
+### Warm and cold, side by side (never blended)
+
+The headline latency is **steady state**: every measured window is preceded by
+same-endpoint warmup at the measured rate (`BENCH_WARMUP_SECS`), identical on both
+servers — long enough for .NET tiered compilation to promote to tier-1 code, so the
+comparison isn't Rust-vs-quick-JIT. **Cold** is a real user experience too (server
+restart, first browse) and a legitimate Rust advantage, so it's published as its own
+labeled metric: after the warm legs, the server is **restarted before each sentinel
+endpoint** (hitting one endpoint warms shared state for the next) and the first
+`BENCH_COLD_REQUESTS` requests are timed individually (`cold_probe.py`) — the first
+request is the number, the rest show the warm-up curve. The record carries `warm`
+percentiles and a `cold` block per sentinel; the regression gate runs on warm, and
+cold gates only cold-vs-cold on the same gross factor.
+
 And, optional/experimental (`RUN_TRANSCODE=1`): **time-to-first-HLS-segment**. Low signal —
 both servers call the *same ffmpeg*, so this measures only the pipeline/playlist overhead
 before ffmpeg output, not transcode throughput.

@@ -32,6 +32,12 @@ SUITE = ROOT / "suite"
 RESULTS = SUITE / "results"
 RAW = RESULTS / "raw"
 
+# The methodology knobs (three-layer resolution: default < bench.conf < env)
+# live in suite/perf/config.py — the manifest check needs the cold-endpoint
+# list resolved the same way the measuring leg resolved it.
+sys.path.insert(0, str(SUITE / "perf"))
+from config import CONFIG  # noqa: E402
+
 
 def run_signature(record):
     """Fingerprint a run's *measured* numbers so an exact re-merge of the same raw
@@ -189,15 +195,17 @@ def server_build():
         return None
 
 
-def manifest_check(v2op, perf, foot):
+def manifest_check(v2op, perf, foot, cold):
     """A1 (fail loud): every registry bench variant must have produced a latency
-    row on BOTH servers, and each declared special leg (TTFS copy/encode, when
-    RUN_TRANSCODE=1) its footprint block. A leg that silently vanished — the
-    2026-08 transcode.js path break produced two green runs with zero TTFS
-    rows — must fail the merge, never thin the record.
+    row on BOTH servers, each declared special leg (TTFS copy/encode, when
+    RUN_TRANSCODE=1) its footprint block, and each configured cold sentinel its
+    cold row on both servers. A leg that silently vanished — the 2026-08
+    transcode.js path break produced two green runs with zero TTFS rows — must
+    fail the merge, never thin the record.
 
     Returns (skipped, missing): SKIP_VARIANTS (comma list) records a variant as
-    deliberately skipped instead of missing; anything else absent is missing.
+    deliberately skipped instead of missing (`cold:<name>` skips a cold row);
+    anything else absent is missing.
     """
     skip = {s.strip() for s in os.environ.get("SKIP_VARIANTS", "").split(",") if s.strip()}
     missing = []
@@ -218,6 +226,13 @@ def manifest_check(v2op, perf, foot):
                     continue
                 if not (foot or {}).get(f"{key}_{leg}"):
                     missing.append(f"{leg}[{tgt}]")
+    for name in CONFIG["BENCH_COLD_ENDPOINTS"].split():
+        if f"cold:{name}" in skip:
+            continue
+        for tgt in ("ferrofin", "jellyfin"):
+            row = (cold.get(tgt) or {}).get("endpoints", {}).get(name)
+            if not row or row.get("first") is None:
+                missing.append(f"cold:{name}[{tgt}]")
     return sorted(skip), sorted(missing)
 
 
@@ -236,12 +251,14 @@ def main():
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
     foot = footprint()
     perf_meta = (load_json(SUITE / "perf/results/raw/ferrofin-summary.json") or {}).get("meta")
+    cold = {tgt: load_json(SUITE / f"perf/results/raw/{tgt}-cold-requests.json", {})
+            for tgt in ("ferrofin", "jellyfin")}
 
     # A1: measure the full manifest or fail loud (no green record with holes).
     # MERGE_ALLOW_INCOMPLETE=1 downgrades to a record stamped `incomplete` that
     # is written but kept OUT of the trend file (needed for the legacy
     # bench-data fallback, which predates the full endpoint set).
-    skipped, missing = manifest_check(v2op, perf, foot)
+    skipped, missing = manifest_check(v2op, perf, foot, cold)
     if missing:
         print(f"!! manifest incomplete — {len(missing)} expected leg(s) produced no data:", file=sys.stderr)
         for m in missing:
@@ -284,6 +301,19 @@ def main():
 
         win = wins_all_three(p)
         speedup = round(p["j_p50"] / p["h_p50"], 2) if have_lat and p["h_p50"] else None
+        # H2: cold rows ride the same operation, as a separate labeled block —
+        # WARM percentiles above are the headline; cold is published beside
+        # them, never blended (fresh-process first-request latency).
+        ch = (cold.get("ferrofin") or {}).get("endpoints", {}).get(variant)
+        cj = (cold.get("jellyfin") or {}).get("endpoints", {}).get(variant)
+        cold_block = None
+        if ch or cj:
+            cold_block = {
+                "h_first": (ch or {}).get("first"), "h_p50": (ch or {}).get("p50"),
+                "h_max": (ch or {}).get("max"),
+                "j_first": (cj or {}).get("first"), "j_p50": (cj or {}).get("p50"),
+                "j_max": (cj or {}).get("max"),
+            }
         operations.append({
             "op": op, "tag": tag,
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
@@ -291,7 +321,8 @@ def main():
             "perf": {"variant": variant, **p, "speedup": speedup,
                      "win_all_three": win,
                      "tail_loss": bool(comparable and speedup and speedup > 1 and not win),
-                     "comparable": comparable, "reason": reason},
+                     "comparable": comparable, "reason": reason,
+                     **({"cold": cold_block} if cold_block else {})},
         })
 
     comp = [o["perf"] for o in operations if o["perf"]["comparable"]]

@@ -89,6 +89,7 @@
   <table id="ops"><thead><tr>
     <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
     <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
+    <th title="Fresh-process first-request latency (H / J, ms) — sentinels only; separate from warm, never blended">cold first H/J</th>
     <th title="Ferrofin p50 change vs the selected base run">Δ vs base</th>
     <th>speedup</th><th>verdict</th><th class="l">note</th>
   </tr></thead><tbody></tbody></table>
@@ -219,6 +220,7 @@ function render() {
       <td>${o.parity.deep_verified ? "✓" : "·"}</td>
       <td>${num(p.h_p50)}</td><td>${num(p.h_p95)}</td><td>${num(p.h_p99)}</td>
       <td>${num(p.j_p50)}</td><td>${num(p.j_p95)}</td><td>${num(p.j_p99)}</td>
+      <td>${p.cold ? `${num(p.cold.h_first)} / ${num(p.cold.j_first)}` : "—"}</td>
       <td>${delta}</td><td>${spd}</td>
       <td>${verdict}</td><td class="l muted">${p.comparable ? "" : (p.reason || "")}</td>
     </tr>`;

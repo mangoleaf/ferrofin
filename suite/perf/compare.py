@@ -91,7 +91,12 @@ def run_bench(target, base):
     (RAW / f"{target}-ctx.json").write_text(json.dumps(ctx, indent=2) + "\n")
 
     rates = load_rates()
-    warmup = int(os.environ.get("BENCH_WARMUP_SECONDS", "10"))
+    # H1: warmup is SAME-endpoint traffic at the measured rate, identical on
+    # both servers, long enough for .NET tiered compilation to promote the hot
+    # paths to tier-1 — otherwise a short window measures Jellyfin's quick-JIT
+    # tier-0 code and flatters Ferrofin (Rust has no tiers; it gets the same
+    # warmup anyway so the protocol stays symmetric).
+    warmup = CONFIG["BENCH_WARMUP_SECS"]
     duration = CONFIG["BENCH_DURATION_SECS"]
     login_rate = CONFIG["BENCH_LOGIN_RATE"]
     login_secs = CONFIG["BENCH_LOGIN_DURATION_SECS"]
