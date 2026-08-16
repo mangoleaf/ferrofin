@@ -34,7 +34,10 @@ suite_load_bench_conf() {
   while IFS='=' read -r k v; do
     case "$k" in ''|\#*) continue ;; esac
     k="${k%"${k##*[![:space:]]}"}"   # rtrim
-    [ -n "${!k:-}" ] || export "$k=$v"
+    # Set-ness, not non-emptiness: a PRESENT-but-empty env var is a deliberate
+    # override (e.g. BENCH_COLD_ENDPOINTS="" disables the cold leg) and must
+    # not be resurrected from the file.
+    [ -n "${!k+x}" ] || export "$k=$v"
   done < <(grep -E '^[A-Z_]+=' "$conf")
 }
 

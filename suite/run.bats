@@ -23,6 +23,12 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [ "$status" -eq 0 ]
 }
 
+@test "merge verdict/manifest self-test passes (noise-floor ties)" {
+  run python3 merge_selftest.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all assertions passed"* ]]
+}
+
 @test "run.sh with no stage prints usage and fails" {
   run ./run.sh
   [ "$status" -ne 0 ]

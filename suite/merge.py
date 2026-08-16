@@ -236,11 +236,20 @@ def manifest_check(v2op, perf, foot, cold):
     return sorted(skip), sorted(missing)
 
 
-def wins_all_three(p):
-    v = [p["h_p50"], p["h_p95"], p["h_p99"], p["j_p50"], p["j_p95"], p["j_p99"]]
-    if any(x is None for x in v):
-        return False
-    return p["h_p50"] < p["j_p50"] and p["h_p95"] < p["j_p95"] and p["h_p99"] < p["j_p99"]
+def percentile_verdicts(p, floor):
+    """D1: per-percentile win/tie/loss with the noise floor as a first-class
+    concept. A delta smaller than the floor (host-local jitter band, recorded
+    in meta) is a TIE — neither a win nor a loss, anywhere: a 1 ms 'loss' on a
+    sub-ms endpoint is OS noise, not a result. Returns
+    {'p50': 'win'|'tie'|'loss', ...} (Ferrofin's perspective), or None when
+    either side lacks numbers."""
+    out = {}
+    for pct in ("p50", "p95", "p99"):
+        h, j = p[f"h_{pct}"], p[f"j_{pct}"]
+        if h is None or j is None:
+            return None
+        out[pct] = "tie" if abs(h - j) < floor else "win" if h < j else "loss"
+    return out
 
 
 def main():
@@ -299,7 +308,13 @@ def main():
                   "measured at different arrival rates" if not same_rate else
                   "open-loop rate not held" if not rates_held else "missing latency")
 
-        win = wins_all_three(p)
+        verdicts = percentile_verdicts(p, CONFIG["BENCH_NOISE_FLOOR_MS"])
+        vlist = list(verdicts.values()) if verdicts else []
+        # A win requires clearing the floor on ALL THREE percentiles; all-ties
+        # is an explicit ≈ verdict; a p50 win with a floor-clearing tail loss
+        # stays a tail loss, never folded into "faster".
+        win = vlist.count("win") == 3
+        tie = bool(vlist) and vlist.count("tie") == 3
         speedup = round(p["j_p50"] / p["h_p50"], 2) if have_lat and p["h_p50"] else None
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
@@ -324,7 +339,11 @@ def main():
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
                      "win_all_three": win,
-                     "tail_loss": bool(comparable and speedup and speedup > 1 and not win),
+                     "tie_all_three": tie,
+                     "verdicts": verdicts,
+                     "tail_loss": bool(comparable and verdicts
+                                       and verdicts["p50"] == "win"
+                                       and "loss" in (verdicts["p95"], verdicts["p99"])),
                      "comparable": comparable, "reason": reason,
                      **({"cold": cold_block} if cold_block else {})},
         })
@@ -369,6 +388,8 @@ def main():
         "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
+        "ties": sum(o["tie_all_three"] for o in comp),
+        "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
         "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
         "owners": owners,

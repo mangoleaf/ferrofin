@@ -34,12 +34,19 @@ from pathlib import Path
 
 RESULTS = Path(__file__).resolve().parent / "results"
 BASELINE = Path(__file__).resolve().parent / "perf-baseline.json"
-FACTOR = float(os.environ.get("PERF_GATE_FACTOR", "1.5"))
+
+# The suite's methodology knobs (default < bench.conf < env — see config.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent / "perf"))
+from config import CONFIG  # noqa: E402
+
+FACTOR = float(os.environ.get("PERF_GATE_FACTOR") or CONFIG["PERF_GATE_FACTOR"])
 # Absolute jitter floor (ms): a percentile trip additionally needs this much
-# real worsening. 3 ms default — well under any regression a user feels, well
-# over the OS-noise band on sub-ms endpoints. Env knob, same owner rule as
-# FACTOR: ask before changing the default.
-MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS", "3"))
+# real worsening. THE noise floor (D1) — the same BENCH_NOISE_FLOOR_MS that
+# makes sub-floor deltas ties in the comparison tables gates here: well under
+# any regression a user feels, well over the OS-noise band on sub-ms
+# endpoints. PERF_GATE_MIN_DELTA_MS env remains as a gate-only override.
+MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS")
+                     or CONFIG["BENCH_NOISE_FLOOR_MS"])
 PCTS = ("p50", "p95", "p99")
 
 

@@ -89,7 +89,10 @@ def load():
     conf = _parse_conf()
     values, sources = {}, {}
     for key, default in DEFAULTS.items():
-        if os.environ.get(key) not in (None, ""):
+        # A PRESENT env var wins even when empty — "" is how a caller disables
+        # a list knob (e.g. BENCH_COLD_ENDPOINTS="" turns the cold leg off);
+        # an empty NUMERIC env var falls back to the default via _cast.
+        if key in os.environ:
             values[key], sources[key] = _cast(key, os.environ[key]), "env"
         elif key in conf:
             values[key], sources[key] = _cast(key, conf[key]), "bench.conf"

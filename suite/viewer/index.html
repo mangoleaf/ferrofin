@@ -53,6 +53,7 @@
   .pill.win  { color: var(--good); border-color: #204a2b; background: #10261699; }
   .pill.loss { color: var(--bad);  border-color: #4a1c1c; background: #260f0f99; }
   .pill.tail { color: var(--warn); border-color: #4a3a10; background: #26200f99; }
+  .pill.tie  { color: #9aa7b5; border-color: #33404d; background: #17202899; }
   .pill.owner{ color: #cdbdfa; border-color: #3b2f63; background: #1d173399; }
   .d-REAL { color: var(--real); border-color: #204a2b; background: #10261699; }
   .d-PARTIAL { color: var(--partial); border-color: #4a3a10; background: #26200f99; }
@@ -162,6 +163,7 @@ function statCards(h) {
   return card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup",
               h.median_speedup >= 1 ? "var(--good)" : "var(--bad)")
     + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
+    + (h.ties != null ? card(h.ties, `≈ ties (<${h.noise_floor_ms ?? "?"} ms)`) : "")
     + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
     + card(h.comparable_rows, "comparable rows")
     + card(pct(h.parity_coverage), "parity coverage", "var(--accent)");
@@ -209,9 +211,13 @@ function render() {
   const rows = r.operations.filter(o => !compOnly.checked || o.perf.comparable);
   ops.tBodies[0].innerHTML = rows.map(o => {
     const p = o.perf, cls = m.legacy ? "legacyrow" : (p.comparable ? "" : "incomparable");
+    // D1: sub-noise-floor deltas are ties (≈), never colored win/loss. A row
+    // with no floor-clearing loss reads ≈; "loss" means a real, felt loss.
+    const anyLoss = p.verdicts && Object.values(p.verdicts).includes("loss");
     const verdict = p.win_all_three ? `<span class="pill win">win×3</span>`
       : p.tail_loss ? `<span class="pill tail">tail loss</span>`
-      : p.comparable ? `<span class="pill loss">loss</span>` : "—";
+      : p.tie_all_three ? `<span class="pill tie">≈</span>`
+      : p.comparable ? (anyLoss ? `<span class="pill loss">loss</span>` : `<span class="pill tie">≈</span>`) : "—";
     const depth = o.parity.depth || "—";
     let delta = "—";
     if (b && baseP50[p.variant] != null && p.h_p50 != null && baseP50[p.variant] > 0) {
