@@ -34,12 +34,35 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [ "$status" -ne 0 ]
 }
 
-@test "merge produces a valid run record with the fairness fields" {
+# A1: without raw summaries the manifest is unmeasurable — merge must FAIL, not
+# write a green record with holes. (Skipped on a host that has fresh summaries.)
+@test "merge fails loud when the manifest is unmeasured" {
+  [ -f perf/results/raw/ferrofin-summary.json ] && skip "raw summaries present on this host"
   run python3 merge.py
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"manifest incomplete"* ]]
+}
+
+@test "merge with MERGE_ALLOW_INCOMPLETE writes an incomplete record, out of the trend" {
+  [ -f perf/results/raw/ferrofin-summary.json ] && skip "raw summaries present on this host"
+  before=$(python3 -c "import json;print(len(json.load(open('results/runs.json'))['runs']))")
+  MERGE_ALLOW_INCOMPLETE=1 run_out=$(MERGE_ALLOW_INCOMPLETE=1 python3 merge.py)
+  [[ "$run_out" == *"INCOMPLETE, excluded from the trend"* ]]
+  after=$(python3 -c "import json;print(len(json.load(open('results/runs.json'))['runs']))")
+  [ "$before" -eq "$after" ]
+  python3 -c "import json,glob; \
+r=json.load(open(sorted(glob.glob('results/run-*-incomplete.json'))[-1])); \
+assert r['meta']['incomplete'], 'incomplete stamp missing'"
+  rm -f results/run-*-incomplete.json
+}
+
+@test "merge produces a valid run record with the fairness fields" {
+  MERGE_ALLOW_INCOMPLETE=1 run python3 merge.py
   [ "$status" -eq 0 ]
   run python3 -c "import json,glob,os; \
 r=json.load(open(sorted(glob.glob('results/run-*.json'),key=os.path.getmtime)[-1])); \
 h=r['headline']; assert 'parity_coverage' in h and 'median_speedup' in h; \
+assert 'dropped_rows' in h and 'dropped_by_reason' in h; \
 assert all('comparable' in o['perf'] for o in r['operations'])"
   [ "$status" -eq 0 ]
 }

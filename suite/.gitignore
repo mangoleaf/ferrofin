@@ -3,3 +3,5 @@ __pycache__/
 # Transient per-run captures; the merged records (results/run-*.json, runs.json) and the gate
 # baseline (perf-baseline.json) ARE committed — they're the trend history and the regression floor.
 results/raw/
+# incomplete run records (MERGE_ALLOW_INCOMPLETE) are for inspection, never history
+results/run-*-incomplete.json

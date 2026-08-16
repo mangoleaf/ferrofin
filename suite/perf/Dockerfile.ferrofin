@@ -6,6 +6,13 @@
 FROM rust:1.97.0-bookworm AS build
 WORKDIR /src
 COPY . .
+# The build context excludes .git (.dockerignore), so the harness passes the
+# host's `git describe` in as a build arg; build.rs (ferrofin-health) bakes it
+# into the binary, and the harness verifies it back over GET /health/live
+# before measuring — a stale cached binary carries a stale value and aborts
+# the run instead of being silently benchmarked.
+ARG GIT_DESCRIBE=
+ENV FERROFIN_GIT_DESCRIBE=$GIT_DESCRIBE
 RUN --mount=type=cache,target=/src/target,id=ferrofin-target \
     --mount=type=cache,target=/usr/local/cargo/registry,id=ferrofin-cargo-registry \
     cargo build --release -p ferrofin-server \

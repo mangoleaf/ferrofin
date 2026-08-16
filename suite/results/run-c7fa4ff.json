@@ -1,7 +1,5 @@
 {
   "meta": {
-    "hermit": "v0.13.0-2-gc7fa4ff",
-    "hermit_sha": "c7fa4ff",
     "jellyfin_image": "jellyfin/jellyfin:10.11.8",
     "fixture_hash": "fa0024c9f239ea12",
     "cpus": 4,
@@ -23,7 +21,9 @@
       "j_ttfs_copy": null,
       "j_ttfs_encode": null
     },
-    "when": "2026-08-07T01:25Z"
+    "when": "2026-08-07T01:25Z",
+    "ferrofin": "v0.13.0-2-gc7fa4ff",
+    "ferrofin_sha": "c7fa4ff"
   },
   "headline": {
     "comparable_rows": 75,

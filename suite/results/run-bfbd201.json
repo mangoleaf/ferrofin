@@ -1,7 +1,5 @@
 {
   "meta": {
-    "hermit": "v0.8.5-2-gbfbd201",
-    "hermit_sha": "bfbd201",
     "jellyfin_image": "jellyfin/jellyfin:10.11.8",
     "fixture_hash": "fa0024c9f239ea12",
     "cpus": 4,
@@ -43,7 +41,9 @@
         "runs": 3
       }
     },
-    "when": "2026-08-04T05:16Z"
+    "when": "2026-08-04T05:16Z",
+    "ferrofin": "v0.8.5-2-gbfbd201",
+    "ferrofin_sha": "bfbd201"
   },
   "headline": {
     "comparable_rows": 70,

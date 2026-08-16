@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -174,6 +175,47 @@ def fixture_hash():
     return h.hexdigest()[:16]
 
 
+def server_build():
+    """The /health/live build identity run.sh captured for the ferrofin leg."""
+    p = SUITE / "perf" / "results" / "raw" / "ferrofin-build.txt"
+    try:
+        return p.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def manifest_check(v2op, perf, foot):
+    """A1 (fail loud): every registry bench variant must have produced a latency
+    row on BOTH servers, and each declared special leg (TTFS copy/encode, when
+    RUN_TRANSCODE=1) its footprint block. A leg that silently vanished — the
+    2026-08 transcode.js path break produced two green runs with zero TTFS
+    rows — must fail the merge, never thin the record.
+
+    Returns (skipped, missing): SKIP_VARIANTS (comma list) records a variant as
+    deliberately skipped instead of missing; anything else absent is missing.
+    """
+    skip = {s.strip() for s in os.environ.get("SKIP_VARIANTS", "").split(",") if s.strip()}
+    missing = []
+    for variant in sorted(v2op):
+        if variant in skip:
+            continue
+        p = perf.get(variant)
+        h_absent = p is None or p.get("h_p50") is None
+        j_absent = p is None or p.get("j_p50") is None
+        if h_absent or j_absent:
+            side = "both" if h_absent and j_absent else "ferrofin" if h_absent else "jellyfin"
+            missing.append(f"{variant}[{side}]")
+    if bench_env("RUN_TRANSCODE") == "1":
+        for key, tgt in (("h", "ferrofin"), ("j", "jellyfin")):
+            for mode in ("copy", "encode"):
+                leg = f"ttfs_{mode}"
+                if leg in skip:
+                    continue
+                if not (foot or {}).get(f"{key}_{leg}"):
+                    missing.append(f"{leg}[{tgt}]")
+    return sorted(skip), sorted(missing)
+
+
 def wins_all_three(p):
     v = [p["h_p50"], p["h_p95"], p["h_p99"], p["j_p50"], p["j_p95"], p["j_p99"]]
     if any(x is None for x in v):
@@ -187,6 +229,21 @@ def main():
     perf, perf_src = perf_by_variant()
     fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
+    foot = footprint()
+
+    # A1: measure the full manifest or fail loud (no green record with holes).
+    # MERGE_ALLOW_INCOMPLETE=1 downgrades to a record stamped `incomplete` that
+    # is written but kept OUT of the trend file (needed for the legacy
+    # bench-data fallback, which predates the full endpoint set).
+    skipped, missing = manifest_check(v2op, perf, foot)
+    if missing:
+        print(f"!! manifest incomplete — {len(missing)} expected leg(s) produced no data:", file=sys.stderr)
+        for m in missing:
+            print(f"!!   {m}", file=sys.stderr)
+        print("!! (deliberate? record it: SKIP_VARIANTS=name1,name2 — skipped legs are stamped into the record)", file=sys.stderr)
+        if os.environ.get("MERGE_ALLOW_INCOMPLETE") != "1":
+            print("!! refusing to write a run record (MERGE_ALLOW_INCOMPLETE=1 to write one stamped incomplete, excluded from the trend)", file=sys.stderr)
+            sys.exit(2)
 
     operations, benched_ops, deep_ops = [], set(), set()
     for variant, p in perf.items():
@@ -226,8 +283,17 @@ def main():
 
     comp = [o["perf"] for o in operations if o["perf"]["comparable"]]
     speedups = [o["speedup"] for o in comp if o["speedup"] is not None]
+    # A2: surface how many rows fell out of the comparison and why, so shrinking
+    # coverage reads as shrinking coverage instead of "all green".
+    dropped = {}
+    for o in operations:
+        r = o["perf"]["reason"]
+        if r:
+            dropped[r] = dropped.get(r, 0) + 1
     headline = {
         "comparable_rows": len(comp),
+        "dropped_rows": sum(dropped.values()),
+        "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
@@ -246,7 +312,13 @@ def main():
             "load": {"vus": int(bench_env("BENCH_VUS")) if bench_env("BENCH_VUS") else None,
                      "duration": bench_env("BENCH_DURATION")},
             "perf_source": perf_src,
-            "footprint": footprint(),
+            "footprint": foot,
+            # B1: the build identity the running server reported over
+            # /health/live during the perf leg (run.sh verified it against the
+            # tree before measuring); None for records that predate the check.
+            "server_build": server_build(),
+            "skipped_variants": skipped or None,
+            "incomplete": missing or None,
             "when": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         },
         "headline": headline,
@@ -254,6 +326,16 @@ def main():
     }
 
     RESULTS.mkdir(parents=True, exist_ok=True)
+
+    # An incomplete record (MERGE_ALLOW_INCOMPLETE=1) is written for inspection
+    # under its own name but NEVER enters the trend file — a record with holes
+    # must not look like a point on the same curve as complete ones.
+    if missing:
+        out = RESULTS / f"run-{sha}-incomplete.json"
+        record["meta"]["run_label"] = f"{record['meta']['ferrofin']} (incomplete)"
+        out.write_text(json.dumps(record, indent=2) + "\n")
+        print(f">> wrote {out.relative_to(ROOT)} — INCOMPLETE, excluded from the trend")
+        return
 
     # Keep every distinct run of the same SHA (variance across reruns is the point) — but
     # collapse an exact re-merge of the same raw artifacts so a second `run.sh merge`

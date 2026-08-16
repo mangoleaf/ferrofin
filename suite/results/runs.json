@@ -2,8 +2,6 @@
   "runs": [
     {
       "meta": {
-        "hermit": "v0.1.0-4-g2cea32b",
-        "hermit_sha": "v0.1.0-4-g2cea32b",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -14,7 +12,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-07-30T22:36Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.1.0-4-g2cea32b",
+        "ferrofin_sha": "v0.1.0-4-g2cea32b"
       },
       "headline": {
         "comparable_rows": 0,
@@ -217,8 +217,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.1.0",
-        "hermit_sha": "v0.1.0",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -229,7 +227,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-07-30T23:22Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.1.0",
+        "ferrofin_sha": "v0.1.0"
       },
       "headline": {
         "comparable_rows": 0,
@@ -432,8 +432,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.1.0-1-ge142b4d",
-        "hermit_sha": "v0.1.0-1-ge142b4d",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -444,7 +442,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-07-31T03:02Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.1.0-1-ge142b4d",
+        "ferrofin_sha": "v0.1.0-1-ge142b4d"
       },
       "headline": {
         "comparable_rows": 0,
@@ -647,8 +647,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.1.0-2-ga5ad889",
-        "hermit_sha": "v0.1.0-2-ga5ad889",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -659,7 +657,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-07-31T04:34Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.1.0-2-ga5ad889",
+        "ferrofin_sha": "v0.1.0-2-ga5ad889"
       },
       "headline": {
         "comparable_rows": 0,
@@ -862,8 +862,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.2.2-15-gaa7a469",
-        "hermit_sha": "v0.2.2-15-gaa7a469",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -874,7 +872,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-01T18:04Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.2.2-15-gaa7a469",
+        "ferrofin_sha": "v0.2.2-15-gaa7a469"
       },
       "headline": {
         "comparable_rows": 0,
@@ -1725,8 +1725,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.2.3-13-gc09e8cc",
-        "hermit_sha": "v0.2.3-13-gc09e8cc",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -1737,7 +1735,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-01T20:28Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.2.3-13-gc09e8cc",
+        "ferrofin_sha": "v0.2.3-13-gc09e8cc"
       },
       "headline": {
         "comparable_rows": 0,
@@ -3992,8 +3992,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.3.0-9-gf531ca0",
-        "hermit_sha": "v0.3.0-9-gf531ca0",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -4004,7 +4002,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-01T23:18Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.3.0-9-gf531ca0",
+        "ferrofin_sha": "v0.3.0-9-gf531ca0"
       },
       "headline": {
         "comparable_rows": 0,
@@ -4369,8 +4369,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.3.0-10-g6542e9e",
-        "hermit_sha": "v0.3.0-10-g6542e9e",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -4381,7 +4379,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-02T00:09Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.3.0-10-g6542e9e",
+        "ferrofin_sha": "v0.3.0-10-g6542e9e"
       },
       "headline": {
         "comparable_rows": 0,
@@ -6636,8 +6636,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.3.0-11-g1167023",
-        "hermit_sha": "v0.3.0-11-g1167023",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -6648,7 +6646,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-02T00:35Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.3.0-11-g1167023",
+        "ferrofin_sha": "v0.3.0-11-g1167023"
       },
       "headline": {
         "comparable_rows": 0,
@@ -8903,8 +8903,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.4.0-1-g184ecb7",
-        "hermit_sha": "v0.4.0-1-g184ecb7",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -8915,7 +8913,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-02T01:23Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.4.0-1-g184ecb7",
+        "ferrofin_sha": "v0.4.0-1-g184ecb7"
       },
       "headline": {
         "comparable_rows": 0,
@@ -11170,8 +11170,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.5.3-24-ga319da0",
-        "hermit_sha": "v0.5.3-24-ga319da0",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -11182,7 +11180,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-02T20:06Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.5.3-24-ga319da0",
+        "ferrofin_sha": "v0.5.3-24-ga319da0"
       },
       "headline": {
         "comparable_rows": 0,
@@ -13437,8 +13437,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.6.1-3-gf83429c",
-        "hermit_sha": "v0.6.1-3-gf83429c",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -13449,7 +13447,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-02T21:58Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.6.1-3-gf83429c",
+        "ferrofin_sha": "v0.6.1-3-gf83429c"
       },
       "headline": {
         "comparable_rows": 0,
@@ -15704,8 +15704,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.7.0-13-g75d1a94",
-        "hermit_sha": "v0.7.0-13-g75d1a94",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -15716,7 +15714,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-03T04:08Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.7.0-13-g75d1a94",
+        "ferrofin_sha": "v0.7.0-13-g75d1a94"
       },
       "headline": {
         "comparable_rows": 0,
@@ -17971,8 +17971,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.8.2",
-        "hermit_sha": "v0.8.2",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -17983,7 +17981,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-03T06:14Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.8.2",
+        "ferrofin_sha": "v0.8.2"
       },
       "headline": {
         "comparable_rows": 0,
@@ -20238,8 +20238,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.8.2-1-ga243241",
-        "hermit_sha": "v0.8.2-1-ga243241",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": null,
         "cpus": null,
@@ -20250,7 +20248,9 @@
         },
         "perf_source": "legacy",
         "when": "2026-08-03T18:16Z",
-        "legacy": true
+        "legacy": true,
+        "ferrofin": "v0.8.2-1-ga243241",
+        "ferrofin_sha": "v0.8.2-1-ga243241"
       },
       "headline": {
         "comparable_rows": 0,
@@ -22505,8 +22505,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.8.3-13-gf417814",
-        "hermit_sha": "f417814",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -22548,7 +22546,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-04T00:54Z"
+        "when": "2026-08-04T00:54Z",
+        "ferrofin": "v0.8.3-13-gf417814",
+        "ferrofin_sha": "f417814"
       },
       "headline": {
         "comparable_rows": 43,
@@ -24803,8 +24803,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.8.5-2-gbfbd201",
-        "hermit_sha": "bfbd201",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -24846,7 +24844,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-04T05:16Z"
+        "when": "2026-08-04T05:16Z",
+        "ferrofin": "v0.8.5-2-gbfbd201",
+        "ferrofin_sha": "bfbd201"
       },
       "headline": {
         "comparable_rows": 70,
@@ -27938,8 +27938,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.8.5-7-gb41adc1",
-        "hermit_sha": "b41adc1",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -27971,7 +27969,9 @@
           "j_ttfs_copy": null,
           "j_ttfs_encode": null
         },
-        "when": "2026-08-04T17:33Z"
+        "when": "2026-08-04T17:33Z",
+        "ferrofin": "v0.8.5-7-gb41adc1",
+        "ferrofin_sha": "b41adc1"
       },
       "headline": {
         "comparable_rows": 73,
@@ -31173,8 +31173,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.12.0",
-        "hermit_sha": "553252f",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -31216,7 +31214,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-05T22:14Z"
+        "when": "2026-08-05T22:14Z",
+        "ferrofin": "v0.12.0",
+        "ferrofin_sha": "553252f"
       },
       "headline": {
         "comparable_rows": 73,
@@ -34422,8 +34422,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.12.0-20-g3ff9120",
-        "hermit_sha": "3ff9120",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -34465,7 +34463,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-06T22:20Z"
+        "when": "2026-08-06T22:20Z",
+        "ferrofin": "v0.12.0-20-g3ff9120",
+        "ferrofin_sha": "3ff9120"
       },
       "headline": {
         "comparable_rows": 74,
@@ -37670,8 +37670,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.13.0-1-g335c474",
-        "hermit_sha": "335c474",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -37713,7 +37711,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-07T00:15Z"
+        "when": "2026-08-07T00:15Z",
+        "ferrofin": "v0.13.0-1-g335c474",
+        "ferrofin_sha": "335c474"
       },
       "headline": {
         "comparable_rows": 74,
@@ -40918,8 +40918,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.13.0-2-gc7fa4ff",
-        "hermit_sha": "c7fa4ff",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -40941,7 +40939,9 @@
           "j_ttfs_copy": null,
           "j_ttfs_encode": null
         },
-        "when": "2026-08-07T01:25Z"
+        "when": "2026-08-07T01:25Z",
+        "ferrofin": "v0.13.0-2-gc7fa4ff",
+        "ferrofin_sha": "c7fa4ff"
       },
       "headline": {
         "comparable_rows": 75,
@@ -44146,8 +44146,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.16.0",
-        "hermit_sha": "166c7b3",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -44189,7 +44187,9 @@
             "runs": 3
           }
         },
-        "when": "2026-08-09T00:28Z"
+        "when": "2026-08-09T00:28Z",
+        "ferrofin": "v0.16.0",
+        "ferrofin_sha": "166c7b3"
       },
       "headline": {
         "comparable_rows": 75,
@@ -47400,8 +47400,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.16.0",
-        "hermit_sha": "166c7b3",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -47445,7 +47443,9 @@
         },
         "when": "2026-08-09T00:46Z",
         "run_seq": 2,
-        "run_label": "v0.16.0 (2)"
+        "run_label": "v0.16.0 (2)",
+        "ferrofin": "v0.16.0",
+        "ferrofin_sha": "166c7b3"
       },
       "headline": {
         "comparable_rows": 75,
@@ -50650,8 +50650,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.16.0",
-        "hermit_sha": "166c7b3",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -50695,7 +50693,9 @@
         },
         "when": "2026-08-09T01:05Z",
         "run_seq": 3,
-        "run_label": "v0.16.0 (3)"
+        "run_label": "v0.16.0 (3)",
+        "ferrofin": "v0.16.0",
+        "ferrofin_sha": "166c7b3"
       },
       "headline": {
         "comparable_rows": 75,
@@ -53895,8 +53895,6 @@
     },
     {
       "meta": {
-        "hermit": "v0.16.0",
-        "hermit_sha": "166c7b3",
         "jellyfin_image": "jellyfin/jellyfin:10.11.8",
         "fixture_hash": "fa0024c9f239ea12",
         "cpus": 4,
@@ -53940,7 +53938,9 @@
         },
         "when": "2026-08-09T01:23Z",
         "run_seq": 4,
-        "run_label": "v0.16.0 (4)"
+        "run_label": "v0.16.0 (4)",
+        "ferrofin": "v0.16.0",
+        "ferrofin_sha": "166c7b3"
       },
       "headline": {
         "comparable_rows": 75,

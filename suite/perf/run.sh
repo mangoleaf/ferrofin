@@ -19,6 +19,37 @@ source ../lib.sh
 suite_load_env .env
 suite_mint_device_id run
 
+# B1 (stale-binary guard): bake the host tree's identity into the image build and
+# verify it back from the running server before any measurement. GIT_DESCRIBE
+# flows: here → compose build arg → Dockerfile ENV → build.rs → binary →
+# GET /health/live `build`. A poisoned build cache that serves an old binary
+# then reports an old identity, and the run aborts instead of measuring it.
+GIT_DESCRIBE=$(git -C ../.. describe --tags --always --dirty --abbrev=12 2>/dev/null || echo "")
+export GIT_DESCRIBE
+case "$GIT_DESCRIBE" in *-dirty) echo ">> NOTE: working tree is dirty — build identity is ${GIT_DESCRIBE}" ;; esac
+
+# Assert the running Ferrofin is the binary we just asked for. `-dirty` is
+# stripped from both sides: BENCH_SKIP_BUILD images come from a clean
+# `git archive HEAD` while the host tree may carry in-flight edits.
+verify_build() {  # $1=base url $2=target
+  [ "$2" = "ferrofin" ] || return 0
+  local reported expect
+  reported=$(curl -sf "$1/health/live" | jq -r '.build // empty')
+  echo "$reported" > "results/raw/$2-build.txt"
+  expect="${GIT_DESCRIBE%-dirty}"
+  if [ -z "$reported" ]; then
+    echo "!! [$2] server did not report a build identity (/health/live) — refusing to measure an unverifiable binary" >&2
+    exit 1
+  fi
+  if [ -n "$expect" ] && [ "${reported%-dirty}" != "$expect" ]; then
+    echo "!! [$2] STALE BINARY: server reports build '${reported}' but the tree is '${GIT_DESCRIBE}'." >&2
+    echo "!!   The image cache served an old binary (or BENCH_SKIP_BUILD points at an outdated image)." >&2
+    echo "!!   Rebuild (docker compose build ferrofin) or prune the cache mounts, then re-run." >&2
+    exit 1
+  fi
+  echo "   build verified: ${reported}"
+}
+
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
 # BENCH_ONLY=ferrofin|jellyfin re-runs one leg, keeping the other's raw results.
 if [ -z "${BENCH_ONLY:-}" ]; then rm -f results/raw/*.json; fi
@@ -66,6 +97,7 @@ bench() {  # $1=service $2=port $3=TARGET
 
   local cold; cold=$(coldstart "$base"); echo "   cold-start: ${cold}s"
   echo "$cold" > "results/raw/$target-cold.txt"
+  verify_build "$base" "$target"
 
   local ctok cuid
 

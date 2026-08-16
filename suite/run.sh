@@ -22,6 +22,16 @@ case "$stage" in
   parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
   perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
   all)
+    # B2 (hermetic-enough build): a shareable release record must not trust the
+    # incremental BuildKit cache mounts — a poisoned mount once served a stale
+    # binary while the tree compiled fine locally. (`docker build --no-cache`
+    # does NOT clear RUN --mount=type=cache mounts; pruning them does.) The
+    # fast per-change gate keeps the cache; BENCH_KEEP_CACHE=1 opts out here.
+    # B1's /health/live build check still verifies whatever binary comes out.
+    if [ "${BENCH_KEEP_CACHE:-0}" != "1" ]; then
+      echo ">> pruning BuildKit cache mounts (hermetic release build; BENCH_KEEP_CACHE=1 to skip)"
+      docker builder prune -f --filter type=exec.cachemount >/dev/null 2>&1 || true
+    fi
     "$ROOT/suite/parity/sweep.sh"
     "$ROOT/suite/perf/run.sh"
     python3 "$ROOT/suite/merge.py"
@@ -31,10 +41,12 @@ case "$stage" in
     if [ "${1:-}" = "--measure" ]; then
       # Fresh measurement at reduced load (fast via VUs/duration), then merge, then check. Runs
       # both legs so run.sh's report step has both summaries; the gate itself only reads Ferrofin's.
+      # RUN_TRANSCODE=0 must reach the merge too: its manifest check (A1) reads the
+      # env to know whether the TTFS legs were part of this measurement.
       shift
       RUN_TRANSCODE=0 BENCH_VUS="${PERF_GATE_VUS:-10}" BENCH_DURATION="${PERF_GATE_SECONDS:-10}s" \
         "$ROOT/suite/perf/run.sh"
-      python3 "$ROOT/suite/merge.py"
+      RUN_TRANSCODE=0 python3 "$ROOT/suite/merge.py"
     fi
     exec python3 "$ROOT/suite/gate.py" "$@"
     ;;

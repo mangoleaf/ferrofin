@@ -117,6 +117,23 @@ Every knob is in `.env`: fixture size, VU count, load duration, resource caps, J
 > **Match the Jellyfin version to your vendored OpenAPI spec** (`contracts/jellyfin-openapi-*.json`).
 > Comparing against a different Jellyfin version compares against a different API contract.
 
+## Measurement integrity (fail-loud rules)
+
+Two classes of silently-wrong runs happened once each and are now structurally impossible:
+
+- **Stale binary (B1).** The harness passes the host's `git describe` into the image build
+  (`GIT_DESCRIBE` build arg → baked into the binary by `ferrofin-health`'s `build.rs`) and,
+  after cold start, reads it back from `GET /health/live` — a mismatch aborts the run before
+  any measurement. Note: `docker build --no-cache` does **not** clear `RUN --mount=type=cache`
+  mounts (the compile cache lives there); `suite/run.sh all` prunes them for shareable
+  records (`BENCH_KEEP_CACHE=1` to opt out on a slow host).
+- **Missing legs (A1).** `suite/merge.py` treats `suite/registry.json` as a manifest: every
+  bench variant must have produced latencies on both servers (and the TTFS legs their
+  footprint blocks when `RUN_TRANSCODE=1`), or the merge exits non-zero and writes no
+  record. Deliberate omissions are declared (`SKIP_VARIANTS=name1,name2`) and stamped into
+  the record; `MERGE_ALLOW_INCOMPLETE=1` writes a `run-<sha>-incomplete.json` for
+  inspection that never enters the trend file.
+
 ## Perf regression gate (`perf-gate.sh`)
 
 `run.sh` is the full release comparison (both servers, every endpoint) and runs per
