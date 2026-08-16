@@ -553,3 +553,51 @@ async fn analysis_driver_offers_each_item_once() {
         .expect("watermark still there");
     assert_eq!(mark2, b"0");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analysis_driver_skips_disabled_plugins_and_guests_cannot_touch_the_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("fixture.wasm"),
+        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
+    )
+    .unwrap();
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::WasmPluginHost::load(
+            &load_dir,
+            &ferrofin_wasm::WasmSettings::resolve(None, None, None, None),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let disabled: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
+        std::sync::Arc::new(common::DisabledStub(b"{}".to_vec()));
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: std::sync::Arc::new(common::DisabledStub(b"{}".to_vec())),
+    });
+    let task = host.analysis_task(&disabled).expect("analyzer exists");
+    task.execute(&ferrofin_core::TaskProgress::default())
+        .await
+        .expect("pass succeeds");
+    // Disabled plugin: never offered — no watermark was ever written.
+    let state_path = dir
+        .path()
+        .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff.state.json");
+    assert!(
+        ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark").is_none(),
+        "disabled plugins are skipped by the analysis pass"
+    );
+}

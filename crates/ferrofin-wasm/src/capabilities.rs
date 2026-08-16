@@ -553,7 +553,7 @@ const TICKS_PER_SEC: f64 = 10_000_000.0;
 
 /// Resolves a guest-named library item to its filesystem path — the ONLY
 /// way media bytes are ever addressed (a guest never supplies paths).
-fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<(Uuid, String), String> {
+fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<String, String> {
     let id: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
@@ -566,7 +566,7 @@ fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<(Uuid, String
         .path
         .filter(|p| !p.is_empty())
         .ok_or_else(|| format!("item {id} has no media path"))?;
-    Ok((id, path))
+    Ok(path)
 }
 
 /// Executes `media-info` for a guest.
@@ -603,7 +603,8 @@ pub fn media_info(
         container: entity
             .path
             .as_deref()
-            .and_then(|p| p.rsplit('.').next())
+            .and_then(|p| std::path::Path::new(p).extension())
+            .and_then(|e| e.to_str())
             .unwrap_or_default()
             .to_lowercase(),
     })
@@ -642,10 +643,10 @@ pub fn extract_audio(
         (duration_secs * f64::from(spec.sample_rate) * f64::from(spec.channels) * 2.0) as usize;
     if decoded_bytes > bytes_cap {
         return Err(format!(
-            "decoded window (~{decoded_bytes} bytes) exceeds the plugin's analysis budget              ({bytes_cap} bytes) — request a shorter window or lower rate"
+            "decoded window (~{decoded_bytes} bytes) exceeds the plugin's analysis budget ({bytes_cap} bytes) — request a shorter window or lower rate"
         ));
     }
-    let (_, path) = resolve_media_path(cx, &window.item_id)?;
+    let path = resolve_media_path(cx, &window.item_id)?;
     let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
     let samples = cx
         .handle
@@ -687,7 +688,7 @@ pub fn extract_frames(
     }
     let max_dimension = request.max_dimension.clamp(16, FRAME_DIMENSION_MAX);
     let jpeg = matches!(request.format, crate::bindings::types::FrameFormat::Jpeg);
-    let (_, path) = resolve_media_path(cx, &request.item_id)?;
+    let path = resolve_media_path(cx, &request.item_id)?;
     let timestamps: Vec<f64> = request
         .timestamps_ticks
         .iter()

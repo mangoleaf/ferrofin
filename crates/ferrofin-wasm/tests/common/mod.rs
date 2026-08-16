@@ -665,3 +665,59 @@ impl ferrofin_traits::persistence::MediaStreamRepository for StubStreams {
         unimplemented!("stub")
     }
 }
+
+/// Like [`EnabledStub`] but every plugin reads as DISABLED.
+/// A plugin manager stub: every plugin enabled, canned config JSON.
+pub struct DisabledStub(pub Vec<u8>);
+
+#[async_trait::async_trait]
+impl PluginManager for DisabledStub {
+    async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
+        Ok(Some(PluginDescriptor {
+            id,
+            enabled: false,
+            ..PluginDescriptor::default()
+        }))
+    }
+    async fn enable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn disable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn remove_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_plugin_configuration(&self, _id: Uuid) -> Result<Vec<u8>, ServiceError> {
+        Ok(self.0.clone())
+    }
+    async fn set_plugin_configuration(
+        &self,
+        _id: Uuid,
+        _config: Vec<u8>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn plugin_image(&self, _id: Uuid) -> Result<Option<PluginImage>, ServiceError> {
+        Ok(None)
+    }
+    async fn get_repositories(
+        &self,
+    ) -> Result<Vec<ferrofin_model::updates::RepositoryInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn set_repositories(
+        &self,
+        _repositories: Vec<ferrofin_model::updates::RepositoryInfo>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn list_packages(
+        &self,
+    ) -> Result<Vec<ferrofin_model::updates::PackageInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+}

@@ -1080,9 +1080,11 @@ const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
 /// The dashboard task driving every analyzer plugin's `scan-media` pass:
 /// for each ENABLED plugin with non-empty `scan-targets`, offers each item
 /// newer than the plugin's watermark exactly once (host-tracked, in the
-/// plugin's own state file under a reserved key). A guest error is logged
-/// and counted by the plugin's breaker; the task itself never fails on a
-/// plugin's behavior.
+/// plugin's own state file under a reserved key, unreadable and unwritable
+/// from the guest). An orderly guest error is logged (aggregated per pass)
+/// and never retried; TRAPS — not orderly errors — count toward the
+/// plugin's breaker, like every other guest call. The task itself never
+/// fails on a plugin's behavior.
 struct WasmMediaAnalysisTask {
     plugins: Vec<Arc<LoadedPlugin>>,
     plugin_manager: Arc<dyn PluginManager>,
@@ -1143,6 +1145,9 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .unwrap_or(i64::MIN);
             let query = ferrofin_traits::options::InternalItemsQuery {
                 include_item_types: kinds,
+                // Push the watermark into the QUERY — materializing the
+                // whole library per pass per plugin would defeat the point.
+                min_date_created: chrono::DateTime::from_timestamp_micros(watermark.max(0)),
                 ..Default::default()
             };
             let items = cx
@@ -1152,6 +1157,8 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
             let mut new_watermark = watermark;
             let mut offered = 0u32;
+            let mut failed = 0u32;
+            let mut first_failure: Option<String> = None;
             for entity in items {
                 // Items with no creation date sort at epoch: offered on the
                 // first pass, never again once the watermark is >= 0.
@@ -1161,15 +1168,30 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 }
                 let item = capabilities::summarize(&entity, None);
                 if let Err(e) = plugin.runtime.scan_media(item, config.clone()).await {
-                    warn!(
+                    // Per-item detail stays at debug (volume scales with
+                    // library size); one aggregated warn per pass below.
+                    tracing::debug!(
                         plugin = plugin.descriptor.name,
                         item = %entity.id,
                         error = %e,
                         "scan-media failed for one item (offered once; not retried)"
                     );
+                    failed += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(format!("{} -> {e}", entity.id));
+                    }
                 }
                 offered += 1;
                 new_watermark = new_watermark.max(created);
+            }
+            if failed > 0 {
+                warn!(
+                    plugin = plugin.descriptor.name,
+                    failed,
+                    offered,
+                    first = first_failure.as_deref().unwrap_or(""),
+                    "scan-media failures this pass (items offered once; not retried)"
+                );
             }
             if new_watermark > watermark
                 && let Err(e) = capabilities::set_state(

@@ -82,3 +82,35 @@ async fn extracts_pcm_and_frames_from_generated_media() {
     // Red in grayscale is mid-dark but nonzero everywhere.
     assert!(frames[0].data.iter().all(|&b| b > 10));
 }
+
+/// The timeout path needs no ffmpeg: any command that hangs silently will
+/// do. Not gated — it must run in every CI pass.
+#[tokio::test]
+async fn stalled_extraction_times_out_and_kills_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("hang.sh");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let extractor = FfmpegMediaExtractor::new(script.to_str().unwrap().to_owned())
+        .with_timeout(std::time::Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let err = extractor
+        .extract_audio(
+            "/nonexistent.mkv",
+            0.0,
+            1.0,
+            AudioSpec {
+                sample_rate: 11_025,
+                channels: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "returned promptly, not after the child's 30 s sleep"
+    );
+}

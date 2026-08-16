@@ -252,3 +252,31 @@ async fn state_and_next_up_flow_through_the_host_trait() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn host_reserved_state_keys_are_invisible_to_guests() {
+    tokio::task::spawn_blocking(move || {
+        use ferrofin_wasm::bindings::host::Host as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.state.json");
+        // The host writes its watermark…
+        ferrofin_wasm::capabilities::set_state(
+            Some(&path),
+            "host:scan-watermark",
+            Some(b"42".to_vec()),
+        )
+        .unwrap();
+        let mut s = state(Arc::new(std::sync::OnceLock::new()));
+        s.state_path = Some(path);
+        // …the guest can neither read nor rewrite nor delete it.
+        assert_eq!(s.get_state("host:scan-watermark".into()), None);
+        let err = s
+            .set_state("host:scan-watermark".into(), Some(b"0".to_vec()))
+            .unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        let err = s.set_state("host:anything".into(), None).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+    })
+    .await
+    .unwrap();
+}
