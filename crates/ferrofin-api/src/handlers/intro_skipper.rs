@@ -604,6 +604,21 @@ fn fpcalc_available() -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("fpcalc").is_file()))
 }
 
+/// Whether the `ffmpeg` on `PATH` has the `chromaprint` muxer — the
+/// fingerprinter's preferred backend, and the only one in the release image.
+/// Probed here rather than read off the extension: the API layer holds managers,
+/// not the compiled-in extensions' collaborators.
+fn ffmpeg_chromaprint_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-muxers"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("chromaprint")
+        })
+}
+
 /// `GET /IntroSkipper/SupportBundle` — a plain-text Markdown troubleshooting
 /// bundle. Port of `TroubleshootingController.GetSupportBundle`, reporting the
 /// facts Ferrofin can supply (server/plugin version, OS, fingerprinter presence).
@@ -613,10 +628,12 @@ async fn support_bundle(State(state): State<AppState>, RequireAuth(_auth): Requi
         "* Server: Ferrofin {server}\n\
          * Plugin version: {version}\n\
          * Runs on: {os} ({arch})\n\
+         * Chromaprint (ffmpeg muxer) available: {muxer}\n\
          * Chromaprint (fpcalc) available: {fpcalc}\n",
         server = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
+        muxer = ffmpeg_chromaprint_available(),
         fpcalc = fpcalc_available(),
     )
 }

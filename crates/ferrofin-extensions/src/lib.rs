@@ -40,8 +40,9 @@ pub struct ExtensionContext {
     pub media_segments: Arc<dyn MediaSegmentManager>,
     /// Read the extension's enabled flag + JSON configuration.
     pub plugins: Arc<dyn PluginManager>,
-    /// The audio fingerprinter, or `None` when Chromaprint (`fpcalc`) is absent —
-    /// the intro skipper then reports unavailable.
+    /// The audio fingerprinter, or `None` when no Chromaprint backend exists
+    /// (ffmpeg's `chromaprint` muxer, else `fpcalc`) — the intro skipper then
+    /// reports unavailable.
     pub fingerprinter: Option<Arc<dyn Fingerprinter>>,
     /// Root for per-extension caches (fingerprints): `{cache}/extensions`.
     pub cache_dir: PathBuf,

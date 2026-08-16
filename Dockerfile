@@ -36,10 +36,14 @@ COPY --from=web-source /web/dist /dist
 
 # ── ffmpeg runtime base (skipped when CI passes RUNTIME_IMAGE) ──────────
 # jellyfin-ffmpeg over Debian's ffmpeg: SIMD single-pass tonemapping and a
-# current libx264 — the difference on 4K HDR transcode start times.
+# current libx264 — the difference on 4K HDR transcode start times. It is also
+# built --enable-chromaprint, which is what the intro skipper fingerprints
+# with; bookworm's libchromaprint-tools (fpcalc 1.5.1, a 2020 release) is
+# deliberately NOT installed — it aborts any window that decodes to
+# end-of-stream, which is every credits window.
 FROM debian:bookworm-slim AS runtime-build
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg libchromaprint-tools \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
  && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian bookworm main" \

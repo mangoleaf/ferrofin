@@ -75,7 +75,8 @@ pinned upstream revision; the pins and the full delta live in
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
 internal `OwnerId`/`LinkedAlternateVersions` machinery, which is representation, not API
-surface. Intro Skipper reports unavailable when `fpcalc` (Chromaprint) is absent. The precise
+surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpeg is built with
+that muxer), falling back to `fpcalc`, and reports unavailable when neither exists. The precise
 per-plugin list is in [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
 
 ## Adding an extension

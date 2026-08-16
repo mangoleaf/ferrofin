@@ -11,8 +11,8 @@
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the
 //! `IntroSkipper.Detect` scheduled task and as the provider behind the
 //! "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`). The task
-//! self-gates on the plugin's enabled flag and no-ops when Chromaprint
-//! (`fpcalc`) is absent.
+//! self-gates on the plugin's enabled flag and no-ops when no Chromaprint
+//! backend is available.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -505,7 +505,8 @@ impl ScheduledTask for DetectSegmentsTask {
         }
         let Some(fingerprinter) = self.fingerprinter.clone() else {
             tracing::warn!(
-                "intro skipper: fpcalc (Chromaprint) not found — install `chromaprint`/`fpcalc` \
+                "intro skipper: no Chromaprint backend — use an ffmpeg built with the \
+                 `chromaprint` muxer (jellyfin-ffmpeg is), or install `chromaprint`/`fpcalc`, \
                  to enable intro/credits detection"
             );
             return Ok(());
