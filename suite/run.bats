@@ -23,8 +23,14 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [ "$status" -eq 0 ]
 }
 
-@test "merge verdict/manifest self-test passes (noise-floor ties)" {
+@test "merge verdict/manifest self-test passes (noise-floor ties + ratio floor)" {
   run python3 merge_selftest.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all assertions passed"* ]]
+}
+
+@test "aggregate self-test passes (paired ratio floor + distributions)" {
+  run python3 aggregate_selftest.py
   [ "$status" -eq 0 ]
   [[ "$output" == *"all assertions passed"* ]]
 }
@@ -64,9 +70,9 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   after=$(python3 -c "import json;print(len(json.load(open('results/runs.json'))['runs']))")
   [ "$before" -eq "$after" ]
   python3 -c "import json,glob; \
-r=json.load(open(sorted(glob.glob('results/run-*-incomplete.json'))[-1])); \
+r=json.load(open(sorted(glob.glob('results/run-*-incomplete*.json'))[-1])); \
 assert r['meta']['incomplete'], 'incomplete stamp missing'"
-  rm -f results/run-*-incomplete.json
+  rm -f results/run-*-incomplete*.json
 }
 
 @test "merge produces a valid run record with the fairness fields" {

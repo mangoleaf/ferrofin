@@ -9,8 +9,9 @@ server has a fixed, small user population — a few apps on a few devices — so
 the closed model (N clients with think time, each waiting for its screen to
 load before the next tap) IS the real workload here, not an approximation of
 one. Coordinated omission is the price of that realism and is accepted by
-design; Python threads driving blocking urllib requests are fine, latency
-precision matters less than the shape of the journey.
+design; Python threads driving pooled keep-alive connections
+(benchlib.PooledClient, one per client) are fine, latency precision matters
+less than the shape of the journey.
 
 Each VU is one client app on its own device (own login + DeviceId — reusing
 one DeviceId across VUs makes the servers fold every reporter into a single

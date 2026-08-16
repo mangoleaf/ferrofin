@@ -7,8 +7,10 @@ connection ACQUISITION", which only a closed model (N VUs in lockstep over
 every endpoint) poses. The open-model vegeta legs saturate one hot query and
 reward pool≈cores; real dashboards produce this mixed regime instead, so the
 FERROFIN_DB_POOL default is decided here (see pool-sweep.sh's header). Python
-threads driving blocking urllib requests are acceptable — latency precision
-matters less here by design.
+threads driving pooled keep-alive connections (benchlib.PooledClient, one per
+VU via phase_c.run_closed_loop) are acceptable — latency precision matters
+less here by design. NOTE: the "auto = cores is optimal" conclusion predates
+this client — re-derive on an idle host before relying on it.
 
 Runs against an ALREADY provisioned + scanned Ferrofin (the sweep scans once
 and reuses the volume across pool sizes), so setup only authenticates, picks

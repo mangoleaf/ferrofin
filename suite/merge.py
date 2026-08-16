@@ -236,6 +236,19 @@ def manifest_check(v2op, perf, foot, cold):
     return sorted(skip), sorted(missing)
 
 
+def floored_speedup(h_p50, j_p50, floor):
+    """The per-row ratio with the noise floor applied (D1): None when either
+    side is missing, Ferrofin's median is zero, or the delta is under the
+    floor — dividing two sub-floor medians amplifies jitter into a fake
+    multiple (0.3 ms vs 0.1 ms reads as "3×"). Pure so merge_selftest.py can
+    pin the rule (review finding, round 2)."""
+    if not h_p50 or j_p50 is None:
+        return None
+    if abs(h_p50 - j_p50) < floor:
+        return None
+    return round(j_p50 / h_p50, 2)
+
+
 def percentile_verdicts(p, floor):
     """D1: per-percentile win/tie/loss with the noise floor as a first-class
     concept. A delta smaller than the floor (host-local jitter band, recorded
@@ -315,13 +328,9 @@ def main():
         # stays a tail loss, never folded into "faster".
         win = vlist.count("win") == 3
         tie = bool(vlist) and vlist.count("tie") == 3
-        # D1 applies to the RATIO too (review finding, round 1): dividing two
-        # sub-floor medians amplifies jitter into a fake multiple — 0.3 ms vs
-        # 0.1 ms is a "3×" that percentile_verdicts itself calls a tie. A p50
-        # tie gets NO speedup; headline.ratio_excluded_ties says how many.
-        p50_tie = verdicts is not None and verdicts["p50"] == "tie"
-        speedup = (round(p["j_p50"] / p["h_p50"], 2)
-                   if have_lat and p["h_p50"] and not p50_tie else None)
+        # D1 applies to the RATIO too: a p50 tie gets NO speedup (see
+        # floored_speedup); headline.ratio_excluded_ties says how many.
+        speedup = floored_speedup(p["h_p50"], p["j_p50"], CONFIG["BENCH_NOISE_FLOOR_MS"])
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
         # them, never blended (fresh-process first-request latency).
@@ -446,7 +455,12 @@ def main():
     # under its own name but NEVER enters the trend file — a record with holes
     # must not look like a point on the same curve as complete ones.
     if missing:
-        out = RESULTS / f"run-{sha}-incomplete.json"
+        # Numbered so successive incomplete runs of one SHA don't overwrite
+        # each other's evidence (review carry-over, round 2).
+        seq = 1
+        while (RESULTS / f"run-{sha}-incomplete-{seq}.json").exists():
+            seq += 1
+        out = RESULTS / f"run-{sha}-incomplete-{seq}.json"
         record["meta"]["run_label"] = f"{record['meta']['ferrofin']} (incomplete)"
         out.write_text(json.dumps(record, indent=2) + "\n")
         print(f">> wrote {out.relative_to(ROOT)} — INCOMPLETE, excluded from the trend")

@@ -34,6 +34,7 @@ DEFAULTS = {
     # warm/cold
     "BENCH_GLOBAL_WARMUP_SECS": 60,
     "BENCH_WARMUP_SECS": 10,
+    "BENCH_WARMUP_MIN_CALLS": 30,
     "BENCH_COLD_REQUESTS": 10,
     "BENCH_COLD_ENDPOINTS": "info_public user_me items_sortname items_mixed item_detail "
                             "persons studios suggestions movie_recommendations "

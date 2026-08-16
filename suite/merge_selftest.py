@@ -36,6 +36,15 @@ assert merge.percentile_verdicts(row(10, 10, 10, 13, 13, 13), FLOOR)["p50"] == "
 # Missing numbers on either side → None (row can't be judged).
 assert merge.percentile_verdicts(row(None, 20, 30, 20, 40, 60), FLOOR) is None
 
+# The ratio rule (review round 2: the headline metric must have a test):
+# a sub-floor p50 delta carries NO speedup — dividing jitter fakes multiples.
+assert merge.floored_speedup(100, 300, FLOOR) == 3.0
+assert merge.floored_speedup(0.1, 0.3, FLOOR) is None      # the "391×" class
+assert merge.floored_speedup(10, 13, FLOOR) == 1.3         # exactly-floor: real
+assert merge.floored_speedup(None, 300, FLOOR) is None
+assert merge.floored_speedup(100, None, FLOOR) is None
+assert merge.floored_speedup(0, 300, FLOOR) is None
+
 # Manifest checker: a variant missing on one side is reported with its side;
 # SKIP_VARIANTS silences it as a recorded skip instead.
 v2op = {"a": ("GET /A", "T"), "b": ("GET /B", "T")}

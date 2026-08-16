@@ -11,8 +11,9 @@ measures how a fixed client population contends for shared server resources,
 and a closed model (N clients, each waiting for its response before issuing
 the next request) is exactly that population. The open-model
 coordinated-omission argument (vegeta.py's docstring) applies to per-endpoint
-latency comparison, not here — so Python threads driving blocking urllib
-requests are acceptable; latency precision matters less by design.
+latency comparison, not here — so Python threads driving pooled
+keep-alive connections (benchlib.PooledClient — one per VU) are acceptable;
+latency precision matters less by design.
 
 The driver only loads a ready context (bootstrap.ready_ctx — the shell
 scripts' bringup_scan has already provisioned + scanned), so run-phase-c.sh

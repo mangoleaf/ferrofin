@@ -207,7 +207,9 @@ function render() {
 
   const h = r.headline, m = r.meta;
   subline.innerHTML = `<b style="color:var(--fg)">${vlabel(r)}</b> · ${m.when || ""} ·
-    Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
+    Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load?.model === "open-loop"
+      ? `open-loop × ${m.load.duration_secs ?? "?"}s/endpoint`
+      : m.load?.vus != null ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
   stats.innerHTML = statCards(h);
   const fp = m.footprint;

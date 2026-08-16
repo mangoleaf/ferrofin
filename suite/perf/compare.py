@@ -32,6 +32,7 @@ per host/fixture, and commit the result next to the baseline.
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -75,12 +76,23 @@ def measure_ceiling(base, ctx):
 
 
 def open_loop_window(base, e, ctx, rate, warmup_secs, duration_secs):
-    """Warmup at the measured rate (discarded), then the measured window."""
+    """Warmup at the measured rate (discarded), then the measured window.
+
+    The warmup is time-based but tier-1 promotion is call-COUNT-based, so it
+    is stretched to at least BENCH_WARMUP_MIN_CALLS at this rate — a slow
+    endpoint (3 req/s calibrated) would otherwise get fewer than the ~30
+    calls .NET needs to promote, biasing exactly the expensive endpoints
+    where JIT matters most (review finding, round 2).
+    """
     targets = vegeta.build_targets(base, e, ctx)
     if e["scenario"] == "login":
         # Fresh DeviceId per request, as target data (see vegeta.build_targets).
-        targets = vegeta.build_targets(base, e, ctx, count=rate * duration_secs)
+        # 2× headroom: vegeta rounds/catches up, and wrapping the target list
+        # would reuse a DeviceId (revoking that request's token mid-window).
+        targets = vegeta.build_targets(base, e, ctx, count=2 * rate * duration_secs)
     if warmup_secs:
+        warmup_secs = max(warmup_secs,
+                          math.ceil(CONFIG["BENCH_WARMUP_MIN_CALLS"] / rate))
         vegeta.attack(targets, rate, warmup_secs)
     records = vegeta.attack(targets, rate, duration_secs)
     return vegeta.summarize(records, e["ok"], duration_secs, rate=rate)
@@ -105,8 +117,14 @@ def run_bench(target, base):
               f"(.NET tier-1 promotion of shared code)", flush=True)
         warm_deadline = time.monotonic() + global_warmup
         warm_eps = [e for e in ENDPOINTS if not e["scenario"]]
-        while time.monotonic() < warm_deadline:
+        warming = True
+        while warming:
             for e in warm_eps:
+                # Per request, not per pass — a slow pass would overshoot the
+                # budget by its whole length (same rule phase_c documents).
+                if time.monotonic() >= warm_deadline:
+                    warming = False
+                    break
                 benchlib.fire(base, e, ctx)
     warmup = CONFIG["BENCH_WARMUP_SECS"]
     duration = CONFIG["BENCH_DURATION_SECS"]

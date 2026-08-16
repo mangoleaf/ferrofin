@@ -219,11 +219,13 @@ def check_merged(run):
                  "methodology-incomparable; run `suite/run.sh gate --rebaseline` once")
     base = merged["variants"]
     fails = []
+    seen = set()
     for o in run["operations"]:
         op, p, par = o["op"], o["perf"], o["parity"]
         b = base.get(p["variant"])
         if b is None:
             continue
+        seen.add(p["variant"])
         if p["h_ok"] is not None and p["h_ok"] < 100:
             fails.append(f"{p['variant']}: Ferrofin 200-rate {p['h_ok']}% < 100%")
         for pct in ("h_p50", "h_p95", "h_p99"):
@@ -242,6 +244,12 @@ def check_merged(run):
                 and (cold_now - cold_base) > MIN_DELTA_MS):
             fails.append(f"{p['variant']} cold_first: {cold_now} > {cold_base}×{FACTOR} "
                          f"(={round(cold_base * FACTOR, 1)})")
+
+    # A baselined variant that vanished from the run is a silent coverage hole
+    # — the exact class the fail-loud manifest exists for (review, round 2).
+    vanished = sorted(set(base) - seen)
+    if vanished:
+        fails.append(f"baselined variants absent from this run: {', '.join(vanished)}")
 
     if fails:
         print(f"PERF/PARITY GATE FAILED ({len(fails)} regressions vs baseline):", file=sys.stderr)

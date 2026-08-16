@@ -33,6 +33,20 @@ from config import CONFIG  # noqa: E402
 METRICS = ("p50", "p95", "p99")
 
 
+def paired_speedup_of(h_med, j_med, floor):
+    """(ratio | None, is_tie) — the paired per-endpoint statistic: ratio of
+    the two MEDIANS (stable numerator/denominator, never a median of noisy
+    per-run ratios), with the noise floor applied: a sub-floor delta carries
+    no ratio at all (division would amplify jitter into fake multiples — the
+    k6-era aggregate had a "391×" from a sub-ms endpoint the verdict logic
+    itself called a tie). Pure so aggregate_selftest.py can pin the rule."""
+    if not h_med or j_med is None:
+        return None, False
+    if abs(h_med - j_med) < floor:
+        return None, True
+    return round(j_med / h_med, 2), False
+
+
 def dist(values):
     """{med, iqr, min, max, n} over the runs' values (None-filtered).
     IQR needs ≥2 points; with one run it is 0 by definition (say so via n)."""
@@ -65,19 +79,12 @@ def aggregate(runs):
         for side in ("h", "j"):
             for m in METRICS:
                 ep[f"{side}_{m}"] = dist([p.get(f"{side}_{m}") for p in rows])
-        # C2: the paired per-endpoint statistic — ratio of the two MEDIANS
-        # (stable numerator/denominator), not the median of noisy ratios.
-        # D1 applies here too (review finding, round 1): a ratio over a
-        # sub-floor delta is jitter amplified by division — the k6-era
-        # aggregate carried a "391×" from a sub-ms endpoint the verdict logic
-        # itself called a tie. Sub-floor pairs get NO ratio and are counted.
+        # C2 + D1: see paired_speedup_of — sub-floor pairs get NO ratio.
         h50, j50 = ep["h_p50"], ep["j_p50"]
-        floor = CONFIG["BENCH_NOISE_FLOOR_MS"]
-        if h50 and j50 and h50["med"] and abs(h50["med"] - j50["med"]) >= floor:
-            ep["paired_speedup"] = round(j50["med"] / h50["med"], 2)
-        else:
-            ep["paired_speedup"] = None
-            ep["paired_tie"] = bool(h50 and j50)  # both measured, delta under floor
+        ep["paired_speedup"], is_tie = paired_speedup_of(
+            h50 and h50["med"], j50 and j50["med"], CONFIG["BENCH_NOISE_FLOOR_MS"])
+        if is_tie:
+            ep["paired_tie"] = True
         cold_firsts_h = [((p.get("cold") or {}).get("h_first")) for p in rows]
         cold_firsts_j = [((p.get("cold") or {}).get("j_first")) for p in rows]
         if any(x is not None for x in cold_firsts_h + cold_firsts_j):
