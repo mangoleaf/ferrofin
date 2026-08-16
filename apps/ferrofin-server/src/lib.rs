@@ -467,7 +467,15 @@ async fn transform_web_file(
 ) -> Response {
     let path = req.uri().path();
     if req.method() == axum::http::Method::GET
-        && let Some(rel) = path.strip_prefix("/web/").filter(|r| !r.is_empty())
+        // A directory request IS the index request: jellyfin-web is an SPA
+        // that browsers always enter at `/web/` (deep links are hash
+        // fragments), so the bare directory must run the index.html
+        // transforms — falling through to ServeDir's own index handling
+        // would serve it untransformed and no client would ever see an
+        // index-targeted transform (e.g. an injected plugin script tag).
+        && let Some(rel) = path
+            .strip_prefix("/web/")
+            .map(|r| if r.is_empty() { "index.html" } else { r })
         // Reject any path that could escape the web root (`..`, absolute).
         && !Path::new(rel).components().any(|c| {
             matches!(
@@ -666,6 +674,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"<!doctype html>ferrofin");
+    }
+
+    #[tokio::test]
+    async fn directory_request_runs_the_index_transforms() {
+        // Browsers enter the SPA at `/web/` — never `/web/index.html` — so
+        // the bare directory request MUST carry index-targeted transforms
+        // (the home-sections plugin's injected script tag regressed here).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<body></body>").unwrap();
+        let service = transformations(dir.path());
+        service
+            .add_transformation(uuid::Uuid::from_u128(7), "index.html", Arc::new(Upper))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), service);
+        let out = app
+            .oneshot(Request::builder().uri("/web/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.status(), StatusCode::OK);
+        assert_eq!(out.headers()["content-type"], "text/html; charset=utf-8");
+        let body = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<BODY></BODY>", "index transform ran on /web/");
     }
 
     #[tokio::test]

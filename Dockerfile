@@ -75,6 +75,14 @@ ENV SERVICE_VERSION=$SERVICE_VERSION
 # would shadow anything baked under it.
 ENV FERROFIN_DATA_DIR=/data FERROFIN_BIND_ADDR=0.0.0.0 FERROFIN_PORT=8096 \
     FERROFIN_WEB_DIR=/usr/share/ferrofin/web
+# Run as a fixed non-root UID (1000, the conventional first-user id media
+# containers standardize on). /data is chowned BEFORE the VOLUME declaration so
+# anonymous volumes inherit the ownership; bind mounts are the operator's job —
+# chown them to 1000:1000 or override with `docker run --user`.
+RUN useradd --uid 1000 --user-group --home-dir /data --no-create-home \
+      --shell /usr/sbin/nologin ferrofin \
+ && mkdir -p /data && chown ferrofin:ferrofin /data
+USER ferrofin
 VOLUME /data
 EXPOSE 8096
 ENTRYPOINT ["ferrofin-server"]

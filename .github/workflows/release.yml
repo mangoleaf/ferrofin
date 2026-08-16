@@ -1,0 +1,164 @@
+name: Release
+
+# GitHub port of the GitLab release pipeline (.gitlab-ci.yml is canonical; the
+# release logic lives in scripts/version.sh + cliff.toml so both CIs share it).
+#
+# Tag scheme (see RELEASE.md):
+#   vX.Y.Z        → image :vX.Y.Z + :latest, GitHub Release, chart @ X.Y.Z
+#   vX.Y.Z-rc.N   → image :vX.Y.Z-rc.N only (never :latest, no release, no chart)
+#   chart-vA.B.C  → chart only @ A.B.C
+#
+# To release: run this workflow manually (workflow_dispatch) on main — it
+# requires green CI on the commit, derives the next version from Conventional
+# Commits, and pushes the tag; the tag push then re-triggers this workflow to
+# build and publish. Requires the RELEASE_TOKEN secret: a PAT with
+# contents:write, because tags pushed with the default GITHUB_TOKEN do NOT
+# trigger workflows.
+on:
+  push:
+    tags: ["v*.*.*", "chart-v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Override the derived version (vX.Y.Z); empty = auto"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
+  create-release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags to derive the bump from commits
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - name: require green CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --json conclusion -q '.[0].conclusion')
+          if [ "$conclusion" != "success" ]; then
+            echo "CI for $GITHUB_SHA is '${conclusion:-missing}', not success — not releasing"
+            exit 1
+          fi
+      - name: derive next version and push the tag
+        env:
+          FORCE_VERSION: ${{ inputs.force_version }}
+        run: |
+          set -eu
+          git config user.email "ci@mangoleafstudios.com"
+          git config user.name "GitHub Actions"
+          NEW=$(bash scripts/version.sh next)
+          echo "Releasing ${NEW} (tagging ${GITHUB_SHA})"
+          git tag -a "$NEW" -m "release $NEW"
+          git push origin "$NEW"
+
+  # ── server image → GHCR (+ Docker Hub when its secrets are configured) ──
+  docker-image:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    env:
+      HAVE_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: free runner disk (~25 GB of preinstalled toolchains)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        if: env.HAVE_DOCKERHUB == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: compute image tags
+        id: tags
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -eu
+          ver="$GITHUB_REF_NAME"
+          images="ghcr.io/$GITHUB_REPOSITORY"
+          [ -n "$DH_USER" ] && images="$images docker.io/$DH_USER/ferrofin"
+          tags=""
+          for img in $images; do
+            tags="$tags,$img:$ver"
+            # :latest tracks FINAL releases ONLY — never an -rc.
+            case "$ver" in *-rc.*) ;; *) tags="$tags,$img:latest" ;; esac
+          done
+          echo "tags=${tags#,}" | tee -a "$GITHUB_OUTPUT"
+      # Unlike GitLab (prebuilt web/runtime base images for kaniko), this uses
+      # the Dockerfile's self-contained path: BuildKit builds only the stages
+      # the final image needs, so jellyfin-web + the ffmpeg runtime are built
+      # from source here. Slower (~20 min) but zero extra infrastructure.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            SERVICE_VERSION=${{ github.ref_name }}
+
+  # ── GitHub Release with git-cliff notes (final versions only) ──
+  github-release:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.')
+    needs: [docker-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs full history + tags
+      - uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --current --strip header
+        env:
+          OUTPUT: release_notes.md
+      - name: create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "Ferrofin $GITHUB_REF_NAME" --notes-file release_notes.md
+
+  # ── Helm chart as an OCI artifact on GHCR ──
+  #   install: helm install ferrofin oci://ghcr.io/<owner>/ferrofin/charts/ferrofin --version A.B.C
+  helm-chart:
+    # Runs for final vX.Y.Z (after the image published) and chart-v* tags
+    # (docker-image skipped — nothing image-side to wait for).
+    if: >-
+      !cancelled() && github.event_name == 'push' &&
+      (needs.docker-image.result == 'success' || needs.docker-image.result == 'skipped') &&
+      (startsWith(github.ref_name, 'chart-v') ||
+       (startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.')))
+    needs: [docker-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: package and push the chart
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # The git tag is the source of truth for both chart and app version.
+          case "$GITHUB_REF_NAME" in
+            chart-v*) VER="${GITHUB_REF_NAME#chart-v}" ;; # chart-only release
+            v*)       VER="${GITHUB_REF_NAME#v}" ;;       # app release republishes the chart
+          esac
+          helm registry login ghcr.io -u "$GITHUB_ACTOR" -p "$GH_TOKEN"
+          # Chart version is bare semver (Helm requires it). appVersion keeps the v
+          # so the chart's default image.tag (= appVersion) matches the image tag.
+          helm package charts/ferrofin --version "$VER" --app-version "v${VER}" --destination /tmp
+          helm push "/tmp/ferrofin-${VER}.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY}/charts"
