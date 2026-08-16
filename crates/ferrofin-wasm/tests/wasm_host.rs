@@ -516,6 +516,9 @@ async fn analysis_driver_offers_each_item_once() {
     .unwrap();
     let plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
         std::sync::Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let library = std::sync::Arc::new(common::OneMovieLibrary {
+        seen: std::sync::Mutex::new(None),
+    });
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
@@ -524,9 +527,7 @@ async fn analysis_driver_offers_each_item_once() {
         user_data: std::sync::Arc::new(common::StubUserData),
         tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
-        library: std::sync::Arc::new(common::OneMovieLibrary {
-            seen: std::sync::Mutex::new(None),
-        }),
+        library: library.clone(),
         media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
         plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
     });
@@ -536,6 +537,19 @@ async fn analysis_driver_offers_each_item_once() {
         .expect("fixture is an analyzer");
     let progress = ferrofin_core::TaskProgress::default();
     task.execute(&progress).await.expect("first pass");
+    // The FIRST pass must be unfiltered (NULL-DateCreated items get their
+    // one offer; SQL `>=` would exclude them forever)…
+    assert!(
+        library
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("query recorded")
+            .min_date_created
+            .is_none(),
+        "first pass runs without a date filter"
+    );
 
     // The offer-once watermark landed in the plugin's own state file under
     // the host-reserved key (the canned item has no date-created → epoch).
@@ -549,6 +563,18 @@ async fn analysis_driver_offers_each_item_once() {
     // Second pass: nothing newer than the watermark — it must not move,
     // and the run still succeeds.
     task.execute(&progress).await.expect("second pass");
+    // …and later passes push the watermark INTO the query.
+    assert!(
+        library
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("query recorded")
+            .min_date_created
+            .is_some(),
+        "later passes carry the date filter"
+    );
     let mark2 = ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark")
         .expect("watermark still there");
     assert_eq!(mark2, b"0");

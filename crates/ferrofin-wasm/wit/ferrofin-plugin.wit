@@ -174,7 +174,9 @@ interface types {
         format: frame-format,
     }
 
-    /// One sampled still.
+    /// One sampled still. NOTE: `jpeg` frames carry `width`/`height` of 0
+    /// — the dimensions live inside the JPEG itself; `gray8` frames carry
+    /// their exact raw dimensions.
     record video-frame {
         /// The sampled instant, in ticks.
         ticks: s64,
@@ -373,7 +375,9 @@ interface host {
 
     /// Writes (or with `none`, deletes) THIS plugin's state value for
     /// `key`. Caps: keys ≤ 256 bytes, values ≤ 1 MiB, a plugin's total
-    /// state ≤ 8 MiB; writes past a cap fail with an error.
+    /// state ≤ 8 MiB; writes past a cap fail with an error. Keys prefixed
+    /// `host:` are RESERVED for the server's own bookkeeping (e.g. the
+    /// analysis watermark) — unreadable and unwritable from a plugin.
     set-state: func(key: string, value: option<list<u8>>) -> result<_, string>;
 
     /// The user's next episodes to watch, in order (Jellyfin's NextUp).
@@ -460,8 +464,10 @@ world plugin {
     /// (each new item is offered once per plugin, host-tracked). The guest
     /// pulls data with `media-info`/`extract-audio`/`extract-frames` and
     /// persists results through its existing capabilities
-    /// (`write-media-segments`, `set-state`). An error is logged and
-    /// counted toward the plugin's breaker — it NEVER fails the scan.
+    /// (`write-media-segments`, `set-state`). An orderly error is logged
+    /// (aggregated per pass) and the item is not retried; TRAPS — not
+    /// orderly errors — count toward the plugin's breaker. A failing
+    /// plugin NEVER fails the scan.
     export scan-media: func(item: item-summary) -> result<_, string>;
 
     /// The background tasks this plugin contributes (may be empty).

@@ -1087,10 +1087,15 @@ pub async fn build_app_state(
         extractor: Arc::new(ferrofin_mediaencoding::FfmpegMediaExtractor::new(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
         )),
-        // Global decode budget for plugin analysis: a quarter of the cores,
-        // at least one — plugin analysis must never starve transcodes.
+        // Global decode budget for plugin analysis — operator-tunable
+        // (FERROFIN_WASM_ANALYSIS_CONCURRENCY); default a quarter of the
+        // cores, at least one: analysis must never starve transcodes.
         analysis: Arc::new(tokio::sync::Semaphore::new(
-            (num_cpus_for_analysis()).max(1),
+            config
+                .wasm_analysis_concurrency
+                .filter(|n| *n > 0)
+                .map_or_else(num_cpus_for_analysis, |n| n as usize)
+                .max(1),
         )),
     });
     // The analysis driver (offers new items to analyzer plugins) exists

@@ -1,6 +1,7 @@
 //! Real-ffmpeg integration for [`FfmpegMediaExtractor`] — gated like every
 //! ffmpeg test: `FERROFIN_FFMPEG_TESTS=1`, skipped when ffmpeg is absent.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
 use ferrofin_mediaencoding::FfmpegMediaExtractor;
@@ -86,7 +87,9 @@ async fn extracts_pcm_and_frames_from_generated_media() {
 }
 
 /// The timeout path needs no ffmpeg: any command that hangs silently will
-/// do. Not gated — it must run in every CI pass.
+/// do. Not gated — it must run in every CI pass (unix-only: the hanging
+/// stand-in is a shell script).
+#[cfg(unix)]
 #[tokio::test]
 async fn stalled_extraction_times_out_and_kills_the_child() {
     let dir = tempfile::tempdir().unwrap();

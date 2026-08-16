@@ -174,8 +174,14 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (a quarter of the cores)
 so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item exactly once (host-tracked) by the "Plugin media
-analysis" dashboard task; a guest error never fails a scan. Trust note: this grants
+offered each new matching item exactly once by the "Plugin media analysis" dashboard
+task. Why a host-driven pass instead of each plugin polling `query-items` with its own
+cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
+`host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
+could be rewound to re-burn the shared decode budget), disabled plugins are centrally
+skipped, N analyzers appear as one dashboard task instead of N, and future scan
+behaviors (changed-item re-offers, scan-completion triggering, progress) evolve
+host-side without another ABI change. A guest error never fails a scan. Trust note: this grants
 the guest **media content**, one rung above catalog metadata — leaving the sandbox
 still requires declared egress, and a genuine analysis plugin declares `[]`.
 

@@ -127,6 +127,7 @@ struct FileConfig {
     wasm_event_queue_capacity: Option<u32>,
     wasm_private_http_allow: Option<String>,
     max_plugin_download_mb: Option<u32>,
+    wasm_analysis_concurrency: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -298,6 +299,14 @@ pub struct Config {
     /// `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` env > `wasm_private_http_allow`
     /// in `config.toml` > deny.
     pub wasm_private_http_allow: Option<String>,
+
+    /// Concurrent media-decode budget for WASM plugin analysis
+    /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
+    /// visible cores, at least one — plugin analysis must never starve
+    /// transcodes, but a NAS and a 32-core host disagree on what that
+    /// means. Resolved `FERROFIN_WASM_ANALYSIS_CONCURRENCY` env >
+    /// `wasm_analysis_concurrency` in `config.toml` > default.
+    pub wasm_analysis_concurrency: Option<u32>,
 
     /// Size cap on a plugin artifact downloaded during a repository install,
     /// in MiB. `None` = the 128 MiB default (sized for interpreter-language
@@ -494,6 +503,8 @@ impl Config {
                 .filter(|s| !s.trim().is_empty()),
             max_plugin_download_mb: parse_var(env, "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB")
                 .or(file.max_plugin_download_mb),
+            wasm_analysis_concurrency: parse_var(env, "FERROFIN_WASM_ANALYSIS_CONCURRENCY")
+                .or(file.wasm_analysis_concurrency),
         })
     }
 
@@ -574,6 +585,7 @@ impl Config {
             wasm_event_queue_capacity: None,
             wasm_private_http_allow: None,
             max_plugin_download_mb: None,
+            wasm_analysis_concurrency: None,
         }
     }
 }

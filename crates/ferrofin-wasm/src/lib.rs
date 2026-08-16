@@ -1073,6 +1073,37 @@ impl WasmPluginHost {
     }
 }
 
+/// The enabled-gate + config + parsed scan-target kinds for one analyzer's
+/// pass; `None` = skip this plugin (disabled, or no parseable targets).
+async fn plugin_pass_prelude(
+    plugin_manager: &Arc<dyn PluginManager>,
+    plugin: &LoadedPlugin,
+) -> Result<Option<(String, Vec<ferrofin_model::data::BaseItemKind>)>, ServiceError> {
+    let enabled = plugin_manager
+        .get_plugin(plugin.descriptor.id)
+        .await?
+        .is_some_and(|d| d.enabled);
+    if !enabled {
+        return Ok(None);
+    }
+    let config = plugin_manager
+        .get_plugin_configuration(plugin.descriptor.id)
+        .await
+        .map_or_else(
+            |_| String::from("{}"),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+    let kinds: Vec<ferrofin_model::data::BaseItemKind> = plugin
+        .scan_targets
+        .iter()
+        .filter_map(|k| serde_json::from_value(serde_json::Value::String(k.clone())).ok())
+        .collect();
+    if kinds.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((config, kinds)))
+}
+
 /// The host-reserved KV key holding the analysis driver's offer-once
 /// watermark (unix microseconds of the newest item already offered).
 const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
@@ -1114,30 +1145,10 @@ impl ScheduledTask for WasmMediaAnalysisTask {
             ));
         };
         for plugin in &self.plugins {
-            let enabled = self
-                .plugin_manager
-                .get_plugin(plugin.descriptor.id)
-                .await?
-                .is_some_and(|d| d.enabled);
-            if !enabled {
+            let Some((config, kinds)) = plugin_pass_prelude(&self.plugin_manager, plugin).await?
+            else {
                 continue;
-            }
-            let config = self
-                .plugin_manager
-                .get_plugin_configuration(plugin.descriptor.id)
-                .await
-                .map_or_else(
-                    |_| String::from("{}"),
-                    |bytes| String::from_utf8_lossy(&bytes).into_owned(),
-                );
-            let kinds: Vec<ferrofin_model::data::BaseItemKind> = plugin
-                .scan_targets
-                .iter()
-                .filter_map(|k| serde_json::from_value(serde_json::Value::String(k.clone())).ok())
-                .collect();
-            if kinds.is_empty() {
-                continue;
-            }
+            };
             let watermark: i64 =
                 capabilities::get_state(Some(&plugin.state_path), SCAN_WATERMARK_KEY)
                     .and_then(|b| String::from_utf8(b).ok())
@@ -1147,7 +1158,16 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 include_item_types: kinds,
                 // Push the watermark into the QUERY — materializing the
                 // whole library per pass per plugin would defeat the point.
-                min_date_created: chrono::DateTime::from_timestamp_micros(watermark.max(0)),
+                // FIRST pass (no watermark yet) stays UNFILTERED so items
+                // with a NULL DateCreated get their one offer (SQL `>=`
+                // would exclude them forever); afterwards the filter
+                // applies and NULL-dated items sit behind the watermark. A
+                // NULL-dated item added AFTER the first pass is never
+                // offered — the scanner always stamps DateCreated, so that
+                // is a non-case in practice.
+                min_date_created: (watermark > i64::MIN)
+                    .then(|| chrono::DateTime::from_timestamp_micros(watermark))
+                    .flatten(),
                 ..Default::default()
             };
             let items = cx
@@ -1160,8 +1180,8 @@ impl ScheduledTask for WasmMediaAnalysisTask {
             let mut failed = 0u32;
             let mut first_failure: Option<String> = None;
             for entity in items {
-                // Items with no creation date sort at epoch: offered on the
-                // first pass, never again once the watermark is >= 0.
+                // NULL-dated items read as epoch: offered on the first
+                // (unfiltered) pass, then permanently behind the watermark.
                 let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
                 if created <= watermark {
                     continue;

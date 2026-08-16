@@ -14,10 +14,6 @@ use tokio::io::AsyncReadExt as _;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_analysis::{AudioSpec, ExtractedFrame, MediaExtractor};
 
-/// Hard byte ceiling on any single extraction read — a backstop above the
-/// caller's own caps (60 s of 48 kHz stereo s16 ≈ 11.5 MiB; frames are KBs).
-const EXTRACT_OUTPUT_MAX: usize = 64 * 1024 * 1024;
-
 /// Wall-clock bound on one extraction: a ≤60 s window decodes in seconds
 /// on anything healthy, so a minute means a wedged decoder or a stalled
 /// mount (see the NFS restart-storm history) — kill it and fail the call
@@ -49,11 +45,18 @@ impl FfmpegMediaExtractor {
         self
     }
 
-    /// Runs one fixed-shape ffmpeg invocation, returning capped stdout.
-    /// stdout and stderr are drained CONCURRENTLY (a full stderr pipe would
-    /// otherwise deadlock the child against our stdout read), and the whole
-    /// invocation sits under a wall-clock timeout with a kill.
-    async fn run(&self, args: &[String]) -> Result<Vec<u8>, ServiceError> {
+    /// Runs one fixed-shape ffmpeg invocation, returning stdout. Output
+    /// size needs no runtime ceiling: every invocation's output is
+    /// arithmetically bounded by its own arguments (`-t` bounds PCM bytes,
+    /// `-frames:v 1` bounds a still) — the `budget` wall-clock bound (with
+    /// a kill via `kill_on_drop`) is what stops a pathological producer.
+    /// stdout and stderr are drained CONCURRENTLY (a full stderr pipe
+    /// would otherwise deadlock the child against our stdout read).
+    async fn run(
+        &self,
+        args: &[String],
+        budget: std::time::Duration,
+    ) -> Result<Vec<u8>, ServiceError> {
         let mut child = tokio::process::Command::new(&self.ffmpeg)
             .args(args)
             .stdin(Stdio::null())
@@ -68,20 +71,11 @@ impl FfmpegMediaExtractor {
         let drained = async {
             let stdout_read = async {
                 let mut out = Vec::new();
-                let mut buf = vec![0u8; 64 * 1024];
-                loop {
-                    let n = stdout
-                        .read(&mut buf)
-                        .await
-                        .map_err(|e| format!("reading ffmpeg output: {e}"))?;
-                    if n == 0 {
-                        return Ok::<Vec<u8>, String>(out);
-                    }
-                    if out.len() + n > EXTRACT_OUTPUT_MAX {
-                        return Err("extraction output exceeds the hard ceiling".to_owned());
-                    }
-                    out.extend_from_slice(&buf[..n]);
-                }
+                stdout
+                    .read_to_end(&mut out)
+                    .await
+                    .map_err(|e| format!("reading ffmpeg output: {e}"))?;
+                Ok::<Vec<u8>, String>(out)
             };
             let stderr_read = async {
                 let mut err = String::new();
@@ -105,12 +99,11 @@ impl FfmpegMediaExtractor {
             }
             Ok(out)
         };
-        match tokio::time::timeout(self.timeout, drained).await {
+        match tokio::time::timeout(budget, drained).await {
             Ok(result) => result.map_err(ServiceError::backend),
             // kill_on_drop reaps the child when the timed-out future drops.
             Err(_) => Err(ServiceError::backend(format!(
-                "ffmpeg extraction timed out after {:?} (stalled decoder or mount)",
-                self.timeout
+                "ffmpeg extraction timed out after {budget:?} (stalled decoder or mount)"
             ))),
         }
     }
@@ -145,7 +138,7 @@ impl MediaExtractor for FfmpegMediaExtractor {
             "s16le".into(),
             "-".into(),
         ];
-        let bytes = self.run(&args).await?;
+        let bytes = self.run(&args, self.timeout).await?;
         // Little-endian s16 pairs → samples (a trailing odd byte is decoder
         // noise; drop it rather than failing the window).
         Ok(bytes
@@ -161,8 +154,17 @@ impl MediaExtractor for FfmpegMediaExtractor {
         max_dimension: u32,
         jpeg: bool,
     ) -> Result<Vec<ExtractedFrame>, ServiceError> {
+        // ONE wall-clock budget for the whole batch — the guest-visible
+        // call is bounded by `timeout`, not 16 × timeout.
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let mut frames = Vec::with_capacity(timestamps_seconds.len());
         for &ts in timestamps_seconds {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ServiceError::backend(
+                    "frame extraction exceeded the batch time budget",
+                ));
+            }
             let (vf, format_args): (String, Vec<String>) = if jpeg {
                 (
                     // Fit inside max_dimension, aspect preserved, even dims.
@@ -198,7 +200,7 @@ impl MediaExtractor for FfmpegMediaExtractor {
             ];
             args.extend(format_args);
             args.push("-".into());
-            let data = self.run(&args).await?;
+            let data = self.run(&args, remaining).await?;
             if data.is_empty() {
                 // Past end-of-stream: skip rather than fail the batch.
                 continue;
