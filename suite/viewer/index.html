@@ -162,7 +162,28 @@ function guardBanner(r, b) {
   guard.innerHTML = bad.length
     ? `<div class="banner warnb">⚠ Not directly comparable — differs on: <b>${bad.join(", ")}</b>.
        Speed deltas between these runs are not meaningful.</div>`
-    : `<div class="banner okb">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`;
+    : `<div class="banner okb">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`
+      + frozenSetBanner(r, b);
+}
+
+// F2 (fairness): when the comparable SET shifts between two runs (an endpoint
+// newly verified, or newly drifting), their headlines have different
+// denominators. Freeze the set to the intersection and report that number
+// beside each run's own, so readers never compare across a moving denominator.
+function frozenSetBanner(r, b) {
+  const compSet = (run) => new Set(run.operations.filter(o => o.perf.comparable).map(o => o.perf.variant));
+  const cs = compSet(r), bs = compSet(b);
+  if (cs.size === bs.size && [...cs].every(v => bs.has(v))) return "";
+  const shared = [...cs].filter(v => bs.has(v));
+  const med = (run) => {
+    const s = run.operations
+      .filter(o => shared.includes(o.perf.variant) && o.perf.speedup != null)
+      .map(o => o.perf.speedup).sort((a, x) => a - x);
+    return s.length ? s[Math.floor(s.length / 2)] : null;
+  };
+  return `<div class="banner warnb">⚠ Comparable set shifted: ${bs.size} → ${cs.size} rows
+    (shared ${shared.length}). Frozen-set median speedup — base ${med(b) ?? "—"}× ·
+    this run ${med(r) ?? "—"}× (full-set headlines have different denominators).</div>`;
 }
 
 function statCards(h) {

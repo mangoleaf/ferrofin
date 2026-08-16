@@ -108,13 +108,16 @@ def render_b(version):
         return "·" if x is None else x
 
     rows = []
+    knee_ms = None
     for name in names:
         h, j = H.get(name), J.get(name)
         hmax = h.get("max_rps") if h else None
         jmax = j.get("max_rps") if j else None
         ratio = (hmax / jmax) if hmax and jmax else None
+        knee_ms = knee_ms or (h or j or {}).get("knee_p99_ms")
         rows.append(
             f"| `{name}` | {num(hmax)} | {num(jmax)} "
+            f"| {num(h.get('knee_rate') if h else None)} / {num(j.get('knee_rate') if j else None)} "
             f"| {num(h.get('p99_at_max') if h else None)} / {num(j.get('p99_at_max') if j else None)} "
             f"| {'·' if ratio is None else f'{ratio:.2f}×'} |")
     table = "\n".join(rows)
@@ -124,15 +127,20 @@ def render_b(version):
 - **Ferrofin:** `{version}`  **Jellyfin:** `{jellyfin_image()}`
 - Each endpoint driven (open model) at a rising arrival-rate ladder until the
   server drops arrivals or stops returning 200; the last clean rate is its
-  **max sustainable throughput** (req/s). Curated endpoint subset.
+  **max sustainable throughput** (req/s). The **knee** is the lowest rate at
+  which p99 exceeded {num(knee_ms)} ms — where latency departs, usually well
+  before hard saturation, and the number users would feel first. Curated
+  endpoint subset. Deliberately a separate report from the fixed-rate latency
+  comparison: max-throughput and latency must never share a headline.
 
 ## Max sustainable throughput (req/s)
 
-| Endpoint | Ferrofin max RPS | Jellyfin max RPS | p99 at max (H / J, ms) | throughput ratio |
-|---|---|---|---|---|
+| Endpoint | Ferrofin max RPS | Jellyfin max RPS | knee (H / J, req/s) | p99 at max (H / J, ms) | throughput ratio |
+|---|---|---|---|---|---|
 {table}
 
-> ratio = Ferrofin max RPS ÷ Jellyfin max RPS (>1 = Ferrofin sustains more). The
+> ratio = Ferrofin max RPS ÷ Jellyfin max RPS (>1 = Ferrofin sustains more). A `·`
+> knee means p99 never crossed the threshold within the sustained ladder. The
 > sweep ladder is coarse (×2 steps), so treat these as order-of-magnitude
 > capacity, not exact ceilings.
 """

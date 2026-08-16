@@ -110,6 +110,13 @@ Mechanics (all enforced, not advisory):
   interference is the point) and phase D (think-time user journeys — a home media
   server has a fixed small user population, which is exactly the case where the
   closed model matches reality).
+- **Isolated vs loaded is structural now** (F3): the comparison legs measure each
+  endpoint in isolation, so cheap-endpoint tails can no longer be inflated by another
+  endpoint's pool queueing and mistaken for intrinsic cost; phase C exists precisely
+  to measure that interference, separately and labeled.
+- **Leg order alternates across the publish runs** (F1): F-then-J on odd runs,
+  J-then-F on even, so slow host drift cancels in the aggregate instead of always
+  taxing the second leg.
 
 ## Fairness (this is where benchmarks lie, so it's most of the harness)
 

@@ -154,8 +154,17 @@ bench() {  # $1=service $2=port $3=TARGET
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
-if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
-if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
+# F1 (fairness): the two legs are sequential on one host, so slow drift
+# (thermal, background load) biases whichever side runs second. Single runs
+# can't fix that; the publish loop alternates BENCH_LEG_ORDER per run so the
+# drift cancels across the N aggregated runs instead of accumulating.
+if [ "${BENCH_LEG_ORDER:-fj}" = "jf" ]; then
+  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
+  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
+else
+  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
+  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
+fi
 docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering report"

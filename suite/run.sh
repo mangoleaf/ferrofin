@@ -54,6 +54,9 @@ case "$stage" in
       # Rebuild only on the first pass; identical tree → identical image after,
       # and B1's /health/live check verifies the binary every pass regardless.
       if [ "$i" -gt 1 ]; then export BENCH_SKIP_BUILD=1; fi
+      # F1: alternate which server measures first so slow host drift cancels
+      # across the aggregate instead of always biasing the second leg.
+      if [ $((i % 2)) -eq 0 ]; then export BENCH_LEG_ORDER=jf; else export BENCH_LEG_ORDER=fj; fi
       "$ROOT/suite/perf/run.sh"
       python3 "$ROOT/suite/merge.py"
     done
