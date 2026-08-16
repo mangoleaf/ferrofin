@@ -6,9 +6,16 @@ metadata:
     {{- include "ferrofin.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  # SQLite is single-writer: never run two pods against the same data dir.
+  {{- with .Values.strategy }}
   strategy:
-    type: Recreate
+    type: {{ .type }}
+    {{- if eq .type "RollingUpdate" }}
+    {{- with .rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "ferrofin.selectorLabels" . | nindent 6 }}

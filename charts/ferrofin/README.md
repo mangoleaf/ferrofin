@@ -33,6 +33,7 @@ For a private registry, provide `imagePullSecrets` (a `docker-registry` secret) 
 | `volumes` / `volumeMounts` | `[]` | Extra media/host volumes |
 | `ferrofin.env` / `ferrofin.envFrom` / `ferrofin.args` | `[]` | Config via `FERROFIN_*` env or CLI flags |
 | `livenessProbe` / `readinessProbe` | `/health/live` / `/health/ready` | Ferrofin's health endpoints |
+| `strategy` | RollingUpdate, surge 1 / unavailable 0 | Upgrade without dropping playback; set `type: Recreate` if the config PVC can't be mounted twice |
 | `ingress.enabled` | `false` | Standard `Ingress` (most clusters expose Ferrofin this way) |
 | `httpRoute.enabled` | `false` | Gateway API `HTTPRoute` (alternative to ingress) |
 | `networkPolicy.enabled` | `false` | Pod isolation (needs a policy-enforcing CNI) |

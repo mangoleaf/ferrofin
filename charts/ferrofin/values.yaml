@@ -11,6 +11,20 @@
 # -- Number of Ferrofin replicas. Ferrofin is single-writer (SQLite); leave at 1.
 replicaCount: 1
 
+# -- Deployment update strategy. RollingUpdate + maxUnavailable 0 starts the new pod
+# and waits for its readiness probe (/health/ready) before the old one is torn down,
+# so an upgrade doesn't drop playback. The two pods briefly share the data dir; SQLite
+# runs in WAL with a 30s busy timeout, so concurrent access is safe (one writer at a
+# time) — this is what jellyfin-helm does too. Requirements for the surge pod to
+# schedule: the config PVC must be mountable twice (RWX, or RWO with both pods on the
+# same node) and any exclusive resource in `resources` (e.g. nvidia.com/gpu) must have
+# a spare unit. If neither holds, set `type: Recreate` (and drop `rollingUpdate`).
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
 image:
   # -- Container image repository. Override per-environment; the placeholder is
   # replaced by the published image location at the public release.
