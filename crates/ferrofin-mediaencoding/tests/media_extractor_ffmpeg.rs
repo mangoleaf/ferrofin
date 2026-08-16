@@ -1,6 +1,8 @@
 //! Real-ffmpeg integration for [`FfmpegMediaExtractor`] — gated like every
 //! ffmpeg test: `FERROFIN_FFMPEG_TESTS=1`, skipped when ffmpeg is absent.
 
+use std::os::unix::fs::PermissionsExt as _;
+
 use ferrofin_mediaencoding::FfmpegMediaExtractor;
 use ferrofin_traits::media_analysis::{AudioSpec, MediaExtractor as _};
 
@@ -89,7 +91,6 @@ async fn extracts_pcm_and_frames_from_generated_media() {
 async fn stalled_extraction_times_out_and_kills_the_child() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("hang.sh");
-    use std::os::unix::fs::PermissionsExt as _;
     std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
