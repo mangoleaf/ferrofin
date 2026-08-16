@@ -141,10 +141,20 @@ impl host::Host for HostState {
     }
 
     fn get_state(&mut self, key: String) -> Option<Vec<u8>> {
+        // `host:`-prefixed keys are the HOST'S bookkeeping (e.g. the
+        // analysis watermark) — invisible and unwritable from the guest,
+        // or a plugin could rewind its own offer-once cursor and re-burn
+        // the shared decode budget on every pass.
+        if key.starts_with("host:") {
+            return None;
+        }
         crate::capabilities::get_state(self.state_path.as_deref(), &key)
     }
 
     fn set_state(&mut self, key: String, value: Option<Vec<u8>>) -> Result<(), String> {
+        if key.starts_with("host:") {
+            return Err("keys prefixed `host:` are reserved for the server".to_owned());
+        }
         crate::capabilities::set_state(self.state_path.as_deref(), &key, value)
     }
 
@@ -154,6 +164,33 @@ impl host::Host for HostState {
             .get()
             .ok_or("next-up is not available during plugin load")?;
         crate::capabilities::next_up(cx, &user_id, limit)
+    }
+
+    fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("media-info is not available during plugin load")?;
+        crate::capabilities::media_info(cx, &item_id)
+    }
+
+    fn extract_audio(&mut self, window: types::AudioWindow) -> Result<types::AudioChunk, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-audio is not available during plugin load")?;
+        crate::capabilities::extract_audio(cx, self.memory_limit_bytes, &window)
+    }
+
+    fn extract_frames(
+        &mut self,
+        request: types::FrameRequest,
+    ) -> Result<Vec<types::VideoFrame>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-frames is not available during plugin load")?;
+        crate::capabilities::extract_frames(cx, &request)
     }
 
     fn query_items(&mut self, query: types::ItemQuery) -> Result<Vec<types::ItemSummary>, String> {

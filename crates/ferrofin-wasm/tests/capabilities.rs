@@ -106,6 +106,10 @@ fn collaborators(
     segments: Arc<dyn MediaSegmentManager>,
 ) -> Collaborators {
     Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
         handle: tokio::runtime::Handle::current(),
         library,
         media_segments: segments,
@@ -496,6 +500,10 @@ fn recorded_query_rig() -> (Collaborators, std::sync::Arc<common::OneMovieLibrar
     });
     (
         Collaborators {
+            media_streams: std::sync::Arc::new(common::StubStreams),
+            extractor: std::sync::Arc::new(common::StubExtractor::default()),
+            analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
             users: std::sync::Arc::new(common::StubUsers),
             user_data: std::sync::Arc::new(common::StubUserData),
             tv: std::sync::Arc::new(common::StubTv),
@@ -611,4 +619,90 @@ fn set_state_refuses_to_wipe_on_a_corrupt_file() {
         b"definitely not json",
         "the damaged file was left untouched for recovery"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analysis_capabilities_cap_resolve_and_extract() {
+    use ferrofin_wasm::bindings::types::{AudioSpec, AudioWindow, FrameFormat, FrameRequest};
+    use ferrofin_wasm::capabilities::{extract_audio, extract_frames, media_info};
+    const ITEM: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01";
+    const MEM: usize = 128 * 1024 * 1024;
+
+    let extractor = std::sync::Arc::new(common::StubExtractor::default());
+    let cx = Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: extractor.clone(),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+    };
+    let window = |dur_secs: i64| AudioWindow {
+        item_id: ITEM.to_owned(),
+        start_ticks: 0,
+        duration_ticks: dur_secs * 10_000_000,
+        spec: AudioSpec {
+            sample_rate: 11_025,
+            channels: 1,
+        },
+    };
+
+    tokio::task::spawn_blocking(move || {
+        // Over the 60 s window cap.
+        let err = extract_audio(&cx, MEM, &window(61)).unwrap_err();
+        assert!(err.contains("60"), "{err}");
+        // Over the byte budget (tiny memory limit).
+        let err = extract_audio(&cx, 1024, &window(10)).unwrap_err();
+        assert!(err.contains("budget"), "{err}");
+        // Unknown item id.
+        let mut w = window(10);
+        w.item_id = uuid::Uuid::from_u128(0xdead).to_string();
+        let err = extract_audio(&cx, MEM, &w).unwrap_err();
+        assert!(err.contains("no such"), "{err}");
+        // Happy path: resolved via the library, decoded by the stub.
+        let chunk = extract_audio(&cx, MEM, &window(10)).expect("extract");
+        assert!(!chunk.samples.is_empty());
+        assert_eq!(chunk.spec.sample_rate, 11_025);
+
+        // Frames: per-call cap, then a clamped happy path.
+        let req = |n: usize, dim: u32| FrameRequest {
+            item_id: ITEM.to_owned(),
+            timestamps_ticks: (0..i64::try_from(n).unwrap())
+                .map(|i| i * 10_000_000)
+                .collect(),
+            max_dimension: dim,
+            format: FrameFormat::Gray8,
+        };
+        let err = extract_frames(&cx, &req(17, 128)).unwrap_err();
+        assert!(err.contains("16"), "{err}");
+        let frames = extract_frames(&cx, &req(2, 9999)).expect("frames");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].width, 320, "dimension clamped to the cap");
+
+        // media-info: duration + streams + container.
+        let info = media_info(&cx, ITEM).expect("info");
+        assert_eq!(info.duration_ticks, 5_000_000_000);
+        assert!(info.has_audio && info.has_video);
+        assert_eq!(info.container, "mkv");
+        let err = media_info(&cx, "junk").unwrap_err();
+        assert!(err.contains("UUID"), "{err}");
+    })
+    .await
+    .unwrap();
+
+    // The extractor received the LIBRARY-resolved path — never guest input.
+    let (path, start, dur) = extractor
+        .last_audio
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("called");
+    assert_eq!(path, "/media/movies/bbb.mkv");
+    assert!(start.abs() < f64::EPSILON && (dur - 10.0).abs() < 0.001);
 }

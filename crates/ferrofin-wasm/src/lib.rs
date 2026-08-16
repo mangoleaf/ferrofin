@@ -25,7 +25,7 @@ pub mod capabilities;
 pub mod runtime;
 
 /// The hand-written canonical-ABI component implementing the
-/// `ferrofin:plugin@0.3.0` world, as WAT text — the shared test fixture for
+/// `ferrofin:plugin@0.4.0` world, as WAT text — the shared test fixture for
 /// this crate's host tests and the server-level HTTP test (compiled at test
 /// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
 /// API: test support only.
@@ -163,6 +163,11 @@ pub struct LoadedPlugin {
     /// The guest's declared web-file transformations (applied by the host
     /// while the plugin is enabled; see the WIT trust note).
     pub web_transforms: Vec<bindings::types::WebTransform>,
+    /// The item kinds this plugin analyzes (empty = not an analyzer).
+    pub scan_targets: Vec<String>,
+    /// Where the plugin's KV state persists — the analysis driver keeps its
+    /// offer-once watermark there under a host-reserved key.
+    state_path: std::path::PathBuf,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -303,7 +308,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.3.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.4.0 \
                          component); skipping this file"
                     );
                 }
@@ -505,6 +510,7 @@ fn load_one(
     let tasks = instance.call_tasks(&mut store)?;
     let config_pages = instance.call_config_pages(&mut store)?;
     let web_transforms = instance.call_web_transforms(&mut store)?;
+    let scan_targets = instance.call_scan_targets(&mut store)?;
     let declared_egress = instance.call_declared_egress(&mut store)?;
     let egress = Arc::new(capabilities::EgressPolicy::parse(&declared_egress));
     if egress.allow_any {
@@ -562,6 +568,8 @@ fn load_one(
         tasks,
         config_pages,
         web_transforms,
+        scan_targets,
+        state_path,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
@@ -770,7 +778,7 @@ fn escape_html(text: &str) -> String {
 /// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
 /// world version from `wit/ferrofin-plugin.wit` (a test guards against
 /// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
-pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.3.0";
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.4.0";
 
 /// The install-time artifact validator: proves a downloaded `.wasm` is a
 /// loadable `ferrofin:plugin` component and reports its self-declared id,
@@ -1062,6 +1070,195 @@ impl WasmPluginHost {
                 );
             }
         }
+    }
+}
+
+/// The enabled-gate + config + parsed scan-target kinds for one analyzer's
+/// pass; `None` = skip this plugin (disabled, or no parseable targets).
+async fn plugin_pass_prelude(
+    plugin_manager: &Arc<dyn PluginManager>,
+    plugin: &LoadedPlugin,
+) -> Result<Option<(String, Vec<ferrofin_model::data::BaseItemKind>)>, ServiceError> {
+    let enabled = plugin_manager
+        .get_plugin(plugin.descriptor.id)
+        .await?
+        .is_some_and(|d| d.enabled);
+    if !enabled {
+        return Ok(None);
+    }
+    let config = plugin_manager
+        .get_plugin_configuration(plugin.descriptor.id)
+        .await
+        .map_or_else(
+            |_| String::from("{}"),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+    let kinds: Vec<ferrofin_model::data::BaseItemKind> = plugin
+        .scan_targets
+        .iter()
+        .filter_map(|k| serde_json::from_value(serde_json::Value::String(k.clone())).ok())
+        .collect();
+    if kinds.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((config, kinds)))
+}
+
+/// The host-reserved KV key holding the analysis driver's offer-once
+/// watermark (unix microseconds of the newest item already offered).
+const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
+
+/// The dashboard task driving every analyzer plugin's `scan-media` pass:
+/// for each ENABLED plugin with non-empty `scan-targets`, offers each item
+/// newer than the plugin's watermark exactly once (host-tracked, in the
+/// plugin's own state file under a reserved key, unreadable and unwritable
+/// from the guest). An orderly guest error is logged (aggregated per pass)
+/// and never retried; TRAPS — not orderly errors — count toward the
+/// plugin's breaker, like every other guest call. The task itself never
+/// fails on a plugin's behavior.
+struct WasmMediaAnalysisTask {
+    plugins: Vec<Arc<LoadedPlugin>>,
+    plugin_manager: Arc<dyn PluginManager>,
+    collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+}
+
+#[allow(clippy::unnecessary_literal_bound)] // the trait pins `-> &str`
+#[async_trait]
+impl ScheduledTask for WasmMediaAnalysisTask {
+    fn key(&self) -> &str {
+        "WasmMediaAnalysis"
+    }
+    fn name(&self) -> &str {
+        "Plugin media analysis"
+    }
+    fn description(&self) -> &str {
+        "Offers new library items to analysis plugins (scan-media)."
+    }
+    fn category(&self) -> &str {
+        "Library"
+    }
+
+    async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+        let Some(cx) = self.collaborators.get() else {
+            return Err(ServiceError::backend(
+                "analysis collaborators are not armed",
+            ));
+        };
+        for plugin in &self.plugins {
+            let Some((config, kinds)) = plugin_pass_prelude(&self.plugin_manager, plugin).await?
+            else {
+                continue;
+            };
+            let watermark: i64 =
+                capabilities::get_state(Some(&plugin.state_path), SCAN_WATERMARK_KEY)
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(i64::MIN);
+            let query = ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: kinds,
+                // Push the watermark into the QUERY — materializing the
+                // whole library per pass per plugin would defeat the point.
+                // FIRST pass (no watermark yet) stays UNFILTERED so items
+                // with a NULL DateCreated get their one offer (SQL `>=`
+                // would exclude them forever); afterwards the filter
+                // applies and NULL-dated items sit behind the watermark. A
+                // NULL-dated item added AFTER the first pass is never
+                // offered — the scanner always stamps DateCreated, so that
+                // is a non-case in practice.
+                min_date_created: (watermark > i64::MIN)
+                    .then(|| chrono::DateTime::from_timestamp_micros(watermark))
+                    .flatten(),
+                ..Default::default()
+            };
+            let items = cx
+                .library
+                .get_item_list(&query)
+                .await
+                .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
+            let mut new_watermark = watermark;
+            let mut offered = 0u32;
+            let mut failed = 0u32;
+            let mut first_failure: Option<String> = None;
+            for entity in items {
+                // NULL-dated items read as epoch: offered on the first
+                // (unfiltered) pass, then permanently behind the watermark.
+                let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
+                if created <= watermark {
+                    continue;
+                }
+                let item = capabilities::summarize(&entity, None);
+                if let Err(e) = plugin.runtime.scan_media(item, config.clone()).await {
+                    // Per-item detail stays at debug (volume scales with
+                    // library size); one aggregated warn per pass below.
+                    tracing::debug!(
+                        plugin = plugin.descriptor.name,
+                        item = %entity.id,
+                        error = %e,
+                        "scan-media failed for one item (offered once; not retried)"
+                    );
+                    failed += 1;
+                    if first_failure.is_none() {
+                        first_failure = Some(format!("{} -> {e}", entity.id));
+                    }
+                }
+                offered += 1;
+                new_watermark = new_watermark.max(created);
+            }
+            if failed > 0 {
+                warn!(
+                    plugin = plugin.descriptor.name,
+                    failed,
+                    offered,
+                    first = first_failure.as_deref().unwrap_or(""),
+                    "scan-media failures this pass (items offered once; not retried)"
+                );
+            }
+            if new_watermark > watermark
+                && let Err(e) = capabilities::set_state(
+                    Some(&plugin.state_path),
+                    SCAN_WATERMARK_KEY,
+                    Some(new_watermark.to_string().into_bytes()),
+                )
+            {
+                warn!(
+                    plugin = plugin.descriptor.name,
+                    error = %e,
+                    "could not persist the analysis watermark; items will re-offer"
+                );
+            }
+            if offered > 0 {
+                info!(
+                    plugin = plugin.descriptor.name,
+                    offered, "analysis pass offered new items"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WasmPluginHost {
+    /// The analysis driver task, when any loaded plugin declares
+    /// `scan-targets` (`None` otherwise — no task registered, no overhead).
+    #[must_use]
+    pub fn analysis_task(
+        &self,
+        plugin_manager: &Arc<dyn PluginManager>,
+    ) -> Option<Arc<dyn ScheduledTask>> {
+        let analyzers: Vec<Arc<LoadedPlugin>> = self
+            .plugins
+            .iter()
+            .filter(|p| !p.scan_targets.is_empty())
+            .cloned()
+            .collect();
+        if analyzers.is_empty() {
+            return None;
+        }
+        Some(Arc::new(WasmMediaAnalysisTask {
+            plugins: analyzers,
+            plugin_manager: Arc::clone(plugin_manager),
+            collaborators: Arc::clone(&self.collaborators),
+        }))
     }
 }
 

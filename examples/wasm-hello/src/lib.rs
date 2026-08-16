@@ -104,6 +104,18 @@ impl Guest for HelloPlugin {
         vec!["*".to_owned()]
     }
 
+    fn scan_targets() -> Vec<String> {
+        // Not an analyzer. An analysis plugin returns the kinds it wants
+        // offered ("Episode", "Audio", ...) and does its work in scan_media
+        // via media_info / extract_audio / extract_frames — the host
+        // decodes, the guest analyzes.
+        Vec::new()
+    }
+
+    fn scan_media(_item: ItemSummary) -> Result<(), String> {
+        Ok(())
+    }
+
     fn web_transforms() -> Vec<WebTransform> {
         // The reference plugin injects nothing — client-side injection is
         // the largest trust grant a plugin has; see the WIT trust note. A
