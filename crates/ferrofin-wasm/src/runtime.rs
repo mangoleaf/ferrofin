@@ -87,6 +87,15 @@ pub enum Command {
         /// The event's JSON payload.
         json: String,
     },
+    /// Route one HTTP request from the plugin's URL space to the guest.
+    HandleRequest {
+        /// The request, already identity-resolved by the host.
+        request: crate::bindings::types::PluginRequest,
+        /// Fresh configuration JSON to snapshot before the call.
+        config: String,
+        /// Receives the guest's response (or the host/trap error text).
+        reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
+    },
     /// Ask the guest for metadata on one item (the scan's dynamic pass).
     MetadataLookup {
         /// The item as scanned so far.
@@ -124,6 +133,11 @@ pub struct InstanceSpec {
     pub private_http_allowed: bool,
     /// The manager handles behind the E2 capabilities (installed post-load).
     pub collaborators: Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
+    /// Where the plugin's key/value state persists (`None` until the id is
+    /// known / in validation stores).
+    pub state_path: Option<std::path::PathBuf>,
+    /// The plugin's declared public-egress allowlist.
+    pub egress: Arc<crate::capabilities::EgressPolicy>,
 }
 
 impl InstanceSpec {
@@ -149,6 +163,8 @@ impl InstanceSpec {
             memory_limit_bytes: self.memory_limit_bytes,
             http: Arc::clone(&self.http),
             http_timeout: std::time::Duration::from_secs(self.timeout_ticks),
+            state_path: self.state_path.clone(),
+            egress: Arc::clone(&self.egress),
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),
@@ -205,6 +221,35 @@ impl RuntimeHandle {
             .map_err(|_| "plugin runtime thread has exited".to_owned())?;
         rx.await
             .map_err(|_| "plugin runtime dropped the task reply".to_owned())?
+    }
+
+    /// Routes one HTTP request to the guest and awaits its response.
+    ///
+    /// # Errors
+    /// The guest/host error text, the breaker being open, or the runtime
+    /// thread being gone.
+    pub async fn handle_request(
+        &self,
+        request: crate::bindings::types::PluginRequest,
+        config: String,
+    ) -> Result<crate::bindings::types::PluginResponse, String> {
+        if self.is_dead() {
+            return Err(format!(
+                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
+                self.plugin_name
+            ));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::HandleRequest {
+                request,
+                config,
+                reply,
+            })
+            .await
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        rx.await
+            .map_err(|_| "plugin runtime dropped the request reply".to_owned())?
     }
 
     /// Asks the guest for metadata on one item and awaits its offer.
@@ -356,6 +401,11 @@ fn run_loop(
                     }
                 }
             }
+            Command::HandleRequest {
+                request,
+                config,
+                reply,
+            } => dispatch_request(spec, store, instance, &request, config, reply),
             Command::MetadataLookup {
                 item,
                 provider_ids,
@@ -425,9 +475,36 @@ fn refuse(command: Command, plugin_name: &str) {
         Command::RunTask { reply, .. } => {
             let _ = reply.send(Err(message));
         }
+        Command::HandleRequest { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
         Command::MetadataLookup { reply, .. } => {
             let _ = reply.send(Err(message));
         }
         Command::OnEvent { .. } => {}
+    }
+}
+
+/// Runs one `handle-request` guest call (extracted from the actor loop to
+/// keep it readable). Returns whether the call trapped.
+fn dispatch_request(
+    spec: &InstanceSpec,
+    store: &mut Store<HostState>,
+    instance: &Plugin,
+    request: &crate::bindings::types::PluginRequest,
+    config: String,
+    reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
+) -> bool {
+    store.data_mut().config_json = config;
+    store.set_epoch_deadline(spec.timeout_ticks);
+    match instance.call_handle_request(&mut *store, request) {
+        Ok(response) => {
+            let _ = reply.send(Ok(response));
+            false
+        }
+        Err(trap) => {
+            let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+            true
+        }
     }
 }

@@ -307,3 +307,251 @@ impl MediaSegmentManager for RecordingSegments {
         Ok(Vec::new())
     }
 }
+
+// ── stubs for the user/tv collaborator seams (0.3.0 capabilities) ──
+#[allow(unused_imports)]
+use ferrofin_db::entities::base_items::BaseItemEntity as _StubBI;
+use ferrofin_db::entities::users::UserEntity;
+#[allow(unused_imports)]
+use ferrofin_model::configuration::UserConfiguration;
+#[allow(unused_imports)]
+use ferrofin_model::dto::NameIdPair;
+#[allow(unused_imports)]
+use ferrofin_model::dto::{BaseItemDto, UpdateUserItemDataDto, UserDto, UserItemDataDto};
+#[allow(unused_imports)]
+use ferrofin_model::querying::QueryResult;
+#[allow(unused_imports)]
+use ferrofin_model::users::UserPolicy;
+#[allow(unused_imports)]
+use ferrofin_traits::options::DtoOptions;
+#[allow(unused_imports)]
+use ferrofin_traits::tv::NextUpQuery;
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubUsers;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::UserManager for StubUsers {
+    async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn initialize(&self) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_by_id(&self, _id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        Ok(Some(test_user(_id)))
+    }
+    async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_by_name(&self, _name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn rename_user(
+        &self,
+        _user_id: Uuid,
+        _old_name: &str,
+        _new_name: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn create_user(&self, _name: &str) -> Result<UserEntity, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn delete_user(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn reset_password(&self, _user_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn change_password(
+        &self,
+        _user_id: Uuid,
+        _new_password: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn authenticate_user(
+        &self,
+        _username: &str,
+        _password: &str,
+        _remote_endpoint: &str,
+        _is_user_session: bool,
+    ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_dto(
+        &self,
+        _user: &UserEntity,
+        _server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_configuration(
+        &self,
+        _user_id: Uuid,
+        _config: &UserConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn update_policy(
+        &self,
+        _user_id: Uuid,
+        _policy: &UserPolicy,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn clear_profile_image(&self, _user: &UserEntity) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubUserData;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::UserDataManager for StubUserData {
+    async fn save_user_data(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _user_data: &UpdateUserItemDataDto,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_data_dto(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Option<UserItemDataDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_user_data_batch(
+        &self,
+        _item_ids: &[Uuid],
+        _user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        Ok(_item_ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    UserItemDataDto {
+                        rating: None,
+                        played_percentage: None,
+                        unplayed_item_count: None,
+                        playback_position_ticks: 1230,
+                        play_count: 2,
+                        is_favorite: true,
+                        likes: None,
+                        last_played_date: None,
+                        played: true,
+                        key: String::new(),
+                        item_id: *id,
+                    },
+                )
+            })
+            .collect())
+    }
+    async fn update_play_state(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _reported_position_ticks: Option<i64>,
+    ) -> Result<bool, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn mark_played(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn mark_unplayed(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<UserItemDataDto, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn reset_playback_stream_selections(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Panic-on-call stub — only the methods a test exercises matter.
+pub struct StubTv;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::tv::TvSeriesManager for StubTv {
+    async fn get_next_up(
+        &self,
+        _query: &NextUpQuery,
+        _options: &DtoOptions,
+    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        Ok(QueryResult {
+            items: vec![BaseItemDto {
+                id: Uuid::parse_str("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEFF01").unwrap(),
+                ..BaseItemDto::default()
+            }],
+            total_record_count: 1,
+            start_index: 0,
+        })
+    }
+}
+
+/// A minimal-but-complete user entity for user-scoped query tests.
+#[must_use]
+pub fn test_user(id: Uuid) -> UserEntity {
+    UserEntity {
+        id: id.to_string(),
+        audio_language_preference: None,
+        authentication_provider_id: String::new(),
+        cast_receiver_id: None,
+        display_collections_view: false,
+        display_missing_episodes: false,
+        enable_auto_login: false,
+        enable_local_password: false,
+        enable_next_episode_auto_play: false,
+        enable_user_preference_access: false,
+        hide_played_in_latest: false,
+        internal_id: 0,
+        invalid_login_attempt_count: 0,
+        last_activity_date: None,
+        last_login_date: None,
+        login_attempts_before_lockout: None,
+        max_active_sessions: 0,
+        max_parental_rating_score: None,
+        max_parental_rating_sub_score: None,
+        must_update_password: false,
+        password: Some("hashed".to_owned()),
+        password_reset_provider_id: String::new(),
+        play_default_audio_track: false,
+        remember_audio_selections: false,
+        remember_subtitle_selections: false,
+        remote_client_bitrate_limit: None,
+        row_version: 0,
+        subtitle_language_preference: None,
+        subtitle_mode: 0,
+        sync_play_access: 0,
+        username: "plugin-test-user".to_owned(),
+    }
+}

@@ -27,7 +27,11 @@ async fn accepts_the_fixture_component_and_reports_its_id() {
         .validate(&component)
         .await
         .expect("fixture is valid");
-    assert_eq!(id.to_string(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff");
+    assert_eq!(id.id.to_string(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff");
+    assert!(
+        id.declared_egress.is_empty(),
+        "fixture declares no public egress"
+    );
 }
 
 #[tokio::test]

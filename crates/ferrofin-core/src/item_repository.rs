@@ -1211,7 +1211,11 @@ mod tests {
             .get_item_list(&by_item_id)
             .await
             .expect("by item id");
-        assert_eq!(rows.len(), 1, "person item id resolves filmography via name");
+        assert_eq!(
+            rows.len(),
+            1,
+            "person item id resolves filmography via name"
+        );
         assert_eq!(rows[0].id, guid_to_db(movie_a));
     }
 

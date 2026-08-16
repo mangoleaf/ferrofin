@@ -141,10 +141,45 @@ browser, not in the sandbox.
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
 explicitly exports, so that one file is the entire reviewable attack surface. Today that
 surface is: `log`, `get-config` (its own config only), `http-fetch` (host-executed HTTP with
-the destination logged and the response capped at the plugin's memory limit), `query-items`
-(a small read-only item projection, max 1000 rows per call), and `write-media-segments`
-(scoped to the plugin's own provider id — it can never touch another provider's or a user's
-segments). Plugins can also act as **metadata sources**: the scan offers every item to each
+the destination logged, the response capped at the plugin's memory limit, and —
+crucially — **gated by the plugin's own declared egress allowlist**, below), `query-items`
+(a read-only item projection — filterable by kind/genre/user state, sortable, user-scopable
+so parental limits apply and per-user played/favorite/resume fields populate; max 1000 rows
+per call), `next-up` (the user's next-episodes queue), `get-state`/`set-state` (a small
+per-plugin key/value store — 256 B keys, 1 MiB values, 8 MiB total — for per-user settings
+and cursors; the admin never sees it), and `write-media-segments` (scoped to the plugin's
+own provider id — it can never touch another provider's or a user's segments).
+
+**Declared egress (`declared-egress`)** — every plugin ships its own public-network
+allowlist inside the artifact (and, for template-built plugins, in plain sight in the
+repo's `Cargo.toml`): exact hosts, `*.sub.example` wildcards, or `*` for plugins whose
+destinations are user-configured (the server logs `*` plugins loudly at load).
+**Deny-by-default: an empty list means no internet access at all** — most plugins
+declare nothing and physically cannot phone home. The check runs on the URL's host
+string *before any DNS resolution* (a denied fetch must not leak data through the DNS
+query itself); private/LAN destinations remain a separate, admin-granted layer
+(`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`), which supersedes the declared list for plugins
+the admin explicitly trusted — note the blast radius: naming a plugin there (or `*`)
+exempts it from the declared-egress model entirely, public destinations included. Install-time validation records each plugin's declared
+list, and an upgrade that GROWS it is warned about by name — a plugin's reach changing
+is a decision-worthy event.
+
+Plugins can also OWN A URL SPACE and EXTEND THE WEB UI (the two capabilities that make
+plugins like Home Screen Sections possible):
+
+- **`handle-request`** — the server routes `ANY /Plugins/{id}/web/*` into the plugin
+  (method, path, query, headers, body in; status, headers, body out), on the plugin's own
+  runtime thread under the same deadline/memory/breaker discipline as every guest call.
+  This URL space is reachable **without authentication** (plugin pages load their assets
+  via plain `<script src>` tags, exactly like upstream `[AllowAnonymous]` plugin
+  controllers); the caller's resolved identity (`user-id`, `is-admin`,
+  `is-authenticated`) is forwarded — never a token — and the plugin gates its own
+  sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+- **`web-transforms`** — declared literal search/replace patches the server applies to
+  matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
+  text). This is how a plugin injects its client-side hooks into jellyfin-web.
+
+Plugins can also act as **metadata sources**: the scan offers every item to each
 enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
 ran, and applies results **supplement-only** — a plugin fills fields that are still empty
 and records its own external ids; it can never overwrite a built-in provider or a user
@@ -170,7 +205,9 @@ where any installed plugin runs with the server's own privileges — and it is g
 could still abuse: `query-items` exposes your library **catalog** (titles, ids, filesystem
 paths — never file contents), and `http-fetch` performs outbound HTTP on the plugin's
 behalf (destination logged, body bounded). Combined, a hostile plugin could send your movie
-list to a remote host. By default `http-fetch` is refused for **private, loopback, link-local, and CGNAT
+list to a remote host — **but only to a destination it declared in its own auditable
+egress allowlist**: read the plugin's `egress = [...]` before installing, and treat a `*`
+declaration as the plugin asking for the whole internet. By default `http-fetch` is refused for **private, loopback, link-local, and CGNAT
 destinations** (your LAN, cloud metadata services, Tailscale/tailnet ranges, Ferrofin
 itself), which
 removes the server-as-network-pivot risk; grant a specific trusted plugin private-network
@@ -180,6 +217,13 @@ itself** (the request resolves to the address that was checked, not a second
 DNS answer), closing the classic DNS-rebinding TOCTOU. (Referencing plugins by
 UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
 planned improvement.)
+
+**Web transforms are JavaScript injection into EVERY user's browser.** A
+plugin's declared `web-transforms` rewrite served jellyfin-web files for all
+users — a strictly larger grant than settings pages (admin-only) or plugin
+routes (opt-in fetches). It is the single strongest reason to install only
+plugins you trust; a disabled plugin's transforms are not applied
+(restart-required, like everything decided at boot).
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust

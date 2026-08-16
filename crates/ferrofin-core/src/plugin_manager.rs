@@ -358,6 +358,12 @@ struct PersistedState {
     /// The configured package repositories.
     #[serde(default)]
     repositories: Vec<RepositoryInfo>,
+    /// Each installed plugin's declared public-egress allowlist (verbatim
+    /// from install-time validation), keyed by guid. An upgrade that GROWS
+    /// this list is logged loudly — a plugin's network reach changing is a
+    /// decision-worthy event, not background noise.
+    #[serde(default)]
+    installed_egress: BTreeMap<String, Vec<String>>,
     /// sha256 of every artifact ever installed, keyed plugin-guid → version.
     /// A published version is immutable: re-installing a known version whose
     /// artifact digest changed is refused (a compromised repository must
@@ -466,6 +472,13 @@ impl FerrofinPluginManager {
             .unwrap_or(plugin.descriptor.enabled)
     }
 
+    /// The state-directory path — a test seam (`state.json` assertions).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn plugins_dir_for_test(&self) -> &std::path::Path {
+        &self.plugins_dir
+    }
+
     /// The path to a plugin's config file.
     fn config_path(&self, id: Uuid) -> PathBuf {
         self.plugins_dir.join(id.to_string()).join("config.json")
@@ -515,6 +528,33 @@ impl FerrofinPluginManager {
             )));
         }
         Ok(())
+    }
+
+    /// Warns when an upgrade's declared egress GROWS beyond what was
+    /// recorded at the previous install (see `installed_egress` docs).
+    fn warn_on_egress_growth(&self, guid: Uuid, version: &str, declared: &[String]) {
+        let state = self.state.lock().expect("plugin state lock poisoned");
+        if let Some(previous) = state.installed_egress.get(&guid.to_string()) {
+            let grown: Vec<&String> = declared.iter().filter(|h| !previous.contains(h)).collect();
+            if !grown.is_empty() {
+                tracing::warn!(
+                    plugin = %guid,
+                    version,
+                    added = ?grown,
+                    "plugin upgrade DECLARES NEW egress destinations — its \
+                     network reach grew; review before trusting"
+                );
+            }
+        }
+    }
+
+    /// Records an installed plugin's declared egress (best-effort persist).
+    fn record_installed_egress(&self, guid: Uuid, declared: Vec<String>) {
+        let mut state = self.state.lock().expect("plugin state lock poisoned");
+        state.installed_egress.insert(guid.to_string(), declared);
+        let snapshot = state.clone();
+        drop(state);
+        let _ = self.persist(&snapshot);
     }
 
     /// Records an installed artifact's digest (best-effort persist — the
@@ -585,12 +625,15 @@ impl PluginManager for FerrofinPluginManager {
                 std::fs::remove_file(&artifact).map_err(|e| {
                     ServiceError::backend(format!("removing {}: {e}", artifact.display()))
                 })?;
-                // Best-effort cleanup of the plugin's config dir + enabled
-                // override; the file removal above is the load-bearing part.
+                // Best-effort cleanup of the plugin's KV state, config dir
+                // + enabled override; the artifact removal above is the
+                // load-bearing part.
+                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
                 {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
+                    state.installed_egress.remove(&id.to_string());
                     let snapshot = state.clone();
                     drop(state);
                     let _ = self.persist(&snapshot);
@@ -711,13 +754,16 @@ impl PluginManager for FerrofinPluginManager {
         //    self-reported id matches the catalog guid (otherwise enable/
         //    disable/uninstall would target a different identity than the
         //    loader registers on boot).
-        let reported = validator.validate(&bytes).await?;
-        if reported != package.id {
+        let artifact = validator.validate(&bytes).await?;
+        if artifact.id != package.id {
             return Err(ServiceError::invalid_input(format!(
-                "artifact reports plugin id {reported}, catalog says {} — refusing",
-                package.id
+                "artifact reports plugin id {}, catalog says {} — refusing",
+                artifact.id, package.id
             )));
         }
+        // Surface egress growth on upgrade: any newly-declared destination
+        // is a change in what this plugin can reach.
+        self.warn_on_egress_growth(package.id, &chosen.version, &artifact.declared_egress);
 
         // 6. Commit: atomic write into the WASM host's load directory.
         //    Upgrades are the same filename → overwrite. Known v1 edge: a
@@ -727,8 +773,9 @@ impl PluginManager for FerrofinPluginManager {
             .map_err(|e| ServiceError::backend(format!("create {}: {e}", wasm_dir.display())))?;
         Self::atomic_write(&wasm_dir.join(format!("{}.wasm", package.id)), &bytes)?;
 
-        // Record the installed digest (see step 4b).
+        // Record the installed digest (see step 4b) + declared egress.
         self.record_installed_digest(package.id, &chosen.version, digest);
+        self.record_installed_egress(package.id, artifact.declared_egress);
 
         // 7. Activate on next restart (Jellyfin's model).
         if let Some(lifecycle) = &self.lifecycle {
@@ -1215,8 +1262,17 @@ mod tests {
         fn supported_abi(&self) -> &str {
             self.abi
         }
-        async fn validate(&self, _bytes: &[u8]) -> Result<Uuid, ServiceError> {
-            self.id.clone().map_err(ServiceError::invalid_input)
+        async fn validate(
+            &self,
+            _bytes: &[u8],
+        ) -> Result<ferrofin_traits::plugins::ValidatedArtifact, ServiceError> {
+            self.id
+                .clone()
+                .map(|id| ferrofin_traits::plugins::ValidatedArtifact {
+                    id,
+                    declared_egress: vec!["api.example.com".to_owned()],
+                })
+                .map_err(ServiceError::invalid_input)
         }
     }
 
@@ -1319,10 +1375,32 @@ mod tests {
         let staged = rig.wasm_dir.join(format!("{PKG_ID}.wasm"));
         assert_eq!(std::fs::read(&staged).unwrap(), artifact, "artifact staged");
         assert!(rig.lifecycle.has_pending_restart(), "restart flagged");
+        // The validator-reported egress allowlist was recorded (upgrade
+        // growth diffs against it).
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["installed_egress"][PKG_ID.to_string()][0],
+            "api.example.com",
+            "declared egress persisted: {persisted}"
+        );
 
-        // Uninstall removes the staged file and re-flags restart.
+        // Uninstall removes the staged file and re-flags restart — and the
+        // egress record goes with it (a reinstall must not diff stale).
         rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
         assert!(!staged.exists(), "artifact removed");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["installed_egress"]
+                .get(PKG_ID.to_string())
+                .is_none(),
+            "egress record cleared on uninstall: {persisted}"
+        );
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
     }

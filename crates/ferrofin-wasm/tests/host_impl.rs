@@ -28,6 +28,10 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
                 .unwrap(),
         ),
         http_timeout: std::time::Duration::from_secs(5),
+        state_path: None,
+        egress: std::sync::Arc::new(ferrofin_wasm::capabilities::EgressPolicy::parse(&[
+            "*".to_owned()
+        ])),
         collaborators,
         private_http_allowed: true, // tests hit a loopback listener
         wasi: HostState::empty_wasi(),
@@ -59,6 +63,14 @@ fn capability_calls_fail_cleanly_before_collaborators_are_armed() {
             parent_id: None,
             search_term: None,
             limit: None,
+            user_id: None,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            genres: Vec::new(),
+            sort_by: None,
+            sort_descending: false,
+            ids: Vec::new(),
         })
         .unwrap_err();
     assert!(err.contains("not available during plugin load"), "{err}");
@@ -94,6 +106,9 @@ async fn http_fetch_round_trips_once_collaborators_are_armed() {
     let (url, server) = one_shot_http("204 No Content", b"");
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
@@ -125,6 +140,9 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     let segments = Arc::new(RecordingSegments::default());
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
@@ -146,6 +164,14 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
                 parent_id: None,
                 search_term: None,
                 limit: Some(5),
+                user_id: None,
+                is_played: None,
+                is_favorite: None,
+                is_resumable: None,
+                genres: Vec::new(),
+                sort_by: None,
+                sort_descending: false,
+                ids: Vec::new(),
             })
             .expect("query succeeds");
         assert_eq!(rows.len(), 1);
@@ -168,4 +194,49 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     assert_eq!(created.len(), 1);
     // The provider id is derived from the plugin id — never guest-supplied.
     assert_eq!(created[0].1, "wasm:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff99");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_and_next_up_flow_through_the_host_trait() {
+    // HostState holds a blocking reqwest client — build and drive it all on
+    // a blocking thread (the same rule as the plugin runtime threads).
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        use ferrofin_wasm::bindings::host::Host as _;
+        // Unarmed collaborators: next-up refuses during load, state works
+        // (it is local, no exfil channel — allowed at load by design).
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = state(Arc::new(std::sync::OnceLock::new()));
+        s.state_path = Some(dir.path().join("p.state.json"));
+        let err = s.next_up("00000000-0000-0000-0000-000000000001".into(), 5);
+        assert!(err.unwrap_err().contains("during plugin load"));
+        s.set_state("k".into(), Some(b"v".to_vec())).unwrap();
+        assert_eq!(s.get_state("k".into()), Some(b"v".to_vec()));
+        s.set_state("k".into(), None).unwrap();
+        assert_eq!(s.get_state("k".into()), None);
+
+        // Armed: next-up reaches the stub queue and enriches via user data.
+        let cell = Arc::new(std::sync::OnceLock::new());
+        cell.set(Collaborators {
+            users: std::sync::Arc::new(common::StubUsers),
+            user_data: std::sync::Arc::new(common::StubUserData),
+            tv: std::sync::Arc::new(common::StubTv),
+            handle,
+            library: Arc::new(OneMovieLibrary {
+                seen: std::sync::Mutex::new(None),
+            }),
+            media_segments: Arc::new(RecordingSegments::default()),
+            plugins: Arc::new(EnabledStub(b"{}".to_vec())),
+        })
+        .ok()
+        .unwrap();
+        let mut s = state(cell);
+        let items = s
+            .next_up("00000000-0000-0000-0000-000000000001".into(), 5)
+            .expect("next-up through the trait");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Big Buck Bunny");
+    })
+    .await
+    .unwrap();
 }

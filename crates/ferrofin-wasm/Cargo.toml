@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
+ferrofin-db.workspace = true
 ferrofin-model.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
@@ -25,7 +26,7 @@ wasmtime-wasi.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
-ferrofin-db.workspace = true
+chrono.workspace = true
 wat.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

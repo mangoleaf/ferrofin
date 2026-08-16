@@ -677,6 +677,10 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/SkipButtonCss/UpdateSkipDuration"),
     ("get", "/IntroSkipper"),
     ("get", "/IntroSkipper/SupportBundle"),
+    // NOTE: the runtime plugins' URL space `/Plugins/{pluginId}/web/{*path}`
+    // is registered by handlers::plugins but deliberately NOT listed here —
+    // REAL_ROUTES rows must be vendored-contract operations, and that route
+    // is a Ferrofin extension (like /health), outside the Jellyfin spec.
     ("get", "/Intros/AnalyzerActions/{SeasonId}"),
     ("post", "/Intros/AnalyzerActions/UpdateSeason"),
     ("get", "/Intros/Show/{SeriesId}/{SeasonId}"),

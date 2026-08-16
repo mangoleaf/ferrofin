@@ -132,6 +132,9 @@ async fn real_guest_loads_runs_and_reports_rss() {
     // ── E2: the analyze task drives all three capabilities ─────────────
     let segment_store = Arc::new(RecordingSegments::default());
     host.set_runtime_collaborators(Collaborators {
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
         handle: tokio::runtime::Handle::current(),
         library: Arc::new(OneMovieLibrary {
             seen: std::sync::Mutex::new(None),
