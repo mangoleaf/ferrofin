@@ -172,8 +172,8 @@ resolves files itself and owns the whole decoder invocation), and receives bound
 decoded data: audio windows ≤ 60 s and ≤ a quarter of the plugin's memory limit as
 PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, silence and
 black-frame detection — and analyses nobody has written yet — are all guest code over
-these windows; extraction runs under a global decode budget (a quarter of the cores)
-so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
+these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
+default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
 offered each new matching item exactly once by the "Plugin media analysis" dashboard
 task. Why a host-driven pass instead of each plugin polling `query-items` with its own
 cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a

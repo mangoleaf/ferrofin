@@ -1013,6 +1013,13 @@ mod tests {
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.max_plugin_download_mb, Some(256));
 
+        // So does the analysis decode budget.
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.wasm_analysis_concurrency, None, "default = cores/4");
+        let env = FakeEnv::new().with("FERROFIN_WASM_ANALYSIS_CONCURRENCY", "2");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.wasm_analysis_concurrency, Some(2));
+
         // Env values apply.
         let env = FakeEnv::new()
             .with("FERROFIN_WASM_CALL_TIMEOUT_SECS", "10")
