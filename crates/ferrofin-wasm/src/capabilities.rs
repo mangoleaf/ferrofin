@@ -724,8 +724,9 @@ pub fn extract_frames(
 const STATE_KEY_MAX: usize = 256;
 /// Max bytes for one state value.
 const STATE_VALUE_MAX: usize = 1024 * 1024;
-/// Max total logical bytes (keys + values) for one plugin's state.
-const STATE_TOTAL_MAX: usize = 8 * 1024 * 1024;
+/// Default max total logical bytes (keys + values) for one plugin's
+/// state (`FERROFIN_WASM_STATE_LIMIT_MB` overrides).
+pub const STATE_TOTAL_DEFAULT: usize = 8 * 1024 * 1024;
 
 /// Hex-encodes a state value (values are stored as hex strings — a JSON
 /// `Vec<u8>` would serialize as a number array, ~4× the logical size).
@@ -789,6 +790,20 @@ pub fn set_state(
     key: &str,
     value: Option<Vec<u8>>,
 ) -> Result<(), String> {
+    set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
+}
+
+/// [`set_state`] with an explicit total cap (the host passes the
+/// operator-configured limit; the default wrapper serves tests/tools).
+///
+/// # Errors
+/// Cap violations or I/O failures, as the guest-visible string.
+pub fn set_state_capped(
+    path: Option<&std::path::Path>,
+    key: &str,
+    value: Option<Vec<u8>>,
+    total_cap: usize,
+) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
     if key.len() > STATE_KEY_MAX {
         return Err(format!("state key exceeds {STATE_KEY_MAX} bytes"));
@@ -809,9 +824,9 @@ pub fn set_state(
     }
     // Logical size: hex stores two chars per byte.
     let total: usize = map.iter().map(|(k, v)| k.len() + v.len() / 2).sum();
-    if total > STATE_TOTAL_MAX {
+    if total > total_cap {
         return Err(format!(
-            "plugin state would exceed {STATE_TOTAL_MAX} bytes in total"
+            "plugin state would exceed {total_cap} bytes in total"
         ));
     }
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;

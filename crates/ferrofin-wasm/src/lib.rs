@@ -82,6 +82,10 @@ pub struct WasmSettings {
     /// Per-plugin event queue depth (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`,
     /// default 256 — inherits the approved bus-capacity setting).
     pub event_queue_capacity: u32,
+    /// Per-plugin total KV-state cap in MiB
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 — settings/cursors fit
+    /// easily; stats-heavy plugins may need more).
+    pub state_limit_mb: u32,
     /// Plugin ids allowed to reach private/loopback HTTP destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`: comma-separated plugin UUIDs, or
     /// `*` for every plugin). Default empty: private destinations denied.
@@ -96,12 +100,23 @@ impl Default for WasmSettings {
             call_timeout_secs: 30,
             memory_limit_mb: 128,
             event_queue_capacity: 256,
+            state_limit_mb: 8,
             private_http_allow: Vec::new(),
         }
     }
 }
 
 impl WasmSettings {
+    /// Overrides the per-plugin total state cap
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_state_limit_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.state_limit_mb = mb;
+        }
+        self
+    }
+
     /// Whether the allowlist grants plugin `id` private-HTTP access.
     #[must_use]
     pub fn allows_private_http(&self, id: Uuid) -> bool {
@@ -125,6 +140,7 @@ impl WasmSettings {
     ) -> Self {
         let d = Self::default();
         Self {
+            state_limit_mb: d.state_limit_mb,
             call_timeout_secs: call_timeout_secs
                 .filter(|&v| v > 0)
                 .unwrap_or(d.call_timeout_secs),
@@ -489,6 +505,7 @@ fn load_one(
         state_path: None, // id-derived; set below once the descriptor is read
         // Load-time calls can't fetch at all; the real policy is read below.
         egress: Arc::new(capabilities::EgressPolicy::default()),
+        state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
@@ -857,6 +874,7 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                 private_http_allowed: false,
                 state_path: None, // validation is throwaway — no persistence
                 egress: Arc::new(capabilities::EgressPolicy::default()),
+                state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
                 // Never armed: query-items/write-media-segments/http-fetch
                 // all refuse during validation.
                 collaborators: Arc::new(std::sync::OnceLock::new()),

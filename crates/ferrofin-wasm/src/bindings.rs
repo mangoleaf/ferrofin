@@ -58,6 +58,9 @@ pub struct HostState {
     /// The per-call timeout, needed when `http-fetch` builds a one-off
     /// DNS-pinned client (the shared client's timeout is not readable).
     pub http_timeout: std::time::Duration,
+    /// The operator-configured total state cap, in bytes
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 MiB).
+    pub state_total_cap: usize,
     /// Where this plugin's key/value state persists
     /// (`{plugins_dir}/{id}.state.json`). `None` until the plugin's id is
     /// known (during the identity calls at load) and in throwaway
@@ -155,7 +158,12 @@ impl host::Host for HostState {
         if key.starts_with("host:") {
             return Err("keys prefixed `host:` are reserved for the server".to_owned());
         }
-        crate::capabilities::set_state(self.state_path.as_deref(), &key, value)
+        crate::capabilities::set_state_capped(
+            self.state_path.as_deref(),
+            &key,
+            value,
+            self.state_total_cap,
+        )
     }
 
     fn next_up(&mut self, user_id: String, limit: u32) -> Result<Vec<types::ItemSummary>, String> {

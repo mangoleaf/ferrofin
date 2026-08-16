@@ -533,7 +533,8 @@ pub async fn build_app_state(
             config.wasm_memory_limit_mb,
             config.wasm_event_queue_capacity,
             config.wasm_private_http_allow.as_deref(),
-        );
+        )
+        .with_state_limit_mb(config.wasm_state_limit_mb);
         let wasm_dir = config.data_dir.join("plugins");
         match tokio::task::spawn_blocking(move || {
             ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
@@ -685,12 +686,15 @@ pub async fn build_app_state(
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
-        ferrofin_wasm::WasmArtifactValidator::new(&ferrofin_wasm::WasmSettings::resolve(
-            config.wasm_call_timeout_secs,
-            config.wasm_memory_limit_mb,
-            config.wasm_event_queue_capacity,
-            config.wasm_private_http_allow.as_deref(),
-        ))
+        ferrofin_wasm::WasmArtifactValidator::new(
+            &ferrofin_wasm::WasmSettings::resolve(
+                config.wasm_call_timeout_secs,
+                config.wasm_memory_limit_mb,
+                config.wasm_event_queue_capacity,
+                config.wasm_private_http_allow.as_deref(),
+            )
+            .with_state_limit_mb(config.wasm_state_limit_mb),
+        )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(

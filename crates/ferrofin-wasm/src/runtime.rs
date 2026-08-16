@@ -147,6 +147,8 @@ pub struct InstanceSpec {
     pub state_path: Option<std::path::PathBuf>,
     /// The plugin's declared public-egress allowlist.
     pub egress: Arc<crate::capabilities::EgressPolicy>,
+    /// The operator-configured total state cap, in bytes.
+    pub state_total_cap: usize,
 }
 
 impl InstanceSpec {
@@ -174,6 +176,7 @@ impl InstanceSpec {
             http_timeout: std::time::Duration::from_secs(self.timeout_ticks),
             state_path: self.state_path.clone(),
             egress: Arc::clone(&self.egress),
+            state_total_cap: self.state_total_cap,
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),

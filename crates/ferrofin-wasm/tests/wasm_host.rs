@@ -104,6 +104,7 @@ fn tight_settings() -> WasmSettings {
         call_timeout_secs: 1,
         memory_limit_mb: 2,
         event_queue_capacity: 8,
+        state_limit_mb: 8,
         private_http_allow: Vec::new(),
     }
 }

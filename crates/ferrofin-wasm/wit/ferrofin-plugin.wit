@@ -375,7 +375,8 @@ interface host {
 
     /// Writes (or with `none`, deletes) THIS plugin's state value for
     /// `key`. Caps: keys ≤ 256 bytes, values ≤ 1 MiB, a plugin's total
-    /// state ≤ 8 MiB; writes past a cap fail with an error. Keys prefixed
+    /// state ≤ 8 MiB by default (the operator can raise it); writes past a
+    /// cap fail with an error. Keys prefixed
     /// `host:` are RESERVED for the server's own bookkeeping (e.g. the
     /// analysis watermark) — unreadable and unwritable from a plugin.
     set-state: func(key: string, value: option<list<u8>>) -> result<_, string>;

@@ -29,6 +29,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         ),
         http_timeout: std::time::Duration::from_secs(5),
         state_path: None,
+        state_total_cap: 8 * 1024 * 1024,
         egress: std::sync::Arc::new(ferrofin_wasm::capabilities::EgressPolicy::parse(&[
             "*".to_owned()
         ])),

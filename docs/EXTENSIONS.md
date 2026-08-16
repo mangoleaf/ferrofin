@@ -147,8 +147,9 @@ crucially — **gated by the plugin's own declared egress allowlist**, below), `
 (a read-only item projection — filterable by kind/genre/user state, sortable, user-scopable
 so parental limits apply and per-user played/favorite/resume fields populate; max 1000 rows
 per call), `next-up` (the user's next-episodes queue), `get-state`/`set-state` (a small
-per-plugin key/value store — 256 B keys, 1 MiB values, 8 MiB total — for per-user settings
-and cursors; the admin never sees it), and `write-media-segments` (scoped to the plugin's
+per-plugin key/value store — 256 B keys, 1 MiB values, 8 MiB total by default
+(`FERROFIN_WASM_STATE_LIMIT_MB`) — for per-user settings and cursors; the admin never
+sees it), and `write-media-segments` (scoped to the plugin's
 own provider id — it can never touch another provider's or a user's segments).
 
 **Declared egress (`declared-egress`)** — every plugin ships its own public-network
