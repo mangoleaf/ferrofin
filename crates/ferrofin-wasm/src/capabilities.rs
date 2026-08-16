@@ -725,6 +725,34 @@ pub fn extract_frames(
         .collect())
 }
 
+/// Cap on one extracted subtitle track (SRT text; 10 MiB is generous).
+const SUBTITLE_TRACK_MAX: usize = 10 * 1024 * 1024;
+
+/// Executes `extract-subtitle-track`.
+///
+/// # Errors
+/// Unknown item, decode failure, or an over-cap track.
+pub fn extract_subtitle_track(
+    cx: &Collaborators,
+    item_id: &str,
+    stream_index: u32,
+) -> Result<Vec<u8>, String> {
+    let path = resolve_media_path(cx, item_id)?;
+    let bytes = cx
+        .handle
+        .block_on(async {
+            let _permit = cx.analysis.acquire().await;
+            cx.extractor.extract_subtitle(&path, stream_index).await
+        })
+        .map_err(|e| format!("subtitle extraction failed: {e}"))?;
+    if bytes.len() > SUBTITLE_TRACK_MAX {
+        return Err(format!(
+            "extracted track exceeds the {SUBTITLE_TRACK_MAX}-byte cap"
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The plugin key/value state caps — hardcoded abuse guards in the
 /// manifest-cap tradition (state is for settings/cursors, not blobs).
 const STATE_KEY_MAX: usize = 256;

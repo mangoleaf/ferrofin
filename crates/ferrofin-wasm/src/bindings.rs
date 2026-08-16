@@ -247,6 +247,18 @@ impl host::Host for HostState {
         )
     }
 
+    fn extract_subtitle_track(
+        &mut self,
+        item_id: String,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-subtitle-track is not available during plugin load")?;
+        crate::capabilities::extract_subtitle_track(cx, &item_id, stream_index)
+    }
+
     fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {
         let cx = self
             .collaborators

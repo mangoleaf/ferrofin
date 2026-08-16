@@ -437,6 +437,12 @@ interface host {
     /// Adds/removes items (≤ 1000 each) on a collection THIS PLUGIN owns.
     update-collection: func(collection-id: string, add: list<string>, remove: list<string>) -> result<_, string>;
 
+    /// Extracts one embedded subtitle stream of a library item as SRT
+    /// bytes (≤ 10 MiB). `stream-index` is the SUBTITLE-relative index
+    /// (0 = first subtitle stream). Same rules as the other extraction
+    /// fns: host-owned pipeline, item-addressed, load-denied.
+    extract-subtitle-track: func(item-id: string, stream-index: u32) -> result<list<u8>, string>;
+
     /// Replaces THIS plugin's media segments for an item (other providers'
     /// and user-authored segments are untouched — each plugin writes under
     /// its own provider id, like every segment provider). An empty list

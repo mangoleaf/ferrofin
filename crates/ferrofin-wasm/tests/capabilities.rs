@@ -697,6 +697,17 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].width, 320, "dimension clamped to the cap");
 
+        // Subtitle extraction rides the same item-addressed path.
+        let srt = ferrofin_wasm::capabilities::extract_subtitle_track(&cx, ITEM, 0).expect("srt");
+        assert!(String::from_utf8_lossy(&srt).contains("stream 0"));
+        let err = ferrofin_wasm::capabilities::extract_subtitle_track(
+            &cx,
+            &uuid::Uuid::from_u128(0xdead).to_string(),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.contains("no such"), "{err}");
+
         // media-info: duration + streams + container.
         let info = media_info(&cx, ITEM).expect("info");
         assert_eq!(info.duration_ticks, 5_000_000_000);

@@ -597,6 +597,14 @@ impl ferrofin_traits::media_analysis::MediaExtractor for StubExtractor {
         Ok(vec![7i16; samples.min(1024)])
     }
 
+    async fn extract_subtitle(
+        &self,
+        _path: &str,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, ServiceError> {
+        Ok(format!("1\n00:00:00,000 --> 00:00:01,000\nstream {stream_index}\n").into_bytes())
+    }
+
     async fn extract_frames(
         &self,
         _path: &str,
