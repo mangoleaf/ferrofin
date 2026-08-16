@@ -349,6 +349,17 @@ interface types {
         /// External ids to record, as (provider name, id) pairs — e.g. a
         /// plugin for a niche database records its own id here.
         provider-ids: list<tuple<string, string>>,
+        /// Tagline (applied only when the item has none).
+        tagline: option<string>,
+        /// Studio names (applied only when the item has none).
+        studios: list<string>,
+        /// Tag names (applied only when the item has none).
+        tags: list<string>,
+        /// Parental/official rating, e.g. `PG-13` (applied only when the
+        /// item has none).
+        official-rating: option<string>,
+        /// End date, ISO-8601 (series/albums; applied only when unset).
+        end-date: option<string>,
     }
 }
 

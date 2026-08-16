@@ -999,6 +999,11 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
 
         Ok(
             offer.map(|m| ferrofin_traits::providers::DynamicMetadataResult {
+                tagline: m.tagline,
+                studios: m.studios,
+                tags: m.tags,
+                official_rating: m.official_rating,
+                end_date: m.end_date,
                 overview: m.overview,
                 production_year: m.production_year,
                 community_rating: m.community_rating,

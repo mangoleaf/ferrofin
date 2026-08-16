@@ -1580,6 +1580,25 @@ impl LibraryScanner {
             if entity.community_rating.is_none() {
                 entity.community_rating = result.community_rating;
             }
+            if entity.tagline.as_deref().is_none_or(str::is_empty) {
+                entity.tagline = result.tagline.clone().filter(|t| !t.is_empty());
+            }
+            if entity.studios.as_deref().is_none_or(str::is_empty) && !result.studios.is_empty() {
+                entity.studios = Some(result.studios.join("|"));
+            }
+            if entity.tags.as_deref().is_none_or(str::is_empty) && !result.tags.is_empty() {
+                entity.tags = Some(result.tags.join("|"));
+            }
+            if entity.official_rating.as_deref().is_none_or(str::is_empty) {
+                entity.official_rating = result.official_rating.clone().filter(|r| !r.is_empty());
+            }
+            if entity.end_date.is_none() {
+                entity.end_date = result
+                    .end_date
+                    .as_deref()
+                    .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+            }
             if entity.genres.as_deref().unwrap_or_default().is_empty() && !result.genres.is_empty()
             {
                 entity.genres = Some(result.genres.join("|"));
@@ -4909,6 +4928,11 @@ mod tests {
             > {
                 assert_eq!(item.kind, "Movie");
                 Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    tagline: None,
+                    studios: Vec::new(),
+                    tags: Vec::new(),
+                    official_rating: None,
+                    end_date: None,
                     overview: Some("From the dynamic provider".to_owned()),
                     production_year: Some(1980), // must NOT overwrite the NFO's 2020
                     community_rating: Some(6.5),
@@ -4933,6 +4957,11 @@ mod tests {
                 ferrofin_traits::error::ServiceError,
             > {
                 Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    tagline: None,
+                    studios: Vec::new(),
+                    tags: Vec::new(),
+                    official_rating: None,
+                    end_date: None,
                     provider_ids: vec![("helloDB".to_owned(), "stolen".to_owned())],
                     ..Default::default()
                 }))

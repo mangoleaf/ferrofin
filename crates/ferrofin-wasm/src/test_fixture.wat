@@ -267,7 +267,10 @@
   (type $meta0 (record
     (field "overview" (option string)) (field "production-year" (option s32))
     (field "community-rating" (option f64)) (field "genres" (list string))
-    (field "provider-ids" (list (tuple string string)))))
+    (field "provider-ids" (list (tuple string string)))
+    (field "tagline" (option string)) (field "studios" (list string))
+    (field "tags" (list string)) (field "official-rating" (option string))
+    (field "end-date" (option string))))
   (export $meta "metadata-result" (type $meta0))
 
   (func $descriptor (result $descriptor)

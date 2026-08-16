@@ -322,6 +322,16 @@ pub struct DynamicMetadataResult {
     pub genres: Vec<String>,
     /// External ids to record, as (provider name, id) pairs.
     pub provider_ids: Vec<(String, String)>,
+    /// Tagline (supplement-only).
+    pub tagline: Option<String>,
+    /// Studio names (supplement-only).
+    pub studios: Vec<String>,
+    /// Tag names (supplement-only).
+    pub tags: Vec<String>,
+    /// Parental rating (supplement-only).
+    pub official_rating: Option<String>,
+    /// End date, ISO-8601 (supplement-only).
+    pub end_date: Option<String>,
 }
 
 /// A dynamically-registered scan metadata source — the seam Tier-1b WASM
