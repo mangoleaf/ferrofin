@@ -12,6 +12,9 @@ services:
         # Host `git describe`, baked into the binary and verified back over
         # /health/live before any measurement window (stale-binary guard, B1).
         GIT_DESCRIBE: ${GIT_DESCRIBE:-}
+        # Per-checkout compile-cache scope (see Dockerfile.ferrofin) — set it
+        # alongside COMPOSE_PROJECT_NAME when running from a worktree.
+        CACHE_SCOPE: ${BENCH_CACHE_SCOPE:-shared}
     image: ferrofin-bench:local
     cpus: ${BENCH_CPUS}
     mem_limit: ${BENCH_MEM}

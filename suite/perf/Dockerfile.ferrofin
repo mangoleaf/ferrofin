@@ -13,7 +13,14 @@ COPY . .
 # the run instead of being silently benchmarked.
 ARG GIT_DESCRIBE=
 ENV FERROFIN_GIT_DESCRIBE=$GIT_DESCRIBE
-RUN --mount=type=cache,target=/src/target,id=ferrofin-target \
+# CACHE_SCOPE keys the compile cache per checkout/worktree. The mounts are
+# HOST-GLOBAL by id: two checkouts building different trees into one shared
+# cargo target dir poison each other (cargo's mtime freshness can pair one
+# tree's .rmeta with the other's sources — observed as a phantom E0599 on a
+# method that exists). Same-scope rebuilds stay incremental; different trees
+# never share artifacts.
+ARG CACHE_SCOPE=shared
+RUN --mount=type=cache,target=/src/target,id=ferrofin-target-${CACHE_SCOPE} \
     --mount=type=cache,target=/usr/local/cargo/registry,id=ferrofin-cargo-registry \
     cargo build --release -p ferrofin-server \
  && cp /src/target/release/ferrofin-server /usr/local/bin/ferrofin-server
