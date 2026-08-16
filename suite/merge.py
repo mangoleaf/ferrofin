@@ -315,7 +315,13 @@ def main():
         # stays a tail loss, never folded into "faster".
         win = vlist.count("win") == 3
         tie = bool(vlist) and vlist.count("tie") == 3
-        speedup = round(p["j_p50"] / p["h_p50"], 2) if have_lat and p["h_p50"] else None
+        # D1 applies to the RATIO too (review finding, round 1): dividing two
+        # sub-floor medians amplifies jitter into a fake multiple — 0.3 ms vs
+        # 0.1 ms is a "3×" that percentile_verdicts itself calls a tie. A p50
+        # tie gets NO speedup; headline.ratio_excluded_ties says how many.
+        p50_tie = verdicts is not None and verdicts["p50"] == "tie"
+        speedup = (round(p["j_p50"] / p["h_p50"], 2)
+                   if have_lat and p["h_p50"] and not p50_tie else None)
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
         # them, never blended (fresh-process first-request latency).
@@ -387,6 +393,10 @@ def main():
         "dropped_rows": sum(dropped.values()),
         "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
+        # Comparable rows whose p50 delta is under the floor: they carry no
+        # ratio (see above), and this count keeps the exclusion visible.
+        "ratio_excluded_ties": sum(
+            1 for o in comp if (o.get("verdicts") or {}).get("p50") == "tie"),
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "ties": sum(o["tie_all_three"] for o in comp),
         "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
@@ -405,14 +415,16 @@ def main():
             "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
             "mem": bench_env("BENCH_MEM"),
             # The load model + engine + resolved methodology knobs come from the
-            # perf leg's own summary meta (compare.py) — self-describing records.
-            # Old (closed-loop k6) records carry {"vus","duration"} here instead;
-            # the comparability guard keys on this, so the two never compare.
-            "load": {"model": "open-loop",
+            # perf leg's own summary meta (compare.py is the ONLY producer of
+            # that meta block, and only it runs open-loop) — a summary without
+            # it (the legacy bench-data fallback, or a stale k6 raw summary)
+            # must NOT be stamped open-loop: gate.py's rebaseline honesty
+            # check keys on this (review finding, round 1).
+            "load": {"model": "open-loop" if perf_meta else None,
                      "duration_secs": (perf_meta or {}).get("bench_config", {})
                      .get("values", {}).get("BENCH_DURATION_SECS")},
             "engine": (perf_meta or {}).get("engine"),
-            "generator_ceiling_rps": (perf_meta or {}).get("generator_ceiling_rps"),
+            "ping_ceiling_rps": (perf_meta or {}).get("ping_ceiling_rps"),
             "bench_config": (perf_meta or {}).get("bench_config"),
             "perf_source": perf_src,
             "footprint": foot,

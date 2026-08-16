@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 
 import bootstrap
-from benchlib import fire
+from benchlib import PooledClient
 from endpoints import ENDPOINTS
 from vegeta import percentile
 
@@ -76,21 +76,28 @@ def run_closed_loop(base, ctx, vus, duration_secs):
               for _ in range(vus)]
 
     def worker(mine):
-        while time.monotonic() < deadline:
-            for e in MIXED:
-                # Check per request, not per pass: a full pass under contention
-                # can take many seconds, and overshooting a whole pass would
-                # stretch the measured window unevenly across VUs.
-                if time.monotonic() >= deadline:
-                    return
-                t0 = time.perf_counter()
-                status, _ = fire(base, e, ctx)
-                ms = (time.perf_counter() - t0) * 1000
-                row = mine[e["name"]]
-                row["total"] += 1
-                if status == e["ok"]:
-                    row["ok"] += 1
-                    row["lat"].append(ms)
+        # One persistent keep-alive connection per VU — a fresh TCP connect
+        # per request makes the CLIENT the contended resource at 50 threads
+        # and measures connect overhead, not the server (review, round 1).
+        conn = PooledClient(base)
+        try:
+            while time.monotonic() < deadline:
+                for e in MIXED:
+                    # Check per request, not per pass: a full pass under contention
+                    # can take many seconds, and overshooting a whole pass would
+                    # stretch the measured window unevenly across VUs.
+                    if time.monotonic() >= deadline:
+                        return
+                    t0 = time.perf_counter()
+                    status, _ = conn.fire(e, ctx)
+                    ms = (time.perf_counter() - t0) * 1000
+                    row = mine[e["name"]]
+                    row["total"] += 1
+                    if status == e["ok"]:
+                        row["ok"] += 1
+                        row["lat"].append(ms)
+        finally:
+            conn.close()
 
     threads = [threading.Thread(target=worker, args=(per_vu[i],), daemon=True)
                for i in range(vus)]

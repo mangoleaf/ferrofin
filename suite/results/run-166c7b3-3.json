@@ -45,7 +45,8 @@
     "run_seq": 3,
     "run_label": "v0.16.0 (3)",
     "ferrofin": "v0.16.0",
-    "ferrofin_sha": "166c7b3"
+    "ferrofin_sha": "166c7b3",
+    "legacy": "k6-closed-loop"
   },
   "headline": {
     "comparable_rows": 75,

@@ -22548,7 +22548,8 @@
         },
         "when": "2026-08-04T00:54Z",
         "ferrofin": "v0.8.3-13-gf417814",
-        "ferrofin_sha": "f417814"
+        "ferrofin_sha": "f417814",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 43,
@@ -24846,7 +24847,8 @@
         },
         "when": "2026-08-04T05:16Z",
         "ferrofin": "v0.8.5-2-gbfbd201",
-        "ferrofin_sha": "bfbd201"
+        "ferrofin_sha": "bfbd201",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 70,
@@ -27971,7 +27973,8 @@
         },
         "when": "2026-08-04T17:33Z",
         "ferrofin": "v0.8.5-7-gb41adc1",
-        "ferrofin_sha": "b41adc1"
+        "ferrofin_sha": "b41adc1",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 73,
@@ -31216,7 +31219,8 @@
         },
         "when": "2026-08-05T22:14Z",
         "ferrofin": "v0.12.0",
-        "ferrofin_sha": "553252f"
+        "ferrofin_sha": "553252f",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 73,
@@ -34465,7 +34469,8 @@
         },
         "when": "2026-08-06T22:20Z",
         "ferrofin": "v0.12.0-20-g3ff9120",
-        "ferrofin_sha": "3ff9120"
+        "ferrofin_sha": "3ff9120",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 74,
@@ -37713,7 +37718,8 @@
         },
         "when": "2026-08-07T00:15Z",
         "ferrofin": "v0.13.0-1-g335c474",
-        "ferrofin_sha": "335c474"
+        "ferrofin_sha": "335c474",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 74,
@@ -40941,7 +40947,8 @@
         },
         "when": "2026-08-07T01:25Z",
         "ferrofin": "v0.13.0-2-gc7fa4ff",
-        "ferrofin_sha": "c7fa4ff"
+        "ferrofin_sha": "c7fa4ff",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 75,
@@ -44189,7 +44196,8 @@
         },
         "when": "2026-08-09T00:28Z",
         "ferrofin": "v0.16.0",
-        "ferrofin_sha": "166c7b3"
+        "ferrofin_sha": "166c7b3",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 75,
@@ -47445,7 +47453,8 @@
         "run_seq": 2,
         "run_label": "v0.16.0 (2)",
         "ferrofin": "v0.16.0",
-        "ferrofin_sha": "166c7b3"
+        "ferrofin_sha": "166c7b3",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 75,
@@ -50695,7 +50704,8 @@
         "run_seq": 3,
         "run_label": "v0.16.0 (3)",
         "ferrofin": "v0.16.0",
-        "ferrofin_sha": "166c7b3"
+        "ferrofin_sha": "166c7b3",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 75,
@@ -53940,7 +53950,8 @@
         "run_seq": 4,
         "run_label": "v0.16.0 (4)",
         "ferrofin": "v0.16.0",
-        "ferrofin_sha": "166c7b3"
+        "ferrofin_sha": "166c7b3",
+        "legacy": "k6-closed-loop"
       },
       "headline": {
         "comparable_rows": 75,

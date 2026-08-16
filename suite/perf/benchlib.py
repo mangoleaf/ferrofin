@@ -11,6 +11,7 @@ None of this is measurement hot-path: the measured windows are driven by
 vegeta (see vegeta.py); this module only provisions, warms, and probes.
 """
 
+import http.client
 import json
 import os
 import time
@@ -83,6 +84,69 @@ def fire(base, e, ctx, timeout=30):
     headers = token_headers(ctx["token"]) if e["auth"] else {"Content-Type": "application/json"}
     body = render_body(e["body"], ctx) if e["body"] is not None else None
     return request(e["method"], f"{base}{render_path(e, ctx)}", body, headers, timeout)
+
+
+class PooledClient:
+    """One persistent HTTP/1.1 keep-alive connection, for the CLOSED-LOOP legs
+    (phase C/D, pool sweep).
+
+    ``urllib.request`` opens a fresh TCP connection per request; at 50 VU
+    threads that makes the *client* the contended resource and the numbers
+    measure connect overhead, not the server (k6 pooled by default, so the
+    ported legs must too — review finding, round 1). ``http.client`` is not
+    thread-safe: create ONE instance per thread.
+
+    Same return contract as :func:`request`: ``(status, body_bytes)``;
+    transport errors return ``(0, b"")`` after one reconnect attempt (a server
+    closing an idle keep-alive connection is normal, not an error).
+    """
+
+    def __init__(self, base, timeout=30):
+        u = urllib.parse.urlsplit(base)
+        self._https = u.scheme == "https"
+        self._host = u.hostname
+        self._port = u.port or (443 if self._https else 80)
+        self._timeout = timeout
+        self._conn = None
+
+    def _connect(self):
+        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
+        self._conn = cls(self._host, self._port, timeout=self._timeout)
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+    def request(self, method, url, body=None, headers=None):
+        """One request over the pooled connection. `url` may be a bare
+        path(+query) or an absolute URL (the host part is ignored — this
+        connection is pinned to its base)."""
+        if url.startswith("http"):
+            u = urllib.parse.urlsplit(url)
+            url = u.path + (f"?{u.query}" if u.query else "")
+        data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
+        for attempt in (0, 1):
+            try:
+                if self._conn is None:
+                    self._connect()
+                self._conn.request(method, url, data, headers or {})
+                r = self._conn.getresponse()
+                return r.status, r.read()
+            except (http.client.HTTPException, OSError):
+                self.close()
+                if attempt:
+                    return 0, b""
+        return 0, b""  # pragma: no cover - loop always returns
+
+    def fire(self, e, ctx):
+        """benchlib.fire, over the pooled connection."""
+        headers = token_headers(ctx["token"]) if e["auth"] else {"Content-Type": "application/json"}
+        body = render_body(e["body"], ctx) if e["body"] is not None else None
+        return self.request(e["method"], render_path(e, ctx), body, headers)
 
 
 def authenticate(base, target):

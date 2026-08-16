@@ -32,7 +32,8 @@ DEFAULTS = {
     "BENCH_RATE_FRACTION": 0.5,
     "BENCH_RATE_TOLERANCE": 0.99,
     # warm/cold
-    "BENCH_WARMUP_SECS": 90,
+    "BENCH_GLOBAL_WARMUP_SECS": 60,
+    "BENCH_WARMUP_SECS": 10,
     "BENCH_COLD_REQUESTS": 10,
     "BENCH_COLD_ENDPOINTS": "info_public user_me items_sortname items_mixed item_detail "
                             "persons studios suggestions movie_recommendations "
@@ -68,20 +69,23 @@ def _parse_conf(path=CONF_FILE):
 
 
 def _cast(key, raw):
-    """Parse `raw` with the type of the code default; fall back to the default
-    (never crash a run on a malformed line — but say so)."""
+    """Parse `raw` with the type of the code default → (value, parsed_ok).
+    A malformed value falls back to the default (never crash a run) and
+    reports parsed_ok=False so the SOURCE can say so — a meta block claiming
+    'env' for a value that actually came from the default would lie
+    (review finding, round 1)."""
     default = DEFAULTS[key]
     try:
         if isinstance(default, bool):  # pragma: no cover - no bool knobs today
-            return raw.lower() in ("1", "true", "yes")
+            return raw.lower() in ("1", "true", "yes"), True
         if isinstance(default, int):
-            return int(raw)
+            return int(raw), True
         if isinstance(default, float):
-            return float(raw)
-        return raw
+            return float(raw), True
+        return raw, True
     except ValueError:
-        print(f"!! bench.conf: {key}={raw!r} is not a {type(default).__name__}; using default {default}")
-        return default
+        print(f"!! bench config: {key}={raw!r} is not a {type(default).__name__}; using default {default}")
+        return default, False
 
 
 def load():
@@ -93,11 +97,14 @@ def load():
         # a list knob (e.g. BENCH_COLD_ENDPOINTS="" turns the cold leg off);
         # an empty NUMERIC env var falls back to the default via _cast.
         if key in os.environ:
-            values[key], sources[key] = _cast(key, os.environ[key]), "env"
+            raw, layer = os.environ[key], "env"
         elif key in conf:
-            values[key], sources[key] = _cast(key, conf[key]), "bench.conf"
+            raw, layer = conf[key], "bench.conf"
         else:
             values[key], sources[key] = default, "default"
+            continue
+        values[key], ok = _cast(key, raw)
+        sources[key] = layer if ok else f"default (invalid {layer})"
     return values, sources
 
 

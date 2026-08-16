@@ -195,7 +195,7 @@ cat <<EOF
 - **Ferrofin:** \`${VERSION}\`  **Jellyfin:** \`${JELLYFIN_IMAGE}\`
 - **When:** ${DATE}
 - **Host:** ${HOST}
-- **Library:** ${H_N} items (Ferrofin) / ${J_N} (Jellyfin) · **Load:** ${BENCH_VUS} VUs × ${BENCH_DURATION}/endpoint
+- **Library:** ${H_N} items (Ferrofin) / ${J_N} (Jellyfin) · **Load:** open-loop, per-endpoint arrival rates (rates.json or BENCH_RATE) × ${BENCH_DURATION_SECS:-30}s/endpoint
 - Method & caveats: see [README](../README.md).
 
 ${WARN}

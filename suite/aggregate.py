@@ -25,6 +25,10 @@ from statistics import median, quantiles
 
 RESULTS = Path(__file__).resolve().parent / "results"
 
+# The noise floor (D1) applies to the paired ratios here too — see paired_speedup.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "perf"))
+from config import CONFIG  # noqa: E402
+
 # Per-endpoint warm metrics aggregated across runs, per side.
 METRICS = ("p50", "p95", "p99")
 
@@ -63,9 +67,17 @@ def aggregate(runs):
                 ep[f"{side}_{m}"] = dist([p.get(f"{side}_{m}") for p in rows])
         # C2: the paired per-endpoint statistic — ratio of the two MEDIANS
         # (stable numerator/denominator), not the median of noisy ratios.
+        # D1 applies here too (review finding, round 1): a ratio over a
+        # sub-floor delta is jitter amplified by division — the k6-era
+        # aggregate carried a "391×" from a sub-ms endpoint the verdict logic
+        # itself called a tie. Sub-floor pairs get NO ratio and are counted.
         h50, j50 = ep["h_p50"], ep["j_p50"]
-        ep["paired_speedup"] = (round(j50["med"] / h50["med"], 2)
-                                if h50 and j50 and h50["med"] else None)
+        floor = CONFIG["BENCH_NOISE_FLOOR_MS"]
+        if h50 and j50 and h50["med"] and abs(h50["med"] - j50["med"]) >= floor:
+            ep["paired_speedup"] = round(j50["med"] / h50["med"], 2)
+        else:
+            ep["paired_speedup"] = None
+            ep["paired_tie"] = bool(h50 and j50)  # both measured, delta under floor
         cold_firsts_h = [((p.get("cold") or {}).get("h_first")) for p in rows]
         cold_firsts_j = [((p.get("cold") or {}).get("j_first")) for p in rows]
         if any(x is not None for x in cold_firsts_h + cold_firsts_j):
@@ -75,6 +87,7 @@ def aggregate(runs):
     heads = [r["headline"] for r in runs]
     paired = [ep["paired_speedup"] for ep in endpoints.values()
               if ep["paired_speedup"] is not None and ep["n_comparable"] == len(runs)]
+    paired_ties = sum(1 for ep in endpoints.values() if ep.get("paired_tie"))
     headline = {
         # The honest headline: exact and deterministic.
         "parity_coverage": heads[-1].get("parity_coverage"),
@@ -83,7 +96,12 @@ def aggregate(runs):
         "ties": dist([h.get("ties") for h in heads]),
         # Distribution of paired per-endpoint speedups over always-comparable
         # endpoints — the defensible single number, WITH its spread.
+        # paired_excluded_ties = endpoints whose medians differ by less than
+        # the noise floor: they carry no ratio at all (division would amplify
+        # jitter into fake multiples) and are counted here instead.
         "paired_speedup": dist(paired),
+        "paired_excluded_ties": paired_ties,
+        "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
         # Footnote only — see the module docstring.
         "median_speedup_footnote": {
             "values": [h.get("median_speedup") for h in heads],
@@ -111,7 +129,9 @@ def render_md(agg, sha):
                f"comparable rows {fmt_dist(h['comparable_rows'])} · "
                f"win-rate {fmt_dist(h['win_rate'])} · ties {fmt_dist(h['ties'])}")
     out.append(f"- Paired speedup over always-comparable endpoints: **{fmt_dist(h['paired_speedup'])}** "
-               f"(ratio of per-endpoint medians; spread is IQR across endpoints)\n")
+               f"(ratio of per-endpoint medians; spread is IQR across endpoints; "
+               f"{h['paired_excluded_ties']} endpoint(s) tied under the {h['noise_floor_ms']} ms "
+               f"floor carry no ratio)\n")
     out.append("Latency is ms, shown as `median±IQR` across runs. Cold is a fresh-process "
                "first request — separate from warm, never blended.\n")
     out.append("| endpoint | owner | H p50 | J p50 | H p95 | J p95 | H p99 | J p99 | paired | cold H/J (first) | n |")
@@ -130,13 +150,17 @@ def render_md(agg, sha):
 
 def main():
     runs_doc = json.loads((RESULTS / "runs.json").read_text())["runs"]
-    live = [r for r in runs_doc if not r["meta"].get("legacy")]
+    # Aggregates are published records: only non-legacy, OPEN-LOOP runs may
+    # enter one (the gate refuses pre-migration baselines; the aggregate feed
+    # must not publish pre-migration numbers either — review finding, round 1).
+    live = [r for r in runs_doc if not r["meta"].get("legacy")
+            and (r["meta"].get("load") or {}).get("model") == "open-loop"]
     if not live:
-        sys.exit("aggregate: no non-legacy runs in runs.json")
+        sys.exit("aggregate: no open-loop runs in runs.json — run `suite/run.sh publish` first")
     sha = sys.argv[1] if len(sys.argv) > 1 else live[-1]["meta"]["ferrofin_sha"]
     same = [r for r in live if r["meta"]["ferrofin_sha"] == sha]
     if not same:
-        sys.exit(f"aggregate: no runs for SHA {sha!r}")
+        sys.exit(f"aggregate: no open-loop runs for SHA {sha!r}")
 
     agg = aggregate(same)
     out = RESULTS / f"agg-{sha}.json"

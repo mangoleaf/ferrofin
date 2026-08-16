@@ -65,15 +65,19 @@ case "$stage" in
   merge)   exec python3 "$ROOT/suite/merge.py" "$@" ;;
   gate)
     if [ "${1:-}" = "--measure" ]; then
-      # Fresh measurement at reduced load (fast via VUs/duration), then merge, then check. Runs
-      # both legs so run.sh's report step has both summaries; the gate itself only reads Ferrofin's.
-      # RUN_TRANSCODE=0 must reach the merge too: its manifest check (A1) reads the
-      # env to know whether the TTFS legs were part of this measurement.
+      # Fresh measurement at reduced load (short windows, no warmup ramp, no
+      # cold restarts), then merge, then check. Runs both legs so run.sh's
+      # report step has both summaries; the gate itself only reads Ferrofin's.
+      # EVERY leg-shaping override must reach the merge too: merge.py's
+      # manifest check (A1) re-resolves RUN_TRANSCODE and BENCH_COLD_ENDPOINTS
+      # to know which legs were part of this measurement — a mismatch makes it
+      # demand legs that were deliberately skipped (review finding, round 1).
       shift
-      RUN_TRANSCODE=0 BENCH_DURATION_SECS="${PERF_GATE_SECONDS:-10}" BENCH_WARMUP_SECS=5 \
-        BENCH_COLD_ENDPOINTS="" \
+      GATE_SECS="${PERF_GATE_SECONDS:-$(cd "$ROOT/suite/perf" && python3 -c 'from config import CONFIG; print(CONFIG["PERF_GATE_SECONDS"])')}"
+      export RUN_TRANSCODE=0 BENCH_COLD_ENDPOINTS=""
+      BENCH_DURATION_SECS="$GATE_SECS" BENCH_GLOBAL_WARMUP_SECS=10 BENCH_WARMUP_SECS=5 \
         "$ROOT/suite/perf/run.sh"
-      RUN_TRANSCODE=0 python3 "$ROOT/suite/merge.py"
+      python3 "$ROOT/suite/merge.py"
     fi
     exec python3 "$ROOT/suite/gate.py" "$@"
     ;;

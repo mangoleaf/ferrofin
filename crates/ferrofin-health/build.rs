@@ -13,6 +13,15 @@
 //! binary produced through a warm cache still carries the *current* value — and
 //! a binary that somehow wasn't rebuilt carries its old one, which is exactly
 //! what lets the benchmark harness detect a stale binary before measuring it.
+//!
+//! Deliberately NO `rerun-if-changed=.git/HEAD`: this crate sits near the
+//! bottom of the graph (api and the server build on it), so re-running on
+//! every commit/branch switch would cascade a rebuild of the whole stack in
+//! every worktree. The paths that MATTER are exact anyway: the benchmark
+//! harness always passes `FERROFIN_GIT_DESCRIBE` explicitly (env change ⇒
+//! recompile), and release images get `SERVICE_VERSION` at runtime. The cost
+//! is only that a *local dev* binary may report a slightly stale describe
+//! until this crate next rebuilds — informational surfaces only.
 
 use std::process::Command;
 
@@ -32,6 +41,4 @@ fn main() {
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     println!("cargo:rustc-env=FERROFIN_BUILD_VERSION={version}");
     println!("cargo:rerun-if-env-changed=FERROFIN_GIT_DESCRIBE");
-    // Re-run when HEAD moves so the baked version tracks new commits/tags.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
 }

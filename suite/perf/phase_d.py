@@ -95,11 +95,15 @@ def vu_worker(base, target, vu, data, deadline, out):
         return
     uid = me["userId"]
     headers = me["headers"]
+    # One persistent keep-alive connection per client app — real clients pool;
+    # a per-request TCP connect would bill connect overhead to every step
+    # (review, round 1). http.client is not thread-safe: one per VU thread.
+    conn = benchlib.PooledClient(base)
 
     def step(name, requests):
         for method, url, body in requests:
             t0 = time.perf_counter()
-            status, _ = benchlib.request(method, url, body, headers)
+            status, _ = conn.request(method, url, body, headers)
             ms = (time.perf_counter() - t0) * 1000
             out["total"] += 1
             # Non-4xx/5xx counts as ok; status 0 (transport error) does NOT —
@@ -161,6 +165,8 @@ def vu_worker(base, target, vu, data, deadline, out):
         # Whole-session duration includes the think time — it's the user's
         # wall-clock journey, matching the JS.
         out["sessions"].append((time.perf_counter() - start) * 1000)
+
+    conn.close()
 
 
 def trend(values, decimals=2, p99=True):

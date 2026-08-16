@@ -56,10 +56,12 @@ Plus **footprint**, which is a bigger Rust-vs-.NET story than percentiles:
 
 ### Warm and cold, side by side (never blended)
 
-The headline latency is **steady state**: every measured window is preceded by
-same-endpoint warmup at the measured rate (`BENCH_WARMUP_SECS`), identical on both
-servers — long enough for .NET tiered compilation to promote to tier-1 code, so the
-comparison isn't Rust-vs-quick-JIT. **Cold** is a real user experience too (server
+The headline latency is **steady state**, via two-stage warmup identical on both
+servers: one global pass cycling every endpoint after bring-up
+(`BENCH_GLOBAL_WARMUP_SECS` — .NET tier-1 promotion is per-method and mostly shared
+code, so promoting it once beats paying a long warmup 117 times), then a short
+same-endpoint top-up at the measured rate before each window (`BENCH_WARMUP_SECS`).
+The comparison is never Rust-vs-quick-JIT. **Cold** is a real user experience too (server
 restart, first browse) and a legitimate Rust advantage, so it's published as its own
 labeled metric: after the warm legs, the server is **restarted before each sentinel
 endpoint** (hitting one endpoint warms shared state for the next) and the first
@@ -103,9 +105,10 @@ Mechanics (all enforced, not advisory):
 - **A window that can't hold its rate fails.** If the achieved rate falls below
   `BENCH_RATE_TOLERANCE` × target, the generator has silently degraded into a closed
   loop — the leg exits non-zero and `merge.py` marks the row incomparable.
-- **The generator proves it isn't the bottleneck.** Every run measures vegeta's own
-  ceiling against `/System/Ping` and records it (`meta.generator_ceiling_rps`); any
-  target rate at/above the ceiling fails loud.
+- **The generator proves it isn't the bottleneck.** Every run measures the max
+  `/System/Ping` throughput on the server under test — `meta.ping_ceiling_rps`, i.e.
+  min(generator capacity, that server's ping capacity), a conservative lower bound on
+  what the generator can dispatch — and any target rate at/above it fails loud.
 - **Two legs stay closed-loop on purpose** and say so: phase C (mixed contention — the
   interference is the point) and phase D (think-time user journeys — a home media
   server has a fixed small user population, which is exactly the case where the

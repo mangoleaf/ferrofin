@@ -189,13 +189,15 @@ function frozenSetBanner(r, b) {
 function statCards(h) {
   const card = (n, l, color) =>
     `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
-  return card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup",
-              h.median_speedup >= 1 ? "var(--good)" : "var(--bad)")
+  // Parity coverage leads (exact, deterministic); the ratio comes LAST and
+  // labeled — it is the noisiest number on the page (review, round 1).
+  return card(pct(h.parity_coverage), "parity coverage", "var(--accent)")
+    + card(h.comparable_rows, "comparable rows")
     + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
     + (h.ties != null ? card(h.ties, `≈ ties (<${h.noise_floor_ms ?? "?"} ms)`) : "")
     + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
-    + card(h.comparable_rows, "comparable rows")
-    + card(pct(h.parity_coverage), "parity coverage", "var(--accent)");
+    + card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup (noisy — see aggregate)",
+           h.median_speedup >= 1 ? "var(--good)" : "var(--bad)");
 }
 
 function render() {

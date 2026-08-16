@@ -7,9 +7,10 @@ requirement — median-only gating hides tail regressions). Two input shapes,
 one baseline file (this directory's perf-baseline.json, sections `raw` and
 `merged`):
 
-Raw capture mode — driven by suite/perf/perf-gate.sh, which runs k6 per
-sentinel endpoint into results/raw/perfgate-ferrofin-<name>.json (CWD-relative,
-the runner cd's into suite/perf/):
+Raw capture mode — driven by suite/perf/perf-gate.sh, which runs perf_gate.py
+(open-loop vegeta) per sentinel endpoint into
+results/raw/perfgate-ferrofin-<name>.json (CWD-relative, the runner cd's into
+suite/perf/):
 
   python3 ../gate.py compare-raw    <baselineFile> <factor> <name...>
   python3 ../gate.py rebaseline-raw <baselineFile> <rate> <secs> <name...>
@@ -102,6 +103,8 @@ def rebaseline_raw(baseline_file, rate, secs, names):
             sys.exit(f"rebaseline: no data for {name} — aborting")
         if cur.get("bad"):
             sys.exit(f"rebaseline: {name} had {cur['bad']} non-200s — refusing to baseline a broken endpoint")
+        if cur.get("rate_held") is False:
+            sys.exit(f"rebaseline: {name} did not hold its open-loop rate — refusing to baseline a degraded window")
         endpoints[name] = {p: cur[p] for p in PCTS}
     doc = _read_baseline_file(baseline_file)
     doc["raw"] = {"params": {"rate": int(rate), "secs": int(secs)}, "endpoints": endpoints}
@@ -134,7 +137,15 @@ def compare_raw(baseline_file, factor, names):
         cur = _load_raw(name)
         if not cur or not cur.get("ok"):
             regressed.append(name)
-            print(name.ljust(24) + "NO DATA (k6 produced no measured 200s)", file=err)
+            print(name.ljust(24) + "NO DATA (no measured expected-status responses)", file=err)
+            continue
+        if cur.get("rate_held") is False:
+            # The window degraded into a closed loop (generator couldn't hold
+            # the schedule) — its percentiles are not comparable to an
+            # open-loop baseline. Counted as a failure so the runner's
+            # retry-once path re-measures it.
+            regressed.append(name)
+            print(name.ljust(24) + "RATE NOT HELD (open-loop window degraded — remeasure)", file=err)
             continue
         if not base:
             print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   (no baseline — skipped)",
@@ -163,7 +174,19 @@ def latest_run():
     return live[-1]
 
 
+def _run_model(run):
+    return (run["meta"].get("load") or {}).get("model")
+
+
 def rebaseline_merged(run):
+    # A baseline is only meaningful for the methodology that will be gated
+    # against it — stamping open-loop unconditionally would disarm the
+    # refusal guard the moment someone rebaselines from a legacy record
+    # (review finding, round 1). Derive from the run; refuse anything else.
+    model = _run_model(run)
+    if model != "open-loop":
+        sys.exit(f"gate: refusing to baseline a non-open-loop run (meta.load.model={model!r}) "
+                 "— produce a run with the current suite (`suite/run.sh all`) first")
     # Keyed by VARIANT (each /Items variant has its own latency); deep_verified is its op's.
     variants = {}
     for o in run["operations"]:
@@ -177,13 +200,16 @@ def rebaseline_merged(run):
         if (p.get("cold") or {}).get("h_first") is not None:
             variants[p["variant"]]["h_cold_first"] = p["cold"]["h_first"]
     doc = _read_baseline_file(BASELINE)
-    doc["merged"] = {"factor": FACTOR, "engine": "open-loop",
+    doc["merged"] = {"factor": FACTOR, "engine": model,
                      "ferrofin": run["meta"]["ferrofin"], "variants": variants}
     BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
     print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['ferrofin']} [merged]")
 
 
 def check_merged(run):
+    if _run_model(run) != "open-loop":
+        sys.exit(f"gate: latest run is not an open-loop record (meta.load.model="
+                 f"{_run_model(run)!r}) — methodology-incomparable with the baseline")
     doc = _read_baseline_file(BASELINE)
     merged = doc.get("merged")
     if not merged:

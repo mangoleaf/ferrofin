@@ -34,6 +34,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import benchlib
@@ -61,9 +62,12 @@ def rate_for(name, rates):
 
 
 def measure_ceiling(base, ctx):
-    """I4: the generator's own throughput ceiling on this host, measured against
-    the cheapest endpoint (/System/Ping). Recorded into meta; a target rate
-    above it means the generator, not the server, is the bottleneck."""
+    """I4: an upper bound the open-loop rates must stay under, measured as the
+    max throughput of /System/Ping on the server under test. This is
+    min(generator capacity, that server's ping capacity) — NOT a pure
+    generator number (it differs per leg), hence the honest name
+    ping_ceiling_rps. As a guard it is conservative-correct: any target rate
+    below it is one the generator can provably dispatch."""
     ping = next(e for e in ENDPOINTS if e["name"] == "system_ping")
     targets = vegeta.build_targets(base, ping, ctx)
     records = vegeta.max_attack(targets, duration_secs=5)
@@ -91,11 +95,19 @@ def run_bench(target, base):
     (RAW / f"{target}-ctx.json").write_text(json.dumps(ctx, indent=2) + "\n")
 
     rates = load_rates()
-    # H1: warmup is SAME-endpoint traffic at the measured rate, identical on
-    # both servers, long enough for .NET tiered compilation to promote the hot
-    # paths to tier-1 — otherwise a short window measures Jellyfin's quick-JIT
-    # tier-0 code and flatters Ferrofin (Rust has no tiers; it gets the same
-    # warmup anyway so the protocol stays symmetric).
+    # H1, two-stage (identical on both servers so the comparison is never
+    # Rust-vs-quick-JIT): a global pass promoting the mostly-shared .NET code
+    # once, then a short same-endpoint top-up at the measured rate before each
+    # window. Rust has no tiers; it gets the same protocol for symmetry.
+    global_warmup = CONFIG["BENCH_GLOBAL_WARMUP_SECS"]
+    if global_warmup:
+        print(f">> [{target}] global warmup: cycling all endpoints for {global_warmup}s "
+              f"(.NET tier-1 promotion of shared code)", flush=True)
+        warm_deadline = time.monotonic() + global_warmup
+        warm_eps = [e for e in ENDPOINTS if not e["scenario"]]
+        while time.monotonic() < warm_deadline:
+            for e in warm_eps:
+                benchlib.fire(base, e, ctx)
     warmup = CONFIG["BENCH_WARMUP_SECS"]
     duration = CONFIG["BENCH_DURATION_SECS"]
     login_rate = CONFIG["BENCH_LOGIN_RATE"]
@@ -103,17 +115,18 @@ def run_bench(target, base):
     tolerance = CONFIG["BENCH_RATE_TOLERANCE"]
 
     ceiling = measure_ceiling(base, ctx)
-    print(f">> [{target}] generator ceiling: {ceiling} rps (open-loop rates must stay below)")
+    print(f">> [{target}] ping ceiling: {ceiling} rps (open-loop rates must stay below; "
+          f"= min(generator, this server's /System/Ping capacity))")
 
     out = {"target": target, "durationSec": duration, "endpoints": {},
-           "meta": {"engine": f"vegeta {vegeta.version()}", "generator_ceiling_rps": ceiling,
+           "meta": {"engine": f"vegeta {vegeta.version()}", "ping_ceiling_rps": ceiling,
                     "rates_meta": rates.get("_meta", {}), "bench_config": resolved_meta()}}
     failures = []
     main_eps = [e for e in ENDPOINTS if not e["scenario"]]
     for i, e in enumerate(main_eps, 1):
         rate, src = rate_for(e["name"], rates)
         if rate >= ceiling:
-            failures.append(f"{e['name']}: target rate {rate} ≥ generator ceiling {ceiling}")
+            failures.append(f"{e['name']}: target rate {rate} ≥ ping ceiling {ceiling}")
             out["endpoints"][e["name"]] = {"p50": None, "p95": None, "p99": None,
                                            "count": 0, "rps": 0, "okPct": 0,
                                            "rate_source": src, "rate_held": False}
@@ -161,12 +174,21 @@ def calibrate_rates(target, base):
     for i, e in enumerate(main_eps, 1):
         targets = vegeta.build_targets(base, e, ctx)
         records = vegeta.max_attack(targets, duration_secs=8)
-        ok = [1 for code, _ in records if code == e["ok"]]
-        capacity = len(records) / 8
+        ok = sum(1 for code, _ in records if code == e["ok"])
+        # Capacity counts EXPECTED-STATUS responses only (review finding,
+        # round 1): an endpoint that 4xx's fast would otherwise calibrate a
+        # rate the real path can never hold. Zero ok responses ⇒ no entry —
+        # the bench falls back to the flat rate and records rate_source.
+        capacity = ok / 8
+        if not ok:
+            print(f"   [{i:3}/{len(main_eps)}] {e['name']:28} 0/{len(records)} expected-status — "
+                  f"NOT calibrated (flat BENCH_RATE will apply)", flush=True)
+            continue
         rate = max(1, round(capacity * fraction))
         rates[e["name"]] = rate
+        note = "" if ok == len(records) else f"  (! only {ok}/{len(records)} expected-status)"
         print(f"   [{i:3}/{len(main_eps)}] {e['name']:28} capacity≈{capacity:7.1f}/s "
-              f"→ rate {rate}/s  (ok {len(ok)}/{len(records)})", flush=True)
+              f"→ rate {rate}/s{note}", flush=True)
     doc = {"_meta": {"calibrated_on": target, "fraction": fraction,
                      "engine": f"vegeta {vegeta.version()}",
                      "note": "rate = fraction × measured max throughput of the weaker server; "

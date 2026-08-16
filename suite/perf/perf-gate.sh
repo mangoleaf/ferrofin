@@ -39,6 +39,11 @@ BASELINE=../perf-baseline.json
 REBASELINE=0
 [ "${1:-}" = "--rebaseline" ] && REBASELINE=1
 
+# Containers must come down on EVERY exit path — including a set -e abort
+# mid-script (a review-caught crash here once left docker up after measuring
+# all 11 endpoints). The explicit downs below remain (idempotent).
+trap 'docker compose down -v >/dev/null 2>&1 || true' EXIT
+
 # Library list — the ONE construction in suite/lib.sh (this script used to
 # duplicate it inline; the copies drifted being the risk, not a bug yet).
 suite_build_libraries
@@ -61,7 +66,7 @@ run_endpoints "$ENDPOINTS_LIST"
 
 if [ "$REBASELINE" = 1 ]; then
   # shellcheck disable=SC2086  # word-splitting is intentional: names → separate args
-  python3 ../gate.py rebaseline-raw "$BASELINE" "$VUS" "$SECS" $ENDPOINTS_LIST
+  python3 ../gate.py rebaseline-raw "$BASELINE" "$RATE" "$SECS" $ENDPOINTS_LIST
   docker compose down -v >/dev/null 2>&1 || true
   exit 0
 fi

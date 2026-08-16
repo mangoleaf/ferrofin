@@ -33,7 +33,8 @@
     },
     "when": "2026-08-04T17:33Z",
     "ferrofin": "v0.8.5-7-gb41adc1",
-    "ferrofin_sha": "b41adc1"
+    "ferrofin_sha": "b41adc1",
+    "legacy": "k6-closed-loop"
   },
   "headline": {
     "comparable_rows": 73,

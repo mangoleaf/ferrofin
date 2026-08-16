@@ -4,5 +4,5 @@
 #            version is recorded into every run record's meta)
 #   cd suite/perf && mise install
 [tools]
-bats = "latest"
+bats = "1.13.0"
 "ubi:tsenart/vegeta" = "12.12.0"

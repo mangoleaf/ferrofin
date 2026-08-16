@@ -22,6 +22,7 @@ Fairness rules enforced here, not left to callers:
 
 import base64
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -87,15 +88,23 @@ def _run_attack(targets, extra_args, duration_secs):
         for t in targets:
             tf.write(json.dumps(t) + "\n")
         targets_path = tf.name
-    atk = subprocess.Popen(
-        vegeta_cmd() + ["attack", "-format=json", f"-targets={targets_path}",
-                        f"-duration={duration_secs}s"] + extra_args,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    enc = subprocess.Popen(vegeta_cmd() + ["encode", "-to=json"],
-                           stdin=atk.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    atk.stdout.close()
-    out, enc_err = enc.communicate(timeout=duration_secs + 120)
-    _, atk_err = atk.communicate(timeout=30)
+    try:
+        atk = subprocess.Popen(
+            vegeta_cmd() + ["attack", "-format=json", f"-targets={targets_path}",
+                            f"-duration={duration_secs}s"] + extra_args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        enc = subprocess.Popen(vegeta_cmd() + ["encode", "-to=json"],
+                               stdin=atk.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        atk.stdout.close()
+        out, enc_err = enc.communicate(timeout=duration_secs + 120)
+        _, atk_err = atk.communicate(timeout=30)
+    finally:
+        # delete=False is only so vegeta can open the path; a 470-window run
+        # must not leave 470 target files behind (review, round 1).
+        try:
+            os.unlink(targets_path)
+        except OSError:
+            pass
     if atk.returncode != 0:
         raise RuntimeError(f"vegeta attack failed: {atk_err.decode(errors='replace')[:400]}")
     if enc.returncode != 0:
