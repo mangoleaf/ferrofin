@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One command to (re)generate the Ferrofin-vs-Jellyfin benchmark. Run this every release.
 #   ./run.sh
-# Requires: docker, docker compose, k6, jq on the host. ffmpeg only for gen-fixtures.sh.
+# Requires: docker, docker compose, jq, python3 on the host, plus vegeta (pinned in
+# ./mise.toml — `mise install` here). ffmpeg only for gen-fixtures.sh.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -104,21 +105,28 @@ bench() {  # $1=service $2=port $3=TARGET
   : > "results/raw/$target-rss.txt"   # sampler appends; clear stale samples from prior runs
   sample_rss "$svc" "results/raw/$target-rss.txt" & local rss_pid=$!
 
-  TARGET="$target" BASE_URL="$base" k6 run scenario.js 2>&1 | tee "results/raw/$target-k6.log"
+  # compare.py exits non-zero when a leg couldn't hold its open-loop rate — that
+  # invalidates the whole leg. The `if !` guard (not bare set -e) ensures the
+  # background RSS sampler is reaped before we bail.
+  if ! python3 compare.py --target "$target" --base "$base" 2>&1 | tee "results/raw/$target-bench.log"; then
+    kill "$rss_pid" 2>/dev/null || true
+    echo "!! [$target] bench leg failed — no record will be merged" >&2
+    exit 3
+  fi
 
-  # Reuse the token scenario.js minted in setup() — provisioned (Jellyfin's bench user is
-  # created there via the startup wizard) and unthrottled. Re-authenticating here instead
-  # would 500 against Jellyfin: the auth_login scenario hammers /Users/AuthenticateByName
-  # at ${BENCH_VUS} VUs (login drops to ~7% success) and a fresh post-load login fails.
-  # setup() console.logs "CAPTURE_CREDS <token> <userId>"; empty ⇒ consumers self-auth.
-  local creds; creds=$(grep -oE 'CAPTURE_CREDS [^ "]+ [^ "]+' "results/raw/$target-k6.log" | tail -1)
-  ctok=$(awk '{print $2}' <<<"$creds"); cuid=$(awk '{print $3}' <<<"$creds")
+  # Reuse the token compare.py minted during bring-up — provisioned (Jellyfin's bench
+  # user is created there via the startup wizard) and unthrottled: the login-storm leg
+  # hammers /Users/AuthenticateByName and a fresh post-load login 500s on Jellyfin.
+  # compare.py persists it in results/raw/<target>-ctx.json (the old k6 setup() could
+  # only smuggle it out via a console-log grep).
+  ctok=$(jq -r '.token // empty' "results/raw/$target-ctx.json" 2>/dev/null)
+  cuid=$(jq -r '.userId // empty' "results/raw/$target-ctx.json" 2>/dev/null)
 
   # Stop RSS sampling BEFORE the transcode phase: its ffmpeg child peaks ~1 GB on a
   # 4K encode and would drown the server-footprint number on both sides identically.
   kill "$rss_pid" 2>/dev/null || true
 
-  [ "${RUN_TRANSCODE:-0}" = "1" ] && TARGET="$target" BASE_URL="$base" CAP_TOKEN="$ctok" CAP_UID="$cuid" k6 run transcode.js || true
+  [ "${RUN_TRANSCODE:-0}" = "1" ] && python3 ttfs.py --target "$target" --base "$base" || true
   suite_count_items "$base" "$ctok" "$cuid" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
   # Perf-side body fingerprint, BOTH servers — merge.py compares Ferrofin's shape
   # against Jellyfin's from this same leg (same fresh-scan DB state), flagging

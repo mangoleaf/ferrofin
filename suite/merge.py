@@ -119,7 +119,7 @@ def footprint():
         out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
         out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
         out[f"{key}_items"] = first(f"{tgt}-count.txt")
-        # HLS play-start TTFS (transcode.js, RUN_TRANSCODE=1): median time to
+        # HLS play-start TTFS (ttfs.py, RUN_TRANSCODE=1): median time to
         # first segment for a stream-copy remux and a forced 4K HEVC->H.264
         # encode — the closest thing to "how fast does play start" and a
         # headline metric, never to be dropped from the record.
@@ -146,6 +146,11 @@ def perf_by_variant():
                 "h_rps": hv.get("rps"), "h_ok": hv.get("okPct"),
                 "j_p50": jv.get("p50"), "j_p95": jv.get("p95"), "j_p99": jv.get("p99"),
                 "j_rps": jv.get("rps"), "j_ok": jv.get("okPct"),
+                # Open-loop bookkeeping (G1): both sides must have been driven at
+                # the SAME recorded arrival rate, and each must have held it.
+                "rate": hv.get("target_rate"), "rate_source": hv.get("rate_source"),
+                "h_rate_held": hv.get("rate_held"), "j_rate_held": jv.get("rate_held"),
+                "j_rate": jv.get("target_rate"),
             }
         return out, "raw-summary"
     bd = load_json(SUITE / "perf" / "bench-data.json")
@@ -230,6 +235,7 @@ def main():
     fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
     foot = footprint()
+    perf_meta = (load_json(SUITE / "perf/results/raw/ferrofin-summary.json") or {}).get("meta")
 
     # A1: measure the full manifest or fail loud (no green record with holes).
     # MERGE_ALLOW_INCOMPLETE=1 downgrades to a record stamped `incomplete` that
@@ -263,11 +269,18 @@ def main():
         drift = (not is_write) and op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
         both_ok = p.get("h_ok") == 100 and p.get("j_ok") == 100
         have_lat = p["h_p50"] is not None and p["j_p50"] is not None
-        comparable = deep and both_ok and have_lat and not drift
+        # G1: a latency comparison is only meaningful at the same arrival rate,
+        # actually held on both sides. Legacy (closed-loop) records carry no
+        # rate keys — None == None keeps them flowing through unchanged.
+        same_rate = p.get("rate") == p.get("j_rate")
+        rates_held = p.get("h_rate_held") is not False and p.get("j_rate_held") is not False
+        comparable = deep and both_ok and have_lat and not drift and same_rate and rates_held
         reason = (None if comparable else
                   "body shape diverges from Jellyfin at bench time" if drift else
                   "not deep-verified" if not deep else
-                  "200-rate < 100%" if not both_ok else "missing latency")
+                  "200-rate < 100%" if not both_ok else
+                  "measured at different arrival rates" if not same_rate else
+                  "open-loop rate not held" if not rates_held else "missing latency")
 
         win = wins_all_three(p)
         speedup = round(p["j_p50"] / p["h_p50"], 2) if have_lat and p["h_p50"] else None
@@ -309,8 +322,16 @@ def main():
             "fixture_hash": fixture_hash(),
             "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
             "mem": bench_env("BENCH_MEM"),
-            "load": {"vus": int(bench_env("BENCH_VUS")) if bench_env("BENCH_VUS") else None,
-                     "duration": bench_env("BENCH_DURATION")},
+            # The load model + engine + resolved methodology knobs come from the
+            # perf leg's own summary meta (compare.py) — self-describing records.
+            # Old (closed-loop k6) records carry {"vus","duration"} here instead;
+            # the comparability guard keys on this, so the two never compare.
+            "load": {"model": "open-loop",
+                     "duration_secs": (perf_meta or {}).get("bench_config", {})
+                     .get("values", {}).get("BENCH_DURATION_SECS")},
+            "engine": (perf_meta or {}).get("engine"),
+            "generator_ceiling_rps": (perf_meta or {}).get("generator_ceiling_rps"),
+            "bench_config": (perf_meta or {}).get("bench_config"),
             "perf_source": perf_src,
             "footprint": foot,
             # B1: the build identity the running server reported over

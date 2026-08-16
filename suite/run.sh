@@ -44,7 +44,7 @@ case "$stage" in
       # RUN_TRANSCODE=0 must reach the merge too: its manifest check (A1) reads the
       # env to know whether the TTFS legs were part of this measurement.
       shift
-      RUN_TRANSCODE=0 BENCH_VUS="${PERF_GATE_VUS:-10}" BENCH_DURATION="${PERF_GATE_SECONDS:-10}s" \
+      RUN_TRANSCODE=0 BENCH_DURATION_SECS="${PERF_GATE_SECONDS:-10}" BENCH_WARMUP_SECONDS=5 \
         "$ROOT/suite/perf/run.sh"
       RUN_TRANSCODE=0 python3 "$ROOT/suite/merge.py"
     fi

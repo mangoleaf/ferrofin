@@ -1,4 +1,8 @@
-# `mise install` here to get bats for run.bats (the benchmark helper tests).
-#   cd benchmark && mise install && bats run.bats
+# `mise install` here to get the suite's pinned tools:
+#   bats — run.bats (the benchmark helper tests)
+#   vegeta — the open-loop load generator (the measurement hot-path; its
+#            version is recorded into every run record's meta)
+#   cd suite/perf && mise install
 [tools]
 bats = "latest"
+"ubi:tsenart/vegeta" = "12.12.0"

@@ -62,9 +62,18 @@ jobs:
             echo "perf-gate: no perf-relevant paths touched — skipping"
             echo "relevant=0" >> "$GITHUB_OUTPUT"
           fi
-      - name: install k6 + ffmpeg
+      - name: install vegeta (+ k6 for pre-migration merge-bases) + ffmpeg
         if: steps.paths.outputs.relevant == '1'
         run: |
+          # vegeta drives the current suite (pinned to match suite/perf/mise.toml).
+          curl -sL https://github.com/tsenart/vegeta/releases/download/v12.12.0/vegeta_12.12.0_linux_amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin vegeta
+          # k6 remains only for merge-base trees that predate the Python/vegeta
+          # suite — the baseline leg runs the BASE tree's own perf-gate.sh.
+          # Drop this block once the migration commit is in every merge-base.
+          # NOTE: while the merge-base is still k6-driven, its baseline was
+          # measured closed-loop and the PR leg open-loop — the comparison is
+          # methodology-crossed noise; the job is continue-on-error by design.
           sudo gpg -k && sudo gpg --no-default-keyring \
             --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
             --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69

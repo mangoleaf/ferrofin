@@ -12,7 +12,7 @@ sentinel endpoint into results/raw/perfgate-ferrofin-<name>.json (CWD-relative,
 the runner cd's into suite/perf/):
 
   python3 ../gate.py compare-raw    <baselineFile> <factor> <name...>
-  python3 ../gate.py rebaseline-raw <baselineFile> <vus> <secs> <name...>
+  python3 ../gate.py rebaseline-raw <baselineFile> <rate> <secs> <name...>
 
 compare-raw prints a before/after table (all three percentiles) to STDERR and
 the space-separated regressed endpoint names to STDOUT — the runner re-runs
@@ -86,7 +86,7 @@ def _read_baseline_file(path):
         return {}
 
 
-def rebaseline_raw(baseline_file, vus, secs, names):
+def rebaseline_raw(baseline_file, rate, secs, names):
     """Writes the `raw` section from the current captures, preserving `merged`."""
     endpoints = {}
     for name in names:
@@ -97,9 +97,9 @@ def rebaseline_raw(baseline_file, vus, secs, names):
             sys.exit(f"rebaseline: {name} had {cur['bad']} non-200s — refusing to baseline a broken endpoint")
         endpoints[name] = {p: cur[p] for p in PCTS}
     doc = _read_baseline_file(baseline_file)
-    doc["raw"] = {"params": {"vus": int(vus), "secs": int(secs)}, "endpoints": endpoints}
+    doc["raw"] = {"params": {"rate": int(rate), "secs": int(secs)}, "endpoints": endpoints}
     Path(baseline_file).write_text(json.dumps(doc, indent=2) + "\n")
-    print(f"baselined {len(names)} endpoints @ {vus} VUs × {secs}s → {baseline_file} [raw]",
+    print(f"baselined {len(names)} endpoints @ {rate}/s × {secs}s → {baseline_file} [raw]",
           file=sys.stderr)
 
 
@@ -113,7 +113,7 @@ def compare_raw(baseline_file, factor, names):
     bp = raw.get("params", {})
     err = sys.stderr
     fmt = lambda n: "—" if n is None else f"{n:.1f}"  # noqa: E731 — tiny table formatter
-    print(f"perf-gate: factor {factor}×, baseline @ {bp.get('vus', '?')} VUs × {bp.get('secs', '?')}s", file=err)
+    print(f"perf-gate: factor {factor}×, baseline @ {bp.get('rate', bp.get('vus', '?'))}/s × {bp.get('secs', '?')}s", file=err)
     print("endpoint".ljust(24) + "".join(f"{p} base→cur (×)".ljust(22) for p in PCTS) + "200%  verdict", file=err)
 
     regressed = []

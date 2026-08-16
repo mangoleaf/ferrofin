@@ -34,6 +34,13 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [ "$status" -ne 0 ]
 }
 
+@test "bench.conf resolution: env wins, file supplies, defaults fill" {
+  run env BENCH_RATE=99 python3 perf/config.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"BENCH_RATE=99  (env)"* ]]
+  [[ "$output" == *"BENCH_RUNS=5  (bench.conf)"* ]]
+}
+
 # A1: without raw summaries the manifest is unmeasurable — merge must FAIL, not
 # write a green record with holes. (Skipped on a host that has fresh summaries.)
 @test "merge fails loud when the manifest is unmeasured" {

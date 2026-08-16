@@ -27,7 +27,7 @@ mixed() {   # $1=service $2=port $3=target
   bringup_scan "$svc" "$base" "$target" || return 0
 
   echo "   mixed ${BENCH_VUS}-VU load for ${BENCH_DURATION}"
-  k6 run -e TARGET="$target" -e BASE_URL="$base" phase-c.js </dev/null || true
+  python3 phase_c.py --target "$target" --base "$base" </dev/null || true
 
   # Whole-run peak (incl. scan) — the same yardstick for both runtimes. anon is
   # the working set (excludes reclaimable page cache).
@@ -43,5 +43,5 @@ docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase C report"
 VERSION=$(git -C .. describe --tags --always 2>/dev/null || echo dev)
-node render-phase-c.mjs "$VERSION" "$BENCH_VUS" "$BENCH_DURATION"
+python3 render_closed.py c "$VERSION" "$BENCH_VUS" "$BENCH_DURATION"
 echo ">> wrote results/phaseC-${VERSION}.md"

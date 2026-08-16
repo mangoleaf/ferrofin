@@ -11,13 +11,31 @@
 #   - suite_guard_no_probe refuses a probe while a measured k6 phase is running (would perturb it).
 
 # Load an env file (default .env), auto-exporting every value, seeding from .env.example once.
+# Also resolves the methodology knobs from suite/bench.conf FIRST (so .env / process
+# env win over it — the documented order: code default < bench.conf < env).
 suite_load_env() {  # $1=env file (relative to suite/perf/), default .env
   local envf="${1:-.env}"
+  suite_load_bench_conf
   [ -f "$envf" ] || cp .env.example "$envf"
   set -a
   # shellcheck disable=SC1090
   . "./$envf"
   set +a
+}
+
+# Export every bench.conf KEY=value that the process environment doesn't already
+# set. Python consumers resolve via suite/perf/config.py; this is the same
+# contract for the shell scripts. A missing bench.conf is fine (code defaults in
+# the consumers still apply).
+suite_load_bench_conf() {
+  local conf="../bench.conf" k v
+  [ -f "$conf" ] || conf="../../suite/bench.conf"
+  [ -f "$conf" ] || return 0
+  while IFS='=' read -r k v; do
+    case "$k" in ''|\#*) continue ;; esac
+    k="${k%"${k##*[![:space:]]}"}"   # rtrim
+    [ -n "${!k:-}" ] || export "$k=$v"
+  done < <(grep -E '^[A-Z_]+=' "$conf")
 }
 
 # Build the docker-side library list from REAL_MEDIA_DIR/REAL_TV_DIR and/or synthetic padding,
@@ -88,9 +106,12 @@ suite_count_items() {  # $1=base url  [$2=token $3=userId]
     | jq -r '.TotalRecordCount // "?"'
 }
 
-# Refuse a probe while a measured k6 phase is active — probes perturb the measurement, and a
-# reused session/DeviceId can corrupt it. Perf stages set SUITE_K6_ACTIVE=1 around each k6 run.
+# Refuse a probe while a measured load phase is active — probes perturb the measurement,
+# and a reused session/DeviceId can corrupt it. Perf stages set SUITE_MEASURE_ACTIVE=1
+# around each measured window (SUITE_K6_ACTIVE honored for muscle memory).
 suite_guard_no_probe() {
-  [ "${SUITE_K6_ACTIVE:-0}" = 1 ] && { echo "!! refusing probe: a k6 measurement phase is active" >&2; return 1; }
+  if [ "${SUITE_MEASURE_ACTIVE:-0}" = 1 ] || [ "${SUITE_K6_ACTIVE:-0}" = 1 ]; then
+    echo "!! refusing probe: a measured load phase is active" >&2; return 1
+  fi
   return 0
 }

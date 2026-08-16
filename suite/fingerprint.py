@@ -64,7 +64,7 @@ def capture(base, out, token=None, uid=None):
                               body=json.dumps({"Username": "bench", "Pw": "benchpass123"})))
         token, uid = auth["AccessToken"], auth["User"]["Id"]
     # Resolve the ids the expanded endpoint set templates on (mirror of
-    # bench-lib's enrichContext; missing shapes resolve to '' and those ops
+    # benchlib's enrich_context; missing shapes resolve to '' and those ops
     # skip below rather than fingerprinting a 404).
     items = json.loads(req(f"{base}/Items?userId={uid}&recursive=true&includeItemTypes=Movie&limit=1", token))
     item_id = (items.get("Items") or [{}])[0].get("Id", "")
