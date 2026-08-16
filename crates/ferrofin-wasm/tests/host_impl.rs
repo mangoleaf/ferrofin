@@ -106,6 +106,10 @@ async fn http_fetch_round_trips_once_collaborators_are_armed() {
     let (url, server) = one_shot_http("204 No Content", b"");
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
         users: std::sync::Arc::new(common::StubUsers),
         user_data: std::sync::Arc::new(common::StubUserData),
         tv: std::sync::Arc::new(common::StubTv),
@@ -140,6 +144,10 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     let segments = Arc::new(RecordingSegments::default());
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
         users: std::sync::Arc::new(common::StubUsers),
         user_data: std::sync::Arc::new(common::StubUserData),
         tv: std::sync::Arc::new(common::StubTv),
@@ -218,6 +226,10 @@ async fn state_and_next_up_flow_through_the_host_trait() {
         // Armed: next-up reaches the stub queue and enriches via user data.
         let cell = Arc::new(std::sync::OnceLock::new());
         cell.set(Collaborators {
+            media_streams: std::sync::Arc::new(common::StubStreams),
+            extractor: std::sync::Arc::new(common::StubExtractor::default()),
+            analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
             users: std::sync::Arc::new(common::StubUsers),
             user_data: std::sync::Arc::new(common::StubUserData),
             tv: std::sync::Arc::new(common::StubTv),

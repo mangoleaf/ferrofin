@@ -29,6 +29,7 @@ pub mod events;
 pub mod filesystem;
 pub mod library;
 pub mod localization;
+pub mod media_analysis;
 pub mod media_encoding;
 pub mod media_segments;
 pub mod merge_versions;

@@ -7,6 +7,7 @@
 //! hardware-acceleration matrix (nvenc/qsv/vaapi/videotoolbox) and BdInfo are
 //! deferred; core software transcode + ffprobe parsing are ported.
 
+pub mod analysis;
 pub mod attachments;
 pub mod configuration;
 pub mod encoder;
@@ -38,3 +39,5 @@ pub use transcoding::{
     SEGMENT_READY_POLL_INTERVAL_MS, SegmentTranscoder, SessionReporter, SpawnRequest,
     TokioSegmentTranscoder, TranscodeChild, TranscodeManagerImpl, WAIT_FOR_FILE_TIMEOUT_MS,
 };
+
+pub use analysis::FfmpegMediaExtractor;

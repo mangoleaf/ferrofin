@@ -50,6 +50,11 @@ use crate::bootstrap::FfmpegPaths;
 use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
+/// The plugin-analysis decode budget: a quarter of the visible cores.
+fn num_cpus_for_analysis() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get() / 4)
+}
+
 /// The product / package identity advertised by the server, ported from
 /// Jellyfin's `ApplicationHost` constants.
 const PRODUCT_NAME: &str = "Jellyfin Server";
@@ -1078,7 +1083,21 @@ pub async fn build_app_state(
         users: Arc::clone(&users),
         user_data: Arc::clone(&user_data),
         tv: Arc::clone(&tv_series),
+        media_streams: Arc::clone(&media_stream_repository),
+        extractor: Arc::new(ferrofin_mediaencoding::FfmpegMediaExtractor::new(
+            ffmpeg.ffmpeg.to_string_lossy().into_owned(),
+        )),
+        // Global decode budget for plugin analysis: a quarter of the cores,
+        // at least one — plugin analysis must never starve transcodes.
+        analysis: Arc::new(tokio::sync::Semaphore::new(
+            (num_cpus_for_analysis()).max(1),
+        )),
     });
+    // The analysis driver (offers new items to analyzer plugins) exists
+    // only when some loaded plugin declares scan-targets.
+    if let Some(task) = wasm_host.analysis_task(&plugins) {
+        task_manager.register(task);
+    }
 
     // ---- host + system + auth + quick-connect -----------------------------
     let app_host = Arc::new(FerrofinServerApplicationHost::new(

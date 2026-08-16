@@ -332,6 +332,10 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // Armed: the fixture's metadata-lookup answers ok(none); the second call
     // takes the (enabled, config) gate from the cache.
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+
         users: std::sync::Arc::new(common::StubUsers),
         user_data: std::sync::Arc::new(common::StubUserData),
         tv: std::sync::Arc::new(common::StubTv),
@@ -490,4 +494,62 @@ async fn dispatcher_routes_by_id_and_gates_on_enabled() {
             .expect("dispatch")
             .is_none()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analysis_driver_offers_each_item_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("fixture.wasm"),
+        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
+    )
+    .unwrap();
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        ferrofin_wasm::WasmPluginHost::load(
+            &load_dir,
+            &ferrofin_wasm::WasmSettings::resolve(None, None, None, None),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
+        std::sync::Arc::new(common::EnabledStub(b"{}".to_vec()));
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+    });
+    // The fixture declares scan-targets ["Movie"], so the driver exists.
+    let task = host
+        .analysis_task(&plugins)
+        .expect("fixture is an analyzer");
+    let progress = ferrofin_core::TaskProgress::default();
+    task.execute(&progress).await.expect("first pass");
+
+    // The offer-once watermark landed in the plugin's own state file under
+    // the host-reserved key (the canned item has no date-created → epoch).
+    let state_path = dir
+        .path()
+        .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff.state.json");
+    let mark = ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark")
+        .expect("watermark persisted");
+    assert_eq!(mark, b"0");
+
+    // Second pass: nothing newer than the watermark — it must not move,
+    // and the run still succeeds.
+    task.execute(&progress).await.expect("second pass");
+    let mark2 = ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark")
+        .expect("watermark still there");
+    assert_eq!(mark2, b"0");
 }

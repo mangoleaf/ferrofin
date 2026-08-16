@@ -36,6 +36,7 @@
     (data (i32.const 464) "AAA")                                  ;; transform search (3)
     (data (i32.const 468) "BBB")                                  ;; transform replace (3)
     (data (i32.const 472) "pong")                                 ;; handler body (4)
+    (data (i32.const 488) "Movie")                                ;; scan target (5)
     (data (i32.const 400) "<div data-role=\22page\22>fixture</div>") ;; page html (35)
 
     ;; descriptor: () -> record of 4 strings (8 i32s at the ret area)
@@ -171,6 +172,23 @@
       (i32.store (i32.const 1124) (i32.const 0))
       i32.const 1120)
 
+    ;; scan-targets: () -> list<string>; ["Movie"] so driver tests can
+    ;; exercise the analysis pass against this fixture.
+    (func (export "scan-targets") (result i32)
+      (i32.store (i32.const 1136) (i32.const 488))
+      (i32.store (i32.const 1140) (i32.const 5))
+      (i32.store (i32.const 1152) (i32.const 1136))
+      (i32.store (i32.const 1156) (i32.const 1))
+      i32.const 1152)
+
+    ;; scan-media: (item-summary) -> result<_, string>; args indirect (the
+    ;; grown item-summary exceeds 16 flats), always ok.
+    (func (export "scan-media") (param i32) (result i32)
+      (i32.store (i32.const 1168) (i32.const 0))
+      (i32.store (i32.const 1172) (i32.const 0))
+      (i32.store (i32.const 1176) (i32.const 0))
+      i32.const 1168)
+
     ;; handle-request: (plugin-request) -> plugin-response
     ;; plugin-request flattens to exactly 16 params (the direct-passing
     ;; limit): method p0/p1, path p2/p3, query p4/p5, headers p6/p7,
@@ -262,6 +280,11 @@
     (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
   (func $web-transforms (result (list $wt))
     (canon lift (core func $i "web-transforms") (memory $i "memory") string-encoding=utf8))
+  (func $scan-targets (result (list string))
+    (canon lift (core func $i "scan-targets") (memory $i "memory") string-encoding=utf8))
+  (func $scan-media (param "item" $item) (result (result (error string)))
+    (canon lift (core func $i "scan-media") (memory $i "memory")
+      (realloc (core func $i "realloc")) string-encoding=utf8))
   (func $declared-egress (result (list string))
     (canon lift (core func $i "declared-egress") (memory $i "memory") string-encoding=utf8))
   (func $handle-request (param "request" $req) (result $resp)
@@ -284,6 +307,8 @@
   (export "tasks" (func $tasks))
   (export "config-pages" (func $config-pages))
   (export "web-transforms" (func $web-transforms))
+  (export "scan-targets" (func $scan-targets))
+  (export "scan-media" (func $scan-media))
   (export "declared-egress" (func $declared-egress))
   (export "handle-request" (func $handle-request))
   (export "run-task" (func $run-task))

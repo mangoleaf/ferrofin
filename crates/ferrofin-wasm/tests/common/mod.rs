@@ -106,7 +106,23 @@ pub struct OneMovieLibrary {
 #[allow(clippy::unimplemented)]
 impl LibraryManager for OneMovieLibrary {
     async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        unimplemented!("stub")
+        // The canned movie, for the id it advertises; None otherwise (the
+        // analysis capabilities resolve items through this).
+        if _id.to_string() != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01" {
+            return Ok(None);
+        }
+        Ok(Some(BaseItemEntity {
+            id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEFF01".to_owned(),
+            name: Some("Big Buck Bunny".to_owned()),
+            type_: ferrofin_core::item_type_lookup::stored_type_name(
+                ferrofin_model::data::BaseItemKind::Movie,
+            )
+            .unwrap()
+            .to_owned(),
+            path: Some("/media/movies/bbb.mkv".to_owned()),
+            run_time_ticks: Some(5_000_000_000),
+            ..BaseItemEntity::default()
+        }))
     }
     async fn query_items(
         &self,
@@ -553,5 +569,99 @@ pub fn test_user(id: Uuid) -> UserEntity {
         subtitle_mode: 0,
         sync_play_access: 0,
         username: "plugin-test-user".to_owned(),
+    }
+}
+
+/// A recording extractor: returns a deterministic tone/frame so capability
+/// tests can assert caps + plumbing without ffmpeg.
+#[derive(Default)]
+pub struct StubExtractor {
+    /// The (path, start, duration) of the last audio request.
+    pub last_audio: Mutex<Option<(String, f64, f64)>>,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::media_analysis::MediaExtractor for StubExtractor {
+    async fn extract_audio(
+        &self,
+        path: &str,
+        start_seconds: f64,
+        duration_seconds: f64,
+        spec: ferrofin_traits::media_analysis::AudioSpec,
+    ) -> Result<Vec<i16>, ServiceError> {
+        *self.last_audio.lock().unwrap() = Some((path.to_owned(), start_seconds, duration_seconds));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // bounded test durations
+        let samples =
+            (duration_seconds * f64::from(spec.sample_rate)) as usize * usize::from(spec.channels);
+        Ok(vec![7i16; samples.min(1024)])
+    }
+
+    async fn extract_frames(
+        &self,
+        _path: &str,
+        timestamps_seconds: &[f64],
+        max_dimension: u32,
+        jpeg: bool,
+    ) -> Result<Vec<ferrofin_traits::media_analysis::ExtractedFrame>, ServiceError> {
+        Ok(timestamps_seconds
+            .iter()
+            .map(|&t| ferrofin_traits::media_analysis::ExtractedFrame {
+                seconds: t,
+                width: max_dimension,
+                height: max_dimension,
+                jpeg,
+                data: vec![0u8; 16],
+            })
+            .collect())
+    }
+}
+
+/// Stream stub: one audio + one video row for any item.
+pub struct StubStreams;
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::persistence::MediaStreamRepository for StubStreams {
+    async fn get_media_streams(
+        &self,
+        filter: &ferrofin_traits::persistence::MediaStreamQuery,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::MediaStreamInfoEntity>, ServiceError> {
+        let mut audio = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+            item_id: filter.item_id.to_string(),
+            ..Default::default()
+        };
+        audio.stream_type = 0;
+        let mut video = audio.clone();
+        video.stream_type = 1;
+        Ok(vec![audio, video])
+    }
+
+    async fn get_media_stream_languages(
+        &self,
+        _stream_type: ferrofin_model::entities::MediaStreamType,
+    ) -> Result<Vec<String>, ServiceError> {
+        unimplemented!("stub")
+    }
+
+    async fn save_media_streams(
+        &self,
+        _item_id: Uuid,
+        _streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+
+    async fn get_media_streams_batch(
+        &self,
+        _item_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<
+            Uuid,
+            Vec<ferrofin_db::entities::base_items::MediaStreamInfoEntity>,
+        >,
+        ServiceError,
+    > {
+        unimplemented!("stub")
     }
 }

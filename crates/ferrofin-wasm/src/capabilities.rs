@@ -44,6 +44,14 @@ pub struct Collaborators {
     pub user_data: Arc<dyn ferrofin_traits::library::UserDataManager>,
     /// The NextUp algorithm behind the `next-up` host function.
     pub tv: Arc<dyn ferrofin_traits::tv::TvSeriesManager>,
+    /// Stream rows behind `media-info` (has-audio/has-video).
+    pub media_streams: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository>,
+    /// The decoder behind `extract-audio`/`extract-frames`.
+    pub extractor: Arc<dyn ferrofin_traits::media_analysis::MediaExtractor>,
+    /// Global analysis-decode budget shared by every plugin (per-plugin
+    /// concurrency is already 1 — each plugin's calls serialize on its own
+    /// runtime thread).
+    pub analysis: Arc<tokio::sync::Semaphore>,
 }
 
 /// A plugin's declared public-egress allowlist, parsed once at load from
@@ -383,7 +391,7 @@ fn parse_sort_by(sort: &str) -> Result<ferrofin_model::live_tv::ItemSortBy, Stri
 }
 
 /// Projects one entity (+ optional per-user data) into the WIT summary.
-fn summarize(
+pub(crate) fn summarize(
     e: &ferrofin_db::entities::base_items::BaseItemEntity,
     user_data: Option<&ferrofin_model::dto::UserItemDataDto>,
 ) -> ItemSummary {
@@ -531,6 +539,183 @@ fn parse_segment_type(name: &str) -> Result<MediaSegmentType, String> {
             "unknown segment-type `{other}` (expected Intro/Outro/Recap/Preview/Commercial)"
         )),
     }
+}
+
+/// Analysis caps — hardcoded abuse guards (PLAN_MEDIA_ANALYSIS_CAPABILITY):
+/// longest audio window per call, in seconds.
+const AUDIO_WINDOW_MAX_SECS: f64 = 60.0;
+/// Most frames per `extract-frames` call.
+const FRAMES_PER_CALL_MAX: usize = 16;
+/// Longest output edge for a sampled frame, in pixels.
+const FRAME_DIMENSION_MAX: u32 = 320;
+/// Ticks per second (Jellyfin's 100 ns unit).
+const TICKS_PER_SEC: f64 = 10_000_000.0;
+
+/// Resolves a guest-named library item to its filesystem path — the ONLY
+/// way media bytes are ever addressed (a guest never supplies paths).
+fn resolve_media_path(cx: &Collaborators, item_id: &str) -> Result<(Uuid, String), String> {
+    let id: Uuid = item_id
+        .parse()
+        .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
+    let entity = cx
+        .handle
+        .block_on(cx.library.get_item_by_id(id))
+        .map_err(|e| format!("item lookup failed: {e}"))?
+        .ok_or_else(|| format!("no such library item {id}"))?;
+    let path = entity
+        .path
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("item {id} has no media path"))?;
+    Ok((id, path))
+}
+
+/// Executes `media-info` for a guest.
+///
+/// # Errors
+/// Unknown/pathless item or repository failure, as the guest-visible string.
+pub fn media_info(
+    cx: &Collaborators,
+    item_id: &str,
+) -> Result<crate::bindings::types::MediaTechnicalInfo, String> {
+    let id: Uuid = item_id
+        .parse()
+        .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
+    let entity = cx
+        .handle
+        .block_on(cx.library.get_item_by_id(id))
+        .map_err(|e| format!("item lookup failed: {e}"))?
+        .ok_or_else(|| format!("no such library item {id}"))?;
+    let streams = cx
+        .handle
+        .block_on(cx.media_streams.get_media_streams(
+            &ferrofin_traits::persistence::MediaStreamQuery {
+                item_id: id,
+                stream_type: None,
+                index: None,
+            },
+        ))
+        .map_err(|e| format!("stream lookup failed: {e}"))?;
+    // Stream-type discriminants per the DB mapping: 0 = Audio, 1 = Video.
+    Ok(crate::bindings::types::MediaTechnicalInfo {
+        duration_ticks: entity.run_time_ticks.unwrap_or(0),
+        has_audio: streams.iter().any(|s| s.stream_type == 0),
+        has_video: streams.iter().any(|s| s.stream_type == 1),
+        container: entity
+            .path
+            .as_deref()
+            .and_then(|p| p.rsplit('.').next())
+            .unwrap_or_default()
+            .to_lowercase(),
+    })
+}
+
+/// Executes `extract-audio` for a guest: caps the window, clamps the spec,
+/// resolves the item, and decodes under the global analysis budget.
+///
+/// # Errors
+/// Cap violations, unknown items, or decode failures.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // tick↔second conversions: values are bounded (≤60 s windows) long before
+// any cast, so precision/truncation cannot bite.
+pub fn extract_audio(
+    cx: &Collaborators,
+    memory_limit_bytes: usize,
+    window: &crate::bindings::types::AudioWindow,
+) -> Result<crate::bindings::types::AudioChunk, String> {
+    let duration_secs = window.duration_ticks as f64 / TICKS_PER_SEC;
+    if !(0.0..=AUDIO_WINDOW_MAX_SECS).contains(&duration_secs) || duration_secs == 0.0 {
+        return Err(format!(
+            "audio window must be 0..{AUDIO_WINDOW_MAX_SECS} seconds (got {duration_secs:.1})"
+        ));
+    }
+    let spec = ferrofin_traits::media_analysis::AudioSpec {
+        sample_rate: window.spec.sample_rate.clamp(8_000, 48_000),
+        channels: window.spec.channels.clamp(1, 2),
+    };
+    // Refuse windows whose decoded size cannot fit the byte budget (a
+    // quarter of the plugin's memory limit) BEFORE decoding anything.
+    let bytes_cap = memory_limit_bytes / 4;
+    let decoded_bytes =
+        (duration_secs * f64::from(spec.sample_rate) * f64::from(spec.channels) * 2.0) as usize;
+    if decoded_bytes > bytes_cap {
+        return Err(format!(
+            "decoded window (~{decoded_bytes} bytes) exceeds the plugin's analysis budget              ({bytes_cap} bytes) — request a shorter window or lower rate"
+        ));
+    }
+    let (_, path) = resolve_media_path(cx, &window.item_id)?;
+    let start_secs = (window.start_ticks.max(0)) as f64 / TICKS_PER_SEC;
+    let samples = cx
+        .handle
+        .block_on(async {
+            let _permit = cx.analysis.acquire().await;
+            cx.extractor
+                .extract_audio(&path, start_secs, duration_secs, spec)
+                .await
+        })
+        .map_err(|e| format!("audio extraction failed: {e}"))?;
+    Ok(crate::bindings::types::AudioChunk {
+        spec: crate::bindings::types::AudioSpec {
+            sample_rate: spec.sample_rate,
+            channels: spec.channels,
+        },
+        start_ticks: window.start_ticks,
+        samples,
+    })
+}
+
+/// Executes `extract-frames` for a guest.
+///
+/// # Errors
+/// Cap violations, unknown items, or decode failures.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+// tick↔second conversions on bounded timestamps.
+pub fn extract_frames(
+    cx: &Collaborators,
+    request: &crate::bindings::types::FrameRequest,
+) -> Result<Vec<crate::bindings::types::VideoFrame>, String> {
+    if request.timestamps_ticks.is_empty() {
+        return Ok(Vec::new());
+    }
+    if request.timestamps_ticks.len() > FRAMES_PER_CALL_MAX {
+        return Err(format!(
+            "at most {FRAMES_PER_CALL_MAX} frames per call (got {})",
+            request.timestamps_ticks.len()
+        ));
+    }
+    let max_dimension = request.max_dimension.clamp(16, FRAME_DIMENSION_MAX);
+    let jpeg = matches!(request.format, crate::bindings::types::FrameFormat::Jpeg);
+    let (_, path) = resolve_media_path(cx, &request.item_id)?;
+    let timestamps: Vec<f64> = request
+        .timestamps_ticks
+        .iter()
+        .map(|t| (*t).max(0) as f64 / TICKS_PER_SEC)
+        .collect();
+    let frames = cx
+        .handle
+        .block_on(async {
+            let _permit = cx.analysis.acquire().await;
+            cx.extractor
+                .extract_frames(&path, &timestamps, max_dimension, jpeg)
+                .await
+        })
+        .map_err(|e| format!("frame extraction failed: {e}"))?;
+    Ok(frames
+        .into_iter()
+        .map(|f| crate::bindings::types::VideoFrame {
+            ticks: (f.seconds * TICKS_PER_SEC) as i64,
+            width: f.width,
+            height: f.height,
+            format: if f.jpeg {
+                crate::bindings::types::FrameFormat::Jpeg
+            } else {
+                crate::bindings::types::FrameFormat::Gray8
+            },
+            data: f.data,
+        })
+        .collect())
 }
 
 /// The plugin key/value state caps — hardcoded abuse guards in the

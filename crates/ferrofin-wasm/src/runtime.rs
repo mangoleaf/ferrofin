@@ -96,6 +96,15 @@ pub enum Command {
         /// Receives the guest's response (or the host/trap error text).
         reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
     },
+    /// Offer the guest one library item for media analysis.
+    ScanMedia {
+        /// The item, as the shared summary projection.
+        item: crate::bindings::types::ItemSummary,
+        /// Fresh configuration JSON to snapshot before the call.
+        config: String,
+        /// Receives the guest's outcome (or the host/trap error text).
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Ask the guest for metadata on one item (the scan's dynamic pass).
     MetadataLookup {
         /// The item as scanned so far.
@@ -252,6 +261,35 @@ impl RuntimeHandle {
             .map_err(|_| "plugin runtime dropped the request reply".to_owned())?
     }
 
+    /// Offers the guest one item for media analysis and awaits its outcome.
+    ///
+    /// # Errors
+    /// The guest's error text, the breaker being open, or the runtime
+    /// thread being gone.
+    pub async fn scan_media(
+        &self,
+        item: crate::bindings::types::ItemSummary,
+        config: String,
+    ) -> Result<(), String> {
+        if self.is_dead() {
+            return Err(format!(
+                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
+                self.plugin_name
+            ));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::ScanMedia {
+                item,
+                config,
+                reply,
+            })
+            .await
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        rx.await
+            .map_err(|_| "plugin runtime dropped the scan reply".to_owned())?
+    }
+
     /// Asks the guest for metadata on one item and awaits its offer.
     ///
     /// # Errors
@@ -406,6 +444,11 @@ fn run_loop(
                 config,
                 reply,
             } => dispatch_request(spec, store, instance, &request, config, reply),
+            Command::ScanMedia {
+                item,
+                config,
+                reply,
+            } => dispatch_scan(spec, store, instance, &item, config, reply),
             Command::MetadataLookup {
                 item,
                 provider_ids,
@@ -469,6 +512,7 @@ fn trip_if_due(spec: &InstanceSpec, dead: &AtomicBool, consecutive_failures: u32
 }
 
 /// Answers a command that will not be executed (dead plugin / broken state).
+#[allow(clippy::match_same_arms)] // arms differ by reply TYPE, not intent
 fn refuse(command: Command, plugin_name: &str) {
     let message = format!("plugin `{plugin_name}` is disabled until restart (circuit breaker)");
     match command {
@@ -476,6 +520,9 @@ fn refuse(command: Command, plugin_name: &str) {
             let _ = reply.send(Err(message));
         }
         Command::HandleRequest { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
+        Command::ScanMedia { reply, .. } => {
             let _ = reply.send(Err(message));
         }
         Command::MetadataLookup { reply, .. } => {
@@ -500,6 +547,31 @@ fn dispatch_request(
     match instance.call_handle_request(&mut *store, request) {
         Ok(response) => {
             let _ = reply.send(Ok(response));
+            false
+        }
+        Err(trap) => {
+            let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+            true
+        }
+    }
+}
+
+/// Runs one `scan-media` guest call (extracted from the actor loop for the
+/// same readability reason as [`dispatch_request`]). Returns whether the
+/// call trapped.
+fn dispatch_scan(
+    spec: &InstanceSpec,
+    store: &mut Store<HostState>,
+    instance: &Plugin,
+    item: &crate::bindings::types::ItemSummary,
+    config: String,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+) -> bool {
+    store.data_mut().config_json = config;
+    store.set_epoch_deadline(spec.timeout_ticks);
+    match instance.call_scan_media(&mut *store, item) {
+        Ok(outcome) => {
+            let _ = reply.send(outcome);
             false
         }
         Err(trap) => {

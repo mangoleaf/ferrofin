@@ -156,6 +156,33 @@ impl host::Host for HostState {
         crate::capabilities::next_up(cx, &user_id, limit)
     }
 
+    fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("media-info is not available during plugin load")?;
+        crate::capabilities::media_info(cx, &item_id)
+    }
+
+    fn extract_audio(&mut self, window: types::AudioWindow) -> Result<types::AudioChunk, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-audio is not available during plugin load")?;
+        crate::capabilities::extract_audio(cx, self.memory_limit_bytes, &window)
+    }
+
+    fn extract_frames(
+        &mut self,
+        request: types::FrameRequest,
+    ) -> Result<Vec<types::VideoFrame>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-frames is not available during plugin load")?;
+        crate::capabilities::extract_frames(cx, &request)
+    }
+
     fn query_items(&mut self, query: types::ItemQuery) -> Result<Vec<types::ItemSummary>, String> {
         let cx = self
             .collaborators

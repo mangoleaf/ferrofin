@@ -10,7 +10,7 @@
 /// SECURITY MODEL: guests get no filesystem and no network. Every effect a
 /// plugin can have on the outside world goes through the `host` interface
 /// below — this file IS the reviewable attack surface.
-package ferrofin:plugin@0.3.0;
+package ferrofin:plugin@0.4.0;
 
 /// Data types shared by both sides of the boundary.
 interface types {
@@ -77,7 +77,7 @@ interface types {
         query: string,
         /// Request headers as (name, value) pairs.
         headers: list<tuple<string, string>>,
-        /// The request body (the host caps its size).
+        /// The request body (the host caps it at 1 MiB).
         body: option<list<u8>>,
         /// The authenticated caller's user id, when there is one.
         user-id: option<string>,
@@ -110,10 +110,94 @@ interface types {
         /// The served-file name pattern the transform applies to
         /// (e.g. `index.html`, `*.chunk.js`).
         path-pattern: string,
-        /// The literal text to find (the host caps its size).
+        /// The literal text to find (the host caps it at 256 KiB).
         search: string,
-        /// The literal replacement text (the host caps its size).
+        /// The literal replacement text (the host caps it at 256 KiB).
         replace: string,
+    }
+
+    /// Decoded-audio parameters for `extract-audio`. The host pins the
+    /// entire codec pipeline; a guest only chooses rate/channels, and the
+    /// host clamps the rate to 8000..=48000 and channels to 1..=2.
+    record audio-spec {
+        /// Target sample rate in Hz (clamped to 8000..=48000).
+        sample-rate: u32,
+        /// Channel count: 1 (mono) or 2 (interleaved stereo).
+        channels: u8,
+    }
+
+    /// One window of one library item's audio. The guest names a library
+    /// ITEM — never a filesystem path; the host resolves the file itself.
+    /// The window is capped at 60 seconds per call AND at a decoded size of
+    /// one quarter of the plugin's memory limit; longer analyses stream
+    /// consecutive windows (fingerprinting/loudness are streaming anyway).
+    record audio-window {
+        /// Canonical UUID string of the library item.
+        item-id: string,
+        /// Window start, in ticks (100 ns units).
+        start-ticks: s64,
+        /// Window length, in ticks (host cap: 60 s).
+        duration-ticks: s64,
+        /// Requested decode parameters.
+        spec: audio-spec,
+    }
+
+    /// Interleaved signed-16-bit PCM, exactly as requested.
+    record audio-chunk {
+        /// The spec actually decoded (after clamping).
+        spec: audio-spec,
+        /// The window start, echoed.
+        start-ticks: s64,
+        /// Interleaved samples.
+        samples: list<s16>,
+    }
+
+    /// Still-frame encodings for `extract-frames`.
+    enum frame-format {
+        /// Raw 8-bit grayscale at exactly max-dimension × max-dimension
+        /// (aspect is NOT preserved — analysis frames, not thumbnails).
+        gray8,
+        /// JPEG, scaled to fit max-dimension (aspect preserved).
+        jpeg,
+    }
+
+    /// Sampled stills from one library item. Host caps: at most 16
+    /// timestamps per call, max-dimension clamped to 320.
+    record frame-request {
+        /// Canonical UUID string of the library item.
+        item-id: string,
+        /// The instants to sample, in ticks.
+        timestamps-ticks: list<s64>,
+        /// The longest output edge, in pixels (clamped to 320).
+        max-dimension: u32,
+        /// The output encoding.
+        format: frame-format,
+    }
+
+    /// One sampled still.
+    record video-frame {
+        /// The sampled instant, in ticks.
+        ticks: s64,
+        /// Output width in pixels.
+        width: u32,
+        /// Output height in pixels.
+        height: u32,
+        /// The encoding used.
+        format: frame-format,
+        /// The encoded bytes.
+        data: list<u8>,
+    }
+
+    /// The technical facts a guest needs to window an item sensibly.
+    record media-technical-info {
+        /// Total runtime in ticks (0 when unknown).
+        duration-ticks: s64,
+        /// Whether the item has at least one audio stream.
+        has-audio: bool,
+        /// Whether the item has at least one video stream.
+        has-video: bool,
+        /// The container hint (file extension), lowercased; may be empty.
+        container: string,
     }
 
     /// A background task the plugin offers to the scheduled-task registry.
@@ -259,7 +343,8 @@ interface types {
 /// a guest has on the world. Every function here is host-mediated, logged,
 /// and bounded; adding one is a security decision, not a convenience.
 interface host {
-    use types.{log-level, http-request, http-response, item-summary, item-query, media-segment};
+    use types.{log-level, http-request, http-response, item-summary, item-query, media-segment,
+        media-technical-info, audio-window, audio-chunk, frame-request, video-frame};
 
     /// Emits a log line into the server's tracing pipeline, tagged with the
     /// plugin's id and name.
@@ -287,12 +372,30 @@ interface host {
     get-state: func(key: string) -> option<list<u8>>;
 
     /// Writes (or with `none`, deletes) THIS plugin's state value for
-    /// `key`. The host caps key size, value size, and the plugin's total
-    /// state; writes past a cap fail with an error.
+    /// `key`. Caps: keys ≤ 256 bytes, values ≤ 1 MiB, a plugin's total
+    /// state ≤ 8 MiB; writes past a cap fail with an error.
     set-state: func(key: string, value: option<list<u8>>) -> result<_, string>;
 
     /// The user's next episodes to watch, in order (Jellyfin's NextUp).
     next-up: func(user-id: string, limit: u32) -> result<list<item-summary>, string>;
+
+    /// The technical facts of one library item (duration, stream kinds).
+    /// Collaborator-armed: refused during plugin load, like `query-items`.
+    media-info: func(item-id: string) -> result<media-technical-info, string>;
+
+    /// Decodes one bounded audio window of a library item to PCM — the
+    /// generic media-analysis primitive (THE HOST DECODES, THE GUEST
+    /// ANALYZES): fingerprinting, loudness, silence detection and anything
+    /// not yet invented are all guest code over these windows. The host
+    /// owns the decoder invocation entirely (no arguments cross this
+    /// boundary beyond the window), runs it under a global analysis
+    /// concurrency budget, and refuses the call during plugin load.
+    extract-audio: func(window: audio-window) -> result<audio-chunk, string>;
+
+    /// Samples bounded still frames of a library item (black-frame,
+    /// scene-cut and similar visual analyses). Same rules as
+    /// `extract-audio`: host-owned pipeline, capped output, load-denied.
+    extract-frames: func(request: frame-request) -> result<list<video-frame>, string>;
 
     /// Replaces THIS plugin's media segments for an item (other providers'
     /// and user-authored segments are untouched — each plugin writes under
@@ -346,6 +449,20 @@ world plugin {
     /// `404` unconditionally. See the `plugin-request` trust note: this
     /// runs for UNAUTHENTICATED callers too.
     export handle-request: func(request: plugin-request) -> plugin-response;
+
+    /// The item kinds this plugin ANALYZES (`Movie`, `Episode`, `Audio`,
+    /// …). Empty — the common case — means the plugin is not an analyzer
+    /// and `scan-media` is never called. Identity export: read once at
+    /// load, network-mute.
+    export scan-targets: func() -> list<string>;
+
+    /// Offered one eligible library item by the host's analysis pass
+    /// (each new item is offered once per plugin, host-tracked). The guest
+    /// pulls data with `media-info`/`extract-audio`/`extract-frames` and
+    /// persists results through its existing capabilities
+    /// (`write-media-segments`, `set-state`). An error is logged and
+    /// counted toward the plugin's breaker — it NEVER fails the scan.
+    export scan-media: func(item: item-summary) -> result<_, string>;
 
     /// The background tasks this plugin contributes (may be empty).
     export tasks: func() -> list<task-descriptor>;
