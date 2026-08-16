@@ -27,6 +27,8 @@ DEFAULTS = {
     "BENCH_RUNS": 5,
     "BENCH_NOISE_FLOOR_MS": 3.0,
     # open-loop load
+    "BENCH_MIN_SAMPLES": 1000,
+    "BENCH_MIN_WINDOW_SECS": 5,
     "BENCH_DURATION_SECS": 30,
     "BENCH_RATE": 25,
     "BENCH_RATE_FRACTION": 0.5,

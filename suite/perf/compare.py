@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 import benchlib
+import bootstrap
 import vegeta
 from config import CONFIG, resolved_meta
 from endpoints import ENDPOINTS
@@ -60,6 +61,19 @@ def rate_for(name, rates):
     if r:
         return r, "calibrated"
     return CONFIG["BENCH_RATE"], "flat-default"
+
+
+def window_secs(rate):
+    """Measured-window length for one endpoint: enough requests for stable
+    tail percentiles rather than a flat wall-time (precision scales with
+    SAMPLES; a flat 30 s at a 500/s calibrated rate collects 15k samples the
+    tails don't need, ×118 endpoints ×2 servers ×N runs = hours of nothing).
+    clamp(MIN_SAMPLES/rate, floor, cap) — the floor keeps a wall-clock-long
+    enough window for cache/steady-state effects, the cap bounds the slow
+    endpoints. Identical for both servers (derives only from the shared rate)."""
+    return max(CONFIG["BENCH_MIN_WINDOW_SECS"],
+               min(CONFIG["BENCH_DURATION_SECS"],
+                   math.ceil(CONFIG["BENCH_MIN_SAMPLES"] / rate)))
 
 
 def measure_ceiling(base, ctx):
@@ -100,11 +114,11 @@ def open_loop_window(base, e, ctx, rate, warmup_secs, duration_secs):
 
 def run_bench(target, base):
     print(f">> [{target}] bring-up", flush=True)
-    ctx = benchlib.bring_up(base, target)
-    benchlib.pick_items(base, ctx)
-    benchlib.enrich_context(base, ctx)
-    RAW.mkdir(parents=True, exist_ok=True)
-    (RAW / f"{target}-ctx.json").write_text(json.dumps(ctx, indent=2) + "\n")
+    # ready_ctx reuses a still-valid provisioned state (publish runs ≥2 keep
+    # the scanned volume — rescanning identical media N times bought nothing
+    # but wall-clock); a fresh DB invalidates the saved token and provisions
+    # from scratch. run.sh removes the ctx file whenever it wipes the volume.
+    ctx = bootstrap.ready_ctx(target, base)
 
     rates = load_rates()
     # H1, two-stage (identical on both servers so the comparison is never
@@ -127,7 +141,6 @@ def run_bench(target, base):
                     break
                 benchlib.fire(base, e, ctx)
     warmup = CONFIG["BENCH_WARMUP_SECS"]
-    duration = CONFIG["BENCH_DURATION_SECS"]
     login_rate = CONFIG["BENCH_LOGIN_RATE"]
     login_secs = CONFIG["BENCH_LOGIN_DURATION_SECS"]
     tolerance = CONFIG["BENCH_RATE_TOLERANCE"]
@@ -136,7 +149,7 @@ def run_bench(target, base):
     print(f">> [{target}] ping ceiling: {ceiling} rps (open-loop rates must stay below; "
           f"= min(generator, this server's /System/Ping capacity))")
 
-    out = {"target": target, "durationSec": duration, "endpoints": {},
+    out = {"target": target, "durationSec": CONFIG["BENCH_DURATION_SECS"], "endpoints": {},
            "meta": {"engine": f"vegeta {vegeta.version()}", "ping_ceiling_rps": ceiling,
                     "rates_meta": rates.get("_meta", {}), "bench_config": resolved_meta()}}
     failures = []
@@ -149,13 +162,15 @@ def run_bench(target, base):
                                            "count": 0, "rps": 0, "okPct": 0,
                                            "rate_source": src, "rate_held": False}
             continue
-        row = open_loop_window(base, e, ctx, rate, warmup, duration)
+        dur = window_secs(rate)
+        row = open_loop_window(base, e, ctx, rate, warmup, dur)
         row["rate_source"] = src
+        row["duration_secs"] = dur
         row["rate_held"] = row["achieved_rate"] >= tolerance * rate
         if not row["rate_held"]:
             failures.append(f"{e['name']}: achieved {row['achieved_rate']}/s of target {rate}/s")
         out["endpoints"][e["name"]] = row
-        print(f"   [{i:3}/{len(main_eps)}] {e['name']:28} rate={rate:>4}/s "
+        print(f"   [{i:3}/{len(main_eps)}] {e['name']:28} rate={rate:>4}/s×{dur:>2}s "
               f"p50={row['p50']} p95={row['p95']} p99={row['p99']} ok={row['okPct']}%", flush=True)
 
     # Login storm — its own open-loop window after the mixed legs drain.

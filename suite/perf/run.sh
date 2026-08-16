@@ -86,8 +86,18 @@ sample_rss() {  # $1=service $2=outfile
 
 bench() {  # $1=service $2=port $3=TARGET
   local svc="$1" base="http://localhost:$2" target="$3"
-  echo ">> [$target] clean start"
-  docker compose down -v >/dev/null 2>&1 || true
+  # BENCH_KEEP_DATA=1 (publish runs ≥2): reuse the scanned volume from the
+  # previous run instead of wiping + rescanning identical media — the DB state
+  # is identical by construction (write rows are state-preserving), and only
+  # measurement noise needs to be independent across runs, not the scan.
+  # compare.py's ready_ctx revalidates the saved token either way.
+  if [ "${BENCH_KEEP_DATA:-0}" = "1" ]; then
+    echo ">> [$target] start (keeping scanned volume from previous run)"
+  else
+    echo ">> [$target] clean start"
+    docker compose down -v >/dev/null 2>&1 || true
+    rm -f "results/raw/$target-ctx.json"   # fresh DB ⇒ saved tokens/ids are dead
+  fi
   # BENCH_SKIP_BUILD=1: use the existing ferrofin-bench:local image (e.g. one built
   # from a clean `git archive HEAD` while the working tree carries in-flight edits).
   if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then
@@ -165,7 +175,11 @@ else
   if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
   if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
 fi
-docker compose down -v >/dev/null 2>&1 || true
+if [ "${BENCH_KEEP_DATA:-0}" = "1" ]; then
+  docker compose stop >/dev/null 2>&1 || true   # volumes live on for the next run
+else
+  docker compose down -v >/dev/null 2>&1 || true
+fi
 
 echo ">> rendering report"
 VERSION=$(git -C .. describe --tags --always 2>/dev/null || echo dev)

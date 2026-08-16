@@ -49,6 +49,11 @@ case "$stage" in
     fi
     RUNS_N="${BENCH_RUNS:-$(cd "$ROOT/suite/perf" && python3 -c 'from config import CONFIG; print(CONFIG["BENCH_RUNS"])')}"
     "$ROOT/suite/parity/sweep.sh"
+    # One wipe up front, one cleanup at the end: runs 2..N reuse the scanned
+    # volumes (BENCH_KEEP_DATA — rescanning identical media N times bought
+    # nothing but wall-clock; only measurement noise needs independence).
+    (cd "$ROOT/suite/perf" && docker compose down -v >/dev/null 2>&1) || true
+    export BENCH_KEEP_DATA=1
     for i in $(seq 1 "$RUNS_N"); do
       echo ">> publish run $i/$RUNS_N"
       # Rebuild only on the first pass; identical tree → identical image after,
@@ -60,6 +65,7 @@ case "$stage" in
       "$ROOT/suite/perf/run.sh"
       python3 "$ROOT/suite/merge.py"
     done
+    (cd "$ROOT/suite/perf" && docker compose down -v >/dev/null 2>&1) || true
     exec python3 "$ROOT/suite/aggregate.py"
     ;;
   merge)   exec python3 "$ROOT/suite/merge.py" "$@" ;;

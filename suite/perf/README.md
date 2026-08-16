@@ -102,6 +102,14 @@ Mechanics (all enforced, not advisory):
   driven at the *same* recorded rate. Without a calibrated entry the flat `BENCH_RATE`
   applies and the record says so (`rate_source: flat-default`). Re-calibrate on
   rebaseline (host/fixture-local, like the baseline itself).
+- **Windows are sample-count-based.** Percentile precision scales with samples, not
+  wall time: each endpoint's measured window is
+  `clamp(BENCH_MIN_SAMPLES/rate, BENCH_MIN_WINDOW_SECS, BENCH_DURATION_SECS)` —
+  identical on both servers (it derives only from the shared rate) and recorded per
+  row. A flat 30 s window at calibrated rates collected 10-100× more samples than the
+  tails need, ×118 endpoints ×2 servers ×N runs; this is what keeps a full run in
+  hours, not days. Publish runs ≥2 also reuse the scanned volume (`BENCH_KEEP_DATA` —
+  DB state is identical by construction; only measurement noise needs independence).
 - **A window that can't hold its rate fails.** If the achieved rate falls below
   `BENCH_RATE_TOLERANCE` × target, the generator has silently degraded into a closed
   loop — the leg exits non-zero and `merge.py` marks the row incomparable.
