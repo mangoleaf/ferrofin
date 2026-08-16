@@ -197,6 +197,22 @@ impl Guest for HelloPlugin {
         host::log(LogLevel::Debug, &format!("saw event {event_name}"));
     }
 
+    fn remote_images(item: ItemSummary) -> Result<Vec<ImageCandidate>, String> {
+        // The reference artwork source: one Primary candidate for the demo
+        // title. The HOST downloads the URL (through this plugin's declared
+        // egress) — the guest never touches image bytes.
+        if item.kind == "Movie" && item.name.contains("Bunny") {
+            return Ok(vec![ImageCandidate {
+                kind: "Primary".to_owned(),
+                url: "https://peach.blender.org/wp-content/uploads/bbb-splash.png".to_owned(),
+                width: Some(1920),
+                height: Some(1080),
+                language: None,
+            }]);
+        }
+        Ok(vec![])
+    }
+
     fn metadata_lookup(
         item: ItemSummary,
         _provider_ids: Vec<(String, String)>,

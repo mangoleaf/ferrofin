@@ -186,6 +186,12 @@ pub struct LoadedPlugin {
     /// Where the plugin's KV state persists — the analysis driver keeps its
     /// offer-once watermark there under a host-reserved key.
     state_path: std::path::PathBuf,
+    /// The plugin's parsed declared-egress policy — the artwork-download
+    /// path re-checks it host-side (the guest only names URLs).
+    egress: Arc<capabilities::EgressPolicy>,
+    /// Whether the admin granted this plugin private-network HTTP (the
+    /// grant supersedes declared egress, exactly as in `http-fetch`).
+    private_http_allowed: bool,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -573,7 +579,8 @@ fn load_one(
     store.data_mut().plugin_name.clone_from(&spec.plugin_name);
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
     store.data_mut().private_http_allowed = spec.private_http_allowed;
-    store.data_mut().egress = egress;
+    store.data_mut().egress = Arc::clone(&egress);
+    let private_http_allowed = spec.private_http_allowed;
 
     let runtime = runtime::spawn(
         spec,
@@ -591,6 +598,8 @@ fn load_one(
         scan_targets,
         provider_info,
         state_path,
+        egress,
+        private_http_allowed,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
@@ -928,18 +937,11 @@ struct WasmMetadataProvider {
 /// ≪ human toggle latency works; not worth a setting.
 const METADATA_GATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[async_trait]
-impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
-    fn name(&self) -> &str {
-        &self.plugin.descriptor.name
-    }
-
-    async fn lookup(
-        &self,
-        item: &ferrofin_traits::providers::DynamicMetadataLookup,
-    ) -> Result<Option<ferrofin_traits::providers::DynamicMetadataResult>, ServiceError> {
-        // Inert until the composition root arms the collaborators (a scan
-        // cannot run before that) and while the plugin is disabled.
+impl WasmMetadataProvider {
+    /// The shared per-item gate: `None` while the collaborators are unarmed
+    /// or the plugin is disabled, otherwise the fresh config JSON to hand
+    /// the guest. Snapshot-cached per [`METADATA_GATE_CACHE_TTL`].
+    async fn gate(&self) -> Result<Option<String>, ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Ok(None);
         };
@@ -952,48 +954,80 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
         let (enabled, config) = if let Some((_, enabled, config)) = cached {
             (enabled, config)
         } else {
-            {
-                let enabled = cx
-                    .plugins
-                    .get_plugin(self.plugin.descriptor.id)
-                    .await?
-                    .is_some_and(|d| d.enabled);
-                let config = cx
-                    .plugins
-                    .get_plugin_configuration(self.plugin.descriptor.id)
-                    .await
-                    .map_or_else(
-                        |_| String::from("{}"),
-                        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
-                    );
-                *self.gate_cache.lock().expect("gate cache lock poisoned") =
-                    Some((std::time::Instant::now(), enabled, config.clone()));
-                (enabled, config)
-            }
+            let enabled = cx
+                .plugins
+                .get_plugin(self.plugin.descriptor.id)
+                .await?
+                .is_some_and(|d| d.enabled);
+            let config = cx
+                .plugins
+                .get_plugin_configuration(self.plugin.descriptor.id)
+                .await
+                .map_or_else(
+                    |_| String::from("{}"),
+                    |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+                );
+            *self.gate_cache.lock().expect("gate cache lock poisoned") =
+                Some((std::time::Instant::now(), enabled, config.clone()));
+            (enabled, config)
         };
-        if !enabled {
-            return Ok(None);
-        }
+        Ok(enabled.then_some(config))
+    }
+}
 
-        let wire_item = bindings::types::ItemSummary {
-            id: item.item_id.to_string(),
-            name: item.name.clone(),
-            kind: item.kind.clone(),
-            path: item.path.clone(),
-            parent_id: None,
-            run_time_ticks: None,
-            // The scan offer carries identity only — the plugin queries for
-            // anything richer; per-user fields never apply to a scan.
-            genres: Vec::new(),
-            premiere_date: None,
-            date_created: None,
-            community_rating: None,
-            production_year: None,
-            is_folder: false,
-            played: None,
-            is_favorite: None,
-            playback_position_ticks: None,
+/// Projects a scanner lookup into the wire [`ItemSummary`] a scan offer
+/// carries — identity only; the plugin queries for anything richer, and
+/// per-user fields never apply to a scan.
+fn scan_wire_item(
+    item: &ferrofin_traits::providers::DynamicMetadataLookup,
+) -> bindings::types::ItemSummary {
+    bindings::types::ItemSummary {
+        id: item.item_id.to_string(),
+        name: item.name.clone(),
+        kind: item.kind.clone(),
+        path: item.path.clone(),
+        parent_id: None,
+        run_time_ticks: None,
+        genres: Vec::new(),
+        premiere_date: None,
+        date_created: None,
+        community_rating: None,
+        production_year: None,
+        is_folder: false,
+        played: None,
+        is_favorite: None,
+        playback_position_ticks: None,
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
+    fn name(&self) -> &str {
+        // The ADVERTISED identity: a declared provider-descriptor name is
+        // what the library-options UI lists and what saved TypeOptions
+        // reference — the gate must match on the same string.
+        self.plugin
+            .provider_info
+            .as_ref()
+            .map_or(&self.plugin.descriptor.name, |info| &info.name)
+    }
+
+    fn library_gated(&self) -> bool {
+        // Declaring provider-info opts the plugin into per-library admin
+        // control; a plugin without one supplements ungated, as before.
+        self.plugin.provider_info.is_some()
+    }
+
+    async fn lookup(
+        &self,
+        item: &ferrofin_traits::providers::DynamicMetadataLookup,
+    ) -> Result<Option<ferrofin_traits::providers::DynamicMetadataResult>, ServiceError> {
+        // Inert until the composition root arms the collaborators (a scan
+        // cannot run before that) and while the plugin is disabled.
+        let Some(config) = self.gate().await? else {
+            return Ok(None);
         };
+        let wire_item = scan_wire_item(item);
         let offer = self
             .plugin
             .runtime
@@ -1015,6 +1049,64 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 provider_ids: m.provider_ids,
             }),
         )
+    }
+
+    async fn images(
+        &self,
+        item: &ferrofin_traits::providers::DynamicMetadataLookup,
+        wanted: &[ferrofin_model::entities::ImageType],
+    ) -> Result<Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>, ServiceError> {
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(config) = self.gate().await? else {
+            return Ok(Vec::new());
+        };
+        let candidates = self
+            .plugin
+            .runtime
+            .remote_images(scan_wire_item(item), config)
+            .await
+            .map_err(ServiceError::backend)?;
+
+        let mut out = Vec::new();
+        for kind in wanted {
+            // Candidate kinds arrive as strings; parse against the model
+            // enum's serde names so unknown kinds are skipped, not errors.
+            let Some(candidate) = candidates.iter().find(|c| {
+                serde_json::from_value::<ferrofin_model::entities::ImageType>(
+                    serde_json::Value::String(c.kind.clone()),
+                )
+                .is_ok_and(|parsed| parsed == *kind)
+            }) else {
+                continue;
+            };
+            let plugin = Arc::clone(&self.plugin);
+            let url = candidate.url.clone();
+            let downloaded = tokio::task::spawn_blocking(move || {
+                capabilities::download_image(
+                    &plugin.descriptor.name,
+                    plugin.private_http_allowed,
+                    &plugin.egress,
+                    &url,
+                )
+            })
+            .await
+            .map_err(|e| ServiceError::backend(format!("image download task failed: {e}")))?;
+            match downloaded {
+                Ok(bytes) => out.push((*kind, bytes)),
+                // A refused/failed candidate loses its slot but never the
+                // scan — same rule as every other plugin offer.
+                Err(reason) => warn!(
+                    plugin = %self.plugin.descriptor.id,
+                    item = %item.item_id,
+                    kind = ?kind,
+                    reason,
+                    "wasm plugin artwork candidate refused/failed; skipping"
+                ),
+            }
+        }
+        Ok(out)
     }
 }
 

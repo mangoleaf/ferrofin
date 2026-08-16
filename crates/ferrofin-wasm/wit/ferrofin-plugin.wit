@@ -213,6 +213,23 @@ interface types {
         playback-position-ticks: option<s64>,
     }
 
+    /// One remote-artwork candidate a provider offers. The HOST downloads
+    /// the winning candidate itself, through the plugin's declared egress
+    /// (a provider plugin declares its API and image-CDN hosts) — raw
+    /// image bytes never cross the guest boundary.
+    record image-candidate {
+        /// The image slot (`Primary`, `Backdrop`, `Logo`, `Thumb`, …).
+        kind: string,
+        /// The image URL (must sit inside the plugin's declared egress).
+        url: string,
+        /// Pixel width, when known.
+        width: option<u32>,
+        /// Pixel height, when known.
+        height: option<u32>,
+        /// BCP-47 language of any embedded text, when known.
+        language: option<string>,
+    }
+
     /// A named metadata provider's identity: how the plugin appears in
     /// the library-options provider lists (Dashboard → Libraries).
     record provider-descriptor {
@@ -472,7 +489,7 @@ interface host {
 
 /// The contract a Ferrofin plugin component implements.
 world plugin {
-    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result, plugin-request, plugin-response, web-transform, provider-descriptor};
+    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result, plugin-request, plugin-response, web-transform, provider-descriptor, image-candidate};
 
     import host;
 
@@ -523,6 +540,12 @@ world plugin {
     /// supplement-only rule (full provider ordering is a server-side
     /// roadmap item that applies to built-in providers too).
     export provider-info: func() -> option<provider-descriptor>;
+
+    /// Remote-artwork candidates for one item (empty for non-providers).
+    /// Called during the scan for items still missing artwork after the
+    /// built-in providers ran; the host downloads the first suitable
+    /// candidate per missing slot through the plugin's declared egress.
+    export remote-images: func(item: item-summary) -> result<list<image-candidate>, string>;
 
     /// The item kinds this plugin ANALYZES (`Movie`, `Episode`, `Audio`,
     /// …). Empty — the common case — means the plugin is not an analyzer

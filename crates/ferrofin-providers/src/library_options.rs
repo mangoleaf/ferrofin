@@ -21,6 +21,33 @@ use ferrofin_model::configuration::{
 };
 use ferrofin_model::entities::ImageType;
 
+/// The advertised provider names — the EXACT strings clients round-trip in
+/// `TypeOptions.MetadataFetchers` / `ImageFetchers` (and the flat reader
+/// lists), and therefore the strings the scanner's per-library gate matches
+/// on. Matching Jellyfin's provider `Name` properties keeps a migrated
+/// Jellyfin database's saved checkbox state meaningful. Never rename one:
+/// renaming orphans every saved library's fetcher selection.
+pub mod fetcher_names {
+    /// The local Kodi/XBMC NFO reader/saver.
+    pub const NFO: &str = "Nfo";
+    /// TMDB metadata + images.
+    pub const TMDB: &str = "TheMovieDb";
+    /// OMDb (Rotten Tomatoes rating supplement).
+    pub const OMDB: &str = "The Open Movie Database";
+    /// TheTVDB series/episode metadata + artwork.
+    pub const TVDB: &str = "TheTVDB";
+    /// fanart.tv artwork supplement.
+    pub const FANART: &str = "FanArt";
+    /// MusicBrainz id resolution for music.
+    pub const MUSICBRAINZ: &str = "MusicBrainz";
+    /// TheAudioDB music metadata + artwork.
+    pub const AUDIODB: &str = "TheAudioDB";
+    /// Sidecar/art-dir image discovery.
+    pub const LOCAL_IMAGES: &str = "Local Images";
+    /// Cover art extracted from the media file itself.
+    pub const EMBEDDED_IMAGES: &str = "Embedded Image Extractor";
+}
+
 /// A capability a provider exposes (one provider may expose several).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cap {
@@ -103,6 +130,50 @@ fn providers() -> Vec<Provider> {
             name: "The Open Movie Database",
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Movie", "Series", "Episode"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            // Optional at runtime (needs an API key/config), like OMDb —
+            // the checkbox gates; absence of config just yields no hits.
+            name: fetcher_names::TVDB,
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            types: &["Series", "Season", "Episode"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::FANART,
+            caps: &[Cap::ImageFetcher],
+            types: &["Movie", "Series"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::MUSICBRAINZ,
+            caps: &[Cap::MetadataFetcher],
+            types: &["MusicArtist", "MusicAlbum", "Audio"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::AUDIODB,
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            types: &["MusicArtist", "MusicAlbum"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::EMBEDDED_IMAGES,
+            caps: &[Cap::ImageFetcher],
+            types: &[
+                "Movie",
+                "Episode",
+                "MusicVideo",
+                "Video",
+                "Audio",
+                "AudioBook",
+            ],
             default_enabled: true,
             compiled: true,
         },
@@ -228,10 +299,17 @@ pub fn library_options_info(
                     .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
                     .map(|(name, _)| dynamic_info(name)),
             );
+            let mut image_fetchers = per_type(Cap::ImageFetcher);
+            image_fetchers.extend(
+                dynamic_fetchers
+                    .iter()
+                    .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
+                    .map(|(name, _)| dynamic_info(name)),
+            );
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
                 metadata_fetchers,
-                image_fetchers: per_type(Cap::ImageFetcher),
+                image_fetchers,
                 supported_image_types: supported_image_types(type_name),
                 default_image_options: default_image_options(type_name),
             }

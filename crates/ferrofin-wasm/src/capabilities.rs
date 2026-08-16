@@ -296,6 +296,58 @@ pub fn http_fetch(
     })
 }
 
+/// Cap on one downloaded remote-artwork candidate. Hardcoded abuse guard:
+/// posters/backdrops are single-digit MiB; anything larger is not artwork.
+pub const IMAGE_DOWNLOAD_MAX: usize = 20 * 1024 * 1024;
+
+/// Wall-clock bound for one artwork download (a CDN GET, not a transfer
+/// job — generous for any real poster/backdrop).
+pub const IMAGE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Downloads one remote-artwork candidate ON THE PLUGIN'S BEHALF — the
+/// guest only names URLs; bytes never enter guest memory. The download runs
+/// through the exact same gate as `http-fetch`: declared-egress allowlist
+/// checked pre-DNS, private-address vetting with the DNS-rebinding pin,
+/// redirects off.
+///
+/// # Errors
+/// The same refusals as [`http_fetch`], a non-200 status, or an over-cap
+/// body — as a plain string for the scan warn line.
+pub fn download_image(
+    plugin_name: &str,
+    private_http_allowed: bool,
+    egress: &EgressPolicy,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(IMAGE_DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("building image download client: {e}"))?;
+    let response = http_fetch(
+        &client,
+        plugin_name,
+        IMAGE_DOWNLOAD_MAX,
+        private_http_allowed,
+        egress,
+        IMAGE_DOWNLOAD_TIMEOUT,
+        &HttpRequest {
+            method: String::from("GET"),
+            url: url.to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    )?;
+    if response.status != 200 {
+        return Err(format!("image download returned HTTP {}", response.status));
+    }
+    if response.body.is_empty() {
+        return Err(String::from("image download returned an empty body"));
+    }
+    Ok(response.body)
+}
+
 /// Executes `query-items` for a guest: filters → `InternalItemsQuery`,
 /// entities → the small stable [`ItemSummary`] projection.
 ///

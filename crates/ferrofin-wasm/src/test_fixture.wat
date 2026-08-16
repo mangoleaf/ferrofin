@@ -195,6 +195,15 @@
       (i32.store (i32.const 1176) (i32.const 0))
       i32.const 1168)
 
+    ;; remote-images: (item-summary) -> result<list<image-candidate>, string>;
+    ;; args indirect like scan-media; always ok([]). Ret area @1216:
+    ;; tag ok, list ptr/len 0.
+    (func (export "remote-images") (param i32) (result i32)
+      (i32.store (i32.const 1216) (i32.const 0))
+      (i32.store (i32.const 1220) (i32.const 0))
+      (i32.store (i32.const 1224) (i32.const 0))
+      i32.const 1216)
+
     ;; handle-request: (plugin-request) -> plugin-response
     ;; plugin-request flattens to exactly 16 params (the direct-passing
     ;; limit): method p0/p1, path p2/p3, query p4/p5, headers p6/p7,
@@ -281,6 +290,11 @@
     (field "tags" (list string)) (field "official-rating" (option string))
     (field "end-date" (option string))))
   (export $meta "metadata-result" (type $meta0))
+  (type $ic0 (record
+    (field "kind" string) (field "url" string)
+    (field "width" (option u32)) (field "height" (option u32))
+    (field "language" (option string))))
+  (export $ic "image-candidate" (type $ic0))
 
   (func $descriptor (result $descriptor)
     (canon lift (core func $i "descriptor") (memory $i "memory") string-encoding=utf8))
@@ -310,6 +324,9 @@
   (func $on-event (param "event-name" string) (param "event-json" string)
     (canon lift (core func $i "on-event") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
+  (func $remote-images (param "item" $item) (result (result (list $ic) (error string)))
+    (canon lift (core func $i "remote-images") (memory $i "memory")
+      (realloc (core func $i "realloc")) string-encoding=utf8))
   (func $metadata-lookup
     (param "item" $item) (param "provider-ids" (list (tuple string string)))
     (result (result (option $meta) (error string)))
@@ -328,5 +345,6 @@
   (export "handle-request" (func $handle-request))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))
+  (export "remote-images" (func $remote-images))
   (export "metadata-lookup" (func $metadata-lookup))
 )

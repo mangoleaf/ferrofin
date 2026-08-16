@@ -427,6 +427,38 @@ fn state_kv_round_trips_caps_and_deletes() {
     assert_eq!(get_state(Some(&path), "cursor"), None);
 }
 
+// The artwork download runs the plugin's declared-egress gate host-side:
+// an undeclared host is refused pre-connect, a declared-but-private host is
+// refused without the grant, and with the grant the GET round-trips with a
+// non-200 refusal.
+#[test]
+fn download_image_enforces_egress_status_and_returns_bytes() {
+    use ferrofin_wasm::capabilities::{EgressPolicy, download_image};
+
+    // Undeclared destination: refused before any connection.
+    let policy = EgressPolicy::parse(&["cdn.example.com".to_owned()]);
+    let err = download_image("p", false, &policy, "http://127.0.0.1:9/x").unwrap_err();
+    assert!(err.contains("declared egress"), "got: {err}");
+
+    // Declared but loopback/private: still refused without the grant.
+    let policy = EgressPolicy::parse(&["127.0.0.1".to_owned()]);
+    let err = download_image("p", false, &policy, "http://127.0.0.1:9/x").unwrap_err();
+    assert!(err.contains("private"), "got: {err}");
+
+    // With the private grant: a non-200 answer loses the slot…
+    let (url, server) = one_shot_http("404 Not Found", b"nope");
+    let err = download_image("p", true, &EgressPolicy::default(), &url).unwrap_err();
+    assert!(err.contains("404"), "got: {err}");
+    server.join().unwrap();
+
+    // …and a 200 yields the raw bytes via a GET.
+    let (url, server) = one_shot_http("200 OK", b"IMAGEBYTES");
+    let bytes = download_image("p", true, &EgressPolicy::default(), &url).unwrap();
+    assert_eq!(bytes, b"IMAGEBYTES");
+    let request = server.join().unwrap();
+    assert!(request.starts_with(b"GET "), "artwork fetch must be a GET");
+}
+
 #[test]
 fn egress_policy_matching_rules() {
     use ferrofin_wasm::capabilities::EgressPolicy;

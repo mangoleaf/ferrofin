@@ -353,6 +353,15 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     });
     assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
     assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
+
+    // remote-images rides the same gate: the fixture answers ok([]) so no
+    // slot is filled, but the call proves the full adapter → guest path.
+    let wanted = [ferrofin_model::entities::ImageType::Primary];
+    let contributed = providers[0].images(&lookup, &wanted).await.unwrap();
+    assert!(contributed.is_empty());
+    // An empty wanted list short-circuits without a guest call.
+    let contributed = providers[0].images(&lookup, &[]).await.unwrap();
+    assert!(contributed.is_empty());
 }
 
 #[test]

@@ -201,11 +201,20 @@ plugins like Home Screen Sections possible):
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
   text). This is how a plugin injects its client-side hooks into jellyfin-web.
 
-Plugins can also act as **metadata sources**: the scan offers every item to each
-enabled plugin's `metadata-lookup` export after the built-in providers (NFO/TVDB/TMDB/OMDb)
-ran, and applies results **supplement-only** — a plugin fills fields that are still empty
-and records its own external ids; it can never overwrite a built-in provider or a user
-edit. Each plugin runs on its own runtime thread under an enforced
+Plugins can also act as **metadata and artwork providers**: the scan offers every item
+to each enabled plugin's `metadata-lookup` export after the built-in providers
+(NFO/TVDB/TMDB/OMDb) ran, and applies results **supplement-only** — a plugin fills fields
+that are still empty and records its own external ids; it can never overwrite a built-in
+provider or a user edit. A plugin that declares `provider-info` becomes a **named
+provider**: its name appears in each library's *Metadata downloaders* / *Image fetchers*
+checkboxes, and the per-library selection and order are enforced during the scan — for
+named plugins and for the built-ins alike (TheTVDB vs TheMovieDb authority for a series
+follows the saved order; a fetcher a library unchecked never runs for its items).
+Artwork rides the `remote-images` export: for items still missing a Primary/Backdrop
+after the built-in chain, the host asks each eligible plugin for **image candidates
+(URLs)** and downloads the winner itself through that plugin's declared egress
+(20 MiB cap, 30 s timeout, redirects off, private addresses refused) — raw image bytes
+never enter guest memory, and an undeclared image host is refused before DNS. Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
 (`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that
@@ -287,11 +296,16 @@ evolution only). Planned capability growth (host-mediated HTTP, read-only item q
 media-segment writes, then a metadata-provider export) is tracked in
 `brain/plans/PLAN_PLUGIN_TIERS.md` phases E2–E3.
 
+## Non-goals for the WASM tier
+
+- **Authentication providers (SSO/LDAP)** — security-critical core surface; if wanted it
+  becomes a core feature, never sandbox-hosted third-party code.
+- **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
+- **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
+  plugins supplement, they never restructure the library.
+
 ## Roadmap
 
-- **WASM image contribution** — `metadata-lookup` deliberately excludes artwork in 0.x;
-  the image-candidate contract lands when a real plugin needs it (the image pipeline's
-  cache/dimension/blurhash integration deserves its own design pass).
 - **External integrations over REST** — an event push story (webhooks / WebSocket
   subscriptions) for tools that are already separate systems (Jellyseerr-shaped). Planned
   as Tier 2; not part of the in-process plugin model.
