@@ -213,6 +213,15 @@ interface types {
         playback-position-ticks: option<s64>,
     }
 
+    /// A named metadata provider's identity: how the plugin appears in
+    /// the library-options provider lists (Dashboard → Libraries).
+    record provider-descriptor {
+        /// The provider's display name (e.g. `HelloDb`, `Douban`).
+        name: string,
+        /// The item kinds it offers metadata for (`Movie`, `Series`, …).
+        supported-kinds: list<string>,
+    }
+
     /// A background task the plugin offers to the scheduled-task registry.
     record task-descriptor {
         /// Stable key, unique within this plugin (the host namespaces it).
@@ -463,7 +472,7 @@ interface host {
 
 /// The contract a Ferrofin plugin component implements.
 world plugin {
-    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result, plugin-request, plugin-response, web-transform};
+    use types.{plugin-descriptor, config-page, task-descriptor, item-summary, metadata-result, plugin-request, plugin-response, web-transform, provider-descriptor};
 
     import host;
 
@@ -506,6 +515,14 @@ world plugin {
     /// `404` unconditionally. See the `plugin-request` trust note: this
     /// runs for UNAUTHENTICATED callers too.
     export handle-request: func(request: plugin-request) -> plugin-response;
+
+    /// This plugin's identity as a NAMED metadata provider, when it is
+    /// one (`none` for everyone else — the common case). A named provider
+    /// appears in the dashboard's library-options fetcher lists; its
+    /// metadata still applies through `metadata-lookup` under the
+    /// supplement-only rule (full provider ordering is a server-side
+    /// roadmap item that applies to built-in providers too).
+    export provider-info: func() -> option<provider-descriptor>;
 
     /// The item kinds this plugin ANALYZES (`Movie`, `Episode`, `Audio`,
     /// …). Empty — the common case — means the plugin is not an analyzer

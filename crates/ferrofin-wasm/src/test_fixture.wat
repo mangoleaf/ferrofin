@@ -172,6 +172,12 @@
       (i32.store (i32.const 1124) (i32.const 0))
       i32.const 1120)
 
+    ;; provider-info: () -> option<provider-descriptor>; none (the fixture
+    ;; is not a named provider). Ret area @1184: tag 0.
+    (func (export "provider-info") (result i32)
+      (i32.store (i32.const 1184) (i32.const 0))
+      i32.const 1184)
+
     ;; scan-targets: () -> list<string>; ["Movie"] so driver tests can
     ;; exercise the analysis pass against this fixture.
     (func (export "scan-targets") (result i32)
@@ -260,6 +266,9 @@
     (field "headers" (list (tuple string string)))
     (field "body" (list u8))))
   (export $resp "plugin-response" (type $resp0))
+  (type $pd0 (record
+    (field "name" string) (field "supported-kinds" (list string))))
+  (export $pd "provider-descriptor" (type $pd0))
   (type $wt0 (record
     (field "path-pattern" string) (field "search" string)
     (field "replace" string)))
@@ -283,6 +292,8 @@
     (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
   (func $web-transforms (result (list $wt))
     (canon lift (core func $i "web-transforms") (memory $i "memory") string-encoding=utf8))
+  (func $provider-info (result (option $pd))
+    (canon lift (core func $i "provider-info") (memory $i "memory") string-encoding=utf8))
   (func $scan-targets (result (list string))
     (canon lift (core func $i "scan-targets") (memory $i "memory") string-encoding=utf8))
   (func $scan-media (param "item" $item) (result (result (error string)))
@@ -310,6 +321,7 @@
   (export "tasks" (func $tasks))
   (export "config-pages" (func $config-pages))
   (export "web-transforms" (func $web-transforms))
+  (export "provider-info" (func $provider-info))
   (export "scan-targets" (func $scan-targets))
   (export "scan-media" (func $scan-media))
   (export "declared-egress" (func $declared-egress))

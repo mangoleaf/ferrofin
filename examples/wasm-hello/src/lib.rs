@@ -104,6 +104,16 @@ impl Guest for HelloPlugin {
         vec!["*".to_owned()]
     }
 
+    fn provider_info() -> Option<ProviderDescriptor> {
+        // The reference plugin IS a (tiny) named provider: its
+        // metadata_lookup recognizes one demo title, and this name is what
+        // the dashboard's library-options fetcher list shows.
+        Some(ProviderDescriptor {
+            name: "HelloDb".to_owned(),
+            supported_kinds: vec!["Movie".to_owned()],
+        })
+    }
+
     fn scan_targets() -> Vec<String> {
         // Not an analyzer. An analysis plugin returns the kinds it wants
         // offered ("Episode", "Audio", ...) and does its work in scan_media
@@ -202,6 +212,13 @@ impl Guest for HelloPlugin {
                 community_rating: Some(7.9),
                 genres: vec!["Animation".to_owned(), "Short".to_owned()],
                 provider_ids: vec![("HelloDb".to_owned(), "bbb-1".to_owned())],
+                // The 0.5.0 supplement fields — demo a tagline; the rest
+                // pass through empty (supplement-only either way).
+                tagline: Some("A big bunny, three bullies.".to_owned()),
+                studios: vec!["Blender Foundation".to_owned()],
+                tags: vec![],
+                official_rating: None,
+                end_date: None,
             }));
         }
         Ok(None)

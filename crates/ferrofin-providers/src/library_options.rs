@@ -191,9 +191,18 @@ fn default_image_options(type_name: &str) -> Vec<ImageOption> {
 }
 
 /// Assembles the [`LibraryOptionsResultDto`] for a library whose representative
-/// item types are `item_types`.
+/// item types are `item_types`. `dynamic_fetchers` are runtime-registered
+/// named metadata providers (WASM plugins) as (name, supported kinds) —
+/// they appear in the fetcher lists exactly like compiled providers.
 #[must_use]
-pub fn library_options_info(item_types: &[String]) -> LibraryOptionsResultDto {
+pub fn library_options_info(
+    item_types: &[String],
+    dynamic_fetchers: &[(String, Vec<String>)],
+) -> LibraryOptionsResultDto {
+    let dynamic_info = |name: &str| LibraryOptionInfoDto {
+        name: Some(name.to_owned()),
+        default_enabled: true,
+    };
     let provs = providers();
     let flat = |cap: Cap| -> Vec<LibraryOptionInfoDto> {
         provs
@@ -212,9 +221,16 @@ pub fn library_options_info(item_types: &[String]) -> LibraryOptionsResultDto {
                     .map(Provider::info)
                     .collect()
             };
+            let mut metadata_fetchers = per_type(Cap::MetadataFetcher);
+            metadata_fetchers.extend(
+                dynamic_fetchers
+                    .iter()
+                    .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
+                    .map(|(name, _)| dynamic_info(name)),
+            );
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
-                metadata_fetchers: per_type(Cap::MetadataFetcher),
+                metadata_fetchers,
                 image_fetchers: per_type(Cap::ImageFetcher),
                 supported_image_types: supported_image_types(type_name),
                 default_image_options: default_image_options(type_name),
@@ -271,7 +287,7 @@ mod tests {
 
     #[test]
     fn movie_options_expose_real_fetchers_and_savers() {
-        let info = library_options_info(&["Movie".to_owned()]);
+        let info = library_options_info(&["Movie".to_owned()], &[]);
         // Nfo is a local reader + saver.
         assert!(
             info.metadata_readers
@@ -312,7 +328,7 @@ mod tests {
 
     #[test]
     fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
-        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()]);
+        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()], &[]);
         let series = info.type_options.first().expect("series block");
         // TheMovieDb is always wired, so it is always offered for a series.
         assert!(

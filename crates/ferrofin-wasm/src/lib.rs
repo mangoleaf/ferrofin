@@ -181,6 +181,8 @@ pub struct LoadedPlugin {
     pub web_transforms: Vec<bindings::types::WebTransform>,
     /// The item kinds this plugin analyzes (empty = not an analyzer).
     pub scan_targets: Vec<String>,
+    /// The plugin's named-provider identity, when it is one.
+    pub provider_info: Option<bindings::types::ProviderDescriptor>,
     /// Where the plugin's KV state persists — the analysis driver keeps its
     /// offer-once watermark there under a host-reserved key.
     state_path: std::path::PathBuf,
@@ -528,6 +530,7 @@ fn load_one(
     let config_pages = instance.call_config_pages(&mut store)?;
     let web_transforms = instance.call_web_transforms(&mut store)?;
     let scan_targets = instance.call_scan_targets(&mut store)?;
+    let provider_info = instance.call_provider_info(&mut store)?;
     let declared_egress = instance.call_declared_egress(&mut store)?;
     let egress = Arc::new(capabilities::EgressPolicy::parse(&declared_egress));
     if egress.allow_any {
@@ -586,6 +589,7 @@ fn load_one(
         config_pages,
         web_transforms,
         scan_targets,
+        provider_info,
         state_path,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
@@ -1261,6 +1265,18 @@ impl ScheduledTask for WasmMediaAnalysisTask {
 }
 
 impl WasmPluginHost {
+    /// The named-provider identities of every loaded plugin that declares
+    /// one, as (name, supported kinds) — surfaced in the dashboard's
+    /// library-options fetcher lists.
+    #[must_use]
+    pub fn provider_names(&self) -> Vec<(String, Vec<String>)> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.provider_info.as_ref())
+            .map(|info| (info.name.clone(), info.supported_kinds.clone()))
+            .collect()
+    }
+
     /// The analysis driver task, when any loaded plugin declares
     /// `scan-targets` (`None` otherwise — no task registered, no overhead).
     #[must_use]
