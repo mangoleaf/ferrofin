@@ -317,6 +317,10 @@ struct CreditsResponse {
     cast: Vec<CastEntry>,
     #[serde(default)]
     crew: Vec<CrewEntry>,
+    /// Episode credits only: the people credited as guest stars on THIS
+    /// episode (the series regulars come back in `cast`).
+    #[serde(default)]
+    guest_stars: Vec<CastEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,6 +468,8 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
 pub struct TmdbClient {
     http: reqwest::Client,
     api_key: SecretString,
+    /// API root, overridable for tests ([`with_base_url`](TmdbClient::with_base_url)).
+    base_url: String,
 }
 
 impl Default for TmdbClient {
@@ -479,6 +485,7 @@ impl TmdbClient {
         Self {
             http: reqwest::Client::new(),
             api_key: SecretString::from(DEFAULT_API_KEY),
+            base_url: API_BASE.to_owned(),
         }
     }
 
@@ -492,7 +499,17 @@ impl TmdbClient {
             } else {
                 key
             }),
+            base_url: API_BASE.to_owned(),
         }
+    }
+
+    /// Points the client at a different API root (a mock server in tests).
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        base_url
+            .trim_end_matches('/')
+            .clone_into(&mut self.base_url);
+        self
     }
 
     /// Matches `name`/`year` against TMDB and returns its poster (Primary) and
@@ -517,7 +534,7 @@ impl TmdbClient {
         };
         let mut req = self
             .http
-            .get(format!("{API_BASE}/{path}"))
+            .get(format!("{}/{path}", self.base_url))
             .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
@@ -568,7 +585,7 @@ impl TmdbClient {
     pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
         let mut req = self
             .http
-            .get(format!("{API_BASE}/search/tv"))
+            .get(format!("{}/search/tv", self.base_url))
             .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[("first_air_date_year", y.to_string())]);
@@ -608,7 +625,7 @@ impl TmdbClient {
     /// season name/overview/poster and every episode's name/overview/still, in a
     /// single request. `None` on any failure.
     pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
-        let url = format!("{API_BASE}/tv/{tmdb_id}/season/{season_number}");
+        let url = format!("{}/tv/{tmdb_id}/season/{season_number}", self.base_url);
         let resp = self
             .http
             .get(url)
@@ -654,7 +671,7 @@ impl TmdbClient {
         };
         let mut req = self
             .http
-            .get(format!("{API_BASE}/{path}"))
+            .get(format!("{}/{path}", self.base_url))
             .query(&[("api_key", self.api_key.expose_secret()), ("query", name)]);
         if let Some(y) = year {
             req = req.query(&[(year_param, y.to_string())]);
@@ -693,7 +710,7 @@ impl TmdbClient {
         };
         let Ok(resp) = self
             .http
-            .get(format!("{API_BASE}/{path}/{tmdb_id}/images"))
+            .get(format!("{}/{path}/{tmdb_id}/images", self.base_url))
             .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
@@ -725,6 +742,82 @@ impl TmdbClient {
             .collect()
     }
 
+    /// Fetches ONE episode's credited people via
+    /// `/tv/{id}/season/{season}/episode/{episode}/credits`.
+    ///
+    /// Port of `TmdbEpisodeProvider`'s credits handling: the episode's own
+    /// `cast` (the regulars credited in THIS episode, in billing order), then
+    /// its `guest_stars` (typed `GuestStar`), then the wanted `crew` — which is
+    /// what fills an episode page's Cast & Crew upstream. Empty on any
+    /// network/parse error, so the caller can fall back.
+    pub async fn episode_credits(
+        &self,
+        series_tmdb_id: i64,
+        season: i32,
+        episode: i32,
+    ) -> Vec<TmdbPerson> {
+        let url = format!(
+            "{}/tv/{series_tmdb_id}/season/{season}/episode/{episode}/credits",
+            self.base_url
+        );
+        let Ok(resp) = self
+            .http
+            .get(url)
+            .query(&[("api_key", self.api_key.expose_secret())])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(credits) = resp.json::<CreditsResponse>().await else {
+            return Vec::new();
+        };
+        let mut people = Vec::new();
+        let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
+            for (order, c) in entries.into_iter().enumerate() {
+                if c.name.is_empty() {
+                    continue;
+                }
+                people.push(TmdbPerson {
+                    tmdb_id: c.id,
+                    name: c.name,
+                    person_type: person_type.to_owned(),
+                    role: c.character.filter(|r| !r.is_empty()),
+                    sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                    profile_url: c
+                        .profile_path
+                        .filter(|p| !p.is_empty())
+                        .map(|p| format!("{IMAGE_BASE}{p}")),
+                });
+            }
+        };
+        push_cast(credits.cast, "Actor");
+        push_cast(credits.guest_stars, "GuestStar");
+        for c in credits.crew {
+            let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+                continue;
+            };
+            if c.name.is_empty() {
+                continue;
+            }
+            people.push(TmdbPerson {
+                tmdb_id: c.id,
+                name: c.name,
+                person_type: person_type.to_owned(),
+                role: c.job.filter(|r| !r.is_empty()),
+                sort_order: i32::MAX,
+                profile_url: c
+                    .profile_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| format!("{IMAGE_BASE}{p}")),
+            });
+        }
+        people
+    }
+
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
     /// rating, certification, premiere date, runtime, and cast + key crew) via
     /// `/movie|tv/{id}?append_to_response=credits,release_dates|content_ratings`.
@@ -736,7 +829,7 @@ impl TmdbClient {
         };
         let resp = self
             .http
-            .get(format!("{API_BASE}/{path}/{tmdb_id}"))
+            .get(format!("{}/{path}/{tmdb_id}", self.base_url))
             .query(&[
                 ("api_key", self.api_key.expose_secret()),
                 ("append_to_response", append),
@@ -840,7 +933,7 @@ impl TmdbClient {
     pub async fn person_details(&self, tmdb_id: i64) -> Option<TmdbPersonDetails> {
         let resp = self
             .http
-            .get(format!("{API_BASE}/person/{tmdb_id}"))
+            .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
@@ -914,6 +1007,60 @@ mod tests {
         assert_eq!(year_from(Some("2014-10-10")), Some(2014));
         assert_eq!(year_from(Some("")), None);
         assert_eq!(year_from(None), None);
+    }
+
+    // An episode page's Cast & Crew comes from the EPISODE's credits: the
+    // regulars credited in it (billing order), then its guest stars (typed
+    // GuestStar), then the wanted crew — the shape upstream's
+    // TmdbEpisodeProvider produces.
+    #[tokio::test]
+    async fn episode_credits_map_cast_guests_and_crew() {
+        use crate::mock_http::MockServer;
+
+        let body = r#"{
+          "cast": [
+            {"id": 1, "name": "Regular One", "character": "Hero", "profile_path": "/r1.jpg"},
+            {"id": 2, "name": "Regular Two", "character": "Sidekick"}
+          ],
+          "guest_stars": [
+            {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg"}
+          ],
+          "crew": [
+            {"id": 4, "name": "Ep Director", "job": "Director"},
+            {"id": 5, "name": "Ep Writer", "job": "Screenplay"},
+            {"id": 6, "name": "Best Boy", "job": "Best Boy"},
+            {"id": 7, "name": "", "job": "Director"}
+          ]
+        }"#;
+        let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let people = client.episode_credits(1399, 1, 1).await;
+        let rows: Vec<(&str, &str, Option<&str>)> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.person_type.as_str(), p.role.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Regular One", "Actor", Some("Hero")),
+                ("Regular Two", "Actor", Some("Sidekick")),
+                ("Guest Star", "GuestStar", Some("Villain")),
+                ("Ep Director", "Director", Some("Director")),
+                ("Ep Writer", "Writer", Some("Screenplay")),
+            ],
+            "unwanted crew jobs and blank names are dropped"
+        );
+        // Billing order is preserved for cast, and headshots are absolute URLs.
+        assert_eq!(people[0].sort_order, 0);
+        assert_eq!(people[1].sort_order, 1);
+        assert!(
+            people[0]
+                .profile_url
+                .as_deref()
+                .is_some_and(|u| u.ends_with("/r1.jpg"))
+        );
+        assert_eq!(people[1].profile_url, None);
     }
 
     #[test]
