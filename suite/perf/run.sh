@@ -168,12 +168,18 @@ bench() {  # $1=service $2=port $3=TARGET
 # (thermal, background load) biases whichever side runs second. Single runs
 # can't fix that; the publish loop alternates BENCH_LEG_ORDER per run so the
 # drift cancels across the N aggregated runs instead of accumulating.
+# Ports come from the same env the compose file maps (hardcoding them here
+# while compose honored the override was an inconsistency — and running in an
+# isolated COMPOSE_PROJECT_NAME + port pair is how a run survives another
+# checkout's `docker compose down` on the shared default project).
+FPORT="${FERROFIN_HOST_PORT:-18096}"
+JPORT="${JELLYFIN_HOST_PORT:-18097}"
 if [ "${BENCH_LEG_ORDER:-fj}" = "jf" ]; then
-  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
-  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
+  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin "$JPORT" jellyfin; fi
+  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   "$FPORT" ferrofin;   fi
 else
-  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   18096 ferrofin;   fi
-  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin 18097 jellyfin; fi
+  if [ "${BENCH_ONLY:-}" != "jellyfin" ]; then bench ferrofin   "$FPORT" ferrofin;   fi
+  if [ "${BENCH_ONLY:-}" != "ferrofin" ];   then bench jellyfin "$JPORT" jellyfin; fi
 fi
 if [ "${BENCH_KEEP_DATA:-0}" = "1" ]; then
   docker compose stop >/dev/null 2>&1 || true   # volumes live on for the next run
