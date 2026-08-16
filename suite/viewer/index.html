@@ -53,6 +53,7 @@
   .pill.win  { color: var(--good); border-color: #204a2b; background: #10261699; }
   .pill.loss { color: var(--bad);  border-color: #4a1c1c; background: #260f0f99; }
   .pill.tail { color: var(--warn); border-color: #4a3a10; background: #26200f99; }
+  .pill.owner{ color: #cdbdfa; border-color: #3b2f63; background: #1d173399; }
   .d-REAL { color: var(--real); border-color: #204a2b; background: #10261699; }
   .d-PARTIAL { color: var(--partial); border-color: #4a3a10; background: #26200f99; }
   .d-HOLLOW { color: var(--hollow); border-color: #4a2e14; background: #26160f99; }
@@ -104,6 +105,7 @@
   <div class="lctl">
     <input type="search" id="lq" placeholder="Filter by operation, classification…">
     <select id="ldepth"><option value="">depth: all</option></select>
+    <select id="lowner"><option value="">owner: all</option></select>
     <select id="ldeep">
       <option value="">deep: all</option>
       <option value="true">✅ verified</option>
@@ -114,7 +116,7 @@
   </div>
   <div class="bar" id="lbar"></div>
   <table id="ledger"><thead><tr>
-    <th class="l">operation</th><th class="l">depth</th><th>status</th><th>schema</th>
+    <th class="l">operation</th><th class="l">owner</th><th class="l">depth</th><th>status</th><th>schema</th>
     <th>deep</th><th class="l">classification</th>
   </tr></thead><tbody></tbody></table>
 </main>
@@ -126,6 +128,10 @@ const num = (x) => x == null ? "—" : (+x).toFixed(x < 10 ? 2 : 0);
 // records predate run_label, so fall back to the bare version.
 const vlabel = (r) => r.meta.run_label || r.meta.ferrofin;
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
+// core is unmarked prose (it's the default story); extensions get a labeled
+// badge so their rows never silently blend into core's numbers.
+const ownerBadge = (owner) => (!owner || owner === "core")
+  ? `<span class="muted">core</span>` : `<span class="pill owner">${owner}</span>`;
 const opCell = (op) => {
   const [m, ...rest] = op.split(" ");
   return `<code><span class="method m-${m}">${m}</span>${rest.join(" ")}</code>`;
@@ -215,7 +221,7 @@ function render() {
     const spd = p.speedup == null ? "—"
       : `<span class="${p.speedup >= 1 ? "good" : "bad"}">${p.speedup}×</span>`;
     return `<tr class="${cls}">
-      <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code></td>
+      <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code>${o.owner && o.owner !== "core" ? " " + ownerBadge(o.owner) : ""}</td>
       <td class="l"><span class="pill d-${depth}">${depth}</span></td>
       <td>${o.parity.deep_verified ? "✓" : "·"}</td>
       <td>${num(p.h_p50)}</td><td>${num(p.h_p95)}</td><td>${num(p.h_p99)}</td>
@@ -243,10 +249,11 @@ function renderTrend() {
 let LEDGER = [];
 function renderLedger() {
   const q = lq.value.trim().toLowerCase();
-  const fd = ldepth.value, fv = ldeep.value;
+  const fd = ldepth.value, fv = ldeep.value, fo = lowner.value;
   const mark = (v) => v === true ? "✅" : v === false ? "⚠️" : "·";
   const rows = LEDGER.filter(x => {
     if (fd && x.depth !== fd) return false;
+    if (fo && (x.owner || "core") !== fo) return false;
     if (fv === "true" && x.deep_verified !== true) return false;
     if (fv === "class" && !(x.classification && x.deep_verified !== true)) return false;
     if (fv === "untested" && (x.deep_verified !== null || x.classification)) return false;
@@ -261,6 +268,7 @@ function renderLedger() {
   lbar.innerHTML = seg(deep, "var(--good)") + seg(cls, "var(--warn)") + seg(total - deep - cls, "var(--none)");
   ledger.tBodies[0].innerHTML = rows.map(x => `<tr>
     <td class="l">${opCell(x.operation)}</td>
+    <td class="l">${ownerBadge(x.owner)}</td>
     <td class="l"><span class="pill d-${x.depth}">${x.depth}</span></td>
     <td>${mark(x.status_conformant)}</td><td>${mark(x.schema_valid)}</td>
     <td title="${x.deep_verified === true ? "verified" : x.deep_verified === false ? "classified" : "untested"}">${mark(x.deep_verified)}</td>
@@ -280,7 +288,9 @@ fetch("/suite/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d =>
   LEDGER = d.operations;
   ldepth.innerHTML = `<option value="">depth: all</option>` +
     [...new Set(LEDGER.map(x => x.depth))].sort().map(v => `<option>${v}</option>`).join("");
-  [lq, ldepth, ldeep].forEach(el => el.oninput = renderLedger);
+  lowner.innerHTML = `<option value="">owner: all</option>` +
+    [...new Set(LEDGER.map(x => x.owner || "core"))].sort().map(v => `<option>${v}</option>`).join("");
+  [lq, ldepth, ldeep, lowner].forEach(el => el.oninput = renderLedger);
   renderLedger();
 }).catch(() => { lstats.textContent = "ledger.json not found — run suite/run.sh parity"; });
 </script>

@@ -316,6 +316,10 @@ def main():
             }
         operations.append({
             "op": op, "tag": tag,
+            # E2: core vs compiled-in-extension ownership, from the parity
+            # ledger (whose source is the EXTENSION_ROUTES const in
+            # ferrofin-api — compile-time asserted against REAL_ROUTES).
+            "owner": pr.get("owner", "core"),
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
@@ -334,6 +338,31 @@ def main():
         r = o["perf"]["reason"]
         if r:
             dropped[r] = dropped.get(r, 0) + 1
+    # E3: per-owner breakdown — extensions must not dilute or flatter core's
+    # numbers, so each owner's share stands alone. (All benched variants are
+    # core today; extension variants slot in with no further edits here.)
+    owners = {}
+    for o in operations:
+        ow = owners.setdefault(o["owner"], {"rows": 0, "comparable_rows": 0,
+                                            "speedups": [], "wins": 0, "deep": 0})
+        ow["rows"] += 1
+        ow["deep"] += bool(o["parity"]["deep_verified"])
+        if o["perf"]["comparable"]:
+            ow["comparable_rows"] += 1
+            ow["wins"] += bool(o["perf"]["win_all_three"])
+            if o["perf"]["speedup"] is not None:
+                ow["speedups"].append(o["perf"]["speedup"])
+    owners = {
+        name: {
+            "rows": ow["rows"],
+            "comparable_rows": ow["comparable_rows"],
+            "median_speedup": round(median(ow["speedups"]), 3) if ow["speedups"] else None,
+            "win_rate": round(ow["wins"] / ow["comparable_rows"], 3) if ow["comparable_rows"] else None,
+            "parity_coverage": round(ow["deep"] / ow["rows"], 3) if ow["rows"] else None,
+        }
+        for name, ow in owners.items()
+    }
+
     headline = {
         "comparable_rows": len(comp),
         "dropped_rows": sum(dropped.values()),
@@ -342,6 +371,7 @@ def main():
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
         "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
+        "owners": owners,
     }
 
     sha = sh("git", "rev-parse", "--short", "HEAD") or "unknown"
