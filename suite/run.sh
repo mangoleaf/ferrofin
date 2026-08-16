@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # suite/run.sh — the one entry point for the merged parity + perf suite (Plan 6).
 #
+#   suite/run.sh calibrate  measure per-endpoint capacity on Jellyfin → suite/perf/rates.json
 #   suite/run.sh parity   both servers up   → sweep + reads + journeys + assets → ledger (+fingerprints)
 #   suite/run.sh perf     one-at-a-time     → open-loop vegeta bench → per-endpoint latencies (+fingerprints)
 #   suite/run.sh all      parity, then perf, same build + same fixture → merged run record
@@ -20,6 +21,28 @@ usage() { sed -n '2,15p' "$ROOT/suite/run.sh"; exit 1; }
 stage="$1"; shift || true
 
 case "$stage" in
+  calibrate)
+    # One-time per host/fixture (and on rebaseline): measure each endpoint's
+    # capacity on the WEAKER server (Jellyfin) and write suite/perf/rates.json
+    # at BENCH_RATE_FRACTION of it. Commit the result next to the baseline —
+    # without it the bench runs at the flat BENCH_RATE and every window hits
+    # the duration cap (slower run, rate_source=flat-default in the record).
+    cd "$ROOT/suite/perf"
+    # shellcheck source=lib.sh
+    source ../lib.sh
+    suite_load_env .env
+    suite_mint_device_id calibrate
+    suite_build_libraries
+    suite_gen_fixtures
+    docker compose down -v >/dev/null 2>&1 || true
+    rm -f results/raw/jellyfin-ctx.json   # fresh DB ⇒ saved tokens/ids are dead
+    docker compose up -d jellyfin
+    JPORT="${JELLYFIN_HOST_PORT:-18097}"
+    suite_wait200 "http://localhost:$JPORT" jellyfin
+    python3 compare.py --target jellyfin --base "http://localhost:$JPORT" --calibrate-rates
+    docker compose down -v >/dev/null 2>&1 || true
+    echo ">> wrote suite/perf/rates.json — commit it (host/fixture-local, like the baseline)"
+    ;;
   parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
   perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
   all)
