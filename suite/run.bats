@@ -75,13 +75,23 @@ assert r['meta']['incomplete'], 'incomplete stamp missing'"
   rm -f results/run-*-incomplete*.json
 }
 
+# Skips rather than degrade: on a host without raw summaries the old version
+# took the ALLOW_INCOMPLETE early-return, globbed up its own incomplete record
+# (operations: []) and passed every assertion vacuously — green while checking
+# zero rows, the exact pattern this branch exists to kill (review, round 3).
+# The non-empty assert makes vacuous passes impossible regardless of host.
 @test "merge produces a valid run record with the fairness fields" {
-  MERGE_ALLOW_INCOMPLETE=1 run python3 merge.py
+  [ -f perf/results/raw/ferrofin-summary.json ] || skip "no raw summaries on this host"
+  # Optional legs pinned OFF: TTFS and the cold restarts are env-driven and
+  # their raw files may legitimately be absent; the mandatory manifest (all
+  # 118 variants, both servers) is still asserted strictly.
+  run env RUN_TRANSCODE=0 BENCH_COLD_ENDPOINTS="" python3 merge.py
   [ "$status" -eq 0 ]
   run python3 -c "import json,glob,os; \
 r=json.load(open(sorted(glob.glob('results/run-*.json'),key=os.path.getmtime)[-1])); \
 h=r['headline']; assert 'parity_coverage' in h and 'median_speedup' in h; \
 assert 'dropped_rows' in h and 'dropped_by_reason' in h; \
+assert r['operations'], 'record has no operations'; \
 assert all('comparable' in o['perf'] for o in r['operations'])"
   [ "$status" -eq 0 ]
 }

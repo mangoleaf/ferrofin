@@ -40,10 +40,16 @@ def paired_speedup_of(h_med, j_med, floor):
     no ratio at all (division would amplify jitter into fake multiples — the
     k6-era aggregate had a "391×" from a sub-ms endpoint the verdict logic
     itself called a tie). Pure so aggregate_selftest.py can pin the rule."""
-    if not h_med or j_med is None:
+    if h_med is None or j_med is None:
         return None, False
+    # Tie check BEFORE the zero check so every measured pair classifies into a
+    # bucket (review, round 3): a zero median with a sub-floor counterpart is
+    # a tie; with a floor-clearing counterpart the ratio is undefined
+    # (division by zero) and stays out — unreachable at ms rounding anyway.
     if abs(h_med - j_med) < floor:
         return None, True
+    if not h_med:
+        return None, False
     return round(j_med / h_med, 2), False
 
 

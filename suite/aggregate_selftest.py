@@ -22,6 +22,10 @@ assert aggregate.paired_speedup_of(10, 13, 3.0) == (1.3, False)
 # Missing either side: no ratio, not a tie.
 assert aggregate.paired_speedup_of(None, 300, 3.0) == (None, False)
 assert aggregate.paired_speedup_of(100, None, 3.0) == (None, False)
+# Zero medians classify too (round 3): sub-floor counterpart is a tie,
+# floor-clearing counterpart is an undefined ratio (never silent AND uncounted
+# when both sides were actually measured close together).
+assert aggregate.paired_speedup_of(0, 1, 3.0) == (None, True)
 assert aggregate.paired_speedup_of(0, 300, 3.0) == (None, False)
 
 # ── dist: median ± IQR across runs ───────────────────────────────────────────

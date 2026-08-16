@@ -237,16 +237,21 @@ def manifest_check(v2op, perf, foot, cold):
 
 
 def floored_speedup(h_p50, j_p50, floor):
-    """The per-row ratio with the noise floor applied (D1): None when either
-    side is missing, Ferrofin's median is zero, or the delta is under the
-    floor — dividing two sub-floor medians amplifies jitter into a fake
-    multiple (0.3 ms vs 0.1 ms reads as "3×"). Pure so merge_selftest.py can
-    pin the rule (review finding, round 2)."""
-    if not h_p50 or j_p50 is None:
-        return None
+    """The per-row ratio with the noise floor applied (D1) → (ratio, is_tie).
+
+    None ratio when either side is missing, the delta is under the floor
+    (dividing two sub-floor medians amplifies jitter into a fake multiple —
+    0.3 ms vs 0.1 ms reads as "3×"), or Ferrofin's median is zero. is_tie
+    marks exactly the floor-suppressed case, so the headline's
+    ratio_excluded_ties derives from THIS rule instead of a parallel
+    reimplementation (review, round 3). Pure so merge_selftest.py pins it."""
+    if h_p50 is None or j_p50 is None:
+        return None, False
     if abs(h_p50 - j_p50) < floor:
-        return None
-    return round(j_p50 / h_p50, 2)
+        return None, True
+    if not h_p50:
+        return None, False  # zero median: ratio undefined, not a tie
+    return round(j_p50 / h_p50, 2), False
 
 
 def percentile_verdicts(p, floor):
@@ -330,7 +335,8 @@ def main():
         tie = bool(vlist) and vlist.count("tie") == 3
         # D1 applies to the RATIO too: a p50 tie gets NO speedup (see
         # floored_speedup); headline.ratio_excluded_ties says how many.
-        speedup = floored_speedup(p["h_p50"], p["j_p50"], CONFIG["BENCH_NOISE_FLOOR_MS"])
+        speedup, ratio_tie = floored_speedup(
+            p["h_p50"], p["j_p50"], CONFIG["BENCH_NOISE_FLOOR_MS"])
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
         # them, never blended (fresh-process first-request latency).
@@ -353,6 +359,7 @@ def main():
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
+                     "ratio_tie": ratio_tie,
                      "win_all_three": win,
                      "tie_all_three": tie,
                      "verdicts": verdicts,
@@ -403,9 +410,9 @@ def main():
         "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
         # Comparable rows whose p50 delta is under the floor: they carry no
-        # ratio (see above), and this count keeps the exclusion visible.
-        "ratio_excluded_ties": sum(
-            1 for o in comp if (o.get("verdicts") or {}).get("p50") == "tie"),
+        # ratio (see floored_speedup — the single source of the rule), and
+        # this count keeps the exclusion visible.
+        "ratio_excluded_ties": sum(1 for o in comp if o.get("ratio_tie")),
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
         "ties": sum(o["tie_all_three"] for o in comp),
         "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
