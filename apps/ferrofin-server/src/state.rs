@@ -1088,6 +1088,9 @@ pub async fn build_app_state(
         user_data: Arc::clone(&user_data),
         tv: Arc::clone(&tv_series),
         media_streams: Arc::clone(&media_stream_repository),
+        lyrics: Arc::clone(&lyrics),
+        subtitles: Arc::clone(&subtitles),
+        collections: Arc::clone(&collections),
         extractor: Arc::new(ferrofin_mediaencoding::FfmpegMediaExtractor::new(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
         )),

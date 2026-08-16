@@ -324,7 +324,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.4.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.5.0 \
                          component); skipping this file"
                     );
                 }
@@ -795,7 +795,7 @@ fn escape_html(text: &str) -> String {
 /// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
 /// world version from `wit/ferrofin-plugin.wit` (a test guards against
 /// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
-pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.4.0";
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.5.0";
 
 /// The install-time artifact validator: proves a downloaded `.wasm` is a
 /// loadable `ferrofin:plugin` component and reports its self-declared id,

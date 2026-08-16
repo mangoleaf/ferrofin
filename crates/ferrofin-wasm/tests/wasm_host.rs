@@ -333,6 +333,10 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // Armed: the fixture's metadata-lookup answers ok(none); the second call
     // takes the (enabled, config) gate from the cache.
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -521,6 +525,10 @@ async fn analysis_driver_offers_each_item_once() {
         seen: std::sync::Mutex::new(None),
     });
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -602,6 +610,10 @@ async fn analysis_driver_skips_disabled_plugins_and_guests_cannot_touch_the_wate
     let disabled: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
         std::sync::Arc::new(common::DisabledStub(b"{}".to_vec()));
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),

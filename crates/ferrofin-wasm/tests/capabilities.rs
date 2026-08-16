@@ -106,6 +106,10 @@ fn collaborators(
     segments: Arc<dyn MediaSegmentManager>,
 ) -> Collaborators {
     Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -500,6 +504,10 @@ fn recorded_query_rig() -> (Collaborators, std::sync::Arc<common::OneMovieLibrar
     });
     (
         Collaborators {
+            lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+            subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+            collections: std::sync::Arc::new(common::StubCollections::default()),
+
             media_streams: std::sync::Arc::new(common::StubStreams),
             extractor: std::sync::Arc::new(common::StubExtractor::default()),
             analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -630,6 +638,10 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
 
     let extractor = std::sync::Arc::new(common::StubExtractor::default());
     let cx = Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: extractor.clone(),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -705,4 +717,95 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         .expect("called");
     assert_eq!(path, "/media/movies/bbb.mkv");
     assert!(start.abs() < f64::EPSILON && (dur - 10.0).abs() < 0.001);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_family_caps_ownership_and_plumbing() {
+    use ferrofin_wasm::capabilities::{
+        create_collection, set_user_data, update_collection, write_lyrics, write_subtitles,
+    };
+    const ITEM: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01";
+    const USER: &str = "00000000-0000-0000-0000-000000000001";
+
+    let lyrics = std::sync::Arc::new(common::StubLyrics::default());
+    let subtitles = std::sync::Arc::new(common::StubSubtitles::default());
+    let collections = std::sync::Arc::new(common::StubCollections::default());
+    let cx = Collaborators {
+        lyrics: lyrics.clone(),
+        subtitles: subtitles.clone(),
+        collections: collections.clone(),
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("p.state.json");
+
+    tokio::task::spawn_blocking(move || {
+        use ferrofin_wasm::bindings::types::UserDataUpdate;
+        // set-user-data: bad ids error; the write reaches the manager.
+        // (StubUserData::save_user_data is a panic stub — the recording
+        // proof here is the error shape; the manager plumbing is covered
+        // by the trait call compiling against the real signature. Use the
+        // id-validation paths.)
+        let update = UserDataUpdate {
+            played: Some(true),
+            favorite: None,
+            playback_position_ticks: Some(123),
+        };
+        let err = set_user_data(&cx, "p", "junk", ITEM, &update).unwrap_err();
+        assert!(err.contains("user-id"), "{err}");
+        let err = set_user_data(&cx, "p", USER, "junk", &update).unwrap_err();
+        assert!(err.contains("item-id"), "{err}");
+
+        // Lyrics: UTF-8 + cap + recorded write.
+        let err = write_lyrics(&cx, ITEM, "lrc", &vec![0u8; 2 * 1024 * 1024 + 1]).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+        let err = write_lyrics(&cx, ITEM, "lrc", &[0xFF, 0xFE]).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+        write_lyrics(&cx, ITEM, "lrc", b"[00:01.00] hi").unwrap();
+        let w = lyrics.writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].2.starts_with("lrc:"), "{:?}", w[0]);
+
+        // Subtitles: cap + recorded language/format/size.
+        write_subtitles(&cx, ITEM, "eng", "srt", b"1\n00:00:01 --> 2\nhi").unwrap();
+        let w = subtitles.writes.lock().unwrap().clone();
+        assert_eq!(
+            w[0].2,
+            format!("eng:srt:{}", b"1\n00:00:01 --> 2\nhi".len())
+        );
+
+        // Collections: create records ownership; updating an unowned id is
+        // refused BEFORE any manager call; owned updates go through.
+        let cid = create_collection(&cx, Some(&state), 8 * 1024 * 1024, "Best", &[ITEM.into()])
+            .expect("create");
+        let err = update_collection(
+            &cx,
+            Some(&state),
+            &uuid::Uuid::from_u128(0xdead).to_string(),
+            &[ITEM.into()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not owned"), "{err}");
+        update_collection(&cx, Some(&state), &cid, &[ITEM.into()], &[]).expect("owned update");
+        let w = collections.writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 2, "create + add only: {w:?}");
+        assert_eq!(w[1].0, "add");
+        // The ownership ledger sits under a host-reserved key — invisible
+        // to guests (bindings-layer guard, proven elsewhere).
+        assert!(ferrofin_wasm::capabilities::get_state(Some(&state), "host:collections").is_some());
+    })
+    .await
+    .unwrap();
 }

@@ -721,3 +721,175 @@ impl PluginManager for DisabledStub {
         Ok(Vec::new())
     }
 }
+
+// ── G2 write-capability stubs ──
+#[allow(unused_imports)]
+use ferrofin_model::lyrics::{LyricDto, RemoteLyricInfoDto};
+#[allow(unused_imports)]
+use ferrofin_model::providers::{LyricProviderInfo, RemoteSubtitleInfo, SubtitleProviderInfo};
+#[allow(unused_imports)]
+use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubLyrics {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::stubs::LyricManager for StubLyrics {
+    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn download_lyrics(
+        &self,
+        _item_id: Uuid,
+        _lyric_id: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn save_lyric(
+        &self,
+        item_id: Uuid,
+        format: &str,
+        lyrics: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        self.writes.lock().unwrap().push((
+            "lyric".into(),
+            item_id.to_string(),
+            format!("{format}:{}", lyrics.len()),
+        ));
+        Ok(None)
+    }
+    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<LyricProviderInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubSubtitles {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::subtitles::SubtitleManager for StubSubtitles {
+    async fn search_subtitles(
+        &self,
+        _request: &SubtitleSearchRequest,
+    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn download_subtitles(
+        &self,
+        _item_id: Uuid,
+        _subtitle_id: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn upload_subtitle(
+        &self,
+        item_id: Uuid,
+        response: &ferrofin_traits::subtitles::SubtitleResponse,
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "subtitle".into(),
+            item_id.to_string(),
+            format!(
+                "{}:{}:{}",
+                response.language,
+                response.format,
+                response.content.len()
+            ),
+        ));
+        Ok(())
+    }
+    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<SubtitleProviderInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubCollections {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::collections::CollectionManager for StubCollections {
+    async fn create_collection(
+        &self,
+        options: &ferrofin_traits::collections::CollectionCreationOptions,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        self.writes.lock().unwrap().push((
+            "create".into(),
+            options.name.clone(),
+            options.item_id_list.len().to_string(),
+        ));
+        Ok(BaseItemEntity {
+            id: "12121212-3434-5656-7878-909090909090".to_owned(),
+            ..BaseItemEntity::default()
+        })
+    }
+    async fn add_to_collection(
+        &self,
+        collection_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "add".into(),
+            collection_id.to_string(),
+            item_ids.len().to_string(),
+        ));
+        Ok(())
+    }
+    async fn remove_from_collection(
+        &self,
+        collection_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "remove".into(),
+            collection_id.to_string(),
+            item_ids.len().to_string(),
+        ));
+        Ok(())
+    }
+    async fn get_collections_containing_item(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_collections_folder(
+        &self,
+        _create_if_needed: bool,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+}

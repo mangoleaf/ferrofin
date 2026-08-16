@@ -174,6 +174,79 @@ impl host::Host for HostState {
         crate::capabilities::next_up(cx, &user_id, limit)
     }
 
+    fn set_user_data(
+        &mut self,
+        user_id: String,
+        item_id: String,
+        update: types::UserDataUpdate,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("set-user-data is not available during plugin load")?;
+        crate::capabilities::set_user_data(cx, &self.plugin_name, &user_id, &item_id, &update)
+    }
+
+    fn write_lyrics(
+        &mut self,
+        item_id: String,
+        format: String,
+        content: Vec<u8>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("write-lyrics is not available during plugin load")?;
+        crate::capabilities::write_lyrics(cx, &item_id, &format, &content)
+    }
+
+    fn write_subtitles(
+        &mut self,
+        item_id: String,
+        language: String,
+        format: String,
+        content: Vec<u8>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("write-subtitles is not available during plugin load")?;
+        crate::capabilities::write_subtitles(cx, &item_id, &language, &format, &content)
+    }
+
+    fn create_collection(&mut self, name: String, item_ids: Vec<String>) -> Result<String, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("create-collection is not available during plugin load")?;
+        crate::capabilities::create_collection(
+            cx,
+            self.state_path.as_deref(),
+            self.state_total_cap,
+            &name,
+            &item_ids,
+        )
+    }
+
+    fn update_collection(
+        &mut self,
+        collection_id: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("update-collection is not available during plugin load")?;
+        crate::capabilities::update_collection(
+            cx,
+            self.state_path.as_deref(),
+            &collection_id,
+            &add,
+            &remove,
+        )
+    }
+
     fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {
         let cx = self
             .collaborators
