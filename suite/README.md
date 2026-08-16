@@ -15,6 +15,7 @@ the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → suite/parity/ledger.json (+fingerprints)
 suite/run.sh perf     # one at a time    → open-loop vegeta bench → suite/perf/results/raw/*-summary.json (+fingerprints)
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
+suite/run.sh publish  # parity once + BENCH_RUNS × perf → suite/results/agg-<sha>.{json,md} (median±IQR distributions)
 suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
 suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
 suite/viewer/serve.sh # → http://127.0.0.1:8125/suite/viewer/   (THE dashboard, one page)

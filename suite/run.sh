@@ -2,8 +2,9 @@
 # suite/run.sh — the one entry point for the merged parity + perf suite (Plan 6).
 #
 #   suite/run.sh parity   both servers up   → sweep + reads + journeys + assets → ledger (+fingerprints)
-#   suite/run.sh perf     one-at-a-time     → k6 load bench → per-endpoint latencies (+fingerprints)
+#   suite/run.sh perf     one-at-a-time     → open-loop vegeta bench → per-endpoint latencies (+fingerprints)
 #   suite/run.sh all      parity, then perf, same build + same fixture → merged run record
+#   suite/run.sh publish  parity once, then BENCH_RUNS × (perf + merge) → agg-<sha> distributions
 #   suite/run.sh merge    join the latest parity ledger + perf summaries into the run record
 #   suite/run.sh gate [--measure|--rebaseline]   regression gate over the merged record
 #
@@ -35,6 +36,28 @@ case "$stage" in
     "$ROOT/suite/parity/sweep.sh"
     "$ROOT/suite/perf/run.sh"
     python3 "$ROOT/suite/merge.py"
+    ;;
+  publish)
+    # C1: the publishable record is a DISTRIBUTION over BENCH_RUNS independent
+    # perf runs (single-run point estimates carry ~30% noise on the ratio
+    # metrics — measured on identical code). Parity runs once (deterministic);
+    # each perf run merges into its own run-<sha>[-N].json; aggregate.py then
+    # reduces them to agg-<sha>.{json,md} with per-endpoint median ± IQR.
+    if [ "${BENCH_KEEP_CACHE:-0}" != "1" ]; then
+      echo ">> pruning BuildKit cache mounts (hermetic release build; BENCH_KEEP_CACHE=1 to skip)"
+      docker builder prune -f --filter type=exec.cachemount >/dev/null 2>&1 || true
+    fi
+    RUNS_N="${BENCH_RUNS:-$(cd "$ROOT/suite/perf" && python3 -c 'from config import CONFIG; print(CONFIG["BENCH_RUNS"])')}"
+    "$ROOT/suite/parity/sweep.sh"
+    for i in $(seq 1 "$RUNS_N"); do
+      echo ">> publish run $i/$RUNS_N"
+      # Rebuild only on the first pass; identical tree → identical image after,
+      # and B1's /health/live check verifies the binary every pass regardless.
+      if [ "$i" -gt 1 ]; then export BENCH_SKIP_BUILD=1; fi
+      "$ROOT/suite/perf/run.sh"
+      python3 "$ROOT/suite/merge.py"
+    done
+    exec python3 "$ROOT/suite/aggregate.py"
     ;;
   merge)   exec python3 "$ROOT/suite/merge.py" "$@" ;;
   gate)

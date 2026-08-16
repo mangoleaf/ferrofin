@@ -96,6 +96,14 @@
     <th>speedup</th><th>verdict</th><th class="l">note</th>
   </tr></thead><tbody></tbody></table>
 
+  <h2 id="aggh" style="display:none">Aggregate <span class="muted" id="aggsub" style="text-transform:none"></span></h2>
+  <table id="agg" style="display:none"><thead><tr>
+    <th class="l">endpoint</th><th class="l">owner</th>
+    <th>H p50</th><th>J p50</th><th>H p99</th><th>J p99</th>
+    <th title="ratio of per-endpoint medians (stable), not median of noisy per-run ratios">paired</th>
+    <th title="fresh-process first request, median±IQR across runs">cold H/J</th><th>n</th>
+  </tr></thead><tbody></tbody></table>
+
   <h2>Trend <span class="muted" style="text-transform:none">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
   <table id="trend"><thead><tr>
     <th class="l">build</th><th class="l">when</th><th>comparable rows</th>
@@ -289,6 +297,29 @@ fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => 
   [run, base, compOnly].forEach(el => el.onchange = render);
   render(); renderTrend();
 });
+
+// C2: the publishable numbers are distributions (median±IQR over BENCH_RUNS
+// runs), led by parity coverage and paired per-endpoint speedups — the
+// single-run median-of-ratios stays out of the headline (≈30% run noise).
+const fd = (d) => d == null ? "—" : `${d.med}±${d.iqr}`;
+fetch("/suite/results/aggregates.json?t=" + Date.now()).then(r => r.json()).then(d => {
+  const a = d.aggregates[d.aggregates.length - 1];
+  if (!a) return;
+  const h = a.headline, m = a.meta;
+  document.getElementById("aggh").style.display = "";
+  document.getElementById("agg").style.display = "";
+  document.getElementById("aggsub").textContent =
+    `${m.ferrofin} · ${m.aggregated_runs} runs · latency median±IQR (ms) · ` +
+    `parity ${h.parity_coverage} · paired speedup ${fd(h.paired_speedup)} · win-rate ${fd(h.win_rate)}`;
+  document.querySelector("#agg tbody").innerHTML = Object.entries(a.endpoints).map(([v, ep]) => `<tr>
+    <td class="l"><code>${v}</code></td><td class="l">${ownerBadge(ep.owner)}</td>
+    <td>${fd(ep.h_p50)}</td><td>${fd(ep.j_p50)}</td>
+    <td>${fd(ep.h_p99)}</td><td>${fd(ep.j_p99)}</td>
+    <td>${ep.paired_speedup == null ? "—" : `<span class="${ep.paired_speedup >= 1 ? "good" : "bad"}">${ep.paired_speedup}×</span>`}</td>
+    <td>${ep.cold_first ? `${fd(ep.cold_first.h)} / ${fd(ep.cold_first.j)}` : "—"}</td>
+    <td>${ep.n_comparable}/${ep.n_runs}</td>
+  </tr>`).join("");
+}).catch(() => {});
 
 fetch("/suite/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
   LEDGER = d.operations;
