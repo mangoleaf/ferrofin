@@ -15,7 +15,10 @@ services:
         # Per-checkout compile-cache scope (see Dockerfile.ferrofin) — set it
         # alongside COMPOSE_PROJECT_NAME when running from a worktree.
         CACHE_SCOPE: ${BENCH_CACHE_SCOPE:-shared}
-    image: ferrofin-bench:local
+    # The image TAG is scoped too: with a shared tag, a concurrent checkout's
+    # rebuild silently replaces the binary a BENCH_SKIP_BUILD run picks up.
+    # (B1's /health/live check caught exactly that — this removes the trap.)
+    image: ferrofin-bench:${BENCH_CACHE_SCOPE:-local}
     cpus: ${BENCH_CPUS}
     mem_limit: ${BENCH_MEM}
     ports: ["${FERROFIN_HOST_PORT:-18096}:8096"]   # host 8096 is often a live dev Ferrofin — stay clear
