@@ -159,7 +159,12 @@ bench() {  # $1=service $2=port $3=TARGET
   if [ -n "${BENCH_COLD_ENDPOINTS:-}" ]; then
     rm -f "results/raw/$target-cold-requests.json"
     for name in $BENCH_COLD_ENDPOINTS; do
-      docker compose restart "$svc" >/dev/null 2>&1
+      # GRACEFUL stop (-t 60), never `restart`: restart's default 10s grace
+      # SIGKILLs Jellyfin mid-shutdown on a populated DB, and eleven dirty
+      # kills in a row left it unable to boot at all (Kestrel startup
+      # cancelled, FTL loop) — observed live, whole cold leg lost.
+      docker compose stop -t 60 "$svc" >/dev/null 2>&1
+      docker compose start "$svc" >/dev/null 2>&1
       for _ in $(seq 1 240); do curl -sf "$base/System/Info/Public" >/dev/null 2>&1 && break; sleep 0.5; done
       # A failed probe leaves its endpoint missing — merge.py's manifest check
       # fails the run rather than shipping a record with a silent cold hole.
