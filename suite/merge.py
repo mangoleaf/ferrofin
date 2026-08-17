@@ -362,9 +362,9 @@ def main():
         if ch or cj:
             cold_block = {
                 "h_first": (ch or {}).get("first"), "h_p50": (ch or {}).get("p50"),
-                "h_max": (ch or {}).get("max"),
+                "h_max": (ch or {}).get("max"), "h_ready_ms": (ch or {}).get("ready_wait_ms"),
                 "j_first": (cj or {}).get("first"), "j_p50": (cj or {}).get("p50"),
-                "j_max": (cj or {}).get("max"),
+                "j_max": (cj or {}).get("max"), "j_ready_ms": (cj or {}).get("ready_wait_ms"),
             }
         operations.append({
             "op": op, "tag": tag,

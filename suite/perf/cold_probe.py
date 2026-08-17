@@ -37,10 +37,34 @@ RAW = Path(__file__).resolve().parent / "results" / "raw"
 
 
 def probe(base, e, ctx, count):
-    """First-`count` sequential requests → per-request ms (expected-status only
-    enters the latency list; errors are counted, never timed as successes)."""
+    """First-`count` sequential requests → (per-request ms, bad, ready_wait_ms).
+
+    Jellyfin answers /System/Info/Public while the app is still initializing
+    and 503s authenticated routes — run.sh's readiness gate passes before the
+    API actually serves (observed live: every authenticated sentinel probed
+    0/10 while unauthenticated info_public was 10/10). 503/transport
+    rejections come from middleware BEFORE the handler runs, so waiting them
+    out doesn't warm what we measure; the wait itself is a real part of the
+    restart experience and is returned separately. The first ACCEPTED request
+    is the cold number. Expected-status only enters the latency list; other
+    accepted-but-wrong statuses count as bad, never timed as successes."""
     lat, bad = [], 0
-    for _ in range(count):
+    t_start = time.perf_counter()
+    deadline = t_start + CONFIG["BENCH_COLD_READY_TIMEOUT_SECS"]
+    while True:
+        t0 = time.perf_counter()
+        status, _body = benchlib.fire(base, e, ctx, timeout=120)
+        ms = (time.perf_counter() - t0) * 1000
+        if status in (0, 503) and time.perf_counter() < deadline:
+            time.sleep(0.25)
+            continue
+        break
+    ready_wait_ms = (t0 - t_start) * 1000
+    if status == e["ok"]:
+        lat.append(round(ms, 2))
+    else:
+        bad += 1
+    for _ in range(count - 1):
         t0 = time.perf_counter()
         status, _body = benchlib.fire(base, e, ctx, timeout=120)
         ms = (time.perf_counter() - t0) * 1000
@@ -48,7 +72,7 @@ def probe(base, e, ctx, count):
             lat.append(round(ms, 2))
         else:
             bad += 1
-    return lat, bad
+    return lat, bad, round(ready_wait_ms, 1)
 
 
 def main():
@@ -67,13 +91,16 @@ def main():
     if ctx is None:
         sys.exit(f"no {args.target}-ctx.json — run the warm leg (compare.py) first")
 
-    lat, bad = probe(args.base, e, ctx, CONFIG["BENCH_COLD_REQUESTS"])
+    lat, bad, ready_wait_ms = probe(args.base, e, ctx, CONFIG["BENCH_COLD_REQUESTS"])
     row = {
         "first": lat[0] if lat else None,          # THE cold number
         "p50": round(percentile(sorted(lat), 50), 2) if lat else None,
         "max": max(lat) if lat else None,
         "all": lat,                                 # the warm-up curve, in order
         "bad": bad,
+        # Restart → API-actually-serving wait (Jellyfin's init window; ~0 on
+        # Ferrofin) — part of the restart experience, separate from `first`.
+        "ready_wait_ms": ready_wait_ms,
     }
 
     out_path = RAW / f"{args.target}-cold-requests.json"

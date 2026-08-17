@@ -39,6 +39,7 @@ DEFAULTS = {
     "BENCH_WARMUP_SECS": 10,
     "BENCH_WARMUP_MIN_CALLS": 30,
     "BENCH_COLD_REQUESTS": 10,
+    "BENCH_COLD_READY_TIMEOUT_SECS": 120,
     "BENCH_COLD_ENDPOINTS": "info_public user_me items_sortname items_mixed item_detail "
                             "persons studios suggestions movie_recommendations "
                             "items_filters2 image_primary",
