@@ -250,6 +250,71 @@ the baseline and gate on the same host/fixture.
 > `ferrofin-core`, `ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths. See the
 > quality-gates section of the root `CLAUDE.md`.
 
+## Profiling the server (chasing a benchmark row down to a cause)
+
+When a row here says an endpoint is slow, the profiling loop is: reproduce the
+row's load against a **native** build (never inside Docker), then walk down —
+spans → SQL → flamegraph. The suite's own drivers are the load harness.
+
+**One-time host setup:**
+
+```bash
+# The profiling build profile is in the workspace Cargo.toml already:
+cargo build --profile profiling -p ferrofin-server   # release speed + debug symbols
+
+cargo install samply          # sampling profiler (Firefox Profiler UI)
+
+# Sampling profilers use the kernel's perf facility; the default
+# kernel.perf_event_paranoid=2 blocks samply. Level 1 = "profile your OWN
+# processes, incl. kernel-side stacks" — the standard dev-box setting. It is
+# machine-wide, so set it on dev/bench hosts only, never shared/prod machines.
+echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid                  # until reboot
+echo 'kernel.perf_event_paranoid = 1' | sudo tee /etc/sysctl.d/99-perf.conf  # persistent
+
+sudo pacman -S heaptrack      # heap profiling (memory workstreams only)
+```
+
+**Per-investigation loop:**
+
+```bash
+# 1. A scanned DB: copy the bench volume once (or scan fresh locally).
+docker run --rm -v ferrofin-benchv2_ferrofin-data:/data \
+  -v /tmp/ferrofin-profile:/out alpine \
+  sh -c "cp -r /data /out/ && chown -R $(id -u):$(id -g) /out/data"
+
+# 2. Native server on it, profiling build.
+FERROFIN_ADMIN_USER=bench FERROFIN_ADMIN_PASSWORD=benchpass123 \
+  ./target/profiling/ferrofin-server --data-dir /tmp/ferrofin-profile/data \
+  --bind 127.0.0.1 --port 18496
+
+# 3. Mint a run context once (from suite/perf/):
+python3 - <<'EOF'
+import json, pathlib, sys; sys.path.insert(0, ".")
+import benchlib
+base = "http://127.0.0.1:18496"
+ctx = benchlib.authenticate(base, "ferrofin")
+ctx.update({"username": "bench", "password": "benchpass123"})
+benchlib.pick_items(base, ctx); benchlib.enrich_context(base, ctx)
+pathlib.Path("results/raw/ferrofin-ctx.json").write_text(json.dumps(ctx))
+EOF
+
+# 4. Reproduce the row: same endpoint, same rate the record shows.
+python3 phase_a.py --target ferrofin --base http://127.0.0.1:18496 \
+  -e items_resume --rate 464 --dur 20 --warmup 5 --out /tmp/repro.json
+
+# 5. Profile during the load (writes a profile you open in profiler.firefox.com):
+samply record -p "$(pgrep -f 'profiling/ferrofin-server')" --duration 15 \
+  --save-only -o /tmp/profile.json.gz
+```
+
+**Reading it:** a big flamegraph tower = CPU-bound, optimize the frames. CPU
+flat but latency huge = the request is *waiting* (async off-CPU) — check the
+tracing spans (`OTEL_EXPORTER_OTLP_ENDPOINT` → Tempo), then
+`RUST_LOG=sqlx::query=debug` to see each SQL statement with its duration, then
+`EXPLAIN QUERY PLAN` in `sqlite3` against the copied DB (full scans and temp
+b-trees on hot paths are the usual culprits). Verify every fix at the top:
+`./perf-gate.sh`, then the endpoint's row in a fresh leg.
+
 ## Regenerating on every release
 
 `./run.sh` *is* the regeneration command — run it at each Ferrofin release and commit the new
