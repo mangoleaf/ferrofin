@@ -91,11 +91,13 @@ pub async fn auth_context_layer(
 
 /// Extractor for handlers behind Jellyfin's `[Authorize]` policy.
 ///
-/// Validates the request's credentials via [`AuthService::authenticate`] and
-/// yields the authenticated [`AuthorizationInfo`]; a missing or invalid token
-/// becomes `401`. Handlers that merely want the (possibly anonymous) context
-/// should read the [`AuthorizationInfo`] extension set by [`auth_context_layer`]
-/// instead.
+/// Reads the [`AuthorizationInfo`] that [`auth_context_layer`] already resolved
+/// and stashed as a request extension. When the extension carries an
+/// authenticated context the extractor returns immediately — no DB, no
+/// header-parsing, nothing. Only when the extension is absent or anonymous
+/// does it fall through to [`AuthService::authenticate`], which is the old
+/// per-handler path and serves as a safety net for tests that wire
+/// `FakeAuthContext` (unauthenticated) alongside `AuthedAuthService`.
 #[derive(Debug, Clone)]
 pub struct RequireAuth(pub AuthorizationInfo);
 
@@ -106,6 +108,13 @@ impl FromRequestParts<AppState> for RequireAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(info) = parts
+            .extensions
+            .get::<AuthorizationInfo>()
+            .filter(|i| i.is_authenticated)
+        {
+            return Ok(Self(info.clone()));
+        }
         let ctx = request_context(&parts.headers, parts.uri.query(), None);
         let info = state.auth_service().authenticate(&ctx).await?;
         Ok(Self(info))

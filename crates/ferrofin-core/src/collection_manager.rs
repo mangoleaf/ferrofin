@@ -33,6 +33,7 @@
 //! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
 //!   user-view tree and returns `None` here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
     PlaylistUserUpdateRequest,
 };
+use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
 use ferrofin_traits::collections::{
@@ -463,13 +465,31 @@ impl PlaylistManager for FerrofinPlaylistManager {
             .linked_children
             .get_linked_children_ids(playlist_id, Some(LINKED_CHILD_MANUAL))
             .await?;
-        let mut out = Vec::with_capacity(child_ids.len());
-        for child_id in child_ids {
-            if let Some(row) = self.library_manager.get_item_by_id(child_id).await? {
-                out.push(row);
-            }
+        if child_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let db_ids: Vec<String> = child_ids.iter().copied().map(guid_to_db).collect();
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
+        let mut sep = qb.separated(", ");
+        for id in &db_ids {
+            sep.push_bind(id.as_str());
+        }
+        sep.push_unseparated(")");
+        let rows: Vec<BaseItemEntity> = qb
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        // Restore linked-children order (SQL IN doesn't guarantee it).
+        let pos: HashMap<&str, usize> = db_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+        let mut sorted = rows;
+        sorted.sort_by_key(|r| pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
+        Ok(sorted)
     }
 
     async fn add_user_to_shares(

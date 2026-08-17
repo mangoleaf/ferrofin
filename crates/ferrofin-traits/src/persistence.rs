@@ -117,6 +117,18 @@ pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Retrieves multiple items by id in a single round-trip, preserving the
+    /// input order. Missing ids are silently skipped.
+    async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Walks the `ParentId` chain from `item_id` upward in a single query
+    /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
+    /// the starting item does not exist.
+    async fn get_ancestor_chain(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError>;
+
     /// Runs a query and returns a page of item rows plus the total count.
     async fn get_items(
         &self,

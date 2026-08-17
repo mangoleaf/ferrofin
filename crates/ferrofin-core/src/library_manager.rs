@@ -173,6 +173,13 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.retrieve_item(id).await
     }
 
+    async fn get_ancestors(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        self.items.get_ancestor_chain(item_id).await
+    }
+
     async fn get_item_images(
         &self,
         item_id: Uuid,

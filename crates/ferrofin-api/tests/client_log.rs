@@ -113,6 +113,9 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
+            client: Some("Test Client".to_owned()),
+            version: Some("9.9.9".to_owned()),
+            is_api_key: self.is_api_key,
             user: Some(user()),
             is_authenticated: true,
             ..Default::default()

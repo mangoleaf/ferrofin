@@ -37,6 +37,17 @@ use crate::db_error::db_err;
 use crate::item_type_lookup;
 use crate::item_type_lookup::stored_type_name;
 
+/// `PeopleEntity` + the `COUNT(*) OVER()` total, so a single query returns
+/// both the page and the pagination total without a separate round-trip.
+#[derive(sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+struct PeopleWithCount {
+    id: String,
+    name: String,
+    person_type: Option<String>,
+    total_count: i64,
+}
+
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
 /// user-data join (C# `itemTypeLookup.BaseItemKindNames[Person]`).
 const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
@@ -396,16 +407,11 @@ impl FerrofinPeopleRepository {
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
-        let mut count_qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
-        push_predicates(&mut count_qb, filter);
-        let total: i64 = count_qb
-            .build_query_scalar()
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err)?;
-
+        // Single query: COUNT(*) OVER() inlines the total alongside each data
+        // row, eliminating a separate round-trip (one fewer pool acquire + the
+        // full row-streaming overhead through sqlx-sqlite's per-row channel).
         let mut qb = base_query_from(
-            r#"p."Id", p."Name", p."PersonType""#,
+            r#"p."Id", p."Name", p."PersonType", COUNT(*) OVER() AS "TotalCount""#,
             DEDUP_PEOPLE_FROM,
             filter,
         );
@@ -413,7 +419,6 @@ impl FerrofinPeopleRepository {
         qb.push(r#" ORDER BY p."Name""#);
         let start = filter.start_index.unwrap_or(0);
         if filter.limit > 0 || start > 0 {
-            // SQLite needs a LIMIT clause to attach OFFSET; -1 = unlimited.
             qb.push(" LIMIT ");
             qb.push_bind(if filter.limit > 0 {
                 i64::from(filter.limit)
@@ -426,14 +431,26 @@ impl FerrofinPeopleRepository {
             }
         }
         let rows = qb
-            .build_query_as::<PeopleEntity>()
+            .build_query_as::<PeopleWithCount>()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
+        let total = rows.first().map_or(0, |r| r.total_count);
+        let items = rows
+            .into_iter()
+            .map(|r| PeopleEntity {
+                id: r.id,
+                name: r.name,
+                person_type: r.person_type,
+                role: None,
+                primary_image_url: None,
+                provider_id: None,
+            })
+            .collect();
         Ok(QueryResult::new(
             Some(start),
             Some(i32::try_from(total).unwrap_or(i32::MAX)),
-            rows,
+            items,
         ))
     }
 }

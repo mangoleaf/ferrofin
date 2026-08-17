@@ -94,6 +94,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 
+# ── allocator (server-only: glibc malloc convoyed under 64 threads) ─
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 # ── observability / net ────────────────────────────────────────────
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
