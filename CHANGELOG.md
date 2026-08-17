@@ -5,17 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 [Conventional Commits](https://www.conventionalcommits.org); versions follow
 [Semantic Versioning](https://semver.org).
 
-## [Unreleased]
+Upgrades needing a manual step or with a non-obvious behavior change are
+called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
-### Upgrade Notes
-- Per-library metadata/image fetcher selections are now enforced during the
-  scan, and five built-in fetchers are newly named in library options
-  (TheTVDB, FanArt, MusicBrainz, TheAudioDB, Embedded Image Extractor). A
-  library whose options were last saved by an older Ferrofin will not have
-  these in its saved lists, so they stop running for that library after the
-  upgrade — open each library's settings and Save once to re-enable them.
-  Libraries migrated from a Jellyfin database, and libraries created after
-  the upgrade, are unaffected.
+## [Unreleased]
 
 ### Bug Fixes
 - Report CanUninstall=true so the dashboard shows the enable/disable toggle
