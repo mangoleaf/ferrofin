@@ -339,11 +339,18 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
     }
 }
 
-/// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1`, applying the optional
+/// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
 /// `is_favorite` user-data restriction as an `EXISTS` sub-select (C# joins
-/// `UserData` on the person item's name).
-fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
-    let mut qb = QueryBuilder::new(format!(r#"SELECT {cols} FROM "Peoples" p WHERE 1 = 1"#));
+/// `UserData` on the person item's name). `from` is either the raw
+/// `"Peoples"` table or the deduped derived table (see
+/// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
+/// reference `p."Name"`/`p."Id"`, which both shapes expose.
+fn base_query_from<'a>(
+    cols: &str,
+    from: &str,
+    filter: &InternalPeopleQuery,
+) -> QueryBuilder<'a, Sqlite> {
+    let mut qb = QueryBuilder::new(format!("SELECT {cols} FROM {from} p WHERE 1 = 1"));
     if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "UserData" ud
@@ -360,25 +367,87 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
     qb
 }
 
+fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
+    base_query_from(cols, r#""Peoples""#, filter)
+}
+
+/// The deduped-people derived table: one representative row per lower-cased
+/// name. SQLite's documented single-`MIN` bare-column semantics make the
+/// non-aggregated columns come from the `MIN("Id")` row — the same
+/// representative the previous `p."Id" IN (SELECT MIN(...) GROUP BY ...)`
+/// shape selected (verified row-identical on the bench library), but in ONE
+/// aggregation pass that the `HermitIX_Peoples_LowerName_Cover` index serves
+/// as an index-only scan: 28 ms → 0.85 ms per query on 7.5k people.
+const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."PersonType"
+     FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
+
+impl FerrofinPeopleRepository {
+    /// The `/Persons` by-name listing: deduped representatives with the
+    /// predicates applied to the representative row (exactly the previous
+    /// `p."Id" IN (SELECT MIN(...) GROUP BY ...)` semantics — verified
+    /// row-identical on the bench library) and paging pushed into SQL, with
+    /// the total from a companion COUNT over the same derived table.
+    ///
+    /// The previous shape materialized the ENTIRE deduped table through sqlx
+    /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
+    /// 28 ms of SQL+decode per request that collapsed `/Persons` to a 29.8 s
+    /// p50 at its calibrated 608 req/s in the benchmark (P0.5 family).
+    async fn get_people_by_name(
+        &self,
+        filter: &InternalPeopleQuery,
+    ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
+        let mut count_qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
+        push_predicates(&mut count_qb, filter);
+        let total: i64 = count_qb
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+
+        let mut qb = base_query_from(
+            r#"p."Id", p."Name", p."PersonType""#,
+            DEDUP_PEOPLE_FROM,
+            filter,
+        );
+        push_predicates(&mut qb, filter);
+        qb.push(r#" ORDER BY p."Name""#);
+        let start = filter.start_index.unwrap_or(0);
+        if filter.limit > 0 || start > 0 {
+            // SQLite needs a LIMIT clause to attach OFFSET; -1 = unlimited.
+            qb.push(" LIMIT ");
+            qb.push_bind(if filter.limit > 0 {
+                i64::from(filter.limit)
+            } else {
+                -1
+            });
+            if start > 0 {
+                qb.push(" OFFSET ");
+                qb.push_bind(i64::from(start));
+            }
+        }
+        let rows = qb
+            .build_query_as::<PeopleEntity>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(QueryResult::new(
+            Some(start),
+            Some(i32::try_from(total).unwrap_or(i32::MAX)),
+            rows,
+        ))
+    }
+}
+
 #[async_trait]
 impl PeopleRepository for FerrofinPeopleRepository {
     async fn get_people(
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
-        let mut rows = if filter.item_id.is_nil() {
-            // Collapse to one representative id per lower-cased name.
-            let mut qb = base_query(r#"p."Id", p."Name", p."PersonType""#, filter);
-            push_predicates(&mut qb, filter);
-            qb.push(
-                r#" AND p."Id" IN (SELECT MIN(p2."Id") FROM "Peoples" p2
-                    GROUP BY LOWER(p2."Name")) ORDER BY p."Name""#,
-            );
-            qb.build_query_as::<PeopleEntity>()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?
-        } else {
+        if filter.item_id.is_nil() {
+            return self.get_people_by_name(filter).await;
+        }
+        let mut rows = {
             // Item-scoped credits carry the credited role (a character name)
             // from the map row, like the C# `GetPeople` projection — without it
             // every cast entry renders roleless on the detail page. NULLIF folds
