@@ -2,8 +2,9 @@
 # Phase A — isolated, open-model, per-endpoint profiling.
 #
 # For each server: bring it up + scan ONCE, then drive each endpoint on its own
-# at a fixed arrival rate (phase-a.js, constant-arrival-rate), snapshotting the
-# container's cgroup cpu.stat around each run to attribute CPU-seconds/request.
+# at a fixed arrival rate (phase_a.py → vegeta, constant arrival rate),
+# snapshotting the container's cgroup cpu.stat around each run to attribute
+# CPU-seconds/request.
 # Produces per-endpoint p50/p95/p99 + CPU-µs/req that are actually comparable
 # between Ferrofin and Jellyfin (no cross-endpoint interference, honest tails).
 #
@@ -28,14 +29,11 @@ export PHASE_RATE PHASE_DUR PHASE_WARMUP
 # Shared bring-up: library list + passthrough env (suite/lib.sh).
 suite_build_libraries
 
-# Endpoint names come from the single source of truth (bench-lib ENDPOINTS),
-# read via node with the k6 imports stripped.
+# Endpoint names come from the single source of truth (endpoints.py ENDPOINTS).
+# Scenario rows (auth_login) run in their own window elsewhere, never in the
+# per-endpoint phase loop.
 endpoint_names() {
-  node -e '
-    const fs=require("fs");
-    let s=fs.readFileSync("bench-lib.js","utf8").replace(/^import .*$/gm,"").replace(/^export /gm,"");
-    s+="\nENDPOINTS.forEach(e=>console.log(e.name));";
-    new Function("__ENV", s)({});'
+  python3 -c "from endpoints import ENDPOINTS; [print(e['name']) for e in ENDPOINTS if not e['scenario']]"
 }
 # usage_usec (total CPU µs charged to the container's cgroup).
 # `</dev/null` so `docker exec` can't swallow the endpoint-loop's stdin.
@@ -54,15 +52,26 @@ profile() {   # $1=service $2=port $3=target
   local total_s; total_s=$(awk -v w="${PHASE_WARMUP%s}" -v d="${PHASE_DUR%s}" 'BEGIN{print w+d}')
   while IFS= read -r name; do
     local c0 c1 dcpu; c0=$(cpu_usec "$svc" || echo 0)
-    k6 run -e ENDPOINT="$name" -e TARGET="$target" -e BASE_URL="$base" phase-a.js </dev/null >/dev/null 2>&1 || true
+    local f="results/raw/phaseA-${target}-${name}.json"
+    rm -f "$f"   # a failed leg must leave no file — never patch a stale run's numbers
+    python3 phase_a.py --target "$target" --base "$base" -e "$name" \
+      --rate "$PHASE_RATE" --dur "${PHASE_DUR%s}" --warmup "${PHASE_WARMUP%s}" \
+      --out "$f" </dev/null >/dev/null 2>&1 || true
     c1=$(cpu_usec "$svc" || echo "$c0")
     # CPU µs consumed by the endpoint's requests = total delta minus idle burn over the window.
     dcpu=$(awk -v a="${c0:-0}" -v b="${c1:-0}" -v idle="$idle_rate" -v s="$total_s" 'BEGIN{d=(b-a)-idle*s; print (d<0?0:d)}')
     [ -z "$dcpu" ] && dcpu=0
-    local f="results/raw/phaseA-${target}-${name}.json"
     if [ -f "$f" ]; then
-      node -e "const d=require('./$f'); d.cpu_us=$dcpu; d.cpu_us_per_req=d.reqs?($dcpu/d.reqs):null; require('fs').writeFileSync('./$f',JSON.stringify(d));" || true
-      printf '   %-24s p50=%s cpu/req=%.1fµs\n' "$name" "$(node -pe "require('./$f').p50" 2>/dev/null || echo '?')" "$(node -pe "require('./$f').cpu_us_per_req||0" 2>/dev/null || echo 0)" || true
+      python3 -c '
+import json, sys
+p, dcpu = sys.argv[1], float(sys.argv[2])
+d = json.load(open(p))
+d["cpu_us"] = dcpu
+d["cpu_us_per_req"] = dcpu / d["reqs"] if d.get("reqs") else None
+open(p, "w").write(json.dumps(d))' "$f" "$dcpu" || true
+      printf '   %-24s p50=%s cpu/req=%.1fµs\n' "$name" \
+        "$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get("p50"); print("?" if v is None else v)' "$f" 2>/dev/null || echo '?')" \
+        "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cpu_us_per_req") or 0)' "$f" 2>/dev/null || echo 0)" || true
     fi
   done < <(endpoint_names)
   docker compose stop "$svc" >/dev/null 2>&1 || true
@@ -74,5 +83,5 @@ docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase A report"
 VERSION=$(git -C .. describe --tags --always 2>/dev/null || echo dev)
-node render-phase-a.mjs "$VERSION" "$PHASE_RATE" "$PHASE_DUR"
+python3 render_phases.py a "$VERSION" "$PHASE_RATE" "$PHASE_DUR"
 echo ">> wrote results/phaseA-${VERSION}.md"

@@ -690,6 +690,111 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/FileTransformation/RegisterTransformation"),
 ];
 
+/// `(method, path, extension-id)` for every route owned by a **compiled-in
+/// extension** (`ferrofin-extensions`); core routes are everything in
+/// [`REAL_ROUTES`] not listed here.
+///
+/// This is the machine-readable ownership manifest the benchmark/parity suite
+/// reads (`suite/parity/gen-ledger.py` parses this const the same way it
+/// parses `REAL_ROUTES`), so "how fast/complete is core Ferrofin" is
+/// separable from "how fast/complete is each extension" in every published
+/// record. Extension authors update ONE place: add the route here and to
+/// `REAL_ROUTES`; the compile-time assertion below catches an entry that
+/// drifts from (or never lands in) `REAL_ROUTES`, and the suite picks the
+/// ownership up with no further edits.
+///
+/// Paths are the contract-canonical forms, verbatim from `REAL_ROUTES`
+/// (e.g. `/MediaSegmentsApi/{segmentId}` canonicalizes to `{itemId}`).
+pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
+    // MergeVersions plugin (see handlers::merge_versions).
+    ("post", "/MergeVersions/MergeMovies", "merge-versions"),
+    ("post", "/MergeVersions/SplitMovies", "merge-versions"),
+    ("post", "/MergeVersions/MergeEpisodes", "merge-versions"),
+    ("post", "/MergeVersions/SplitEpisodes", "merge-versions"),
+    // Intro Skipper extension (see handlers::intro_skipper).
+    ("get", "/Episode/{Id}/Timestamps", "intro-skipper"),
+    ("post", "/Episode/{Id}/Timestamps", "intro-skipper"),
+    ("get", "/Episode/{Id}/IntroSkipperSegments", "intro-skipper"),
+    ("post", "/Intros/EraseTimestamps", "intro-skipper"),
+    ("post", "/Intros/RebuildDatabase", "intro-skipper"),
+    ("get", "/MediaSegmentsApi", "intro-skipper"),
+    ("post", "/MediaSegmentsApi/{itemId}", "intro-skipper"),
+    ("delete", "/MediaSegmentsApi/{itemId}", "intro-skipper"),
+    ("post", "/SkipButtonCss/InjectCss", "intro-skipper"),
+    ("post", "/SkipButtonCss/UpdateSkipDuration", "intro-skipper"),
+    ("get", "/IntroSkipper", "intro-skipper"),
+    ("get", "/IntroSkipper/SupportBundle", "intro-skipper"),
+    ("get", "/Intros/AnalyzerActions/{SeasonId}", "intro-skipper"),
+    (
+        "post",
+        "/Intros/AnalyzerActions/UpdateSeason",
+        "intro-skipper",
+    ),
+    ("get", "/Intros/Show/{SeriesId}/{SeasonId}", "intro-skipper"),
+    (
+        "delete",
+        "/Intros/Show/{SeriesId}/{SeasonId}",
+        "intro-skipper",
+    ),
+    (
+        "post",
+        "/Intros/ScanSeason/{SeriesId}/{SeasonId}",
+        "intro-skipper",
+    ),
+    ("get", "/Intros/ScanStatus", "intro-skipper"),
+    // FileTransformation registration hook (lives in handlers::intro_skipper).
+    (
+        "post",
+        "/FileTransformation/RegisterTransformation",
+        "file-transformation",
+    ),
+];
+
+/// Compile-time `str` equality (`==` on `&str` isn't const).
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Every [`EXTENSION_ROUTES`] entry must name a real route — a moved or
+/// renamed route fails the BUILD, so the ownership manifest can't drift.
+const fn extension_routes_all_real() -> bool {
+    let mut i = 0;
+    while i < EXTENSION_ROUTES.len() {
+        let (m, p, _ext) = EXTENSION_ROUTES[i];
+        let mut found = false;
+        let mut j = 0;
+        while j < REAL_ROUTES.len() {
+            let (rm, rp) = REAL_ROUTES[j];
+            if str_eq(m, rm) && str_eq(p, rp) {
+                found = true;
+                break;
+            }
+            j += 1;
+        }
+        if !found {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    extension_routes_all_real(),
+    "EXTENSION_ROUTES contains an entry that is not in REAL_ROUTES"
+);
+
 /// Mounts every real First-Light handler onto `router`, overriding the matching
 /// `501` stub entries registered from the vendored contract table.
 ///

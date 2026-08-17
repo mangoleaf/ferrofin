@@ -1,7 +1,5 @@
 {
   "meta": {
-    "hermit": "v0.8.3-13-gf417814",
-    "hermit_sha": "f417814",
     "jellyfin_image": "jellyfin/jellyfin:10.11.8",
     "fixture_hash": "fa0024c9f239ea12",
     "cpus": 4,
@@ -43,7 +41,10 @@
         "runs": 3
       }
     },
-    "when": "2026-08-04T00:54Z"
+    "when": "2026-08-04T00:54Z",
+    "ferrofin": "v0.8.3-13-gf417814",
+    "ferrofin_sha": "f417814",
+    "legacy": "k6-closed-loop"
   },
   "headline": {
     "comparable_rows": 43,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase D — realistic-load comparison: a few think-time clients (phase-d.js)
+# Phase D — realistic-load comparison: a few think-time clients (phase_d.py)
 # instead of the 50-VU lockstep stress. This is the "what users feel" number;
 # run.sh's 50-VU table stays the stress headline.
 #
@@ -22,7 +22,7 @@ suite_build_libraries
 phase_d() {  # $1=service $2=port $3=target
   local svc="$1" base="http://localhost:$2" target="$3"
   bringup_scan "$svc" "$base" "$target" || return 0
-  TARGET="$target" BASE_URL="$base" k6 run phase-d.js </dev/null
+  python3 phase_d.py --target "$target" --base "$base" </dev/null
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
@@ -32,5 +32,5 @@ docker compose down -v >/dev/null 2>&1 || true
 
 echo ">> rendering Phase D report"
 VERSION=$(git -C .. describe --tags --always 2>/dev/null || echo dev)
-node render-phase-d.mjs "$VERSION"
+python3 render_closed.py d "$VERSION"
 echo ">> wrote results/phaseD-${VERSION}.md"

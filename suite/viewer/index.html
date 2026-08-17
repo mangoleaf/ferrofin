@@ -53,6 +53,8 @@
   .pill.win  { color: var(--good); border-color: #204a2b; background: #10261699; }
   .pill.loss { color: var(--bad);  border-color: #4a1c1c; background: #260f0f99; }
   .pill.tail { color: var(--warn); border-color: #4a3a10; background: #26200f99; }
+  .pill.tie  { color: #9aa7b5; border-color: #33404d; background: #17202899; }
+  .pill.owner{ color: #cdbdfa; border-color: #3b2f63; background: #1d173399; }
   .d-REAL { color: var(--real); border-color: #204a2b; background: #10261699; }
   .d-PARTIAL { color: var(--partial); border-color: #4a3a10; background: #26200f99; }
   .d-HOLLOW { color: var(--hollow); border-color: #4a2e14; background: #26160f99; }
@@ -89,8 +91,17 @@
   <table id="ops"><thead><tr>
     <th class="l">operation</th><th class="l">variant</th><th class="l">parity</th><th>deep?</th>
     <th>H p50</th><th>H p95</th><th>H p99</th><th>J p50</th><th>J p95</th><th>J p99</th>
+    <th title="Fresh-process first-request latency (H / J, ms) — sentinels only; separate from warm, never blended">cold first H/J</th>
     <th title="Ferrofin p50 change vs the selected base run">Δ vs base</th>
     <th>speedup</th><th>verdict</th><th class="l">note</th>
+  </tr></thead><tbody></tbody></table>
+
+  <h2 id="aggh" style="display:none">Aggregate <span class="muted" id="aggsub" style="text-transform:none"></span></h2>
+  <table id="agg" style="display:none"><thead><tr>
+    <th class="l">endpoint</th><th class="l">owner</th>
+    <th>H p50</th><th>J p50</th><th>H p99</th><th>J p99</th>
+    <th title="ratio of per-endpoint medians (stable), not median of noisy per-run ratios">paired</th>
+    <th title="fresh-process first request, median±IQR across runs">cold H/J</th><th>n</th>
   </tr></thead><tbody></tbody></table>
 
   <h2>Trend <span class="muted" style="text-transform:none">(comparable median speedup + parity coverage; legacy greyed)</span></h2>
@@ -103,6 +114,7 @@
   <div class="lctl">
     <input type="search" id="lq" placeholder="Filter by operation, classification…">
     <select id="ldepth"><option value="">depth: all</option></select>
+    <select id="lowner"><option value="">owner: all</option></select>
     <select id="ldeep">
       <option value="">deep: all</option>
       <option value="true">✅ verified</option>
@@ -113,7 +125,7 @@
   </div>
   <div class="bar" id="lbar"></div>
   <table id="ledger"><thead><tr>
-    <th class="l">operation</th><th class="l">depth</th><th>status</th><th>schema</th>
+    <th class="l">operation</th><th class="l">owner</th><th class="l">depth</th><th>status</th><th>schema</th>
     <th>deep</th><th class="l">classification</th>
   </tr></thead><tbody></tbody></table>
 </main>
@@ -125,6 +137,10 @@ const num = (x) => x == null ? "—" : (+x).toFixed(x < 10 ? 2 : 0);
 // records predate run_label, so fall back to the bare version.
 const vlabel = (r) => r.meta.run_label || r.meta.ferrofin;
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
+// core is unmarked prose (it's the default story); extensions get a labeled
+// badge so their rows never silently blend into core's numbers.
+const ownerBadge = (owner) => (!owner || owner === "core")
+  ? `<span class="muted">core</span>` : `<span class="pill owner">${owner}</span>`;
 const opCell = (op) => {
   const [m, ...rest] = op.split(" ");
   return `<code><span class="method m-${m}">${m}</span>${rest.join(" ")}</code>`;
@@ -146,18 +162,42 @@ function guardBanner(r, b) {
   guard.innerHTML = bad.length
     ? `<div class="banner warnb">⚠ Not directly comparable — differs on: <b>${bad.join(", ")}</b>.
        Speed deltas between these runs are not meaningful.</div>`
-    : `<div class="banner okb">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`;
+    : `<div class="banner okb">✓ Comparable: same fixture, load, cpus, and Jellyfin image.</div>`
+      + frozenSetBanner(r, b);
+}
+
+// F2 (fairness): when the comparable SET shifts between two runs (an endpoint
+// newly verified, or newly drifting), their headlines have different
+// denominators. Freeze the set to the intersection and report that number
+// beside each run's own, so readers never compare across a moving denominator.
+function frozenSetBanner(r, b) {
+  const compSet = (run) => new Set(run.operations.filter(o => o.perf.comparable).map(o => o.perf.variant));
+  const cs = compSet(r), bs = compSet(b);
+  if (cs.size === bs.size && [...cs].every(v => bs.has(v))) return "";
+  const shared = [...cs].filter(v => bs.has(v));
+  const med = (run) => {
+    const s = run.operations
+      .filter(o => shared.includes(o.perf.variant) && o.perf.speedup != null)
+      .map(o => o.perf.speedup).sort((a, x) => a - x);
+    return s.length ? s[Math.floor(s.length / 2)] : null;
+  };
+  return `<div class="banner warnb">⚠ Comparable set shifted: ${bs.size} → ${cs.size} rows
+    (shared ${shared.length}). Frozen-set median speedup — base ${med(b) ?? "—"}× ·
+    this run ${med(r) ?? "—"}× (full-set headlines have different denominators).</div>`;
 }
 
 function statCards(h) {
   const card = (n, l, color) =>
     `<div class="stat"><div class="n" style="color:${color || "var(--fg)"}">${n}</div><div class="l">${l}</div></div>`;
-  return card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup",
-              h.median_speedup >= 1 ? "var(--good)" : "var(--bad)")
-    + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
-    + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
+  // Parity coverage leads (exact, deterministic); the ratio comes LAST and
+  // labeled — it is the noisiest number on the page (review, round 1).
+  return card(pct(h.parity_coverage), "parity coverage", "var(--accent)")
     + card(h.comparable_rows, "comparable rows")
-    + card(pct(h.parity_coverage), "parity coverage", "var(--accent)");
+    + card(pct(h.win_rate), "win-rate (p50+p95+p99)", h.win_rate >= 0.5 ? "var(--good)" : "var(--bad)")
+    + (h.ties != null ? card(h.ties, `≈ ties (<${h.noise_floor_ms ?? "?"} ms)`) : "")
+    + card((h.tail_losses || []).length, "tail losses", (h.tail_losses || []).length ? "var(--warn)" : "var(--good)")
+    + card(h.median_speedup == null ? "—" : h.median_speedup + "×", "median speedup (noisy — see aggregate)",
+           h.median_speedup >= 1 ? "var(--good)" : "var(--bad)");
 }
 
 function render() {
@@ -167,7 +207,9 @@ function render() {
 
   const h = r.headline, m = r.meta;
   subline.innerHTML = `<b style="color:var(--fg)">${vlabel(r)}</b> · ${m.when || ""} ·
-    Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
+    Jellyfin <code>${m.jellyfin_image || "?"}</code> · ${m.load?.model === "open-loop"
+      ? `open-loop, sample-based windows ≤${m.load.duration_secs ?? "?"}s/endpoint`
+      : m.load?.vus != null ? `${m.load.vus} VUs × ${m.load.duration}` : ""} ·
     ${m.cpus ?? "?"} cpus / ${m.mem ?? "?"}`;
   stats.innerHTML = statCards(h);
   const fp = m.footprint;
@@ -202,9 +244,13 @@ function render() {
   const rows = r.operations.filter(o => !compOnly.checked || o.perf.comparable);
   ops.tBodies[0].innerHTML = rows.map(o => {
     const p = o.perf, cls = m.legacy ? "legacyrow" : (p.comparable ? "" : "incomparable");
+    // D1: sub-noise-floor deltas are ties (≈), never colored win/loss. A row
+    // with no floor-clearing loss reads ≈; "loss" means a real, felt loss.
+    const anyLoss = p.verdicts && Object.values(p.verdicts).includes("loss");
     const verdict = p.win_all_three ? `<span class="pill win">win×3</span>`
       : p.tail_loss ? `<span class="pill tail">tail loss</span>`
-      : p.comparable ? `<span class="pill loss">loss</span>` : "—";
+      : p.tie_all_three ? `<span class="pill tie">≈</span>`
+      : p.comparable ? (anyLoss ? `<span class="pill loss">loss</span>` : `<span class="pill tie">≈</span>`) : "—";
     const depth = o.parity.depth || "—";
     let delta = "—";
     if (b && baseP50[p.variant] != null && p.h_p50 != null && baseP50[p.variant] > 0) {
@@ -214,11 +260,12 @@ function render() {
     const spd = p.speedup == null ? "—"
       : `<span class="${p.speedup >= 1 ? "good" : "bad"}">${p.speedup}×</span>`;
     return `<tr class="${cls}">
-      <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code></td>
+      <td class="l">${opCell(o.op)}</td><td class="l"><code>${p.variant}</code>${o.owner && o.owner !== "core" ? " " + ownerBadge(o.owner) : ""}</td>
       <td class="l"><span class="pill d-${depth}">${depth}</span></td>
       <td>${o.parity.deep_verified ? "✓" : "·"}</td>
       <td>${num(p.h_p50)}</td><td>${num(p.h_p95)}</td><td>${num(p.h_p99)}</td>
       <td>${num(p.j_p50)}</td><td>${num(p.j_p95)}</td><td>${num(p.j_p99)}</td>
+      <td>${p.cold ? `${num(p.cold.h_first)} / ${num(p.cold.j_first)}` : "—"}</td>
       <td>${delta}</td><td>${spd}</td>
       <td>${verdict}</td><td class="l muted">${p.comparable ? "" : (p.reason || "")}</td>
     </tr>`;
@@ -241,10 +288,11 @@ function renderTrend() {
 let LEDGER = [];
 function renderLedger() {
   const q = lq.value.trim().toLowerCase();
-  const fd = ldepth.value, fv = ldeep.value;
+  const fd = ldepth.value, fv = ldeep.value, fo = lowner.value;
   const mark = (v) => v === true ? "✅" : v === false ? "⚠️" : "·";
   const rows = LEDGER.filter(x => {
     if (fd && x.depth !== fd) return false;
+    if (fo && (x.owner || "core") !== fo) return false;
     if (fv === "true" && x.deep_verified !== true) return false;
     if (fv === "class" && !(x.classification && x.deep_verified !== true)) return false;
     if (fv === "untested" && (x.deep_verified !== null || x.classification)) return false;
@@ -259,6 +307,7 @@ function renderLedger() {
   lbar.innerHTML = seg(deep, "var(--good)") + seg(cls, "var(--warn)") + seg(total - deep - cls, "var(--none)");
   ledger.tBodies[0].innerHTML = rows.map(x => `<tr>
     <td class="l">${opCell(x.operation)}</td>
+    <td class="l">${ownerBadge(x.owner)}</td>
     <td class="l"><span class="pill d-${x.depth}">${x.depth}</span></td>
     <td>${mark(x.status_conformant)}</td><td>${mark(x.schema_valid)}</td>
     <td title="${x.deep_verified === true ? "verified" : x.deep_verified === false ? "classified" : "untested"}">${mark(x.deep_verified)}</td>
@@ -274,11 +323,36 @@ fetch("/suite/results/runs.json?t=" + Date.now()).then(r => r.json()).then(d => 
   render(); renderTrend();
 });
 
+// C2: the publishable numbers are distributions (median±IQR over BENCH_RUNS
+// runs), led by parity coverage and paired per-endpoint speedups — the
+// single-run median-of-ratios stays out of the headline (≈30% run noise).
+const fd = (d) => d == null ? "—" : `${d.med}±${d.iqr}`;
+fetch("/suite/results/aggregates.json?t=" + Date.now()).then(r => r.json()).then(d => {
+  const a = d.aggregates[d.aggregates.length - 1];
+  if (!a) return;
+  const h = a.headline, m = a.meta;
+  document.getElementById("aggh").style.display = "";
+  document.getElementById("agg").style.display = "";
+  document.getElementById("aggsub").textContent =
+    `${m.ferrofin} · ${m.aggregated_runs} runs · latency median±IQR (ms) · ` +
+    `parity ${h.parity_coverage} · paired speedup ${fd(h.paired_speedup)} · win-rate ${fd(h.win_rate)}`;
+  document.querySelector("#agg tbody").innerHTML = Object.entries(a.endpoints).map(([v, ep]) => `<tr>
+    <td class="l"><code>${v}</code></td><td class="l">${ownerBadge(ep.owner)}</td>
+    <td>${fd(ep.h_p50)}</td><td>${fd(ep.j_p50)}</td>
+    <td>${fd(ep.h_p99)}</td><td>${fd(ep.j_p99)}</td>
+    <td>${ep.paired_speedup == null ? "—" : `<span class="${ep.paired_speedup >= 1 ? "good" : "bad"}">${ep.paired_speedup}×</span>`}</td>
+    <td>${ep.cold_first ? `${fd(ep.cold_first.h)} / ${fd(ep.cold_first.j)}` : "—"}</td>
+    <td>${ep.n_comparable}/${ep.n_runs}</td>
+  </tr>`).join("");
+}).catch(() => {});
+
 fetch("/suite/parity/ledger.json?t=" + Date.now()).then(r => r.json()).then(d => {
   LEDGER = d.operations;
   ldepth.innerHTML = `<option value="">depth: all</option>` +
     [...new Set(LEDGER.map(x => x.depth))].sort().map(v => `<option>${v}</option>`).join("");
-  [lq, ldepth, ldeep].forEach(el => el.oninput = renderLedger);
+  lowner.innerHTML = `<option value="">owner: all</option>` +
+    [...new Set(LEDGER.map(x => x.owner || "core"))].sort().map(v => `<option>${v}</option>`).join("");
+  [lq, ldepth, ldeep, lowner].forEach(el => el.oninput = renderLedger);
   renderLedger();
 }).catch(() => { lstats.textContent = "ledger.json not found — run suite/run.sh parity"; });
 </script>

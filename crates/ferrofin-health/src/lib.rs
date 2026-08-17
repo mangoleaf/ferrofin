@@ -37,6 +37,18 @@ pub use checker::{FnChecker, HealthChecker};
 pub use response::{LiveResponse, ReadyResponse};
 pub use router::health_router;
 
+/// The build identity baked in at compile time by this crate's `build.rs`:
+/// `FERROFIN_GIT_DESCRIBE` when supplied (Docker builds without `.git`), else
+/// `git describe --tags --always --dirty`, else the crate version.
+///
+/// This is a *compile-time* value — reading it from a running process (via
+/// `GET /health/live`) identifies the binary itself, which is what lets the
+/// benchmark harness refuse to measure a stale build.
+#[must_use]
+pub fn build_version() -> &'static str {
+    env!("FERROFIN_BUILD_VERSION")
+}
+
 use utoipa::OpenApi;
 
 /// OpenAPI document for the health probe endpoints.

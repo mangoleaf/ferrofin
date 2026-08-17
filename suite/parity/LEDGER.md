@@ -16,6 +16,17 @@ _Layer 1: 162/188 status-conformant · 125/127 schema-valid_
 | **route registered** | 412 | 100% |
 | **route 501-stub** | 0 | 0% |
 
+## Ownership (core vs compiled-in extensions)
+
+_Extensions must not dilute or flatter core's coverage number — each owner's deep-verified share stands alone._
+
+| owner | ops | deep-verified | classified | untested |
+|---|---:|---:|---:|---:|
+| core | 389 | 201 (51%) | 188 | 0 |
+| file-transformation | 1 | 0 (0%) | 1 | 0 |
+| intro-skipper | 18 | 0 (0%) | 18 | 0 |
+| merge-versions | 4 | 0 (0%) | 4 | 0 |
+
 ## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)
 
 - ✅ `GET /Albums/{itemId}/InstantMix`

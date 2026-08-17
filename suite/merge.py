@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -30,6 +31,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SUITE = ROOT / "suite"
 RESULTS = SUITE / "results"
 RAW = RESULTS / "raw"
+
+# The methodology knobs (three-layer resolution: default < bench.conf < env)
+# live in suite/perf/config.py — the manifest check needs the cold-endpoint
+# list resolved the same way the measuring leg resolved it.
+sys.path.insert(0, str(SUITE / "perf"))
+from config import CONFIG  # noqa: E402
 
 
 def run_signature(record):
@@ -118,7 +125,7 @@ def footprint():
         out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
         out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
         out[f"{key}_items"] = first(f"{tgt}-count.txt")
-        # HLS play-start TTFS (transcode.js, RUN_TRANSCODE=1): median time to
+        # HLS play-start TTFS (ttfs.py, RUN_TRANSCODE=1): median time to
         # first segment for a stream-copy remux and a forced 4K HEVC->H.264
         # encode — the closest thing to "how fast does play start" and a
         # headline metric, never to be dropped from the record.
@@ -145,6 +152,16 @@ def perf_by_variant():
                 "h_rps": hv.get("rps"), "h_ok": hv.get("okPct"),
                 "j_p50": jv.get("p50"), "j_p95": jv.get("p95"), "j_p99": jv.get("p99"),
                 "j_rps": jv.get("rps"), "j_ok": jv.get("okPct"),
+                # Open-loop bookkeeping (G1): both sides must have been driven at
+                # the SAME recorded arrival rate, and each must have held it.
+                "rate": hv.get("target_rate"), "rate_source": hv.get("rate_source"),
+                "h_rate_held": hv.get("rate_held"), "j_rate_held": jv.get("rate_held"),
+                "j_rate": jv.get("target_rate"),
+                # Distinguishes "measured, zero expected-status responses"
+                # (achieved rate recorded — e.g. Jellyfin's login path
+                # collapsing under storm load) from "leg never ran" for the
+                # A1 manifest check.
+                "h_achieved": hv.get("achieved_rate"), "j_achieved": jv.get("achieved_rate"),
             }
         return out, "raw-summary"
     bd = load_json(SUITE / "perf" / "bench-data.json")
@@ -174,11 +191,99 @@ def fixture_hash():
     return h.hexdigest()[:16]
 
 
-def wins_all_three(p):
-    v = [p["h_p50"], p["h_p95"], p["h_p99"], p["j_p50"], p["j_p95"], p["j_p99"]]
-    if any(x is None for x in v):
-        return False
-    return p["h_p50"] < p["j_p50"] and p["h_p95"] < p["j_p95"] and p["h_p99"] < p["j_p99"]
+def server_build():
+    """The /health/live build identity run.sh captured for the ferrofin leg."""
+    p = SUITE / "perf" / "results" / "raw" / "ferrofin-build.txt"
+    try:
+        return p.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def manifest_check(v2op, perf, foot, cold):
+    """A1 (fail loud): every registry bench variant must have produced a latency
+    row on BOTH servers, each declared special leg (TTFS copy/encode, when
+    RUN_TRANSCODE=1) its footprint block, and each configured cold sentinel its
+    cold row on both servers. A leg that silently vanished — the 2026-08
+    transcode.js path break produced two green runs with zero TTFS rows — must
+    fail the merge, never thin the record.
+
+    Returns (skipped, missing): SKIP_VARIANTS (comma list) records a variant as
+    deliberately skipped instead of missing (`cold:<name>` skips a cold row);
+    anything else absent is missing.
+    """
+    skip = {s.strip() for s in os.environ.get("SKIP_VARIANTS", "").split(",") if s.strip()}
+    missing = []
+    for variant in sorted(v2op):
+        if variant in skip:
+            continue
+        p = perf.get(variant)
+
+        # A side is MISSING when its leg produced nothing at all — no latency
+        # AND no recorded attempt. A measured window where every response was
+        # unexpected-status (p50 None but achieved_rate recorded — Jellyfin's
+        # login path under storm load does exactly this) is NOT a manifest
+        # hole: the row lands in the record as incomparable with its 0%
+        # visible. A1 exists for legs that silently vanish, not for servers
+        # that fail honestly under load.
+        def side_absent(prefix):
+            return (p is None or (p.get(f"{prefix}_p50") is None
+                                  and not p.get(f"{prefix}_achieved")))
+
+        h_absent, j_absent = side_absent("h"), side_absent("j")
+        if h_absent or j_absent:
+            side = "both" if h_absent and j_absent else "ferrofin" if h_absent else "jellyfin"
+            missing.append(f"{variant}[{side}]")
+    if bench_env("RUN_TRANSCODE") == "1":
+        for key, tgt in (("h", "ferrofin"), ("j", "jellyfin")):
+            for mode in ("copy", "encode"):
+                leg = f"ttfs_{mode}"
+                if leg in skip:
+                    continue
+                if not (foot or {}).get(f"{key}_{leg}"):
+                    missing.append(f"{leg}[{tgt}]")
+    for name in CONFIG["BENCH_COLD_ENDPOINTS"].split():
+        if f"cold:{name}" in skip:
+            continue
+        for tgt in ("ferrofin", "jellyfin"):
+            row = (cold.get(tgt) or {}).get("endpoints", {}).get(name)
+            if not row or row.get("first") is None:
+                missing.append(f"cold:{name}[{tgt}]")
+    return sorted(skip), sorted(missing)
+
+
+def floored_speedup(h_p50, j_p50, floor):
+    """The per-row ratio with the noise floor applied (D1) → (ratio, is_tie).
+
+    None ratio when either side is missing, the delta is under the floor
+    (dividing two sub-floor medians amplifies jitter into a fake multiple —
+    0.3 ms vs 0.1 ms reads as "3×"), or Ferrofin's median is zero. is_tie
+    marks exactly the floor-suppressed case, so the headline's
+    ratio_excluded_ties derives from THIS rule instead of a parallel
+    reimplementation (review, round 3). Pure so merge_selftest.py pins it."""
+    if h_p50 is None or j_p50 is None:
+        return None, False
+    if abs(h_p50 - j_p50) < floor:
+        return None, True
+    if not h_p50:
+        return None, False  # zero median: ratio undefined, not a tie
+    return round(j_p50 / h_p50, 2), False
+
+
+def percentile_verdicts(p, floor):
+    """D1: per-percentile win/tie/loss with the noise floor as a first-class
+    concept. A delta smaller than the floor (host-local jitter band, recorded
+    in meta) is a TIE — neither a win nor a loss, anywhere: a 1 ms 'loss' on a
+    sub-ms endpoint is OS noise, not a result. Returns
+    {'p50': 'win'|'tie'|'loss', ...} (Ferrofin's perspective), or None when
+    either side lacks numbers."""
+    out = {}
+    for pct in ("p50", "p95", "p99"):
+        h, j = p[f"h_{pct}"], p[f"j_{pct}"]
+        if h is None or j is None:
+            return None
+        out[pct] = "tie" if abs(h - j) < floor else "win" if h < j else "loss"
+    return out
 
 
 def main():
@@ -187,6 +292,24 @@ def main():
     perf, perf_src = perf_by_variant()
     fp_h = load_json(RAW / "perf-fingerprints-ferrofin.json", {})
     fp_j = load_json(RAW / "perf-fingerprints-jellyfin.json", {})
+    foot = footprint()
+    perf_meta = (load_json(SUITE / "perf/results/raw/ferrofin-summary.json") or {}).get("meta")
+    cold = {tgt: load_json(SUITE / f"perf/results/raw/{tgt}-cold-requests.json", {})
+            for tgt in ("ferrofin", "jellyfin")}
+
+    # A1: measure the full manifest or fail loud (no green record with holes).
+    # MERGE_ALLOW_INCOMPLETE=1 downgrades to a record stamped `incomplete` that
+    # is written but kept OUT of the trend file (needed for the legacy
+    # bench-data fallback, which predates the full endpoint set).
+    skipped, missing = manifest_check(v2op, perf, foot, cold)
+    if missing:
+        print(f"!! manifest incomplete — {len(missing)} expected leg(s) produced no data:", file=sys.stderr)
+        for m in missing:
+            print(f"!!   {m}", file=sys.stderr)
+        print("!! (deliberate? record it: SKIP_VARIANTS=name1,name2 — skipped legs are stamped into the record)", file=sys.stderr)
+        if os.environ.get("MERGE_ALLOW_INCOMPLETE") != "1":
+            print("!! refusing to write a run record (MERGE_ALLOW_INCOMPLETE=1 to write one stamped incomplete, excluded from the trend)", file=sys.stderr)
+            sys.exit(2)
 
     operations, benched_ops, deep_ops = [], set(), set()
     for variant, p in perf.items():
@@ -206,32 +329,112 @@ def main():
         drift = (not is_write) and op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
         both_ok = p.get("h_ok") == 100 and p.get("j_ok") == 100
         have_lat = p["h_p50"] is not None and p["j_p50"] is not None
-        comparable = deep and both_ok and have_lat and not drift
+        # G1: a latency comparison is only meaningful at the same arrival rate,
+        # actually held on both sides. Legacy (closed-loop) records carry no
+        # rate keys — None == None keeps them flowing through unchanged.
+        same_rate = p.get("rate") == p.get("j_rate")
+        rates_held = p.get("h_rate_held") is not False and p.get("j_rate_held") is not False
+        comparable = deep and both_ok and have_lat and not drift and same_rate and rates_held
         reason = (None if comparable else
                   "body shape diverges from Jellyfin at bench time" if drift else
                   "not deep-verified" if not deep else
-                  "200-rate < 100%" if not both_ok else "missing latency")
+                  "200-rate < 100%" if not both_ok else
+                  "measured at different arrival rates" if not same_rate else
+                  "open-loop rate not held" if not rates_held else "missing latency")
 
-        win = wins_all_three(p)
-        speedup = round(p["j_p50"] / p["h_p50"], 2) if have_lat and p["h_p50"] else None
+        verdicts = percentile_verdicts(p, CONFIG["BENCH_NOISE_FLOOR_MS"])
+        vlist = list(verdicts.values()) if verdicts else []
+        # A win requires clearing the floor on ALL THREE percentiles; all-ties
+        # is an explicit ≈ verdict; a p50 win with a floor-clearing tail loss
+        # stays a tail loss, never folded into "faster".
+        win = vlist.count("win") == 3
+        tie = bool(vlist) and vlist.count("tie") == 3
+        # D1 applies to the RATIO too: a p50 tie gets NO speedup (see
+        # floored_speedup); headline.ratio_excluded_ties says how many.
+        speedup, ratio_tie = floored_speedup(
+            p["h_p50"], p["j_p50"], CONFIG["BENCH_NOISE_FLOOR_MS"])
+        # H2: cold rows ride the same operation, as a separate labeled block —
+        # WARM percentiles above are the headline; cold is published beside
+        # them, never blended (fresh-process first-request latency).
+        ch = (cold.get("ferrofin") or {}).get("endpoints", {}).get(variant)
+        cj = (cold.get("jellyfin") or {}).get("endpoints", {}).get(variant)
+        cold_block = None
+        if ch or cj:
+            cold_block = {
+                "h_first": (ch or {}).get("first"), "h_p50": (ch or {}).get("p50"),
+                "h_max": (ch or {}).get("max"), "h_ready_ms": (ch or {}).get("ready_wait_ms"),
+                "j_first": (cj or {}).get("first"), "j_p50": (cj or {}).get("p50"),
+                "j_max": (cj or {}).get("max"), "j_ready_ms": (cj or {}).get("ready_wait_ms"),
+            }
         operations.append({
             "op": op, "tag": tag,
+            # E2: core vs compiled-in-extension ownership, from the parity
+            # ledger (whose source is the EXTENSION_ROUTES const in
+            # ferrofin-api — compile-time asserted against REAL_ROUTES).
+            "owner": pr.get("owner", "core"),
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
+                     "ratio_tie": ratio_tie,
                      "win_all_three": win,
-                     "tail_loss": bool(comparable and speedup and speedup > 1 and not win),
-                     "comparable": comparable, "reason": reason},
+                     "tie_all_three": tie,
+                     "verdicts": verdicts,
+                     "tail_loss": bool(comparable and verdicts
+                                       and verdicts["p50"] == "win"
+                                       and "loss" in (verdicts["p95"], verdicts["p99"])),
+                     "comparable": comparable, "reason": reason,
+                     **({"cold": cold_block} if cold_block else {})},
         })
 
     comp = [o["perf"] for o in operations if o["perf"]["comparable"]]
     speedups = [o["speedup"] for o in comp if o["speedup"] is not None]
+    # A2: surface how many rows fell out of the comparison and why, so shrinking
+    # coverage reads as shrinking coverage instead of "all green".
+    dropped = {}
+    for o in operations:
+        r = o["perf"]["reason"]
+        if r:
+            dropped[r] = dropped.get(r, 0) + 1
+    # E3: per-owner breakdown — extensions must not dilute or flatter core's
+    # numbers, so each owner's share stands alone. (All benched variants are
+    # core today; extension variants slot in with no further edits here.)
+    owners = {}
+    for o in operations:
+        ow = owners.setdefault(o["owner"], {"rows": 0, "comparable_rows": 0,
+                                            "speedups": [], "wins": 0, "deep": 0})
+        ow["rows"] += 1
+        ow["deep"] += bool(o["parity"]["deep_verified"])
+        if o["perf"]["comparable"]:
+            ow["comparable_rows"] += 1
+            ow["wins"] += bool(o["perf"]["win_all_three"])
+            if o["perf"]["speedup"] is not None:
+                ow["speedups"].append(o["perf"]["speedup"])
+    owners = {
+        name: {
+            "rows": ow["rows"],
+            "comparable_rows": ow["comparable_rows"],
+            "median_speedup": round(median(ow["speedups"]), 3) if ow["speedups"] else None,
+            "win_rate": round(ow["wins"] / ow["comparable_rows"], 3) if ow["comparable_rows"] else None,
+            "parity_coverage": round(ow["deep"] / ow["rows"], 3) if ow["rows"] else None,
+        }
+        for name, ow in owners.items()
+    }
+
     headline = {
         "comparable_rows": len(comp),
+        "dropped_rows": sum(dropped.values()),
+        "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
+        # Comparable rows whose p50 delta is under the floor: they carry no
+        # ratio (see floored_speedup — the single source of the rule), and
+        # this count keeps the exclusion visible.
+        "ratio_excluded_ties": sum(1 for o in comp if o.get("ratio_tie")),
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
+        "ties": sum(o["tie_all_three"] for o in comp),
+        "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
         "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
+        "owners": owners,
     }
 
     sha = sh("git", "rev-parse", "--short", "HEAD") or "unknown"
@@ -243,10 +446,26 @@ def main():
             "fixture_hash": fixture_hash(),
             "cpus": int(bench_env("BENCH_CPUS")) if bench_env("BENCH_CPUS") else None,
             "mem": bench_env("BENCH_MEM"),
-            "load": {"vus": int(bench_env("BENCH_VUS")) if bench_env("BENCH_VUS") else None,
-                     "duration": bench_env("BENCH_DURATION")},
+            # The load model + engine + resolved methodology knobs come from the
+            # perf leg's own summary meta (compare.py is the ONLY producer of
+            # that meta block, and only it runs open-loop) — a summary without
+            # it (the legacy bench-data fallback, or a stale k6 raw summary)
+            # must NOT be stamped open-loop: gate.py's rebaseline honesty
+            # check keys on this (review finding, round 1).
+            "load": {"model": "open-loop" if perf_meta else None,
+                     "duration_secs": (perf_meta or {}).get("bench_config", {})
+                     .get("values", {}).get("BENCH_DURATION_SECS")},
+            "engine": (perf_meta or {}).get("engine"),
+            "ping_ceiling_rps": (perf_meta or {}).get("ping_ceiling_rps"),
+            "bench_config": (perf_meta or {}).get("bench_config"),
             "perf_source": perf_src,
-            "footprint": footprint(),
+            "footprint": foot,
+            # B1: the build identity the running server reported over
+            # /health/live during the perf leg (run.sh verified it against the
+            # tree before measuring); None for records that predate the check.
+            "server_build": server_build(),
+            "skipped_variants": skipped or None,
+            "incomplete": missing or None,
             "when": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         },
         "headline": headline,
@@ -254,6 +473,21 @@ def main():
     }
 
     RESULTS.mkdir(parents=True, exist_ok=True)
+
+    # An incomplete record (MERGE_ALLOW_INCOMPLETE=1) is written for inspection
+    # under its own name but NEVER enters the trend file — a record with holes
+    # must not look like a point on the same curve as complete ones.
+    if missing:
+        # Numbered so successive incomplete runs of one SHA don't overwrite
+        # each other's evidence (review carry-over, round 2).
+        seq = 1
+        while (RESULTS / f"run-{sha}-incomplete-{seq}.json").exists():
+            seq += 1
+        out = RESULTS / f"run-{sha}-incomplete-{seq}.json"
+        record["meta"]["run_label"] = f"{record['meta']['ferrofin']} (incomplete)"
+        out.write_text(json.dumps(record, indent=2) + "\n")
+        print(f">> wrote {out.relative_to(ROOT)} — INCOMPLETE, excluded from the trend")
+        return
 
     # Keep every distinct run of the same SHA (variance across reruns is the point) — but
     # collapse an exact re-merge of the same raw artifacts so a second `run.sh merge`

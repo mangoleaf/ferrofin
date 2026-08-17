@@ -183,3 +183,24 @@ fn real_routes_have_no_duplicates() {
         "REAL_ROUTES has entries absent from the vendored contract: {orphans:?}"
     );
 }
+
+/// `EXTENSION_ROUTES` (the core-vs-extension ownership manifest the benchmark
+/// suite reads) must be a duplicate-free set. Membership in `REAL_ROUTES` is
+/// already a compile-time assertion next to the const; this guards the one
+/// property a `const fn` can't cheaply express.
+#[test]
+fn extension_routes_have_no_duplicates() {
+    use ferrofin_api::handlers::EXTENSION_ROUTES;
+
+    let mut seen = BTreeSet::new();
+    let mut dups = Vec::new();
+    for (method, path, _ext) in EXTENSION_ROUTES {
+        if !seen.insert((*method, *path)) {
+            dups.push((*method, *path));
+        }
+    }
+    assert!(
+        dups.is_empty(),
+        "EXTENSION_ROUTES contains duplicate (method, path) rows: {dups:?}"
+    );
+}
