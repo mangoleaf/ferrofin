@@ -263,15 +263,22 @@ const EMBEDDED_IMAGE_STREAM_TYPE: i32 = 3;
 /// The image file extensions the art-dir helpers recognize.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 
-/// Magic-byte sniff for the artwork formats plugins may return (the
-/// [`ART_FILE_EXTENSIONS`] set) — enough to keep an arbitrary blob from
-/// persisting as a permanent zero-dimension image.
-fn looks_like_image(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\xFF\xD8\xFF") // JPEG
-        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || bytes.starts_with(b"GIF87a")
-        || bytes.starts_with(b"GIF89a")
-        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+/// Magic-byte sniff for the artwork formats plugins may return, returning the
+/// file extension to store the bytes under (one of [`ART_FILE_EXTENSIONS`]),
+/// or `None` for anything that is not a recognized image — enough to keep an
+/// arbitrary blob from persisting as a permanent zero-dimension image.
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
 }
 
 /// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
@@ -2406,8 +2413,10 @@ impl LibraryScanner {
                 }
                 // Sniff before persisting: an undecodable blob would land as
                 // a permanent 0×0 "image" (art on disk always wins, so the
-                // slot never recovers).
-                if !looks_like_image(&bytes) {
+                // slot never recovers). Store under the sniffed format's
+                // extension — a PNG as `.png`, not a mislabeled `.jpg`; the
+                // art-dir readers accept every ART_FILE_EXTENSIONS entry.
+                let Some(ext) = sniff_image_ext(&bytes) else {
                     tracing::warn!(
                         provider = provider.name(),
                         item = %entity.id,
@@ -2415,8 +2424,8 @@ impl LibraryScanner {
                         "plugin artwork bytes are not a recognized image format; skipping"
                     );
                     continue;
-                }
-                let dest = item_dir.join(format!("{}.jpg", image_type_file_stem(kind)));
+                };
+                let dest = item_dir.join(format!("{}.{ext}", image_type_file_stem(kind)));
                 if let Err(err) =
                     std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
                 {
@@ -5647,12 +5656,17 @@ mod tests {
         .with_dynamic_providers(vec![provider.clone()]);
         scanner.scan_all().await.unwrap();
 
-        // The bytes landed as {metadata}/{id}/primary.jpg…
+        // The bytes landed under the SNIFFED extension — PNG magic ⇒
+        // primary.png, not a mislabeled primary.jpg.
         let primary = std::fs::read_dir(&meta_dir)
             .expect("metadata dir exists")
-            .map(|e| e.unwrap().path().join("primary.jpg"))
+            .map(|e| e.unwrap().path().join("primary.png"))
             .find(|p| p.exists())
-            .expect("dynamic Primary written to disk");
+            .expect("dynamic Primary written to disk as .png");
+        assert!(
+            !primary.with_file_name("primary.jpg").exists(),
+            "PNG bytes must not be stored under a .jpg name"
+        );
         assert_eq!(std::fs::read(&primary).unwrap(), PNG_FIRST);
         // …and as a persisted Primary image row pointing at that file
         // (read back through the repository, not raw SQL — boundary rule).

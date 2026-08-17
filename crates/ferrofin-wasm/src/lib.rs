@@ -370,7 +370,7 @@ impl WasmPluginHost {
 
         for path in paths {
             match load_one(&engine, &linker, &path, settings, &http, &collaborators) {
-                Ok(loaded) => {
+                Ok(mut loaded) => {
                     if plugins
                         .iter()
                         .any(|p| p.descriptor.id == loaded.descriptor.id)
@@ -387,21 +387,26 @@ impl WasmPluginHost {
                     // (case-insensitively) — a collision with a built-in
                     // fetcher or another plugin would ride that fetcher's
                     // checkbox/order and be impossible to toggle apart.
-                    if let Some(info) = &loaded.provider_info {
-                        let reserved = ferrofin_providers::library_options::fetcher_names::ALL
-                            .iter()
-                            .any(|r| r.eq_ignore_ascii_case(&info.name));
+                    // Normalized (trimmed) BEFORE the checks: HTML collapses
+                    // padding, so " TheMovieDb" would render identically to
+                    // the real entry.
+                    if let Some(info) = loaded.provider_info.as_mut() {
+                        if info.name.trim().len() != info.name.len() {
+                            info.name = info.name.trim().to_owned();
+                        }
                         let taken = plugins.iter().any(|p| {
                             p.provider_info
                                 .as_ref()
                                 .is_some_and(|i| i.name.eq_ignore_ascii_case(&info.name))
                         });
-                        if reserved || taken {
+                        let violation = provider_name_violation(&info.name)
+                            .or_else(|| taken.then(|| "is already taken".to_owned()));
+                        if let Some(why) = violation {
                             error!(
                                 path = %path.display(),
                                 provider = info.name,
-                                "wasm plugin declares a provider name that collides with \
-                                 a built-in fetcher or an already-loaded plugin; \
+                                why,
+                                "wasm plugin declares an unacceptable provider name; \
                                  skipping this file"
                             );
                             continue;
@@ -577,6 +582,30 @@ impl WasmPluginHost {
             }
         }
     }
+}
+
+/// Longest accepted provider-descriptor name in bytes — a dashboard display
+/// string; bounded like state keys (an abuse guard, not a tuning knob).
+const PROVIDER_NAME_MAX: usize = 256;
+
+/// Why a (trimmed) declared provider name is unacceptable regardless of
+/// what else is loaded: unnameable, oversized, or impersonating a built-in
+/// fetcher. `None` = acceptable. The "already taken by another plugin" half
+/// lives at the load loop, which is the only place that sees the full set.
+fn provider_name_violation(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    if name.len() > PROVIDER_NAME_MAX {
+        return Some(format!("exceeds {PROVIDER_NAME_MAX} bytes"));
+    }
+    if ferrofin_providers::library_options::fetcher_names::ALL
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(name))
+    {
+        return Some("collides with a built-in fetcher".to_owned());
+    }
+    None
 }
 
 /// Compiles, instantiates and interrogates a single component file.
@@ -1008,6 +1037,22 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
             let declared_egress = instance.call_declared_egress(&mut store).map_err(|e| {
                 ServiceError::invalid_input(format!("artifact declared-egress call failed: {e:#}"))
             })?;
+            // Refuse an unacceptable provider name AT INSTALL, not at the
+            // next boot — otherwise the admin sees "installed" and then a
+            // silently absent provider. (The "taken by another loaded
+            // plugin" half can only be checked at load; this covers the
+            // reserved/empty/oversized violations.)
+            let provider_info = instance.call_provider_info(&mut store).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact provider-info call failed: {e:#}"))
+            })?;
+            if let Some(info) = &provider_info
+                && let Some(why) = provider_name_violation(info.name.trim())
+            {
+                return Err(ServiceError::invalid_input(format!(
+                    "artifact declares provider name `{}`, which {why}",
+                    info.name.trim()
+                )));
+            }
             Ok(ferrofin_traits::plugins::ValidatedArtifact {
                 id,
                 declared_egress,

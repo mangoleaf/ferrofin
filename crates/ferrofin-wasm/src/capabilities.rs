@@ -931,6 +931,9 @@ fn state_after_set(
 
 /// Cap on collection membership operations per call.
 const COLLECTION_IDS_MAX: usize = 1000;
+/// Cap on a created collection's name — the one guest string in the write
+/// family that had no bound (same abuse-guard size as state keys).
+const COLLECTION_NAME_MAX: usize = 256;
 /// The host-reserved state key listing collection ids a plugin owns.
 const OWNED_COLLECTIONS_KEY: &str = "host:collections";
 
@@ -1046,6 +1049,11 @@ pub fn create_collection(
 ) -> Result<String, String> {
     if item_ids.len() > COLLECTION_IDS_MAX {
         return Err(format!("at most {COLLECTION_IDS_MAX} items per call"));
+    }
+    if name.len() > COLLECTION_NAME_MAX {
+        return Err(format!(
+            "collection name exceeds {COLLECTION_NAME_MAX} bytes"
+        ));
     }
     let ids: Vec<Uuid> = item_ids
         .iter()

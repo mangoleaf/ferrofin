@@ -7,6 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 
 ## [Unreleased]
 
+### Upgrade Notes
+- Per-library metadata/image fetcher selections are now enforced during the
+  scan, and five built-in fetchers are newly named in library options
+  (TheTVDB, FanArt, MusicBrainz, TheAudioDB, Embedded Image Extractor). A
+  library whose options were last saved by an older Ferrofin will not have
+  these in its saved lists, so they stop running for that library after the
+  upgrade — open each library's settings and Save once to re-enable them.
+  Libraries migrated from a Jellyfin database, and libraries created after
+  the upgrade, are unaffected.
+
 ### Bug Fixes
 - Report CanUninstall=true so the dashboard shows the enable/disable toggle
 - Correct transcode.js fixture path after the suite/ reorg

@@ -837,7 +837,18 @@ async fn write_family_caps_ownership_and_plumbing() {
             format!("eng:srt:{}", b"1\n00:00:01 --> 2\nhi".len())
         );
 
-        // Collections: create records ownership; updating an unowned id is
+        // Collections: an over-long name is refused before any manager call.
+        let err = create_collection(
+            &cx,
+            Some(&state),
+            8 * 1024 * 1024,
+            &"x".repeat(257),
+            &[ITEM.into()],
+        )
+        .unwrap_err();
+        assert!(err.contains("name exceeds"), "{err}");
+
+        // create records ownership; updating an unowned id is
         // refused BEFORE any manager call; owned updates go through.
         let cid = create_collection(&cx, Some(&state), 8 * 1024 * 1024, "Best", &[ITEM.into()])
             .expect("create");

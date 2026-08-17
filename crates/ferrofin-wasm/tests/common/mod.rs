@@ -901,3 +901,35 @@ impl ferrofin_traits::collections::CollectionManager for StubCollections {
         unimplemented!("stub")
     }
 }
+
+/// The shared WAT fixture, re-identified (`id` must stay 36 chars) and
+/// upgraded from `provider-info: none` to `some({name, supported-kinds:
+/// []})` — the canonical-ABI ret area gains the payload (name ptr/len, empty
+/// list) and the name string lands in otherwise-unused memory at 1280.
+/// Used by the load tests (name-collision guard) and the validator test
+/// (install-time reserved-name refusal).
+pub fn named_provider_fixture(id: &str, provider_name: &str) -> String {
+    assert_eq!(id.len(), 36, "must byte-replace the 36-char fixture id");
+    ferrofin_wasm::TEST_FIXTURE_WAT
+        .replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
+        .replace(
+            "(data (i32.const 488) \"Movie\")",
+            &format!(
+                "(data (i32.const 488) \"Movie\")\n    (data (i32.const 1280) \"{provider_name}\")"
+            ),
+        )
+        .replace(
+            "    (func (export \"provider-info\") (result i32)\n      \
+             (i32.store (i32.const 1184) (i32.const 0))\n      i32.const 1184)",
+            &format!(
+                "    (func (export \"provider-info\") (result i32)\n      \
+                 (i32.store (i32.const 1184) (i32.const 1))\n      \
+                 (i32.store (i32.const 1188) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1192) (i32.const {len}))\n      \
+                 (i32.store (i32.const 1196) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1200) (i32.const 0))\n      \
+                 i32.const 1184)",
+                len = provider_name.len()
+            ),
+        )
+}

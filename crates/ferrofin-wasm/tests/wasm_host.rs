@@ -173,35 +173,7 @@ fn duplicate_plugin_ids_keep_only_the_first() {
     assert_eq!(host.plugins().len(), 1, "same id must load once");
 }
 
-/// The fixture WAT, re-identified (`id` must stay 36 chars) and upgraded
-/// from `provider-info: none` to `some({name, supported-kinds: []})` — the
-/// canonical-ABI ret area gains the payload (name ptr/len, empty list) and
-/// the name string lands in otherwise-unused memory at 1280.
-fn named_provider_fixture(id: &str, provider_name: &str) -> String {
-    assert_eq!(id.len(), 36, "must byte-replace the 36-char fixture id");
-    FIXTURE_WAT
-        .replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
-        .replace(
-            "(data (i32.const 488) \"Movie\")",
-            &format!(
-                "(data (i32.const 488) \"Movie\")\n    (data (i32.const 1280) \"{provider_name}\")"
-            ),
-        )
-        .replace(
-            "    (func (export \"provider-info\") (result i32)\n      \
-             (i32.store (i32.const 1184) (i32.const 0))\n      i32.const 1184)",
-            &format!(
-                "    (func (export \"provider-info\") (result i32)\n      \
-                 (i32.store (i32.const 1184) (i32.const 1))\n      \
-                 (i32.store (i32.const 1188) (i32.const 1280))\n      \
-                 (i32.store (i32.const 1192) (i32.const {len}))\n      \
-                 (i32.store (i32.const 1196) (i32.const 1280))\n      \
-                 (i32.store (i32.const 1200) (i32.const 0))\n      \
-                 i32.const 1184)",
-                len = provider_name.len()
-            ),
-        )
-}
+use common::named_provider_fixture;
 
 #[test]
 fn colliding_provider_names_are_refused_at_load() {
@@ -227,12 +199,25 @@ fn colliding_provider_names_are_refused_at_load() {
         "c-acme-again",
         &named_provider_fixture("33333333-3333-3333-3333-333333333333", "acmedb"),
     );
+    // Skipped: a padded built-in name — HTML collapses the whitespace, so
+    // this would render as the real TMDB entry. Normalized before the check.
+    write_fixture(
+        dir.path(),
+        "d-padded",
+        &named_provider_fixture("44444444-4444-4444-4444-444444444444", " TheMovieDb "),
+    );
+    // Skipped: an empty name (a blank-labelled fetcher).
+    write_fixture(
+        dir.path(),
+        "e-empty",
+        &named_provider_fixture("55555555-5555-5555-5555-555555555555", ""),
+    );
 
     let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(
         host.plugins().len(),
         1,
-        "reserved/taken provider names must be skipped"
+        "reserved/taken/empty/padded provider names must be skipped"
     );
     let info = host.plugins()[0]
         .provider_info
@@ -240,6 +225,26 @@ fn colliding_provider_names_are_refused_at_load() {
         .expect("the surviving plugin is the named provider");
     assert_eq!(info.name, "AcmeDb");
     assert!(info.supported_kinds.is_empty());
+}
+
+#[test]
+fn a_padded_provider_name_is_trimmed_before_use() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    // A leading/trailing-space name that does NOT collide is accepted, but
+    // stored trimmed — the gate and the dashboard must see the same string.
+    write_fixture(
+        dir.path(),
+        "spacey",
+        &named_provider_fixture("66666666-6666-6666-6666-666666666666", "  Spacey DB  "),
+    );
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert_eq!(host.plugins().len(), 1);
+    assert_eq!(
+        host.plugins()[0].provider_info.as_ref().unwrap().name,
+        "Spacey DB",
+        "the stored name is trimmed"
+    );
 }
 
 #[tokio::test]

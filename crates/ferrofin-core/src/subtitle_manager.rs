@@ -235,17 +235,18 @@ fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> std::path::Pat
     }
 }
 
-/// The stored codec for a subtitle format (`srt` → `subrip`, etc.).
-fn codec_for(format: &str) -> &str {
-    match format.to_ascii_lowercase().as_str() {
-        "srt" | "sub" => "subrip",
+/// The stored codec for a sidecar extension. The only caller feeds this the
+/// output of [`safe_subtitle_ext`], so the input is always one of
+/// [`SUBTITLE_EXTENSIONS`]; the catch-all covers that invariant, not real
+/// input.
+fn codec_for(ext: &str) -> &str {
+    match ext {
         "vtt" => "webvtt",
         "ssa" => "ssa",
         "ass" => "ass",
-        other => match other {
-            "" => "subrip",
-            _ => format,
-        },
+        // srt, sub, and the unreachable catch-all (callers pass an
+        // allowlisted extension) all record as subrip.
+        _ => "subrip",
     }
 }
 
