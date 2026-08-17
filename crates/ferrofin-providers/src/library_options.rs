@@ -21,6 +21,49 @@ use ferrofin_model::configuration::{
 };
 use ferrofin_model::entities::ImageType;
 
+/// The advertised provider names — the EXACT strings clients round-trip in
+/// `TypeOptions.MetadataFetchers` / `ImageFetchers` (and the flat reader
+/// lists), and therefore the strings the scanner's per-library gate matches
+/// on. Matching Jellyfin's provider `Name` properties keeps a migrated
+/// Jellyfin database's saved checkbox state meaningful. Never rename one:
+/// renaming orphans every saved library's fetcher selection.
+pub mod fetcher_names {
+    /// The local Kodi/XBMC NFO reader/saver.
+    pub const NFO: &str = "Nfo";
+    /// TMDB metadata + images.
+    pub const TMDB: &str = "TheMovieDb";
+    /// OMDb (Rotten Tomatoes rating supplement).
+    pub const OMDB: &str = "The Open Movie Database";
+    /// TheTVDB series/episode metadata + artwork.
+    pub const TVDB: &str = "TheTVDB";
+    /// fanart.tv artwork supplement.
+    pub const FANART: &str = "FanArt";
+    /// MusicBrainz id resolution for music.
+    pub const MUSICBRAINZ: &str = "MusicBrainz";
+    /// TheAudioDB music metadata + artwork.
+    pub const AUDIODB: &str = "TheAudioDB";
+    /// Sidecar/art-dir image discovery.
+    pub const LOCAL_IMAGES: &str = "Local Images";
+    /// Cover art extracted from the media file itself.
+    pub const EMBEDDED_IMAGES: &str = "Embedded Image Extractor";
+
+    /// Every built-in fetcher name — the reserved set a dynamically
+    /// registered (WASM) provider name must not collide with: a plugin
+    /// declaring `"TheMovieDb"` would ride TMDB's checkbox/order and
+    /// appear twice in the dashboard lists.
+    pub const ALL: &[&str] = &[
+        NFO,
+        TMDB,
+        OMDB,
+        TVDB,
+        FANART,
+        MUSICBRAINZ,
+        AUDIODB,
+        LOCAL_IMAGES,
+        EMBEDDED_IMAGES,
+    ];
+}
+
 /// A capability a provider exposes (one provider may expose several).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cap {
@@ -103,6 +146,50 @@ fn providers() -> Vec<Provider> {
             name: "The Open Movie Database",
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Movie", "Series", "Episode"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            // Optional at runtime (needs an API key/config), like OMDb —
+            // the checkbox gates; absence of config just yields no hits.
+            name: fetcher_names::TVDB,
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            types: &["Series", "Season", "Episode"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::FANART,
+            caps: &[Cap::ImageFetcher],
+            types: &["Movie", "Series"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::MUSICBRAINZ,
+            caps: &[Cap::MetadataFetcher],
+            types: &["MusicArtist", "MusicAlbum", "Audio"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::AUDIODB,
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            types: &["MusicArtist", "MusicAlbum"],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: fetcher_names::EMBEDDED_IMAGES,
+            caps: &[Cap::ImageFetcher],
+            types: &[
+                "Movie",
+                "Episode",
+                "MusicVideo",
+                "Video",
+                "Audio",
+                "AudioBook",
+            ],
             default_enabled: true,
             compiled: true,
         },
@@ -191,9 +278,18 @@ fn default_image_options(type_name: &str) -> Vec<ImageOption> {
 }
 
 /// Assembles the [`LibraryOptionsResultDto`] for a library whose representative
-/// item types are `item_types`.
+/// item types are `item_types`. `dynamic_fetchers` are runtime-registered
+/// named metadata providers (WASM plugins) as (name, supported kinds) —
+/// they appear in the fetcher lists exactly like compiled providers.
 #[must_use]
-pub fn library_options_info(item_types: &[String]) -> LibraryOptionsResultDto {
+pub fn library_options_info(
+    item_types: &[String],
+    dynamic_fetchers: &[(String, Vec<String>)],
+) -> LibraryOptionsResultDto {
+    let dynamic_info = |name: &str| LibraryOptionInfoDto {
+        name: Some(name.to_owned()),
+        default_enabled: true,
+    };
     let provs = providers();
     let flat = |cap: Cap| -> Vec<LibraryOptionInfoDto> {
         provs
@@ -212,10 +308,24 @@ pub fn library_options_info(item_types: &[String]) -> LibraryOptionsResultDto {
                     .map(Provider::info)
                     .collect()
             };
+            let mut metadata_fetchers = per_type(Cap::MetadataFetcher);
+            metadata_fetchers.extend(
+                dynamic_fetchers
+                    .iter()
+                    .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
+                    .map(|(name, _)| dynamic_info(name)),
+            );
+            let mut image_fetchers = per_type(Cap::ImageFetcher);
+            image_fetchers.extend(
+                dynamic_fetchers
+                    .iter()
+                    .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
+                    .map(|(name, _)| dynamic_info(name)),
+            );
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
-                metadata_fetchers: per_type(Cap::MetadataFetcher),
-                image_fetchers: per_type(Cap::ImageFetcher),
+                metadata_fetchers,
+                image_fetchers,
                 supported_image_types: supported_image_types(type_name),
                 default_image_options: default_image_options(type_name),
             }
@@ -271,7 +381,7 @@ mod tests {
 
     #[test]
     fn movie_options_expose_real_fetchers_and_savers() {
-        let info = library_options_info(&["Movie".to_owned()]);
+        let info = library_options_info(&["Movie".to_owned()], &[]);
         // Nfo is a local reader + saver.
         assert!(
             info.metadata_readers
@@ -312,7 +422,7 @@ mod tests {
 
     #[test]
     fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
-        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()]);
+        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()], &[]);
         let series = info.type_options.first().expect("series block");
         // TheMovieDb is always wired, so it is always offered for a series.
         assert!(

@@ -82,6 +82,26 @@ pub struct WasmSettings {
     /// Per-plugin event queue depth (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`,
     /// default 256 — inherits the approved bus-capacity setting).
     pub event_queue_capacity: u32,
+    /// Per-plugin total KV-state cap in MiB
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 — settings/cursors fit
+    /// easily; stats-heavy plugins may need more).
+    pub state_limit_mb: u32,
+    /// Cap on one downloaded remote-artwork candidate, in MiB
+    /// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`, default 20 — posters/backdrops
+    /// are single-digit MiB; anything larger is not artwork).
+    pub image_download_mb: u32,
+    /// Wall-clock bound for one artwork download, in seconds
+    /// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`, default 30 — a CDN GET, not a
+    /// transfer job).
+    pub image_timeout_secs: u32,
+    /// Cap on one `write-lyrics`/`write-subtitles` payload, in MiB
+    /// (`FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 — settings-class
+    /// writes, not media).
+    pub write_content_mb: u32,
+    /// Cap on one extracted subtitle track, in MiB
+    /// (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`, default 10 — generous for SRT
+    /// text).
+    pub subtitle_extract_mb: u32,
     /// Plugin ids allowed to reach private/loopback HTTP destinations
     /// (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`: comma-separated plugin UUIDs, or
     /// `*` for every plugin). Default empty: private destinations denied.
@@ -96,12 +116,67 @@ impl Default for WasmSettings {
             call_timeout_secs: 30,
             memory_limit_mb: 128,
             event_queue_capacity: 256,
+            state_limit_mb: 8,
+            image_download_mb: 20,
+            image_timeout_secs: 30,
+            write_content_mb: 2,
+            subtitle_extract_mb: 10,
             private_http_allow: Vec::new(),
         }
     }
 }
 
 impl WasmSettings {
+    /// Overrides the per-plugin total state cap
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_state_limit_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.state_limit_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the artwork-download size cap
+    /// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_image_download_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.image_download_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the artwork-download timeout
+    /// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_image_timeout_secs(mut self, secs: Option<u32>) -> Self {
+        if let Some(secs) = secs.filter(|&v| v > 0) {
+            self.image_timeout_secs = secs;
+        }
+        self
+    }
+
+    /// Overrides the lyric/subtitle write cap
+    /// (`FERROFIN_WASM_WRITE_CONTENT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_write_content_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.write_content_mb = mb;
+        }
+        self
+    }
+
+    /// Overrides the extracted-subtitle-track cap
+    /// (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`; `None`/zero keeps the default).
+    #[must_use]
+    pub fn with_subtitle_extract_mb(mut self, mb: Option<u32>) -> Self {
+        if let Some(mb) = mb.filter(|&v| v > 0) {
+            self.subtitle_extract_mb = mb;
+        }
+        self
+    }
+
     /// Whether the allowlist grants plugin `id` private-HTTP access.
     #[must_use]
     pub fn allows_private_http(&self, id: Uuid) -> bool {
@@ -143,6 +218,8 @@ impl WasmSettings {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // The remaining caps resolve through their `with_*` builders.
+            ..d
         }
     }
 }
@@ -165,9 +242,17 @@ pub struct LoadedPlugin {
     pub web_transforms: Vec<bindings::types::WebTransform>,
     /// The item kinds this plugin analyzes (empty = not an analyzer).
     pub scan_targets: Vec<String>,
+    /// The plugin's named-provider identity, when it is one.
+    pub provider_info: Option<bindings::types::ProviderDescriptor>,
     /// Where the plugin's KV state persists — the analysis driver keeps its
     /// offer-once watermark there under a host-reserved key.
     state_path: std::path::PathBuf,
+    /// The plugin's parsed declared-egress policy — the artwork-download
+    /// path re-checks it host-side (the guest only names URLs).
+    egress: Arc<capabilities::EgressPolicy>,
+    /// Whether the admin granted this plugin private-network HTTP (the
+    /// grant supersedes declared egress, exactly as in `http-fetch`).
+    private_http_allowed: bool,
     runtime: RuntimeHandle,
     /// Short-lived enabled-flag snapshot for the event fan-out. Events fire
     /// often (`PlaybackProgress` per session per tick); without this each one
@@ -231,6 +316,9 @@ pub struct WasmPluginHost {
     /// One cell shared by every plugin's `HostState` (and every rebuild):
     /// filling it arms `query-items`/`write-media-segments` host functions.
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    /// The resolved host settings — kept for host-side work done outside a
+    /// guest store (the artwork download cap/timeout).
+    settings: WasmSettings,
 }
 
 impl WasmPluginHost {
@@ -282,7 +370,7 @@ impl WasmPluginHost {
 
         for path in paths {
             match load_one(&engine, &linker, &path, settings, &http, &collaborators) {
-                Ok(loaded) => {
+                Ok(mut loaded) => {
                     if plugins
                         .iter()
                         .any(|p| p.descriptor.id == loaded.descriptor.id)
@@ -293,6 +381,36 @@ impl WasmPluginHost {
                             "duplicate wasm plugin id; skipping this file"
                         );
                         continue;
+                    }
+                    // A declared provider name is what the dashboard lists
+                    // and what the per-library gate matches on
+                    // (case-insensitively) — a collision with a built-in
+                    // fetcher or another plugin would ride that fetcher's
+                    // checkbox/order and be impossible to toggle apart.
+                    // Normalized (trimmed) BEFORE the checks: HTML collapses
+                    // padding, so " TheMovieDb" would render identically to
+                    // the real entry.
+                    if let Some(info) = loaded.provider_info.as_mut() {
+                        if info.name.trim().len() != info.name.len() {
+                            info.name = info.name.trim().to_owned();
+                        }
+                        let taken = plugins.iter().any(|p| {
+                            p.provider_info
+                                .as_ref()
+                                .is_some_and(|i| i.name.eq_ignore_ascii_case(&info.name))
+                        });
+                        let violation = provider_name_violation(&info.name)
+                            .or_else(|| taken.then(|| "is already taken".to_owned()));
+                        if let Some(why) = violation {
+                            error!(
+                                path = %path.display(),
+                                provider = info.name,
+                                why,
+                                "wasm plugin declares an unacceptable provider name; \
+                                 skipping this file"
+                            );
+                            continue;
+                        }
                     }
                     info!(
                         plugin = loaded.descriptor.name,
@@ -308,7 +426,7 @@ impl WasmPluginHost {
                     error!(
                         path = %path.display(),
                         error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.4.0 \
+                        "failed to load wasm plugin (expected a ferrofin:plugin@0.5.0 \
                          component); skipping this file"
                     );
                 }
@@ -318,6 +436,7 @@ impl WasmPluginHost {
         Ok(Self {
             plugins,
             collaborators,
+            settings: settings.clone(),
         })
     }
 
@@ -327,6 +446,7 @@ impl WasmPluginHost {
         Self {
             plugins: Vec::new(),
             collaborators: Arc::new(std::sync::OnceLock::new()),
+            settings: WasmSettings::default(),
         }
     }
 
@@ -349,6 +469,10 @@ impl WasmPluginHost {
                     plugin: Arc::clone(plugin),
                     collaborators: Arc::clone(&self.collaborators),
                     gate_cache: std::sync::Mutex::new(None),
+                    image_download_cap: self.settings.image_download_mb as usize * 1024 * 1024,
+                    image_download_timeout: std::time::Duration::from_secs(u64::from(
+                        self.settings.image_timeout_secs,
+                    )),
                 }) as Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>
             })
             .collect()
@@ -460,6 +584,30 @@ impl WasmPluginHost {
     }
 }
 
+/// Longest accepted provider-descriptor name in bytes — a dashboard display
+/// string; bounded like state keys (an abuse guard, not a tuning knob).
+const PROVIDER_NAME_MAX: usize = 256;
+
+/// Why a (trimmed) declared provider name is unacceptable regardless of
+/// what else is loaded: unnameable, oversized, or impersonating a built-in
+/// fetcher. `None` = acceptable. The "already taken by another plugin" half
+/// lives at the load loop, which is the only place that sees the full set.
+fn provider_name_violation(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    if name.len() > PROVIDER_NAME_MAX {
+        return Some(format!("exceeds {PROVIDER_NAME_MAX} bytes"));
+    }
+    if ferrofin_providers::library_options::fetcher_names::ALL
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(name))
+    {
+        return Some("collides with a built-in fetcher".to_owned());
+    }
+    None
+}
+
 /// Compiles, instantiates and interrogates a single component file.
 fn load_one(
     engine: &Engine,
@@ -489,6 +637,9 @@ fn load_one(
         state_path: None, // id-derived; set below once the descriptor is read
         // Load-time calls can't fetch at all; the real policy is read below.
         egress: Arc::new(capabilities::EgressPolicy::default()),
+        state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
+        write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
+        subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
@@ -511,6 +662,7 @@ fn load_one(
     let config_pages = instance.call_config_pages(&mut store)?;
     let web_transforms = instance.call_web_transforms(&mut store)?;
     let scan_targets = instance.call_scan_targets(&mut store)?;
+    let provider_info = instance.call_provider_info(&mut store)?;
     let declared_egress = instance.call_declared_egress(&mut store)?;
     let egress = Arc::new(capabilities::EgressPolicy::parse(&declared_egress));
     if egress.allow_any {
@@ -553,7 +705,8 @@ fn load_one(
     store.data_mut().plugin_name.clone_from(&spec.plugin_name);
     store.data_mut().plugin_id.clone_from(&spec.plugin_id);
     store.data_mut().private_http_allowed = spec.private_http_allowed;
-    store.data_mut().egress = egress;
+    store.data_mut().egress = Arc::clone(&egress);
+    let private_http_allowed = spec.private_http_allowed;
 
     let runtime = runtime::spawn(
         spec,
@@ -569,7 +722,10 @@ fn load_one(
         config_pages,
         web_transforms,
         scan_targets,
+        provider_info,
         state_path,
+        egress,
+        private_http_allowed,
         runtime,
         enabled_cache: std::sync::Mutex::new(None),
     })
@@ -778,7 +934,7 @@ fn escape_html(text: &str) -> String {
 /// The plugin ABI this build of Ferrofin supports — the `ferrofin:plugin`
 /// world version from `wit/ferrofin-plugin.wit` (a test guards against
 /// drift). Repository manifests must declare this exact `targetAbi` at 0.x.
-pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.4.0";
+pub const PLUGIN_ABI: &str = "ferrofin:plugin@0.5.0";
 
 /// The install-time artifact validator: proves a downloaded `.wasm` is a
 /// loadable `ferrofin:plugin` component and reports its self-declared id,
@@ -857,6 +1013,9 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                 private_http_allowed: false,
                 state_path: None, // validation is throwaway — no persistence
                 egress: Arc::new(capabilities::EgressPolicy::default()),
+                state_total_cap: settings.state_limit_mb as usize * 1024 * 1024,
+                write_content_cap: settings.write_content_mb as usize * 1024 * 1024,
+                subtitle_extract_cap: settings.subtitle_extract_mb as usize * 1024 * 1024,
                 // Never armed: query-items/write-media-segments/http-fetch
                 // all refuse during validation.
                 collaborators: Arc::new(std::sync::OnceLock::new()),
@@ -878,6 +1037,22 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
             let declared_egress = instance.call_declared_egress(&mut store).map_err(|e| {
                 ServiceError::invalid_input(format!("artifact declared-egress call failed: {e:#}"))
             })?;
+            // Refuse an unacceptable provider name AT INSTALL, not at the
+            // next boot — otherwise the admin sees "installed" and then a
+            // silently absent provider. (The "taken by another loaded
+            // plugin" half can only be checked at load; this covers the
+            // reserved/empty/oversized violations.)
+            let provider_info = instance.call_provider_info(&mut store).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact provider-info call failed: {e:#}"))
+            })?;
+            if let Some(info) = &provider_info
+                && let Some(why) = provider_name_violation(info.name.trim())
+            {
+                return Err(ServiceError::invalid_input(format!(
+                    "artifact declares provider name `{}`, which {why}",
+                    info.name.trim()
+                )));
+            }
             Ok(ferrofin_traits::plugins::ValidatedArtifact {
                 id,
                 declared_egress,
@@ -899,6 +1074,10 @@ struct WasmMetadataProvider {
     /// flag/config read per interval instead of two per item. The TTL only
     /// delays a mid-scan dashboard toggle taking effect — never correctness.
     gate_cache: std::sync::Mutex<Option<(std::time::Instant, bool, String)>>,
+    /// Operator cap on one artwork candidate (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`).
+    image_download_cap: usize,
+    /// Operator bound on one artwork GET (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`).
+    image_download_timeout: std::time::Duration,
 }
 
 /// How long a [`WasmMetadataProvider`] trusts its (enabled, config)
@@ -906,18 +1085,11 @@ struct WasmMetadataProvider {
 /// ≪ human toggle latency works; not worth a setting.
 const METADATA_GATE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[async_trait]
-impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
-    fn name(&self) -> &str {
-        &self.plugin.descriptor.name
-    }
-
-    async fn lookup(
-        &self,
-        item: &ferrofin_traits::providers::DynamicMetadataLookup,
-    ) -> Result<Option<ferrofin_traits::providers::DynamicMetadataResult>, ServiceError> {
-        // Inert until the composition root arms the collaborators (a scan
-        // cannot run before that) and while the plugin is disabled.
+impl WasmMetadataProvider {
+    /// The shared per-item gate: `None` while the collaborators are unarmed
+    /// or the plugin is disabled, otherwise the fresh config JSON to hand
+    /// the guest. Snapshot-cached per [`METADATA_GATE_CACHE_TTL`].
+    async fn gate(&self) -> Result<Option<String>, ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Ok(None);
         };
@@ -930,48 +1102,80 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
         let (enabled, config) = if let Some((_, enabled, config)) = cached {
             (enabled, config)
         } else {
-            {
-                let enabled = cx
-                    .plugins
-                    .get_plugin(self.plugin.descriptor.id)
-                    .await?
-                    .is_some_and(|d| d.enabled);
-                let config = cx
-                    .plugins
-                    .get_plugin_configuration(self.plugin.descriptor.id)
-                    .await
-                    .map_or_else(
-                        |_| String::from("{}"),
-                        |bytes| String::from_utf8_lossy(&bytes).into_owned(),
-                    );
-                *self.gate_cache.lock().expect("gate cache lock poisoned") =
-                    Some((std::time::Instant::now(), enabled, config.clone()));
-                (enabled, config)
-            }
+            let enabled = cx
+                .plugins
+                .get_plugin(self.plugin.descriptor.id)
+                .await?
+                .is_some_and(|d| d.enabled);
+            let config = cx
+                .plugins
+                .get_plugin_configuration(self.plugin.descriptor.id)
+                .await
+                .map_or_else(
+                    |_| String::from("{}"),
+                    |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+                );
+            *self.gate_cache.lock().expect("gate cache lock poisoned") =
+                Some((std::time::Instant::now(), enabled, config.clone()));
+            (enabled, config)
         };
-        if !enabled {
-            return Ok(None);
-        }
+        Ok(enabled.then_some(config))
+    }
+}
 
-        let wire_item = bindings::types::ItemSummary {
-            id: item.item_id.to_string(),
-            name: item.name.clone(),
-            kind: item.kind.clone(),
-            path: item.path.clone(),
-            parent_id: None,
-            run_time_ticks: None,
-            // The scan offer carries identity only — the plugin queries for
-            // anything richer; per-user fields never apply to a scan.
-            genres: Vec::new(),
-            premiere_date: None,
-            date_created: None,
-            community_rating: None,
-            production_year: None,
-            is_folder: false,
-            played: None,
-            is_favorite: None,
-            playback_position_ticks: None,
+/// Projects a scanner lookup into the wire [`ItemSummary`] a scan offer
+/// carries — identity only; the plugin queries for anything richer, and
+/// per-user fields never apply to a scan.
+fn scan_wire_item(
+    item: &ferrofin_traits::providers::DynamicMetadataLookup,
+) -> bindings::types::ItemSummary {
+    bindings::types::ItemSummary {
+        id: item.item_id.to_string(),
+        name: item.name.clone(),
+        kind: item.kind.clone(),
+        path: item.path.clone(),
+        parent_id: None,
+        run_time_ticks: None,
+        genres: Vec::new(),
+        premiere_date: None,
+        date_created: None,
+        community_rating: None,
+        production_year: None,
+        is_folder: false,
+        played: None,
+        is_favorite: None,
+        playback_position_ticks: None,
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvider {
+    fn name(&self) -> &str {
+        // The ADVERTISED identity: a declared provider-descriptor name is
+        // what the library-options UI lists and what saved TypeOptions
+        // reference — the gate must match on the same string.
+        self.plugin
+            .provider_info
+            .as_ref()
+            .map_or(&self.plugin.descriptor.name, |info| &info.name)
+    }
+
+    fn library_gated(&self) -> bool {
+        // Declaring provider-info opts the plugin into per-library admin
+        // control; a plugin without one supplements ungated, as before.
+        self.plugin.provider_info.is_some()
+    }
+
+    async fn lookup(
+        &self,
+        item: &ferrofin_traits::providers::DynamicMetadataLookup,
+    ) -> Result<Option<ferrofin_traits::providers::DynamicMetadataResult>, ServiceError> {
+        // Inert until the composition root arms the collaborators (a scan
+        // cannot run before that) and while the plugin is disabled.
+        let Some(config) = self.gate().await? else {
+            return Ok(None);
         };
+        let wire_item = scan_wire_item(item);
         let offer = self
             .plugin
             .runtime
@@ -981,6 +1185,11 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
 
         Ok(
             offer.map(|m| ferrofin_traits::providers::DynamicMetadataResult {
+                tagline: m.tagline,
+                studios: m.studios,
+                tags: m.tags,
+                official_rating: m.official_rating,
+                end_date: m.end_date,
                 overview: m.overview,
                 production_year: m.production_year,
                 community_rating: m.community_rating,
@@ -988,6 +1197,67 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 provider_ids: m.provider_ids,
             }),
         )
+    }
+
+    async fn images(
+        &self,
+        item: &ferrofin_traits::providers::DynamicMetadataLookup,
+        wanted: &[ferrofin_model::entities::ImageType],
+    ) -> Result<Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>, ServiceError> {
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(config) = self.gate().await? else {
+            return Ok(Vec::new());
+        };
+        let candidates = self
+            .plugin
+            .runtime
+            .remote_images(scan_wire_item(item), config)
+            .await
+            .map_err(ServiceError::backend)?;
+
+        let mut out = Vec::new();
+        for kind in wanted {
+            // Candidate kinds arrive as strings; parse against the model
+            // enum's serde names so unknown kinds are skipped, not errors.
+            let Some(candidate) = candidates.iter().find(|c| {
+                serde_json::from_value::<ferrofin_model::entities::ImageType>(
+                    serde_json::Value::String(c.kind.clone()),
+                )
+                .is_ok_and(|parsed| parsed == *kind)
+            }) else {
+                continue;
+            };
+            let plugin = Arc::clone(&self.plugin);
+            let url = candidate.url.clone();
+            let (cap, timeout) = (self.image_download_cap, self.image_download_timeout);
+            let downloaded = tokio::task::spawn_blocking(move || {
+                capabilities::download_image(
+                    &plugin.descriptor.name,
+                    plugin.private_http_allowed,
+                    &plugin.egress,
+                    cap,
+                    timeout,
+                    &url,
+                )
+            })
+            .await
+            .map_err(|e| ServiceError::backend(format!("image download task failed: {e}")))?;
+            match downloaded {
+                Ok(bytes) => out.push((*kind, bytes)),
+                // A refused/failed candidate loses its slot but never the
+                // scan — same rule as every other plugin offer.
+                Err(reason) => warn!(
+                    plugin = %self.plugin.descriptor.id,
+                    item = %item.item_id,
+                    kind = ?kind,
+                    reason,
+                    "wasm plugin artwork candidate refused/failed; skipping"
+                ),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1238,6 +1508,18 @@ impl ScheduledTask for WasmMediaAnalysisTask {
 }
 
 impl WasmPluginHost {
+    /// The named-provider identities of every loaded plugin that declares
+    /// one, as (name, supported kinds) — surfaced in the dashboard's
+    /// library-options fetcher lists.
+    #[must_use]
+    pub fn provider_names(&self) -> Vec<(String, Vec<String>)> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.provider_info.as_ref())
+            .map(|info| (info.name.clone(), info.supported_kinds.clone()))
+            .collect()
+    }
+
     /// The analysis driver task, when any loaded plugin declares
     /// `scan-targets` (`None` otherwise — no task registered, no overhead).
     #[must_use]
@@ -1407,6 +1689,58 @@ mod tests {
             has_image: false,
             can_uninstall: false,
         }
+    }
+
+    #[test]
+    fn settings_builders_apply_positive_overrides_and_ignore_zero_and_none() {
+        // Each `with_*` override takes a positive value, ignores zero (a zero
+        // cap would make every op fail — treated as unset), and ignores None.
+        let base = WasmSettings::default();
+        let tuned = base
+            .clone()
+            .with_state_limit_mb(Some(64))
+            .with_image_download_mb(Some(40))
+            .with_image_timeout_secs(Some(60))
+            .with_write_content_mb(Some(4))
+            .with_subtitle_extract_mb(Some(20));
+        assert_eq!(tuned.state_limit_mb, 64);
+        assert_eq!(tuned.image_download_mb, 40);
+        assert_eq!(tuned.image_timeout_secs, 60);
+        assert_eq!(tuned.write_content_mb, 4);
+        assert_eq!(tuned.subtitle_extract_mb, 20);
+
+        // Zero and None both fall back to the defaults.
+        let untuned = base
+            .clone()
+            .with_state_limit_mb(Some(0))
+            .with_image_download_mb(None)
+            .with_image_timeout_secs(Some(0))
+            .with_write_content_mb(None)
+            .with_subtitle_extract_mb(Some(0));
+        assert_eq!(untuned.state_limit_mb, base.state_limit_mb);
+        assert_eq!(untuned.image_download_mb, base.image_download_mb);
+        assert_eq!(untuned.image_timeout_secs, base.image_timeout_secs);
+        assert_eq!(untuned.write_content_mb, base.write_content_mb);
+        assert_eq!(untuned.subtitle_extract_mb, base.subtitle_extract_mb);
+    }
+
+    #[test]
+    fn provider_name_violation_flags_empty_reserved_and_oversized() {
+        use ferrofin_providers::library_options::fetcher_names;
+        assert_eq!(provider_name_violation("").as_deref(), Some("is empty"));
+        assert!(
+            provider_name_violation(fetcher_names::TMDB)
+                .unwrap()
+                .contains("built-in fetcher")
+        );
+        assert!(
+            provider_name_violation(&"x".repeat(PROVIDER_NAME_MAX + 1))
+                .unwrap()
+                .contains("exceeds")
+        );
+        // A distinct, right-sized name is accepted.
+        assert!(provider_name_violation("AcmeDb").is_none());
+        assert!(provider_name_violation(&"x".repeat(PROVIDER_NAME_MAX)).is_none());
     }
 
     #[test]

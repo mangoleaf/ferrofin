@@ -1424,6 +1424,7 @@ dependencies = [
  "ferrofin-core",
  "ferrofin-db",
  "ferrofin-model",
+ "ferrofin-providers",
  "ferrofin-traits",
  "reqwest",
  "serde_json",

@@ -192,6 +192,9 @@ pub trait RemoteSearchProvider: Send + Sync {
 #[derive(Default, Clone)]
 pub struct LocalProviderManager {
     external_id_infos: Vec<ExternalIdInfo>,
+    /// Runtime-registered named metadata providers (WASM plugins) as
+    /// (name, supported kinds), surfaced in library options.
+    dynamic_fetchers: Vec<(String, Vec<String>)>,
     remote_search_providers: Vec<Arc<dyn RemoteSearchProvider>>,
     /// The item-image store (rows) + the directory uploaded images are written
     /// to. Present enables the `save_image`/`delete_image` write paths.
@@ -219,6 +222,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_tmdb", &self.tmdb.is_some())
             .field("has_items", &self.items.is_some())
             .field("has_studios", &self.studios.is_some())
+            .field("dynamic_fetchers", &self.dynamic_fetchers.len())
             .finish()
     }
 }
@@ -234,6 +238,7 @@ impl LocalProviderManager {
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
             external_id_infos,
+            dynamic_fetchers: Vec::new(),
             remote_search_providers: Vec::new(),
             image_store: None,
             metadata_dir: None,
@@ -262,6 +267,14 @@ impl LocalProviderManager {
     ) -> Self {
         self.tmdb = Some(tmdb);
         self.items = Some(items);
+        self
+    }
+
+    /// Registers runtime-loaded named metadata providers (WASM plugins)
+    /// so the dashboard's library-options fetcher lists include them.
+    #[must_use]
+    pub fn with_dynamic_fetchers(mut self, fetchers: Vec<(String, Vec<String>)>) -> Self {
+        self.dynamic_fetchers = fetchers;
         self
     }
 
@@ -1008,7 +1021,10 @@ impl ProviderManager for LocalProviderManager {
         &self,
         item_types: &[String],
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
-        Ok(crate::library_options::library_options_info(item_types))
+        Ok(crate::library_options::library_options_info(
+            item_types,
+            &self.dynamic_fetchers,
+        ))
     }
 
     async fn get_metadata_options(&self, _item_id: Uuid) -> Result<MetadataOptions, ServiceError> {

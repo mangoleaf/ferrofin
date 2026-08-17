@@ -169,7 +169,7 @@ impl FerrofinSubtitleManager {
             is_external: true,
             path: Some(sidecar_str),
             language: (!response.language.is_empty()).then(|| response.language.clone()),
-            codec: Some(codec_for(&response.format).to_owned()),
+            codec: Some(codec_for(&safe_subtitle_ext(&response.format)).to_owned()),
             is_forced: response.is_forced,
             is_hearing_impaired: Some(response.is_hearing_impaired),
             ..Default::default()
@@ -191,36 +191,62 @@ async fn write_sidecar(path: &Path, content: &[u8]) -> std::io::Result<()> {
     tokio::fs::write(path, content).await
 }
 
+/// The sidecar extensions an attached subtitle may take. Anything else is
+/// coerced to `srt`: the language/format here come from callers we must not
+/// trust with path construction (the upload endpoint and WASM plugins), and
+/// an arbitrary extension is its own escalation — a `.nfo` or `.strm`
+/// dropped next to the media would be read back as authoritative on the
+/// next scan.
+const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "sub", "vtt", "ssa", "ass"];
+
+/// Reduces a caller-supplied subtitle format to a safe sidecar extension
+/// (allowlisted, lowercased; unknown → `srt`).
+fn safe_subtitle_ext(format: &str) -> String {
+    let f = format.trim().trim_start_matches('.').to_ascii_lowercase();
+    if SUBTITLE_EXTENSIONS.contains(&f.as_str()) {
+        f
+    } else {
+        "srt".to_owned()
+    }
+}
+
 fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> std::path::PathBuf {
     let path = Path::new(media_path);
     let stem = path.file_stem().map_or_else(
         || "subtitle".to_owned(),
         |s| s.to_string_lossy().into_owned(),
     );
-    let lang = if response.language.is_empty() {
-        "und"
-    } else {
-        &response.language
-    };
+    // Both segments are caller-controlled: reduce the language to a plain
+    // tag ("eng", "pt-BR") and allowlist the extension, so neither can
+    // smuggle a path separator or `..` into the name (`write_sidecar`
+    // create_dir_all's the parent, which would materialize a traversal).
+    let lang: String = response
+        .language
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let lang = if lang.is_empty() { "und" } else { &lang };
+    let format = safe_subtitle_ext(&response.format);
     let forced = if response.is_forced { ".forced" } else { "" };
-    let name = format!("{stem}.{lang}{forced}.{}", response.format);
+    let name = format!("{stem}.{lang}{forced}.{format}");
     match path.parent() {
         Some(dir) => dir.join(name),
         None => std::path::PathBuf::from(name),
     }
 }
 
-/// The stored codec for a subtitle format (`srt` → `subrip`, etc.).
-fn codec_for(format: &str) -> &str {
-    match format.to_ascii_lowercase().as_str() {
-        "srt" | "sub" => "subrip",
+/// The stored codec for a sidecar extension. The only caller feeds this the
+/// output of [`safe_subtitle_ext`], so the input is always one of
+/// [`SUBTITLE_EXTENSIONS`]; the catch-all covers that invariant, not real
+/// input.
+fn codec_for(ext: &str) -> &str {
+    match ext {
         "vtt" => "webvtt",
         "ssa" => "ssa",
         "ass" => "ass",
-        other => match other {
-            "" => "subrip",
-            _ => format,
-        },
+        // srt, sub, and the unreachable catch-all (callers pass an
+        // allowlisted extension) all record as subrip.
+        _ => "subrip",
     }
 }
 
@@ -477,6 +503,72 @@ mod tests {
             .expect("streams");
         assert_eq!(streams.len(), 1);
         assert!(streams[0].is_external);
+    }
+
+    #[test]
+    fn sidecar_path_neutralizes_traversal_and_unknown_extension() {
+        // Caller-controlled language/format must never move the sidecar out
+        // of the media folder or pick a scanner-authoritative extension.
+        let response = SubtitleResponse {
+            language: "x/../../outside/pwned".to_owned(),
+            format: "nfo".to_owned(),
+            is_forced: false,
+            is_hearing_impaired: false,
+            content: Vec::new(),
+        };
+        let path = sidecar_path("/library/movie/Movie.mkv", &response);
+        assert_eq!(
+            path,
+            Path::new("/library/movie/Movie.xoutsidepwned.srt"),
+            "separators stripped from the language, extension allowlisted"
+        );
+
+        // Legitimate tags survive, including BCP-47 region subtags.
+        let response = SubtitleResponse {
+            language: "pt-BR".to_owned(),
+            format: ".VTT".to_owned(),
+            is_forced: true,
+            is_hearing_impaired: false,
+            content: Vec::new(),
+        };
+        assert_eq!(
+            sidecar_path("/library/movie/Movie.mkv", &response),
+            Path::new("/library/movie/Movie.pt-BR.forced.vtt")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_with_hostile_language_stays_inside_the_media_folder() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("Movie.mkv");
+        std::fs::write(&media, b"x").expect("media");
+        set_item_path(&db, item, &media).await;
+
+        let mgr = manager(db, vec![]);
+        mgr.upload_subtitle(
+            item,
+            &SubtitleResponse {
+                language: "x/../../outside/pwned".to_owned(),
+                format: "strm".to_owned(),
+                is_forced: false,
+                is_hearing_impaired: false,
+                content: b"1\n00:00:00,000 --> 00:00:01,000\nhi\n".to_vec(),
+            },
+        )
+        .await
+        .expect("upload");
+
+        assert!(
+            tmp.path().join("Movie.xoutsidepwned.srt").exists(),
+            "sidecar written inside the media folder under the sanitized name"
+        );
+        assert!(
+            !tmp.path().join("outside").exists(),
+            "no traversal directory materialized"
+        );
     }
 
     #[tokio::test]

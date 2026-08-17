@@ -147,6 +147,25 @@ impl MediaExtractor for FfmpegMediaExtractor {
             .collect())
     }
 
+    async fn extract_subtitle(
+        &self,
+        path: &str,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, ServiceError> {
+        let args: Vec<String> = vec![
+            "-v".into(),
+            "error".into(),
+            "-i".into(),
+            path.into(),
+            "-map".into(),
+            format!("0:s:{stream_index}"),
+            "-f".into(),
+            "srt".into(),
+            "-".into(),
+        ];
+        self.run(&args, self.timeout).await
+    }
+
     async fn extract_frames(
         &self,
         path: &str,

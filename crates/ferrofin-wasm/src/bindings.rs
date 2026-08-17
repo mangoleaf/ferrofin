@@ -58,6 +58,15 @@ pub struct HostState {
     /// The per-call timeout, needed when `http-fetch` builds a one-off
     /// DNS-pinned client (the shared client's timeout is not readable).
     pub http_timeout: std::time::Duration,
+    /// The operator-configured total state cap, in bytes
+    /// (`FERROFIN_WASM_STATE_LIMIT_MB`, default 8 MiB).
+    pub state_total_cap: usize,
+    /// The operator-configured cap on one `write-lyrics`/`write-subtitles`
+    /// payload, in bytes (`FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB).
+    pub write_content_cap: usize,
+    /// The operator-configured cap on one extracted subtitle track, in
+    /// bytes (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`, default 10 MiB).
+    pub subtitle_extract_cap: usize,
     /// Where this plugin's key/value state persists
     /// (`{plugins_dir}/{id}.state.json`). `None` until the plugin's id is
     /// known (during the identity calls at load) and in throwaway
@@ -155,7 +164,12 @@ impl host::Host for HostState {
         if key.starts_with("host:") {
             return Err("keys prefixed `host:` are reserved for the server".to_owned());
         }
-        crate::capabilities::set_state(self.state_path.as_deref(), &key, value)
+        crate::capabilities::set_state_capped(
+            self.state_path.as_deref(),
+            &key,
+            value,
+            self.state_total_cap,
+        )
     }
 
     fn next_up(&mut self, user_id: String, limit: u32) -> Result<Vec<types::ItemSummary>, String> {
@@ -164,6 +178,103 @@ impl host::Host for HostState {
             .get()
             .ok_or("next-up is not available during plugin load")?;
         crate::capabilities::next_up(cx, &user_id, limit)
+    }
+
+    fn set_user_data(
+        &mut self,
+        user_id: String,
+        item_id: String,
+        update: types::UserDataUpdate,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("set-user-data is not available during plugin load")?;
+        crate::capabilities::set_user_data(cx, &self.plugin_name, &user_id, &item_id, &update)
+    }
+
+    fn write_lyrics(
+        &mut self,
+        item_id: String,
+        format: String,
+        content: Vec<u8>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("write-lyrics is not available during plugin load")?;
+        crate::capabilities::write_lyrics(cx, self.write_content_cap, &item_id, &format, &content)
+    }
+
+    fn write_subtitles(
+        &mut self,
+        item_id: String,
+        language: String,
+        format: String,
+        content: Vec<u8>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("write-subtitles is not available during plugin load")?;
+        crate::capabilities::write_subtitles(
+            cx,
+            self.write_content_cap,
+            &item_id,
+            &language,
+            &format,
+            &content,
+        )
+    }
+
+    fn create_collection(&mut self, name: String, item_ids: Vec<String>) -> Result<String, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("create-collection is not available during plugin load")?;
+        crate::capabilities::create_collection(
+            cx,
+            self.state_path.as_deref(),
+            self.state_total_cap,
+            &name,
+            &item_ids,
+        )
+    }
+
+    fn update_collection(
+        &mut self,
+        collection_id: String,
+        add: Vec<String>,
+        remove: Vec<String>,
+    ) -> Result<(), String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("update-collection is not available during plugin load")?;
+        crate::capabilities::update_collection(
+            cx,
+            self.state_path.as_deref(),
+            &collection_id,
+            &add,
+            &remove,
+        )
+    }
+
+    fn extract_subtitle_track(
+        &mut self,
+        item_id: String,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, String> {
+        let cx = self
+            .collaborators
+            .get()
+            .ok_or("extract-subtitle-track is not available during plugin load")?;
+        crate::capabilities::extract_subtitle_track(
+            cx,
+            self.subtitle_extract_cap,
+            &item_id,
+            stream_index,
+        )
     }
 
     fn media_info(&mut self, item_id: String) -> Result<types::MediaTechnicalInfo, String> {

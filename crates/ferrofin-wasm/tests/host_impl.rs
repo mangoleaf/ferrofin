@@ -29,6 +29,9 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         ),
         http_timeout: std::time::Duration::from_secs(5),
         state_path: None,
+        state_total_cap: 8 * 1024 * 1024,
+        write_content_cap: 2 * 1024 * 1024,
+        subtitle_extract_cap: 10 * 1024 * 1024,
         egress: std::sync::Arc::new(ferrofin_wasm::capabilities::EgressPolicy::parse(&[
             "*".to_owned()
         ])),
@@ -106,6 +109,10 @@ async fn http_fetch_round_trips_once_collaborators_are_armed() {
     let (url, server) = one_shot_http("204 No Content", b"");
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -144,6 +151,10 @@ async fn armed_capabilities_flow_through_the_trait_with_provider_scoping() {
     let segments = Arc::new(RecordingSegments::default());
     let cell = Arc::new(std::sync::OnceLock::new());
     cell.set(Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -226,6 +237,10 @@ async fn state_and_next_up_flow_through_the_host_trait() {
         // Armed: next-up reaches the stub queue and enriches via user data.
         let cell = Arc::new(std::sync::OnceLock::new());
         cell.set(Collaborators {
+            lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+            subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+            collections: std::sync::Arc::new(common::StubCollections::default()),
+
             media_streams: std::sync::Arc::new(common::StubStreams),
             extractor: std::sync::Arc::new(common::StubExtractor::default()),
             analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),

@@ -153,6 +153,11 @@ ferrofin:
     # FERROFIN_WASM_EVENT_QUEUE_CAPACITY: "256" # per-plugin event queue depth
     # FERROFIN_MAX_PLUGIN_DOWNLOAD_MB: "128"    # repository-install artifact size cap
     # FERROFIN_WASM_ANALYSIS_CONCURRENCY: "2"   # plugin media-decode budget (default cores/4)
+    # FERROFIN_WASM_STATE_LIMIT_MB: "8"          # per-plugin key/value state cap
+    # FERROFIN_WASM_IMAGE_DOWNLOAD_MB: "20"     # cap on one plugin-artwork download
+    # FERROFIN_WASM_IMAGE_TIMEOUT_SECS: "30"    # bound on one plugin-artwork GET
+    # FERROFIN_WASM_WRITE_CONTENT_MB: "2"       # cap on one lyric/subtitle write
+    # FERROFIN_WASM_SUBTITLE_EXTRACT_MB: "10"   # cap on one extracted subtitle track
     # Let SPECIFIC trusted plugins http-fetch private/LAN destinations
     # (default: denied for all; public internet is always allowed):
     # FERROFIN_WASM_PRIVATE_HTTP_ALLOW: "<plugin-uuid>,<plugin-uuid>"

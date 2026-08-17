@@ -322,6 +322,16 @@ pub struct DynamicMetadataResult {
     pub genres: Vec<String>,
     /// External ids to record, as (provider name, id) pairs.
     pub provider_ids: Vec<(String, String)>,
+    /// Tagline (supplement-only).
+    pub tagline: Option<String>,
+    /// Studio names (supplement-only).
+    pub studios: Vec<String>,
+    /// Tag names (supplement-only).
+    pub tags: Vec<String>,
+    /// Parental rating (supplement-only).
+    pub official_rating: Option<String>,
+    /// End date, ISO-8601 (supplement-only).
+    pub end_date: Option<String>,
 }
 
 /// A dynamically-registered scan metadata source — the seam Tier-1b WASM
@@ -336,6 +346,15 @@ pub trait DynamicMetadataProvider: Send + Sync {
     /// A stable display name for logs (typically the plugin name).
     fn name(&self) -> &str;
 
+    /// Whether this source is a NAMED provider the admin manages per
+    /// library (its [`name`](Self::name) appears in the library-options
+    /// fetcher lists). Gated sources are skipped/ordered by the library's
+    /// `TypeOptions`; ungated sources always run, as before. Default:
+    /// ungated.
+    fn library_gated(&self) -> bool {
+        false
+    }
+
     /// Offers metadata for one item, or `Ok(None)` when this source has
     /// nothing to contribute.
     ///
@@ -346,6 +365,19 @@ pub trait DynamicMetadataProvider: Send + Sync {
         &self,
         item: &DynamicMetadataLookup,
     ) -> Result<Option<DynamicMetadataResult>, ServiceError>;
+
+    /// Downloads remote artwork for `item`, one image per wanted slot (the
+    /// implementation fetches its own candidates and returns BYTES — for
+    /// WASM plugins the host performs the download through the plugin's
+    /// declared egress). Default: no artwork.
+    async fn images(
+        &self,
+        item: &DynamicMetadataLookup,
+        wanted: &[ferrofin_model::entities::ImageType],
+    ) -> Result<Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>, ServiceError> {
+        let _ = (item, wanted);
+        Ok(Vec::new())
+    }
 }
 
 fn _assert_object_safe_dynamic_metadata_provider(_: &dyn DynamicMetadataProvider) {}
