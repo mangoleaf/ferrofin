@@ -56,9 +56,15 @@ def load_rates():
 
 
 def rate_for(name, rates):
-    """(rate, source) for one endpoint: calibrated entry else the flat default."""
+    """(rate, source) for one endpoint: calibrated entry (capped at
+    BENCH_RATE_MAX — see bench.conf: half of a closed-loop max-attack on a
+    trivial endpoint exceeds what the paced open-loop scheduler can dispatch,
+    and past ~2k/s the comparison gains nothing) else the flat default."""
     r = rates.get("rates", {}).get(name)
     if r:
+        cap = CONFIG["BENCH_RATE_MAX"]
+        if r > cap:
+            return cap, "calibrated-capped"
         return r, "calibrated"
     return CONFIG["BENCH_RATE"], "flat-default"
 
