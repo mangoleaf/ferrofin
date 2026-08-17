@@ -1692,6 +1692,58 @@ mod tests {
     }
 
     #[test]
+    fn settings_builders_apply_positive_overrides_and_ignore_zero_and_none() {
+        // Each `with_*` override takes a positive value, ignores zero (a zero
+        // cap would make every op fail — treated as unset), and ignores None.
+        let base = WasmSettings::default();
+        let tuned = base
+            .clone()
+            .with_state_limit_mb(Some(64))
+            .with_image_download_mb(Some(40))
+            .with_image_timeout_secs(Some(60))
+            .with_write_content_mb(Some(4))
+            .with_subtitle_extract_mb(Some(20));
+        assert_eq!(tuned.state_limit_mb, 64);
+        assert_eq!(tuned.image_download_mb, 40);
+        assert_eq!(tuned.image_timeout_secs, 60);
+        assert_eq!(tuned.write_content_mb, 4);
+        assert_eq!(tuned.subtitle_extract_mb, 20);
+
+        // Zero and None both fall back to the defaults.
+        let untuned = base
+            .clone()
+            .with_state_limit_mb(Some(0))
+            .with_image_download_mb(None)
+            .with_image_timeout_secs(Some(0))
+            .with_write_content_mb(None)
+            .with_subtitle_extract_mb(Some(0));
+        assert_eq!(untuned.state_limit_mb, base.state_limit_mb);
+        assert_eq!(untuned.image_download_mb, base.image_download_mb);
+        assert_eq!(untuned.image_timeout_secs, base.image_timeout_secs);
+        assert_eq!(untuned.write_content_mb, base.write_content_mb);
+        assert_eq!(untuned.subtitle_extract_mb, base.subtitle_extract_mb);
+    }
+
+    #[test]
+    fn provider_name_violation_flags_empty_reserved_and_oversized() {
+        use ferrofin_providers::library_options::fetcher_names;
+        assert_eq!(provider_name_violation("").as_deref(), Some("is empty"));
+        assert!(
+            provider_name_violation(fetcher_names::TMDB)
+                .unwrap()
+                .contains("built-in fetcher")
+        );
+        assert!(
+            provider_name_violation(&"x".repeat(PROVIDER_NAME_MAX + 1))
+                .unwrap()
+                .contains("exceeds")
+        );
+        // A distinct, right-sized name is accepted.
+        assert!(provider_name_violation("AcmeDb").is_none());
+        assert!(provider_name_violation(&"x".repeat(PROVIDER_NAME_MAX)).is_none());
+    }
+
+    #[test]
     fn authored_pages_pass_through_unchanged() {
         let authored = vec![bindings::types::ConfigPage {
             name: "mypage".to_owned(),
