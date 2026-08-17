@@ -269,7 +269,13 @@ cargo install samply          # sampling profiler (Firefox Profiler UI)
 # processes, incl. kernel-side stacks" — the standard dev-box setting. It is
 # machine-wide, so set it on dev/bench hosts only, never shared/prod machines.
 echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid                  # until reboot
-echo 'kernel.perf_event_paranoid = 1' | sudo tee /etc/sysctl.d/99-perf.conf  # persistent
+# samply maps a perf ring buffer PER THREAD; a tokio server runs dozens of
+# threads (~70 observed), which blows the default 516 KiB unprivileged mlock
+# budget ("Failed to start profiling: mmap failed"). 8 MiB gives headroom.
+echo 8192 | sudo tee /proc/sys/kernel/perf_event_mlock_kb
+# persistent for both:
+printf 'kernel.perf_event_paranoid = 1\nkernel.perf_event_mlock_kb = 8192\n' \
+  | sudo tee /etc/sysctl.d/99-perf.conf
 
 sudo pacman -S heaptrack      # heap profiling (memory workstreams only)
 ```
