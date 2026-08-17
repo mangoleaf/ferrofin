@@ -51,14 +51,16 @@ use crate::state::build_app_state;
 ///
 /// Prefers the `SERVICE_VERSION` environment variable — stamped into the release
 /// image from the git tag by CI. When unset (local/dev builds), it falls back to
-/// `FERROFIN_BUILD_VERSION`, a `git describe` value baked in at compile time by
-/// `build.rs` (latest tag + commits-since + HEAD sha), so the reported version is
-/// derived from git rather than a hardcoded number that goes stale.
+/// [`ferrofin_health::build_version`], the `git describe` value baked in at
+/// compile time (latest tag + commits-since + HEAD sha, or the
+/// `FERROFIN_GIT_DESCRIBE` build-time override for `.git`-less Docker builds),
+/// so the reported version is derived from git rather than a hardcoded number
+/// that goes stale. The same value is served on `GET /health/live` as `build`.
 pub(crate) fn service_version() -> String {
     std::env::var("SERVICE_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| env!("FERROFIN_BUILD_VERSION").to_owned())
+        .unwrap_or_else(|| ferrofin_health::build_version().to_owned())
 }
 
 /// Logs the resolved configuration at startup, grouped into a few `INFO` lines

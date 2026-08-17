@@ -7,12 +7,13 @@ requirement — median-only gating hides tail regressions). Two input shapes,
 one baseline file (this directory's perf-baseline.json, sections `raw` and
 `merged`):
 
-Raw capture mode — driven by suite/perf/perf-gate.sh, which runs k6 per
-sentinel endpoint into results/raw/perfgate-ferrofin-<name>.json (CWD-relative,
-the runner cd's into suite/perf/):
+Raw capture mode — driven by suite/perf/perf-gate.sh, which runs perf_gate.py
+(open-loop vegeta) per sentinel endpoint into
+results/raw/perfgate-ferrofin-<name>.json (CWD-relative, the runner cd's into
+suite/perf/):
 
   python3 ../gate.py compare-raw    <baselineFile> <factor> <name...>
-  python3 ../gate.py rebaseline-raw <baselineFile> <vus> <secs> <name...>
+  python3 ../gate.py rebaseline-raw <baselineFile> <rate> <secs> <name...>
 
 compare-raw prints a before/after table (all three percentiles) to STDERR and
 the space-separated regressed endpoint names to STDOUT — the runner re-runs
@@ -34,12 +35,19 @@ from pathlib import Path
 
 RESULTS = Path(__file__).resolve().parent / "results"
 BASELINE = Path(__file__).resolve().parent / "perf-baseline.json"
-FACTOR = float(os.environ.get("PERF_GATE_FACTOR", "1.5"))
+
+# The suite's methodology knobs (default < bench.conf < env — see config.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent / "perf"))
+from config import CONFIG  # noqa: E402
+
+FACTOR = float(os.environ.get("PERF_GATE_FACTOR") or CONFIG["PERF_GATE_FACTOR"])
 # Absolute jitter floor (ms): a percentile trip additionally needs this much
-# real worsening. 3 ms default — well under any regression a user feels, well
-# over the OS-noise band on sub-ms endpoints. Env knob, same owner rule as
-# FACTOR: ask before changing the default.
-MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS", "3"))
+# real worsening. THE noise floor (D1) — the same BENCH_NOISE_FLOOR_MS that
+# makes sub-floor deltas ties in the comparison tables gates here: well under
+# any regression a user feels, well over the OS-noise band on sub-ms
+# endpoints. PERF_GATE_MIN_DELTA_MS env remains as a gate-only override.
+MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS")
+                     or CONFIG["BENCH_NOISE_FLOOR_MS"])
 PCTS = ("p50", "p95", "p99")
 
 
@@ -86,7 +94,7 @@ def _read_baseline_file(path):
         return {}
 
 
-def rebaseline_raw(baseline_file, vus, secs, names):
+def rebaseline_raw(baseline_file, rate, secs, names):
     """Writes the `raw` section from the current captures, preserving `merged`."""
     endpoints = {}
     for name in names:
@@ -95,11 +103,13 @@ def rebaseline_raw(baseline_file, vus, secs, names):
             sys.exit(f"rebaseline: no data for {name} — aborting")
         if cur.get("bad"):
             sys.exit(f"rebaseline: {name} had {cur['bad']} non-200s — refusing to baseline a broken endpoint")
+        if cur.get("rate_held") is False:
+            sys.exit(f"rebaseline: {name} did not hold its open-loop rate — refusing to baseline a degraded window")
         endpoints[name] = {p: cur[p] for p in PCTS}
     doc = _read_baseline_file(baseline_file)
-    doc["raw"] = {"params": {"vus": int(vus), "secs": int(secs)}, "endpoints": endpoints}
+    doc["raw"] = {"params": {"rate": int(rate), "secs": int(secs)}, "endpoints": endpoints}
     Path(baseline_file).write_text(json.dumps(doc, indent=2) + "\n")
-    print(f"baselined {len(names)} endpoints @ {vus} VUs × {secs}s → {baseline_file} [raw]",
+    print(f"baselined {len(names)} endpoints @ {rate}/s × {secs}s → {baseline_file} [raw]",
           file=sys.stderr)
 
 
@@ -113,7 +123,12 @@ def compare_raw(baseline_file, factor, names):
     bp = raw.get("params", {})
     err = sys.stderr
     fmt = lambda n: "—" if n is None else f"{n:.1f}"  # noqa: E731 — tiny table formatter
-    print(f"perf-gate: factor {factor}×, baseline @ {bp.get('vus', '?')} VUs × {bp.get('secs', '?')}s", file=err)
+    if "rate" not in bp:
+        print("perf-gate: baseline predates the open-loop migration (captured with "
+              "closed-loop VUs) — numbers are methodology-incomparable; run "
+              "./perf-gate.sh --rebaseline once", file=err)
+        sys.exit(2)
+    print(f"perf-gate: factor {factor}×, baseline @ {bp['rate']}/s × {bp.get('secs', '?')}s", file=err)
     print("endpoint".ljust(24) + "".join(f"{p} base→cur (×)".ljust(22) for p in PCTS) + "200%  verdict", file=err)
 
     regressed = []
@@ -122,7 +137,15 @@ def compare_raw(baseline_file, factor, names):
         cur = _load_raw(name)
         if not cur or not cur.get("ok"):
             regressed.append(name)
-            print(name.ljust(24) + "NO DATA (k6 produced no measured 200s)", file=err)
+            print(name.ljust(24) + "NO DATA (no measured expected-status responses)", file=err)
+            continue
+        if cur.get("rate_held") is False:
+            # The window degraded into a closed loop (generator couldn't hold
+            # the schedule) — its percentiles are not comparable to an
+            # open-loop baseline. Counted as a failure so the runner's
+            # retry-once path re-measures it.
+            regressed.append(name)
+            print(name.ljust(24) + "RATE NOT HELD (open-loop window degraded — remeasure)", file=err)
             continue
         if not base:
             print(name.ljust(24) + f"{fmt(cur['p50'])}/{fmt(cur['p95'])}/{fmt(cur['p99'])}   (no baseline — skipped)",
@@ -151,7 +174,19 @@ def latest_run():
     return live[-1]
 
 
+def _run_model(run):
+    return (run["meta"].get("load") or {}).get("model")
+
+
 def rebaseline_merged(run):
+    # A baseline is only meaningful for the methodology that will be gated
+    # against it — stamping open-loop unconditionally would disarm the
+    # refusal guard the moment someone rebaselines from a legacy record
+    # (review finding, round 1). Derive from the run; refuse anything else.
+    model = _run_model(run)
+    if model != "open-loop":
+        sys.exit(f"gate: refusing to baseline a non-open-loop run (meta.load.model={model!r}) "
+                 "— produce a run with the current suite (`suite/run.sh all`) first")
     # Keyed by VARIANT (each /Items variant has its own latency); deep_verified is its op's.
     variants = {}
     for o in run["operations"]:
@@ -160,24 +195,37 @@ def rebaseline_merged(run):
             continue
         variants[p["variant"]] = {"op": o["op"], "h_p50": p["h_p50"], "h_p95": p["h_p95"],
                                   "h_p99": p["h_p99"], "deep_verified": o["parity"]["deep_verified"]}
+        # H2: cold sentinels carry their fresh-process first-request latency —
+        # gated separately from warm (cold-vs-cold only, gross regressions).
+        if (p.get("cold") or {}).get("h_first") is not None:
+            variants[p["variant"]]["h_cold_first"] = p["cold"]["h_first"]
     doc = _read_baseline_file(BASELINE)
-    doc["merged"] = {"factor": FACTOR, "ferrofin": run["meta"]["ferrofin"], "variants": variants}
+    doc["merged"] = {"factor": FACTOR, "engine": model,
+                     "ferrofin": run["meta"]["ferrofin"], "variants": variants}
     BASELINE.write_text(json.dumps(doc, indent=2) + "\n")
     print(f">> wrote {BASELINE.name}: {len(variants)} variants baselined at {run['meta']['ferrofin']} [merged]")
 
 
 def check_merged(run):
+    if _run_model(run) != "open-loop":
+        sys.exit(f"gate: latest run is not an open-loop record (meta.load.model="
+                 f"{_run_model(run)!r}) — methodology-incomparable with the baseline")
     doc = _read_baseline_file(BASELINE)
     merged = doc.get("merged")
     if not merged:
         sys.exit("gate: no merged baseline — run `suite/run.sh gate --rebaseline` once to establish one")
+    if merged.get("engine") != "open-loop":
+        sys.exit("gate: merged baseline predates the open-loop migration — "
+                 "methodology-incomparable; run `suite/run.sh gate --rebaseline` once")
     base = merged["variants"]
     fails = []
+    seen = set()
     for o in run["operations"]:
         op, p, par = o["op"], o["perf"], o["parity"]
         b = base.get(p["variant"])
         if b is None:
             continue
+        seen.add(p["variant"])
         if p["h_ok"] is not None and p["h_ok"] < 100:
             fails.append(f"{p['variant']}: Ferrofin 200-rate {p['h_ok']}% < 100%")
         for pct in ("h_p50", "h_p95", "h_p99"):
@@ -187,6 +235,21 @@ def check_merged(run):
         if b.get("deep_verified") and not par["deep_verified"]:
             fails.append(f"{op} ({p['variant']}): parity regressed — was deep_verified, now "
                          f"{par['depth']}/unverified")
+        # Cold gates cold-vs-cold only (never against warm): same gross-factor
+        # rule; cold first-requests are high-variance, so only a clear breach
+        # (factor AND absolute delta) fails.
+        cold_now = (p.get("cold") or {}).get("h_first")
+        cold_base = b.get("h_cold_first")
+        if (cold_now is not None and cold_base and cold_now > cold_base * FACTOR
+                and (cold_now - cold_base) > MIN_DELTA_MS):
+            fails.append(f"{p['variant']} cold_first: {cold_now} > {cold_base}×{FACTOR} "
+                         f"(={round(cold_base * FACTOR, 1)})")
+
+    # A baselined variant that vanished from the run is a silent coverage hole
+    # — the exact class the fail-loud manifest exists for (review, round 2).
+    vanished = sorted(set(base) - seen)
+    if vanished:
+        fails.append(f"baselined variants absent from this run: {', '.join(vanished)}")
 
     if fails:
         print(f"PERF/PARITY GATE FAILED ({len(fails)} regressions vs baseline):", file=sys.stderr)

@@ -46,9 +46,15 @@ pub fn health_router(checkers: Vec<Arc<dyn HealthChecker>>) -> Router {
 }
 
 /// Handles `GET /health/live`: reports the process is up without probing
-/// dependencies.
+/// dependencies, plus the compile-time build identity of the running binary.
 async fn liveness() -> impl IntoResponse {
-    (StatusCode::OK, Json(LiveResponse { status: "ok" }))
+    (
+        StatusCode::OK,
+        Json(LiveResponse {
+            status: "ok",
+            build: crate::build_version(),
+        }),
+    )
 }
 
 /// Handles `GET /health/ready`: runs every checker and aggregates the outcome.
@@ -108,6 +114,10 @@ mod tests {
         let (status, body) = request(health_router(vec![]), "/health/live").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ok");
+        // The baked build identity is always present and non-empty — the
+        // benchmark harness aborts a run when it can't verify the binary.
+        assert!(!body["build"].as_str().unwrap().is_empty());
+        assert_eq!(body["build"], crate::build_version());
     }
 
     #[tokio::test]

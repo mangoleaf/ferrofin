@@ -43,7 +43,7 @@ if [ "${BENCH_SKIP_BUILD:-0}" = "1" ]; then FERROFIN_DB_POOL="$first_size" docke
 else FERROFIN_DB_POOL="$first_size" docker compose up -d --build ferrofin; fi
 wait200
 echo ">> provision + scan (once)"
-TARGET=ferrofin BASE_URL="$BASE" k6 run bootstrap.js
+python3 bootstrap.py --target ferrofin --base "$BASE"
 
 for n in $POOL_SIZES; do
   echo ">> pool=$n"
@@ -51,7 +51,7 @@ for n in $POOL_SIZES; do
   # persists, so this is seconds, not a rescan.
   FERROFIN_DB_POOL="$n" docker compose up -d ferrofin
   wait200
-  POOL="$n" BASE_URL="$BASE" k6 run pool-sweep.js </dev/null
+  python3 pool_sweep.py --base "$BASE" --pool "$n" </dev/null
   # Keep the pool-sampler evidence for this size (acquisition-wait diagnosis).
   docker compose logs --no-log-prefix ferrofin 2>/dev/null | grep db_pool | tail -6 \
     > "results/raw/pool-$n-sampler.log" || true
@@ -61,4 +61,4 @@ docker compose down -v >/dev/null 2>&1 || true
 
 SHA=$(git -C .. rev-parse --short HEAD)
 # shellcheck disable=SC2086  # POOL_SIZES is intentionally word-split
-node render-pool-sweep.mjs "$SHA" $POOL_SIZES
+python3 render_closed.py pool "$SHA" $POOL_SIZES

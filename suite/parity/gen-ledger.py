@@ -54,6 +54,20 @@ def load_real_routes():
     return set(norm(m, p) for m, p in pairs)
 
 
+def load_extension_routes():
+    """{normalized route: extension-id} from the EXTENSION_ROUTES const —
+    the machine-readable ownership manifest next to REAL_ROUTES (compile-time
+    asserted to be a subset of it). Routes not listed are core."""
+    mod = open(os.path.join(ROOT, "crates/ferrofin-api/src/handlers/mod.rs")).read()
+    try:
+        blk = mod[mod.index("pub const EXTENSION_ROUTES"):]
+    except ValueError:
+        return {}
+    blk = blk[: blk.index("\n];")]
+    triples = re.findall(r'\(\s*"(\w+)"\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,?\s*\)', blk)
+    return {norm(m, p): ext for m, p, ext in triples}
+
+
 def load_overlay(path):
     overlay = {}
     if path:
@@ -95,7 +109,7 @@ def load_sweep():
     return {norm(*op.split(" ", 1)): r for op, r in rows.items()}
 
 
-def build_rows(spec, real, overlay, curated, sweep):
+def build_rows(spec, real, overlay, curated, sweep, owners):
     rows = []
     for path, item in spec["paths"].items():
         for method, op in item.items():
@@ -108,6 +122,7 @@ def build_rows(spec, real, overlay, curated, sweep):
             rows.append({
                 "operation": f"{method.upper()} {path}",
                 "tag": (op.get("tags") or ["_untagged"])[0],
+                "owner": owners.get(k, "core"),
                 "route": "registered" if k in real else "501-stub",
                 "depth": depth,
                 "status_conformant": sw.get("status_conformant"),
@@ -152,6 +167,21 @@ def render_md(rows):
         out.append(f"| {k} | {depth_counts[k]} | {pct(depth_counts[k])} |")
     out.append(f"| **route registered** | {route_counts['registered']} | {pct(route_counts['registered'])} |")
     out.append(f"| **route 501-stub** | {route_counts['501-stub']} | {pct(route_counts['501-stub'])} |")
+    out.append("")
+    out.append("## Ownership (core vs compiled-in extensions)\n")
+    out.append("_Extensions must not dilute or flatter core's coverage number — "
+               "each owner's deep-verified share stands alone._\n")
+    out.append("| owner | ops | deep-verified | classified | untested |")
+    out.append("|---|---:|---:|---:|---:|")
+    by_owner = defaultdict(list)
+    for r in rows:
+        by_owner[r["owner"]].append(r)
+    for owner in sorted(by_owner, key=lambda o: (o != "core", o)):
+        rs = by_owner[owner]
+        d = sum(1 for r in rs if r["deep_verified"] is True)
+        c = sum(1 for r in rs if r["classification"] and r["deep_verified"] is not True)
+        u = sum(1 for r in rs if r["deep_verified"] is None and not r["classification"])
+        out.append(f"| {owner} | {len(rs)} | {d} ({100 * d // len(rs)}%) | {c} | {u} |")
     out.append("")
     out.append("## Deep-verified (response + read-back diffed clean vs Jellyfin 10.11.8)\n")
     for r in rows:
@@ -234,14 +264,15 @@ def main():
     real = load_real_routes()
     curated = build_curated()
     sweep = load_sweep()
+    owners = load_extension_routes()
 
     if "--check" in sys.argv:
-        check(build_rows(spec, real, {}, curated, sweep), curated)
+        check(build_rows(spec, real, {}, curated, sweep, owners), curated)
         return
 
     classify_path = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
     overlay = load_overlay(classify_path)
-    rows = build_rows(spec, real, overlay, curated, sweep)
+    rows = build_rows(spec, real, overlay, curated, sweep, owners)
 
     with open(os.path.join(ROOT, "suite/parity/ledger.json"), "w") as f:
         json.dump({"operations": rows}, f, indent=2)

@@ -1,7 +1,7 @@
 # suite/ — merged parity + perf suite
 
 One harness, one join key, one fair scoreboard (Plan 6). Replaces the three stacks that grew
-separately: the k6 load bench (now `suite/perf/`), the retired k6 parity diff (deleted), and
+separately: the load bench (now `suite/perf/`, Python + vegeta), the retired parity diff (deleted), and
 the Python parity suite (now `suite/parity/`). Everything lives under this one folder:
 the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 
@@ -13,8 +13,9 @@ the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 
 ```
 suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → suite/parity/ledger.json (+fingerprints)
-suite/run.sh perf     # one at a time    → k6 load bench → suite/perf/results/raw/*-summary.json (+fingerprints)
+suite/run.sh perf     # one at a time    → open-loop vegeta bench → suite/perf/results/raw/*-summary.json (+fingerprints)
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
+suite/run.sh publish  # parity once + BENCH_RUNS × perf → suite/results/agg-<sha>.{json,md} (median±IQR distributions)
 suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
 suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
 suite/viewer/serve.sh # → http://127.0.0.1:8125/suite/viewer/   (THE dashboard, one page)
@@ -56,7 +57,7 @@ the registry only adds bench variants on top, never shrinks parity coverage.
 
 `suite/lib.sh` is the single copy of the bring-up: modern `MediaBrowser` auth grammar only (no
 legacy `X-Emby-*`), DeviceId minted per stage, and `suite_guard_no_probe` refuses probes while a
-measured k6 phase is running. Parity keeps both servers up (diffing needs simultaneous state);
+measured load phase is running. Parity keeps both servers up (diffing needs simultaneous state);
 perf runs them one at a time (no resource sharing during measurement).
 
 ## History

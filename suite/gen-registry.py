@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """Generate suite/registry.json — the single join key between parity and perf (Plan 6, M1/M3).
 
-Every benchmark variant is a parameterization of one contract operation. This reads the
-existing bench endpoint list (suite/perf/bench-lib.js `ENDPOINTS`) and the vendored OpenAPI
-spec, and emits a registry keyed by operation ("GET /Items/Filters2") with bench variants
-under it. Run once to (re)generate; the committed registry.json is the source of truth after
-that (variant ids are permanent trend keys — see registry_selftest.py). Re-running only adds
-newly-benched endpoints; it never rewrites existing variant ids, and it preserves aliases.
+Every benchmark variant is a parameterization of one contract operation. This imports the
+bench endpoint table (suite/perf/endpoints.py `ENDPOINTS` — plain data, no parsing) and the
+vendored OpenAPI spec, and emits a registry keyed by operation ("GET /Items/Filters2") with
+bench variants under it. Run once to (re)generate; the committed registry.json is the source
+of truth after that (variant ids are permanent trend keys — see registry_selftest.py).
+Re-running only adds newly-benched endpoints; it never rewrites existing variant ids, and it
+preserves aliases.
 """
+import importlib.util
 import json
-import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BENCH_LIB = ROOT / "suite" / "perf" / "bench-lib.js"
+ENDPOINTS_PY = ROOT / "suite" / "perf" / "endpoints.py"
 SPEC = next((ROOT / "contracts").glob("jellyfin-openapi-*.json"))
 OUT = Path(__file__).resolve().parent / "registry.json"
 
-# k6 template vars → OpenAPI path params. userId is always a query param in the bench set, so
-# it never appears here; item ids are the only path templating we do.
+# Bench context fields → OpenAPI path params. userId is always a query param in the bench
+# set, so it never appears here; item ids are the only path templating we do.
 PATH_VARS = {
-    "c.itemId": "{itemId}",
-    "c.imageItemId": "{itemId}",
-    "c.writeItemId": "{itemId}",
-    "c.seriesId": "{seriesId}",
-    "c.playlistId": "{playlistId}",
-    "c.taskId": "{taskId}",
-    "c.userId": "{userId}",
-    "c.imageTag": "{tag}",
+    "{itemId}": "{itemId}",
+    "{imageItemId}": "{itemId}",
+    "{writeItemId}": "{itemId}",
+    "{seriesId}": "{seriesId}",
+    "{playlistId}": "{playlistId}",
+    "{taskId}": "{taskId}",
+    "{userId}": "{userId}",
+    "{imageTag}": "{tag}",
 }
 
 # Variants whose concrete path carries a literal where the spec has a param (e.g. the image
@@ -44,35 +45,22 @@ OP_OVERRIDES = {
 
 
 def normalize(tmpl: str):
-    """A bench path template → (op_path, query_params). '/Items/${c.itemId}?userId=${c.userId}'
-    → ('/Items/{itemId}', 'userId={userId}&...')."""
+    """A bench path template → (op_path, query_params). '/Items/{itemId}?userId={userId}'
+    → ('/Items/{itemId}', 'userId={userId}&...'). Context aliases ({imageItemId},
+    {writeItemId}) collapse to the spec's path param; the query keeps its fields."""
     path, _, query = tmpl.partition("?")
-    for js, spec in PATH_VARS.items():
-        path = path.replace("${" + js + "}", spec)
-    # Any remaining ${c.foo} in the path we couldn't map is a bug — surface it.
-    query = re.sub(r"\$\{c\.(\w+)\}", lambda m: "{" + m.group(1) + "}", query)
+    for ctx, spec in PATH_VARS.items():
+        path = path.replace(ctx, spec)
     return path, query
 
 
 def parse_endpoints():
-    """Pull (name, method, path-template) out of the ENDPOINTS array in bench-lib.js.
-
-    Parsed LINE-WISE (entries are one per line by convention, stated in bench-lib):
-    a cross-entry regex with an optional `method:` group could otherwise swallow a
-    neighboring entry's fields. `method` defaults to GET when absent.
-    """
-    text = BENCH_LIB.read_text()
-    block = text[text.index("export const ENDPOINTS"):]
-    block = block[:block.index("\n];")]
-    out = []
-    for line in block.splitlines():
-        name = re.search(r"name:\s*'(\w+)'", line)
-        path = re.search(r"path:\s*\([^)]*\)\s*=>\s*(`[^`]*`|'[^']*')", line)
-        if not (name and path):
-            continue
-        method = re.search(r"method:\s*'(\w+)'", line)
-        out.append((name.group(1), method.group(1) if method else "GET", path.group(1)[1:-1]))
-    return out
+    """(name, method, path-template) straight from suite/perf/endpoints.py —
+    imported as data, so there is no line format or parsing convention to keep."""
+    spec_mod = importlib.util.spec_from_file_location("bench_endpoints", ENDPOINTS_PY)
+    mod = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(mod)
+    return [(e["name"], e["method"], e["path"]) for e in mod.ENDPOINTS]
 
 
 def main():
