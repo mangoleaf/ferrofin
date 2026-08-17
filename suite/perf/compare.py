@@ -147,8 +147,6 @@ def run_bench(target, base):
                     break
                 benchlib.fire(base, e, ctx)
     warmup = CONFIG["BENCH_WARMUP_SECS"]
-    login_rate = CONFIG["BENCH_LOGIN_RATE"]
-    login_secs = CONFIG["BENCH_LOGIN_DURATION_SECS"]
     tolerance = CONFIG["BENCH_RATE_TOLERANCE"]
 
     ceiling = measure_ceiling(base, ctx)
@@ -179,15 +177,11 @@ def run_bench(target, base):
         print(f"   [{i:3}/{len(main_eps)}] {e['name']:28} rate={rate:>4}/s×{dur:>2}s "
               f"p50={row['p50']} p95={row['p95']} p99={row['p99']} ok={row['okPct']}%", flush=True)
 
-    # Login storm — its own open-loop window after the mixed legs drain.
-    login = next(e for e in ENDPOINTS if e["scenario"] == "login")
-    row = open_loop_window(base, login, ctx, login_rate, 0, login_secs)
-    row["rate_source"] = "login"
-    row["rate_held"] = row["achieved_rate"] >= tolerance * login_rate
-    if not row["rate_held"]:
-        failures.append(f"auth_login: achieved {row['achieved_rate']}/s of target {login_rate}/s")
-    out["endpoints"]["auth_login"] = row
-    print(f"   login storm: p50={row['p50']} ok={row['okPct']}%")
+    # The login storm is NOT here: it runs as the very LAST leg of the bench
+    # (login_storm.py, invoked by run.sh) — PBKDF2 saturates CPU, every login
+    # invalidates the server-side auth cache, and Jellyfin's brute-force
+    # limiter can lock the bench user afterwards, poisoning anything measured
+    # later (observed live: every post-storm cold probe failed auth).
 
     (RAW / f"{target}-summary.json").write_text(json.dumps(out, indent=2) + "\n")
     print(f">> [{target}] wrote results/raw/{target}-summary.json")

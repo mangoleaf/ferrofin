@@ -157,6 +157,11 @@ def perf_by_variant():
                 "rate": hv.get("target_rate"), "rate_source": hv.get("rate_source"),
                 "h_rate_held": hv.get("rate_held"), "j_rate_held": jv.get("rate_held"),
                 "j_rate": jv.get("target_rate"),
+                # Distinguishes "measured, zero expected-status responses"
+                # (achieved rate recorded — e.g. Jellyfin's login path
+                # collapsing under storm load) from "leg never ran" for the
+                # A1 manifest check.
+                "h_achieved": hv.get("achieved_rate"), "j_achieved": jv.get("achieved_rate"),
             }
         return out, "raw-summary"
     bd = load_json(SUITE / "perf" / "bench-data.json")
@@ -213,8 +218,19 @@ def manifest_check(v2op, perf, foot, cold):
         if variant in skip:
             continue
         p = perf.get(variant)
-        h_absent = p is None or p.get("h_p50") is None
-        j_absent = p is None or p.get("j_p50") is None
+
+        # A side is MISSING when its leg produced nothing at all — no latency
+        # AND no recorded attempt. A measured window where every response was
+        # unexpected-status (p50 None but achieved_rate recorded — Jellyfin's
+        # login path under storm load does exactly this) is NOT a manifest
+        # hole: the row lands in the record as incomparable with its 0%
+        # visible. A1 exists for legs that silently vanish, not for servers
+        # that fail honestly under load.
+        def side_absent(prefix):
+            return (p is None or (p.get(f"{prefix}_p50") is None
+                                  and not p.get(f"{prefix}_achieved")))
+
+        h_absent, j_absent = side_absent("h"), side_absent("j")
         if h_absent or j_absent:
             side = "both" if h_absent and j_absent else "ferrofin" if h_absent else "jellyfin"
             missing.append(f"{variant}[{side}]")

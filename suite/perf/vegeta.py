@@ -162,4 +162,15 @@ def summarize(records, ok_status, duration_secs, rate=None):
     }
     if rate is not None:
         out["target_rate"] = rate
+    # Failure taxonomy: a row below 100% ok must say WHY — code 0 is a
+    # transport error/timeout (a server collapsing under the offered rate
+    # looks exactly like this), 4xx/5xx are the server answering. Without
+    # this, "okPct 7.6" is undiagnosable from the record (observed live on
+    # the endpoints where Ferrofin is slower than the Jellyfin-derived rate).
+    if records and len(ok_lat) < len(records):
+        codes = {}
+        for code, _ in records:
+            if code != ok_status:
+                codes[str(code)] = codes.get(str(code), 0) + 1
+        out["failed_by_code"] = codes
     return out

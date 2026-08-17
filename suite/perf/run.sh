@@ -166,6 +166,15 @@ bench() {  # $1=service $2=port $3=TARGET
       python3 cold_probe.py --target "$target" --base "$base" --endpoint "$name" || true
     done
   fi
+
+  # Login storm LAST — Jellyfin's brute-force limiter can lock the bench user
+  # after the storm, poisoning anything measured later (it broke every cold
+  # probe when the storm ran mid-leg). Nothing measures after this.
+  if ! python3 login_storm.py --target "$target" --base "$base"; then
+    echo "!! [$target] login storm could not hold its rate — leg fails" >&2
+    docker compose stop "$svc" >/dev/null 2>&1 || true
+    exit 3
+  fi
   docker compose stop "$svc" >/dev/null 2>&1 || true
 }
 
