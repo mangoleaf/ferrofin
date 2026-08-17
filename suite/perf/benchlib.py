@@ -214,7 +214,14 @@ def provision(base, target, ctx):
             ],
         },
     }
+    # Idempotent by name: re-provisioning a server whose DB survived (a resumed
+    # run, a kept volume) must NOT add the same library twice — both servers
+    # happily accept the duplicate and then scan everything double, silently
+    # changing the workload (observed live: item count ~2×).
+    existing = {v.get("Name") for v in (get_json(f"{base}/Library/VirtualFolders", h) or [])}
     for lib in json.loads(os.environ.get("LIBRARIES", "[]")):
+        if lib["name"] in existing:
+            continue
         q = (f"name={urllib.parse.quote(lib['name'])}&collectionType={lib['type']}"
              f"&paths={urllib.parse.quote(lib['path'])}")
         # Always send a real JSON body: an empty body with a JSON content-type is a 400 on Ferrofin.

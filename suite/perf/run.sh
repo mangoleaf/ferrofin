@@ -53,7 +53,12 @@ verify_build() {  # $1=base url $2=target
 
 mkdir -p results/raw fixtures/empty fixtures/media/movies fixtures/media/tv
 # BENCH_ONLY=ferrofin|jellyfin re-runs one leg, keeping the other's raw results.
-if [ -z "${BENCH_ONLY:-}" ]; then rm -f results/raw/*.json; fi
+# ctx files are exempt from the wipe: they are provisioning STATE, not results
+# — deleting one while its volume survives (BENCH_KEEP_DATA) made ready_ctx
+# re-provision an already-provisioned server, duplicating every library
+# (observed live: the item count doubled). bench() removes them explicitly
+# whenever it actually wipes the volume.
+if [ -z "${BENCH_ONLY:-}" ]; then find results/raw -name '*.json' ! -name '*-ctx.json' -delete 2>/dev/null || true; fi
 
 # Library list + synthetic fixtures (shared bring-up — see suite/lib.sh).
 suite_build_libraries
