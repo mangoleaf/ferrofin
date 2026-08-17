@@ -118,3 +118,44 @@ async fn stalled_extraction_times_out_and_kills_the_child() {
         "returned promptly, not after the child's 30 s sleep"
     );
 }
+
+#[tokio::test]
+async fn extracts_an_embedded_subtitle_track() {
+    let Some(ffmpeg) = gated() else {
+        eprintln!("skipped: FERROFIN_FFMPEG_TESTS!=1 or no ffmpeg");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let srt = dir.path().join("in.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\nhello ferrofin\n\n").unwrap();
+    let media = dir.path().join("subbed.mkv");
+    let status = std::process::Command::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=64x64:duration=3",
+        ])
+        .arg("-i")
+        .arg(&srt)
+        .args(["-c:v", "libx264", "-c:s", "srt", "-shortest"])
+        .arg(&media)
+        .status()
+        .unwrap();
+    assert!(status.success(), "test media generated");
+
+    let extractor = FfmpegMediaExtractor::new(ffmpeg);
+    let out = ferrofin_traits::media_analysis::MediaExtractor::extract_subtitle(
+        &extractor,
+        media.to_str().unwrap(),
+        0,
+    )
+    .await
+    .expect("subtitle extracted");
+    assert!(
+        String::from_utf8_lossy(&out).contains("hello ferrofin"),
+        "srt text round-tripped"
+    );
+}

@@ -106,6 +106,10 @@ fn collaborators(
     segments: Arc<dyn MediaSegmentManager>,
 ) -> Collaborators {
     Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -423,6 +427,42 @@ fn state_kv_round_trips_caps_and_deletes() {
     assert_eq!(get_state(Some(&path), "cursor"), None);
 }
 
+// The artwork download runs the plugin's declared-egress gate host-side:
+// an undeclared host is refused pre-connect, a declared-but-private host is
+// refused without the grant, and with the grant the GET round-trips with a
+// non-200 refusal.
+#[test]
+fn download_image_enforces_egress_status_and_returns_bytes() {
+    use ferrofin_wasm::capabilities::{EgressPolicy, download_image};
+    const CAP: usize = 20 * 1024 * 1024;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Undeclared destination: refused before any connection.
+    let policy = EgressPolicy::parse(&["cdn.example.com".to_owned()]);
+    let err =
+        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    assert!(err.contains("declared egress"), "got: {err}");
+
+    // Declared but loopback/private: still refused without the grant.
+    let policy = EgressPolicy::parse(&["127.0.0.1".to_owned()]);
+    let err =
+        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    assert!(err.contains("private"), "got: {err}");
+
+    // With the private grant: a non-200 answer loses the slot…
+    let (url, server) = one_shot_http("404 Not Found", b"nope");
+    let err = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap_err();
+    assert!(err.contains("404"), "got: {err}");
+    server.join().unwrap();
+
+    // …and a 200 yields the raw bytes via a GET.
+    let (url, server) = one_shot_http("200 OK", b"IMAGEBYTES");
+    let bytes = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap();
+    assert_eq!(bytes, b"IMAGEBYTES");
+    let request = server.join().unwrap();
+    assert!(request.starts_with(b"GET "), "artwork fetch must be a GET");
+}
+
 #[test]
 fn egress_policy_matching_rules() {
     use ferrofin_wasm::capabilities::EgressPolicy;
@@ -500,6 +540,10 @@ fn recorded_query_rig() -> (Collaborators, std::sync::Arc<common::OneMovieLibrar
     });
     (
         Collaborators {
+            lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+            subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+            collections: std::sync::Arc::new(common::StubCollections::default()),
+
             media_streams: std::sync::Arc::new(common::StubStreams),
             extractor: std::sync::Arc::new(common::StubExtractor::default()),
             analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -630,6 +674,10 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
 
     let extractor = std::sync::Arc::new(common::StubExtractor::default());
     let cx = Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: extractor.clone(),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -685,6 +733,20 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].width, 320, "dimension clamped to the cap");
 
+        // Subtitle extraction rides the same item-addressed path.
+        let srt =
+            ferrofin_wasm::capabilities::extract_subtitle_track(&cx, 10 * 1024 * 1024, ITEM, 0)
+                .expect("srt");
+        assert!(String::from_utf8_lossy(&srt).contains("stream 0"));
+        let err = ferrofin_wasm::capabilities::extract_subtitle_track(
+            &cx,
+            10 * 1024 * 1024,
+            &uuid::Uuid::from_u128(0xdead).to_string(),
+            0,
+        )
+        .unwrap_err();
+        assert!(err.contains("no such"), "{err}");
+
         // media-info: duration + streams + container.
         let info = media_info(&cx, ITEM).expect("info");
         assert_eq!(info.duration_ticks, 5_000_000_000);
@@ -705,4 +767,108 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         .expect("called");
     assert_eq!(path, "/media/movies/bbb.mkv");
     assert!(start.abs() < f64::EPSILON && (dur - 10.0).abs() < 0.001);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_family_caps_ownership_and_plumbing() {
+    use ferrofin_wasm::capabilities::{
+        create_collection, set_user_data, update_collection, write_lyrics, write_subtitles,
+    };
+    const ITEM: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01";
+    const WRITE_CAP: usize = 2 * 1024 * 1024;
+    const USER: &str = "00000000-0000-0000-0000-000000000001";
+
+    let lyrics = std::sync::Arc::new(common::StubLyrics::default());
+    let subtitles = std::sync::Arc::new(common::StubSubtitles::default());
+    let collections = std::sync::Arc::new(common::StubCollections::default());
+    let cx = Collaborators {
+        lyrics: lyrics.clone(),
+        subtitles: subtitles.clone(),
+        collections: collections.clone(),
+        media_streams: std::sync::Arc::new(common::StubStreams),
+        extractor: std::sync::Arc::new(common::StubExtractor::default()),
+        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        users: std::sync::Arc::new(common::StubUsers),
+        user_data: std::sync::Arc::new(common::StubUserData),
+        tv: std::sync::Arc::new(common::StubTv),
+        handle: tokio::runtime::Handle::current(),
+        library: std::sync::Arc::new(common::OneMovieLibrary {
+            seen: std::sync::Mutex::new(None),
+        }),
+        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
+        plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("p.state.json");
+
+    tokio::task::spawn_blocking(move || {
+        use ferrofin_wasm::bindings::types::UserDataUpdate;
+        // set-user-data: bad ids error; the write reaches the manager.
+        // (StubUserData::save_user_data is a panic stub — the recording
+        // proof here is the error shape; the manager plumbing is covered
+        // by the trait call compiling against the real signature. Use the
+        // id-validation paths.)
+        let update = UserDataUpdate {
+            played: Some(true),
+            favorite: None,
+            playback_position_ticks: Some(123),
+        };
+        let err = set_user_data(&cx, "p", "junk", ITEM, &update).unwrap_err();
+        assert!(err.contains("user-id"), "{err}");
+        let err = set_user_data(&cx, "p", USER, "junk", &update).unwrap_err();
+        assert!(err.contains("item-id"), "{err}");
+
+        // Lyrics: UTF-8 + cap + recorded write.
+        let err =
+            write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", &vec![0u8; 2 * 1024 * 1024 + 1]).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+        let err = write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", &[0xFF, 0xFE]).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+        write_lyrics(&cx, WRITE_CAP, ITEM, "lrc", b"[00:01.00] hi").unwrap();
+        let w = lyrics.writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].2.starts_with("lrc:"), "{:?}", w[0]);
+
+        // Subtitles: cap + recorded language/format/size.
+        write_subtitles(&cx, WRITE_CAP, ITEM, "eng", "srt", b"1\n00:00:01 --> 2\nhi").unwrap();
+        let w = subtitles.writes.lock().unwrap().clone();
+        assert_eq!(
+            w[0].2,
+            format!("eng:srt:{}", b"1\n00:00:01 --> 2\nhi".len())
+        );
+
+        // Collections: an over-long name is refused before any manager call.
+        let err = create_collection(
+            &cx,
+            Some(&state),
+            8 * 1024 * 1024,
+            &"x".repeat(257),
+            &[ITEM.into()],
+        )
+        .unwrap_err();
+        assert!(err.contains("name exceeds"), "{err}");
+
+        // create records ownership; updating an unowned id is
+        // refused BEFORE any manager call; owned updates go through.
+        let cid = create_collection(&cx, Some(&state), 8 * 1024 * 1024, "Best", &[ITEM.into()])
+            .expect("create");
+        let err = update_collection(
+            &cx,
+            Some(&state),
+            &uuid::Uuid::from_u128(0xdead).to_string(),
+            &[ITEM.into()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not owned"), "{err}");
+        update_collection(&cx, Some(&state), &cid, &[ITEM.into()], &[]).expect("owned update");
+        let w = collections.writes.lock().unwrap().clone();
+        assert_eq!(w.len(), 2, "create + add only: {w:?}");
+        assert_eq!(w[1].0, "add");
+        // The ownership ledger sits under a host-reserved key — invisible
+        // to guests (bindings-layer guard, proven elsewhere).
+        assert!(ferrofin_wasm::capabilities::get_state(Some(&state), "host:collections").is_some());
+    })
+    .await
+    .unwrap();
 }

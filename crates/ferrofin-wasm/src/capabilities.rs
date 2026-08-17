@@ -48,6 +48,12 @@ pub struct Collaborators {
     pub media_streams: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository>,
     /// The decoder behind `extract-audio`/`extract-frames`.
     pub extractor: Arc<dyn ferrofin_traits::media_analysis::MediaExtractor>,
+    /// Lyric persistence behind `write-lyrics`.
+    pub lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager>,
+    /// Subtitle persistence behind `write-subtitles`.
+    pub subtitles: Arc<dyn ferrofin_traits::subtitles::SubtitleManager>,
+    /// Collection creation/updates behind the plugin-owned collection fns.
+    pub collections: Arc<dyn ferrofin_traits::collections::CollectionManager>,
     /// Global analysis-decode budget shared by every plugin (per-plugin
     /// concurrency is already 1 — each plugin's calls serialize on its own
     /// runtime thread).
@@ -288,6 +294,54 @@ pub fn http_fetch(
         headers,
         body,
     })
+}
+
+/// Downloads one remote-artwork candidate ON THE PLUGIN'S BEHALF — the
+/// guest only names URLs; bytes never enter guest memory. The download runs
+/// through the exact same gate as `http-fetch`: declared-egress allowlist
+/// checked pre-DNS, private-address vetting with the DNS-rebinding pin,
+/// redirects off. `size_cap` bounds the body
+/// (`FERROFIN_WASM_IMAGE_DOWNLOAD_MB`) and `timeout` the whole GET
+/// (`FERROFIN_WASM_IMAGE_TIMEOUT_SECS`).
+///
+/// # Errors
+/// The same refusals as [`http_fetch`], a non-200 status, or an over-cap
+/// body — as a plain string for the scan warn line.
+pub fn download_image(
+    plugin_name: &str,
+    private_http_allowed: bool,
+    egress: &EgressPolicy,
+    size_cap: usize,
+    timeout: std::time::Duration,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("ferrofin-wasm/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("building image download client: {e}"))?;
+    let response = http_fetch(
+        &client,
+        plugin_name,
+        size_cap,
+        private_http_allowed,
+        egress,
+        timeout,
+        &HttpRequest {
+            method: String::from("GET"),
+            url: url.to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    )?;
+    if response.status != 200 {
+        return Err(format!("image download returned HTTP {}", response.status));
+    }
+    if response.body.is_empty() {
+        return Err(String::from("image download returned an empty body"));
+    }
+    Ok(response.body)
 }
 
 /// Executes `query-items` for a guest: filters → `InternalItemsQuery`,
@@ -719,13 +773,39 @@ pub fn extract_frames(
         .collect())
 }
 
+/// Executes `extract-subtitle-track`. `size_cap` bounds the extracted
+/// track (`FERROFIN_WASM_SUBTITLE_EXTRACT_MB`).
+///
+/// # Errors
+/// Unknown item, decode failure, or an over-cap track.
+pub fn extract_subtitle_track(
+    cx: &Collaborators,
+    size_cap: usize,
+    item_id: &str,
+    stream_index: u32,
+) -> Result<Vec<u8>, String> {
+    let path = resolve_media_path(cx, item_id)?;
+    let bytes = cx
+        .handle
+        .block_on(async {
+            let _permit = cx.analysis.acquire().await;
+            cx.extractor.extract_subtitle(&path, stream_index).await
+        })
+        .map_err(|e| format!("subtitle extraction failed: {e}"))?;
+    if bytes.len() > size_cap {
+        return Err(format!("extracted track exceeds the {size_cap}-byte cap"));
+    }
+    Ok(bytes)
+}
+
 /// The plugin key/value state caps — hardcoded abuse guards in the
 /// manifest-cap tradition (state is for settings/cursors, not blobs).
 const STATE_KEY_MAX: usize = 256;
 /// Max bytes for one state value.
 const STATE_VALUE_MAX: usize = 1024 * 1024;
-/// Max total logical bytes (keys + values) for one plugin's state.
-const STATE_TOTAL_MAX: usize = 8 * 1024 * 1024;
+/// Default max total logical bytes (keys + values) for one plugin's
+/// state (`FERROFIN_WASM_STATE_LIMIT_MB` overrides).
+pub const STATE_TOTAL_DEFAULT: usize = 8 * 1024 * 1024;
 
 /// Hex-encodes a state value (values are stored as hex strings — a JSON
 /// `Vec<u8>` would serialize as a number array, ~4× the logical size).
@@ -789,7 +869,39 @@ pub fn set_state(
     key: &str,
     value: Option<Vec<u8>>,
 ) -> Result<(), String> {
+    set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
+}
+
+/// [`set_state`] with an explicit total cap (the host passes the
+/// operator-configured limit; the default wrapper serves tests/tools).
+///
+/// # Errors
+/// Cap violations or I/O failures, as the guest-visible string.
+pub fn set_state_capped(
+    path: Option<&std::path::Path>,
+    key: &str,
+    value: Option<Vec<u8>>,
+    total_cap: usize,
+) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
+    let map = state_after_set(path, key, value, total_cap)?;
+    let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+}
+
+/// The would-be state map after setting `key` to `value`, refused at the
+/// same caps as [`set_state_capped`] — WITHOUT writing. `create-collection`
+/// pre-flights its ledger append through this, so a cap refusal happens
+/// before the collection exists rather than after (which would orphan an
+/// unowned, unmanageable collection).
+fn state_after_set(
+    path: &std::path::Path,
+    key: &str,
+    value: Option<Vec<u8>>,
+    total_cap: usize,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     if key.len() > STATE_KEY_MAX {
         return Err(format!("state key exceeds {STATE_KEY_MAX} bytes"));
     }
@@ -809,13 +921,217 @@ pub fn set_state(
     }
     // Logical size: hex stores two chars per byte.
     let total: usize = map.iter().map(|(k, v)| k.len() + v.len() / 2).sum();
-    if total > STATE_TOTAL_MAX {
+    if total > total_cap {
         return Err(format!(
-            "plugin state would exceed {STATE_TOTAL_MAX} bytes in total"
+            "plugin state would exceed {total_cap} bytes in total"
         ));
     }
-    let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+    Ok(map)
+}
+
+/// Cap on collection membership operations per call.
+const COLLECTION_IDS_MAX: usize = 1000;
+/// Cap on a created collection's name — the one guest string in the write
+/// family that had no bound (same abuse-guard size as state keys).
+const COLLECTION_NAME_MAX: usize = 256;
+/// The host-reserved state key listing collection ids a plugin owns.
+const OWNED_COLLECTIONS_KEY: &str = "host:collections";
+
+fn parse_uuid(what: &str, raw: &str) -> Result<Uuid, String> {
+    raw.parse()
+        .map_err(|_| format!("{what} `{raw}` is not a valid UUID"))
+}
+
+/// Executes `set-user-data` — the strongest write a plugin has; logged
+/// per call with the plugin named (see the WIT trust note).
+///
+/// # Errors
+/// Invalid ids or a manager failure, as the guest-visible string.
+pub fn set_user_data(
+    cx: &Collaborators,
+    plugin_name: &str,
+    user_id: &str,
+    item_id: &str,
+    update: &crate::bindings::types::UserDataUpdate,
+) -> Result<(), String> {
+    let uid = parse_uuid("user-id", user_id)?;
+    let iid = parse_uuid("item-id", item_id)?;
+    tracing::info!(
+        plugin = plugin_name,
+        user = %uid,
+        item = %iid,
+        played = ?update.played,
+        favorite = ?update.favorite,
+        position = ?update.playback_position_ticks,
+        "wasm plugin writes user data"
+    );
+    let dto = ferrofin_model::dto::UpdateUserItemDataDto {
+        played: update.played,
+        is_favorite: update.favorite,
+        playback_position_ticks: update.playback_position_ticks,
+        ..Default::default()
+    };
+    cx.handle
+        .block_on(cx.user_data.save_user_data(uid, iid, &dto))
+        .map_err(|e| format!("user-data write failed: {e}"))
+}
+
+/// Executes `write-lyrics`. `size_cap` bounds the payload
+/// (`FERROFIN_WASM_WRITE_CONTENT_MB` — settings-class writes, not media).
+///
+/// # Errors
+/// Cap/format violations or a manager failure.
+pub fn write_lyrics(
+    cx: &Collaborators,
+    size_cap: usize,
+    item_id: &str,
+    format: &str,
+    content: &[u8],
+) -> Result<(), String> {
+    if content.len() > size_cap {
+        return Err(format!("lyrics exceed the {size_cap}-byte cap"));
+    }
+    let iid = parse_uuid("item-id", item_id)?;
+    let text = std::str::from_utf8(content).map_err(|_| "lyrics must be UTF-8".to_owned())?;
+    cx.handle
+        .block_on(cx.lyrics.save_lyric(iid, format, text))
+        .map(|_| ())
+        .map_err(|e| format!("lyric write failed: {e}"))
+}
+
+/// Executes `write-subtitles`. `size_cap` bounds the payload
+/// (`FERROFIN_WASM_WRITE_CONTENT_MB`).
+///
+/// # Errors
+/// Cap violations or a manager failure.
+pub fn write_subtitles(
+    cx: &Collaborators,
+    size_cap: usize,
+    item_id: &str,
+    language: &str,
+    format: &str,
+    content: &[u8],
+) -> Result<(), String> {
+    if content.len() > size_cap {
+        return Err(format!("subtitles exceed the {size_cap}-byte cap"));
+    }
+    let iid = parse_uuid("item-id", item_id)?;
+    let response = ferrofin_traits::subtitles::SubtitleResponse {
+        language: language.to_owned(),
+        format: format.to_owned(),
+        is_forced: false,
+        is_hearing_impaired: false,
+        content: content.to_vec(),
+    };
+    cx.handle
+        .block_on(cx.subtitles.upload_subtitle(iid, &response))
+        .map_err(|e| format!("subtitle write failed: {e}"))
+}
+
+/// The plugin's owned-collection ledger (host-reserved state).
+fn owned_collections(state_path: Option<&std::path::Path>) -> Vec<String> {
+    state_path
+        .and_then(|p| get_state(Some(p), OWNED_COLLECTIONS_KEY))
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Executes `create-collection` (plugin-owned; recorded in the ledger).
+///
+/// # Errors
+/// Cap violations, missing state, or a manager failure.
+pub fn create_collection(
+    cx: &Collaborators,
+    state_path: Option<&std::path::Path>,
+    total_cap: usize,
+    name: &str,
+    item_ids: &[String],
+) -> Result<String, String> {
+    if item_ids.len() > COLLECTION_IDS_MAX {
+        return Err(format!("at most {COLLECTION_IDS_MAX} items per call"));
+    }
+    if name.len() > COLLECTION_NAME_MAX {
+        return Err(format!(
+            "collection name exceeds {COLLECTION_NAME_MAX} bytes"
+        ));
+    }
+    let ids: Vec<Uuid> = item_ids
+        .iter()
+        .map(|s| parse_uuid("item id", s))
+        .collect::<Result<_, _>>()?;
+    // Pre-flight the ledger append with a same-size placeholder (every
+    // canonical UUID renders to 36 chars), so a refusal — no state in this
+    // context, or the state cap — happens BEFORE the collection exists.
+    let p = state_path.ok_or("state is not available in this context")?;
+    let mut prospective = owned_collections(state_path);
+    prospective.push(Uuid::nil().to_string());
+    let bytes = serde_json::to_vec(&prospective).map_err(|e| format!("ledger: {e}"))?;
+    state_after_set(p, OWNED_COLLECTIONS_KEY, Some(bytes), total_cap)?;
+    let options = ferrofin_traits::collections::CollectionCreationOptions {
+        name: name.to_owned(),
+        parent_id: None,
+        is_locked: false,
+        provider_ids: std::collections::HashMap::new(),
+        item_id_list: ids,
+        user_ids: Vec::new(),
+    };
+    let entity = cx
+        .handle
+        .block_on(cx.collections.create_collection(&options))
+        .map_err(|e| format!("collection create failed: {e}"))?;
+    let id = Uuid::parse_str(&entity.id)
+        .map(|u| u.to_string())
+        .unwrap_or(entity.id);
+    let mut owned = owned_collections(state_path);
+    owned.push(id.clone());
+    let bytes = serde_json::to_vec(&owned).map_err(|e| format!("ledger: {e}"))?;
+    set_state_capped(state_path, OWNED_COLLECTIONS_KEY, Some(bytes), total_cap)?;
+    Ok(id)
+}
+
+/// Executes `update-collection` — refused for collections the plugin does
+/// not own (the ledger is host-reserved state a guest cannot edit).
+///
+/// # Errors
+/// Ownership/cap violations or a manager failure.
+pub fn update_collection(
+    cx: &Collaborators,
+    state_path: Option<&std::path::Path>,
+    collection_id: &str,
+    add: &[String],
+    remove: &[String],
+) -> Result<(), String> {
+    if add.len() > COLLECTION_IDS_MAX || remove.len() > COLLECTION_IDS_MAX {
+        return Err(format!("at most {COLLECTION_IDS_MAX} items per call"));
+    }
+    let cid = parse_uuid("collection-id", collection_id)?;
+    // Compare the canonical rendering, not the raw guest string, so a
+    // valid-but-unhyphenated UUID is not spuriously refused (the ledger
+    // stores canonical ids).
+    let canonical = cid.to_string();
+    if !owned_collections(state_path)
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&canonical))
+    {
+        return Err(format!(
+            "collection {collection_id} is not owned by this plugin — plugins may only \
+modify collections they created"
+        ));
+    }
+    let to_uuid = |v: &[String]| -> Result<Vec<Uuid>, String> {
+        v.iter().map(|s| parse_uuid("item id", s)).collect()
+    };
+    let add = to_uuid(add)?;
+    let remove = to_uuid(remove)?;
+    if !add.is_empty() {
+        cx.handle
+            .block_on(cx.collections.add_to_collection(cid, &add))
+            .map_err(|e| format!("collection add failed: {e}"))?;
+    }
+    if !remove.is_empty() {
+        cx.handle
+            .block_on(cx.collections.remove_from_collection(cid, &remove))
+            .map_err(|e| format!("collection remove failed: {e}"))?;
+    }
+    Ok(())
 }

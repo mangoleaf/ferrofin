@@ -5,6 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com) and
 [Conventional Commits](https://www.conventionalcommits.org); versions follow
 [Semantic Versioning](https://semver.org).
 
+Upgrades needing a manual step or with a non-obvious behavior change are
+called out in [docs/UPGRADING.md](docs/UPGRADING.md).
+
 ## [Unreleased]
 
 ### Bug Fixes

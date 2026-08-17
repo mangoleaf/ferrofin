@@ -597,6 +597,14 @@ impl ferrofin_traits::media_analysis::MediaExtractor for StubExtractor {
         Ok(vec![7i16; samples.min(1024)])
     }
 
+    async fn extract_subtitle(
+        &self,
+        _path: &str,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, ServiceError> {
+        Ok(format!("1\n00:00:00,000 --> 00:00:01,000\nstream {stream_index}\n").into_bytes())
+    }
+
     async fn extract_frames(
         &self,
         _path: &str,
@@ -720,4 +728,208 @@ impl PluginManager for DisabledStub {
     ) -> Result<Vec<ferrofin_model::updates::PackageInfo>, ServiceError> {
         Ok(Vec::new())
     }
+}
+
+// ── G2 write-capability stubs ──
+#[allow(unused_imports)]
+use ferrofin_model::lyrics::{LyricDto, RemoteLyricInfoDto};
+#[allow(unused_imports)]
+use ferrofin_model::providers::{LyricProviderInfo, RemoteSubtitleInfo, SubtitleProviderInfo};
+#[allow(unused_imports)]
+use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubLyrics {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::stubs::LyricManager for StubLyrics {
+    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn download_lyrics(
+        &self,
+        _item_id: Uuid,
+        _lyric_id: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn save_lyric(
+        &self,
+        item_id: Uuid,
+        format: &str,
+        lyrics: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        self.writes.lock().unwrap().push((
+            "lyric".into(),
+            item_id.to_string(),
+            format!("{format}:{}", lyrics.len()),
+        ));
+        Ok(None)
+    }
+    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<LyricProviderInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubSubtitles {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::subtitles::SubtitleManager for StubSubtitles {
+    async fn search_subtitles(
+        &self,
+        _request: &SubtitleSearchRequest,
+    ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn download_subtitles(
+        &self,
+        _item_id: Uuid,
+        _subtitle_id: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn upload_subtitle(
+        &self,
+        item_id: Uuid,
+        response: &ferrofin_traits::subtitles::SubtitleResponse,
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "subtitle".into(),
+            item_id.to_string(),
+            format!(
+                "{}:{}:{}",
+                response.language,
+                response.format,
+                response.content.len()
+            ),
+        ));
+        Ok(())
+    }
+    async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<SubtitleProviderInfo>, ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// Recording/panic stub for the G2 write capabilities.
+#[derive(Default)]
+pub struct StubCollections {
+    /// The recorded write calls (method, item-id, detail).
+    pub writes: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unimplemented)]
+impl ferrofin_traits::collections::CollectionManager for StubCollections {
+    async fn create_collection(
+        &self,
+        options: &ferrofin_traits::collections::CollectionCreationOptions,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        self.writes.lock().unwrap().push((
+            "create".into(),
+            options.name.clone(),
+            options.item_id_list.len().to_string(),
+        ));
+        Ok(BaseItemEntity {
+            id: "12121212-3434-5656-7878-909090909090".to_owned(),
+            ..BaseItemEntity::default()
+        })
+    }
+    async fn add_to_collection(
+        &self,
+        collection_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "add".into(),
+            collection_id.to_string(),
+            item_ids.len().to_string(),
+        ));
+        Ok(())
+    }
+    async fn remove_from_collection(
+        &self,
+        collection_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        self.writes.lock().unwrap().push((
+            "remove".into(),
+            collection_id.to_string(),
+            item_ids.len().to_string(),
+        ));
+        Ok(())
+    }
+    async fn get_collections_containing_item(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+    async fn get_collections_folder(
+        &self,
+        _create_if_needed: bool,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+}
+
+/// The shared WAT fixture, re-identified (`id` must stay 36 chars) and
+/// upgraded from `provider-info: none` to `some({name, supported-kinds:
+/// []})` — the canonical-ABI ret area gains the payload (name ptr/len, empty
+/// list) and the name string lands in otherwise-unused memory at 1280.
+/// Used by the load tests (name-collision guard) and the validator test
+/// (install-time reserved-name refusal).
+pub fn named_provider_fixture(id: &str, provider_name: &str) -> String {
+    assert_eq!(id.len(), 36, "must byte-replace the 36-char fixture id");
+    ferrofin_wasm::TEST_FIXTURE_WAT
+        .replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
+        .replace(
+            "(data (i32.const 488) \"Movie\")",
+            &format!(
+                "(data (i32.const 488) \"Movie\")\n    (data (i32.const 1280) \"{provider_name}\")"
+            ),
+        )
+        .replace(
+            "    (func (export \"provider-info\") (result i32)\n      \
+             (i32.store (i32.const 1184) (i32.const 0))\n      i32.const 1184)",
+            &format!(
+                "    (func (export \"provider-info\") (result i32)\n      \
+                 (i32.store (i32.const 1184) (i32.const 1))\n      \
+                 (i32.store (i32.const 1188) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1192) (i32.const {len}))\n      \
+                 (i32.store (i32.const 1196) (i32.const 1280))\n      \
+                 (i32.store (i32.const 1200) (i32.const 0))\n      \
+                 i32.const 1184)",
+                len = provider_name.len()
+            ),
+        )
 }

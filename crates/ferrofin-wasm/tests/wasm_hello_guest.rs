@@ -132,6 +132,10 @@ async fn real_guest_loads_runs_and_reports_rss() {
     // ── E2: the analyze task drives all three capabilities ─────────────
     let segment_store = Arc::new(RecordingSegments::default());
     host.set_runtime_collaborators(Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),

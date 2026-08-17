@@ -172,6 +172,12 @@
       (i32.store (i32.const 1124) (i32.const 0))
       i32.const 1120)
 
+    ;; provider-info: () -> option<provider-descriptor>; none (the fixture
+    ;; is not a named provider). Ret area @1184: tag 0.
+    (func (export "provider-info") (result i32)
+      (i32.store (i32.const 1184) (i32.const 0))
+      i32.const 1184)
+
     ;; scan-targets: () -> list<string>; ["Movie"] so driver tests can
     ;; exercise the analysis pass against this fixture.
     (func (export "scan-targets") (result i32)
@@ -188,6 +194,15 @@
       (i32.store (i32.const 1172) (i32.const 0))
       (i32.store (i32.const 1176) (i32.const 0))
       i32.const 1168)
+
+    ;; remote-images: (item-summary) -> result<list<image-candidate>, string>;
+    ;; args indirect like scan-media; always ok([]). Ret area @1216:
+    ;; tag ok, list ptr/len 0.
+    (func (export "remote-images") (param i32) (result i32)
+      (i32.store (i32.const 1216) (i32.const 0))
+      (i32.store (i32.const 1220) (i32.const 0))
+      (i32.store (i32.const 1224) (i32.const 0))
+      i32.const 1216)
 
     ;; handle-request: (plugin-request) -> plugin-response
     ;; plugin-request flattens to exactly 16 params (the direct-passing
@@ -260,6 +275,9 @@
     (field "headers" (list (tuple string string)))
     (field "body" (list u8))))
   (export $resp "plugin-response" (type $resp0))
+  (type $pd0 (record
+    (field "name" string) (field "supported-kinds" (list string))))
+  (export $pd "provider-descriptor" (type $pd0))
   (type $wt0 (record
     (field "path-pattern" string) (field "search" string)
     (field "replace" string)))
@@ -267,8 +285,16 @@
   (type $meta0 (record
     (field "overview" (option string)) (field "production-year" (option s32))
     (field "community-rating" (option f64)) (field "genres" (list string))
-    (field "provider-ids" (list (tuple string string)))))
+    (field "provider-ids" (list (tuple string string)))
+    (field "tagline" (option string)) (field "studios" (list string))
+    (field "tags" (list string)) (field "official-rating" (option string))
+    (field "end-date" (option string))))
   (export $meta "metadata-result" (type $meta0))
+  (type $ic0 (record
+    (field "kind" string) (field "url" string)
+    (field "width" (option u32)) (field "height" (option u32))
+    (field "language" (option string))))
+  (export $ic "image-candidate" (type $ic0))
 
   (func $descriptor (result $descriptor)
     (canon lift (core func $i "descriptor") (memory $i "memory") string-encoding=utf8))
@@ -280,6 +306,8 @@
     (canon lift (core func $i "config-pages") (memory $i "memory") string-encoding=utf8))
   (func $web-transforms (result (list $wt))
     (canon lift (core func $i "web-transforms") (memory $i "memory") string-encoding=utf8))
+  (func $provider-info (result (option $pd))
+    (canon lift (core func $i "provider-info") (memory $i "memory") string-encoding=utf8))
   (func $scan-targets (result (list string))
     (canon lift (core func $i "scan-targets") (memory $i "memory") string-encoding=utf8))
   (func $scan-media (param "item" $item) (result (result (error string)))
@@ -296,6 +324,9 @@
   (func $on-event (param "event-name" string) (param "event-json" string)
     (canon lift (core func $i "on-event") (memory $i "memory")
       (realloc (core func $i "realloc")) string-encoding=utf8))
+  (func $remote-images (param "item" $item) (result (result (list $ic) (error string)))
+    (canon lift (core func $i "remote-images") (memory $i "memory")
+      (realloc (core func $i "realloc")) string-encoding=utf8))
   (func $metadata-lookup
     (param "item" $item) (param "provider-ids" (list (tuple string string)))
     (result (result (option $meta) (error string)))
@@ -307,11 +338,13 @@
   (export "tasks" (func $tasks))
   (export "config-pages" (func $config-pages))
   (export "web-transforms" (func $web-transforms))
+  (export "provider-info" (func $provider-info))
   (export "scan-targets" (func $scan-targets))
   (export "scan-media" (func $scan-media))
   (export "declared-egress" (func $declared-egress))
   (export "handle-request" (func $handle-request))
   (export "run-task" (func $run-task))
   (export "on-event" (func $on-event))
+  (export "remote-images" (func $remote-images))
   (export "metadata-lookup" (func $metadata-lookup))
 )

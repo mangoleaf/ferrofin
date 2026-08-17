@@ -26,6 +26,7 @@ use ferrofin_db::entities::base_items::{
     BaseItemEntity, ChapterEntity, MediaStreamInfoEntity, PeopleEntity,
 };
 use ferrofin_db::store::guid_to_db;
+use ferrofin_model::configuration::LibraryOptions as LibraryOptionsModel;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
@@ -36,6 +37,7 @@ use ferrofin_naming::audio::is_audio_file;
 use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
+use ferrofin_providers::library_options::fetcher_names;
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
     RemoteImage, TmdbClient, TmdbDetails, TmdbKind,
@@ -152,12 +154,132 @@ async fn download_images(
     infos
 }
 
+/// The per-library fetcher gate, derived from the owning library's
+/// `LibraryOptions`. The advertised names in [`fetcher_names`] are the
+/// currency: a saved `TypeOptions` entry for an item kind is authoritative
+/// (a fetcher is enabled iff listed, ranked by its position in the order
+/// list), while a library with no entry for the kind enables everything in
+/// the default chain order. A default policy (no library resolved) is
+/// fully permissive — exactly the pre-gating behavior.
+#[derive(Clone, Copy, Default)]
+struct FetcherPolicy<'a> {
+    options: Option<&'a LibraryOptionsModel>,
+}
+
+impl<'a> FetcherPolicy<'a> {
+    fn type_entry(self, kind: &str) -> Option<&'a ferrofin_model::configuration::TypeOptions> {
+        self.options?.type_options.iter().find(|t| {
+            t.type_
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case(kind))
+        })
+    }
+
+    /// Whether the library enabled metadata fetcher `name` for `kind`.
+    fn metadata_enabled(self, kind: &str, name: &str) -> bool {
+        self.type_entry(kind).is_none_or(|t| {
+            t.metadata_fetchers
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// The fetcher's admin-order position for `kind` (lower = higher
+    /// authority); a fetcher absent from the order list sorts last, which
+    /// preserves the default chain among unordered fetchers.
+    fn metadata_rank(self, kind: &str, name: &str) -> usize {
+        self.type_entry(kind).map_or(usize::MAX, |t| {
+            t.metadata_fetcher_order
+                .iter()
+                .position(|f| f.eq_ignore_ascii_case(name))
+                .unwrap_or(usize::MAX)
+        })
+    }
+
+    /// Whether the library enabled image fetcher `name` for `kind`.
+    fn image_enabled(self, kind: &str, name: &str) -> bool {
+        self.type_entry(kind).is_none_or(|t| {
+            t.image_fetchers
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+        })
+    }
+
+    /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order.
+    fn image_rank(self, kind: &str, name: &str) -> usize {
+        self.type_entry(kind).map_or(usize::MAX, |t| {
+            t.image_fetcher_order
+                .iter()
+                .position(|f| f.eq_ignore_ascii_case(name))
+                .unwrap_or(usize::MAX)
+        })
+    }
+
+    /// Whether the flat local-reader list still enables `name` (`Nfo`).
+    fn local_reader_enabled(self, name: &str) -> bool {
+        self.options.is_none_or(|o| {
+            !o.disabled_local_metadata_readers
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+        })
+    }
+}
+
+/// Indexes each library's [`FetcherPolicy`] by its collection-folder id —
+/// the id every [`Planned`] item carries as its first ancestor.
+fn fetcher_policies(folders: &[VirtualFolderInfo]) -> HashMap<Uuid, FetcherPolicy<'_>> {
+    folders
+        .iter()
+        .filter_map(|f| {
+            let id = f.item_id.as_deref()?.parse().ok()?;
+            Some((
+                id,
+                FetcherPolicy {
+                    options: f.library_options.as_ref(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Resolves a stored row's fetcher policy from its `TopParentId` (the
+/// collection folder every scanned entity carries). Unresolvable rows get
+/// the permissive default.
+fn policy_of<'a>(
+    policies: &HashMap<Uuid, FetcherPolicy<'a>>,
+    top_parent_id: Option<&str>,
+) -> FetcherPolicy<'a> {
+    top_parent_id
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .and_then(|id| policies.get(&id))
+        .copied()
+        .unwrap_or_default()
+}
+
 /// The `MediaStreamInfos.StreamType` discriminant for an embedded image
 /// (an attached picture — cover art), matching `media_stream_type_to_disc`.
 const EMBEDDED_IMAGE_STREAM_TYPE: i32 = 3;
 
 /// The image file extensions the art-dir helpers recognize.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
+
+/// Magic-byte sniff for the artwork formats plugins may return, returning the
+/// file extension to store the bytes under (one of [`ART_FILE_EXTENSIONS`]),
+/// or `None` for anything that is not a recognized image — enough to keep an
+/// arbitrary blob from persisting as a permanent zero-dimension image.
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
 
 /// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
 /// extension, preferring the canonical `.jpg` first.
@@ -660,6 +782,13 @@ impl LibraryScanner {
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
         let mut art_cache = ArtworkCache::default();
+        // Per-library fetcher policies, keyed by the collection-folder id
+        // every Planned item carries as its first ancestor. This is what
+        // makes the dashboard's per-library "Metadata downloaders" and
+        // "Image fetchers" checkboxes REAL: a fetcher the admin unchecked
+        // never runs for that library's items, and the saved order picks
+        // the authority when fetchers compete.
+        let fetcher_policies = fetcher_policies(folders);
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
             // Bounded progress cadence (RULES_LOGGING volume rule); `0` disables it.
@@ -677,6 +806,12 @@ impl LibraryScanner {
             // The scan-upsert's `IsLocked` guard backstops the metadata
             // columns; file-derived facts (the probe) still update.
             let locked = self.is_item_locked(item.id).await;
+            let policy = item
+                .ancestors
+                .first()
+                .and_then(|id| fetcher_policies.get(id))
+                .copied()
+                .unwrap_or_default();
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
@@ -688,7 +823,7 @@ impl LibraryScanner {
             let mut people = if locked {
                 Vec::new()
             } else {
-                self.fetch_local_nfo(&mut entity).await
+                self.fetch_local_nfo(&mut entity, policy).await
             };
             // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
             // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
@@ -697,7 +832,7 @@ impl LibraryScanner {
             let remote = if locked {
                 RemoteMetadata::default()
             } else {
-                self.fetch_remote_metadata(&mut entity, &mut art_cache)
+                self.fetch_remote_metadata(&mut entity, &mut art_cache, policy)
                     .await
             };
             if people.is_empty() {
@@ -708,7 +843,13 @@ impl LibraryScanner {
             // supplement whatever the built-in chain left unfilled; the
             // helper merges their (filtered) ids with the built-ins'.
             let all_provider_ids = self
-                .apply_dynamic_metadata(&mut entity, &remote.provider_ids, tag_provider_ids, locked)
+                .apply_dynamic_metadata(
+                    &mut entity,
+                    &remote.provider_ids,
+                    tag_provider_ids,
+                    locked,
+                    policy,
+                )
                 .await;
             // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
             // links) and the stored `DateCreated` on rows that already exist —
@@ -717,32 +858,13 @@ impl LibraryScanner {
             self.persistence
                 .save_scanned_items(std::slice::from_ref(&entity))
                 .await?;
-            // Persist the external provider ids now the item row exists to FK
-            // against: the remote match's (Tmdb/Imdb/Tvdb) plus the embedded
-            // MusicBrainz ids read from the audio tags. These key the
-            // id-dependent providers (fanart, AudioDb, MusicBrainz) and make
-            // re-scans/cross-provider lookups stable. Best-effort: a write
-            // failure is logged, not fatal.
-            for (key, value) in &all_provider_ids {
-                if let Err(err) = self.persistence.save_provider_id(item.id, key, value).await {
-                    tracing::warn!(%err, item = %item.id, provider = key, "failed to persist provider id");
-                }
-            }
-            // Keep the ids in the scan cache so the image pass can key fanart off
-            // them (movies) without a DB round-trip.
-            if !all_provider_ids.is_empty() {
-                art_cache
-                    .item_provider_ids
-                    .insert(entity.id.clone(), all_provider_ids);
-            }
-            // Mirror the item's genres/studios/tags into ItemValues so the
-            // genre/studio/tag *filters* (More Like This, genre browse) match.
-            let item_values = item_values_of(&entity);
-            if !item_values.is_empty() {
-                self.persistence
-                    .save_item_values(item.id, &item_values)
-                    .await?;
-            }
+            self.persist_provider_ids_and_values(
+                item.id,
+                &entity,
+                all_provider_ids,
+                &mut art_cache,
+            )
+            .await?;
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
@@ -765,7 +887,7 @@ impl LibraryScanner {
             // Artwork — locked items skip the rewrite entirely: their image
             // rows are user-owned.
             if !locked {
-                self.persist_artwork(item.id, &entity, &streams, &mut art_cache)
+                self.persist_artwork(item.id, &entity, &streams, &mut art_cache, policy)
                     .await;
             }
             // Per-library refresh % for open dashboards (`RefreshProgress`),
@@ -786,13 +908,49 @@ impl LibraryScanner {
         Ok(planned.len())
     }
 
+    /// Persists the item's external provider ids (the remote match's
+    /// Tmdb/Imdb/Tvdb plus the embedded MusicBrainz tag ids — they key the
+    /// id-dependent providers and make re-scans stable; best-effort, a
+    /// write failure is logged, not fatal), caches them for the image pass
+    /// (fanart keys off them without a DB round-trip), and mirrors
+    /// genres/studios/tags into ItemValues so the genre/studio/tag
+    /// *filters* (More Like This, genre browse) match.
+    async fn persist_provider_ids_and_values(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        all_provider_ids: Vec<(String, String)>,
+        art_cache: &mut ArtworkCache,
+    ) -> Result<(), ServiceError> {
+        for (key, value) in &all_provider_ids {
+            if let Err(err) = self.persistence.save_provider_id(item_id, key, value).await {
+                tracing::warn!(%err, item = %item_id, provider = key, "failed to persist provider id");
+            }
+        }
+        if !all_provider_ids.is_empty() {
+            art_cache
+                .item_provider_ids
+                .insert(entity.id.clone(), all_provider_ids);
+        }
+        let item_values = item_values_of(entity);
+        if !item_values.is_empty() {
+            self.persistence
+                .save_item_values(item_id, &item_values)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// The best-effort enrichment passes that run once the item walk is done.
     /// Each is independent and logs its own failure — none may fail the scan.
     async fn post_scan_passes(&self, folders: &[VirtualFolderInfo]) {
+        // The music pass honors the same per-library fetcher checkboxes as
+        // the item walk — resolved per row via its `TopParentId`.
+        let policies = fetcher_policies(folders);
         // Music enrichment: resolve MusicBrainz ids (and, once wired,
         // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
         // above.
-        if let Err(err) = self.enrich_music().await {
+        if let Err(err) = self.enrich_music(&policies).await {
             tracing::warn!(%err, "music enrichment pass failed");
         }
         // Studio thumbs from the artwork repository for the by-name Studio
@@ -1008,7 +1166,10 @@ impl LibraryScanner {
     /// by name. Also aggregates album-artist/year from an album's tracks onto the
     /// album row. No-op unless both the item repository and MusicBrainz client
     /// are wired.
-    async fn enrich_music(&self) -> Result<(), ServiceError> {
+    async fn enrich_music(
+        &self,
+        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
+    ) -> Result<(), ServiceError> {
         let (Some(items), Some(mb)) = (&self.item_repository, &self.musicbrainz) else {
             return Ok(());
         };
@@ -1054,9 +1215,10 @@ impl LibraryScanner {
             &track_album,
             &track_rg,
             &artist_mbid,
+            policies,
         )
         .await?;
-        self.enrich_artists(items.as_ref(), mb.as_ref(), &artist_mbid)
+        self.enrich_artists(items.as_ref(), mb.as_ref(), &artist_mbid, policies)
             .await?;
         Ok(())
     }
@@ -1103,6 +1265,7 @@ impl LibraryScanner {
         track_album: &HashMap<Uuid, String>,
         track_rg: &HashMap<Uuid, String>,
         artist_mbid: &HashMap<String, String>,
+        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
     ) -> Result<(), ServiceError> {
         let albums = items
             .get_item_list(&InternalItemsQuery {
@@ -1112,8 +1275,17 @@ impl LibraryScanner {
             })
             .await?;
         for album in albums {
-            self.enrich_one_album(&album, items, mb, track_album, track_rg, artist_mbid)
-                .await?;
+            let policy = policy_of(policies, album.top_parent_id.as_deref());
+            self.enrich_one_album(
+                &album,
+                items,
+                mb,
+                track_album,
+                track_rg,
+                artist_mbid,
+                policy,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1121,6 +1293,9 @@ impl LibraryScanner {
     /// Enriches one `MusicAlbum`: aggregate album-artist/year from its tracks,
     /// resolve + persist its MusicBrainz ids, then AudioDb metadata + AudioDb/
     /// fanart artwork.
+    // The per-track id maps + the library policy are each one seam; a
+    // params struct would only rename the coupling.
+    #[allow(clippy::too_many_arguments)]
     async fn enrich_one_album(
         &self,
         album: &BaseItemEntity,
@@ -1129,6 +1304,7 @@ impl LibraryScanner {
         track_album: &HashMap<Uuid, String>,
         track_rg: &HashMap<Uuid, String>,
         artist_mbid: &HashMap<String, String>,
+        policy: FetcherPolicy<'_>,
     ) -> Result<(), ServiceError> {
         let Ok(album_uuid) = Uuid::parse_str(&album.id) else {
             return Ok(());
@@ -1203,9 +1379,14 @@ impl LibraryScanner {
                 .and_then(|s| s.split('|').next())
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned);
-            let resolved = mb
-                .resolve_album(&album_name, embedded, None, album_artist.as_deref())
-                .await;
+            // The library's MusicBrainz checkbox gates the REMOTE
+            // resolution only; the tag/name aggregation above is local.
+            let resolved = if policy.metadata_enabled("MusicAlbum", fetcher_names::MUSICBRAINZ) {
+                mb.resolve_album(&album_name, embedded, None, album_artist.as_deref())
+                    .await
+            } else {
+                ferrofin_providers::AlbumIds::default()
+            };
             if let Some(id) = &resolved.release_id {
                 let _ = self
                     .persistence
@@ -1225,6 +1406,7 @@ impl LibraryScanner {
                 resolved.release_group_id.as_deref(),
                 album_artist.as_deref(),
                 artist_mbid,
+                policy,
             )
             .await?;
             // Last resort: an album with no artwork takes its first track's
@@ -1243,10 +1425,12 @@ impl LibraryScanner {
         release_group_id: Option<&str>,
         album_artist: Option<&str>,
         artist_mbid: &HashMap<String, String>,
+        policy: FetcherPolicy<'_>,
     ) -> Result<(), ServiceError> {
         let mut changed = false;
         let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
-        if let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
+        if policy.metadata_enabled("MusicAlbum", fetcher_names::AUDIODB)
+            && let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
             && let Some(a) = adb.album(rg).await
         {
             if updated.overview.is_none() && a.description.is_some() {
@@ -1281,6 +1465,7 @@ impl LibraryScanner {
         items: &dyn ItemRepository,
         mb: &ferrofin_providers::MusicBrainzClient,
         artist_mbid: &HashMap<String, String>,
+        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
     ) -> Result<(), ServiceError> {
         let artists = items
             .get_item_list(&InternalItemsQuery {
@@ -1296,24 +1481,35 @@ impl LibraryScanner {
             let Some(name) = artist.name.as_deref().filter(|n| !n.is_empty()) else {
                 continue;
             };
+            let policy = policy_of(policies, artist.top_parent_id.as_deref());
+            // The MusicBrainz checkbox gates the REMOTE surface only (the
+            // name search and the persisted provider-id row) — an mbid
+            // already present in the local tags stays usable, so AudioDb/
+            // fanart below still run for tagged libraries (the same
+            // remote-resolve-only gate as `enrich_one_album`).
+            let mb_enabled = policy.metadata_enabled("MusicArtist", fetcher_names::MUSICBRAINZ);
             let mbid = match artist_mbid.get(name) {
                 Some(id) => Some(id.clone()),
-                None => mb.search_artist(name).await,
+                None if mb_enabled => mb.search_artist(name).await,
+                None => None,
             };
             let Some(id) = mbid else {
                 continue;
             };
-            let _ = self
-                .persistence
-                .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
-                .await;
+            if mb_enabled {
+                let _ = self
+                    .persistence
+                    .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
+                    .await;
+            }
 
             // AudioDb bio/genre + AudioDb/fanart artist artwork, keyed by the
             // resolved MusicBrainz artist id.
             let mut updated = artist.clone();
             let mut changed = false;
             let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
-            if let Some(adb) = &self.audiodb
+            if policy.metadata_enabled("MusicArtist", fetcher_names::AUDIODB)
+                && let Some(adb) = &self.audiodb
                 && let Some(a) = adb.artist(&id).await
             {
                 if updated.overview.is_none() && a.biography.is_some() {
@@ -1449,10 +1645,17 @@ impl LibraryScanner {
     ///
     /// Best-effort: a missing/unreadable/malformed sidecar leaves the row untouched
     /// and returns no people, so one bad file never aborts the scan.
-    async fn fetch_local_nfo(&self, entity: &mut BaseItemEntity) -> Vec<PeopleEntity> {
+    async fn fetch_local_nfo(
+        &self,
+        entity: &mut BaseItemEntity,
+        policy: FetcherPolicy<'_>,
+    ) -> Vec<PeopleEntity> {
         use ferrofin_providers::xbmc::{
             self, base_parser::NoDirectoryService, config::NfoConfiguration, item::NfoItemKind,
         };
+        if !policy.local_reader_enabled(fetcher_names::NFO) {
+            return Vec::new();
+        }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let kind = match short {
             "Movie" => NfoItemKind::Movie,
@@ -1527,6 +1730,7 @@ impl LibraryScanner {
         remote_ids: &[(String, String)],
         tag_ids: Vec<(String, String)>,
         locked: bool,
+        policy: FetcherPolicy<'_>,
     ) -> Vec<(String, String)> {
         let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
         // Locked items and provider-less scans skip the pass entirely;
@@ -1557,7 +1761,23 @@ impl LibraryScanner {
             provider_ids: known_ids.clone(),
         };
         let mut contributed_ids = Vec::new();
-        for provider in &self.dynamic_providers {
+        // NAMED providers (declared provider-info) honor the library's
+        // fetcher checkboxes and order; unnamed sources always supplement,
+        // last, in registration order (stable sort keeps their relative
+        // order at equal rank).
+        let mut sources: Vec<_> = self
+            .dynamic_providers
+            .iter()
+            .filter(|p| !p.library_gated() || policy.metadata_enabled(&lookup.kind, p.name()))
+            .collect();
+        sources.sort_by_key(|p| {
+            if p.library_gated() {
+                policy.metadata_rank(&lookup.kind, p.name())
+            } else {
+                usize::MAX
+            }
+        });
+        for provider in sources {
             let result = match provider.lookup(&lookup).await {
                 Ok(Some(result)) => result,
                 Ok(None) => continue,
@@ -1580,6 +1800,25 @@ impl LibraryScanner {
             if entity.community_rating.is_none() {
                 entity.community_rating = result.community_rating;
             }
+            if entity.tagline.as_deref().is_none_or(str::is_empty) {
+                entity.tagline = result.tagline.clone().filter(|t| !t.is_empty());
+            }
+            if entity.studios.as_deref().is_none_or(str::is_empty) && !result.studios.is_empty() {
+                entity.studios = Some(result.studios.join("|"));
+            }
+            if entity.tags.as_deref().is_none_or(str::is_empty) && !result.tags.is_empty() {
+                entity.tags = Some(result.tags.join("|"));
+            }
+            if entity.official_rating.as_deref().is_none_or(str::is_empty) {
+                entity.official_rating = result.official_rating.clone().filter(|r| !r.is_empty());
+            }
+            if entity.end_date.is_none() {
+                entity.end_date = result
+                    .end_date
+                    .as_deref()
+                    .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+            }
             if entity.genres.as_deref().unwrap_or_default().is_empty() && !result.genres.is_empty()
             {
                 entity.genres = Some(result.genres.join("|"));
@@ -1601,10 +1840,14 @@ impl LibraryScanner {
         all
     }
 
+    // `tvdb_on`/`tmdb_on` ARE the point of this function — the two
+    // competitors the admin order arbitrates.
+    #[allow(clippy::similar_names)]
     async fn fetch_remote_metadata(
         &self,
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
     ) -> RemoteMetadata {
         let short = entity
             .type_
@@ -1612,10 +1855,19 @@ impl LibraryScanner {
             .next()
             .unwrap_or(&entity.type_)
             .to_owned();
-        // TheTVDB is the TV authority: when configured, it drives series and
-        // episode metadata (TMDB stays the fallback for a series TVDB can't
-        // match). Movies are TMDB-only.
-        if self.tvdb.is_some() && matches!(short.as_str(), "Series" | "Episode") {
+        // Per-library gate + order over the advertised fetcher names: a
+        // fetcher the library disabled never runs, and for a series the
+        // saved fetcher order decides whether TVDB or TMDB is the authority
+        // (the other stays the miss-fallback). The default (no saved
+        // TypeOptions) preserves the historic chain: TheTVDB is the TV
+        // authority, TMDB the fallback; movies are TMDB-only.
+        let tvdb_on = self.tvdb.is_some()
+            && matches!(short.as_str(), "Series" | "Episode")
+            && policy.metadata_enabled(&short, fetcher_names::TVDB);
+        let tmdb_on = policy.metadata_enabled(&short, fetcher_names::TMDB);
+        let tvdb_first = policy.metadata_rank(&short, fetcher_names::TVDB)
+            <= policy.metadata_rank(&short, fetcher_names::TMDB);
+        if tvdb_on && (tvdb_first || !tmdb_on) {
             let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
             // A TVDB hit (series cached, or episode text applied) is authoritative;
             // only fall through to TMDB for a series TVDB could not resolve.
@@ -1623,21 +1875,49 @@ impl LibraryScanner {
                 return result;
             }
         }
-        let Some(tmdb) = &self.tmdb else {
+        if !tmdb_on {
             return RemoteMetadata::default();
-        };
-        let kind = match short.as_str() {
+        }
+        let omdb_on = policy.metadata_enabled(&short, fetcher_names::OMDB);
+        if let Some(result) = self.fetch_tmdb_metadata(entity, &short, omdb_on).await {
+            return result;
+        }
+        // The library ranked TMDB above TVDB and TMDB missed the series:
+        // TVDB is the fallback.
+        if tvdb_on && short == "Series" && !tvdb_first {
+            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
+            if cache.series_tvdb.contains_key(&entity.id) {
+                return result;
+            }
+        }
+        RemoteMetadata::default()
+    }
+
+    /// The TMDB half of the remote-metadata pass. `None` means TMDB had no
+    /// match for the item (the caller may fall back to another fetcher);
+    /// `Some(default)` means the item needed no fetch at all. `omdb_on`
+    /// gates the OMDb (Rotten Tomatoes) supplement, which rides TMDB's
+    /// IMDb id.
+    async fn fetch_tmdb_metadata(
+        &self,
+        entity: &mut BaseItemEntity,
+        short: &str,
+        omdb_on: bool,
+    ) -> Option<RemoteMetadata> {
+        let tmdb = self.tmdb.as_ref()?;
+        let kind = match short {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
-            _ => return RemoteMetadata::default(),
+            _ => return None,
         };
         // Fetch when the row still lacks core metadata OR still lacks a Rotten
         // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
         // for titles scanned before OMDb was configured. A fully-enriched title is
         // skipped, so re-scans stay cheap.
         let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
-        let wants_rating =
-            self.omdb.as_ref().is_some_and(|o| o.is_enabled()) && entity.critic_rating.is_none();
+        let wants_rating = omdb_on
+            && self.omdb.as_ref().is_some_and(|o| o.is_enabled())
+            && entity.critic_rating.is_none();
         // Also fetch when the row still carries no remote trailers, so titles
         // scanned before trailers were persisted backfill their YouTube links
         // (the client's Trailer button is gated on them).
@@ -1647,24 +1927,18 @@ impl LibraryScanner {
         let wants_trailers =
             crate::item_data::read_remote_trailers(entity.data.as_deref()).is_empty();
         if has_overview && !wants_rating && !wants_trailers {
-            return RemoteMetadata::default();
+            return Some(RemoteMetadata::default());
         }
-        let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-            return RemoteMetadata::default();
-        };
+        let name = entity.name.clone().filter(|n| !n.is_empty())?;
+        let name = name.as_str();
         let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-        let Some(tmdb_id) = tmdb
+        let tmdb_id = tmdb
             .search(kind, name, year)
             .await
             .into_iter()
             .next()
-            .map(|h| h.tmdb_id)
-        else {
-            return RemoteMetadata::default();
-        };
-        let Some(details) = tmdb.details(kind, tmdb_id).await else {
-            return RemoteMetadata::default();
-        };
+            .map(|h| h.tmdb_id)?;
+        let details = tmdb.details(kind, tmdb_id).await?;
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
         if wants_rating
@@ -1679,10 +1953,13 @@ impl LibraryScanner {
         if let Some(imdb) = details.imdb_id.as_deref().filter(|s| !s.is_empty()) {
             provider_ids.push(("Imdb".to_owned(), imdb.to_owned()));
         }
-        RemoteMetadata {
+        // `Some(..)` because this fn returns Option: None is a TMDB miss the
+        // fetcher-order gate falls back from (G1.3); main's tmdb_people helper
+        // replaces the inline people mapping this branch used to carry.
+        Some(RemoteMetadata {
             people: tmdb_people(&details.people),
             provider_ids,
-        }
+        })
     }
 
     /// The people credited on ONE episode: TMDB's per-episode credits when the
@@ -2044,20 +2321,142 @@ impl LibraryScanner {
         entity: &BaseItemEntity,
         streams: &[MediaStreamInfoEntity],
         art_cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
     ) {
-        let mut images = discover_local_images(entity);
-        if images.is_empty() {
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        // "Local Images" is the media-adjacent discovery (poster.jpg next
+        // to the file); the metadata art dir below is Ferrofin-owned
+        // (uploads + earlier downloads) and is never gated.
+        let mut images = if policy.image_enabled(short, fetcher_names::LOCAL_IMAGES) {
+            discover_local_images(entity)
+        } else {
+            Vec::new()
+        };
+        if images.is_empty() && policy.image_enabled(short, fetcher_names::EMBEDDED_IMAGES) {
             images = self.extract_embedded_cover(item_id, entity, streams).await;
         }
         if images.is_empty() {
-            images = self.fetch_remote_images(entity, art_cache).await;
+            images = self.fetch_remote_images(entity, art_cache, policy).await;
         }
         self.append_art_dir_images(entity, &mut images);
+        self.apply_dynamic_images(entity, &mut images, policy).await;
         self.fill_image_metadata(&mut images).await;
         if !images.is_empty()
             && let Err(err) = self.persistence.save_item_images(item_id, &images).await
         {
             tracing::warn!(%err, item = %item_id, "failed to persist discovered artwork");
+        }
+    }
+
+    /// Dynamic (Tier-1b WASM plugin) artwork pass: for the Primary/Backdrop
+    /// slots the built-in chain left empty, ask each dynamic provider for
+    /// image BYTES (the plugin host downloads candidates through the
+    /// plugin's declared egress — the scanner never sees a URL) and write
+    /// them exactly like the built-in downloads (`{metadata}/library/{id}/
+    /// {stem}.jpg`). First provider to fill a slot wins; art already on
+    /// disk (an earlier scan or a user upload) always wins. Best-effort per
+    /// provider — one bad plugin never fails a scan.
+    async fn apply_dynamic_images(
+        &self,
+        entity: &BaseItemEntity,
+        images: &mut Vec<ItemImageInfo>,
+        policy: FetcherPolicy<'_>,
+    ) {
+        if self.dynamic_providers.is_empty() {
+            return;
+        }
+        let Some(meta_root) = &self.metadata_dir else {
+            return;
+        };
+        let item_dir = meta_root.join(&entity.id);
+        let mut wanted: Vec<ImageType> = [ImageType::Primary, ImageType::Backdrop]
+            .into_iter()
+            .filter(|kind| !images.iter().any(|i| i.image_type == *kind))
+            .filter(|kind| existing_art_file(&item_dir, image_type_file_stem(*kind)).is_none())
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        // Same rule as the metadata pass: an unparseable row id never
+        // reaches a guest.
+        let Ok(item_id) = Uuid::parse_str(&entity.id) else {
+            return;
+        };
+        let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
+            item_id,
+            kind: entity
+                .type_
+                .rsplit('.')
+                .next()
+                .unwrap_or(&entity.type_)
+                .to_owned(),
+            name: entity.name.clone().unwrap_or_default(),
+            production_year: entity.production_year.and_then(|y| i32::try_from(y).ok()),
+            path: entity.path.clone(),
+            provider_ids: Vec::new(),
+        };
+        // Artwork is a NAMED-provider surface (the plan scopes it to plugins
+        // that declared provider-info — everything else always returns `[]`,
+        // so asking would be a wasted guest round-trip per item per scan),
+        // under the same admin control as the metadata pass: the library's
+        // image-fetcher checkboxes/order.
+        let mut sources: Vec<_> = self
+            .dynamic_providers
+            .iter()
+            .filter(|p| p.library_gated() && policy.image_enabled(&lookup.kind, p.name()))
+            .collect();
+        sources.sort_by_key(|p| policy.image_rank(&lookup.kind, p.name()));
+        for provider in sources {
+            if wanted.is_empty() {
+                return;
+            }
+            let contributed = match provider.images(&lookup, &wanted).await {
+                Ok(contributed) => contributed,
+                Err(err) => {
+                    tracing::warn!(
+                        provider = provider.name(),
+                        item = %lookup.item_id,
+                        %err,
+                        "dynamic image provider failed; continuing"
+                    );
+                    continue;
+                }
+            };
+            for (kind, bytes) in contributed {
+                if !wanted.contains(&kind) {
+                    continue;
+                }
+                // Sniff before persisting: an undecodable blob would land as
+                // a permanent 0×0 "image" (art on disk always wins, so the
+                // slot never recovers). Store under the sniffed format's
+                // extension — a PNG as `.png`, not a mislabeled `.jpg`; the
+                // art-dir readers accept every ART_FILE_EXTENSIONS entry.
+                let Some(ext) = sniff_image_ext(&bytes) else {
+                    tracing::warn!(
+                        provider = provider.name(),
+                        item = %entity.id,
+                        kind = ?kind,
+                        "plugin artwork bytes are not a recognized image format; skipping"
+                    );
+                    continue;
+                };
+                let dest = item_dir.join(format!("{}.{ext}", image_type_file_stem(kind)));
+                if let Err(err) =
+                    std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
+                {
+                    tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
+                    continue;
+                }
+                images.push(ItemImageInfo {
+                    path: dest.to_string_lossy().into_owned(),
+                    image_type: kind,
+                    date_modified: file_date_modified(&dest),
+                    width: 0,
+                    height: 0,
+                    blur_hash: None,
+                });
+                wanted.retain(|k| *k != kind);
+            }
         }
     }
 
@@ -2229,6 +2628,7 @@ impl LibraryScanner {
         &self,
         entity: &BaseItemEntity,
         cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return Vec::new();
@@ -2246,11 +2646,16 @@ impl LibraryScanner {
                 let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
                     return Vec::new();
                 };
-                let mut images = tmdb.images_for(TmdbKind::Movie, name, year).await;
+                let mut images = if policy.image_enabled(short, fetcher_names::TMDB) {
+                    tmdb.images_for(TmdbKind::Movie, name, year).await
+                } else {
+                    Vec::new()
+                };
                 // fanart.tv supplements TMDB's poster/backdrop with the types it
                 // lacks (logo/clear-art/disc/banner), keyed off the movie's
                 // Tmdb/Imdb id persisted earlier this scan.
-                if let Some(fanart) = &self.fanart
+                if policy.image_enabled(short, fetcher_names::FANART)
+                    && let Some(fanart) = &self.fanart
                     && let Some(id) = cache
                         .item_provider_ids
                         .get(&entity.id)
@@ -2266,9 +2671,13 @@ impl LibraryScanner {
                 // back to a TMDB series match. The Tvdb id (when present) also
                 // keys fanart's series artwork.
                 let tvdb_id = cache.series_tvdb.get(&entity.id).map(|d| d.tvdb_id);
-                let mut images = if let Some(details) = cache.series_tvdb.get(&entity.id) {
+                let tvdb_art = policy
+                    .image_enabled(short, fetcher_names::TVDB)
+                    .then(|| cache.series_tvdb.get(&entity.id))
+                    .flatten();
+                let mut images = if let Some(details) = tvdb_art {
                     details.download_images()
-                } else {
+                } else if policy.image_enabled(short, fetcher_names::TMDB) {
                     let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
                         return Vec::new();
                     };
@@ -2278,8 +2687,12 @@ impl LibraryScanner {
                     // Remember the TMDB id so this series' seasons/episodes resolve.
                     cache.series_tmdb.insert(entity.id.clone(), matched.tmdb_id);
                     matched.images
+                } else {
+                    Vec::new()
                 };
-                if let (Some(fanart), Some(tvdb_id)) = (&self.fanart, tvdb_id) {
+                if policy.image_enabled(short, fetcher_names::FANART)
+                    && let (Some(fanart), Some(tvdb_id)) = (&self.fanart, tvdb_id)
+                {
                     append_fanart(
                         &mut images,
                         fanart.series_images(&tvdb_id.to_string()).await,
@@ -2288,7 +2701,7 @@ impl LibraryScanner {
                 download_images(tmdb, &item_dir, &entity.id, dedup_images_by_type(images)).await
             }
             "Season" | "Episode" => {
-                self.fetch_tv_still_images(entity, short, cache, tmdb, &item_dir)
+                self.fetch_tv_still_images(entity, short, cache, tmdb, &item_dir, policy)
                     .await
             }
             _ => Vec::new(),
@@ -2307,8 +2720,13 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
         tmdb: &TmdbClient,
         item_dir: &Path,
+        policy: FetcherPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
         if short == "Season" {
+            // Season posters (and the episode-still cache) are TMDB's.
+            if !policy.image_enabled(short, fetcher_names::TMDB) {
+                return Vec::new();
+            }
             let (Some(series_id), Some(season_num)) = (
                 entity.series_id.as_deref(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
@@ -2336,11 +2754,14 @@ impl LibraryScanner {
         }
         // Episode: prefer the TVDB still cached during the metadata pass; else
         // fall back to the TMDB season-stills cache.
-        let url = cache
-            .episode_tvdb_still
-            .get(&entity.id)
-            .cloned()
+        let url = policy
+            .image_enabled(short, fetcher_names::TVDB)
+            .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
+            .flatten()
             .or_else(|| {
+                if !policy.image_enabled(short, fetcher_names::TMDB) {
+                    return None;
+                }
                 let (Some(series_id), Some(season_num), Some(ep_num)) = (
                     entity.series_id.as_deref(),
                     entity
@@ -4160,7 +4581,10 @@ mod tests {
                 Arc::clone(&items),
             );
 
-        scanner.enrich_music().await.expect("enrich");
+        scanner
+            .enrich_music(&std::collections::HashMap::new())
+            .await
+            .expect("enrich");
 
         // The album adopted its tracks' release + release-group ids...
         let album_rel = items
@@ -4184,6 +4608,94 @@ mod tests {
         assert!(
             artist_ids.iter().any(|(_, v)| v == "aa-x"),
             "artist resolved to embedded mbid: {artist_ids:?}"
+        );
+    }
+
+    // The music pass honors the per-library MusicBrainz checkbox: rows whose
+    // owning library disabled it are skipped entirely (resolved per row via
+    // TopParentId).
+    #[tokio::test]
+    async fn enrich_music_skips_libraries_that_disabled_musicbrainz() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::configuration::TypeOptions;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        let library_id = uuid::Uuid::new_v4();
+        let album_id = uuid::Uuid::new_v4();
+        let track_id = uuid::Uuid::new_v4();
+        let stored = |k| stored_type_name(k).unwrap().to_owned();
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(album_id),
+                    type_: stored(BaseItemKind::MusicAlbum),
+                    name: Some("Kind of Blue".into()),
+                    top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(track_id),
+                    type_: stored(BaseItemKind::Audio),
+                    name: Some("So What".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("seed");
+        persistence
+            .save_provider_id(track_id, "MusicBrainzAlbum", "rel-x")
+            .await
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
+                Arc::clone(&items),
+            );
+
+        // The owning library saved a MusicAlbum entry WITHOUT MusicBrainz.
+        let options = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicAlbum".to_owned()),
+                metadata_fetchers: vec!["TheAudioDB".to_owned()],
+                ..TypeOptions::default()
+            }],
+            ..LibraryOptions::default()
+        };
+        let mut policies = std::collections::HashMap::new();
+        policies.insert(
+            library_id,
+            super::FetcherPolicy {
+                options: Some(&options),
+            },
+        );
+        scanner.enrich_music(&policies).await.expect("enrich");
+
+        let album_rel = items
+            .get_items_with_provider_id("MusicBrainzAlbum")
+            .await
+            .unwrap();
+        assert!(
+            !album_rel.contains(&(album_id, "rel-x".to_owned())),
+            "a library that disabled MusicBrainz must not gain mb ids: {album_rel:?}"
         );
     }
 
@@ -4884,6 +5396,320 @@ mod tests {
         );
     }
 
+    /// A named (library-gated) dynamic provider whose contribution is its
+    /// own name — so which provider "won" a supplement-only field is
+    /// observable in the row.
+    struct NamedProvider(&'static str);
+    #[async_trait::async_trait]
+    impl ferrofin_traits::providers::DynamicMetadataProvider for NamedProvider {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn library_gated(&self) -> bool {
+            true
+        }
+        async fn lookup(
+            &self,
+            _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+        ) -> Result<
+            Option<ferrofin_traits::providers::DynamicMetadataResult>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                overview: Some(self.0.to_owned()),
+                ..Default::default()
+            }))
+        }
+    }
+
+    /// Builds a movie library whose `LibraryOptions` are the test's to
+    /// shape, returning (scanner-less) parts: media dir populated with one
+    /// bare movie + optional NFO.
+    async fn gated_library(
+        tmp: &std::path::Path,
+        options: LibraryOptions,
+        with_nfo: bool,
+    ) -> (
+        Arc<FerrofinItemPersistenceService>,
+        Arc<dyn VirtualFolderManager>,
+        Database,
+    ) {
+        let media = tmp.join("movies");
+        let folder = media.join("Movie 0001 (2020)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Movie 0001 (2020).mkv"), b"").unwrap();
+        if with_nfo {
+            std::fs::write(
+                folder.join("movie.nfo"),
+                b"<movie><title>Movie 0001</title><year>2020</year></movie>",
+            )
+            .unwrap();
+        }
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let mut options = options;
+        options.path_infos = vec![MediaPathInfo {
+            path: media.to_string_lossy().into_owned(),
+        }];
+        vf.add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        (persistence, vf, db)
+    }
+
+    // The per-library gate is REAL: a named dynamic provider a library's
+    // TypeOptions leaves unchecked never runs for that library's items,
+    // and the saved fetcher order decides which enabled provider wins a
+    // supplement-only field. The flat local-reader list gates the NFO
+    // reader the same way.
+    #[tokio::test]
+    async fn library_options_gate_and_order_fetchers_per_library() {
+        use ferrofin_model::configuration::TypeOptions;
+
+        // Library A: only "beta" checked → alpha must not run, beta's
+        // overview lands. NFO disabled → the NFO year must NOT land.
+        let tmp = tempfile::tempdir().unwrap();
+        let (persistence, vf, db) = gated_library(
+            tmp.path(),
+            LibraryOptions {
+                disabled_local_metadata_readers: vec!["Nfo".to_owned()],
+                type_options: vec![TypeOptions {
+                    type_: Some("Movie".to_owned()),
+                    metadata_fetchers: vec!["beta".to_owned()],
+                    ..TypeOptions::default()
+                }],
+                ..LibraryOptions::default()
+            },
+            true,
+        )
+        .await;
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_dynamic_providers(vec![
+                Arc::new(NamedProvider("alpha")),
+                Arc::new(NamedProvider("beta")),
+            ]);
+        scanner.scan_all().await.unwrap();
+        // The NFO reader is disabled, so its <title> never lands: the row
+        // keeps the folder-derived name (incl. year) — the successful
+        // lookup below IS the NFO-gate assertion.
+        let (overview, ..) = movie_detail_row(&db, "Movie 0001 (2020)").await;
+        assert_eq!(
+            overview.as_deref(),
+            Some("beta"),
+            "only the checked fetcher may run"
+        );
+
+        // Library B: both checked, order says beta first → beta wins the
+        // supplement-only overview even though alpha registered first.
+        let tmp = tempfile::tempdir().unwrap();
+        let (persistence, vf, db) = gated_library(
+            tmp.path(),
+            LibraryOptions {
+                type_options: vec![TypeOptions {
+                    type_: Some("Movie".to_owned()),
+                    metadata_fetchers: vec!["alpha".to_owned(), "beta".to_owned()],
+                    metadata_fetcher_order: vec!["beta".to_owned(), "alpha".to_owned()],
+                    ..TypeOptions::default()
+                }],
+                ..LibraryOptions::default()
+            },
+            false,
+        )
+        .await;
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_dynamic_providers(vec![
+                Arc::new(NamedProvider("alpha")),
+                Arc::new(NamedProvider("beta")),
+            ]);
+        scanner.scan_all().await.unwrap();
+        let (overview, ..) = movie_detail_row(&db, "Movie 0001 (2020)").await;
+        assert_eq!(
+            overview.as_deref(),
+            Some("beta"),
+            "the saved fetcher order picks the winner"
+        );
+
+        // Library C: no TypeOptions entry at all → everything enabled in
+        // registration order; NFO enabled → the year lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let (persistence, vf, db) =
+            gated_library(tmp.path(), LibraryOptions::default(), true).await;
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_dynamic_providers(vec![
+                Arc::new(NamedProvider("alpha")),
+                Arc::new(NamedProvider("beta")),
+            ]);
+        scanner.scan_all().await.unwrap();
+        // The NFO ran (default policy): its <title> renamed the row.
+        let (overview, ..) = movie_detail_row(&db, "Movie 0001").await;
+        assert_eq!(overview.as_deref(), Some("alpha"));
+    }
+
+    // The dynamic artwork pass fills only the slots the built-in chain left
+    // empty, writes bytes as {metadata}/{id}/{stem}.jpg + a persisted image
+    // row, and never overwrites art already on disk (earlier scan or user
+    // upload) — a re-scan offering different bytes must keep the original.
+    #[tokio::test]
+    // Full scan harness + on-disk and DB assertions; the sequence is the point.
+    #[allow(clippy::items_after_statements, clippy::too_many_lines)]
+    async fn dynamic_provider_supplies_missing_artwork_but_never_overwrites() {
+        use ferrofin_model::entities::ImageType;
+
+        // PNG magic + a distinguishable payload: the artwork pass sniffs the
+        // format before persisting, so plain b"FIRST" would be rejected.
+        const PNG_FIRST: &[u8] = b"\x89PNG\r\n\x1a\nFIRST";
+        const PNG_SECOND: &[u8] = b"\x89PNG\r\n\x1a\nSECOND";
+
+        struct ArtDb {
+            calls: std::sync::Mutex<u32>,
+        }
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for ArtDb {
+            fn name(&self) -> &'static str {
+                "art-db"
+            }
+            fn library_gated(&self) -> bool {
+                // The artwork pass only asks named (provider-info) plugins.
+                true
+            }
+            async fn lookup(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Ok(None)
+            }
+            async fn images(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+                wanted: &[ImageType],
+            ) -> Result<Vec<(ImageType, Vec<u8>)>, ferrofin_traits::error::ServiceError>
+            {
+                let call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                assert!(
+                    wanted.contains(&ImageType::Primary) || call > 1,
+                    "first pass must ask for the missing Primary"
+                );
+                // Different bytes per call: a re-download would be visible.
+                // The Backdrop is garbage (no image magic) — the sniff must
+                // drop it instead of persisting a permanent 0×0 row.
+                Ok(vec![
+                    (
+                        ImageType::Primary,
+                        if call == 1 {
+                            PNG_FIRST.to_vec()
+                        } else {
+                            PNG_SECOND.to_vec()
+                        },
+                    ),
+                    (ImageType::Backdrop, b"not an image".to_vec()),
+                ])
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Movie 0001 (2020)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Movie 0001 (2020).mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let meta_dir = tmp.path().join("metadata");
+        let provider = Arc::new(ArtDb {
+            calls: std::sync::Mutex::new(0),
+        });
+        let scanner = LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_metadata_dir(meta_dir.clone())
+        .with_dynamic_providers(vec![provider.clone()]);
+        scanner.scan_all().await.unwrap();
+
+        // The bytes landed under the SNIFFED extension — PNG magic ⇒
+        // primary.png, not a mislabeled primary.jpg.
+        let primary = std::fs::read_dir(&meta_dir)
+            .expect("metadata dir exists")
+            .map(|e| e.unwrap().path().join("primary.png"))
+            .find(|p| p.exists())
+            .expect("dynamic Primary written to disk as .png");
+        assert!(
+            !primary.with_file_name("primary.jpg").exists(),
+            "PNG bytes must not be stored under a .jpg name"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), PNG_FIRST);
+        // …and as a persisted Primary image row pointing at that file
+        // (read back through the repository, not raw SQL — boundary rule).
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
+        let item_id = uuid::Uuid::parse_str(
+            &primary
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+        )
+        .expect("art dir is the item id");
+        let rows = items.get_image_infos(item_id).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|i| i.image_type == ImageType::Primary && i.path == primary.to_string_lossy()),
+            "Primary image row persists; got {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|i| i.image_type == ImageType::Backdrop),
+            "the contributed Backdrop was not a real image — the sniff must \
+             reject it, on disk and in the DB; got {rows:?}"
+        );
+        assert!(
+            !primary.with_file_name("backdrop.jpg").exists(),
+            "rejected bytes must never reach disk"
+        );
+
+        // Re-scan: art on disk wins; the provider's new bytes are ignored.
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            PNG_FIRST,
+            "existing artwork must never be overwritten by a re-scan"
+        );
+    }
+
     // The dynamic (Tier-1b WASM) metadata pass is SUPPLEMENT-ONLY: it fills
     // fields the built-in chain left empty and merges its provider ids, but a
     // value already present (here: the NFO year) must never be overwritten.
@@ -4907,6 +5733,11 @@ mod tests {
             > {
                 assert_eq!(item.kind, "Movie");
                 Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    tagline: None,
+                    studios: Vec::new(),
+                    tags: Vec::new(),
+                    official_rating: None,
+                    end_date: None,
                     overview: Some("From the dynamic provider".to_owned()),
                     production_year: Some(1980), // must NOT overwrite the NFO's 2020
                     community_rating: Some(6.5),
@@ -4931,6 +5762,11 @@ mod tests {
                 ferrofin_traits::error::ServiceError,
             > {
                 Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    tagline: None,
+                    studios: Vec::new(),
+                    tags: Vec::new(),
+                    official_rating: None,
+                    end_date: None,
                     provider_ids: vec![("helloDB".to_owned(), "stolen".to_owned())],
                     ..Default::default()
                 }))

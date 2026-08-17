@@ -51,6 +51,16 @@ pub trait MediaExtractor: Send + Sync {
         spec: AudioSpec,
     ) -> Result<Vec<i16>, ServiceError>;
 
+    /// Extracts one embedded subtitle stream from `path` as SRT text.
+    ///
+    /// # Errors
+    /// Spawn/decode failures or a missing stream.
+    async fn extract_subtitle(
+        &self,
+        path: &str,
+        stream_index: u32,
+    ) -> Result<Vec<u8>, ServiceError>;
+
     /// Samples one still per timestamp from `path`. `jpeg` selects JPEG
     /// (aspect-preserving fit into `max_dimension`) over raw grayscale
     /// (exactly `max_dimension`² — analysis frames, not thumbnails).

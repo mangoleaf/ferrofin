@@ -104,6 +104,11 @@ fn tight_settings() -> WasmSettings {
         call_timeout_secs: 1,
         memory_limit_mb: 2,
         event_queue_capacity: 8,
+        state_limit_mb: 8,
+        image_download_mb: 20,
+        image_timeout_secs: 30,
+        write_content_mb: 2,
+        subtitle_extract_mb: 10,
         private_http_allow: Vec::new(),
     }
 }
@@ -166,6 +171,80 @@ fn duplicate_plugin_ids_keep_only_the_first() {
     write_fixture(dir.path(), "b-second", FIXTURE_WAT);
     let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(host.plugins().len(), 1, "same id must load once");
+}
+
+use common::named_provider_fixture;
+
+#[test]
+fn colliding_provider_names_are_refused_at_load() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    // Loads: a well-behaved named provider (also proves the patched WAT is a
+    // valid some(provider-descriptor), so the two skips below are the name
+    // check and not an ABI decode failure).
+    write_fixture(
+        dir.path(),
+        "a-acme",
+        &named_provider_fixture("11111111-1111-1111-1111-111111111111", "AcmeDb"),
+    );
+    // Skipped: rides a built-in fetcher's checkbox/order (case-insensitive).
+    write_fixture(
+        dir.path(),
+        "b-tmdb",
+        &named_provider_fixture("22222222-2222-2222-2222-222222222222", "themoviedb"),
+    );
+    // Skipped: the name is already taken by the first plugin.
+    write_fixture(
+        dir.path(),
+        "c-acme-again",
+        &named_provider_fixture("33333333-3333-3333-3333-333333333333", "acmedb"),
+    );
+    // Skipped: a padded built-in name — HTML collapses the whitespace, so
+    // this would render as the real TMDB entry. Normalized before the check.
+    write_fixture(
+        dir.path(),
+        "d-padded",
+        &named_provider_fixture("44444444-4444-4444-4444-444444444444", " TheMovieDb "),
+    );
+    // Skipped: an empty name (a blank-labelled fetcher).
+    write_fixture(
+        dir.path(),
+        "e-empty",
+        &named_provider_fixture("55555555-5555-5555-5555-555555555555", ""),
+    );
+
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert_eq!(
+        host.plugins().len(),
+        1,
+        "reserved/taken/empty/padded provider names must be skipped"
+    );
+    let info = host.plugins()[0]
+        .provider_info
+        .as_ref()
+        .expect("the surviving plugin is the named provider");
+    assert_eq!(info.name, "AcmeDb");
+    assert!(info.supported_kinds.is_empty());
+}
+
+#[test]
+fn a_padded_provider_name_is_trimmed_before_use() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    // A leading/trailing-space name that does NOT collide is accepted, but
+    // stored trimmed — the gate and the dashboard must see the same string.
+    write_fixture(
+        dir.path(),
+        "spacey",
+        &named_provider_fixture("66666666-6666-6666-6666-666666666666", "  Spacey DB  "),
+    );
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    assert_eq!(host.plugins().len(), 1);
+    assert_eq!(
+        host.plugins()[0].provider_info.as_ref().unwrap().name,
+        "Spacey DB",
+        "the stored name is trimmed"
+    );
 }
 
 #[tokio::test]
@@ -332,6 +411,10 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // Armed: the fixture's metadata-lookup answers ok(none); the second call
     // takes the (enabled, config) gate from the cache.
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -348,6 +431,15 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     });
     assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
     assert!(providers[0].lookup(&lookup).await.unwrap().is_none());
+
+    // remote-images rides the same gate: the fixture answers ok([]) so no
+    // slot is filled, but the call proves the full adapter → guest path.
+    let wanted = [ferrofin_model::entities::ImageType::Primary];
+    let contributed = providers[0].images(&lookup, &wanted).await.unwrap();
+    assert!(contributed.is_empty());
+    // An empty wanted list short-circuits without a guest call.
+    let contributed = providers[0].images(&lookup, &[]).await.unwrap();
+    assert!(contributed.is_empty());
 }
 
 #[test]
@@ -520,6 +612,10 @@ async fn analysis_driver_offers_each_item_once() {
         seen: std::sync::Mutex::new(None),
     });
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -601,6 +697,10 @@ async fn analysis_driver_skips_disabled_plugins_and_guests_cannot_touch_the_wate
     let disabled: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
         std::sync::Arc::new(common::DisabledStub(b"{}".to_vec()));
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
+        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
+        collections: std::sync::Arc::new(common::StubCollections::default()),
+
         media_streams: std::sync::Arc::new(common::StubStreams),
         extractor: std::sync::Arc::new(common::StubExtractor::default()),
         analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),

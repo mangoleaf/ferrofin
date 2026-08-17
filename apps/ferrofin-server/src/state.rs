@@ -326,6 +326,41 @@ pub async fn build_app_state(
     let studios_client = Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
         &config.studios_repo_url,
     ));
+    // Tier-1b: runtime-installed WASM plugins from `{data_dir}/plugins/*.wasm`
+    // (see brain/plans/PLAN_PLUGIN_TIERS.md). Loading compiles components —
+    // CPU-heavy, so it runs on the blocking pool. A load failure degrades to
+    // "no WASM plugins", never a failed boot; per-file failures are logged
+    // and skipped inside the loader.
+    let wasm_host = {
+        let wasm_settings = ferrofin_wasm::WasmSettings::resolve(
+            config.wasm_call_timeout_secs,
+            config.wasm_memory_limit_mb,
+            config.wasm_event_queue_capacity,
+            config.wasm_private_http_allow.as_deref(),
+        )
+        .with_state_limit_mb(config.wasm_state_limit_mb)
+        .with_image_download_mb(config.wasm_image_download_mb)
+        .with_image_timeout_secs(config.wasm_image_timeout_secs)
+        .with_write_content_mb(config.wasm_write_content_mb)
+        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb);
+        let wasm_dir = config.data_dir.join("plugins");
+        match tokio::task::spawn_blocking(move || {
+            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
+        })
+        .await
+        {
+            Ok(Ok(host)) => host,
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "wasm plugin host unavailable; continuing without it");
+                ferrofin_wasm::WasmPluginHost::empty()
+            }
+            Err(join_err) => {
+                tracing::warn!(%join_err, "wasm plugin load task panicked; continuing without it");
+                ferrofin_wasm::WasmPluginHost::empty()
+            }
+        }
+    };
+
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_store(
@@ -334,6 +369,7 @@ pub async fn build_app_state(
             )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
+            .with_dynamic_fetchers(wasm_host.provider_names())
             .with_studios(Arc::clone(&studios_client)),
     );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
@@ -522,35 +558,6 @@ pub async fn build_app_state(
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
     // clients over the WebSocket so open views refresh after a scan.
-    // Tier-1b: runtime-installed WASM plugins from `{data_dir}/plugins/*.wasm`
-    // (see brain/plans/PLAN_PLUGIN_TIERS.md). Loading compiles components —
-    // CPU-heavy, so it runs on the blocking pool. A load failure degrades to
-    // "no WASM plugins", never a failed boot; per-file failures are logged
-    // and skipped inside the loader.
-    let wasm_host = {
-        let wasm_settings = ferrofin_wasm::WasmSettings::resolve(
-            config.wasm_call_timeout_secs,
-            config.wasm_memory_limit_mb,
-            config.wasm_event_queue_capacity,
-            config.wasm_private_http_allow.as_deref(),
-        );
-        let wasm_dir = config.data_dir.join("plugins");
-        match tokio::task::spawn_blocking(move || {
-            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
-        })
-        .await
-        {
-            Ok(Ok(host)) => host,
-            Ok(Err(err)) => {
-                tracing::warn!(%err, "wasm plugin host unavailable; continuing without it");
-                ferrofin_wasm::WasmPluginHost::empty()
-            }
-            Err(join_err) => {
-                tracing::warn!(%join_err, "wasm plugin load task panicked; continuing without it");
-                ferrofin_wasm::WasmPluginHost::empty()
-            }
-        }
-    };
     // The scan's dynamic metadata pass: every loaded WASM plugin is offered
     // each item after the built-in provider chain (supplement-only; inert
     // until the collaborators are armed below and while a plugin is
@@ -685,12 +692,19 @@ pub async fn build_app_state(
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
-        ferrofin_wasm::WasmArtifactValidator::new(&ferrofin_wasm::WasmSettings::resolve(
-            config.wasm_call_timeout_secs,
-            config.wasm_memory_limit_mb,
-            config.wasm_event_queue_capacity,
-            config.wasm_private_http_allow.as_deref(),
-        ))
+        ferrofin_wasm::WasmArtifactValidator::new(
+            &ferrofin_wasm::WasmSettings::resolve(
+                config.wasm_call_timeout_secs,
+                config.wasm_memory_limit_mb,
+                config.wasm_event_queue_capacity,
+                config.wasm_private_http_allow.as_deref(),
+            )
+            .with_state_limit_mb(config.wasm_state_limit_mb)
+            .with_image_download_mb(config.wasm_image_download_mb)
+            .with_image_timeout_secs(config.wasm_image_timeout_secs)
+            .with_write_content_mb(config.wasm_write_content_mb)
+            .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb),
+        )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
@@ -1084,6 +1098,9 @@ pub async fn build_app_state(
         user_data: Arc::clone(&user_data),
         tv: Arc::clone(&tv_series),
         media_streams: Arc::clone(&media_stream_repository),
+        lyrics: Arc::clone(&lyrics),
+        subtitles: Arc::clone(&subtitles),
+        collections: Arc::clone(&collections),
         extractor: Arc::new(ferrofin_mediaencoding::FfmpegMediaExtractor::new(
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
         )),

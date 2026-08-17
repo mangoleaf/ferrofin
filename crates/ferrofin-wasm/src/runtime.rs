@@ -105,6 +105,17 @@ pub enum Command {
         /// Receives the guest's outcome (or the host/trap error text).
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Ask the guest for remote-artwork candidates for one item.
+    RemoteImages {
+        /// The item, as the shared summary projection.
+        item: crate::bindings::types::ItemSummary,
+        /// Fresh configuration JSON to snapshot before the call.
+        config: String,
+        /// Receives the guest's candidates (or the host/trap error text).
+        reply: tokio::sync::oneshot::Sender<
+            Result<Vec<crate::bindings::types::ImageCandidate>, String>,
+        >,
+    },
     /// Ask the guest for metadata on one item (the scan's dynamic pass).
     MetadataLookup {
         /// The item as scanned so far.
@@ -147,6 +158,12 @@ pub struct InstanceSpec {
     pub state_path: Option<std::path::PathBuf>,
     /// The plugin's declared public-egress allowlist.
     pub egress: Arc<crate::capabilities::EgressPolicy>,
+    /// The operator-configured total state cap, in bytes.
+    pub state_total_cap: usize,
+    /// The operator-configured lyric/subtitle write cap, in bytes.
+    pub write_content_cap: usize,
+    /// The operator-configured extracted-subtitle-track cap, in bytes.
+    pub subtitle_extract_cap: usize,
 }
 
 impl InstanceSpec {
@@ -174,6 +191,9 @@ impl InstanceSpec {
             http_timeout: std::time::Duration::from_secs(self.timeout_ticks),
             state_path: self.state_path.clone(),
             egress: Arc::clone(&self.egress),
+            state_total_cap: self.state_total_cap,
+            write_content_cap: self.write_content_cap,
+            subtitle_extract_cap: self.subtitle_extract_cap,
             private_http_allowed: self.private_http_allowed,
             collaborators: Arc::clone(&self.collaborators),
             wasi: HostState::empty_wasi(),
@@ -290,6 +310,35 @@ impl RuntimeHandle {
             .map_err(|_| "plugin runtime dropped the scan reply".to_owned())?
     }
 
+    /// Asks the guest for artwork candidates and awaits them.
+    ///
+    /// # Errors
+    /// The guest's error text, the breaker being open, or the runtime
+    /// thread being gone.
+    pub async fn remote_images(
+        &self,
+        item: crate::bindings::types::ItemSummary,
+        config: String,
+    ) -> Result<Vec<crate::bindings::types::ImageCandidate>, String> {
+        if self.is_dead() {
+            return Err(format!(
+                "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
+                self.plugin_name
+            ));
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(Command::RemoteImages {
+                item,
+                config,
+                reply,
+            })
+            .await
+            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        rx.await
+            .map_err(|_| "plugin runtime dropped the images reply".to_owned())?
+    }
+
     /// Asks the guest for metadata on one item and awaits its offer.
     ///
     /// # Errors
@@ -379,6 +428,8 @@ pub fn spawn(
 
 /// The actor loop: execute commands against the live instance, rebuilding it
 /// after any failure, until the breaker trips or the channel closes.
+// One arm per world export; the dispatch table IS the function.
+#[allow(clippy::too_many_lines)]
 fn run_loop(
     spec: &InstanceSpec,
     store: Store<HostState>,
@@ -444,6 +495,24 @@ fn run_loop(
                 config,
                 reply,
             } => dispatch_request(spec, store, instance, &request, config, reply),
+            Command::RemoteImages {
+                item,
+                config,
+                reply,
+            } => {
+                store.data_mut().config_json = config;
+                store.set_epoch_deadline(spec.timeout_ticks);
+                match instance.call_remote_images(&mut *store, &item) {
+                    Ok(outcome) => {
+                        let _ = reply.send(outcome);
+                        false
+                    }
+                    Err(trap) => {
+                        let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+                        true
+                    }
+                }
+            }
             Command::ScanMedia {
                 item,
                 config,
@@ -520,6 +589,9 @@ fn refuse(command: Command, plugin_name: &str) {
             let _ = reply.send(Err(message));
         }
         Command::HandleRequest { reply, .. } => {
+            let _ = reply.send(Err(message));
+        }
+        Command::RemoteImages { reply, .. } => {
             let _ = reply.send(Err(message));
         }
         Command::ScanMedia { reply, .. } => {

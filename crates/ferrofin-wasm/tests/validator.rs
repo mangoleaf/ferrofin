@@ -6,6 +6,9 @@
 use ferrofin_traits::plugins::PluginArtifactValidator as _;
 use ferrofin_wasm::{PLUGIN_ABI, WasmArtifactValidator, WasmSettings};
 
+mod common;
+use common::named_provider_fixture;
+
 #[test]
 fn plugin_abi_matches_the_wit_world() {
     // Drift guard: the const must be exactly the world version declared in
@@ -63,4 +66,31 @@ async fn rejects_garbage_and_non_component_wasm() {
         err.to_string().contains("does not instantiate") || err.to_string().contains("descriptor"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn rejects_a_provider_name_colliding_with_a_builtin_at_install() {
+    // The install gate must catch a reserved provider name — otherwise the
+    // admin sees "installed", a restart-required flag, and then a silently
+    // absent provider (the load-time guard would refuse it on next boot).
+    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+
+    let src = named_provider_fixture(
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee1234",
+        " TheMovieDb ", // padded, to also prove the trim happens here
+    );
+    let colliding = wat::parse_str(&src).unwrap();
+    let err = validator.validate(&colliding).await.unwrap_err();
+    assert!(
+        err.to_string().contains("collides with a built-in fetcher"),
+        "{err}"
+    );
+
+    // A well-behaved named provider still validates.
+    let src = named_provider_fixture("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee5678", "AcmeDb");
+    let ok = wat::parse_str(&src).unwrap();
+    validator
+        .validate(&ok)
+        .await
+        .expect("a non-colliding named provider validates");
 }
