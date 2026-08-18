@@ -86,8 +86,9 @@ struct Prefetched {
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
     user_data: HashMap<Uuid, UserItemDataDto>,
-    /// Media streams per item id (populated only when the `MediaStreams` field
-    /// is requested), so a page builds them in one query instead of N.
+    /// Media streams per item id (populated when EITHER the `MediaStreams` or
+    /// the `MediaSources` field is requested), so a page builds them in one
+    /// query instead of N. Read three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
     /// Provider-id maps per item id (populated only when the `ProviderIds`
     /// field is requested).
@@ -131,6 +132,11 @@ struct Prefetched {
     /// The per-NAME `Person` item id for each credited name on the page
     /// (lowercased), so `People[].Id` points at the favoritable by-name item.
     person_ids_by_name: HashMap<String, Uuid>,
+    /// Ids that some item on the page lists as a merged alternate version.
+    /// Their `media_streams` entry is read again while projecting that OTHER
+    /// item, so it must survive its own item's projection — see
+    /// [`FerrofinDtoService::attach_basic_fields`]'s `MediaStreams` read.
+    alt_referenced: std::collections::HashSet<Uuid>,
 }
 
 /// The delete/download half of a user's policy (C# `HasPermission` over
@@ -153,9 +159,16 @@ struct UserContentPermissions {
 /// be handed the same id twice): there the entry is read once per occurrence,
 /// so a repeated id keeps cloning and only unique ids move.
 ///
-/// Only for maps read exactly once per item. `media_streams` in particular is
-/// NOT eligible — `MediaSources` (via a merged item's alternate versions, keyed
-/// by the *alternate's* id) and the `MediaStreams` field both read it.
+/// **Only safe where no reader of that id remains after this point.** For most
+/// maps that is trivially true — they have exactly one read site, keyed by the
+/// item's own id. `media_streams` is the exception and needs care: it is read
+/// three times (the `MediaSources` block, once more there per merged alternate
+/// keyed by the *alternate's* id, and the `MediaStreams` field). It may be
+/// drained ONLY at the last of those, the `MediaStreams` field, and only when
+/// `repeated` also folds in `Prefetched::alt_referenced` — otherwise a page item
+/// that lists this id as its alternate is projected later and finds the entry
+/// gone. Do not drain it at the `MediaSources` block: that read comes first, and
+/// doing so empties `MediaStreams` on every `/Items/{id}`.
 fn take_or_clone<V: Clone>(map: &mut HashMap<Uuid, V>, id: &Uuid, repeated: bool) -> Option<V> {
     if repeated {
         map.get(id).cloned()
@@ -1160,13 +1173,17 @@ impl FerrofinDtoService {
             dto.chapters = Some(chapters);
         }
 
-        // Media streams.
+        // Media streams. This is the LAST read of this id's stream rows, so
+        // no reader remains and the entry can be moved out rather than cloned —
+        // unless one does: a repeated id is projected again, and an id some
+        // other page item lists as a merged alternate is read while projecting
+        // THAT item, both after this point. (The earlier `MediaSources` read,
+        // when its field is requested and the kind is video/audio, already took
+        // its own copy; when it is not, there was no earlier read at all.)
         if options.contains_field(ItemFields::MediaStreams) {
-            let streams = prefetched
-                .media_streams
-                .get(&item_id)
-                .cloned()
-                .unwrap_or_default();
+            let pinned = repeated || prefetched.alt_referenced.contains(&item_id);
+            let streams =
+                take_or_clone(&mut prefetched.media_streams, &item_id, pinned).unwrap_or_default();
             if !streams.is_empty() {
                 dto.media_streams = Some(streams);
             }
@@ -1648,6 +1665,10 @@ impl FerrofinDtoService {
         } else {
             HashMap::new()
         };
+        // An id listed here is another page item's alternate, so its streams are
+        // read while projecting that item — it cannot be drained by its own.
+        let alt_referenced: std::collections::HashSet<Uuid> =
+            alternates.values().flatten().map(row_id).collect();
         let provider_ids = if options.contains_field(ItemFields::ProviderIds) {
             self.load_provider_ids_batch(&ids).await?
         } else {
@@ -1848,6 +1869,7 @@ impl FerrofinDtoService {
             has_subtitles,
             content_permissions,
             person_ids_by_name,
+            alt_referenced,
         })
     }
 
@@ -2517,8 +2539,8 @@ mod tests {
             // Non-empty so the prefetched `media_streams` map is actually
             // populated in these tests: it is read TWICE per video DTO
             // (MediaSources, then the MediaStreams field) plus once per merged
-            // alternate keyed by the alternate's id, which is why it is excluded
-            // from `take_or_clone`. An empty map would hide a regression there.
+            // alternate keyed by the alternate's id, which is why it may only
+            // be drained at its last read. An empty map would hide a regression there.
             Ok(item_ids
                 .iter()
                 .map(|id| {
@@ -3184,6 +3206,10 @@ mod tests {
                 ItemFields::ProviderIds,
                 ItemFields::Chapters,
                 ItemFields::Trickplay,
+                // `media_streams` is drained at its LAST read (the
+                // MediaStreams field), and a repeated id is read again by its
+                // next occurrence — so that half of the guard is covered here.
+                ItemFields::MediaStreams,
             ],
             ..DtoOptions::default()
         };
@@ -3237,6 +3263,10 @@ mod tests {
                     .is_empty(),
                 "occurrence {i} got an empty trickplay manifest"
             );
+            assert!(
+                dto.media_streams.as_ref().is_some_and(|s| !s.is_empty()),
+                "occurrence {i} lost its media streams"
+            );
         }
         // Both projections are identical — the second is not a degraded copy.
         assert_eq!(dtos[0].image_tags, dtos[1].image_tags);
@@ -3248,12 +3278,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_video_requesting_both_media_sources_and_streams_gets_both() {
-        // `media_streams` is the one prefetched map deliberately NOT drained by
-        // `take_or_clone`: item detail asks for MediaSources AND MediaStreams,
-        // so the map is read twice for the same id (plus once per merged
-        // alternate, keyed by the ALTERNATE's id). Draining it would silently
-        // empty `MediaStreams` on every `/Items/{id}` — killing audio/subtitle
-        // track selection in every client — with no other test noticing.
+        // `media_streams` is drained only at its LAST read (the MediaStreams
+        // field). Item detail asks for MediaSources AND MediaStreams, so the map
+        // is read twice for the same id; draining at the FIRST (MediaSources)
+        // read would silently empty `MediaStreams` on every `/Items/{id}` —
+        // killing audio/subtitle track selection in every client — and no other
+        // test notices. This pins that ordering.
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "Streamed").await;
