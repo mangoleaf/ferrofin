@@ -1493,6 +1493,12 @@ mod tests {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
         }
+        async fn get_ancestor_chain(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+            unimplemented!()
+        }
         async fn get_items(
             &self,
             _filter: &ferrofin_traits::options::InternalItemsQuery,

@@ -7,6 +7,12 @@
 //! integration test can drive it. `anyhow` sits at this top level so any bring-up
 //! failure surfaces as a non-zero exit with full context.
 
+// glibc malloc arena contention convoyed 64 threads (32 tokio + 32 sqlx-sqlite)
+// into 2200% kernel-mode CPU at moderate request rates; jemalloc eliminates it.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser as _;
 
 use ferrofin_server::config::{Cli, Config};

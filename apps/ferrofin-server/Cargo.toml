@@ -49,6 +49,7 @@ async-trait.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 anyhow.workspace = true
+tikv-jemallocator.workspace = true
 clap.workspace = true
 config.workspace = true
 serde.workspace = true

@@ -94,6 +94,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 
+# ── allocator (server-only: glibc malloc convoyed under 64 threads) ─
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+
 # ── observability / net ────────────────────────────────────────────
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -146,3 +149,12 @@ quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata
 rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration
 insta = { version = "1", features = ["json"] }   # golden-file parity snapshots
 tempfile = "3"          # temp SQLite files for ferrofin-db tests
+
+# ── build profiles ─────────────────────────────────────────────────
+# Release-speed binary with full debug info, for samply/perf/heaptrack
+# symbolization (PLAN_OPTIMIZE_HOTSPOTS phase 0). Never shipped: release
+# stays lean; this exists so profiling is one flag, not a Cargo.toml edit.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

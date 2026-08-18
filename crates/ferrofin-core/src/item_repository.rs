@@ -145,6 +145,36 @@ impl FerrofinItemRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    /// Fallback total for by-name pagination when the page is empty (past the
+    /// last row). Accepts the SAME pre-computed vectors that the page query
+    /// built, so the filter shape can never drift.
+    async fn count_by_name_total(
+        &self,
+        type_ints: &[i64],
+        content_type_names: &[String],
+        exclude_content_types: &[String],
+        ancestors: &[String],
+        filter: &InternalItemsQuery,
+    ) -> Result<i32, ServiceError> {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
+        push_value_aggregate(
+            &mut qb,
+            type_ints,
+            content_type_names,
+            exclude_content_types,
+            ancestors,
+        );
+        qb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+        append_by_name_filters(&mut qb, filter);
+        let count: i64 = qb
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(i32::try_from(count).unwrap_or(i32::MAX))
+    }
+
     /// Resolves the by-name items of `kind` to [`ItemWithCounts`], counting the
     /// content items that reference each via `ItemValues` of the given types
     /// (port of C# `GetItemValues`).
@@ -181,13 +211,14 @@ impl FerrofinItemRepository {
             .map(guid_to_db)
             .collect();
 
-        // The page of by-name rows, joined to the value-count aggregate so the count
-        // comes back in the same query (id = ItemValueId), with the caller's name
-        // filters, ORDER BY, and LIMIT/OFFSET pushed into SQL — no in-memory sort and
-        // no second IN-list round-trip over the full value set (port of C#
-        // `GetItemValues`, whose outer query applies the same name/paging filters).
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT bi.*, agg.cnt FROM "BaseItems" AS bi JOIN "#);
+        let want_total = filter.enable_total_record_count && filter.limit.is_some();
+        let mut qb: QueryBuilder<Sqlite> = if want_total {
+            QueryBuilder::new(
+                r#"SELECT bi.*, agg.cnt, COUNT(*) OVER() AS "total_count" FROM "BaseItems" AS bi JOIN "#,
+            )
+        } else {
+            QueryBuilder::new(r#"SELECT bi.*, agg.cnt FROM "BaseItems" AS bi JOIN "#)
+        };
         push_value_aggregate(
             &mut qb,
             &type_ints,
@@ -215,6 +246,31 @@ impl FerrofinItemRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
+
+        // Total: C# `GetItemValues` forces EnableTotalRecordCount off when there is
+        // no Limit and then never assigns `TotalRecordCount` — a non-nullable int —
+        // so every unpaged (or count-disabled) by-name response carries
+        // `TotalRecordCount: 0` on the wire, even with a bare StartIndex. Match
+        // that exactly; the ledger's flagged /Genres//Studios read-diffs were this.
+        let start_index = filter.start_index.unwrap_or(0);
+        let total = if want_total {
+            match rows.first() {
+                Some(r) => i32::try_from(r.total_count).unwrap_or(i32::MAX),
+                None if start_index > 0 => {
+                    self.count_by_name_total(
+                        &type_ints,
+                        &content_type_names,
+                        exclude_content_types,
+                        &ancestors,
+                        filter,
+                    )
+                    .await?
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
         let items: Vec<ItemWithCounts> = rows
             .into_iter()
             .map(|r| ItemWithCounts {
@@ -225,45 +281,21 @@ impl FerrofinItemRepository {
                 },
             })
             .collect();
-
-        // Total: C# `GetItemValues` forces EnableTotalRecordCount off when there is
-        // no Limit and then never assigns `TotalRecordCount` — a non-nullable int —
-        // so every unpaged (or count-disabled) by-name response carries
-        // `TotalRecordCount: 0` on the wire, even with a bare StartIndex. Match
-        // that exactly; the ledger's flagged /Genres//Studios read-diffs were this.
-        let start_index = filter.start_index.unwrap_or(0);
-        let total = if filter.enable_total_record_count && filter.limit.is_some() {
-            let mut cqb: QueryBuilder<Sqlite> =
-                QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
-            push_value_aggregate(
-                &mut cqb,
-                &type_ints,
-                &content_type_names,
-                exclude_content_types,
-                &ancestors,
-            );
-            cqb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
-            append_by_name_filters(&mut cqb, filter);
-            let count: i64 = cqb
-                .build_query_scalar::<i64>()
-                .fetch_one(self.db.pool())
-                .await
-                .map_err(db_err)?;
-            i32::try_from(count).unwrap_or(i32::MAX)
-        } else {
-            0
-        };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 }
 
 /// A by-name row plus its in-scope item count, read from the joined by-name
 /// aggregate query (the `cnt` column is the aggregate's `COUNT(DISTINCT ItemId)`).
+/// `total_count` carries the `COUNT(*) OVER()` window-function total when the
+/// caller needs pagination metadata, avoiding a separate COUNT round-trip.
 #[derive(sqlx::FromRow)]
 struct ByNameCountRow {
     #[sqlx(flatten)]
     item: BaseItemEntity,
     cnt: i64,
+    #[sqlx(default)]
+    total_count: i64,
 }
 
 /// Pushes the value-count aggregate as a derived table `agg(vid, cnt)`: for each
@@ -310,6 +342,10 @@ fn push_value_aggregate<'a>(
 /// caller is doing a wildcard search" — their presence routes `SearchTerm` to a
 /// raw (unescaped) `LIKE` instead of a literal contains-match.
 const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
+
+/// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on
+/// a cyclic `ParentId` chain (real libraries are <10 levels deep).
+const MAX_ANCESTOR_DEPTH: i32 = 32;
 
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
@@ -476,6 +512,50 @@ impl ItemRepository for FerrofinItemRepository {
         .await
         .map_err(db_err)?;
         Ok(row)
+    }
+
+    async fn get_ancestor_chain(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        let db_id = guid_to_db(item_id);
+        let rows: Vec<BaseItemEntity> = sqlx::query_as(
+            r#"WITH RECURSIVE chain(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT bi."ParentId", c.depth + 1
+                 FROM chain c
+                 JOIN "BaseItems" bi ON bi."Id" = c.id
+                 WHERE bi."ParentId" IS NOT NULL
+                   AND bi."ParentId" <> ?2
+                   AND c.depth < ?3
+               )
+               SELECT bi.* FROM chain c
+               JOIN "BaseItems" bi ON bi."Id" = c.id
+               WHERE c.depth > 0
+               ORDER BY c.depth ASC"#,
+        )
+        .bind(&db_id)
+        .bind(PLACEHOLDER_ID)
+        .bind(MAX_ANCESTOR_DEPTH)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if rows.is_empty() {
+            let exists = self.retrieve_item(item_id).await?.is_some();
+            return if exists {
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(None)
+            };
+        }
+        // Deduplicate by id (nearest-first) in case the tree has a cycle.
+        let mut seen = std::collections::HashSet::new();
+        let deduped = rows
+            .into_iter()
+            .filter(|r| seen.insert(r.id.clone()))
+            .collect();
+        Ok(Some(deduped))
     }
 
     async fn get_items(
@@ -1952,5 +2032,39 @@ mod tests {
         assert_eq!(batch[&primary].len(), 1);
         assert_eq!(batch[&primary][0].id, guid_to_db(alt));
         assert!(!batch.contains_key(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn by_name_total_survives_offset_past_end() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0F1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for g in ["Action", "Adventure", "Comedy", "Drama", "Horror"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+
+        let past = InternalItemsQuery {
+            start_index: Some(50),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let r = repository.get_genres(&past).await.expect("past");
+        assert!(r.items.is_empty());
+        assert_eq!(
+            r.total_record_count, 5,
+            "total must survive an offset past the end"
+        );
+
+        let nomatch = InternalItemsQuery {
+            search_term: Some("ZZZZ".to_owned()),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let z = repository.get_genres(&nomatch).await.expect("z");
+        assert_eq!(
+            z.total_record_count, 0,
+            "genuine empty is 0, not a stale count"
+        );
     }
 }

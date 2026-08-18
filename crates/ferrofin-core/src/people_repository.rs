@@ -37,6 +37,17 @@ use crate::db_error::db_err;
 use crate::item_type_lookup;
 use crate::item_type_lookup::stored_type_name;
 
+/// `PeopleEntity` + the `COUNT(*) OVER()` total, so a single query returns
+/// both the page and the pagination total without a separate round-trip.
+#[derive(sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+struct PeopleWithCount {
+    id: String,
+    name: String,
+    person_type: Option<String>,
+    total_count: i64,
+}
+
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
 /// user-data join (C# `itemTypeLookup.BaseItemKindNames[Person]`).
 const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
@@ -339,11 +350,18 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
     }
 }
 
-/// Opens `SELECT <cols> FROM "Peoples" p WHERE 1 = 1`, applying the optional
+/// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
 /// `is_favorite` user-data restriction as an `EXISTS` sub-select (C# joins
-/// `UserData` on the person item's name).
-fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
-    let mut qb = QueryBuilder::new(format!(r#"SELECT {cols} FROM "Peoples" p WHERE 1 = 1"#));
+/// `UserData` on the person item's name). `from` is either the raw
+/// `"Peoples"` table or the deduped derived table (see
+/// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
+/// reference `p."Name"`/`p."Id"`/`p."PersonType"`, which both shapes expose.
+fn base_query_from<'a>(
+    cols: &str,
+    from: &str,
+    filter: &InternalPeopleQuery,
+) -> QueryBuilder<'a, Sqlite> {
+    let mut qb = QueryBuilder::new(format!("SELECT {cols} FROM {from} p WHERE 1 = 1"));
     if let (Some(user_id), Some(is_favorite)) = (filter.user_id, filter.is_favorite) {
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "UserData" ud
@@ -360,25 +378,109 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
     qb
 }
 
+fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
+    base_query_from(cols, r#""Peoples""#, filter)
+}
+
+/// The deduped-people derived table: one representative row per lower-cased
+/// name. SQLite's documented single-`MIN` bare-column semantics make the
+/// non-aggregated columns come from the `MIN("Id")` row — the same
+/// representative the previous `p."Id" IN (SELECT MIN(...) GROUP BY ...)`
+/// shape selected (verified row-identical on the bench library), but in ONE
+/// aggregation pass that the `HermitIX_Peoples_LowerName_Cover` index serves
+/// as an index-only scan: 28 ms → 0.85 ms per query on 7.5k people.
+const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."PersonType"
+     FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
+
+impl FerrofinPeopleRepository {
+    /// Fallback total when the by-name page is empty (past the last row).
+    async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
+        let mut qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
+        push_predicates(&mut qb, filter);
+        let count: i64 = qb
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
+    /// The `/Persons` by-name listing: deduped representatives with the
+    /// predicates applied to the representative row (exactly the previous
+    /// `p."Id" IN (SELECT MIN(...) GROUP BY ...)` semantics — verified
+    /// row-identical on the bench library) and paging pushed into SQL, with
+    /// the total inlined via `COUNT(*) OVER()` (fallback COUNT on empty pages).
+    ///
+    /// The previous shape materialized the ENTIRE deduped table through sqlx
+    /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
+    /// 28 ms of SQL+decode per request that collapsed `/Persons` to a 29.8 s
+    /// p50 at its calibrated 608 req/s in the benchmark (P0.5 family).
+    async fn get_people_by_name(
+        &self,
+        filter: &InternalPeopleQuery,
+    ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
+        // Single query: COUNT(*) OVER() inlines the total alongside each data
+        // row, eliminating a separate round-trip (one fewer pool acquire + the
+        // full row-streaming overhead through sqlx-sqlite's per-row channel).
+        let mut qb = base_query_from(
+            r#"p."Id", p."Name", p."PersonType", COUNT(*) OVER() AS "TotalCount""#,
+            DEDUP_PEOPLE_FROM,
+            filter,
+        );
+        push_predicates(&mut qb, filter);
+        qb.push(r#" ORDER BY p."Name""#);
+        let start = filter.start_index.unwrap_or(0);
+        if filter.limit > 0 || start > 0 {
+            qb.push(" LIMIT ");
+            qb.push_bind(if filter.limit > 0 {
+                i64::from(filter.limit)
+            } else {
+                -1
+            });
+            if start > 0 {
+                qb.push(" OFFSET ");
+                qb.push_bind(i64::from(start));
+            }
+        }
+        let rows = qb
+            .build_query_as::<PeopleWithCount>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let total = match rows.first() {
+            Some(r) => r.total_count,
+            None if start > 0 => self.count_people_total(filter).await?,
+            None => 0,
+        };
+        let items = rows
+            .into_iter()
+            .map(|r| PeopleEntity {
+                id: r.id,
+                name: r.name,
+                person_type: r.person_type,
+                role: None,
+                primary_image_url: None,
+                provider_id: None,
+            })
+            .collect();
+        Ok(QueryResult::new(
+            Some(start),
+            Some(i32::try_from(total).unwrap_or(i32::MAX)),
+            items,
+        ))
+    }
+}
+
 #[async_trait]
 impl PeopleRepository for FerrofinPeopleRepository {
     async fn get_people(
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
-        let mut rows = if filter.item_id.is_nil() {
-            // Collapse to one representative id per lower-cased name.
-            let mut qb = base_query(r#"p."Id", p."Name", p."PersonType""#, filter);
-            push_predicates(&mut qb, filter);
-            qb.push(
-                r#" AND p."Id" IN (SELECT MIN(p2."Id") FROM "Peoples" p2
-                    GROUP BY LOWER(p2."Name")) ORDER BY p."Name""#,
-            );
-            qb.build_query_as::<PeopleEntity>()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?
-        } else {
+        if filter.item_id.is_nil() {
+            return self.get_people_by_name(filter).await;
+        }
+        let mut rows = {
             // Item-scoped credits carry the credited role (a character name)
             // from the map row, like the C# `GetPeople` projection — without it
             // every cast entry renders roleless on the detail page. NULLIF folds
@@ -1004,5 +1106,52 @@ mod tests {
             .expect("all");
         assert_eq!(all.items.len(), 1);
         assert_eq!(all.items[0].name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn people_total_survives_offset_past_end() {
+        let db = test_db().await;
+        let item_a = Uuid::from_u128(0x9001);
+        seed_item(&db, item_a, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            item_a,
+            &[
+                person("Alice", "Actor"),
+                person("Bob", "Actor"),
+                person("Cara", "Actor"),
+            ],
+        )
+        .await
+        .expect("a");
+
+        let past = InternalPeopleQuery {
+            limit: 2,
+            start_index: Some(10),
+            ..Default::default()
+        };
+        let r = repo.get_people(&past).await.expect("past");
+        assert!(r.items.is_empty());
+        assert_eq!(
+            r.total_record_count, 3,
+            "total must survive an offset past the end"
+        );
+
+        let first = InternalPeopleQuery {
+            limit: 2,
+            start_index: Some(0),
+            ..Default::default()
+        };
+        let f = repo.get_people(&first).await.expect("first");
+        assert_eq!(f.items.len(), 2);
+        assert_eq!(f.total_record_count, 3);
+
+        let empty = InternalPeopleQuery {
+            limit: 2,
+            name_contains: Some("zzzz".to_owned()),
+            ..Default::default()
+        };
+        let none = repo.get_people(&empty).await.expect("none");
+        assert_eq!(none.total_record_count, 0, "genuine empty is 0");
     }
 }

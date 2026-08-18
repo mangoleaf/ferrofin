@@ -751,12 +751,22 @@ pub(crate) fn push_user_data_exists(
     cond: &str,
     want: bool,
 ) {
+    // `bi."Id" [NOT] IN (<uncorrelated subquery over the user's rows>)`, NOT a
+    // correlated `EXISTS`: the IN form lets SQLite materialize the tiny
+    // per-user list once and drive the outer query through the BaseItems PK,
+    // where the EXISTS could not drive the plan at all — every user-data
+    // filter forced a full `SCAN bi` with per-row probes (3.9 ms/request on
+    // the 9.8k-item bench DB regardless of result size), which is what
+    // collapsed /UserItems/Resume to a 22 s p50 at its calibrated 464 req/s.
+    // Measured there: 1.364 ms → 0.013 ms (105×); plan `SCAN bi` →
+    // `SEARCH bi (Id=?)`. NOT IN is NULL-safe here because UserData.ItemId
+    // is NOT NULL (primary-key component in the pinned Jellyfin schema).
     qb.push(if want {
-        " AND EXISTS "
+        r#" AND bi."Id" IN "#
     } else {
-        " AND NOT EXISTS "
+        r#" AND bi."Id" NOT IN "#
     })
-    .push(r#"(SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
+    .push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
     .push_bind(user_id.to_owned())
     .push(format!(" AND {cond})"));
 }

@@ -1560,20 +1560,26 @@ impl FerrofinDtoService {
         user: Option<&UserEntity>,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
-        let images = if options.enable_images
-            || options.contains_field(ItemFields::PrimaryImageAspectRatio)
-        {
-            self.load_images_batch(&ids).await?
-        } else {
-            HashMap::new()
-        };
-        let user_data = match user {
-            Some(user) if options.enable_user_data => {
-                let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
-                self.user_data.get_user_data_dtos(&ids, user_id).await?
+        // Images and user-data are independent; run them concurrently.
+        let want_images =
+            options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
+        let want_user_data = user.is_some() && options.enable_user_data;
+        let images_fut = async {
+            if want_images {
+                self.load_images_batch(&ids).await
+            } else {
+                Ok(HashMap::new())
             }
-            _ => HashMap::new(),
         };
+        let user_data_fut = async {
+            if want_user_data && let Some(u) = user {
+                let user_id = Uuid::parse_str(&u.id).unwrap_or_else(|_| Uuid::nil());
+                self.user_data.get_user_data_dtos(&ids, user_id).await
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let (images, user_data) = tokio::try_join!(images_fut, user_data_fut)?;
         // Merged alternate versions (rows pointing at a page item via
         // `PrimaryVersionId`), so each item's extra selectable sources build
         // without a per-item query; their streams join the stream batch below.
