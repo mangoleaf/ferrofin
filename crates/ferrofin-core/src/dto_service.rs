@@ -1560,9 +1560,7 @@ impl FerrofinDtoService {
         user: Option<&UserEntity>,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
-        // Images and user-data are independent; run them concurrently to halve
-        // the sequential pool-acquire depth (each is a separate DB round-trip
-        // whose per-row channel overhead convoys under load).
+        // Images and user-data are independent; run them concurrently.
         let want_images =
             options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
         let want_user_data = user.is_some() && options.enable_user_data;
@@ -1574,8 +1572,8 @@ impl FerrofinDtoService {
             }
         };
         let user_data_fut = async {
-            if want_user_data {
-                let user_id = Uuid::parse_str(&user.unwrap().id).unwrap_or_else(|_| Uuid::nil());
+            if want_user_data && let Some(u) = user {
+                let user_id = Uuid::parse_str(&u.id).unwrap_or_else(|_| Uuid::nil());
                 self.user_data.get_user_data_dtos(&ids, user_id).await
             } else {
                 Ok(HashMap::new())

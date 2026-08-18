@@ -10,5 +10,5 @@
 --
 -- Hermit* namespace: Ferrofin-own additive object, invisible to the pinned
 -- Jellyfin 10.11.8 schema (drop-in adoption stays two-way safe).
-CREATE INDEX "HermitIX_Peoples_LowerName_Cover"
+CREATE INDEX IF NOT EXISTS "HermitIX_Peoples_LowerName_Cover"
     ON "Peoples" (LOWER("Name"), "Name", "PersonType", "Id");

@@ -1143,6 +1143,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_ancestors_cycle_terminates_and_deduplicates() {
+        let db = test_db().await;
+        let a = Uuid::from_u128(0x401);
+        let b = Uuid::from_u128(0x402);
+        let child = Uuid::from_u128(0x403);
+        seed_named_item(&db, a, BaseItemKind::Folder, "A").await;
+        seed_named_item(&db, b, BaseItemKind::Folder, "B").await;
+        seed_named_item(&db, child, BaseItemKind::Episode, "C").await;
+        // child -> A -> B -> A (cycle)
+        for (id, parent_id) in [(child, a), (a, b), (b, a)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .bind(ferrofin_db::store::guid_to_db(parent_id))
+                .execute(db.writer())
+                .await
+                .expect("set parent");
+        }
+        let mgr = manager(&db);
+        let anc = mgr
+            .get_ancestors(child)
+            .await
+            .expect("anc")
+            .expect("exists");
+        let ids: Vec<Uuid> = anc
+            .iter()
+            .map(|r| Uuid::parse_str(&r.id).expect("uuid"))
+            .collect();
+        assert_eq!(ids, vec![a, b], "cycle must deduplicate, nearest-first");
+    }
+
+    #[tokio::test]
     async fn get_named_item_missing_is_none() {
         let db = test_db().await;
         let mgr = manager(&db);

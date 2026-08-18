@@ -469,27 +469,30 @@ impl PlaylistManager for FerrofinPlaylistManager {
             return Ok(Vec::new());
         }
         let db_ids: Vec<String> = child_ids.iter().copied().map(guid_to_db).collect();
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
-        let mut sep = qb.separated(", ");
-        for id in &db_ids {
-            sep.push_bind(id.as_str());
+        let mut rows = Vec::with_capacity(db_ids.len());
+        for chunk in db_ids.chunks(500) {
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id.as_str());
+            }
+            sep.push_unseparated(")");
+            let batch: Vec<BaseItemEntity> = qb
+                .build_query_as()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+            rows.extend(batch);
         }
-        sep.push_unseparated(")");
-        let rows: Vec<BaseItemEntity> = qb
-            .build_query_as()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
         // Restore linked-children order (SQL IN doesn't guarantee it).
         let pos: HashMap<&str, usize> = db_ids
             .iter()
             .enumerate()
             .map(|(i, id)| (id.as_str(), i))
             .collect();
-        let mut sorted = rows;
-        sorted.sort_by_key(|r| pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
-        Ok(sorted)
+        rows.sort_by_key(|r| pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
+        Ok(rows)
     }
 
     async fn add_user_to_shares(

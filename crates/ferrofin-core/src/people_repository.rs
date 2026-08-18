@@ -355,7 +355,7 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
 /// `UserData` on the person item's name). `from` is either the raw
 /// `"Peoples"` table or the deduped derived table (see
 /// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
-/// reference `p."Name"`/`p."Id"`, which both shapes expose.
+/// reference `p."Name"`/`p."Id"`/`p."PersonType"`, which both shapes expose.
 fn base_query_from<'a>(
     cols: &str,
     from: &str,
@@ -393,11 +393,23 @@ const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."
      FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
 
 impl FerrofinPeopleRepository {
+    /// Fallback total when the by-name page is empty (past the last row).
+    async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
+        let mut qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
+        push_predicates(&mut qb, filter);
+        let count: i64 = qb
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(count)
+    }
+
     /// The `/Persons` by-name listing: deduped representatives with the
     /// predicates applied to the representative row (exactly the previous
     /// `p."Id" IN (SELECT MIN(...) GROUP BY ...)` semantics — verified
     /// row-identical on the bench library) and paging pushed into SQL, with
-    /// the total from a companion COUNT over the same derived table.
+    /// the total inlined via `COUNT(*) OVER()` (fallback COUNT on empty pages).
     ///
     /// The previous shape materialized the ENTIRE deduped table through sqlx
     /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
@@ -435,7 +447,11 @@ impl FerrofinPeopleRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
-        let total = rows.first().map_or(0, |r| r.total_count);
+        let total = match rows.first() {
+            Some(r) => r.total_count,
+            None if start > 0 => self.count_people_total(filter).await?,
+            None => 0,
+        };
         let items = rows
             .into_iter()
             .map(|r| PeopleEntity {
@@ -1090,5 +1106,52 @@ mod tests {
             .expect("all");
         assert_eq!(all.items.len(), 1);
         assert_eq!(all.items[0].name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn people_total_survives_offset_past_end() {
+        let db = test_db().await;
+        let item_a = Uuid::from_u128(0x9001);
+        seed_item(&db, item_a, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            item_a,
+            &[
+                person("Alice", "Actor"),
+                person("Bob", "Actor"),
+                person("Cara", "Actor"),
+            ],
+        )
+        .await
+        .expect("a");
+
+        let past = InternalPeopleQuery {
+            limit: 2,
+            start_index: Some(10),
+            ..Default::default()
+        };
+        let r = repo.get_people(&past).await.expect("past");
+        assert!(r.items.is_empty());
+        assert_eq!(
+            r.total_record_count, 3,
+            "total must survive an offset past the end"
+        );
+
+        let first = InternalPeopleQuery {
+            limit: 2,
+            start_index: Some(0),
+            ..Default::default()
+        };
+        let f = repo.get_people(&first).await.expect("first");
+        assert_eq!(f.items.len(), 2);
+        assert_eq!(f.total_record_count, 3);
+
+        let empty = InternalPeopleQuery {
+            limit: 2,
+            name_contains: Some("zzzz".to_owned()),
+            ..Default::default()
+        };
+        let none = repo.get_people(&empty).await.expect("none");
+        assert_eq!(none.total_record_count, 0, "genuine empty is 0");
     }
 }

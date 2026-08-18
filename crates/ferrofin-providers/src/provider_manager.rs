@@ -1493,12 +1493,6 @@ mod tests {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
         }
-        async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-            Ok(ids
-                .iter()
-                .filter_map(|id| self.rows.get(id).cloned())
-                .collect())
-        }
         async fn get_ancestor_chain(
             &self,
             _item_id: Uuid,

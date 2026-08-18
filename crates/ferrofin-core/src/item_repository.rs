@@ -145,6 +145,36 @@ impl FerrofinItemRepository {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    /// Fallback total for by-name pagination when the page is empty (past the
+    /// last row). Accepts the SAME pre-computed vectors that the page query
+    /// built, so the filter shape can never drift.
+    async fn count_by_name_total(
+        &self,
+        type_ints: &[i64],
+        content_type_names: &[String],
+        exclude_content_types: &[String],
+        ancestors: &[String],
+        filter: &InternalItemsQuery,
+    ) -> Result<i32, ServiceError> {
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT COUNT(*) FROM "BaseItems" AS bi JOIN "#);
+        push_value_aggregate(
+            &mut qb,
+            type_ints,
+            content_type_names,
+            exclude_content_types,
+            ancestors,
+        );
+        qb.push(r#" ON agg.vid = bi."Id" WHERE 1 = 1"#);
+        append_by_name_filters(&mut qb, filter);
+        let count: i64 = qb
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(i32::try_from(count).unwrap_or(i32::MAX))
+    }
+
     /// Resolves the by-name items of `kind` to [`ItemWithCounts`], counting the
     /// content items that reference each via `ItemValues` of the given types
     /// (port of C# `GetItemValues`).
@@ -224,8 +254,20 @@ impl FerrofinItemRepository {
         // that exactly; the ledger's flagged /Genres//Studios read-diffs were this.
         let start_index = filter.start_index.unwrap_or(0);
         let total = if want_total {
-            rows.first()
-                .map_or(0, |r| i32::try_from(r.total_count).unwrap_or(i32::MAX))
+            match rows.first() {
+                Some(r) => i32::try_from(r.total_count).unwrap_or(i32::MAX),
+                None if start_index > 0 => {
+                    self.count_by_name_total(
+                        &type_ints,
+                        &content_type_names,
+                        exclude_content_types,
+                        &ancestors,
+                        filter,
+                    )
+                    .await?
+                }
+                None => 0,
+            }
         } else {
             0
         };
@@ -300,6 +342,10 @@ fn push_value_aggregate<'a>(
 /// caller is doing a wildcard search" — their presence routes `SearchTerm` to a
 /// raw (unescaped) `LIKE` instead of a literal contains-match.
 const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
+
+/// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on
+/// a cyclic `ParentId` chain (real libraries are <10 levels deep).
+const MAX_ANCESTOR_DEPTH: i32 = 32;
 
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
@@ -468,43 +514,11 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(row)
     }
 
-    async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let db_ids: Vec<String> = ids.iter().copied().map(guid_to_db).collect();
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
-        let mut sep = qb.separated(", ");
-        for id in &db_ids {
-            sep.push_bind(id.as_str());
-        }
-        sep.push_unseparated(r#") AND "Id" <> "#);
-        qb.push_bind(PLACEHOLDER_ID);
-        let rows: Vec<BaseItemEntity> = qb
-            .build_query_as()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        // Restore the caller's input order (SQL IN doesn't guarantee it).
-        let pos: std::collections::HashMap<&str, usize> = db_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-        let mut sorted = rows;
-        sorted.sort_by_key(|r| pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
-        Ok(sorted)
-    }
-
     async fn get_ancestor_chain(
         &self,
         item_id: Uuid,
     ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
         let db_id = guid_to_db(item_id);
-        // Single recursive CTE: walk ParentId upward, cap at 32 to guard
-        // against cycles, return ancestors nearest-first (depth ASC, skip
-        // depth=0 which is the starting item itself).
         let rows: Vec<BaseItemEntity> = sqlx::query_as(
             r#"WITH RECURSIVE chain(id, depth) AS (
                  SELECT ?1, 0
@@ -512,7 +526,9 @@ impl ItemRepository for FerrofinItemRepository {
                  SELECT bi."ParentId", c.depth + 1
                  FROM chain c
                  JOIN "BaseItems" bi ON bi."Id" = c.id
-                 WHERE bi."ParentId" IS NOT NULL AND c.depth < 32
+                 WHERE bi."ParentId" IS NOT NULL
+                   AND bi."ParentId" <> ?2
+                   AND c.depth < ?3
                )
                SELECT bi.* FROM chain c
                JOIN "BaseItems" bi ON bi."Id" = c.id
@@ -520,12 +536,11 @@ impl ItemRepository for FerrofinItemRepository {
                ORDER BY c.depth ASC"#,
         )
         .bind(&db_id)
+        .bind(PLACEHOLDER_ID)
+        .bind(MAX_ANCESTOR_DEPTH)
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        // depth=0 was the starting item; if that doesn't exist, the CTE
-        // produces no rows at all — but we need to distinguish "item not found"
-        // from "item exists but has no parents."
         if rows.is_empty() {
             let exists = self.retrieve_item(item_id).await?.is_some();
             return if exists {
@@ -534,7 +549,13 @@ impl ItemRepository for FerrofinItemRepository {
                 Ok(None)
             };
         }
-        Ok(Some(rows))
+        // Deduplicate by id (nearest-first) in case the tree has a cycle.
+        let mut seen = std::collections::HashSet::new();
+        let deduped = rows
+            .into_iter()
+            .filter(|r| seen.insert(r.id.clone()))
+            .collect();
+        Ok(Some(deduped))
     }
 
     async fn get_items(
@@ -2011,5 +2032,39 @@ mod tests {
         assert_eq!(batch[&primary].len(), 1);
         assert_eq!(batch[&primary][0].id, guid_to_db(alt));
         assert!(!batch.contains_key(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn by_name_total_survives_offset_past_end() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0F1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for g in ["Action", "Adventure", "Comedy", "Drama", "Horror"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+
+        let past = InternalItemsQuery {
+            start_index: Some(50),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let r = repository.get_genres(&past).await.expect("past");
+        assert!(r.items.is_empty());
+        assert_eq!(
+            r.total_record_count, 5,
+            "total must survive an offset past the end"
+        );
+
+        let nomatch = InternalItemsQuery {
+            search_term: Some("ZZZZ".to_owned()),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let z = repository.get_genres(&nomatch).await.expect("z");
+        assert_eq!(
+            z.total_record_count, 0,
+            "genuine empty is 0, not a stale count"
+        );
     }
 }
