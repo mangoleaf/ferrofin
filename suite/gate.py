@@ -42,10 +42,8 @@ from config import CONFIG  # noqa: E402
 
 FACTOR = float(os.environ.get("PERF_GATE_FACTOR") or CONFIG["PERF_GATE_FACTOR"])
 # Absolute jitter floor (ms): a percentile trip additionally needs this much
-# real worsening. THE noise floor (D1) — the same BENCH_NOISE_FLOOR_MS that
-# makes sub-floor deltas ties in the comparison tables gates here: well under
-# any regression a user feels, well over the OS-noise band on sub-ms
-# endpoints. PERF_GATE_MIN_DELTA_MS env remains as a gate-only override.
+# real worsening — sub-ms endpoints can "2× regress" by 1 ms of OS noise.
+# PERF_GATE_MIN_DELTA_MS env remains as a gate-only override.
 MIN_DELTA_MS = float(os.environ.get("PERF_GATE_MIN_DELTA_MS")
                      or CONFIG["BENCH_NOISE_FLOOR_MS"])
 PCTS = ("p50", "p95", "p99")
@@ -191,14 +189,14 @@ def rebaseline_merged(run):
     variants = {}
     for o in run["operations"]:
         p = o["perf"]
-        if p["h_p50"] is None:
+        if p["f_p50"] is None:
             continue
-        variants[p["variant"]] = {"op": o["op"], "h_p50": p["h_p50"], "h_p95": p["h_p95"],
-                                  "h_p99": p["h_p99"], "deep_verified": o["parity"]["deep_verified"]}
+        variants[p["variant"]] = {"op": o["op"], "f_p50": p["f_p50"], "f_p95": p["f_p95"],
+                                  "f_p99": p["f_p99"], "deep_verified": o["parity"]["deep_verified"]}
         # H2: cold sentinels carry their fresh-process first-request latency —
         # gated separately from warm (cold-vs-cold only, gross regressions).
-        if (p.get("cold") or {}).get("h_first") is not None:
-            variants[p["variant"]]["h_cold_first"] = p["cold"]["h_first"]
+        if (p.get("cold") or {}).get("f_first") is not None:
+            variants[p["variant"]]["f_cold_first"] = p["cold"]["f_first"]
     doc = _read_baseline_file(BASELINE)
     doc["merged"] = {"factor": FACTOR, "engine": model,
                      "ferrofin": run["meta"]["ferrofin"], "variants": variants}
@@ -226,9 +224,9 @@ def check_merged(run):
         if b is None:
             continue
         seen.add(p["variant"])
-        if p["h_ok"] is not None and p["h_ok"] < 100:
-            fails.append(f"{p['variant']}: Ferrofin 200-rate {p['h_ok']}% < 100%")
-        for pct in ("h_p50", "h_p95", "h_p99"):
+        if p["f_ok"] is not None and p["f_ok"] < 100:
+            fails.append(f"{p['variant']}: Ferrofin 200-rate {p['f_ok']}% < 100%")
+        for pct in ("f_p50", "f_p95", "f_p99"):
             if (p[pct] is not None and b[pct] and p[pct] > b[pct] * FACTOR
                     and (p[pct] - b[pct]) > MIN_DELTA_MS):
                 fails.append(f"{p['variant']} {pct}: {p[pct]} > {b[pct]}×{FACTOR} (={round(b[pct] * FACTOR, 1)})")
@@ -238,8 +236,8 @@ def check_merged(run):
         # Cold gates cold-vs-cold only (never against warm): same gross-factor
         # rule; cold first-requests are high-variance, so only a clear breach
         # (factor AND absolute delta) fails.
-        cold_now = (p.get("cold") or {}).get("h_first")
-        cold_base = b.get("h_cold_first")
+        cold_now = (p.get("cold") or {}).get("f_first")
+        cold_base = b.get("f_cold_first")
         if (cold_now is not None and cold_base and cold_now > cold_base * FACTOR
                 and (cold_now - cold_base) > MIN_DELTA_MS):
             fails.append(f"{p['variant']} cold_first: {cold_now} > {cold_base}×{FACTOR} "

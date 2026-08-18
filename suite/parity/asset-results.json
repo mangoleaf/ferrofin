@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/assets.py",
-  "last_verified": "166c7b3 2026-08-08",
+  "last_verified": "9d273e2 2026-08-18",
   "rows": {
     "DELETE /Branding/Splashscreen": {
       "classification": "",
@@ -58,19 +58,19 @@
       "note": "H=(4, '') J=(2, 'image', 'png', 600, 600)"
     },
     "GET /Items/{itemId}/Images/{imageType}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image', 'jpeg', 320, 240)"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 320, 240) J=(2, 'image', 'jpeg', 320, 240)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image', 'jpeg', 320, 240)"
     },
     "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image', 'jpeg', 100, 75) J=(2, 'image', 'jpeg', 100, 75)"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image', 'jpeg', 100, 75)"
     },
     "GET /MusicGenres/{name}/Images/{imageType}": {
       "classification": "",
@@ -123,19 +123,19 @@
       "note": "H=(4, '') J=(2, 'image')"
     },
     "HEAD /Items/{itemId}/Images/{imageType}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image')"
     },
     "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image')"
     },
     "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}": {
-      "classification": "",
-      "deep_verified": true,
-      "note": "H=(2, 'image') J=(2, 'image')"
+      "classification": "flagged: asset property diff vs Jellyfin (verify)",
+      "deep_verified": false,
+      "note": "H=(4, '') J=(2, 'image')"
     },
     "HEAD /MusicGenres/{name}/Images/{imageType}": {
       "classification": "",

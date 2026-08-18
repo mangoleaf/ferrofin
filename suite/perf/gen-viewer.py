@@ -55,10 +55,10 @@ def parse(path):
             v["endpoints"].append(
                 {
                     "name": g[0],
-                    "h_p50": num(g[1]), "h_p95": num(g[2]), "h_p99": num(g[3]),
+                    "f_p50": num(g[1]), "f_p95": num(g[2]), "f_p99": num(g[3]),
                     "j_p50": num(g[4]), "j_p95": num(g[5]), "j_p99": num(g[6]),
-                    "h_rps": num(g[7]), "j_rps": num(g[8]),
-                    "h_ok": num(g[9]), "j_ok": num(g[10]),
+                    "f_rps": num(g[7]), "j_rps": num(g[8]),
+                    "f_ok": num(g[9]), "j_ok": num(g[10]),
                     "speedup": num(g[11]),
                 }
             )

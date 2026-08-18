@@ -44,8 +44,8 @@ def run_signature(record):
     artifacts collapses to one entry, while a genuine rerun (which differs in every
     latency) stays distinct. Excludes meta.when, which changes on every merge."""
     perf = sorted(
-        (o["perf"].get("variant"), o["perf"].get("h_p50"), o["perf"].get("j_p50"),
-         o["perf"].get("h_p99"), o["perf"].get("j_p99"))
+        (o["perf"].get("variant"), o["perf"].get("f_p50"), o["perf"].get("j_p50"),
+         o["perf"].get("f_p99"), o["perf"].get("j_p99"))
         for o in record.get("operations", [])
     )
     payload = json.dumps(
@@ -121,7 +121,7 @@ def footprint():
         return round(max(vals)) if vals else None
 
     out = {}
-    for tgt, key in (("ferrofin", "h"), ("jellyfin", "j")):
+    for tgt, key in (("ferrofin", "f"), ("jellyfin", "j")):
         out[f"{key}_cold_s"] = first(f"{tgt}-cold.txt")
         out[f"{key}_rss_peak_mib"] = peak(f"{tgt}-rss.txt")
         out[f"{key}_items"] = first(f"{tgt}-count.txt")
@@ -140,7 +140,7 @@ def footprint():
 
 
 def perf_by_variant():
-    """{variant: {h_p50,h_p95,h_p99,h_rps,h_ok, j_*}} from raw summaries, else bench-data latest."""
+    """{variant: {f_p50,f_p95,f_p99,f_rps,f_ok, j_*}} (f=Ferrofin, j=Jellyfin) from raw summaries, else bench-data latest."""
     h = load_json(SUITE / "perf/results/raw/ferrofin-summary.json")
     j = load_json(SUITE / "perf/results/raw/jellyfin-summary.json")
     if h and j:
@@ -148,28 +148,28 @@ def perf_by_variant():
         for name, hv in h.get("endpoints", {}).items():
             jv = j.get("endpoints", {}).get(name, {})
             out[name] = {
-                "h_p50": hv.get("p50"), "h_p95": hv.get("p95"), "h_p99": hv.get("p99"),
-                "h_rps": hv.get("rps"), "h_ok": hv.get("okPct"),
+                "f_p50": hv.get("p50"), "f_p95": hv.get("p95"), "f_p99": hv.get("p99"),
+                "f_rps": hv.get("rps"), "f_ok": hv.get("okPct"),
                 "j_p50": jv.get("p50"), "j_p95": jv.get("p95"), "j_p99": jv.get("p99"),
                 "j_rps": jv.get("rps"), "j_ok": jv.get("okPct"),
                 # Open-loop bookkeeping (G1): both sides must have been driven at
                 # the SAME recorded arrival rate, and each must have held it.
                 "rate": hv.get("target_rate"), "rate_source": hv.get("rate_source"),
-                "h_rate_held": hv.get("rate_held"), "j_rate_held": jv.get("rate_held"),
+                "f_rate_held": hv.get("rate_held"), "j_rate_held": jv.get("rate_held"),
                 "j_rate": jv.get("target_rate"),
                 # Distinguishes "measured, zero expected-status responses"
                 # (achieved rate recorded — e.g. Jellyfin's login path
                 # collapsing under storm load) from "leg never ran" for the
                 # A1 manifest check.
-                "h_achieved": hv.get("achieved_rate"), "j_achieved": jv.get("achieved_rate"),
+                "f_achieved": hv.get("achieved_rate"), "j_achieved": jv.get("achieved_rate"),
             }
         return out, "raw-summary"
     bd = load_json(SUITE / "perf" / "bench-data.json")
     if bd and bd.get("versions"):
         latest = bd["versions"][-1]
         out = {e["name"]: {
-            "h_p50": e.get("h_p50"), "h_p95": e.get("h_p95"), "h_p99": e.get("h_p99"),
-            "h_rps": e.get("h_rps"), "h_ok": e.get("h_ok"),
+            "f_p50": e.get("f_p50"), "f_p95": e.get("f_p95"), "f_p99": e.get("f_p99"),
+            "f_rps": e.get("f_rps"), "f_ok": e.get("f_ok"),
             "j_p50": e.get("j_p50"), "j_p95": e.get("j_p95"), "j_p99": e.get("j_p99"),
             "j_rps": e.get("j_rps"), "j_ok": e.get("j_ok"),
         } for e in latest.get("endpoints", [])}
@@ -230,12 +230,12 @@ def manifest_check(v2op, perf, foot, cold):
             return (p is None or (p.get(f"{prefix}_p50") is None
                                   and not p.get(f"{prefix}_achieved")))
 
-        h_absent, j_absent = side_absent("h"), side_absent("j")
-        if h_absent or j_absent:
-            side = "both" if h_absent and j_absent else "ferrofin" if h_absent else "jellyfin"
+        f_absent, j_absent = side_absent("f"), side_absent("j")
+        if f_absent or j_absent:
+            side = "both" if f_absent and j_absent else "ferrofin" if f_absent else "jellyfin"
             missing.append(f"{variant}[{side}]")
     if bench_env("RUN_TRANSCODE") == "1":
-        for key, tgt in (("h", "ferrofin"), ("j", "jellyfin")):
+        for key, tgt in (("f", "ferrofin"), ("j", "jellyfin")):
             for mode in ("copy", "encode"):
                 leg = f"ttfs_{mode}"
                 if leg in skip:
@@ -252,37 +252,27 @@ def manifest_check(v2op, perf, foot, cold):
     return sorted(skip), sorted(missing)
 
 
-def floored_speedup(h_p50, j_p50, floor):
-    """The per-row ratio with the noise floor applied (D1) → (ratio, is_tie).
-
-    None ratio when either side is missing, the delta is under the floor
-    (dividing two sub-floor medians amplifies jitter into a fake multiple —
-    0.3 ms vs 0.1 ms reads as "3×"), or Ferrofin's median is zero. is_tie
-    marks exactly the floor-suppressed case, so the headline's
-    ratio_excluded_ties derives from THIS rule instead of a parallel
-    reimplementation (review, round 3). Pure so merge_selftest.py pins it."""
-    if h_p50 is None or j_p50 is None:
-        return None, False
-    if abs(h_p50 - j_p50) < floor:
-        return None, True
-    if not h_p50:
-        return None, False  # zero median: ratio undefined, not a tie
-    return round(j_p50 / h_p50, 2), False
+def speedup_ratio(f_p50, j_p50):
+    """The per-row speedup ratio: j/f. None when either side is missing or
+    Ferrofin's median is zero (division undefined). Pure so merge_selftest.py
+    pins it."""
+    if f_p50 is None or j_p50 is None:
+        return None
+    if not f_p50:
+        return None
+    return round(j_p50 / f_p50, 2)
 
 
-def percentile_verdicts(p, floor):
-    """D1: per-percentile win/tie/loss with the noise floor as a first-class
-    concept. A delta smaller than the floor (host-local jitter band, recorded
-    in meta) is a TIE — neither a win nor a loss, anywhere: a 1 ms 'loss' on a
-    sub-ms endpoint is OS noise, not a result. Returns
-    {'p50': 'win'|'tie'|'loss', ...} (Ferrofin's perspective), or None when
-    either side lacks numbers."""
+def percentile_verdicts(p):
+    """Per-percentile win/loss (Ferrofin's perspective). Ferrofin <= Jellyfin is
+    a win; Ferrofin > Jellyfin is a loss. Returns {'p50': 'win'|'loss', ...},
+    or None when either side lacks numbers."""
     out = {}
     for pct in ("p50", "p95", "p99"):
-        h, j = p[f"h_{pct}"], p[f"j_{pct}"]
-        if h is None or j is None:
+        fv, j = p[f"f_{pct}"], p[f"j_{pct}"]
+        if fv is None or j is None:
             return None
-        out[pct] = "tie" if abs(h - j) < floor else "win" if h < j else "loss"
+        out[pct] = "win" if fv <= j else "loss"
     return out
 
 
@@ -327,13 +317,13 @@ def main():
         # the parity WRITE JOURNEY — plus the 100% expected-status check below.
         is_write = not op.startswith("GET ")
         drift = (not is_write) and op in fp_h and op in fp_j and fp_h[op] != fp_j[op]
-        both_ok = p.get("h_ok") == 100 and p.get("j_ok") == 100
-        have_lat = p["h_p50"] is not None and p["j_p50"] is not None
+        both_ok = p.get("f_ok") == 100 and p.get("j_ok") == 100
+        have_lat = p["f_p50"] is not None and p["j_p50"] is not None
         # G1: a latency comparison is only meaningful at the same arrival rate,
         # actually held on both sides. Legacy (closed-loop) records carry no
         # rate keys — None == None keeps them flowing through unchanged.
         same_rate = p.get("rate") == p.get("j_rate")
-        rates_held = p.get("h_rate_held") is not False and p.get("j_rate_held") is not False
+        rates_held = p.get("f_rate_held") is not False and p.get("j_rate_held") is not False
         comparable = deep and both_ok and have_lat and not drift and same_rate and rates_held
         reason = (None if comparable else
                   "body shape diverges from Jellyfin at bench time" if drift else
@@ -342,17 +332,10 @@ def main():
                   "measured at different arrival rates" if not same_rate else
                   "open-loop rate not held" if not rates_held else "missing latency")
 
-        verdicts = percentile_verdicts(p, CONFIG["BENCH_NOISE_FLOOR_MS"])
+        verdicts = percentile_verdicts(p)
         vlist = list(verdicts.values()) if verdicts else []
-        # A win requires clearing the floor on ALL THREE percentiles; all-ties
-        # is an explicit ≈ verdict; a p50 win with a floor-clearing tail loss
-        # stays a tail loss, never folded into "faster".
         win = vlist.count("win") == 3
-        tie = bool(vlist) and vlist.count("tie") == 3
-        # D1 applies to the RATIO too: a p50 tie gets NO speedup (see
-        # floored_speedup); headline.ratio_excluded_ties says how many.
-        speedup, ratio_tie = floored_speedup(
-            p["h_p50"], p["j_p50"], CONFIG["BENCH_NOISE_FLOOR_MS"])
+        speedup = speedup_ratio(p["f_p50"], p["j_p50"])
         # H2: cold rows ride the same operation, as a separate labeled block —
         # WARM percentiles above are the headline; cold is published beside
         # them, never blended (fresh-process first-request latency).
@@ -361,8 +344,8 @@ def main():
         cold_block = None
         if ch or cj:
             cold_block = {
-                "h_first": (ch or {}).get("first"), "h_p50": (ch or {}).get("p50"),
-                "h_max": (ch or {}).get("max"), "h_ready_ms": (ch or {}).get("ready_wait_ms"),
+                "f_first": (ch or {}).get("first"), "f_p50": (ch or {}).get("p50"),
+                "f_max": (ch or {}).get("max"), "f_ready_ms": (ch or {}).get("ready_wait_ms"),
                 "j_first": (cj or {}).get("first"), "j_p50": (cj or {}).get("p50"),
                 "j_max": (cj or {}).get("max"), "j_ready_ms": (cj or {}).get("ready_wait_ms"),
             }
@@ -375,9 +358,7 @@ def main():
             "parity": {"depth": pr.get("depth"), "deep_verified": deep,
                        "classification": pr.get("classification") or None},
             "perf": {"variant": variant, **p, "speedup": speedup,
-                     "ratio_tie": ratio_tie,
                      "win_all_three": win,
-                     "tie_all_three": tie,
                      "verdicts": verdicts,
                      "tail_loss": bool(comparable and verdicts
                                        and verdicts["p50"] == "win"
@@ -425,13 +406,7 @@ def main():
         "dropped_rows": sum(dropped.values()),
         "dropped_by_reason": dropped,
         "median_speedup": round(median(speedups), 3) if speedups else None,
-        # Comparable rows whose p50 delta is under the floor: they carry no
-        # ratio (see floored_speedup — the single source of the rule), and
-        # this count keeps the exclusion visible.
-        "ratio_excluded_ties": sum(1 for o in comp if o.get("ratio_tie")),
         "win_rate": round(sum(o["win_all_three"] for o in comp) / len(comp), 3) if comp else None,
-        "ties": sum(o["tie_all_three"] for o in comp),
-        "noise_floor_ms": CONFIG["BENCH_NOISE_FLOOR_MS"],
         "tail_losses": [o["variant"] for o in comp if o["tail_loss"]],
         "parity_coverage": round(len(deep_ops) / len(benched_ops), 3) if benched_ops else None,
         "owners": owners,
