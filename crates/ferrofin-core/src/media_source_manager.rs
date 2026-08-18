@@ -146,7 +146,7 @@ impl FerrofinMediaSourceManager {
                 ..Default::default()
             })
             .await?;
-        Ok(rows.iter().map(stream_to_dto).collect())
+        Ok(rows.into_iter().map(stream_to_dto).collect())
     }
 
     /// Builds the static [`MediaSourceInfo`] for a resolved item row and its
@@ -243,26 +243,26 @@ fn source_etag(item: &BaseItemEntity) -> String {
 
 /// Maps a persisted media-stream row to the wire [`MediaStream`] DTO. Fields the
 /// entity does not carry are left at their [`Default`].
-fn stream_to_dto(row: &MediaStreamInfoEntity) -> MediaStream {
+fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     let mut stream = MediaStream {
         index: i32::try_from(row.stream_index).unwrap_or(0),
         stream_type: media_stream_type_from_disc(row.stream_type),
-        codec: row.codec.clone(),
-        codec_tag: row.codec_tag.clone(),
-        language: row.language.clone(),
-        title: row.title.clone(),
-        comment: row.comment.clone(),
-        time_base: row.time_base.clone(),
-        codec_time_base: row.codec_time_base.clone(),
-        nal_length_size: row.nal_length_size.clone(),
-        profile: row.profile.clone(),
-        aspect_ratio: row.aspect_ratio.clone(),
-        path: row.path.clone(),
-        channel_layout: row.channel_layout.clone(),
-        pixel_format: row.pixel_format.clone(),
-        color_space: row.color_space.clone(),
-        color_transfer: row.color_transfer.clone(),
-        color_primaries: row.color_primaries.clone(),
+        codec: row.codec,
+        codec_tag: row.codec_tag,
+        language: row.language,
+        title: row.title,
+        comment: row.comment,
+        time_base: row.time_base,
+        codec_time_base: row.codec_time_base,
+        nal_length_size: row.nal_length_size,
+        profile: row.profile,
+        aspect_ratio: row.aspect_ratio,
+        path: row.path,
+        channel_layout: row.channel_layout,
+        pixel_format: row.pixel_format,
+        color_space: row.color_space,
+        color_transfer: row.color_transfer,
+        color_primaries: row.color_primaries,
         is_interlaced: row.is_interlaced.unwrap_or(false),
         is_avc: row.is_avc,
         is_default: row.is_default,
@@ -411,7 +411,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         let rows = self.streams.get_media_streams_batch(item_ids).await?;
         Ok(rows
             .into_iter()
-            .map(|(id, streams)| (id, streams.iter().map(stream_to_dto).collect()))
+            .map(|(id, streams)| (id, streams.into_iter().map(stream_to_dto).collect()))
             .collect())
     }
 
@@ -586,6 +586,59 @@ mod tests {
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
     #[test]
+    fn stream_text_fields_round_trip_through_entity() {
+        // `stream_to_dto` moves ~16 owned text fields out of the row rather than
+        // cloning them (it is the per-stream hot path for every list page that
+        // asks for MediaStreams/MediaSources). Nothing else asserts those fields
+        // survive the entity hop, so dropping one — codec, language, the
+        // subtitle title a client shows in its track picker — would otherwise be
+        // silent.
+        let dto = MediaStream {
+            index: 2,
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
+            codec: Some("subrip".to_owned()),
+            codec_tag: Some("srt ".to_owned()),
+            language: Some("eng".to_owned()),
+            title: Some("English (SDH)".to_owned()),
+            comment: Some("forced narrative".to_owned()),
+            time_base: Some("1/1000".to_owned()),
+            codec_time_base: Some("1/48000".to_owned()),
+            nal_length_size: Some("4".to_owned()),
+            profile: Some("High".to_owned()),
+            aspect_ratio: Some("16:9".to_owned()),
+            path: Some("/media/movie.en.srt".to_owned()),
+            channel_layout: Some("5.1".to_owned()),
+            pixel_format: Some("yuv420p".to_owned()),
+            // Distinct values on purpose: the three colour fields are adjacent
+            // and same-shaped, so a shared sentinel would let a cross-wired
+            // pair (the likeliest regex slip) round-trip undetected.
+            color_space: Some("bt2020nc".to_owned()),
+            color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            ..MediaStream::default()
+        };
+
+        let back = stream_to_dto(stream_dto_to_entity("item-1", &dto));
+
+        assert_eq!(back.codec.as_deref(), Some("subrip"));
+        assert_eq!(back.codec_tag.as_deref(), Some("srt "));
+        assert_eq!(back.language.as_deref(), Some("eng"));
+        assert_eq!(back.title.as_deref(), Some("English (SDH)"));
+        assert_eq!(back.comment.as_deref(), Some("forced narrative"));
+        assert_eq!(back.time_base.as_deref(), Some("1/1000"));
+        assert_eq!(back.codec_time_base.as_deref(), Some("1/48000"));
+        assert_eq!(back.nal_length_size.as_deref(), Some("4"));
+        assert_eq!(back.profile.as_deref(), Some("High"));
+        assert_eq!(back.aspect_ratio.as_deref(), Some("16:9"));
+        assert_eq!(back.path.as_deref(), Some("/media/movie.en.srt"));
+        assert_eq!(back.channel_layout.as_deref(), Some("5.1"));
+        assert_eq!(back.pixel_format.as_deref(), Some("yuv420p"));
+        assert_eq!(back.color_space.as_deref(), Some("bt2020nc"));
+        assert_eq!(back.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(back.color_primaries.as_deref(), Some("bt2020"));
+    }
+
+    #[test]
     fn dv_metadata_round_trips_through_entity() {
         use ferrofin_model::data::VideoRangeType;
         // A Dolby Vision Profile 8.1 (HDR10-compatible) video stream, as ffprobe
@@ -611,7 +664,7 @@ mod tests {
         assert_eq!(entity.bl_present_flag, Some(true));
         assert_eq!(entity.el_present_flag, Some(false));
 
-        let back = stream_to_dto(&entity);
+        let back = stream_to_dto(entity);
         assert_eq!(back.dv_profile, Some(8));
         assert_eq!(back.dv_bl_signal_compatibility_id, Some(1));
         assert_eq!(back.rpu_present_flag, Some(1));
