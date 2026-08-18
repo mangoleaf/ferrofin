@@ -143,6 +143,27 @@ struct UserContentPermissions {
     can_download: bool,
 }
 
+/// Takes an item's prefetched entry instead of cloning it, when this is the
+/// item's only occurrence on the page.
+///
+/// A prefetched map is built once per page and read once per item, so the
+/// clone the read used to make was pure waste — the map is dropped right after
+/// the page is projected. The exception is a page that repeats an item (a
+/// playlist may legitimately list the same track twice, and `/Items?ids=` can
+/// be handed the same id twice): there the entry is read once per occurrence,
+/// so a repeated id keeps cloning and only unique ids move.
+///
+/// Only for maps read exactly once per item. `media_streams` in particular is
+/// NOT eligible — `MediaSources` (via a merged item's alternate versions, keyed
+/// by the *alternate's* id) and the `MediaStreams` field both read it.
+fn take_or_clone<V: Clone>(map: &mut HashMap<Uuid, V>, id: &Uuid, repeated: bool) -> Option<V> {
+    if repeated {
+        map.get(id).cloned()
+    } else {
+        map.remove(id)
+    }
+}
+
 impl Prefetched {
     /// A studio/genre/artist id from the prefetched `ItemValues` map — the nil
     /// id when the name has no stored value row, exactly as the per-name lookup
@@ -744,7 +765,8 @@ impl FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        prefetched: &Prefetched,
+        prefetched: &mut Prefetched,
+        repeated: bool,
     ) -> Result<BaseItemDto, ServiceError> {
         let item_id = row_id(item);
         let kind = row_kind(item);
@@ -752,7 +774,7 @@ impl FerrofinDtoService {
         let images = if options.enable_images
             || options.contains_field(ItemFields::PrimaryImageAspectRatio)
         {
-            prefetched.images.get(&item_id).cloned().unwrap_or_default()
+            take_or_clone(&mut prefetched.images, &item_id, repeated).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -787,7 +809,7 @@ impl FerrofinDtoService {
                 dto.play_access = Some(ferrofin_model::library::PlayAccess::Full);
             }
             if options.enable_user_data {
-                dto.user_data = prefetched.user_data.get(&item_id).cloned();
+                dto.user_data = take_or_clone(&mut prefetched.user_data, &item_id, repeated);
                 // C# `BaseItem.FillUserDataDtoValues`: a positive resume position
                 // over a known runtime becomes `PlayedPercentage` — the value
                 // client progress bars render on posters and resume rows.
@@ -860,8 +882,10 @@ impl FerrofinDtoService {
             Self::attach_studios(&mut dto, item, prefetched);
         }
 
-        self.attach_basic_fields(&mut dto, item, kind, &images, options, owner_id, prefetched)
-            .await?;
+        self.attach_basic_fields(
+            &mut dto, item, kind, &images, options, owner_id, prefetched, repeated,
+        )
+        .await?;
 
         let perms = prefetched.content_permissions.as_ref();
         // Can-delete / can-download: the file-level fact gated by the user's
@@ -896,7 +920,8 @@ impl FerrofinDtoService {
         images: &[ItemImageInfo],
         options: &DtoOptions,
         _owner_id: Option<Uuid>,
-        prefetched: &Prefetched,
+        prefetched: &mut Prefetched,
+        repeated: bool,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
 
@@ -1032,11 +1057,7 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::ProviderIds) {
             // {} when none (matches Jellyfin).
             dto.provider_ids = Some(
-                prefetched
-                    .provider_ids
-                    .get(&item_id)
-                    .cloned()
-                    .unwrap_or_default(),
+                take_or_clone(&mut prefetched.provider_ids, &item_id, repeated).unwrap_or_default(),
             );
         }
 
@@ -1104,10 +1125,7 @@ impl FerrofinDtoService {
 
             if options.contains_field(ItemFields::Trickplay) {
                 // Jellyfin emits {} when requested but there is no manifest.
-                let manifest = prefetched
-                    .trickplay
-                    .get(&item_id)
-                    .cloned()
+                let manifest = take_or_clone(&mut prefetched.trickplay, &item_id, repeated)
                     .unwrap_or_default();
                 dto.trickplay = Some(to_trickplay_manifest(&manifest));
             }
@@ -1115,11 +1133,8 @@ impl FerrofinDtoService {
 
         // Chapters — [] when requested but there are none (matches Jellyfin).
         if options.contains_field(ItemFields::Chapters) {
-            let mut chapters = prefetched
-                .chapters
-                .get(&item_id)
-                .cloned()
-                .unwrap_or_default();
+            let mut chapters =
+                take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
             // the chapter image request on `ImageTag` (port of
             // `ImageProcessor.GetImageCacheTag(item, chapter)`), so without it
@@ -1490,7 +1505,25 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
-        let prefetched = self.prefetch(items, options, user).await?;
+        let mut prefetched = self.prefetch(items, options, user).await?;
+        // Ids the page lists more than once (a playlist may repeat a track).
+        // Their prefetched entries are read once per occurrence, so they keep
+        // cloning while every unique id moves its entry out — see `take_or_clone`.
+        // `row_id` parses the stored id string, so the page's ids are resolved
+        // once here and reused for both the repeat check and the per-item flag.
+        // A single-item page cannot repeat, and `/Items/{id}`-class requests all
+        // land here through a one-element slice — so skip building the set.
+        let page_ids: Vec<Uuid> = items.iter().map(row_id).collect();
+        let repeated_ids: std::collections::HashSet<Uuid> = if page_ids.len() < 2 {
+            std::collections::HashSet::new()
+        } else {
+            let mut seen = std::collections::HashSet::with_capacity(page_ids.len());
+            page_ids
+                .iter()
+                .filter(|id| !seen.insert(**id))
+                .copied()
+                .collect()
+        };
         // By-name related counts for the page in one grouped query per kind
         // (C# calls `SetItemByNameInfo` per item).
         let name_counts = if options.contains_field(ItemFields::ItemCounts) {
@@ -1500,9 +1533,16 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         };
 
         let mut out = Vec::with_capacity(items.len());
-        for item in items {
+        for (item, item_id) in items.iter().zip(&page_ids) {
             let mut dto = self
-                .build_dto(item, options, user, owner_id, &prefetched)
+                .build_dto(
+                    item,
+                    options,
+                    user,
+                    owner_id,
+                    &mut prefetched,
+                    repeated_ids.contains(item_id),
+                )
                 .await?;
             if let Some(counts) = name_counts.get(&dto.id) {
                 apply_name_counts(&mut dto, counts);
@@ -1527,11 +1567,12 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         tagged_item_ids: Option<&[Uuid]>,
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
-        let prefetched = self
+        let mut prefetched = self
             .prefetch(std::slice::from_ref(item), options, user)
             .await?;
+        // Single-item page: the id cannot repeat, so every entry moves.
         let mut dto = self
-            .build_dto(item, options, user, None, &prefetched)
+            .build_dto(item, options, user, None, &mut prefetched, false)
             .await?;
 
         // When the caller pre-supplies the tagged items, count them by kind
@@ -2449,7 +2490,7 @@ mod tests {
         }
     }
 
-    /// A [`MediaSourceManager`] fake — all empty.
+    /// A [`MediaSourceManager`] fake — canned streams and one alternate version.
     #[derive(Default)]
     struct FakeSources;
 
@@ -2468,6 +2509,30 @@ mod tests {
             _item_id: Uuid,
         ) -> Result<Vec<MediaStream>, ServiceError> {
             Ok(vec![])
+        }
+        async fn get_media_streams_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, Vec<MediaStream>>, ServiceError> {
+            // Non-empty so the prefetched `media_streams` map is actually
+            // populated in these tests: it is read TWICE per video DTO
+            // (MediaSources, then the MediaStreams field) plus once per merged
+            // alternate keyed by the alternate's id, which is why it is excluded
+            // from `take_or_clone`. An empty map would hide a regression there.
+            Ok(item_ids
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        vec![MediaStream {
+                            index: 0,
+                            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                            codec: Some("h264".to_owned()),
+                            ..MediaStream::default()
+                        }],
+                    )
+                })
+                .collect())
         }
         async fn get_media_attachments(
             &self,
@@ -2604,7 +2669,7 @@ mod tests {
         }
     }
 
-    /// A [`TrickplayManager`] fake — no manifest.
+    /// A [`TrickplayManager`] fake — one canned 1080/320 manifest per item.
     #[derive(Default)]
     struct FakeTrickplay;
 
@@ -2641,9 +2706,27 @@ mod tests {
         }
         async fn get_trickplay_manifest(
             &self,
-            _item_id: Uuid,
+            item_id: Uuid,
         ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-            Ok(HashMap::new())
+            // Non-empty: against an EMPTY map `.remove()` and `.get().cloned()`
+            // are indistinguishable, so an empty manifest would let a wrong
+            // `repeated` flag on the trickplay read pass unnoticed.
+            Ok(HashMap::from([(
+                "1080".to_owned(),
+                HashMap::from([(
+                    320,
+                    TrickplayInfoEntity {
+                        item_id: item_id.to_string(),
+                        width: 320,
+                        height: 180,
+                        tile_width: 10,
+                        tile_height: 10,
+                        thumbnail_count: 100,
+                        interval: 10000,
+                        bandwidth: 1000,
+                    },
+                )]),
+            )]))
         }
         async fn get_hls_playlist(
             &self,
@@ -3064,6 +3147,176 @@ mod tests {
 
         assert_eq!(dto.provider_ids.as_ref().unwrap()["Imdb"], "tt1375666");
         assert_eq!(dto.external_urls.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_item_on_one_page_keeps_its_prefetched_rows() {
+        // A page may legitimately list the same item twice — a playlist
+        // repeating a track, or `/Items?ids=` handed the same id twice. The
+        // prefetched relation maps are read once per OCCURRENCE, so the
+        // page-build must not hand the first occurrence the only copy and
+        // leave the second one bare (`take_or_clone`'s `repeated` guard).
+        // All FIVE maps `take_or_clone` drains are covered — images, user_data,
+        // provider_ids, chapters, trickplay — because the whole risk of the
+        // change is "was the right flag threaded to each site", and each site
+        // must be caught individually. Against an EMPTY map `.remove()` and
+        // `.get().cloned()` are indistinguishable, so every map here is
+        // deliberately populated (the fakes return non-empty trickplay/streams).
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        seed_named_item(&db, id, BaseItemKind::Movie, "Twice").await;
+        seed_image(&db, id, 0, "/primary.jpg", Some("LKO2")).await;
+        sqlx::query(
+            r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
+               VALUES (?1, 'Imdb', 'tt1375666')"#,
+        )
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let item = fetch_item(&db, id).await;
+        // Backs the chapter repository, so `chapters` is a populated map.
+        let svc = service_with_chapters(db);
+        let options = DtoOptions {
+            fields: vec![
+                ItemFields::ProviderIds,
+                ItemFields::Chapters,
+                ItemFields::Trickplay,
+            ],
+            ..DtoOptions::default()
+        };
+
+        let dtos = svc
+            .get_base_item_dtos(
+                &[item.clone(), item.clone()],
+                &options,
+                Some(&user),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dtos.len(), 2);
+        for (i, dto) in dtos.iter().enumerate() {
+            let tags = dto
+                .image_tags
+                .as_ref()
+                .unwrap_or_else(|| panic!("occurrence {i} lost its image tags"));
+            assert_eq!(
+                tags[&ImageType::Primary],
+                "tag:/primary.jpg",
+                "occurrence {i} lost its primary image"
+            );
+            let hashes = dto
+                .image_blur_hashes
+                .as_ref()
+                .unwrap_or_else(|| panic!("occurrence {i} lost its blur hashes"));
+            assert_eq!(hashes[&ImageType::Primary]["tag:/primary.jpg"], "LKO2");
+            assert_eq!(
+                dto.provider_ids
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("occurrence {i} lost its provider ids"))["Imdb"],
+                "tt1375666",
+                "occurrence {i} lost its provider ids"
+            );
+            assert!(dto.user_data.is_some(), "occurrence {i} lost its user data");
+            assert!(
+                !dto.chapters
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("occurrence {i} lost its chapters"))
+                    .is_empty(),
+                "occurrence {i} got an empty chapter list"
+            );
+            assert!(
+                !dto.trickplay
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("occurrence {i} lost its trickplay manifest"))
+                    .is_empty(),
+                "occurrence {i} got an empty trickplay manifest"
+            );
+        }
+        // Both projections are identical — the second is not a degraded copy.
+        assert_eq!(dtos[0].image_tags, dtos[1].image_tags);
+        assert_eq!(dtos[0].provider_ids, dtos[1].provider_ids);
+        assert_eq!(dtos[0].chapters, dtos[1].chapters);
+        assert_eq!(dtos[0].user_data, dtos[1].user_data);
+        assert_eq!(dtos[0].trickplay, dtos[1].trickplay);
+    }
+
+    #[tokio::test]
+    async fn a_video_requesting_both_media_sources_and_streams_gets_both() {
+        // `media_streams` is the one prefetched map deliberately NOT drained by
+        // `take_or_clone`: item detail asks for MediaSources AND MediaStreams,
+        // so the map is read twice for the same id (plus once per merged
+        // alternate, keyed by the ALTERNATE's id). Draining it would silently
+        // empty `MediaStreams` on every `/Items/{id}` — killing audio/subtitle
+        // track selection in every client — with no other test noticing.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Streamed").await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let dtos = svc
+            .get_base_item_dtos(&[item], &options, None, None, false)
+            .await
+            .unwrap();
+
+        let dto = &dtos[0];
+        let sources = dto.media_sources.as_ref().expect("MediaSources requested");
+        assert!(
+            !sources[0].media_streams.is_empty(),
+            "MediaSources lost its streams"
+        );
+        assert!(
+            dto.media_streams.as_ref().is_some_and(|s| !s.is_empty()),
+            "MediaStreams emptied — the second read of the prefetched map lost its rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_items_alternate_version_keeps_its_streams_when_also_on_the_page() {
+        // The other half of the `media_streams` exclusion: the map is read once
+        // more keyed by a merged ALTERNATE's id, so draining it at EITHER
+        // per-item read site strands the alternate. A single-item page can't
+        // show this (a drain still returns the value to its own reader), so the
+        // page here deliberately overlaps — `FakeSources` hands every primary
+        // the same canned alternate id, which is also the first item's own id.
+        let db = test_db().await;
+        let shared = Uuid::from_u128(0xA17);
+        let other = Uuid::from_u128(0xA16);
+        seed_named_item(&db, shared, BaseItemKind::Movie, "Alt Cut").await;
+        seed_named_item(&db, other, BaseItemKind::Movie, "Feature").await;
+        let a = fetch_item(&db, shared).await;
+        let b = fetch_item(&db, other).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        };
+
+        let dtos = svc
+            .get_base_item_dtos(&[a, b], &options, None, None, false)
+            .await
+            .unwrap();
+
+        for (i, dto) in dtos.iter().enumerate() {
+            let sources = dto.media_sources.as_ref().expect("MediaSources requested");
+            for (j, source) in sources.iter().enumerate() {
+                assert!(
+                    !source.media_streams.is_empty(),
+                    "item {i} source {j} lost its streams — a prefetched \
+                     media_streams entry was drained out from under it"
+                );
+            }
+        }
     }
 
     #[tokio::test]
