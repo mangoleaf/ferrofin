@@ -99,10 +99,17 @@ struct Prefetched {
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
     person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
-    /// `ItemValues` id per `(value type, clean value)` for every studio/genre/
-    /// artist name across the page, so `attach_studios`/`_genres`/`_artists`
-    /// resolve from memory instead of a query per name.
-    value_ids: HashMap<(i32, String), Uuid>,
+    /// `ItemValues` id per clean value, bucketed by value type, for every
+    /// studio/genre/artist name across the page, so `attach_studios`/`_genres`/
+    /// `_artists` resolve from memory instead of a query per name. Nested (not
+    /// keyed by a `(i32, String)` tuple) so a lookup borrows the clean `&str`
+    /// instead of allocating a key per name per item.
+    value_ids: HashMap<i32, HashMap<String, Uuid>>,
+    /// The clean value ([`crate::text_util::get_clean_value`]) of every distinct
+    /// studio/genre/artist name on the page, computed once by the prefetch that
+    /// already had to compute it to build `value_ids`. `Prefetched::value_id`
+    /// reads it instead of re-cleaning the same name once per item.
+    clean_values: HashMap<String, String>,
     /// Chapters per item id (populated only when the `Chapters` field is requested).
     chapters: HashMap<Uuid, Vec<ferrofin_model::entities_media::ChapterInfo>>,
     /// Trickplay manifest per item id (populated only when the `Trickplay` field
@@ -129,8 +136,11 @@ struct Prefetched {
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
     /// so the whole page gates on one `Permissions` query.
     content_permissions: Option<UserContentPermissions>,
-    /// The per-NAME `Person` item id for each credited name on the page
-    /// (lowercased), so `People[].Id` points at the favoritable by-name item.
+    /// The per-NAME `Person` item id for each credited name on the page, so
+    /// `People[].Id` points at the favoritable by-name item. Keyed by the credit
+    /// row's name *as stored*: the prefetch resolves names case-insensitively
+    /// and then registers the resolved id under every raw spelling it saw, so
+    /// `attach_people` looks up by `&str` instead of lowercasing per credit.
     person_ids_by_name: HashMap<String, Uuid>,
     /// Ids that some item on the page lists as a merged alternate version.
     /// Their `media_streams` entry is read again while projecting that OTHER
@@ -178,15 +188,40 @@ fn take_or_clone<V: Clone>(map: &mut HashMap<Uuid, V>, id: &Uuid, repeated: bool
 }
 
 impl Prefetched {
+    /// The clean lookup key for a display name, reusing the value the prefetch
+    /// already computed for it.
+    ///
+    /// Same key as `get_clean_value(name)` in every case: the cache is filled
+    /// from that exact function, and a name the prefetch never saw (an unpopulated
+    /// `Prefetched`, or a name reached outside the collected fields) falls back
+    /// to computing it. Never normalize differently here — the clean value is the
+    /// join key against the stored `ItemValues.CleanValue` column, so a divergence
+    /// silently empties Genres/Studios/Artists.
+    fn clean_key<'a>(&'a self, name: &str) -> std::borrow::Cow<'a, str> {
+        self.clean_values.get(name).map_or_else(
+            || std::borrow::Cow::Owned(crate::text_util::get_clean_value(name)),
+            |clean| std::borrow::Cow::Borrowed(clean.as_str()),
+        )
+    }
+
+    /// The `ItemValues` id stored for an already-cleaned value under `value_type`,
+    /// or `None` when the page's prefetch found no such row.
+    fn lookup_clean(&self, value_type: i32, clean: &str) -> Option<Uuid> {
+        self.value_ids.get(&value_type)?.get(clean).copied()
+    }
+
+    /// [`Self::lookup_clean`] with the nil id for a missing row — exactly what the
+    /// per-name lookup resolved a missing row to.
+    fn value_id_clean(&self, value_type: i32, clean: &str) -> Uuid {
+        self.lookup_clean(value_type, clean)
+            .unwrap_or_else(Uuid::nil)
+    }
+
     /// A studio/genre/artist id from the prefetched `ItemValues` map — the nil
     /// id when the name has no stored value row, exactly as the per-name lookup
     /// resolved a missing row.
     fn value_id(&self, value_type: i32, name: &str) -> Uuid {
-        let clean = crate::text_util::get_clean_value(name);
-        self.value_ids
-            .get(&(value_type, clean))
-            .copied()
-            .unwrap_or_else(Uuid::nil)
+        self.value_id_clean(value_type, &self.clean_key(name))
     }
 }
 use crate::kinds;
@@ -333,14 +368,17 @@ fn attach_child_count(dto: &mut BaseItemDto, item: &BaseItemEntity, counts: &Has
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
 /// empties. Jellyfin joins `Genres`/`Studios`/`Artists`/… with `|`.
 fn split_multi(stored: Option<&str>) -> Vec<String> {
+    split_multi_str(stored).map(str::to_owned).collect()
+}
+
+/// [`split_multi`] without the allocation: the same segments, borrowed from the
+/// stored column. Used where the names are only read (the page's value-id
+/// prefetch), which is most of the calls — a 50-item page splits four columns
+/// per item and threw away a `String` per segment.
+fn split_multi_str(stored: Option<&str>) -> impl Iterator<Item = &str> {
     stored
-        .map(|s| {
-            s.split('|')
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|s| s.split('|').filter(|p| !p.is_empty()))
 }
 
 /// Parses a stored `MediaType` string into the enum, defaulting to
@@ -481,9 +519,14 @@ impl FerrofinDtoService {
         Ok(map)
     }
 
-    /// Resolves many `(value type, name)` pairs to their `ItemValues` ids in one
-    /// query, keyed by `(type, clean value)` — the page's studios/genres/artists.
+    /// Resolves many `(value type, CLEAN value)` pairs to their `ItemValues` ids
+    /// in one query — the page's studios/genres/artists — bucketed by type.
     /// Pairs with no row are simply absent.
+    ///
+    /// The caller passes values already normalized by
+    /// [`crate::text_util::get_clean_value`] (the prefetch computes each name's
+    /// clean form once and caches it for the projection); this must stay the
+    /// same normalization the stored `ItemValues.CleanValue` column holds.
     ///
     /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
     /// hash-map a clean value to a stable id; here the stored `ItemValues` row
@@ -491,13 +534,13 @@ impl FerrofinDtoService {
     /// suffices.
     async fn resolve_value_ids(
         &self,
-        pairs: &[(i32, String)],
-    ) -> Result<HashMap<(i32, String), Uuid>, ServiceError> {
-        let mut map = HashMap::new();
+        clean_pairs: &[(i32, String)],
+    ) -> Result<HashMap<i32, HashMap<String, Uuid>>, ServiceError> {
+        let mut map: HashMap<i32, HashMap<String, Uuid>> = HashMap::new();
         // Dedup the (type, clean) keys we need.
         let mut want: std::collections::HashSet<(i32, String)> = std::collections::HashSet::new();
-        for (t, name) in pairs {
-            want.insert((*t, crate::text_util::get_clean_value(name)));
+        for (t, clean) in clean_pairs {
+            want.insert((*t, clean.clone()));
         }
         if want.is_empty() {
             return Ok(map);
@@ -518,7 +561,7 @@ impl FerrofinDtoService {
             }
             for (t, clean, id) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(uuid) = Uuid::parse_str(&id) {
-                    map.insert((t, clean), uuid);
+                    map.entry(t).or_default().insert(clean, uuid);
                 }
             }
         }
@@ -604,7 +647,7 @@ impl FerrofinDtoService {
             // pre-unification rows fall back to the credit id.
             let person_id = prefetched
                 .person_ids_by_name
-                .get(&person.name.to_lowercase())
+                .get(person.name.as_str())
                 .copied()
                 .unwrap_or_else(|| Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil()));
             // Resolve the person's primary image tag (from the materialized Person
@@ -687,11 +730,13 @@ impl FerrofinDtoService {
                     // a real page instead of a dangling id. Pure performers
                     // keep the Artist (0) value id until the artist-hierarchy
                     // work lands.
-                    id: prefetched
-                        .value_ids
-                        .get(&(1, crate::text_util::get_clean_value(name)))
-                        .copied()
-                        .unwrap_or_else(|| prefetched.value_id(0, name)),
+                    id: {
+                        // One clean-key computation serves both lookups.
+                        let clean = prefetched.clean_key(name);
+                        prefetched
+                            .lookup_clean(1, &clean)
+                            .unwrap_or_else(|| prefetched.value_id_clean(0, &clean))
+                    },
                 })
                 .collect();
             dto.artists = Some(artists);
@@ -1683,28 +1728,47 @@ impl FerrofinDtoService {
                 // (C# AttachPeople: `People[].Id` is the per-name item id, the
                 // one favorites are written against — never the per-credit
                 // `Peoples` row id, which fragments a person across types).
+                // One lowercase per distinct spelling, not one per credit per
+                // item: `slot_by_name` maps every RAW spelling seen to the slot
+                // of the case-insensitively-deduped name it resolves through, so
+                // the projection can look the id up by the stored string.
                 let mut names: Vec<String> = Vec::new();
-                let mut seen = std::collections::HashSet::new();
+                let mut slot_by_lower: HashMap<String, usize> = HashMap::new();
+                let mut slot_by_name: HashMap<String, usize> = HashMap::new();
                 for person in people.values().flatten() {
-                    if seen.insert(person.name.to_lowercase()) {
-                        names.push(person.name.clone());
+                    if slot_by_name.contains_key(person.name.as_str()) {
+                        continue;
                     }
+                    let slot = *slot_by_lower
+                        .entry(person.name.to_lowercase())
+                        .or_insert_with(|| {
+                            names.push(person.name.clone());
+                            names.len() - 1
+                        });
+                    slot_by_name.insert(person.name.clone(), slot);
                 }
                 let resolved = self
                     .library
                     .get_named_items(ferrofin_model::data::BaseItemKind::Person, &names)
                     .await
                     .unwrap_or_default();
-                let mut by_name: HashMap<String, Uuid> = HashMap::new();
+                let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
                 let mut person_ids: Vec<Uuid> = Vec::new();
-                for (name, row) in names.iter().zip(resolved) {
+                for (slot, row) in resolved.into_iter().enumerate() {
                     if let Some(row) = row
                         && let Ok(id) = Uuid::parse_str(&row.id)
+                        && let Some(entry) = id_by_slot.get_mut(slot)
                     {
-                        by_name.insert(name.to_lowercase(), id);
+                        *entry = Some(id);
                         person_ids.push(id);
                     }
                 }
+                let by_name: HashMap<String, Uuid> = slot_by_name
+                    .into_iter()
+                    .filter_map(|(name, slot)| {
+                        id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
+                    })
+                    .collect();
                 // Pre-unification rows keyed images on the credit id; keep
                 // loading those too so old databases still render cast art.
                 person_ids.extend(
@@ -1725,39 +1789,40 @@ impl FerrofinDtoService {
         // exactly what the attach steps resolve: studios/genres only when their
         // field is requested, artists/album-artists only for the kinds that carry
         // artist fields — so a prefetched miss never wrongly nils a real id.
-        let value_ids = {
-            let mut pairs: Vec<(i32, String)> = Vec::new();
+        let (value_ids, clean_values) = {
+            // Dedup by the RAW name first, borrowing from the rows, so each
+            // distinct name is cleaned exactly once for the whole page (the
+            // projection then reads those cleans back out of `clean_values`
+            // instead of recomputing them per name per item).
+            let mut wanted: std::collections::HashSet<(i32, &str)> =
+                std::collections::HashSet::new();
             let want_studios = options.contains_field(ItemFields::Studios);
             let want_genres = options.contains_field(ItemFields::Genres);
             for item in items {
                 if want_studios {
-                    pairs.extend(
-                        split_multi(item.studios.as_deref())
-                            .into_iter()
-                            .map(|n| (3, n)),
-                    );
+                    wanted.extend(split_multi_str(item.studios.as_deref()).map(|n| (3, n)));
                 }
                 if want_genres {
-                    pairs.extend(
-                        split_multi(item.genres.as_deref())
-                            .into_iter()
-                            .map(|n| (2, n)),
-                    );
+                    wanted.extend(split_multi_str(item.genres.as_deref()).map(|n| (2, n)));
                 }
                 if kinds::has_artist_fields(row_kind(item)) {
-                    pairs.extend(
-                        split_multi(item.artists.as_deref())
-                            .into_iter()
-                            .map(|n| (0, n)),
-                    );
-                    pairs.extend(
-                        split_multi(item.album_artists.as_deref())
-                            .into_iter()
-                            .map(|n| (1, n)),
-                    );
+                    wanted.extend(split_multi_str(item.artists.as_deref()).map(|n| (0, n)));
+                    wanted.extend(split_multi_str(item.album_artists.as_deref()).map(|n| (1, n)));
                 }
             }
-            self.resolve_value_ids(&pairs).await?
+            let mut clean_values: HashMap<String, String> = HashMap::new();
+            let mut pairs: Vec<(i32, String)> = Vec::with_capacity(wanted.len());
+            for (value_type, name) in wanted {
+                let clean = if let Some(clean) = clean_values.get(name) {
+                    clean.clone()
+                } else {
+                    let clean = crate::text_util::get_clean_value(name);
+                    clean_values.insert(name.to_owned(), clean.clone());
+                    clean
+                };
+                pairs.push((value_type, clean));
+            }
+            (self.resolve_value_ids(&pairs).await?, clean_values)
         };
         let chapters = if options.contains_field(ItemFields::Chapters) {
             self.chapters.get_chapters_batch(&ids).await?
@@ -1861,6 +1926,7 @@ impl FerrofinDtoService {
             people,
             person_images,
             value_ids,
+            clean_values,
             chapters,
             trickplay,
             child_counts,
@@ -1927,11 +1993,13 @@ mod tests {
     // Each fake returns the empty/neutral value for every method the DTO paths
     // don't exercise, and a deterministic value for the few that matter.
 
-    /// A [`LibraryManager`] fake: `get_people` returns a fixed list, everything
-    /// else is empty/neutral.
+    /// A [`LibraryManager`] fake: `get_people` returns a fixed list,
+    /// `get_item_list` serves `named_items` by name (what the by-name lookup
+    /// `get_named_item(s)` is built on), everything else is empty/neutral.
     #[derive(Default)]
     struct FakeLibrary {
         people: Vec<PeopleEntity>,
+        named_items: Vec<BaseItemEntity>,
     }
 
     #[async_trait]
@@ -1959,9 +2027,24 @@ mod tests {
         }
         async fn get_item_list(
             &self,
-            _query: &ferrofin_traits::options::InternalItemsQuery,
+            query: &ferrofin_traits::options::InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-            Ok(vec![])
+            // Only the by-name lookup is served (`get_named_item` filters
+            // `get_item_list` by name): match the way the by-name tables do,
+            // case-insensitively.
+            let Some(name) = query.name.as_deref() else {
+                return Ok(vec![]);
+            };
+            Ok(self
+                .named_items
+                .iter()
+                .filter(|row| {
+                    row.name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                })
+                .cloned()
+                .collect())
         }
         async fn get_latest_item_list(
             &self,
@@ -3729,6 +3812,7 @@ mod tests {
                 person_type: Some("Actor".into()),
                 ..Default::default()
             }],
+            ..Default::default()
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -3759,20 +3843,240 @@ mod tests {
         let svc = service(db);
 
         // The batch resolver finds the stored id under its (type, clean) key.
-        let map = svc
-            .resolve_value_ids(&[(3, "Warner Bros.".to_string())])
-            .await
-            .unwrap();
-        assert_eq!(map.get(&(3, clean)).copied(), Some(vid));
+        let map = svc.resolve_value_ids(&[(3, clean.clone())]).await.unwrap();
+        assert_eq!(map.get(&3).and_then(|m| m.get(&clean)).copied(), Some(vid));
 
         // Prefetched::value_id reads the map without a query, and nil-s a name
-        // with no row.
+        // with no row. With an empty clean cache it falls back to cleaning the
+        // name itself, so an un-prefetched name still resolves.
         let pf = Prefetched {
             value_ids: map,
             ..Prefetched::default()
         };
         assert_eq!(pf.value_id(3, "Warner Bros."), vid);
         assert!(pf.value_id(3, "Nobody").is_nil());
+
+        // ...and the cached clean value resolves the same id, for every spelling
+        // that cleans to it.
+        let pf = Prefetched {
+            value_ids: pf.value_ids,
+            clean_values: [("warner  bros!".to_owned(), clean.clone())]
+                .into_iter()
+                .collect(),
+            ..Prefetched::default()
+        };
+        assert_eq!(pf.value_id(3, "warner  bros!"), vid);
+    }
+
+    /// Studios/genres/artists must resolve to the SAME `ItemValues` ids the
+    /// per-name lookup found, for names whose clean form differs from the stored
+    /// spelling — the page's cached clean keys are the join key against
+    /// `ItemValues.CleanValue`, so any normalization drift empties these fields.
+    #[tokio::test]
+    async fn value_ids_resolve_end_to_end_for_awkward_names() {
+        let db = test_db().await;
+
+        // Seed one ItemValues row per (type, clean value).
+        let seed_value = |value_type: i32, name: &'static str| {
+            let db = db.clone();
+            async move {
+                let vid = Uuid::new_v4();
+                sqlx::query(
+                    r#"INSERT INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+                       VALUES (?1, ?2, ?3, ?4)"#,
+                )
+                .bind(guid_to_db(vid))
+                .bind(crate::text_util::get_clean_value(name))
+                .bind(value_type)
+                .bind(name)
+                .execute(db.writer())
+                .await
+                .unwrap();
+                vid
+            }
+        };
+        let studio_id = seed_value(3, "Warner Bros.").await;
+        let genre_id = seed_value(2, "Sci-Fi").await;
+        // The artist is stored under BOTH value types, with different spellings
+        // that share a clean value — attach_artists must prefer the AlbumArtist
+        // (1) row, which is the browsable one.
+        let artist_id = seed_value(0, "Sigur Rós").await;
+        let album_artist_id = seed_value(1, "sigur ros").await;
+
+        let movie = Uuid::from_u128(0xA_1234);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Studios" = 'WARNER   BROS!', "Genres" = 'sci fi'
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(movie))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let song = Uuid::from_u128(0xA_5678);
+        seed_named_item(&db, song, BaseItemKind::Audio, "Song").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Artists" = 'sigur rós', "AlbumArtists" = 'Sigur ROS'
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(song))
+        .execute(db.writer())
+        .await
+        .unwrap();
+
+        let movie_row = fetch_item(&db, movie).await;
+        let song_row = fetch_item(&db, song).await;
+        let svc = service(db);
+        // One page holding both rows: the batch prefetch builds the clean keys.
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie_row, song_row],
+                &DtoOptions::default(),
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let studios = dtos[0].studios.as_ref().expect("studios");
+        assert_eq!(studios[0].name.as_deref(), Some("WARNER   BROS!"));
+        assert_eq!(studios[0].id, studio_id, "studio id");
+        let genres = dtos[0].genre_items.as_ref().expect("genre items");
+        assert_eq!(genres[0].id, genre_id, "genre id");
+
+        let artists = dtos[1].artist_items.as_ref().expect("artist items");
+        assert_eq!(
+            artists[0].id, album_artist_id,
+            "performer prefers the AlbumArtist value id"
+        );
+        assert_ne!(artists[0].id, artist_id);
+        let album_artists = dtos[1].album_artists.as_ref().expect("album artists");
+        assert_eq!(album_artists[0].id, album_artist_id, "album-artist id");
+    }
+
+    /// Every credit spelling on the page must resolve to the ONE by-name `Person`
+    /// item (what favorites are written against), not to its per-credit row id.
+    #[tokio::test]
+    async fn people_ids_resolve_for_every_credit_spelling() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xB_1234);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let person = Uuid::from_u128(0xB_5678);
+        seed_named_item(&db, person, BaseItemKind::Person, "Leonardo DiCaprio").await;
+        let person_row = fetch_item(&db, person).await;
+        let item = fetch_item(&db, movie).await;
+
+        let library = Arc::new(FakeLibrary {
+            people: vec![
+                PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: "Leonardo DiCaprio".into(),
+                    person_type: Some("Actor".into()),
+                    ..Default::default()
+                },
+                // The same person credited again with different casing — one
+                // by-name item backs both.
+                PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: "leonardo dicaprio".into(),
+                    person_type: Some("Director".into()),
+                    ..Default::default()
+                },
+            ],
+            named_items: vec![person_row],
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].id, person, "first spelling");
+        assert_eq!(people[1].id, person, "second spelling");
+    }
+
+    /// The clean lookup key the projection uses must be byte-identical to
+    /// `get_clean_value` for every name — a divergence silently empties
+    /// Genres/Studios/Artists/People instead of failing loudly.
+    #[tokio::test]
+    async fn clean_lookup_keys_match_get_clean_value_for_awkward_names() {
+        const NAMES: &[&str] = &[
+            "Warner Bros.",
+            "warner bros",
+            "WARNER BROS.",
+            "  Leading And Trailing  ",
+            "Ångström Þéâtre",
+            "Motörhead",
+            "Amélie",
+            "AC/DC",
+            "Sigur Rós & Björk",
+            "Beyoncé feat. Jay-Z",
+            "  ",
+            "",
+            "20th Century Fox",
+            "!!!",
+        ];
+
+        let db = test_db().await;
+        let svc = service(db.clone());
+
+        // A stored row for every distinct clean value, so a wrong key is a
+        // missing id rather than a coincidental match.
+        let mut expected: HashMap<String, Uuid> = HashMap::new();
+        for name in NAMES {
+            let clean = crate::text_util::get_clean_value(name);
+            if expected.contains_key(&clean) {
+                continue;
+            }
+            let vid = Uuid::new_v4();
+            sqlx::query(
+                r#"INSERT INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
+                   VALUES (?1, ?2, 3, ?3)"#,
+            )
+            .bind(guid_to_db(vid))
+            .bind(&clean)
+            .bind(*name)
+            .execute(db.writer())
+            .await
+            .unwrap();
+            expected.insert(clean, vid);
+        }
+
+        // The prefetched (cached-clean) path and the uncached fallback path must
+        // agree with each other AND with a fresh get_clean_value lookup.
+        let pairs: Vec<(i32, String)> = NAMES
+            .iter()
+            .map(|n| (3, crate::text_util::get_clean_value(n)))
+            .collect();
+        let value_ids = svc.resolve_value_ids(&pairs).await.unwrap();
+        let cached = Prefetched {
+            value_ids: value_ids.clone(),
+            clean_values: NAMES
+                .iter()
+                .map(|n| ((*n).to_owned(), crate::text_util::get_clean_value(n)))
+                .collect(),
+            ..Prefetched::default()
+        };
+        let uncached = Prefetched {
+            value_ids,
+            ..Prefetched::default()
+        };
+        for name in NAMES {
+            let want = expected
+                .get(&crate::text_util::get_clean_value(name))
+                .copied()
+                .expect("seeded id");
+            assert_eq!(
+                cached.clean_key(name).as_ref(),
+                crate::text_util::get_clean_value(name),
+                "clean key diverged for {name:?}"
+            );
+            assert_eq!(cached.value_id(3, name), want, "cached id for {name:?}");
+            assert_eq!(uncached.value_id(3, name), want, "uncached id for {name:?}");
+        }
     }
 
     #[tokio::test]
