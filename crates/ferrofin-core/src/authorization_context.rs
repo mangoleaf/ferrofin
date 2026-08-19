@@ -943,6 +943,132 @@ mod tests {
         (ctx, config)
     }
 
+    /// Builds a context whose configuration carries the given
+    /// `EnableLegacyAuthorization` value — the single flag every Emby-era
+    /// fallback on the auth path is gated on.
+    fn context_with_legacy(db: Database, legacy: bool) -> FerrofinAuthorizationContext {
+        let mut config = default_server_configuration();
+        config.enable_legacy_authorization = legacy;
+        context_with_config(db, Arc::new(FakeConfig::new(config))).0
+    }
+
+    /// A request carrying exactly one header.
+    fn header_request(name: &str, value: &str) -> RequestContext {
+        RequestContext {
+            headers: vec![(name.to_owned(), value.to_owned())],
+            ..Default::default()
+        }
+    }
+
+    /// A request carrying exactly one query string.
+    fn query_request(query: &str) -> RequestContext {
+        RequestContext {
+            query_string: Some(query.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// Every Emby-era credential form the `EnableLegacyAuthorization` flag
+    /// gates, each presenting the seeded device token (`dev-tok`) and nothing
+    /// else — so whether the request authenticates *is* the flag's observable
+    /// behaviour.
+    fn legacy_credential_requests() -> Vec<(&'static str, RequestContext)> {
+        vec![
+            (
+                "X-Emby-Token header",
+                header_request("X-Emby-Token", "dev-tok"),
+            ),
+            (
+                "X-MediaBrowser-Token header",
+                header_request("X-MediaBrowser-Token", "dev-tok"),
+            ),
+            (
+                "X-Emby-Authorization header",
+                header_request("X-Emby-Authorization", r#"MediaBrowser Token="dev-tok""#),
+            ),
+            (
+                "Emby authorization scheme",
+                header_request("Authorization", r#"Emby Token="dev-tok""#),
+            ),
+            ("api_key query parameter", query_request("api_key=dev-tok")),
+        ]
+    }
+
+    /// The modern (non-legacy) credential forms, presenting the same token.
+    /// These must resolve on BOTH sides of the flag — it gates the Emby-era
+    /// fallbacks, it is not a global authentication switch.
+    fn modern_credential_requests() -> Vec<(&'static str, RequestContext)> {
+        vec![
+            ("MediaBrowser Authorization header", token_request()),
+            ("ApiKey query parameter", query_request("ApiKey=dev-tok")),
+        ]
+    }
+
+    /// Legacy authorization ON: every Emby-era credential resolves the device
+    /// token, and the modern forms keep working.
+    ///
+    /// A fresh context per case keeps the per-context `AuthCache` cold, so each
+    /// assertion really re-runs token resolution.
+    #[tokio::test]
+    async fn legacy_authorization_enabled_accepts_emby_era_credentials() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x3a);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        for (label, request) in legacy_credential_requests()
+            .into_iter()
+            .chain(modern_credential_requests())
+        {
+            let ctx = context_with_legacy(db.clone(), true);
+            let info = ctx.get_authorization_info(&request).await.expect("info");
+            assert!(
+                info.is_authenticated,
+                "{label} must authenticate when legacy authorization is enabled"
+            );
+            assert_eq!(info.user_id(), uid, "{label} resolved the wrong user");
+        }
+    }
+
+    /// Legacy authorization OFF: the same Emby-era credentials are refused —
+    /// no token is even extracted from them — while the modern forms still
+    /// authenticate. This is the negative half of the gate; without it the flag
+    /// could be forced on (or removed) and nothing would notice.
+    #[tokio::test]
+    async fn legacy_authorization_disabled_rejects_emby_era_credentials() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x3b);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        for (label, request) in legacy_credential_requests() {
+            let ctx = context_with_legacy(db.clone(), false);
+            let info = ctx.get_authorization_info(&request).await.expect("info");
+            assert!(
+                !info.is_authenticated,
+                "{label} must be refused when legacy authorization is disabled"
+            );
+            assert!(!info.has_token(), "{label} must not yield a token at all");
+            assert!(
+                matches!(
+                    AuthService::authenticate(&ctx, &request).await,
+                    Err(ServiceError::Unauthorized(_))
+                ),
+                "{label} must be a 401 through the auth service"
+            );
+        }
+
+        for (label, request) in modern_credential_requests() {
+            let ctx = context_with_legacy(db.clone(), false);
+            let info = ctx.get_authorization_info(&request).await.expect("info");
+            assert!(
+                info.is_authenticated,
+                "{label} must still authenticate with legacy authorization disabled"
+            );
+            assert_eq!(info.user_id(), uid, "{label} resolved the wrong user");
+        }
+    }
+
     /// Finding #8: the legacy-authorization flag is read ONCE per request.
     /// Re-reading it deep-clones the entire `ServerConfiguration` (policy,
     /// paths, every `Vec` and `Option` in it) on the authenticated hot path,
