@@ -2,7 +2,8 @@
 //!
 //! Ports the four read-only `[Authorize(FirstTimeSetupOrDefault)]` actions:
 //! - `GET /Localization/Cultures` — the known cultures, de-duplicated by display
-//!   name (case-insensitive) and ordered by it.
+//!   name (case-insensitive) and ordered by it (case-insensitively — see
+//!   [`distinct_ordered_cultures`]).
 //! - `GET /Localization/Countries` — the known countries.
 //! - `GET /Localization/ParentalRatings` — the known parental ratings.
 //! - `GET /Localization/Options` — the UI localization options.
@@ -34,15 +35,34 @@ async fn get_cultures(
     State(state): State<AppState>,
     _auth: FirstTimeSetupOrAuth,
 ) -> Json<Vec<CultureDto>> {
+    Json(distinct_ordered_cultures(state.localization.get_cultures()))
+}
+
+/// C#'s `cultures.DistinctBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase)
+/// .OrderBy(c => c.DisplayName)`, shared by `GET /Localization/Cultures` and
+/// `GET /Items/{itemId}/MetadataEditor` so the two lists a client cross-references
+/// are ordered identically.
+///
+/// Port note — the comparer: `OrderBy(string)` with no comparer uses
+/// `Comparer<string>.Default`, i.e. `string.CompareTo` /
+/// `StringComparer.CurrentCulture` — a *linguistic* comparison, not an ordinal
+/// one. Case is only a tertiary difference there, so "afar" sorts before "Zulu"
+/// (ordinal would put "Zulu" first, since `'Z' (0x5A) < 'a' (0x61)`). Case is
+/// therefore folded for the sort key. Case *ties* need no ordinal tiebreak: names
+/// differing only by case were already collapsed by the `OrdinalIgnoreCase`
+/// dedupe, and the stable sort keeps the surviving source order for the rest.
+///
+/// The dedupe runs first and keeps the first occurrence in *source* order, as
+/// `DistinctBy` does — which entry survives decides the `Name` /
+/// `ThreeLetterISOLanguageName` the client sees for that display name.
+pub(crate) fn distinct_ordered_cultures(cultures: Vec<CultureDto>) -> Vec<CultureDto> {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut cultures: Vec<CultureDto> = state
-        .localization
-        .get_cultures()
+    let mut cultures: Vec<CultureDto> = cultures
         .into_iter()
         .filter(|c| seen.insert(c.display_name.to_ascii_lowercase()))
         .collect();
-    cultures.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-    Json(cultures)
+    cultures.sort_by_cached_key(|c| c.display_name.to_ascii_lowercase());
+    cultures
 }
 
 /// `GET /Localization/Countries` — the known countries.

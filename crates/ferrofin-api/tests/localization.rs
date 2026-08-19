@@ -206,30 +206,22 @@ struct StubLocalization;
 
 impl LocalizationManager for StubLocalization {
     fn get_cultures(&self) -> Vec<CultureDto> {
-        vec![
-            CultureDto {
-                name: "en".to_owned(),
-                display_name: "English".to_owned(),
-                two_letter_iso_language_name: "en".to_owned(),
-                three_letter_iso_language_name: Some("eng".to_owned()),
-                three_letter_iso_language_names: vec!["eng".to_owned()],
-            },
-            // A duplicate display name to prove de-duplication.
-            CultureDto {
-                name: "en2".to_owned(),
-                display_name: "English".to_owned(),
-                two_letter_iso_language_name: "en".to_owned(),
-                three_letter_iso_language_name: Some("eng".to_owned()),
-                three_letter_iso_language_names: vec!["eng".to_owned()],
-            },
-            CultureDto {
-                name: "de".to_owned(),
-                display_name: "German".to_owned(),
-                two_letter_iso_language_name: "de".to_owned(),
-                three_letter_iso_language_name: Some("deu".to_owned()),
-                three_letter_iso_language_names: vec!["deu".to_owned()],
-            },
-        ]
+        // Deliberately out of order, with mixed-case initials: an ordinal sort
+        // ("Zulu" < "afar") and a case-insensitive one ("afar" < "Zulu") disagree
+        // on this list, so the ordering assertion can actually fail.
+        ["Zulu", "English", "english", "German", "afar"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, display_name)| CultureDto {
+                // A distinct Name per entry, so the dedupe's "keep the first in
+                // source order" is observable.
+                name: format!("c{i}"),
+                display_name: display_name.to_owned(),
+                two_letter_iso_language_name: display_name[..2].to_ascii_lowercase(),
+                three_letter_iso_language_name: Some(display_name[..3].to_ascii_lowercase()),
+                three_letter_iso_language_names: vec![display_name[..3].to_ascii_lowercase()],
+            })
+            .collect()
     }
     fn get_countries(&self) -> Vec<CountryInfo> {
         vec![CountryInfo {
@@ -469,16 +461,31 @@ fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("valid JSON body")
 }
 
+/// The order both `GET /Localization/Cultures` and `GET /Items/{id}/MetadataEditor`
+/// must return for the shared stub culture list — the same constant is asserted in
+/// `tests/item_update.rs`, because a client cross-references the two lists.
+///
+/// C#'s `OrderBy(c => c.DisplayName)` takes no comparer, so it sorts with
+/// `Comparer<string>.Default` (`StringComparer.CurrentCulture`) — linguistic, not
+/// ordinal, which puts "afar" before "Zulu". An ordinal sort would yield
+/// `["English", "German", "Zulu", "afar"]`.
+const EXPECTED_CULTURE_ORDER: [&str; 4] = ["afar", "English", "German", "Zulu"];
+
 #[tokio::test]
 async fn localization_cultures_are_distinct_and_ordered() {
     let (status, body) = get(full_state(), "/Localization/Cultures").await;
     assert_eq!(status, StatusCode::OK);
     let v = json(&body);
     let arr = v.as_array().unwrap();
-    // "English" (duplicated) collapses to one; ordered English < German.
-    assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0]["DisplayName"], "English");
-    assert_eq!(arr[1]["DisplayName"], "German");
+    // "English"/"english" collapse to one (OrdinalIgnoreCase DistinctBy).
+    let names: Vec<&str> = arr
+        .iter()
+        .map(|c| c["DisplayName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, EXPECTED_CULTURE_ORDER, "case-insensitive order");
+    // The dedupe keeps the *first* entry in source order, so "English" (c1) wins
+    // over "english" (c2).
+    assert_eq!(arr[1]["Name"], "c1");
 }
 
 #[tokio::test]

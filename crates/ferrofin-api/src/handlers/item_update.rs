@@ -545,7 +545,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 ///
 /// Port of `ItemUpdateController.GetMetadataEditorInfo`: resolves the item (`404`
 /// when absent), then assembles the reference data — parental ratings, countries,
-/// cultures (deduped by display name, name-ordered), the item's external-id
+/// cultures (deduped by display name, name-ordered case-insensitively via the
+/// shared [`crate::handlers::localization::distinct_ordered_cultures`]), the item's external-id
 /// descriptors, and the per-item content-type options.
 ///
 /// Port note — content type: C# refines `ContentType`/`ContentTypeOptions` from
@@ -576,14 +577,10 @@ async fn get_metadata_editor(
     let external_id_infos = state.providers.get_external_id_infos(item_id).await?;
 
     // Dedupe cultures by display name (case-insensitively) and order by it, as in
-    // C#'s `DistinctBy(...).OrderBy(c => c.DisplayName)`.
-    let mut cultures = state.localization.get_cultures();
-    cultures.sort_by(|a, b| {
-        a.display_name
-            .to_ascii_lowercase()
-            .cmp(&b.display_name.to_ascii_lowercase())
-    });
-    cultures.dedup_by(|a, b| a.display_name.eq_ignore_ascii_case(&b.display_name));
+    // C#'s `DistinctBy(...).OrderBy(c => c.DisplayName)`. Shared with
+    // `GET /Localization/Cultures` so both lists come back in the same order.
+    let cultures =
+        crate::handlers::localization::distinct_ordered_cultures(state.localization.get_cultures());
 
     let info = MetadataEditorInfo {
         parental_rating_options: state.localization.get_parental_ratings(),

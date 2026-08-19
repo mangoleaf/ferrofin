@@ -571,28 +571,28 @@ impl ProviderManager for RecordingProviders {
 }
 
 /// A [`LocalizationManager`] returning canned cultures/countries/ratings so the
-/// metadata-editor handler can build its descriptor. The two cultures share a
-/// display name (different casing) to exercise the handler's dedupe.
+/// metadata-editor handler can build its descriptor. Two cultures share a display
+/// name (different casing) to exercise the handler's dedupe, and the list mixes
+/// upper- and lower-case initials so an ordinal sort and a case-insensitive one
+/// disagree on it. It is the same list `tests/localization.rs` feeds
+/// `GET /Localization/Cultures`, so both endpoints can assert one expected order.
 struct StubLocalization;
 
 impl ferrofin_traits::localization::LocalizationManager for StubLocalization {
     fn get_cultures(&self) -> Vec<ferrofin_model::globalization::CultureDto> {
-        vec![
-            ferrofin_model::globalization::CultureDto {
-                name: "en".to_owned(),
-                display_name: "English".to_owned(),
-                two_letter_iso_language_name: "en".to_owned(),
-                three_letter_iso_language_name: Some("eng".to_owned()),
-                three_letter_iso_language_names: vec!["eng".to_owned()],
-            },
-            ferrofin_model::globalization::CultureDto {
-                name: "en-US".to_owned(),
-                display_name: "english".to_owned(),
-                two_letter_iso_language_name: "en".to_owned(),
-                three_letter_iso_language_name: Some("eng".to_owned()),
-                three_letter_iso_language_names: vec!["eng".to_owned()],
-            },
-        ]
+        ["Zulu", "English", "english", "German", "afar"]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(i, display_name)| ferrofin_model::globalization::CultureDto {
+                    name: format!("c{i}"),
+                    display_name: display_name.to_owned(),
+                    two_letter_iso_language_name: display_name[..2].to_ascii_lowercase(),
+                    three_letter_iso_language_name: Some(display_name[..3].to_ascii_lowercase()),
+                    three_letter_iso_language_names: vec![display_name[..3].to_ascii_lowercase()],
+                },
+            )
+            .collect()
     }
     fn get_countries(&self) -> Vec<ferrofin_model::globalization::CountryInfo> {
         vec![ferrofin_model::globalization::CountryInfo::default()]
@@ -967,6 +967,22 @@ async fn metadata_editor_returns_descriptor() {
     // configurable. See get_metadata_editor.
     assert!(info.content_type_options.is_empty());
     assert_eq!(info.external_id_infos.len(), 1);
+
+    // Cultures are deduped case-insensitively and ordered case-insensitively, the
+    // same way `GET /Localization/Cultures` orders them (C#'s comparer-less
+    // `OrderBy(c => c.DisplayName)` is linguistic, not ordinal, so "afar" precedes
+    // "Zulu"; an ordinal sort would yield ["English", "German", "Zulu", "afar"]).
+    // `tests/localization.rs::EXPECTED_CULTURE_ORDER` asserts this same sequence
+    // for the same stub list — the two lists a client cross-references must agree.
+    let names: Vec<&str> = info
+        .cultures
+        .iter()
+        .map(|c| c.display_name.as_str())
+        .collect();
+    assert_eq!(names, ["afar", "English", "German", "Zulu"]);
+    // The dedupe keeps the first entry in source order: "English" (c1), not
+    // "english" (c2).
+    assert_eq!(info.cultures[1].name, "c1");
 }
 
 #[tokio::test]
