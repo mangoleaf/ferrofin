@@ -27,6 +27,7 @@
 //!   device-name/app-version, has its row updated (skipping cast receivers,
 //!   matching upstream `allowTokenInfoUpdate`).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -125,46 +126,49 @@ impl FerrofinAuthorizationContext {
 
     /// Resolves the access token from the parsed auth header fields, then the
     /// legacy headers / query parameters (the latter gated on legacy auth).
-    async fn resolve_token(
-        &self,
+    ///
+    /// `legacy` is the already-resolved `EnableLegacyAuthorization` flag: the
+    /// caller reads it once per request so this path never re-clones the whole
+    /// [`ferrofin_model::configuration::ServerConfiguration`].
+    fn resolve_token(
         request: &RequestContext,
-        header_token: Option<&str>,
-    ) -> Result<Option<String>, ServiceError> {
+        header_token: Option<String>,
+        legacy: bool,
+    ) -> Option<String> {
         if let Some(token) = header_token.filter(|t| !t.is_empty()) {
-            return Ok(Some(token.to_owned()));
+            return Some(token);
         }
 
-        let legacy = self.legacy_authorization_enabled().await?;
         if legacy {
             for header in ["X-Emby-Token", "X-MediaBrowser-Token"] {
                 if let Some(token) = request.header(header).filter(|t| !t.is_empty()) {
-                    return Ok(Some(token.to_owned()));
+                    return Some(token.to_owned());
                 }
             }
         }
 
         if let Some(token) = query_value(request, "ApiKey").filter(|t| !t.is_empty()) {
-            return Ok(Some(token));
+            return Some(token.into_owned());
         }
         if let Some(token) = query_value(request, "api_key").filter(|t| legacy && !t.is_empty()) {
-            return Ok(Some(token));
+            return Some(token.into_owned());
         }
-        Ok(None)
+        None
     }
 
     /// Reads the (single) authorization header, honouring the legacy
     /// `X-Emby-Authorization` header when legacy auth is enabled.
-    async fn authorization_header<'r>(
-        &self,
-        request: &'r RequestContext,
-    ) -> Result<Option<&'r str>, ServiceError> {
+    ///
+    /// Takes the pre-resolved `legacy` flag for the same reason as
+    /// [`Self::resolve_token`].
+    fn authorization_header(request: &RequestContext, legacy: bool) -> Option<&str> {
         if let Some(value) = request.header("Authorization") {
-            return Ok(Some(value));
+            return Some(value);
         }
-        if self.legacy_authorization_enabled().await? {
-            return Ok(request.header("X-Emby-Authorization"));
+        if legacy {
+            return request.header("X-Emby-Authorization");
         }
-        Ok(None)
+        None
     }
 
     /// Resolves a device token into the auth info, refreshing stale/changed
@@ -326,28 +330,27 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
         &self,
         request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        let header = self.authorization_header(request).await?;
+        // The one configuration read of the request: every legacy fallback
+        // below is gated on this flag, and re-reading it deep-clones the whole
+        // `ServerConfiguration`.
         let legacy = self.legacy_authorization_enabled().await?;
-        let parts = header.and_then(|h| parse_authorization_header(h, legacy));
+        let header = Self::authorization_header(request, legacy);
+        let mut parts = header
+            .and_then(|h| parse_authorization_header(h, legacy))
+            .unwrap_or_default();
 
         let mut info = AuthorizationInfo {
-            device_id: parts.as_ref().and_then(|p| p.get("DeviceId").cloned()),
-            device: parts.as_ref().and_then(|p| p.get("Device").cloned()),
-            client: parts.as_ref().and_then(|p| p.get("Client").cloned()),
-            version: parts.as_ref().and_then(|p| p.get("Version").cloned()),
+            device_id: parts.device_id.take(),
+            device: parts.device.take(),
+            client: parts.client.take(),
+            version: parts.version.take(),
             token: None,
             is_api_key: false,
             user: None,
             is_authenticated: false,
         };
 
-        let header_token = parts
-            .as_ref()
-            .and_then(|p| p.get("Token").map(String::as_str));
-        info.token = self
-            .resolve_token(request, header_token)
-            .await?
-            .map(Into::into);
+        info.token = Self::resolve_token(request, parts.token.take(), legacy).map(Into::into);
 
         if !info.has_token() {
             return Ok(info);
@@ -407,8 +410,6 @@ impl AuthService for FerrofinAuthService {
     }
 }
 
-/// Reads the first value of a query-string parameter, case-insensitively on the
-/// key. The `RequestContext` carries the raw query string (no leading `?`).
 /// Fills the auth info's blank client/device fields from a device row — the
 /// hit-path half of `resolve_device_token`'s defaults (the C# branch that only
 /// *reads* the row; the rename/refresh half runs on cache misses only).
@@ -430,7 +431,9 @@ fn fill_blank_client_fields(
     }
 }
 
-fn query_value(request: &RequestContext, key: &str) -> Option<String> {
+/// Reads the first value of a query-string parameter, case-insensitively on the
+/// key. The `RequestContext` carries the raw query string (no leading `?`).
+fn query_value<'r>(request: &'r RequestContext, key: &str) -> Option<Cow<'r, str>> {
     let query = request.query_string.as_deref()?;
     for pair in query.split('&') {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -441,13 +444,48 @@ fn query_value(request: &RequestContext, key: &str) -> Option<String> {
     None
 }
 
-/// Parses a `MediaBrowser`/`Emby` authorization header into its component map
-/// (C# `GetAuthorization` + `GetParts`). Returns `None` when the scheme name is
-/// missing or is not a recognised scheme (`Emby` only when `legacy`).
-fn parse_authorization_header(
-    header: &str,
-    legacy: bool,
-) -> Option<std::collections::HashMap<String, String>> {
+/// The five authorization-header fields Ferrofin consumes (C# reads exactly
+/// these out of `GetParts`' dictionary). Holding them in a struct instead of a
+/// `HashMap<String, String>` keeps the per-request cost to at most one
+/// allocation per *present* field — no map, no owned keys, and nothing at all
+/// for parts the server never reads.
+///
+/// Keys are matched **case-sensitively**, matching the ordinal
+/// `Dictionary<string, string>` lookups upstream (and the previous map).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct AuthorizationParts {
+    /// `DeviceId="…"`.
+    device_id: Option<String>,
+    /// `Device="…"` (the device's display name).
+    device: Option<String>,
+    /// `Client="…"`.
+    client: Option<String>,
+    /// `Version="…"`.
+    version: Option<String>,
+    /// `Token="…"` (the access token).
+    token: Option<String>,
+}
+
+impl AuthorizationParts {
+    /// Records one `key`/raw-`value` pair, URL-decoding the value and stripping
+    /// its surrounding quotes. Unrecognised keys are dropped.
+    fn set(&mut self, key: &str, raw: &str) {
+        let slot = match key {
+            "DeviceId" => &mut self.device_id,
+            "Device" => &mut self.device,
+            "Client" => &mut self.client,
+            "Version" => &mut self.version,
+            "Token" => &mut self.token,
+            _ => return,
+        };
+        *slot = Some(url_decode(raw.trim_matches('"')).into_owned());
+    }
+}
+
+/// Parses a `MediaBrowser`/`Emby` authorization header into its component
+/// fields (C# `GetAuthorization` + `GetParts`). Returns `None` when the scheme
+/// name is missing or is not a recognised scheme (`Emby` only when `legacy`).
+fn parse_authorization_header(header: &str, legacy: bool) -> Option<AuthorizationParts> {
     let (scheme, rest) = header.split_once(' ')?;
     let valid = scheme.eq_ignore_ascii_case("MediaBrowser")
         || (legacy && scheme.eq_ignore_ascii_case("Emby"));
@@ -460,39 +498,42 @@ fn parse_authorization_header(
 /// Parses the comma-separated `Key="Value"` parts of an authorization header
 /// (C# `GetParts`), URL-decoding each value and honouring quoted values that may
 /// themselves contain commas.
-fn parse_parts(header: &str) -> std::collections::HashMap<String, String> {
-    let mut result = std::collections::HashMap::new();
-    let chars: Vec<char> = header.chars().collect();
+///
+/// Scans `header.as_bytes()` and slices the original `&str`. Every byte the
+/// state machine reacts to (`"`, `,`, `=`) is ASCII, and UTF-8 continuation
+/// bytes are all `>= 0x80`, so a byte scan visits exactly the same decision
+/// points a `char` scan did and every recorded offset lands on a character
+/// boundary — the slicing is infallible and the parse is byte-for-byte the one
+/// the `Vec<char>` version produced.
+fn parse_parts(header: &str) -> AuthorizationParts {
+    let mut result = AuthorizationParts::default();
+    let bytes = header.as_bytes();
     let mut escaped = false;
     let mut start = 0usize;
-    let mut key = String::new();
+    let mut key: &str = "";
 
-    let mut i = 0usize;
-    while i < chars.len() {
-        let token = chars[i];
-        if token == '"' || token == ',' {
+    for (i, &token) in bytes.iter().enumerate() {
+        match token {
             // A quote toggles the escape state; a comma closes a value only when
             // not inside quotes (mirrors the C# `escaped` XOR bookkeeping).
-            let is_quote = token == '"';
-            escaped = if is_quote { !escaped } else { escaped };
-            if token == ',' && !escaped && start < i {
-                let raw: String = chars[start..i].iter().collect();
-                result.insert(std::mem::take(&mut key), url_decode(raw.trim_matches('"')));
-                start = i + 1;
-            } else if token == ',' && !escaped {
+            b'"' => escaped = !escaped,
+            b',' if !escaped => {
+                if start < i {
+                    result.set(key, &header[start..i]);
+                    key = "";
+                }
                 start = i + 1;
             }
-        } else if !escaped && token == '=' {
-            let raw: String = chars[start..i].iter().collect();
-            key = String::from(raw.trim());
-            start = i + 1;
+            b'=' if !escaped => {
+                key = header[start..i].trim();
+                start = i + 1;
+            }
+            _ => {}
         }
-        i += 1;
     }
 
-    if start < i {
-        let raw: String = chars[start..i].iter().collect();
-        result.insert(key, url_decode(raw.trim_matches('"')));
+    if start < bytes.len() {
+        result.set(key, &header[start..]);
     }
     result
 }
@@ -500,8 +541,15 @@ fn parse_parts(header: &str) -> std::collections::HashMap<String, String> {
 /// Minimal `application/x-www-form-urlencoded` decoder for header/query values:
 /// `+` → space and `%XX` → byte, leaving anything malformed as-is. Sufficient
 /// for the client/device/version/token fields Jellyfin sends.
-fn url_decode(input: &str) -> String {
+///
+/// Borrows when there is nothing to decode — the overwhelmingly common case for
+/// the auth header on every request — so the hot path allocates only for values
+/// that really are encoded.
+fn url_decode(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
+    if !bytes.iter().any(|b| matches!(b, b'+' | b'%')) {
+        return Cow::Borrowed(input);
+    }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -528,7 +576,7 @@ fn url_decode(input: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -547,6 +595,22 @@ mod tests {
     /// exercised by the authorization context.
     struct FakeConfig {
         config: ServerConfiguration,
+        /// How many times the whole `ServerConfiguration` was deep-cloned out
+        /// of this manager — the cost finding #8 is about.
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeConfig {
+        fn new(config: ServerConfiguration) -> Self {
+            Self {
+                config,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
@@ -556,6 +620,7 @@ mod tests {
         }
 
         async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.config.clone())
         }
 
@@ -629,11 +694,11 @@ mod tests {
     fn parses_authorization_header_parts() {
         let header = r#"MediaBrowser Client="Web", Device="Firefox", DeviceId="abc", Version="1.2", Token="tok""#;
         let parts = parse_authorization_header(header, false).expect("parsed");
-        assert_eq!(parts.get("Client").map(String::as_str), Some("Web"));
-        assert_eq!(parts.get("Device").map(String::as_str), Some("Firefox"));
-        assert_eq!(parts.get("DeviceId").map(String::as_str), Some("abc"));
-        assert_eq!(parts.get("Version").map(String::as_str), Some("1.2"));
-        assert_eq!(parts.get("Token").map(String::as_str), Some("tok"));
+        assert_eq!(parts.client.as_deref(), Some("Web"));
+        assert_eq!(parts.device.as_deref(), Some("Firefox"));
+        assert_eq!(parts.device_id.as_deref(), Some("abc"));
+        assert_eq!(parts.version.as_deref(), Some("1.2"));
+        assert_eq!(parts.token.as_deref(), Some("tok"));
     }
 
     #[test]
@@ -641,6 +706,9 @@ mod tests {
         assert!(parse_authorization_header("Bearer abc", true).is_none());
         assert!(parse_authorization_header(r#"Emby Token="t""#, false).is_none());
         assert!(parse_authorization_header(r#"Emby Token="t""#, true).is_some());
+        // No space at all → no scheme → rejected outright.
+        assert!(parse_authorization_header("MediaBrowser", false).is_none());
+        assert!(parse_authorization_header("", false).is_none());
     }
 
     #[test]
@@ -648,18 +716,279 @@ mod tests {
         assert_eq!(url_decode("a+b"), "a b");
         assert_eq!(url_decode("a%20b"), "a b");
         assert_eq!(url_decode("bad%zz"), "bad%zz");
+        // Nothing to decode → borrowed, not a fresh allocation.
+        assert!(matches!(
+            url_decode("plain value"),
+            Cow::Borrowed("plain value")
+        ));
+        assert!(matches!(url_decode("a+b"), Cow::Owned(_)));
+        // A truncated escape at the very end is left verbatim (C# parity).
+        assert_eq!(url_decode("tail%4"), "tail%4");
+        assert_eq!(url_decode("%41%42"), "AB");
+    }
+
+    /// The parser's edge cases, asserted directly on the struct. These are the
+    /// header shapes real clients (and hand-rolled scripts) actually send.
+    #[test]
+    fn parses_edge_case_header_shapes() {
+        // Unquoted values, no spaces after the commas.
+        let p = parse_authorization_header("MediaBrowser Client=Web,Device=TV,Token=t1", false)
+            .expect("parsed");
+        assert_eq!(p.client.as_deref(), Some("Web"));
+        assert_eq!(p.device.as_deref(), Some("TV"));
+        assert_eq!(p.token.as_deref(), Some("t1"));
+
+        // Extra whitespace around a KEY is trimmed. Whitespace around a VALUE
+        // is NOT — `trim_matches('"')` only strips quotes, so a padded value
+        // keeps its padding and its quotes. That is the upstream C# behaviour
+        // and clients never send it; pinned here so the rewrite can't quietly
+        // "fix" it into a parity divergence.
+        let p = parse_authorization_header(
+            r#"MediaBrowser   Client = "Jellyfin Web" ,  Token = "t2""#,
+            false,
+        )
+        .expect("parsed");
+        assert_eq!(p.client.as_deref(), Some(r#" "Jellyfin Web" "#));
+        assert_eq!(p.token.as_deref(), Some(r#" "t2"#));
+
+        // A comma inside a quoted value does not split the value.
+        let p = parse_authorization_header(
+            r#"MediaBrowser Device="Smith, John's TV", Token="t3""#,
+            false,
+        )
+        .expect("parsed");
+        assert_eq!(p.device.as_deref(), Some("Smith, John's TV"));
+        assert_eq!(p.token.as_deref(), Some("t3"));
+
+        // Empty value → an empty string, not a missing field; and an empty
+        // trailing segment is dropped rather than recorded.
+        let p = parse_authorization_header(r#"MediaBrowser Client="", Token="t4","#, false)
+            .expect("parsed");
+        assert_eq!(p.client.as_deref(), Some(""));
+        assert_eq!(p.token.as_deref(), Some("t4"));
+
+        // Unknown keys are ignored, known ones still land.
+        let p = parse_authorization_header(
+            r#"MediaBrowser Bogus="x", Client="Web", DeviceProfile="y""#,
+            false,
+        )
+        .expect("parsed");
+        assert_eq!(p.client.as_deref(), Some("Web"));
+        assert_eq!(
+            p,
+            AuthorizationParts {
+                client: Some("Web".into()),
+                ..Default::default()
+            }
+        );
+
+        // Keys are case-SENSITIVE (ordinal, as upstream) — `token` is not `Token`.
+        let p = parse_authorization_header(r#"MediaBrowser token="t5""#, false).expect("parsed");
+        assert_eq!(p.token, None);
+
+        // Percent/plus encoding is decoded in values.
+        let p = parse_authorization_header(r#"MediaBrowser Device="Ken%27s+TV""#, false)
+            .expect("parsed");
+        assert_eq!(p.device.as_deref(), Some("Ken's TV"));
+
+        // A value with no `=` at all contributes nothing (empty key).
+        let p = parse_authorization_header("MediaBrowser garbage", false).expect("parsed");
+        assert_eq!(p, AuthorizationParts::default());
+
+        // Multibyte UTF-8 survives the byte scan intact.
+        let p =
+            parse_authorization_header(r#"MediaBrowser Device="Café — 日本", Token="t6""#, false)
+                .expect("parsed");
+        assert_eq!(p.device.as_deref(), Some("Café — 日本"));
+        assert_eq!(p.token.as_deref(), Some("t6"));
+
+        // A later duplicate wins, matching the map's insert semantics.
+        let p = parse_authorization_header(r#"MediaBrowser Token="a", Token="b""#, false)
+            .expect("parsed");
+        assert_eq!(p.token.as_deref(), Some("b"));
+
+        // A key is consumed by the value it introduced: a trailing key-less
+        // segment must NOT be re-filed under the previous key (that would let a
+        // malformed tail silently overwrite the token).
+        let p =
+            parse_authorization_header(r#"MediaBrowser Token="a", bare"#, false).expect("parsed");
+        assert_eq!(p.token.as_deref(), Some("a"));
+        let p = parse_authorization_header(r#"MediaBrowser Client="Web", Token"#, false)
+            .expect("parsed");
+        assert_eq!(p.client.as_deref(), Some("Web"));
+        assert_eq!(p.token, None);
+    }
+
+    /// Verbatim copy of the pre-optimisation `Vec<char>` parser, kept as the
+    /// parity oracle for the byte-scanning replacement. If the two ever
+    /// disagree on any header shape below, the rewrite changed the trust
+    /// boundary's behaviour and the differential test fails.
+    fn oracle_parse_parts(header: &str) -> std::collections::HashMap<String, String> {
+        let mut result = std::collections::HashMap::new();
+        let chars: Vec<char> = header.chars().collect();
+        let mut escaped = false;
+        let mut start = 0usize;
+        let mut key = String::new();
+
+        let mut i = 0usize;
+        while i < chars.len() {
+            let token = chars[i];
+            if token == '"' || token == ',' {
+                let is_quote = token == '"';
+                escaped = if is_quote { !escaped } else { escaped };
+                if token == ',' && !escaped && start < i {
+                    let raw: String = chars[start..i].iter().collect();
+                    result.insert(
+                        std::mem::take(&mut key),
+                        url_decode(raw.trim_matches('"')).into_owned(),
+                    );
+                    start = i + 1;
+                } else if token == ',' && !escaped {
+                    start = i + 1;
+                }
+            } else if !escaped && token == '=' {
+                let raw: String = chars[start..i].iter().collect();
+                key = String::from(raw.trim());
+                start = i + 1;
+            }
+            i += 1;
+        }
+
+        if start < i {
+            let raw: String = chars[start..i].iter().collect();
+            result.insert(key, url_decode(raw.trim_matches('"')).into_owned());
+        }
+        result
+    }
+
+    #[test]
+    fn byte_scan_parser_matches_the_char_scan_oracle() {
+        let corpus = [
+            r#"Client="Web", Device="Firefox", DeviceId="abc", Version="1.2", Token="tok""#,
+            "Client=Web,Device=TV,Token=t1",
+            r#"   Client = "Jellyfin Web" ,  Token = "t2" "#,
+            r#"Device="Smith, John's TV", Token="t3""#,
+            r#"Client="", Token="t4","#,
+            r#"Bogus="x", Client="Web", DeviceProfile="y""#,
+            r#"token="t5""#,
+            r#"Device="Ken%27s+TV""#,
+            "garbage",
+            "",
+            ",,,,",
+            "=",
+            "==",
+            r#"Token="unterminated"#,
+            r#"Token=""""#,
+            r#"Device="Café — 日本", Token="t6""#,
+            r#"Device="日本,語", Client="Ünïcödé""#,
+            r#"Token="a", Token="b""#,
+            r#"Token="a", bare"#,
+            r#"Client="Web", Token"#,
+            r#"Client="Web",,Token="t""#,
+            r#"Client="Web"Device="TV""#,
+            r#"Token=a"b"c"#,
+            "Client=,Device=,Token=",
+            r#"Token   =   "  spaced  ""#,
+            "Version=1.2.3, Client=Web",
+            r#"DeviceId="%E6%97%A5", Token="t""#,
+            r#"Client="a,b,c", Device="d,e", Token="f""#,
+        ];
+
+        for header in corpus {
+            let expected = oracle_parse_parts(header);
+            let actual = parse_parts(header);
+            for (key, slot) in [
+                ("DeviceId", &actual.device_id),
+                ("Device", &actual.device),
+                ("Client", &actual.client),
+                ("Version", &actual.version),
+                ("Token", &actual.token),
+            ] {
+                assert_eq!(
+                    slot.as_deref(),
+                    expected.get(key).map(String::as_str),
+                    "key {key} diverged for header {header:?}"
+                );
+            }
+        }
     }
 
     /// Builds a context over a database, wired to fake host/config dependencies.
     fn context(db: Database) -> FerrofinAuthorizationContext {
-        let config = Arc::new(FakeConfig {
-            config: default_server_configuration(),
-        });
+        context_with_config(
+            db,
+            Arc::new(FakeConfig::new(default_server_configuration())),
+        )
+        .0
+    }
+
+    /// Builds a context over a caller-supplied config manager, handing the
+    /// manager back so a test can inspect how often it was read.
+    fn context_with_config(
+        db: Database,
+        config: Arc<FakeConfig>,
+    ) -> (FerrofinAuthorizationContext, Arc<FakeConfig>) {
         let host = Arc::new(FakeHost {
             name: "test-machine".to_owned(),
         });
         let users = Arc::new(FerrofinUserManager::new(db.clone()));
-        FerrofinAuthorizationContext::new(db, users, host, config, "sys-1", "10.9.0")
+        let ctx = FerrofinAuthorizationContext::new(
+            db,
+            users,
+            host,
+            Arc::clone(&config) as Arc<dyn ServerConfigurationManager>,
+            "sys-1",
+            "10.9.0",
+        );
+        (ctx, config)
+    }
+
+    /// Finding #8: the legacy-authorization flag is read ONCE per request.
+    /// Re-reading it deep-clones the entire `ServerConfiguration` (policy,
+    /// paths, every `Vec` and `Option` in it) on the authenticated hot path,
+    /// which the header/token fallbacks used to do one or two extra times.
+    #[tokio::test]
+    async fn resolving_auth_reads_the_configuration_exactly_once() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x2c);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        // The worst case for the old code: no `Authorization` header at all, so
+        // the header lookup, the parse gate and the token fallbacks each wanted
+        // the flag.
+        let bare = RequestContext {
+            query_string: Some("api_key=dev-tok".to_owned()),
+            ..Default::default()
+        };
+        let (ctx, config) = context_with_config(
+            db.clone(),
+            Arc::new(FakeConfig::new(default_server_configuration())),
+        );
+        assert!(
+            ctx.get_authorization_info(&bare)
+                .await
+                .unwrap()
+                .is_authenticated
+        );
+        assert_eq!(
+            config.reads(),
+            1,
+            "no-header request: one configuration read"
+        );
+
+        // And the common case: a full MediaBrowser header.
+        let (ctx, config) = context_with_config(
+            db.clone(),
+            Arc::new(FakeConfig::new(default_server_configuration())),
+        );
+        assert!(
+            ctx.get_authorization_info(&token_request())
+                .await
+                .unwrap()
+                .is_authenticated
+        );
+        assert_eq!(config.reads(), 1, "header request: one configuration read");
     }
 
     #[tokio::test]

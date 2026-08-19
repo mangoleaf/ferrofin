@@ -26,7 +26,7 @@
 //! contract (every mutating path clears) plus the TTL.
 
 use std::collections::HashMap;
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use ferrofin_db::entities::security::DeviceEntity;
@@ -49,9 +49,14 @@ pub const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 const AUTH_CACHE_MAX_ENTRIES: usize = 4096;
 
 /// One cached token resolution.
+///
+/// The device row is held behind an [`Arc`] because a hit only ever *reads* it
+/// (to fill the auth info's blank client/device fields), so handing out a
+/// refcount bump instead of a deep copy saves one allocation per `String`
+/// column on every authenticated request.
 #[derive(Debug, Clone)]
 struct CachedAuth {
-    device: DeviceEntity,
+    device: Arc<DeviceEntity>,
     user: Option<UserEntity>,
     cached_at: Instant,
 }
@@ -92,14 +97,21 @@ impl AuthCache {
     }
 
     /// The cached resolution for `token`, if present and fresher than the TTL.
+    ///
+    /// The device row comes back as a shared [`Arc`] (callers only read it), so
+    /// a hit costs one refcount bump rather than a deep copy of every column.
+    /// The user entity is still cloned because [`AuthorizationInfo`] owns it
+    /// outright.
+    ///
+    /// [`AuthorizationInfo`]: ferrofin_traits::options::AuthorizationInfo
     #[must_use]
-    pub fn get(&self, token: &str) -> Option<(DeviceEntity, Option<UserEntity>)> {
+    pub fn get(&self, token: &str) -> Option<(Arc<DeviceEntity>, Option<UserEntity>)> {
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
         let hit = entries.get(token)?;
         if hit.cached_at.elapsed() > self.ttl {
             return None;
         }
-        Some((hit.device.clone(), hit.user.clone()))
+        Some((Arc::clone(&hit.device), hit.user.clone()))
     }
 
     /// Caches a successful token resolution.
@@ -111,7 +123,7 @@ impl AuthCache {
         entries.insert(
             token.to_owned(),
             CachedAuth {
-                device,
+                device: Arc::new(device),
                 user,
                 cached_at: Instant::now(),
             },
@@ -209,6 +221,29 @@ mod tests {
         assert!(cache.get("tok").is_some(), "fresh entry hits");
         std::thread::sleep(Duration::from_millis(40));
         assert!(cache.get("tok").is_none(), "expired entry misses");
+    }
+
+    /// Finding #3: a hit must hand out a shared handle to the device row, not a
+    /// deep copy of it. Pointer identity across two hits is the proof — a
+    /// per-hit clone would give two distinct allocations.
+    #[test]
+    fn hits_share_the_device_row_instead_of_deep_copying_it() {
+        let cache = AuthCache::default();
+        cache.put("tok", device("tok"), None);
+
+        let (first, _) = cache.get("tok").expect("first hit");
+        let (second, _) = cache.get("tok").expect("second hit");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both hits point at the one cached device row"
+        );
+        // And the string columns are the same allocation, not copies.
+        assert_eq!(
+            first.device_name.as_ptr(),
+            second.device_name.as_ptr(),
+            "no per-hit String reallocation"
+        );
+        assert_eq!(first.access_token, "tok", "the shared row is the right one");
     }
 
     #[test]
