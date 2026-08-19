@@ -293,8 +293,16 @@ fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 
 /// `GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}` — a video
 /// segment. Starts (or reuses) the transcode and serves the segment file.
+///
+/// Authenticated: C# `DynamicHlsController` carries a class-level `[Authorize]`
+/// with no `[AllowAnonymous]`, so the `hls1` segment routes are gated upstream —
+/// unlike the legacy `hls` segment routes below, which upstream leaves open with
+/// an explicit comment about Chrome omitting the query string. `RequireAuth`
+/// accepts the `api_key`/`ApiKey` query parameter, which is how players that
+/// cannot set an `Authorization` header on a segment URL authenticate.
 async fn get_video_hls_segment(
     State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
@@ -307,9 +315,10 @@ async fn get_video_hls_segment(
 }
 
 /// `GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}` — an audio
-/// segment.
+/// segment. Authenticated for the same reason as its video sibling above.
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
+    RequireAuth(_auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,

@@ -525,6 +525,79 @@ fn build_state(
     .with_media_encoding(hls, attachments)
 }
 
+/// An authorization context that rejects everything, so a route's auth gate is
+/// observable: with [`OkAuth`] every extractor succeeds and a missing gate looks
+/// identical to a present one.
+struct DenyAuth;
+
+#[async_trait]
+impl AuthorizationContext for DenyAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo::default())
+    }
+}
+
+#[async_trait]
+impl AuthService for DenyAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Err(ServiceError::unauthorized("no token"))
+    }
+}
+
+/// Like [`build_state`] but with an auth service that rejects every request, so
+/// a route's auth gate becomes observable.
+fn router_denying_auth(hls: Arc<dyn HlsStreamManager>) -> axum::Router {
+    use ferrofin_api::test_support as t;
+    let app = AppState::new(
+        Arc::new(ItemLibrary { present: true }),
+        Arc::new(t::FakeUsers),
+        Arc::new(t::FakeUserViews),
+        Arc::new(t::FakeUserData),
+        Arc::new(t::FakeMediaSources),
+        Arc::new(t::FakeSessions),
+        Arc::new(t::FakeSystem),
+        Arc::new(t::FakeAppHost),
+        Arc::new(t::FakeConfig),
+        Arc::new(t::FakeProviders),
+        Arc::new(t::FakeMusic),
+        Arc::new(t::FakeSimilarItems),
+        Arc::new(t::FakeSearch),
+        Arc::new(t::FakeDto),
+        Arc::new(DenyAuth),
+        Arc::new(DenyAuth),
+        Arc::new(t::FakeQuickConnect),
+        Arc::new(t::FakePlaylists),
+        Arc::new(t::FakeCollections),
+        Arc::new(t::FakeTvSeries),
+        Arc::new(t::FakeSubtitles),
+        Arc::new(t::FakeLyrics),
+        Arc::new(t::FakeMediaSegments),
+        Arc::new(t::FakeTrickplay),
+        Arc::new(t::FakeDevices),
+        Arc::new(t::FakeClientEventLogger),
+        Arc::new(t::FakeApiKeys),
+        Arc::new(t::FakeLocalization),
+        Arc::new(t::FakeDisplayPreferences),
+        Arc::new(t::FakeActivity),
+        Arc::new(t::FakeFileSystem),
+        Arc::new(t::FakeTasks),
+    )
+    .with_media_encoding(
+        hls,
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+    );
+    create_router(app)
+}
+
 fn ok_hls(served_path: &str, rec: Arc<Recorded>) -> Arc<FakeHls> {
     Arc::new(FakeHls {
         served_path: served_path.to_owned(),
@@ -902,4 +975,38 @@ async fn audio_universal_falls_back_to_transcode() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_string(resp).await, "SEGMENT-BYTES");
+}
+
+#[tokio::test]
+async fn hls1_segments_require_auth_but_legacy_segments_stay_open() {
+    // Upstream `DynamicHlsController` carries a class-level `[Authorize]` with no
+    // `[AllowAnonymous]`, so the `hls1` segment routes are authenticated in
+    // Jellyfin. The LEGACY `hls` segment routes are deliberately anonymous
+    // upstream — `HlsSegmentController` says so in a comment ("Can't require
+    // authentication just yet due to seeing some requests come from Chrome
+    // without full query string"). Both halves are pinned here: gating the
+    // legacy routes would be as much a parity break as leaving hls1 open.
+    let tmp = TempFile::new();
+    let rec = Arc::new(Recorded::default());
+    let router = router_denying_auth(ok_hls(&tmp.path, rec));
+
+    for uri in [
+        format!("/Videos/{ITEM_ID}/hls1/main/3.ts?runtimeTicks=0"),
+        format!("/Audio/{ITEM_ID}/hls1/main/0.aac"),
+    ] {
+        let resp = router.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "hls1 segment {uri} must be gated"
+        );
+    }
+
+    let legacy = format!("/Videos/{ITEM_ID}/hls/main/3.ts");
+    let resp = router.oneshot(authed("GET", &legacy)).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "legacy hls segments are anonymous upstream — gating them breaks parity"
+    );
 }
