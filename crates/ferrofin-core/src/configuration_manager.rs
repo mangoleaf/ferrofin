@@ -21,10 +21,49 @@
 //!   [`FerrofinServerApplicationPaths`] on every load and save
 //!   (`UpdateMetadataPath`).
 //!
-//! The in-memory configuration is held behind an [`RwLock`] so the object-safe,
-//! `&self` trait methods can read and replace it. On construction the manager
-//! loads `system.json` if present, otherwise falls back to
-//! [`ServerConfiguration::default`] and writes it out.
+//! The in-memory configuration is held as an `RwLock<Arc<ServerConfiguration>>`
+//! so the object-safe, `&self` trait methods can read and replace it. On
+//! construction the manager loads `system.json` if present, otherwise falls
+//! back to [`default_server_configuration`] and writes it out.
+//!
+//! ## What the `Arc` indirection buys today, and what it does not
+//!
+//! `ServerConfiguration` is a large struct with dozens of heap-owned fields
+//! (`String`s, `Vec`s, the per-type `MetadataOptions` table), so handing out a
+//! *clone* of it is dozens of allocations. Storing it behind an `Arc` delivers
+//! two things right now:
+//!
+//! - Writers build a fresh `ServerConfiguration`, wrap it in a new `Arc`, and
+//!   swap the pointer, so the write section is a single pointer store and an
+//!   in-flight reader keeps a consistent (never torn) view of the document it
+//!   started with while the next read observes the new one.
+//! - The deep clone that [`snapshot`](FerrofinServerConfigurationManager::snapshot)
+//!   performs now happens *after* the read lock is released (it clones the
+//!   handle under the lock and the document outside it), so a slow reader no
+//!   longer widens the window in which a writer is blocked.
+//!
+//! It does **not** yet make per-request configuration reads cheap, and nothing
+//! in this module should be read as claiming otherwise. The readers that would
+//! benefit most — the API auth extractor (`ferrofin-api`'s `auth.rs`) and
+//! `AuthorizationContext` — hold the manager as
+//! `Arc<dyn ServerConfigurationManager>` and can therefore only call
+//! [`ServerConfigurationManager::configuration`], which is declared to return an
+//! *owned* `ServerConfiguration`. Every one of those reads still deep-clones the
+//! whole document, exactly as it did before the `Arc` landed, and
+//! [`snapshot_shared`](FerrofinServerConfigurationManager::snapshot_shared)
+//! currently has no caller outside this module.
+//!
+//! Unlocking the hot path is a **pending, one-line change to a file this module
+//! does not own** — `crates/ferrofin-traits/src/configuration.rs`: declare
+//!
+//! ```text
+//! async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError>;
+//! ```
+//!
+//! (still object-safe), return `self.snapshot_shared()` from the impl below,
+//! and adjust the handful of call sites that mutate the returned value to clone
+//! it explicitly. Until that lands, treat the `Arc` storage as groundwork, not
+//! as a delivered per-request win.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -170,15 +209,15 @@ pub fn default_server_configuration() -> ServerConfiguration {
 
 /// The concrete server configuration manager.
 ///
-/// Owns the shared application paths and the live configuration. Reads are
-/// lock-guarded clones (the configuration is small); writes replace the whole
-/// document and persist it to `system.json`.
+/// Owns the shared application paths and the live configuration. Reads take a
+/// refcounted handle to the current document (`Arc` clone, no deep copy);
+/// writes replace the whole document and persist it to `system.json`.
 pub struct FerrofinServerConfigurationManager {
     paths: Arc<FerrofinServerApplicationPaths>,
     config_file: PathBuf,
     branding_file: PathBuf,
     encoding_file: PathBuf,
-    configuration: RwLock<ServerConfiguration>,
+    configuration: RwLock<Arc<ServerConfiguration>>,
 }
 
 impl std::fmt::Debug for FerrofinServerConfigurationManager {
@@ -256,11 +295,52 @@ impl FerrofinServerConfigurationManager {
             config_file,
             branding_file,
             encoding_file,
-            configuration: RwLock::new(configuration),
+            configuration: RwLock::new(Arc::new(configuration)),
         })
     }
 
+    /// A shared handle to the current configuration.
+    ///
+    /// Clones the `Arc`, not the document, so a reader that only needs to
+    /// *observe* the configuration pays one refcount bump instead of a deep copy
+    /// of every `String`/`Vec` in [`ServerConfiguration`]. The returned handle is
+    /// a point-in-time snapshot: a concurrent
+    /// [`update_configuration`](ServerConfigurationManager::update_configuration)
+    /// swaps in a *new* `Arc`, so an existing handle keeps observing the
+    /// document it was taken from and the next call observes the new one.
+    ///
+    /// **Callers today: this module only** —
+    /// [`snapshot`](Self::snapshot) and `validate_metadata_path`. The
+    /// per-request readers (the API auth extractor, `AuthorizationContext`) see
+    /// this manager as `Arc<dyn ServerConfigurationManager>`, so they can only
+    /// reach [`ServerConfigurationManager::configuration`], which returns an
+    /// owned document and therefore still deep-clones on every request. This
+    /// method is groundwork for the pending trait-signature change described in
+    /// the module docs; it is not, on its own, a per-request saving.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the configuration lock is poisoned — i.e. a thread
+    /// panicked while holding it, which this crate never does.
+    #[must_use]
+    pub fn snapshot_shared(&self) -> Arc<ServerConfiguration> {
+        Arc::clone(
+            &self
+                .configuration
+                .read()
+                .expect("configuration lock poisoned"),
+        )
+    }
+
     /// A snapshot clone of the current configuration.
+    ///
+    /// This deep-copies the whole document. It is nonetheless the path *every*
+    /// trait-seam read takes — including every per-request one — because
+    /// [`ServerConfigurationManager::configuration`] is declared to hand out an
+    /// owned value; see the module docs. The one thing the `Arc` changes here is
+    /// that the copy is made after the read lock has been dropped rather than
+    /// while holding it. In-crate callers that only need to read a field should
+    /// prefer [`snapshot_shared`](Self::snapshot_shared).
     ///
     /// # Panics
     ///
@@ -268,10 +348,7 @@ impl FerrofinServerConfigurationManager {
     /// panicked while holding it, which this crate never does.
     #[must_use]
     pub fn snapshot(&self) -> ServerConfiguration {
-        self.configuration
-            .read()
-            .expect("configuration lock poisoned")
-            .clone()
+        (*self.snapshot_shared()).clone()
     }
 
     /// The shared application paths as the concrete type (used by sibling
@@ -291,8 +368,10 @@ impl FerrofinServerConfigurationManager {
         if new_path.trim().is_empty() {
             return Ok(());
         }
-        let current = self.snapshot().metadata_path;
-        if new_path == current {
+        // Read through the shared handle: this only needs one field, so a deep
+        // clone of the whole document would be pure waste.
+        let current = self.snapshot_shared();
+        if new_path == current.metadata_path {
             return Ok(());
         }
         if !PathBuf::from(new_path).is_dir() {
@@ -322,12 +401,16 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         self.validate_metadata_path(&configuration.metadata_path)?;
         write_config(&self.config_file, configuration).await?;
 
+        // Build the replacement outside the lock, then swap the pointer: the
+        // write section is a single pointer store, and readers holding an older
+        // handle keep a consistent view of the document they took.
+        let replacement = Arc::new(configuration.clone());
         {
             let mut guard = self
                 .configuration
                 .write()
                 .expect("configuration lock poisoned");
-            *guard = configuration.clone();
+            *guard = replacement;
         }
 
         // OnConfigurationUpdated → UpdateMetadataPath.
@@ -469,6 +552,98 @@ mod tests {
             .await
             .expect("reload");
         assert_eq!(reloaded.snapshot().server_name, "Ferrofin Test");
+    }
+
+    /// The read path must hand out the *same* allocation on repeat reads (no
+    /// deep clone), and a write must be visible to every subsequent read —
+    /// through the shared handle, the owned snapshot, and the trait seam alike.
+    #[tokio::test]
+    async fn write_swaps_the_shared_document_and_is_observed_by_later_reads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+
+        // Two reads with no intervening write observe one shared document.
+        let before = mgr.snapshot_shared();
+        assert!(
+            Arc::ptr_eq(&before, &mgr.snapshot_shared()),
+            "repeat reads must share one allocation, not deep-clone the document"
+        );
+        // The owned snapshot is value-identical to the shared one (parity: the
+        // trait seam must keep emitting exactly what it emitted before).
+        assert_eq!(mgr.snapshot(), *before);
+        assert_eq!(
+            mgr.configuration().await.expect("configuration"),
+            *before,
+            "the trait accessor must observe the same document"
+        );
+
+        // Mutate a spread of heap-owned and scalar fields.
+        let mut cfg = mgr.snapshot();
+        cfg.server_name = "Swapped".to_owned();
+        cfg.sort_remove_words = vec!["das".to_owned(), "der".to_owned()];
+        cfg.cors_hosts = vec!["https://example.invalid".to_owned()];
+        cfg.min_resume_pct = 11;
+        cfg.enable_metrics = true;
+        mgr.update_configuration(&cfg).await.expect("update");
+
+        // The write installed a NEW document; the handle taken before the write
+        // still observes the pre-write values (no torn/in-place mutation).
+        let after = mgr.snapshot_shared();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a write must swap in a new document, not mutate the shared one"
+        );
+        assert_ne!(before.server_name, "Swapped");
+        assert_eq!(before.min_resume_pct, 5);
+
+        // Every subsequent read observes the write, on all three read paths.
+        for observed in [
+            (*after).clone(),
+            mgr.snapshot(),
+            mgr.configuration().await.expect("configuration"),
+        ] {
+            assert_eq!(observed.server_name, "Swapped");
+            assert_eq!(observed.sort_remove_words, vec!["das", "der"]);
+            assert_eq!(observed.cors_hosts, vec!["https://example.invalid"]);
+            assert_eq!(observed.min_resume_pct, 11);
+            assert!(observed.enable_metrics);
+            assert_eq!(observed, cfg, "the read must equal the written document");
+        }
+
+        // And the swapped-in document is itself shared, not re-cloned per read.
+        assert!(Arc::ptr_eq(&after, &mgr.snapshot_shared()));
+    }
+
+    /// `validate_metadata_path` reads the live document, so an unchanged path is
+    /// accepted even after the configuration has been replaced.
+    #[tokio::test]
+    async fn metadata_path_validation_reads_the_current_document() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+
+        let meta = tmp.path().join("meta");
+        std::fs::create_dir_all(&meta).expect("mkdir meta");
+        let meta_str = meta.to_string_lossy().into_owned();
+
+        let mut cfg = mgr.snapshot();
+        cfg.metadata_path.clone_from(&meta_str);
+        mgr.update_configuration(&cfg).await.expect("first update");
+        assert_eq!(mgr.snapshot_shared().metadata_path, meta_str);
+
+        // The directory goes away; the same (unchanged) path must still validate
+        // because it matches the *current* configuration.
+        std::fs::remove_dir_all(&meta).expect("rmdir meta");
+        cfg.server_name = "Renamed".to_owned();
+        mgr.update_configuration(&cfg)
+            .await
+            .expect("unchanged metadata path stays valid");
+        assert_eq!(mgr.snapshot_shared().server_name, "Renamed");
     }
 
     #[tokio::test]
