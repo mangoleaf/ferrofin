@@ -7,7 +7,7 @@
 //! descendant methods use the `AncestorIds` closure table directly for the
 //! common hierarchical case, and the deeper linked-folder roll-up is deferred.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -74,7 +74,7 @@ impl FerrofinItemCountService {
             sql.push(')');
             let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(ancestor_id));
             for id in &matching {
-                query = query.bind(id.clone());
+                query = query.bind(id.as_str());
             }
             query.fetch_all(self.db.pool()).await.map_err(db_err)?
         };
@@ -95,7 +95,7 @@ impl FerrofinItemCountService {
         sql.push(')');
         let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
         for id in &descendants {
-            query = query.bind(id.clone());
+            query = query.bind(id.as_str());
         }
         let played_i64 = query.fetch_one(self.db.pool()).await.map_err(db_err)?;
         Ok(PlayedAndTotal {
@@ -135,15 +135,16 @@ impl FerrofinItemCountService {
             return Ok(out);
         }
 
-        let type_names: Vec<String> = related_item_kinds
+        let type_names: Vec<&'static str> = related_item_kinds
             .iter()
             .filter_map(|k| stored_type_name(*k))
-            .map(ToOwned::to_owned)
             .collect();
-        let distinct_names: Vec<String> = name_by_id
+        // Dedupe by borrowing from `name_by_id` — the names are bound straight
+        // through to sqlx as `&str`, so no name is ever copied on this path.
+        let distinct_names: Vec<&str> = name_by_id
             .iter()
-            .map(|(_, n)| n.clone())
-            .collect::<std::collections::HashSet<_>>()
+            .map(|(_, n)| n.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
             .collect();
 
@@ -166,10 +167,10 @@ impl FerrofinItemCountService {
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
             for name in chunk {
-                query = query.bind(name.clone());
+                query = query.bind(*name);
             }
             for t in &type_names {
-                query = query.bind(t.clone());
+                query = query.bind(*t);
             }
             for (name, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 by_name
@@ -292,10 +293,9 @@ impl ItemCountService for FerrofinItemCountService {
             return Ok(out);
         }
 
-        let type_names: Vec<String> = related_item_kinds
+        let type_names: Vec<&'static str> = related_item_kinds
             .iter()
             .filter_map(|k| stored_type_name(*k))
-            .map(ToOwned::to_owned)
             .collect();
 
         // Count the related items carrying each clean value, grouped by value
@@ -307,10 +307,12 @@ impl ItemCountService for FerrofinItemCountService {
         // nothing. Re-introduce access scoping as a SQL predicate (subquery/join), not an
         // app-materialized id list, when real access restrictions land.
         let _ = access_filter;
-        let distinct_cleans: Vec<String> = clean_by_id
+        // Dedupe by borrowing from `clean_by_id`; the chunks bind straight through
+        // to sqlx as `&str`, so no clean value is copied on this path.
+        let distinct_cleans: Vec<&str> = clean_by_id
             .iter()
-            .map(|(_, c)| c.clone())
-            .collect::<std::collections::HashSet<_>>()
+            .map(|(_, c)| c.as_str())
+            .collect::<HashSet<&str>>()
             .into_iter()
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
@@ -331,10 +333,10 @@ impl ItemCountService for FerrofinItemCountService {
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
             for clean in chunk {
-                query = query.bind(clean.clone());
+                query = query.bind(*clean);
             }
             for t in &type_names {
-                query = query.bind(t.clone());
+                query = query.bind(*t);
             }
             for (clean, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 by_clean
@@ -401,7 +403,7 @@ impl ItemCountService for FerrofinItemCountService {
         sql.push(')');
         let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
         for id in &matching {
-            query = query.bind(id.clone());
+            query = query.bind(id.as_str());
         }
         let children = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
         let total = i32::try_from(children.len()).unwrap_or(i32::MAX);
@@ -419,7 +421,7 @@ impl ItemCountService for FerrofinItemCountService {
         sql.push(')');
         let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
         for id in &children {
-            query = query.bind(id.clone());
+            query = query.bind(id.as_str());
         }
         let played = query.fetch_one(self.db.pool()).await.map_err(db_err)?;
         Ok(PlayedAndTotal {
@@ -467,7 +469,7 @@ impl ItemCountService for FerrofinItemCountService {
         let total_sql = grouped("", "");
         let mut total_q = sqlx::query_as::<_, (String, i64)>(&total_sql);
         for id in &ids {
-            total_q = total_q.bind(id.clone());
+            total_q = total_q.bind(id.as_str());
         }
         let totals = total_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
@@ -477,9 +479,9 @@ impl ItemCountService for FerrofinItemCountService {
             r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
         );
         // The `?` for UserId precedes the `ParentItemId` in-list, so bind it first.
-        let mut played_q = sqlx::query_as::<_, (String, i64)>(&played_sql).bind(user.id.clone());
+        let mut played_q = sqlx::query_as::<_, (String, i64)>(&played_sql).bind(user.id.as_str());
         for id in &ids {
-            played_q = played_q.bind(id.clone());
+            played_q = played_q.bind(id.as_str());
         }
         let played_rows = played_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
         let played_by_parent: HashMap<String, i64> = played_rows.into_iter().collect();
@@ -540,7 +542,7 @@ impl ItemCountService for FerrofinItemCountService {
             }
             let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
             for id in &ids {
-                query = query.bind(id.clone());
+                query = query.bind(id.as_str());
             }
             into.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
         }
@@ -933,6 +935,226 @@ mod tests {
             .expect("single counts");
         assert_eq!(single.movie_count, batch[&comedy].movie_count);
         assert_eq!(single.series_count, batch[&comedy].series_count);
+    }
+
+    /// The by-name count paths dedupe names before binding them. Guards the
+    /// three edges that dedupe can break: an empty id list (which must never
+    /// reach the SQL builder), several distinct by-name rows sharing one
+    /// name/clean value (dedupe must collapse the *bind*, never the *result*),
+    /// and an empty related-kind list (no `Type IN (…)` clause at all).
+    #[tokio::test]
+    async fn name_item_counts_dedupe_names_without_losing_rows() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // Empty id list → empty map, and no query is built at all.
+        let empty = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &[],
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("empty ids");
+        assert!(empty.is_empty(), "empty input yields empty output");
+        let empty_people = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Person,
+                &[],
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("empty person ids");
+        assert!(empty_people.is_empty());
+
+        // Three separate Genre by-name rows that all clean to "drama", plus one
+        // that doesn't. Dedupe binds "drama" once; all three rows must still
+        // report the movie.
+        let dupes = [
+            (Uuid::from_u128(0x0D01), "Drama"),
+            (Uuid::from_u128(0x0D02), "drama"),
+            (Uuid::from_u128(0x0D03), "DRAMA!"),
+        ];
+        for (id, raw) in dupes {
+            seed_named_item(&db, id, BaseItemKind::Genre, raw).await;
+            set_clean_name(&db, id, raw).await;
+        }
+        let other = Uuid::from_u128(0x0D04);
+        seed_named_item(&db, other, BaseItemKind::Genre, "Comedy").await;
+        set_clean_name(&db, other, "Comedy").await;
+
+        let movie = Uuid::from_u128(0x0D11);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        let comedy_series = Uuid::from_u128(0x0D12);
+        seed_named_item(&db, comedy_series, BaseItemKind::Series, "S").await;
+        seed_item_genre(&db, comedy_series, "Comedy").await;
+
+        let ids: Vec<Uuid> = dupes.iter().map(|(id, _)| *id).chain([other]).collect();
+        let counts = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &ids,
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("duplicate-clean counts");
+        assert_eq!(counts.len(), 4, "every id reports");
+        for (id, raw) in dupes {
+            assert_eq!(counts[&id].movie_count, 1, "{raw} counts the movie");
+            assert_eq!(counts[&id].series_count, 0, "{raw} excludes the comedy");
+        }
+        assert_eq!(counts[&other].series_count, 1);
+        assert_eq!(counts[&other].movie_count, 0);
+
+        // No related-kind restriction → the `Type IN (…)` clause is omitted and
+        // every type is counted.
+        let unrestricted = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &ids,
+                &[],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("unrestricted counts");
+        assert_eq!(unrestricted[&dupes[0].0].movie_count, 1);
+        assert_eq!(unrestricted[&other].series_count, 1);
+    }
+
+    /// The Person branch dedupes on the raw `Name`, so two Person rows sharing a
+    /// name must both receive the shared filmography, and a name carrying SQL
+    /// metacharacters/quotes/unicode must round-trip as a bound parameter.
+    #[tokio::test]
+    async fn person_counts_dedupe_names_and_survive_quoting() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        // One `Peoples` row; two Person by-name rows carrying the same Name.
+        let raw_name = r#"O'Brien, "Bo%_" Ünïcode"#;
+        let people_id = Uuid::from_u128(0x0AA0);
+        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,?2,?3)"#)
+            .bind(guid_to_db(people_id))
+            .bind(raw_name)
+            .bind("Actor")
+            .execute(db.writer())
+            .await
+            .expect("seed people");
+
+        // A decoy person whose name shares a LIKE-wildcard prefix — it must not
+        // leak into the first person's counts (proving `?` binds literally).
+        let decoy_people = Uuid::from_u128(0x0AA1);
+        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,?2,?3)"#)
+            .bind(guid_to_db(decoy_people))
+            .bind(r#"O'Brien, "Bozo" Ünïcode"#)
+            .bind("Actor")
+            .execute(db.writer())
+            .await
+            .expect("seed decoy people");
+
+        for (i, kind) in [
+            BaseItemKind::Movie,
+            BaseItemKind::Movie,
+            BaseItemKind::Series,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let item = Uuid::from_u128(0x0AB0 + i as u128);
+            seed_named_item(&db, item, *kind, "credit").await;
+            sqlx::query(
+                r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+                   VALUES (?1,?2,?3,0,0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(people_id))
+            .bind("Role")
+            .execute(db.writer())
+            .await
+            .expect("seed people map");
+        }
+        // The decoy is credited on a third movie that must stay uncounted.
+        let decoy_movie = Uuid::from_u128(0x0AC0);
+        seed_named_item(&db, decoy_movie, BaseItemKind::Movie, "decoy credit").await;
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+               VALUES (?1,?2,?3,0,0)"#,
+        )
+        .bind(guid_to_db(decoy_movie))
+        .bind(guid_to_db(decoy_people))
+        .bind("Role")
+        .execute(db.writer())
+        .await
+        .expect("seed decoy map");
+
+        let p1 = Uuid::from_u128(0x0AD1);
+        let p2 = Uuid::from_u128(0x0AD2);
+        for id in [p1, p2] {
+            seed_named_item(&db, id, BaseItemKind::Person, raw_name).await;
+        }
+
+        let counts = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Person,
+                &[p1, p2],
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("person counts");
+        assert_eq!(counts.len(), 2);
+        for id in [p1, p2] {
+            assert_eq!(counts[&id].movie_count, 2, "decoy credit excluded");
+            assert_eq!(counts[&id].series_count, 1);
+            assert_eq!(counts[&id].item_count, 3);
+        }
+    }
+
+    /// The by-name count path chunks its `IN` lists at 500. Seeding 501 distinct
+    /// by-name rows crosses that boundary in both the CleanName-resolution query
+    /// (`ids.chunks`) and the count query (`distinct_cleans.chunks`); an
+    /// off-by-one in either silently drops the tail's counts.
+    #[tokio::test]
+    async fn name_item_counts_span_the_chunk_boundary() {
+        /// One past the 500-item `IN`-chunk size used by the by-name count path.
+        const N: u128 = 501;
+
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let mut genre_ids = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let name = format!("Genre{i}");
+            let genre = Uuid::from_u128(0x10_0000 + i);
+            seed_named_item(&db, genre, BaseItemKind::Genre, &name).await;
+            set_clean_name(&db, genre, &name).await;
+            genre_ids.push(genre);
+
+            let movie = Uuid::from_u128(0x20_0000 + i);
+            seed_named_item(&db, movie, BaseItemKind::Movie, &name).await;
+            seed_item_genre(&db, movie, &name).await;
+        }
+
+        let counts = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &genre_ids,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("chunked counts");
+
+        assert_eq!(counts.len(), N as usize);
+        for (i, id) in genre_ids.iter().enumerate() {
+            assert_eq!(counts[id].movie_count, 1, "genre #{i} counted");
+        }
+        // Explicitly pin the elements straddling the 500-item chunk edge.
+        assert_eq!(counts[&genre_ids[499]].movie_count, 1);
+        assert_eq!(counts[&genre_ids[500]].movie_count, 1);
     }
 
     #[tokio::test]
