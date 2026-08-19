@@ -26,8 +26,8 @@
     {"operation": "GET /Library/MediaFolders", "deep_verified": false, "classification": "instance: differs only by container data-dir path"},
     {"operation": "GET /Library/VirtualFolders", "deep_verified": false, "classification": "instance: differs only by container data-dir path"},
     {"operation": "GET /UserViews", "deep_verified": false, "classification": "instance: differs only by container data-dir path"},
-    {"operation": "GET /Years", "deep_verified": false, "classification": "expected-extension: Hermit does not materialize Year items (out of scope)"},
-    {"operation": "GET /Plugins", "deep_verified": false, "classification": "expected-extension: Hermit uses compiled-in extensions, not external-repo plugins"},
+    {"operation": "GET /Years", "deep_verified": false, "classification": "expected-extension: Ferrofin does not materialize Year items (out of scope)"},
+    {"operation": "GET /Plugins", "deep_verified": false, "classification": "expected-extension: Ferrofin uses compiled-in extensions, not external-repo plugins"},
     {"operation": "GET /ScheduledTasks", "deep_verified": false, "classification": "methodology: LastExecutionResult depends on whether/when a task ran"}
   ]
 }

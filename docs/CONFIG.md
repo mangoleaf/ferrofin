@@ -23,8 +23,7 @@ boots.
 | `FERROFIN_CONFIG_FILE` | `{data_dir}/config.toml` | Path to the optional bootstrap `config.toml`. |
 
 The database file is `{data_dir}/ferrofin.db`. For drop-in adoption Ferrofin also opens a
-legacy `hermit.db` or a Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data
-dir — see [Migrating from Jellyfin](../README.md#migrating-from-jellyfin).
+Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — see [Migrating from Jellyfin](../README.md#migrating-from-jellyfin).
 
 ## Network & identity
 

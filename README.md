@@ -17,10 +17,6 @@ existing Jellyfin clients — the web UI, and native TV/mobile apps like Swiftfi
 Wolphin — connect to it **unchanged**. A client only ever sees an HTTP endpoint; it can't tell
 the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place.
 
-> The name: a hermit crab moves into a shell it didn't grow. Ferrofin (*ferro*, iron/rust +
-> *fin*, from Jellyfin) moves into Jellyfin's API shell — reusing the contract that clients
-> depend on while replacing the body with idiomatic Rust.
-
 - **Want to try it?** → [Quickstart](#quickstart)
 - **Coming from Jellyfin?** → [Migrating from Jellyfin](#migrating-from-jellyfin)
 - **What actually works?** → [Feature status](docs/FEATURES.md)

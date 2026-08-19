@@ -561,7 +561,6 @@ impl Config {
     /// the root, or Jellyfin's own layout `data/jellyfin.db` — that file is
     /// opened instead and adopted in place
     /// (`ferrofin_db::Database` validates the version and takes a backup).
-    /// A legacy `hermit.db` (pre-rename native database) is opened in place too.
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         let ferrofin = self.data_dir.join(DATABASE_FILE_NAME);
@@ -569,7 +568,6 @@ impl Config {
             return ferrofin;
         }
         for candidate in [
-            self.data_dir.join("hermit.db"),
             self.data_dir.join("jellyfin.db"),
             self.data_dir.join("data").join("jellyfin.db"),
         ] {

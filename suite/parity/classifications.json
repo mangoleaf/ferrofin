@@ -4,7 +4,7 @@
   "rows": {
     "GET /IntroSkipper/SupportBundle": {
       "category": "expected-extension",
-      "classification": "expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design."
+      "classification": "expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design."
     },
     "GET /Items/Suggestions": {
       "category": "instance",
@@ -24,7 +24,7 @@
     },
     "GET /Movies/Recommendations": {
       "category": "deferred",
-      "classification": "deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."
+      "classification": "deferred: Ferrofin seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data."
     },
     "GET /Search/Hints": {
       "category": "deferred",
@@ -32,7 +32,7 @@
     },
     "GET /LiveTv/ListingProviders/SchedulesDirect/Countries": {
       "category": "deferred",
-      "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision."
+      "classification": "deferred: Jellyfin proxies json.schedulesdirect.org; Ferrofin has no Schedules Direct DVR provider (returns empty). Subsystem decision."
     },
     "GET /UserViews": {
       "category": "instance",
@@ -72,7 +72,7 @@
     },
     "GET /web/ConfigurationPages": {
       "category": "expected-extension",
-      "classification": "expected-extension: plugin configuration pages come from external plugins Hermit doesn't host."
+      "classification": "expected-extension: plugin configuration pages come from external plugins Ferrofin doesn't host."
     },
     "GET /Items/{itemId}/ExternalIdInfos": {
       "category": "deferred",
@@ -96,7 +96,7 @@
     },
     "GET /Years": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope)."
+      "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope)."
     },
     "GET /ScheduledTasks": {
       "category": "instance",
@@ -108,7 +108,7 @@
     },
     "GET /System/Ping": {
       "category": "instance",
-      "classification": "instance: returns the server name string (hermit vs the Jellyfin instance name)."
+      "classification": "instance: returns the server name string (ferrofin vs the Jellyfin instance name)."
     },
     "GET /Environment/Drives": {
       "category": "instance",
@@ -132,15 +132,15 @@
     },
     "GET /System/Configuration": {
       "category": "instance",
-      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug."
+      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug."
     },
     "GET /LiveTv/TunerHosts/Types": {
       "category": "deferred",
-      "classification": "deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."
+      "classification": "deferred: Ferrofin implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported."
     },
     "POST /Items/{itemId}": {
       "category": "instance",
-      "classification": "instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect."
+      "classification": "instance/methodology: the metadata edit persists correctly on Ferrofin (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Ferrofin defect."
     },
     "GET /Items/{itemId}/MetadataEditor": {
       "category": "deferred",
@@ -148,7 +148,7 @@
     },
     "DELETE /Playlists/{playlistId}/Users/{userId}": {
       "category": "instance",
-      "classification": "instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect."
+      "classification": "instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect."
     },
     "DELETE /Audio/{itemId}/Lyrics": {
       "category": "deferred-remote-or-feature-gated",
@@ -760,31 +760,31 @@
     },
     "GET /Trailers": {
       "category": "instance",
-      "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap."
+      "classification": "instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap."
     },
     "POST /MergeVersions/MergeMovies": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+      "classification": "expected-extension: Ferrofin ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
     },
     "POST /MergeVersions/MergeEpisodes": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+      "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
     },
     "POST /MergeVersions/SplitMovies": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+      "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
     },
     "POST /MergeVersions/SplitEpisodes": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
+      "classification": "expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design."
     },
     "GET /Items/Root": {
       "category": "deferred",
-      "classification": "deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200)."
+      "classification": "deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200)."
     },
     "GET /Years/{year}": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200)."
+      "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200)."
     },
     "GET /Artists/{name}": {
       "category": "not-testable-this-way",
@@ -804,31 +804,31 @@
     },
     "GET /Playlists/{itemId}/InstantMix": {
       "category": "expected-extension",
-      "classification": "expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset."
+      "classification": "expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset."
     },
     "GET /Genres/{name}/Images/{imageType}": {
       "category": "deferred",
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
     },
     "GET /Genres/{name}/Images/{imageType}/{imageIndex}": {
       "category": "deferred",
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
     },
     "HEAD /Genres/{name}/Images/{imageType}": {
       "category": "deferred",
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
     },
     "HEAD /Genres/{name}/Images/{imageType}/{imageIndex}": {
       "category": "deferred",
-      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
+      "classification": "deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported."
     },
     "GET /Studios/{name}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404."
+      "classification": "accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404."
     },
     "GET /Genres/{genreName}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Hermit 404 vs Jellyfin auto-created 200. Shape verified."
+      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Ferrofin 404 vs Jellyfin auto-created 200. Shape verified."
     },
     "GET /Persons/{name}": {
       "category": "accepted-divergence",
@@ -852,7 +852,7 @@
     },
     "GET /DisplayPreferences/{displayPreferencesId}": {
       "category": "verified",
-      "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses."
+      "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses."
     }
   }
 }
