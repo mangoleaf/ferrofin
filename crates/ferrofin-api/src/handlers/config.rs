@@ -126,6 +126,43 @@ async fn update_branding_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Reads the persisted named configuration at `path`, or `None` when nothing
+/// usable is stored there.
+///
+/// Port of `BaseConfigurationManager.LoadConfiguration`, which wraps its
+/// deserialize in `catch { Logger.LogError(ex, "Error loading configuration
+/// file: {Path}", path) }` and then falls back to `Activator.CreateInstance` —
+/// the response shape stays the typed default, but the failure is **logged**.
+/// A missing file is the ordinary "never saved" case (upstream's `File.Exists`
+/// guard) and stays silent; a read error or invalid JSON is a broken store that
+/// would otherwise be indistinguishable from it, making an admin's saved
+/// settings look reset to defaults with nothing to look at.
+async fn read_named_config(path: &std::path::Path) -> Option<Value> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "reading named configuration failed; falling back to defaults"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "named configuration is not valid JSON; falling back to defaults"
+            );
+            None
+        }
+    }
+}
+
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
 /// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
@@ -160,13 +197,9 @@ async fn get_named_configuration(
         ))?));
     }
     // A previously-saved value wins over the default object.
-    let saved = if let Some(path) = named_config_file(&state, &key)
-        && let Ok(bytes) = tokio::fs::read(&path).await
-        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-    {
-        Some(value)
-    } else {
-        None
+    let saved = match named_config_file(&state, &key) {
+        Some(path) => read_named_config(&path).await,
+        None => None,
     };
     // `livetv` merges the persisted scalars (recording paths, padding) with the
     // canonical tuner/provider rows the Live TV manager keeps in SQLite — the
@@ -180,8 +213,30 @@ async fn get_named_configuration(
             ))?,
         };
         if let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value) {
-            let tuners = live_tv.get_tuner_hosts().await.unwrap_or_default();
-            let providers = live_tv.get_listing_providers().await.unwrap_or_default();
+            // A backend failure must not read as "no tuners configured": the
+            // rows still render empty (Jellyfin's corrupt-store fallback also
+            // yields an empty `LiveTvOptions`), but the failure is logged
+            // instead of vanishing.
+            let tuners = match live_tv.get_tuner_hosts().await {
+                Ok(tuners) => tuners,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "listing Live TV tuner hosts failed; reporting none configured"
+                    );
+                    Vec::new()
+                }
+            };
+            let providers = match live_tv.get_listing_providers().await {
+                Ok(providers) => providers,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "listing Live TV listing providers failed; reporting none configured"
+                    );
+                    Vec::new()
+                }
+            };
             map.insert(
                 "TunerHosts".to_owned(),
                 to_value(serde_json::to_value(tuners))?,
