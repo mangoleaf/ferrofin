@@ -14,6 +14,27 @@
 //! that define the next-up algorithm and defer the parental widening to the
 //! caller. Episodes are ordered by `(ParentIndexNumber, IndexNumber)` — season,
 //! then episode — exactly as C#.
+//!
+//! # Round-trip budget
+//!
+//! Every query here is batched over *all* requested series keys — nothing runs
+//! per series. One next-up request costs:
+//!
+//! * 1 query for the eligible series keys ([`get_next_up_series_keys`]);
+//! * 1 query for the `(id, season, episode, played, virtual)` projection of every
+//!   non-special episode of those series — the played, unplayed and
+//!   played-non-virtual pools are partitioned from that single result set;
+//! * 1 query for the specials, only when specials were requested;
+//! * 1 query for the *played by date* projection, only in rewatching mode;
+//! * 1 query for the full rows of the (few) episodes the batch result actually
+//!   returns.
+//!
+//! So 3 round-trips in the default configuration and 5 with rewatching on. The
+//! picked-episode positions come from the projection, so no full row has to be
+//! loaded just to read its season/episode, and each full row is *moved* into the
+//! batch result (cloned only when two fields of the same series name it).
+//!
+//! [`get_next_up_series_keys`]: NextUpService::get_next_up_series_keys
 
 use std::collections::HashMap;
 
@@ -92,10 +113,51 @@ impl FerrofinNextUpService {
 
 /// A lightweight `(id, season, episode)` projection used to pick the next/last
 /// episode without loading full rows (mirrors the C# anonymous projection).
+///
+/// `is_real` mirrors the SQL `IsVirtualItem = 0` predicate: only *real* (on-disk)
+/// episodes are eligible as a next-up pick, while the last-watched position is
+/// taken over played episodes whether or not they are virtual.
+#[derive(Clone, Copy)]
 struct EpisodePos {
     id: Uuid,
     season: Option<i64>,
     episode: Option<i64>,
+    is_real: bool,
+}
+
+impl EpisodePos {
+    /// The `(season, episode)` position, or `None` when either number is missing
+    /// — the same nullability rule the C# uses when comparing positions, so a
+    /// last-watched episode with no numbers searches from the start of the series.
+    fn position(self) -> Option<(i64, i64)> {
+        Some((self.season?, self.episode?))
+    }
+}
+
+/// A row of the episode-position projection:
+/// `(series key, id, season, episode, played, is virtual)`.
+type PositionRow = (String, String, Option<i64>, Option<i64>, bool, bool);
+
+/// A row of the played-by-date projection:
+/// `(series key, id, season, episode, is virtual, last played)`.
+type PlayDateRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    bool,
+    Option<DateTime<Utc>>,
+);
+
+/// The episode pools of one series, partitioned out of the single projection
+/// query. `played` keeps virtual rows (the last-watched position may sit on a
+/// virtual episode); `unplayed` holds only real, unplayed episodes.
+#[derive(Default)]
+struct SeriesEpisodes {
+    /// Played, non-special episodes — virtual rows included.
+    played: Vec<EpisodePos>,
+    /// Unplayed, non-special, non-virtual episodes — the next-up candidates.
+    unplayed: Vec<EpisodePos>,
 }
 
 #[async_trait]
@@ -169,14 +231,16 @@ impl NextUpService for FerrofinNextUpService {
         let episode_type = Self::episode_type()?;
         let user_id = user.id.clone();
 
-        // ── Last watched (highest season/episode among played, non-special) ──
-        let played = self
-            .episode_positions(episode_type, &user_id, series_keys, Played::Only, false)
+        // ── One projection query feeds every position-based decision below ──
+        let by_key = self
+            .episode_positions(episode_type, &user_id, series_keys)
             .await?;
-        let mut last_watched_by_key: HashMap<String, Uuid> = HashMap::new();
-        for (key, positions) in group_by_key(played) {
-            if let Some(last) = highest_position(&positions) {
-                last_watched_by_key.insert(key, last);
+
+        // Last watched: highest season/episode among played, non-special rows.
+        let mut last_watched_by_key: HashMap<&str, EpisodePos> = HashMap::new();
+        for (key, episodes) in &by_key {
+            if let Some(last) = highest_position(&episodes.played) {
+                last_watched_by_key.insert(key.as_str(), last);
             }
         }
 
@@ -195,74 +259,74 @@ impl NextUpService for FerrofinNextUpService {
             HashMap::new()
         };
 
-        // Full rows for the last-watched episodes, to read their season/episode.
-        let last_watched_ids: Vec<Uuid> = last_watched_by_key
-            .values()
-            .chain(last_watched_by_date.values())
-            .copied()
-            .collect();
-        let last_watched_rows = self.episodes_by_ids(&last_watched_ids).await?;
-
         // ── Next up: first unplayed episode after the last-watched position ──
-        let unplayed = self
-            .episode_positions(episode_type, &user_id, series_keys, Played::Not, true)
-            .await?;
-        let unplayed_by_key = group_by_key(unplayed);
-        let mut next_up_by_key: HashMap<String, Uuid> = HashMap::new();
-        for key in series_keys {
-            let Some(candidates) = unplayed_by_key.get(key) else {
-                continue;
-            };
+        let mut next_up_by_key: HashMap<&str, Uuid> = HashMap::new();
+        for (key, episodes) in &by_key {
             let after = last_watched_by_key
-                .get(key)
-                .and_then(|id| last_watched_rows.get(id))
-                .and_then(position_of);
-            if let Some(next) = first_after(candidates, after) {
-                next_up_by_key.insert(key.clone(), next);
+                .get(key.as_str())
+                .and_then(|pos| pos.position());
+            if let Some(next) = first_after(&episodes.unplayed, after) {
+                next_up_by_key.insert(key.as_str(), next);
             }
         }
 
         // ── Next played (rewatching): first played episode after last-by-date ──
-        let next_played_by_key = if include_watched_for_rewatching {
-            self.next_played_for_rewatching(
-                episode_type,
-                &user_id,
-                series_keys,
-                &last_watched_by_date,
-                &last_watched_rows,
-            )
-            .await?
-        } else {
-            HashMap::new()
-        };
+        let mut next_played_by_key: HashMap<&str, Uuid> = HashMap::new();
+        if include_watched_for_rewatching {
+            for (key, last) in &last_watched_by_date {
+                let Some(episodes) = by_key.get(key) else {
+                    continue;
+                };
+                // The rewatching candidates are the *real* played episodes.
+                let candidates: Vec<EpisodePos> = episodes
+                    .played
+                    .iter()
+                    .copied()
+                    .filter(|pos| pos.is_real)
+                    .collect();
+                if let Some(next) = first_after(&candidates, last.position()) {
+                    next_played_by_key.insert(key.as_str(), next);
+                }
+            }
+        }
 
-        // Full rows for the chosen next episodes.
-        let next_ids: Vec<Uuid> = next_up_by_key
+        // ── One fetch of the full rows the batch result actually returns ──
+        let mut refs: HashMap<Uuid, usize> = HashMap::new();
+        for id in last_watched_by_key
             .values()
-            .chain(next_played_by_key.values())
-            .copied()
-            .collect();
-        let next_rows = self.episodes_by_ids(&next_ids).await?;
+            .map(|pos| pos.id)
+            .chain(next_up_by_key.values().copied())
+            .chain(last_watched_by_date.values().map(|pos| pos.id))
+            .chain(next_played_by_key.values().copied())
+        {
+            *refs.entry(id).or_insert(0) += 1;
+        }
+        let wanted: Vec<Uuid> = refs.keys().copied().collect();
+        let mut rows = self.episodes_by_ids(&wanted).await?;
 
         // ── Assemble a batch result per series key ──
-        let mut result = HashMap::new();
+        let mut result: HashMap<String, NextUpEpisodeBatchResult> = HashMap::new();
         for key in series_keys {
-            let mut batch = NextUpEpisodeBatchResult::default();
-            if let Some(id) = last_watched_by_key.get(key) {
-                batch.last_watched = last_watched_rows.get(id).cloned();
+            // Duplicate keys would otherwise re-take rows already moved out.
+            if result.contains_key(key) {
+                continue;
             }
-            if let Some(id) = next_up_by_key.get(key) {
-                batch.next_up = next_rows.get(id).cloned();
+            let mut batch = NextUpEpisodeBatchResult::default();
+            if let Some(pos) = last_watched_by_key.get(key.as_str()) {
+                batch.last_watched = take_row(&mut rows, &mut refs, pos.id);
+            }
+            if let Some(id) = next_up_by_key.get(key.as_str()) {
+                batch.next_up = take_row(&mut rows, &mut refs, *id);
             }
             if include_specials {
                 batch.specials = specials_by_key.remove(key).unwrap_or_default();
             }
             if include_watched_for_rewatching {
-                if let Some(id) = last_watched_by_date.get(key) {
-                    batch.last_watched_for_rewatching = last_watched_rows.get(id).cloned();
+                if let Some(pos) = last_watched_by_date.get(key) {
+                    batch.last_watched_for_rewatching = take_row(&mut rows, &mut refs, pos.id);
                 }
-                if let Some(id) = next_played_by_key.get(key) {
-                    batch.next_played_for_rewatching = next_rows.get(id).cloned();
+                if let Some(id) = next_played_by_key.get(key.as_str()) {
+                    batch.next_played_for_rewatching = take_row(&mut rows, &mut refs, *id);
                 }
             }
             result.insert(key.clone(), batch);
@@ -271,26 +335,22 @@ impl NextUpService for FerrofinNextUpService {
     }
 }
 
-/// Whether the episode-position query restricts to played or unplayed rows.
-#[derive(Clone, Copy)]
-enum Played {
-    /// Only episodes the user has played.
-    Only,
-    /// Only episodes the user has not played.
-    Not,
-}
-
 impl FerrofinNextUpService {
-    /// The most-recently-played episode id per series key (rewatching mode).
+    /// The most-recently-played episode per series key (rewatching mode).
     /// Rows come back date-descending, so the first seen per key is the newest.
+    ///
+    /// The season/episode numbers ride along so the caller never has to load the
+    /// full row just to read the position it must search past.
     async fn last_watched_by_play_date(
         &self,
         episode_type: &str,
         user_id: &str,
         series_keys: &[String],
-    ) -> Result<HashMap<String, Uuid>, ServiceError> {
+    ) -> Result<HashMap<String, EpisodePos>, ServiceError> {
         let mut sql = String::from(
-            r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id", ud."LastPlayedDate"
+            r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
+                      bi."ParentIndexNumber", bi."IndexNumber", bi."IsVirtualItem",
+                      ud."LastPlayedDate"
                FROM "BaseItems" bi
                JOIN "UserData" ud ON ud."ItemId" = bi."Id"
                WHERE bi."Type" = ? AND ud."UserId" = ? AND ud."Played" = 1
@@ -299,7 +359,7 @@ impl FerrofinNextUpService {
         );
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push_str(r#") ORDER BY ud."LastPlayedDate" DESC"#);
-        let mut query = sqlx::query_as::<_, (String, String, Option<DateTime<Utc>>)>(&sql)
+        let mut query = sqlx::query_as::<_, PlayDateRow>(&sql)
             .bind(episode_type)
             .bind(user_id)
             .bind(PLACEHOLDER_ID);
@@ -307,10 +367,15 @@ impl FerrofinNextUpService {
             query = query.bind(key.clone());
         }
         let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-        let mut out: HashMap<String, Uuid> = HashMap::new();
-        for (key, id, _date) in rows {
+        let mut out: HashMap<String, EpisodePos> = HashMap::new();
+        for (key, id, season, episode, is_virtual, _date) in rows {
             if let Ok(id) = Uuid::parse_str(&id) {
-                out.entry(key).or_insert(id);
+                out.entry(key).or_insert(EpisodePos {
+                    id,
+                    season,
+                    episode,
+                    is_real: !is_virtual,
+                });
             }
         }
         Ok(out)
@@ -343,94 +408,80 @@ impl FerrofinNextUpService {
         Ok(out)
     }
 
-    /// The next *played* episode after the last-watched-by-date position, per
-    /// series key — the rewatching-mode analogue of the next-up computation.
-    async fn next_played_for_rewatching(
-        &self,
-        episode_type: &str,
-        user_id: &str,
-        series_keys: &[String],
-        last_watched_by_date: &HashMap<String, Uuid>,
-        last_watched_rows: &HashMap<Uuid, BaseItemEntity>,
-    ) -> Result<HashMap<String, Uuid>, ServiceError> {
-        let played_all = self
-            .episode_positions(episode_type, user_id, series_keys, Played::Only, true)
-            .await?;
-        let played_by_key = group_by_key(played_all);
-        let mut out: HashMap<String, Uuid> = HashMap::new();
-        for key in series_keys {
-            let Some(last_by_date_id) = last_watched_by_date.get(key) else {
-                continue;
-            };
-            let Some(last_row) = last_watched_rows.get(last_by_date_id) else {
-                continue;
-            };
-            let Some(candidates) = played_by_key.get(key) else {
-                continue;
-            };
-            if let Some(next) = first_after(candidates, position_of(last_row)) {
-                out.insert(key.clone(), next);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Fetches `(id, season, episode)` projections of episodes for the given
-    /// series keys, restricted to played/unplayed and (optionally) non-virtual,
-    /// non-special rows.
+    /// Fetches the `(id, season, episode, played, virtual)` projection of every
+    /// non-special episode of the given series, grouped per series key.
+    ///
+    /// This is deliberately **one** query covering all three pools the batch
+    /// algorithm needs (played incl. virtual, unplayed real, played real): the
+    /// played flag is an `EXISTS` over `UserData` — the same predicate the
+    /// per-pool queries used to carry in their `WHERE` — evaluated once per row
+    /// instead of once per row per pool.
     async fn episode_positions(
         &self,
         episode_type: &str,
         user_id: &str,
         series_keys: &[String],
-        played: Played,
-        exclude_specials: bool,
-    ) -> Result<Vec<(String, EpisodePos)>, ServiceError> {
-        let played_pred = match played {
-            Played::Only => {
-                r#"EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id"
-                       AND ud."UserId" = ? AND ud."Played" = 1)"#
-            }
-            Played::Not => {
-                r#"NOT EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id"
-                       AND ud."UserId" = ? AND ud."Played" = 1)"#
-            }
-        };
-        let mut sql = format!(
+    ) -> Result<HashMap<String, SeriesEpisodes>, ServiceError> {
+        let mut sql = String::from(
             r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
-                      bi."ParentIndexNumber", bi."IndexNumber"
+                      bi."ParentIndexNumber", bi."IndexNumber",
+                      EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id"
+                              AND ud."UserId" = ? AND ud."Played" = 1) AS "Played",
+                      bi."IsVirtualItem"
                FROM "BaseItems" bi
-               WHERE bi."Type" = ? AND bi."ParentIndexNumber" <> 0 AND {played_pred}"#
+               WHERE bi."Type" = ? AND bi."ParentIndexNumber" <> 0
+                 AND bi."SeriesPresentationUniqueKey" IN ("#,
         );
-        if exclude_specials {
-            sql.push_str(r#" AND bi."IsVirtualItem" = 0"#);
-        }
-        sql.push_str(r#" AND bi."SeriesPresentationUniqueKey" IN ("#);
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push(')');
 
-        let mut query = sqlx::query_as::<_, (String, String, Option<i64>, Option<i64>)>(&sql)
-            .bind(episode_type)
-            .bind(user_id);
+        let mut query = sqlx::query_as::<_, PositionRow>(&sql)
+            .bind(user_id)
+            .bind(episode_type);
         for key in series_keys {
             query = query.bind(key.clone());
         }
         let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for (key, id, season, episode) in rows {
-            if let Ok(id) = Uuid::parse_str(&id) {
-                out.push((
-                    key,
-                    EpisodePos {
-                        id,
-                        season,
-                        episode,
-                    },
-                ));
+        let mut out: HashMap<String, SeriesEpisodes> = HashMap::new();
+        for (key, id, season, episode, played, is_virtual) in rows {
+            let Ok(id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let pos = EpisodePos {
+                id,
+                season,
+                episode,
+                is_real: !is_virtual,
+            };
+            let bucket = out.entry(key).or_default();
+            if played {
+                bucket.played.push(pos);
+            } else if pos.is_real {
+                bucket.unplayed.push(pos);
             }
         }
         Ok(out)
+    }
+}
+
+/// Moves the row for `id` out of `rows`, cloning only while another batch field
+/// still references it (the same episode can be both the last watched and the
+/// last watched *by date*).
+fn take_row(
+    rows: &mut HashMap<Uuid, BaseItemEntity>,
+    refs: &mut HashMap<Uuid, usize>,
+    id: Uuid,
+) -> Option<BaseItemEntity> {
+    match refs.get_mut(&id) {
+        Some(remaining) if *remaining > 1 => {
+            *remaining -= 1;
+            rows.get(&id).cloned()
+        }
+        _ => {
+            refs.remove(&id);
+            rows.remove(&id)
+        }
     }
 }
 
@@ -448,32 +499,18 @@ fn push_key_placeholders(sql: &mut String, n: usize) {
     }
 }
 
-/// Groups `(key, pos)` pairs into a map keyed by series presentation key.
-fn group_by_key(rows: Vec<(String, EpisodePos)>) -> HashMap<String, Vec<EpisodePos>> {
-    let mut map: HashMap<String, Vec<EpisodePos>> = HashMap::new();
-    for (key, pos) in rows {
-        map.entry(key).or_default().push(pos);
-    }
-    map
-}
-
 /// The `(season, episode)` sort key of an episode row, missing numbers sorting
 /// lowest (`i64::MIN`), matching the C# nullable ordering.
 fn sort_key(season: Option<i64>, episode: Option<i64>) -> (i64, i64) {
     (season.unwrap_or(i64::MIN), episode.unwrap_or(i64::MIN))
 }
 
-/// The `(season, episode)` of a full episode row.
-fn position_of(row: &BaseItemEntity) -> Option<(i64, i64)> {
-    Some((row.parent_index_number?, row.index_number?))
-}
-
-/// The id of the highest-numbered episode in a group (last watched).
-fn highest_position(positions: &[EpisodePos]) -> Option<Uuid> {
+/// The highest-numbered episode in a group (last watched).
+fn highest_position(positions: &[EpisodePos]) -> Option<EpisodePos> {
     positions
         .iter()
         .max_by_key(|p| sort_key(p.season, p.episode))
-        .map(|p| p.id)
+        .copied()
 }
 
 /// The id of the first episode strictly after `after` (or the very first when
@@ -602,5 +639,551 @@ mod tests {
         let series = batch.get("series-a").expect("series present");
         assert_eq!(series.specials.len(), 1);
         assert_eq!(series.specials[0].id, guid_to_db(special));
+    }
+
+    // ── Semantics pinned below: which episode is "next", and over which pool ──
+
+    /// Clears an episode's `IndexNumber`, so the position is only half-known.
+    async fn clear_index_number(db: &ferrofin_db::Database, id: Uuid) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "IndexNumber" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("clear index number");
+    }
+
+    /// Runs the batch with specials and rewatching off — the default shape.
+    async fn batch_of(
+        svc: &FerrofinNextUpService,
+        user: UserEntity,
+        top: Uuid,
+        keys: &[&str],
+    ) -> std::collections::HashMap<String, ferrofin_traits::persistence::NextUpEpisodeBatchResult>
+    {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        svc.get_next_up_episodes_batch(&query_for(user, top), &keys, false, false)
+            .await
+            .expect("batch")
+    }
+
+    #[tokio::test]
+    async fn next_up_never_picks_a_virtual_episode() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2_virtual = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2_virtual, "series-a", 1, 2, true, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = batch_of(&svc, user, top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        // The unwatched season-1 episode 2 exists only as a virtual (missing
+        // file) row, so the pick skips past it to episode 3.
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e3))
+        );
+    }
+
+    #[tokio::test]
+    async fn last_watched_position_counts_virtual_played_episodes() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2_virtual = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2_virtual, "series-a", 1, 2, true, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        // Only the *virtual* episode 2 is played; episode 1 is still unwatched.
+        seed_user_data(
+            &db,
+            user_id,
+            e2_virtual,
+            true,
+            Some(ts("2021-01-01T00:00:00Z")),
+        )
+        .await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = batch_of(&svc, user, top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        // The last-watched pool is *not* filtered to real rows, so the position
+        // to search past is (1, 2) — episode 1 is behind it and episode 3 wins.
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2_virtual))
+        );
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e3))
+        );
+    }
+
+    #[tokio::test]
+    async fn unnumbered_last_watched_searches_from_the_start() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let watched = Uuid::new_v4();
+        let unnumbered = Uuid::new_v4();
+        seed_episode(&db, watched, "series-a", 1, 5, false, Some(top)).await;
+        seed_episode(&db, unnumbered, "series-a", 1, 9, false, Some(top)).await;
+        clear_index_number(&db, watched).await;
+        clear_index_number(&db, unnumbered).await;
+        seed_user_data(
+            &db,
+            user_id,
+            watched,
+            true,
+            Some(ts("2021-01-01T00:00:00Z")),
+        )
+        .await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = batch_of(&svc, user, top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        // A half-known position yields no comparison point at all (`None`), so
+        // the first unplayed candidate is taken even though it does not sort
+        // strictly after the last-watched sort key.
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(unnumbered))
+        );
+    }
+
+    #[tokio::test]
+    async fn specials_are_not_next_up_candidates() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let special = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, special, "series-a", 0, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+
+        let svc = FerrofinNextUpService::new(db.clone());
+
+        // Nothing is played yet, so there is no last-watched position to search
+        // past and the pick is simply the lowest-sorting candidate. Season 0
+        // sorts *below* every real season, so the special would win outright
+        // unless the projection query excludes it: this is the shape where the
+        // `ParentIndexNumber <> 0` guard — not the ordering — is load-bearing.
+        let batch = batch_of(&svc, user.clone(), top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        assert!(series.last_watched.is_none(), "nothing has been played");
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e1)),
+            "an unwatched series starts at its first real episode, not its special"
+        );
+
+        // And mid-series the special is still not a candidate.
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        let batch = batch_of(&svc, user, top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_watched_series_has_no_next_up() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e2, true, Some(ts("2021-01-02T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = batch_of(&svc, user, top, &["series-a"]).await;
+        let series = batch.get("series-a").expect("series present");
+        assert!(series.next_up.is_none());
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    #[tokio::test]
+    async fn each_series_in_a_batch_is_resolved_independently() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let b1 = Uuid::new_v4();
+        let b2 = Uuid::new_v4();
+        seed_episode(&db, a1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, a2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, b1, "series-b", 2, 7, false, Some(top)).await;
+        seed_episode(&db, b2, "series-b", 2, 8, false, Some(top)).await;
+        seed_user_data(&db, user_id, a1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, b1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = batch_of(&svc, user, top, &["series-a", "series-b"]).await;
+        assert_eq!(
+            batch["series-a"].next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(a2))
+        );
+        assert_eq!(
+            batch["series-b"].next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(b2))
+        );
+        // Neither series' pool leaks into the other's last-watched position.
+        assert_eq!(
+            batch["series-b"]
+                .last_watched
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(b1))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_series_key_still_yields_the_full_result() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        let special = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, special, "series-a", 0, 1, false, Some(top)).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let keys = vec!["series-a".to_owned(), "series-a".to_owned()];
+        let batch = svc
+            .get_next_up_episodes_batch(&query_for(user, top), &keys, true, false)
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(series.specials.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rewatching_resumes_after_the_most_recently_played_episode() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        // Whole series watched, then episode 1 re-watched most recently.
+        seed_user_data(&db, user_id, e2, true, Some(ts("2021-01-02T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e3, true, Some(ts("2021-01-03T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-06-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = svc
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                true,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert!(series.next_up.is_none(), "nothing is unwatched");
+        // Highest position is still episode 3 …
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e3))
+        );
+        // … but the rewatch pick follows the most recent *play date* (episode 1).
+        assert_eq!(
+            series
+                .last_watched_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(
+            series
+                .next_played_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    #[tokio::test]
+    async fn rewatching_never_picks_a_virtual_episode() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2_virtual = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2_virtual, "series-a", 1, 2, true, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        seed_user_data(
+            &db,
+            user_id,
+            e2_virtual,
+            true,
+            Some(ts("2021-01-02T00:00:00Z")),
+        )
+        .await;
+        seed_user_data(&db, user_id, e3, true, Some(ts("2021-01-03T00:00:00Z"))).await;
+        // Episode 1 re-watched last, so the rewatch search starts after (1, 1).
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-06-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = svc
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                true,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        // Episode 2 is played but virtual, so the rewatch pick skips to 3 — the
+        // rewatch candidate pool is filtered to real rows even though the
+        // last-watched pool is not.
+        assert_eq!(
+            series
+                .next_played_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e3))
+        );
+    }
+
+    /// Overwrites a user-data row's `LastPlayedDate` with a value no timestamp
+    /// decoder accepts. `LastPlayedDate` is selected by exactly one query in the
+    /// batch path — the play-date projection the rewatching flag gates — so a
+    /// batch that still succeeds is proof that round-trip was never issued.
+    async fn corrupt_last_played_date(db: &ferrofin_db::Database, user: Uuid, item: Uuid) {
+        sqlx::query(
+            r#"UPDATE "UserData" SET "LastPlayedDate" = 'not-a-timestamp'
+               WHERE "UserId" = ?1 AND "ItemId" = ?2"#,
+        )
+        .bind(guid_to_db(user))
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("corrupt last played date");
+    }
+
+    /// Seeds `series-a` as watched through episode 2 with episode 1 re-watched
+    /// most recently, so both rewatching fields have a real answer to report
+    /// (`last_watched_for_rewatching` = e1, `next_played_for_rewatching` = e2),
+    /// and returns `(user, top parent, e1, e2)`. Episode 3 stays unplayed so the
+    /// non-rewatching `next_up` still has an answer too.
+    async fn seed_rewatched_series(db: &ferrofin_db::Database) -> (UserEntity, Uuid, Uuid, Uuid) {
+        let top = Uuid::new_v4();
+        let user = seed_user(db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        let e3 = Uuid::new_v4();
+        seed_episode(db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(db, e3, "series-a", 1, 3, false, Some(top)).await;
+        seed_user_data(db, user_id, e2, true, Some(ts("2021-01-02T00:00:00Z"))).await;
+        seed_user_data(db, user_id, e1, true, Some(ts("2021-06-01T00:00:00Z"))).await;
+        (user, top, e1, e2)
+    }
+
+    /// The *compute* gate: the play-date round-trip must not be issued at all
+    /// when rewatching was not asked for. Covered independently of the assembly
+    /// gate — the assertions here are about which query runs, not about which
+    /// fields the batch result carries.
+    #[tokio::test]
+    async fn rewatching_play_date_query_is_only_issued_when_requested() {
+        let db = test_db().await;
+        let (user, top, e1, e2) = seed_rewatched_series(&db).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        corrupt_last_played_date(&db, user_id, e1).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let keys = ["series-a".to_owned()];
+
+        // Rewatching off: the unreadable column is never selected, so the batch
+        // resolves normally off the position projection alone.
+        let batch = svc
+            .get_next_up_episodes_batch(&query_for(user.clone(), top), &keys, false, false)
+            .await
+            .expect("batch resolves without touching LastPlayedDate");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+
+        // Rewatching on: the same call now reads the column and fails — which is
+        // what makes the success above evidence of a skipped query rather than
+        // of a harmless one.
+        let err = svc
+            .get_next_up_episodes_batch(&query_for(user, top), &keys, false, true)
+            .await;
+        assert!(
+            err.is_err(),
+            "the play-date query must run when rewatching is requested"
+        );
+    }
+
+    /// The *assembly* gate: the rewatching fields of the batch result are filled
+    /// in exactly when rewatching was requested. Same database, same seeded
+    /// history, only the flag differs — so the pair discriminates the gate on
+    /// its own, without depending on the compute gate upstream.
+    #[tokio::test]
+    async fn rewatching_fields_follow_the_request_flag() {
+        let db = test_db().await;
+        let (user, top, e1, e2) = seed_rewatched_series(&db).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let keys = ["series-a".to_owned()];
+
+        let batch = svc
+            .get_next_up_episodes_batch(&query_for(user.clone(), top), &keys, false, false)
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert!(series.last_watched_for_rewatching.is_none());
+        assert!(series.next_played_for_rewatching.is_none());
+        assert!(series.specials.is_empty(), "specials were not requested");
+
+        let batch = svc
+            .get_next_up_episodes_batch(&query_for(user, top), &keys, false, true)
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series
+                .last_watched_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(
+            series
+                .next_played_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    #[tokio::test]
+    async fn last_watched_and_rewatch_pick_can_be_the_same_row() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        // Episode 2 is both the highest played and the most recently played, so
+        // `last_watched` and `last_watched_for_rewatching` name the same row.
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e2, true, Some(ts("2021-01-02T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = svc
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                true,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+        assert_eq!(
+            series
+                .last_watched_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+        assert!(series.next_played_for_rewatching.is_none());
+    }
+
+    #[tokio::test]
+    async fn series_keys_respect_the_date_cutoff_and_limit() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        seed_episode(&db, a, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, b, "series-b", 1, 1, false, Some(top)).await;
+        seed_episode(&db, c, "series-c", 1, 1, false, Some(top)).await;
+        seed_user_data(&db, user_id, a, true, Some(ts("2019-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, b, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, c, true, Some(ts("2022-01-01T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let mut query = query_for(user, top);
+        query.limit = Some(1);
+        let keys = svc
+            .get_next_up_series_keys(&query, ts("2020-01-01T00:00:00Z"))
+            .await
+            .expect("keys");
+        // series-a is behind the cutoff; the limit keeps only the newest of the
+        // remaining two, newest-first.
+        assert_eq!(keys, vec!["series-c".to_owned()]);
     }
 }
