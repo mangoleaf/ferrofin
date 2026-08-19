@@ -585,8 +585,13 @@ async fn image_info_dto(
     };
     // Size is the on-disk file length, stat'd at projection time (Jellyfin's GetImageInfo does the
     // same: `length = fileInfo.Length` for local files). Remote/missing files report 0.
+    //
+    // The stat goes through `tokio::fs` (i.e. the blocking pool), never `std::fs` inline: this
+    // runs once per image row inside `GET /Items/{itemId}/Images`, and on network-backed media
+    // (NFS/SMB) a cold stat can park the calling worker thread for seconds.
     let size = if image.is_local_file() {
-        std::fs::metadata(&image.path)
+        tokio::fs::metadata(&image.path)
+            .await
             .ok()
             .and_then(|m| i64::try_from(m.len()).ok())
             .unwrap_or(0)
@@ -1190,6 +1195,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::time::Duration;
 
     fn img(path: String) -> ItemImageInfo {
         ItemImageInfo {
@@ -1373,5 +1379,69 @@ mod tests {
                 .size,
             0
         );
+    }
+
+    /// The `Size` stat must be dispatched to the blocking pool, not run inline.
+    ///
+    /// This is the discriminating test for the blocking-I/O fix, and it works by
+    /// starving the pool: the runtime is built with exactly one blocking thread
+    /// and that thread is held busy for the duration. A `tokio::fs::metadata`
+    /// stat is therefore *queued* and cannot complete, so the timeout elapses —
+    /// while a `std::fs::metadata` call runs on the async worker itself and
+    /// returns immediately, regardless of the pool. Asserting that the call
+    /// makes no progress is what fails if the blocking syscall comes back.
+    ///
+    /// Motivation is a real incident: on cold network-backed media (NFS/SMB) each
+    /// inline stat parked a tokio worker for the length of the syscall, once per
+    /// image row of `GET /Items/{itemId}/Images`.
+    #[test]
+    fn image_info_size_stat_goes_through_the_blocking_pool() {
+        // Only bounds the failing direction: an inline `std::fs::metadata` on a
+        // just-written temp file returns in microseconds, so any value well above
+        // the noise floor works. Nothing waits on this when the code is correct.
+        const STARVED_WAIT: Duration = Duration::from_millis(250);
+
+        let dir = std::env::temp_dir().join(format!("ferrofin-img-nb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("poster.jpg");
+        std::fs::write(&file, b"0123456789").unwrap(); // 10 bytes
+        let path = file.to_string_lossy().into_owned();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            // Occupy the single blocking thread, and wait until it is provably busy
+            // so the stat below cannot win the race for it.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                STARVED_WAIT,
+                image_info_dto(&img(path.clone()), None, None, Uuid::nil()),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "stat completed with the blocking pool starved, so it ran inline on the async \
+                 worker thread"
+            );
+
+            // Free the pool and confirm the same call still reports the real length.
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let dto = image_info_dto(&img(path), None, None, Uuid::nil()).await;
+            assert_eq!(dto.size, 10);
+        });
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
