@@ -33,7 +33,6 @@
 //! - the collections **folder** (`GetCollectionsFolder`) resolution needs the
 //!   user-view tree and returns `None` here.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -46,7 +45,7 @@ use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
     PlaylistUserUpdateRequest,
 };
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
 use ferrofin_traits::collections::{
@@ -64,6 +63,98 @@ use crate::item_type_lookup::stored_type_name;
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
 const LINKED_CHILD_MANUAL: i32 = 0;
+
+/// The one query behind `GET /Playlists/{id}/Items`: every member row of the
+/// playlist, in link order, each carrying the caller's access columns.
+///
+/// Collapsing the read into a single statement is load-bearing under open-loop
+/// load — the previous shape took one reader-pool connection for the access
+/// check, another for the child-id list, and another for the `IN (…)` detail
+/// fetch, so a single request queued three times on a pool sized to the core
+/// count. `?1` = playlist id, `?2` = caller, `?3` = the manual child type.
+///
+/// `pl` proves the playlist's own `BaseItems` row exists (a member edge without
+/// its container must still read as missing, exactly as the access query does);
+/// `p`/`s` are LEFT-joined so a legacy playlist with no meta row and a caller
+/// with no share row both come back as NULLs [`decide_access`] interprets.
+const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
+       p."OwnerUserId" AS "PlaylistOwnerUserId",
+       p."OpenAccess"  AS "PlaylistOpenAccess",
+       s."CanEdit"     AS "PlaylistShareCanEdit"
+   FROM "HermitLinkedChildren" lc
+   JOIN "BaseItems" pl ON pl."Id" = lc."ParentId"
+   JOIN "BaseItems" ch ON ch."Id" = lc."ChildId"
+   LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = lc."ParentId"
+   LEFT JOIN "HermitPlaylistShares" s
+          ON s."PlaylistId" = lc."ParentId" AND s."UserId" = ?2
+   WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
+   ORDER BY lc."SortOrder""#;
+
+/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
+/// access columns (identical on every row of a given playlist).
+struct PlaylistItemRow {
+    /// The member item row.
+    item: BaseItemEntity,
+    /// `HermitPlaylists.OwnerUserId` (NULL for a legacy or API-key playlist).
+    owner: Option<String>,
+    /// `HermitPlaylists.OpenAccess` (NULL only when the meta row is absent).
+    open_access: Option<i64>,
+    /// The caller's `HermitPlaylistShares.CanEdit` (NULL when not shared).
+    can_edit: Option<i64>,
+}
+
+impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            item: BaseItemEntity::from_row(row)?,
+            owner: row.try_get("PlaylistOwnerUserId")?,
+            open_access: row.try_get("PlaylistOpenAccess")?,
+            can_edit: row.try_get("PlaylistShareCanEdit")?,
+        })
+    }
+}
+
+/// Decides the caller's [`PlaylistAccess`] from the three joined access columns
+/// (C# `Playlist.IsVisible` plus the owner/`CanEdit` split the controller checks
+/// derive from it). `None` means invisible — callers report `NotFound`.
+///
+/// Shared by the access query and the joined items read so both paths can never
+/// drift apart.
+fn decide_access(
+    owner: Option<&str>,
+    open_access: Option<i64>,
+    can_edit: Option<i64>,
+    user_id: Uuid,
+) -> Option<PlaylistAccess> {
+    // `open_access` is NULL only when the meta row is absent — a legacy
+    // playlist predating owner tracking: every caller is owner-equivalent.
+    let Some(open_access) = open_access else {
+        return Some(PlaylistAccess {
+            level: PlaylistAccessLevel::Owner,
+            open_access: false,
+        });
+    };
+    let open_access = open_access != 0;
+    // A NULL owner in an existing meta row is an API-key playlist: no user
+    // owns it, so — like a legacy row — every caller is owner-equivalent.
+    // Parse-compare the stored owner GUID so rows written in either case
+    // (legacy lowercase, canonical uppercase) still match.
+    let owner_is_caller = owner.and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
+    let level = if owner.is_none() || owner_is_caller {
+        PlaylistAccessLevel::Owner
+    } else if let Some(can_edit) = can_edit {
+        if can_edit != 0 {
+            PlaylistAccessLevel::CanEdit
+        } else {
+            PlaylistAccessLevel::Read
+        }
+    } else if open_access {
+        PlaylistAccessLevel::Read
+    } else {
+        return None;
+    };
+    Some(PlaylistAccess { level, open_access })
+}
 
 /// Inserts a minimal `BaseItems` row of the given folder-ish kind and returns
 /// the persisted row. Only the schema-required columns are set; richer metadata
@@ -277,35 +368,7 @@ impl FerrofinPlaylistManager {
         .map_err(db_err)?;
         let not_found = || ServiceError::not_found(format!("playlist {playlist_id}"));
         let (owner, open_access, can_edit) = row.ok_or_else(not_found)?;
-        // `open_access` is NULL only when the meta row is absent — a legacy
-        // playlist predating owner tracking: every caller is owner-equivalent.
-        let Some(open_access) = open_access else {
-            return Ok(PlaylistAccess {
-                level: PlaylistAccessLevel::Owner,
-                open_access: false,
-            });
-        };
-        let open_access = open_access != 0;
-        // A NULL owner in an existing meta row is an API-key playlist: no user
-        // owns it, so — like a legacy row — every caller is owner-equivalent.
-        // Parse-compare the stored owner GUID so rows written in either case
-        // (legacy lowercase, canonical uppercase) still match.
-        let owner_is_caller =
-            owner.as_deref().and_then(|o| Uuid::parse_str(o).ok()) == Some(user_id);
-        let level = if owner.is_none() || owner_is_caller {
-            PlaylistAccessLevel::Owner
-        } else if let Some(can_edit) = can_edit {
-            if can_edit != 0 {
-                PlaylistAccessLevel::CanEdit
-            } else {
-                PlaylistAccessLevel::Read
-            }
-        } else if open_access {
-            PlaylistAccessLevel::Read
-        } else {
-            return Err(not_found());
-        };
-        Ok(PlaylistAccess { level, open_access })
+        decide_access(owner.as_deref(), open_access, can_edit, user_id).ok_or_else(not_found)
     }
 }
 
@@ -457,42 +520,38 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Visibility gate (invisible → NotFound); the C# `Forbid()` branch is
-        // unreachable here because visible ⇔ permitted-to-read. Per-member
-        // parental-control filtering stays deferred: members return in link order.
-        self.access(playlist_id, user_id).await?;
-        let child_ids = self
-            .linked_children
-            .get_linked_children_ids(playlist_id, Some(LINKED_CHILD_MANUAL))
-            .await?;
-        if child_ids.is_empty() {
+        // One round-trip ([`PLAYLIST_ITEMS_SQL`]): the member rows already in
+        // link order (`ORDER BY lc."SortOrder"` — the same ordering
+        // `get_linked_children_ids` applies), each carrying the caller's access
+        // columns, so the visibility gate costs no extra query. The C# `Forbid()`
+        // branch is unreachable here because visible ⇔ permitted-to-read;
+        // per-member parental-control filtering stays deferred.
+        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
+            .bind(guid_to_db(playlist_id))
+            .bind(guid_to_db(user_id))
+            .bind(i64::from(LINKED_CHILD_MANUAL))
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let Some(first) = rows.first() else {
+            // No member rows: the join can't tell "empty playlist" from
+            // "missing/invisible playlist", so resolve access on its own. Only
+            // empty playlists pay for this second query.
+            self.access(playlist_id, user_id).await?;
             return Ok(Vec::new());
+        };
+        // Every row repeats the same access columns; the first decides.
+        if decide_access(
+            first.owner.as_deref(),
+            first.open_access,
+            first.can_edit,
+            user_id,
+        )
+        .is_none()
+        {
+            return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
         }
-        let db_ids: Vec<String> = child_ids.iter().copied().map(guid_to_db).collect();
-        let mut rows = Vec::with_capacity(db_ids.len());
-        for chunk in db_ids.chunks(500) {
-            let mut qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
-            let mut sep = qb.separated(", ");
-            for id in chunk {
-                sep.push_bind(id.as_str());
-            }
-            sep.push_unseparated(")");
-            let batch: Vec<BaseItemEntity> = qb
-                .build_query_as()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-            rows.extend(batch);
-        }
-        // Restore linked-children order (SQL IN doesn't guarantee it).
-        let pos: HashMap<&str, usize> = db_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.as_str(), i))
-            .collect();
-        rows.sort_by_key(|r| pos.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
-        Ok(rows)
+        Ok(rows.into_iter().map(|r| r.item).collect())
     }
 
     async fn add_user_to_shares(
@@ -1105,6 +1164,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_playlist_items_reflects_move_item_order() {
+        // Playlists are user-ordered, so the read must echo the stored
+        // `SortOrder` — including after a reorder. The member ids are FIXED and
+        // ascending while the link order is their exact reverse, so any
+        // id/rowid/insertion ordering (e.g. dropping `ORDER BY lc."SortOrder"`)
+        // fails this deterministically rather than by luck of random guids.
+        let db = test_db().await;
+        let (a, b, c) = (
+            Uuid::from_u128(0x1111_1111),
+            Uuid::from_u128(0x2222_2222),
+            Uuid::from_u128(0x3333_3333),
+        );
+        for id in [a, b, c] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = playlist_manager(&db);
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Reordered".to_owned()),
+                item_id_list: vec![c, b, a],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+        let read = |user| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.get_playlist_items(playlist_id, user)
+                    .await
+                    .expect("items")
+                    .iter()
+                    .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                    .collect::<Vec<Uuid>>()
+            }
+        };
+        assert_eq!(read(owner).await, vec![c, b, a], "link order, not id order");
+
+        // Move the middle entry to the end: [C, A, B].
+        mgr.move_item(&created.id, &b.to_string(), 2, owner)
+            .await
+            .expect("move");
+        assert_eq!(
+            read(owner).await,
+            vec![c, a, b],
+            "read must echo the rewritten SortOrder"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_pins_entry_id_derivation() {
+        // `PlaylistItemId` on the wire is `item.id.replace('-', "")` over the row
+        // this returns, so the row's `Id` must stay the canonical stored guid
+        // (dashed uppercase) — the joined read must project the CHILD's `Id`,
+        // never the playlist's.
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(&db);
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Pinned".to_owned()),
+                item_id_list: vec![track],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+
+        let items = mgr
+            .get_playlist_items(playlist_id, owner)
+            .await
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].id,
+            ferrofin_db::store::guid_to_db(track),
+            "row id must be the child's canonical stored guid"
+        );
+        assert_eq!(
+            items[0].id.replace('-', ""),
+            track.simple().to_string().to_uppercase(),
+            "PlaylistItemId derivation must be unchanged"
+        );
+        // And the member's own fields came back (not the playlist's).
+        assert_eq!(
+            Some(items[0].type_.as_str()),
+            crate::item_type_lookup::stored_type_name(BaseItemKind::Audio)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_denies_stranger_on_populated_playlist() {
+        // The single-query read decides access from columns joined onto the
+        // member rows; a stranger must still get NotFound and see NO items.
+        let db = test_db().await;
+        let track = Uuid::new_v4();
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(&db);
+        let (alice, carol) = (Uuid::new_v4(), Uuid::new_v4());
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Private".to_owned()),
+                item_id_list: vec![track],
+                user_id: alice,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+
+        // The owner sees it…
+        assert_eq!(
+            mgr.get_playlist_items(playlist_id, alice)
+                .await
+                .expect("owner reads")
+                .len(),
+            1
+        );
+        // …a stranger does not, and leaks nothing.
+        let err = mgr
+            .get_playlist_items(playlist_id, carol)
+            .await
+            .expect_err("stranger must not read a private playlist's members");
+        assert!(matches!(
+            err,
+            ferrofin_traits::error::ServiceError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_visible_to_shared_and_open_access() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        // Fixed, ascending ids added in reverse: the assertion below pins link
+        // order too, and can't pass by chance on an id ordering.
+        let (a, b) = (Uuid::from_u128(0x4444_4444), Uuid::from_u128(0x5555_5555));
+        for id in [a, b] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = playlist_manager(&db);
+        let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+
+        // Shared read-only with bob.
+        let shared = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                item_id_list: vec![b, a],
+                user_id: alice,
+                users: vec![PlaylistUserPermissions::new(bob, false)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create shared")
+            .id,
+        )
+        .expect("uuid");
+        let ids: Vec<Uuid> = mgr
+            .get_playlist_items(shared, bob)
+            .await
+            .expect("share grants read")
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(ids, vec![b, a], "a shared reader sees the members in order");
+
+        // Open access: any caller reads it.
+        let public = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Public".to_owned()),
+                item_id_list: vec![b],
+                user_id: alice,
+                public: Some(true),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create public")
+            .id,
+        )
+        .expect("uuid");
+        assert_eq!(
+            mgr.get_playlist_items(public, Uuid::new_v4())
+                .await
+                .expect("open access grants read")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_empty_playlist_still_gates_access() {
+        // With no member rows the joined read has no access columns to read, so
+        // the fallback must still answer: empty for the owner, NotFound for a
+        // stranger.
+        let db = test_db().await;
+        let mgr = playlist_manager(&db);
+        let alice = Uuid::new_v4();
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Empty".to_owned()),
+                user_id: alice,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+
+        assert!(
+            mgr.get_playlist_items(playlist_id, alice)
+                .await
+                .expect("owner reads an empty playlist")
+                .is_empty()
+        );
+        assert!(matches!(
+            mgr.get_playlist_items(playlist_id, Uuid::new_v4()).await,
+            Err(ferrofin_traits::error::ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_legacy_playlist_without_meta_row_reads() {
+        // A pre-ownership playlist (no `HermitPlaylists` row) keeps granting
+        // owner-equivalent access on the joined path — the LEFT JOIN's NULLs must
+        // be read as "legacy", not "denied".
+        let db = test_db().await;
+        let legacy = Uuid::new_v4();
+        let track = Uuid::new_v4();
+        seed_item(&db, legacy, BaseItemKind::Playlist).await;
+        seed_item(&db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(&db);
+        mgr.add_item_to_playlist(legacy, &[track], None, Uuid::new_v4())
+            .await
+            .expect("add");
+
+        let items = mgr
+            .get_playlist_items(legacy, Uuid::new_v4())
+            .await
+            .expect("legacy playlists stay readable");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, ferrofin_db::store::guid_to_db(track));
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_ignores_non_manual_links() {
+        // Only manual (ChildType 0) edges are playlist members; a shortcut edge
+        // on the same parent must not surface.
+        let db = test_db().await;
+        let member = Uuid::new_v4();
+        let shortcut = Uuid::new_v4();
+        for id in [member, shortcut] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let mgr = playlist_manager(&db);
+        let owner = Uuid::new_v4();
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Typed".to_owned()),
+                item_id_list: vec![member],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
+        let links = HermitLinkedChildrenService::new(db.clone());
+        ferrofin_traits::persistence::LinkedChildrenService::upsert_linked_child(
+            &links,
+            playlist_id,
+            shortcut,
+            1,
+        )
+        .await
+        .expect("shortcut link");
+
+        let ids: Vec<Uuid> = mgr
+            .get_playlist_items(playlist_id, owner)
+            .await
+            .expect("items")
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(ids, vec![member], "shortcut links are not playlist members");
+    }
+
+    #[tokio::test]
     async fn get_playlist_items_missing_is_not_found() {
         let db = test_db().await;
         let mgr = FerrofinPlaylistManager::new(
@@ -1388,5 +1741,118 @@ mod tests {
             .expect("now public");
         assert_eq!(stranger.level, PlaylistAccessLevel::Read);
         assert!(stranger.open_access);
+    }
+
+    /// Seeds a one-track playlist owned by `owner`, shared read-only with
+    /// `shared_with` (when given) and open-access when `public`. Returns the
+    /// manager, the playlist id and the member track id — the fixture the
+    /// `get_playlist_items` visibility tests share.
+    async fn playlist_with_one_track(
+        db: &ferrofin_db::Database,
+        owner: Uuid,
+        shared_with: Option<Uuid>,
+        public: bool,
+    ) -> (FerrofinPlaylistManager, Uuid, Uuid) {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let track = Uuid::new_v4();
+        seed_item(db, track, BaseItemKind::Audio).await;
+        let mgr = playlist_manager(db);
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Members".to_owned()),
+                item_id_list: vec![track],
+                user_id: owner,
+                users: shared_with
+                    .into_iter()
+                    .map(|u| PlaylistUserPermissions::new(u, false))
+                    .collect(),
+                public: Some(public),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        (mgr, Uuid::parse_str(&created.id).expect("uuid"), track)
+    }
+
+    /// The member ids `get_playlist_items` returns for `reader`, in link order.
+    async fn items_for(
+        mgr: &FerrofinPlaylistManager,
+        playlist_id: Uuid,
+        reader: Uuid,
+    ) -> Vec<Uuid> {
+        mgr.get_playlist_items(playlist_id, reader)
+            .await
+            .expect("items")
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_readable_by_owner_and_shared_user() {
+        // The members read is gated by the `access` join, whose share leg keys
+        // on the *caller's* `UserId`. Owner and share-holder are the two callers
+        // that leg must let through.
+        let db = test_db().await;
+        let (owner, friend) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist_id, track) =
+            playlist_with_one_track(&db, owner, Some(friend), false).await;
+
+        assert_eq!(
+            items_for(&mgr, playlist_id, owner).await,
+            vec![track],
+            "the owner reads their own playlist's members"
+        );
+        assert_eq!(
+            items_for(&mgr, playlist_id, friend).await,
+            vec![track],
+            "a user the playlist is explicitly shared with reads its members"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_hidden_from_unrelated_user() {
+        // The share row belongs to `friend`; the join's `UserId` predicate is
+        // the only thing standing between `stranger` and another user's private
+        // playlist. Invisible reads as missing (never a partial member list).
+        let db = test_db().await;
+        let (owner, friend, stranger) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist_id, _track) =
+            playlist_with_one_track(&db, owner, Some(friend), false).await;
+
+        let err = mgr
+            .get_playlist_items(playlist_id, stranger)
+            .await
+            .expect_err("an unrelated user must not read a shared-with-someone-else playlist");
+        assert!(
+            matches!(err, ferrofin_traits::error::ServiceError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+        // Same verdict through the sibling read paths, so the gate can't be
+        // routed around: neither exposes the playlist to a non-share-holder.
+        assert!(matches!(
+            mgr.get_playlist_access(playlist_id, stranger).await,
+            Err(ferrofin_traits::error::ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.get_playlist_for_user(playlist_id, stranger).await,
+            Err(ferrofin_traits::error::ServiceError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_playlist_items_open_access_readable_by_unrelated_user() {
+        // Open access is orthogonal to the share join: with no share row at all
+        // any caller still reads the members (unchanged behaviour).
+        let db = test_db().await;
+        let (mgr, playlist_id, track) =
+            playlist_with_one_track(&db, Uuid::new_v4(), None, true).await;
+
+        assert_eq!(
+            items_for(&mgr, playlist_id, Uuid::new_v4()).await,
+            vec![track],
+            "an open-access playlist stays readable by any user"
+        );
     }
 }
