@@ -37,6 +37,17 @@ use crate::db_error::db_err;
 use crate::item_type_lookup;
 use crate::item_type_lookup::stored_type_name;
 
+/// `PeopleEntity` + the `COUNT(*) OVER()` total, so a single query returns
+/// both the page and the pagination total without a separate round-trip.
+#[derive(sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+struct PeopleWithCount {
+    id: String,
+    name: String,
+    person_type: Option<String>,
+    total_count: i64,
+}
+
 /// The stored `Type` name of a `Person` item, used by the `is_favorite`
 /// user-data join (C# `itemTypeLookup.BaseItemKindNames[Person]`).
 const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
@@ -342,8 +353,8 @@ fn push_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalPeopleQue
 /// Opens `SELECT <cols> FROM <from> p WHERE 1 = 1`, applying the optional
 /// `is_favorite` user-data restriction as an `EXISTS` sub-select (C# joins
 /// `UserData` on the person item's name). `from` is either the raw
-/// `"Peoples"` table (the listing + item-scoped reads) or the deduped derived
-/// table [`DEDUP_PEOPLE_FROM`] (the pagination total) — the predicates only
+/// `"Peoples"` table or the deduped derived table (see
+/// [`FerrofinPeopleRepository::get_people_by_name`]) — the predicates only
 /// reference `p."Name"`/`p."Id"`/`p."PersonType"`, which both shapes expose.
 fn base_query_from<'a>(
     cols: &str,
@@ -381,25 +392,101 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
 const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."PersonType"
      FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
 
-/// The row-wise spelling of the same dedup: a `"Peoples"` row survives iff its
-/// `"Id"` is the `MIN("Id")` of every row sharing its lower-cased name — exactly
-/// the row [`DEDUP_PEOPLE_FROM`]'s aggregate projects (SQLite's documented
-/// single-`MIN` bare-column rule picks the `MIN("Id")` row's `"Name"` /
-/// `"PersonType"`). Set-, column- and order-identical to the aggregate, verified
-/// row-by-row on a 9 100-row `Peoples` table containing case-variant duplicates.
+/// The total column for an **unnarrowed** by-name listing: the deduped set is
+/// then exactly the distinct lower-cased names, so the total comes off
+/// `HermitIX_Peoples_LowerName_Cover` as a plain index-only distinct count —
+/// no `MIN("Id")` aggregation, no row materialization, and (being an
+/// uncorrelated scalar sub-select) evaluated **once** per statement rather
+/// than per row.
+const TOTAL_ALL_NAMES: &str =
+    r#"(SELECT COUNT(DISTINCT LOWER("Name")) FROM "Peoples") AS "TotalCount""#;
+
+/// The total column for a **narrowed** by-name listing: the predicates apply to
+/// the deduped representative row, so the total can only be counted over the
+/// already-filtered result. `COUNT(*) OVER()` costs one extra pass over the
+/// *filtered* rows, which for a narrowed query is far cheaper than re-running
+/// the dedup aggregate a second time (measured below).
+const TOTAL_FILTERED_WINDOW: &str = r#"COUNT(*) OVER() AS "TotalCount""#;
+
+/// Whether `filter` narrows the by-name listing at all — i.e. whether any
+/// predicate that [`base_query_from`]/[`push_predicates`] can emit is active.
 ///
-/// The point of the rewrite is the *plan*: because the outer table is plain
-/// `"Peoples"`, SQLite walks `IX_Peoples_Name` in `"Name"` order, so
-/// `ORDER BY p."Name"` needs no temp B-tree over every person and `LIMIT` stops
-/// the scan once a page is filled. The aggregate form had to build, sort and
-/// materialize the ENTIRE deduped set for every request no matter how small the
-/// page: 2.3 ms per `limit=100` request on 7 500 people vs 0.08 ms here.
-const REPRESENTATIVE_ROW: &str = r#" AND p."Id" = (SELECT MIN(p2."Id") FROM "Peoples" p2
-     WHERE LOWER(p2."Name") = LOWER(p."Name"))"#;
+/// When nothing narrows it, the deduped set is the whole `Peoples` table
+/// collapsed by lower-cased name, so its size is a distinct count that needs no
+/// aggregate over the representative rows ([`TOTAL_ALL_NAMES`]). `max_list_order`
+/// is deliberately absent: it is only emitted for an item-scoped query, which
+/// never reaches the by-name path.
+fn narrows_by_name(filter: &InternalPeopleQuery) -> bool {
+    let name_bound = [
+        &filter.name_contains,
+        &filter.name_starts_with,
+        &filter.name_less_than,
+        &filter.name_starts_with_or_greater,
+    ]
+    .into_iter()
+    .any(|v| v.as_ref().is_some_and(|s| !s.trim().is_empty()));
+
+    !filter.item_id.is_nil()
+        || filter.parent_id.is_some()
+        || (filter.user_id.is_some() && filter.is_favorite.is_some())
+        || filter.person_types.iter().any(|t| is_valid_person_type(t))
+        || filter
+            .exclude_person_types
+            .iter()
+            .any(|t| is_valid_person_type(t))
+        || name_bound
+}
+
+/// Builds the by-name page query: the deduped representatives, the predicates,
+/// the total column chosen by [`narrows_by_name`], the name ordering, and the
+/// page window.
+///
+/// Split out of [`FerrofinPeopleRepository::get_people_by_name`] so tests can
+/// assert the emitted SQL and its `EXPLAIN QUERY PLAN` — the only way to pin
+/// "this request does not pay for a second full-table aggregate", which no
+/// response-body assertion can see.
+fn by_name_page_query<'a>(filter: &InternalPeopleQuery) -> QueryBuilder<'a, Sqlite> {
+    let total = if narrows_by_name(filter) {
+        TOTAL_FILTERED_WINDOW
+    } else {
+        TOTAL_ALL_NAMES
+    };
+    let mut qb = base_query_from(
+        &format!(r#"p."Id", p."Name", p."PersonType", {total}"#),
+        DEDUP_PEOPLE_FROM,
+        filter,
+    );
+    push_predicates(&mut qb, filter);
+    qb.push(r#" ORDER BY p."Name""#);
+    let start = filter.start_index.unwrap_or(0);
+    if filter.limit > 0 || start > 0 {
+        qb.push(" LIMIT ");
+        qb.push_bind(if filter.limit > 0 {
+            i64::from(filter.limit)
+        } else {
+            -1
+        });
+        if start > 0 {
+            qb.push(" OFFSET ");
+            qb.push_bind(i64::from(start));
+        }
+    }
+    qb
+}
 
 impl FerrofinPeopleRepository {
     /// Fallback total when the by-name page is empty (past the last row).
+    ///
+    /// Uses the same two shapes as the page query, for the same reason: an
+    /// unnarrowed count is a distinct count off the covering index, not an
+    /// aggregate over the representative rows.
     async fn count_people_total(&self, filter: &InternalPeopleQuery) -> Result<i64, ServiceError> {
+        if !narrows_by_name(filter) {
+            return sqlx::query_scalar(r#"SELECT COUNT(DISTINCT LOWER("Name")) FROM "Peoples""#)
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err);
+        }
         let mut qb = base_query_from("COUNT(*)", DEDUP_PEOPLE_FROM, filter);
         push_predicates(&mut qb, filter);
         let count: i64 = qb
@@ -410,69 +497,61 @@ impl FerrofinPeopleRepository {
         Ok(count)
     }
 
-    /// The `/Persons` by-name listing: the deduped representative rows
-    /// ([`REPRESENTATIVE_ROW`]) with the predicates applied to the
-    /// representative, ordered by `"Name"`, paged in SQL.
+    /// The `/Persons` by-name listing: deduped representatives with the
+    /// predicates applied to the representative row (exactly the previous
+    /// `p."Id" IN (SELECT MIN(...) GROUP BY ...)` semantics — verified
+    /// row-identical on the bench library) and paging pushed into SQL, with
+    /// the exact total inlined in the same statement (fallback COUNT on empty
+    /// pages past the last row).
     ///
-    /// **A page-sized request does page-sized work.** Both previous shapes were
-    /// O(every person) per request whatever the page size: the first
-    /// materialized the whole deduped table through sqlx and sliced in Rust; the
-    /// second pushed `LIMIT`/`OFFSET` down but kept a `GROUP BY LOWER("Name")`
-    /// derived table (full aggregate pass), a `ORDER BY "Name"` that could only
-    /// be served by a temp B-tree over every group, and a `COUNT(*) OVER()`
-    /// whose window forced the entire match set to be built anyway. On a 7 500-row
-    /// `Peoples` table that is 2.3 ms of SQL for a `limit=100` page — 1.4 CPU-cores
-    /// of pure SQLite at the endpoint's calibrated 608 req/s, which is what made
-    /// `/Persons` collapse under load while looking healthy when idle.
+    /// The pre-paging shape materialized the ENTIRE deduped table through sqlx
+    /// on every request (7k rows for a `limit=100` page) and sliced in Rust —
+    /// 28 ms of SQL+decode per request that collapsed `/Persons` to a 29.8 s
+    /// p50 at its calibrated 608 req/s in the benchmark (P0.5 family).
     ///
-    /// The total stays exact. A short page *is* the end of the result set, so
-    /// `start_index + page length` is the count — no second query. Only a full
-    /// page (more rows may follow) or an empty page past the end (nothing to
-    /// infer from) falls back to [`Self::count_people_total`], which is still a
-    /// full aggregate pass: measured end to end on those 7 500 rows a
-    /// `limit=100` request is 0.09 ms (page) + 1.0 ms (count) ≈ 1.1 ms against
-    /// the old 2.3–3.0 ms, and every request that does NOT need the count is
-    /// ~20× cheaper.
-    ///
-    /// Counting distinct names cannot be made sub-linear without a materialized
-    /// view, and `InternalPeopleQuery` has no `enable_total_record_count` knob to
-    /// turn it off — worth adding, since the only production callers
-    /// (`LibraryManager::get_people` → `.items`, `get_people_items`) throw the
-    /// total away and `PersonsController` reports `items.len()` on the wire.
+    /// Pushing the page into SQL left a second cost behind: `COUNT(*) OVER()`
+    /// made SQLite re-materialize every deduped row through a second aggregate
+    /// pass before the `LIMIT` could discard them, which on the *unnarrowed*
+    /// listing (`/Persons?userId=…&limit=100`, the benchmark's request and the
+    /// client's default People browse) is the whole table. The total is still
+    /// exact — the only production caller, `LibraryManager::get_people`,
+    /// discards it, and `/Persons` reports Jellyfin's own page-length total via
+    /// `get_people_items`, but a repository must not hand back a number that
+    /// isn't the total — it is just no longer bought with an extra pass over
+    /// all people. Measured on the bench library (7.5k names / 9.4k rows,
+    /// `limit=100`): 5.5 ms → 2.7 ms p50 (3.3 ms → 1.6 ms min); unpaged:
+    /// 11.2 ms → 6.6 ms. A narrowed query keeps the window function, which
+    /// measures fastest there (e.g. a name substring: 3.2 ms window vs 5.9 ms
+    /// for any second-pass shape, since the window only spans the matches).
     async fn get_people_by_name(
         &self,
         filter: &InternalPeopleQuery,
     ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
-        let mut qb = base_query(r#"p."Id", p."Name", p."PersonType""#, filter);
-        qb.push(REPRESENTATIVE_ROW);
-        push_predicates(&mut qb, filter);
-        qb.push(r#" ORDER BY p."Name""#);
-        let start = filter.start_index.unwrap_or(0).max(0);
-        let limit = filter.limit.max(0);
-        if limit > 0 || start > 0 {
-            qb.push(" LIMIT ");
-            qb.push_bind(if limit > 0 { i64::from(limit) } else { -1 });
-            if start > 0 {
-                qb.push(" OFFSET ");
-                qb.push_bind(i64::from(start));
-            }
-        }
-        let items = qb
-            .build_query_as::<PeopleEntity>()
+        // Single query: the total travels alongside each data row, so a page
+        // costs one pool acquire and one statement.
+        let mut qb = by_name_page_query(filter);
+        let start = filter.start_index.unwrap_or(0);
+        let rows = qb
+            .build_query_as::<PeopleWithCount>()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
-
-        // `role` / `primary_image_url` / `provider_id` are write-path fields, not
-        // `Peoples` columns: `#[sqlx(default)]` leaves them `None` here, as the
-        // by-name listing has always returned them.
-        let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
-        let full_page = limit > 0 && page_len >= limit;
-        let total = if full_page || (items.is_empty() && start > 0) {
-            self.count_people_total(filter).await?
-        } else {
-            i64::from(start) + i64::from(page_len)
+        let total = match rows.first() {
+            Some(r) => r.total_count,
+            None if start > 0 => self.count_people_total(filter).await?,
+            None => 0,
         };
+        let items = rows
+            .into_iter()
+            .map(|r| PeopleEntity {
+                id: r.id,
+                name: r.name,
+                person_type: r.person_type,
+                role: None,
+                primary_image_url: None,
+                provider_id: None,
+            })
+            .collect();
         Ok(QueryResult::new(
             Some(start),
             Some(i32::try_from(total).unwrap_or(i32::MAX)),
@@ -828,240 +907,6 @@ mod tests {
         }
     }
 
-    /// Inserts a `Peoples` row at an exact id, so a test can pin which row of a
-    /// case-variant name group is the `MIN("Id")` representative.
-    async fn seed_people_row(db: &ferrofin_db::Database, id: u128, name: &str, person_type: &str) {
-        sqlx::query(r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, ?2, ?3)"#)
-            .bind(guid_to_db(Uuid::from_u128(id)))
-            .bind(name)
-            .bind(person_type)
-            .execute(db.writer())
-            .await
-            .expect("seed people row");
-    }
-
-    /// The fixture used by the by-name listing tests: six distinct names, two of
-    /// them spelled in two cases across two `Peoples` rows (so the dedup has to
-    /// pick a representative), plus one name whose only row is a `Director`.
-    ///
-    /// `"Name"` order (binary, the listing's ORDER BY) is
-    /// `Ana < Bob < Dave < Zed < carol < Éve`.
-    async fn seed_by_name_fixture(db: &ferrofin_db::Database) {
-        seed_people_row(db, 0x1001, "Ana", "Actor").await;
-        seed_people_row(db, 0x1002, "ana", "Director").await; // same name, higher id
-        seed_people_row(db, 0x1003, "Bob", "Actor").await;
-        seed_people_row(db, 0x1005, "Carol", "Writer").await; // higher id than "carol"
-        seed_people_row(db, 0x1004, "carol", "Actor").await;
-        seed_people_row(db, 0x1006, "Dave", "Actor").await;
-        seed_people_row(db, 0x1007, "Éve", "Actor").await;
-        seed_people_row(db, 0x1008, "Zed", "Director").await;
-    }
-
-    fn listed(result: &ferrofin_model::querying::QueryResult<PeopleEntity>) -> Vec<String> {
-        result
-            .items
-            .iter()
-            .map(|p| {
-                format!(
-                    "{}|{}|{}",
-                    p.id,
-                    p.name,
-                    p.person_type.clone().unwrap_or_default()
-                )
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn by_name_pages_reassemble_the_unpaged_listing_with_an_exact_total() {
-        let db = test_db().await;
-        seed_by_name_fixture(&db).await;
-        let repo = FerrofinPeopleRepository::new(db);
-
-        let all = repo
-            .get_people(&InternalPeopleQuery::default())
-            .await
-            .expect("unpaged");
-        assert_eq!(
-            all.items.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
-            vec!["Ana", "Bob", "Dave", "Zed", "carol", "Éve"],
-            "one row per lower-cased name, ordered by Name"
-        );
-        assert_eq!(all.total_record_count, 6);
-
-        // Every page of two, re-assembled, must be the unpaged listing — and each
-        // page must report the same total (the full-page branch runs the COUNT,
-        // the short/empty pages derive it from the offset).
-        let mut paged: Vec<String> = Vec::new();
-        for start in [0, 2, 4, 6] {
-            let page = repo
-                .get_people(&InternalPeopleQuery {
-                    limit: 2,
-                    start_index: Some(start),
-                    ..Default::default()
-                })
-                .await
-                .expect("page");
-            assert_eq!(
-                page.total_record_count, 6,
-                "total must be exact on the page at offset {start}"
-            );
-            assert_eq!(page.start_index, start);
-            paged.extend(listed(&page));
-        }
-        assert_eq!(paged, listed(&all), "paged slices == unpaged listing");
-
-        // A *partial* last page is where the total is derived rather than
-        // counted: offset 4 of a page of 4 returns the last two rows, so the
-        // total must be 4 + 2, not 2.
-        let tail = repo
-            .get_people(&InternalPeopleQuery {
-                limit: 4,
-                start_index: Some(4),
-                ..Default::default()
-            })
-            .await
-            .expect("partial last page");
-        assert_eq!(
-            tail.items
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["carol", "Éve"]
-        );
-        assert_eq!(tail.total_record_count, 6);
-
-        // Same for an unpaged read that starts part-way in.
-        let unpaged_tail = repo
-            .get_people(&InternalPeopleQuery {
-                start_index: Some(5),
-                ..Default::default()
-            })
-            .await
-            .expect("unpaged tail");
-        assert_eq!(
-            unpaged_tail
-                .items
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["Éve"]
-        );
-        assert_eq!(unpaged_tail.total_record_count, 6);
-
-        // A page that lands entirely past the end still reports the real total.
-        let past = repo
-            .get_people(&InternalPeopleQuery {
-                limit: 2,
-                start_index: Some(50),
-                ..Default::default()
-            })
-            .await
-            .expect("past end");
-        assert!(past.items.is_empty());
-        assert_eq!(past.total_record_count, 6);
-    }
-
-    #[tokio::test]
-    async fn by_name_representative_is_the_min_id_row_of_the_name_group() {
-        let db = test_db().await;
-        seed_by_name_fixture(&db).await;
-        let repo = FerrofinPeopleRepository::new(db);
-
-        let all = repo
-            .get_people(&InternalPeopleQuery::default())
-            .await
-            .expect("unpaged");
-        // "Ana"/"ana": the MIN(Id) row is 0x1001 → its id, ITS spelling and ITS
-        // person type are what the listing returns.
-        let ana = &all.items[0];
-        assert_eq!(ana.id, guid_to_db(Uuid::from_u128(0x1001)));
-        assert_eq!(ana.name, "Ana");
-        assert_eq!(ana.person_type.as_deref(), Some("Actor"));
-        // "carol"/"Carol": here the LOWER-cased spelling holds the MIN(Id), so the
-        // representative is the lower-cased row — and it sorts after "Zed".
-        let carol = all
-            .items
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case("carol"))
-            .expect("carol listed");
-        assert_eq!(carol.id, guid_to_db(Uuid::from_u128(0x1004)));
-        assert_eq!(carol.name, "carol");
-        assert_eq!(carol.person_type.as_deref(), Some("Actor"));
-    }
-
-    #[tokio::test]
-    async fn by_name_filters_apply_to_the_representative_row_only() {
-        let db = test_db().await;
-        seed_by_name_fixture(&db).await;
-        let repo = FerrofinPeopleRepository::new(db);
-
-        // "ana" HAS a Director row (0x1002) — but it is not the group's
-        // representative, so the Director filter must not surface the name.
-        // Only "Zed", whose sole (and therefore representative) row is a
-        // Director, matches.
-        let directors = repo
-            .get_people(&InternalPeopleQuery {
-                person_types: vec!["Director".to_owned()],
-                ..Default::default()
-            })
-            .await
-            .expect("directors");
-        assert_eq!(
-            directors
-                .items
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["Zed"]
-        );
-        assert_eq!(directors.total_record_count, 1);
-
-        // The same restriction, paged: the total stays the filtered total, not
-        // the unfiltered one.
-        let page = repo
-            .get_people(&InternalPeopleQuery {
-                person_types: vec!["Actor".to_owned()],
-                limit: 2,
-                ..Default::default()
-            })
-            .await
-            .expect("actors page");
-        assert_eq!(
-            page.items
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["Ana", "Bob"]
-        );
-        assert_eq!(
-            page.total_record_count, 5,
-            "Ana, Bob, Dave, carol, Éve are the Actor representatives"
-        );
-
-        // A name-substring filter pages the same way.
-        let contains = repo
-            .get_people(&InternalPeopleQuery {
-                name_contains: Some("a".to_owned()),
-                limit: 1,
-                ..Default::default()
-            })
-            .await
-            .expect("contains");
-        assert_eq!(
-            contains
-                .items
-                .iter()
-                .map(|p| p.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["Ana"]
-        );
-        assert_eq!(
-            contains.total_record_count, 3,
-            "Ana, Dave, carol contain an 'a'"
-        );
-    }
-
     #[tokio::test]
     async fn identity_wired_repo_materializes_one_person_item_per_name() {
         use crate::item_type_lookup::{IdDerivation, person_item_id};
@@ -1397,5 +1242,176 @@ mod tests {
         };
         let none = repo.get_people(&empty).await.expect("none");
         assert_eq!(none.total_record_count, 0, "genuine empty is 0");
+    }
+
+    /// The unnarrowed `/Persons` page must not pay for a second pass over every
+    /// person. `COUNT(*) OVER()` looks free in a response body — the total is
+    /// identical either way — so only the emitted SQL and its query plan can
+    /// pin it: the window function forces SQLite to re-materialize the whole
+    /// deduped set through an extra `CO-ROUTINE (subquery-N)` / `SCAN
+    /// (subquery-N)` pair before `LIMIT` can discard it.
+    #[tokio::test]
+    async fn unnarrowed_by_name_page_has_no_second_aggregate_pass() {
+        let db = test_db().await;
+        let item = Uuid::from_u128(0x9101);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        repo.update_people(item, &[person("Alice", "Actor"), person("Bob", "Director")])
+            .await
+            .expect("credits");
+
+        // The paged request the benchmark issues (`/Persons?userId=…&limit=100`
+        // → no narrowing predicate) and its unpaged sibling must both take the
+        // index-only distinct count, never the window function.
+        for query in [
+            InternalPeopleQuery {
+                limit: 100,
+                user_id: Some(Uuid::from_u128(0x9102)),
+                ..Default::default()
+            },
+            InternalPeopleQuery::default(),
+        ] {
+            let sql = super::by_name_page_query(&query).into_sql();
+            assert!(
+                !sql.contains("OVER()"),
+                "unnarrowed page must not window-count every deduped row: {sql}"
+            );
+            assert!(
+                sql.contains(r#"COUNT(DISTINCT LOWER("Name"))"#),
+                "unnarrowed total must come off the covering index: {sql}"
+            );
+        }
+
+        // …and SQLite agrees: planning the unpaged form (identical plan to the
+        // paged one, which only adds a bound LIMIT) shows a single aggregate
+        // pass. `EXPLAIN QUERY PLAN` names each extra materialization pass
+        // `(subquery-N)`.
+        let sql = super::by_name_page_query(&InternalPeopleQuery::default()).into_sql();
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .fetch_all(db.pool())
+                .await
+                .expect("plan");
+        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+        assert!(
+            !details.iter().any(|d| d.contains("(subquery")),
+            "unnarrowed page plans one aggregate pass, got {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.contains("HermitIX_Peoples_LowerName_Cover")),
+            "the dedup pass must stay index-only, got {details:?}"
+        );
+
+        // A narrowed query deliberately keeps the window function: it spans
+        // only the matching rows there, which measures faster than any shape
+        // that re-runs the dedup aggregate.
+        let narrowed = InternalPeopleQuery {
+            limit: 100,
+            person_types: vec!["Actor".to_owned()],
+            ..Default::default()
+        };
+        assert!(super::narrows_by_name(&narrowed));
+        assert!(
+            super::by_name_page_query(&narrowed)
+                .into_sql()
+                .contains("OVER()")
+        );
+    }
+
+    /// Whichever shape computes it, the total is the number of deduped people
+    /// the filter matches — never the page length. A repository that reported
+    /// `items.len()` would look right on page 0 of a short library and lie on
+    /// every real page.
+    #[tokio::test]
+    async fn by_name_total_is_the_deduped_match_count_not_the_page_length() {
+        let db = test_db().await;
+        let item_a = Uuid::from_u128(0x9201);
+        let item_b = Uuid::from_u128(0x9202);
+        seed_item(&db, item_a, BaseItemKind::Movie).await;
+        seed_item(&db, item_b, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            item_a,
+            &[
+                person("Alice", "Actor"),
+                person("Bob", "Actor"),
+                person("Cara", "Actor"),
+                person("Dan", "Director"),
+                person("Eve", "Writer"),
+            ],
+        )
+        .await
+        .expect("a");
+        // "dan" collapses onto "Dan" (one deduped person, two Peoples rows), so
+        // the total counts names, not rows. The duplicate is a non-Actor on both
+        // rows, keeping the person-type assertion below independent of which row
+        // wins `MIN("Id")` as the group's representative.
+        repo.update_people(item_b, &[person("dan", "Producer")])
+            .await
+            .expect("b");
+
+        // Every page of the unnarrowed listing reports 5, including the full
+        // pages whose length says nothing about what follows.
+        for start in [0, 2, 4] {
+            let page = repo
+                .get_people(&InternalPeopleQuery {
+                    limit: 2,
+                    start_index: Some(start),
+                    ..Default::default()
+                })
+                .await
+                .expect("page");
+            assert_eq!(
+                page.total_record_count, 5,
+                "page at {start} must report the whole deduped set"
+            );
+            assert_eq!(page.start_index, start);
+        }
+
+        // The unpaged listing agrees with the paged totals.
+        let all = repo
+            .get_people(&InternalPeopleQuery::default())
+            .await
+            .expect("all");
+        assert_eq!(all.items.len(), 5);
+        assert_eq!(all.total_record_count, 5);
+
+        // A narrowed page still reports the filtered total, not its length.
+        let actors = repo
+            .get_people(&InternalPeopleQuery {
+                limit: 1,
+                person_types: vec!["Actor".to_owned()],
+                ..Default::default()
+            })
+            .await
+            .expect("actors");
+        assert_eq!(actors.items.len(), 1);
+        assert_eq!(actors.total_record_count, 3, "Alice, Bob, Cara");
+
+        // …and so does the empty-page-past-the-end fallback, in both shapes.
+        let past_unnarrowed = repo
+            .get_people(&InternalPeopleQuery {
+                limit: 2,
+                start_index: Some(50),
+                ..Default::default()
+            })
+            .await
+            .expect("past unnarrowed");
+        assert!(past_unnarrowed.items.is_empty());
+        assert_eq!(past_unnarrowed.total_record_count, 5);
+
+        let past_narrowed = repo
+            .get_people(&InternalPeopleQuery {
+                limit: 2,
+                start_index: Some(50),
+                person_types: vec!["Actor".to_owned()],
+                ..Default::default()
+            })
+            .await
+            .expect("past narrowed");
+        assert!(past_narrowed.items.is_empty());
+        assert_eq!(past_narrowed.total_record_count, 3);
     }
 }
