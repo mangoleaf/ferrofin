@@ -2030,18 +2030,22 @@ mod tests {
             query: &ferrofin_traits::options::InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             // Only the by-name lookup is served (`get_named_item` filters
-            // `get_item_list` by name): match the way the by-name tables do,
-            // case-insensitively.
+            // `get_item_list` by name). Match the way the real by-name resolver
+            // does — on the CLEAN value (`LibraryManager::get_named_items`
+            // compares `get_clean_value(name)` against the stored `CleanName`),
+            // so accents, punctuation, spacing and case all fold exactly as they
+            // do against a real database.
             let Some(name) = query.name.as_deref() else {
                 return Ok(vec![]);
             };
+            let want = crate::text_util::get_clean_value(name);
             Ok(self
                 .named_items
                 .iter()
                 .filter(|row| {
                     row.name
                         .as_deref()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                        .is_some_and(|n| crate::text_util::get_clean_value(n) == want)
                 })
                 .cloned()
                 .collect())
@@ -3996,6 +4000,176 @@ mod tests {
         assert_eq!(people.len(), 2);
         assert_eq!(people[0].id, person, "first spelling");
         assert_eq!(people[1].id, person, "second spelling");
+    }
+
+    /// Credit spellings whose *stored* form differs from every "tidy" convention
+    /// a test would otherwise use: mixed case, leading/trailing and doubled
+    /// internal whitespace, punctuation, accents, and non-Latin script. Paired
+    /// with the name of the ONE by-name `Person` item that backs each — the
+    /// clean value folds case/diacritics/punctuation, so the two spellings of a
+    /// pair legitimately differ.
+    const AWKWARD_CREDITS: &[(&str, &str)] = &[
+        // Mixed case: `to_lowercase()` is not the identity here.
+        ("Robert De Niro", "Robert De Niro"),
+        ("Andie MacDowell", "Andie MacDowell"),
+        // Leading/trailing whitespace on the credit row.
+        ("  Meryl Streep  ", "Meryl Streep"),
+        // Doubled internal whitespace + an apostrophe.
+        ("Conan  O'Brien", "Conan O'Brien"),
+        // Hyphenated given name.
+        ("Jean-Luc Godard", "Jean-Luc Godard"),
+        // Accent on the credit, folded on the by-name item.
+        ("Renée Zellweger", "Renee Zellweger"),
+        // Accent on both sides — lowercasing this is NOT a no-op.
+        ("Björk", "Björk"),
+        // Non-Latin script.
+        ("宮崎 駿", "宮崎 駿"),
+    ];
+
+    /// A slice index as a `u128`, for deriving distinct fixture ids.
+    fn idx(i: usize) -> u128 {
+        u128::try_from(i).expect("index fits")
+    }
+
+    /// The `person_ids_by_name` key convention, pinned END TO END: the prefetch
+    /// builds the map and `attach_people` reads it, so the two sides must agree
+    /// about the key for every one of [`AWKWARD_CREDITS`].
+    ///
+    /// If they ever disagree (one side lowercasing, trimming or cleaning while
+    /// the other does not) every cast member silently falls back to its
+    /// per-credit `Peoples` row id — which is NOT what favorites are written
+    /// against — and nothing else in the suite would notice, because tidy ASCII
+    /// names key the same under either convention.
+    #[tokio::test]
+    async fn person_ids_resolve_for_awkwardly_spelled_credits() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xB_9001);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+
+        // One by-name Person item per credit, plus one per-credit Peoples row
+        // with a DIFFERENT id, so a fallback to the credit id is visible.
+        let mut person_rows = Vec::new();
+        let mut expected = Vec::new();
+        let mut credits = Vec::new();
+        let mut credit_ids = Vec::new();
+        for (i, (credited_as, item_name)) in AWKWARD_CREDITS.iter().enumerate() {
+            let person_id = Uuid::from_u128(0xB_9100 + idx(i));
+            seed_named_item(&db, person_id, BaseItemKind::Person, item_name).await;
+            person_rows.push(fetch_item(&db, person_id).await);
+            expected.push(person_id);
+            let credit_id = Uuid::from_u128(0xB_9200 + idx(i));
+            credit_ids.push(credit_id);
+            credits.push(PeopleEntity {
+                id: credit_id.to_string(),
+                name: (*credited_as).into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            });
+        }
+        let item = fetch_item(&db, movie).await;
+
+        let library = Arc::new(FakeLibrary {
+            people: credits,
+            named_items: person_rows,
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(people.len(), AWKWARD_CREDITS.len());
+        for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
+            // The credit keeps its stored spelling…
+            assert_eq!(
+                people[i].name.as_deref(),
+                Some(*credited_as),
+                "credit name for {credited_as:?}"
+            );
+            // …and resolves to the by-name Person item, not the credit row.
+            assert_ne!(
+                people[i].id, credit_ids[i],
+                "{credited_as:?} fell back to its per-credit row id — the build \
+                 and lookup sides of person_ids_by_name disagree about the key"
+            );
+            assert_eq!(
+                people[i].id, expected[i],
+                "by-name Person id for {credited_as:?}"
+            );
+        }
+    }
+
+    /// The lookup half of the same convention, pinned in isolation: the map is
+    /// keyed by the credit row's name EXACTLY as stored (the contract its doc
+    /// comment states), and a name the prefetch never resolved falls back to the
+    /// per-credit row id — or the nil id when that is not a GUID.
+    #[tokio::test]
+    async fn attach_people_looks_up_the_raw_stored_credit_name() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xB_9301);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let svc = service(db);
+
+        let mut credits = Vec::new();
+        let mut by_name: HashMap<String, Uuid> = HashMap::new();
+        let mut expected = Vec::new();
+        for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
+            let person_id = Uuid::from_u128(0xB_9400 + idx(i));
+            // Registered under the RAW spelling — what the prefetch stores.
+            by_name.insert((*credited_as).to_owned(), person_id);
+            expected.push(person_id);
+            credits.push(PeopleEntity {
+                id: Uuid::from_u128(0xB_9500 + idx(i)).to_string(),
+                name: (*credited_as).into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            });
+        }
+        // An unresolved credit keeps its own row id…
+        let unresolved = Uuid::from_u128(0xB_95FF);
+        credits.push(PeopleEntity {
+            id: unresolved.to_string(),
+            name: "Nobody At All".into(),
+            person_type: Some("Actor".into()),
+            ..Default::default()
+        });
+        // …and a pre-GUID credit id degrades to nil rather than panicking.
+        credits.push(PeopleEntity {
+            id: "not-a-guid".into(),
+            name: "Also Nobody".into(),
+            person_type: Some("Actor".into()),
+            ..Default::default()
+        });
+
+        let prefetched = Prefetched {
+            people: [(movie, credits)].into_iter().collect(),
+            person_ids_by_name: by_name,
+            ..Prefetched::default()
+        };
+        let mut dto = BaseItemDto::default();
+        svc.attach_people(&mut dto, &item, &prefetched)
+            .await
+            .unwrap();
+
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(people.len(), AWKWARD_CREDITS.len() + 2);
+        for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
+            assert_eq!(
+                people[i].id, expected[i],
+                "{credited_as:?} must be looked up under its raw stored spelling"
+            );
+        }
+        assert_eq!(
+            people[AWKWARD_CREDITS.len()].id,
+            unresolved,
+            "unresolved credit keeps its per-credit row id"
+        );
+        assert!(
+            people[AWKWARD_CREDITS.len() + 1].id.is_nil(),
+            "non-GUID credit id degrades to nil"
+        );
     }
 
     /// The clean lookup key the projection uses must be byte-identical to
