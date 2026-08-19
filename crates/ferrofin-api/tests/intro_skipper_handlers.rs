@@ -458,6 +458,21 @@ async fn plugin_metadata_and_support_bundle() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Plugin version: 1.2.3"));
     assert!(body.contains("Runs on:"));
+    // The fingerprinter probes still report, and report a bool — the ffmpeg one
+    // runs as a child process the handler awaits rather than blocks on.
+    for line in [
+        "Chromaprint (ffmpeg muxer) available: ",
+        "Chromaprint (fpcalc) available: ",
+    ] {
+        let at = body
+            .find(line)
+            .unwrap_or_else(|| panic!("{line:?} missing from bundle: {body:?}"));
+        let value = body[at + line.len()..].lines().next().unwrap_or_default();
+        assert!(
+            value == "true" || value == "false",
+            "{line:?} carries a bool, got {value:?}"
+        );
+    }
 }
 
 #[tokio::test]

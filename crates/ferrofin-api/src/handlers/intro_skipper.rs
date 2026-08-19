@@ -505,10 +505,28 @@ fn update_duration_value(css: &str, delay: u64) -> (String, bool) {
     (format!("{css}\n{}", root_css(delay)), true)
 }
 
+/// Byte offset of the last ASCII-case-insensitive occurrence of `needle`.
+///
+/// Searches `haystack`'s own bytes so the offset stays valid for slicing it.
+/// Lowercasing a copy first would not: `str::to_lowercase` is Unicode-aware and
+/// not byte-length preserving (`İ` U+0130 is 2 bytes and lowercases to 3, `ẞ`
+/// U+1E9E is 3 and lowercases to 2), so offsets taken from the copy drift and
+/// can land mid-character in the original — a wrong insertion point or a panic.
+/// `needle` is ASCII (`@import`), and .NET's `StringComparison.OrdinalIgnoreCase`
+/// folds nothing outside ASCII onto an ASCII needle, so ASCII folding matches
+/// upstream exactly. A match implies `haystack[i]` is ASCII, hence a boundary.
+fn rfind_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let (hay, ndl) = (haystack.as_bytes(), needle.as_bytes());
+    let last_start = hay.len().checked_sub(ndl.len())?;
+    (0..=last_start)
+        .rev()
+        .find(|&i| hay[i..i + ndl.len()].eq_ignore_ascii_case(ndl))
+}
+
 /// Inserts the `@import` after the last existing `@import`, else prepends it.
 /// Port of `InjectImport`.
 fn inject_import(css: &str) -> String {
-    if let Some(last_import) = css.to_lowercase().rfind("@import") {
+    if let Some(last_import) = rfind_ascii_case_insensitive(css, "@import") {
         if let Some(rel_semi) = css[last_import..].find(';') {
             let mut insert_at = last_import + rel_semi + 1;
             let bytes = css.as_bytes();
@@ -608,12 +626,16 @@ fn fpcalc_available() -> bool {
 /// fingerprinter's preferred backend, and the only one in the release image.
 /// Probed here rather than read off the extension: the API layer holds managers,
 /// not the compiled-in extensions' collaborators.
-fn ffmpeg_chromaprint_available() -> bool {
-    std::process::Command::new("ffmpeg")
+/// Spawned through `tokio::process` so the `ffmpeg -muxers` run does not block
+/// the worker thread this handler is polled on.
+async fn ffmpeg_chromaprint_available() -> bool {
+    tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-muxers"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
+        .await
         .is_ok_and(|out| {
             out.status.success() && String::from_utf8_lossy(&out.stdout).contains("chromaprint")
         })
@@ -633,7 +655,7 @@ async fn support_bundle(State(state): State<AppState>, RequireAuth(_auth): Requi
         server = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
-        muxer = ffmpeg_chromaprint_available(),
+        muxer = ffmpeg_chromaprint_available().await,
         fpcalc = fpcalc_available(),
     )
 }
@@ -911,6 +933,43 @@ mod tests {
         let our = out.find(IMPORT_STRING).unwrap();
         let theirs = out.find("a.css").unwrap();
         assert!(theirs < our, "existing import stays first");
+    }
+
+    /// Non-ASCII branding CSS must not shift the `@import` search offset.
+    /// `str::to_lowercase` is not byte-length preserving, so an offset taken
+    /// from a lowercased copy and used on the original either lands mid-char
+    /// (panic) or points somewhere else entirely (import injected into the
+    /// wrong place, where a browser drops it).
+    #[test]
+    fn inject_import_handles_non_ascii_css() {
+        // `ẞ` (U+1E9E, 3 bytes) lowercases to `ß` (2 bytes), so a lowercased-copy
+        // offset points one byte *before* the real `@` — here into the middle of
+        // the 2-byte `é`, which is a slicing panic, not merely a wrong answer.
+        let shrinking = "/* ẞ */é@import url(\"a.css\");\n.x{}";
+        let out = inject_import(shrinking);
+        let theirs = out.find("a.css").expect("existing import kept");
+        let ours = out.find(IMPORT_STRING).expect("our import injected");
+        assert!(theirs < ours, "our import follows the existing one");
+        assert!(
+            out.starts_with("/* ẞ */é@import url(\"a.css\");\n"),
+            "existing rules are preserved verbatim: {out:?}"
+        );
+
+        // `İ` (U+0130, 2 bytes) lowercases to 3 bytes: the offset drifts
+        // forward, past the existing import's `;` and into the next rule.
+        let growing = format!(
+            "/* {} */\n@import url(\"a.css\");\n.x {{ color: red; }}\n",
+            "İ".repeat(25)
+        );
+        let out = inject_import(&growing);
+        let theirs = out.find("a.css").expect("existing import kept");
+        let ours = out.find(IMPORT_STRING).expect("our import injected");
+        let rule = out.find(".x {").expect("following rule kept");
+        assert!(theirs < ours, "our import follows the existing one");
+        assert!(
+            ours < rule,
+            "our import stays at top level, not inside the next rule: {out:?}"
+        );
     }
 
     #[test]
