@@ -194,7 +194,7 @@ pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
 /// trim `/\`, `/`→`\`) for machine independence — verified byte-for-byte
 /// against a real 10.11.8 database. Early Ferrofin lowercased the path and
 /// skipped the rewrite; databases scanned that way keep their ids via
-/// [`IdDerivation::LegacyLowercase`] (stored in `HermitMeta`,
+/// [`IdDerivation::LegacyLowercase`] (stored in `FerrofinMeta`,
 /// `item_id_derivation`), while fresh and adopted databases use
 /// [`IdDerivation::Jellyfin`] so scans converge on Jellyfin's ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +210,7 @@ pub enum IdDerivation {
 }
 
 impl IdDerivation {
-    /// The `HermitMeta.item_id_derivation` value naming this mode.
+    /// The `FerrofinMeta.item_id_derivation` value naming this mode.
     #[must_use]
     pub fn meta_value(&self) -> &'static str {
         match self {
@@ -219,7 +219,7 @@ impl IdDerivation {
         }
     }
 
-    /// Resolves the mode from a stored `HermitMeta` value (`None`/unknown ⇒
+    /// Resolves the mode from a stored `FerrofinMeta` value (`None`/unknown ⇒
     /// Jellyfin parity, the correct default for fresh and adopted databases).
     #[must_use]
     pub fn from_meta(value: Option<&str>, program_data_path: Option<String>) -> Self {

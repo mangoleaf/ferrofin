@@ -168,7 +168,7 @@ impl FerrofinPeopleRepository {
 
     /// One-shot startup pass: collapses the pre-unification per-(name, type)
     /// `Person` items onto the deterministic per-name id, repointing user data
-    /// and images, and records completion in `HermitMeta` so subsequent boots
+    /// and images, and records completion in `FerrofinMeta` so subsequent boots
     /// skip it. On a database adopted from Jellyfin (already one id per name)
     /// every group resolves to its existing row and nothing changes.
     ///
@@ -182,7 +182,7 @@ impl FerrofinPeopleRepository {
             return Ok(0);
         }
         let done: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Value" FROM "HermitMeta" WHERE "Key" = ?1 LIMIT 1"#)
+            sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1 LIMIT 1"#)
                 .bind(META_KEY)
                 .fetch_optional(self.db.pool())
                 .await
@@ -222,7 +222,7 @@ impl FerrofinPeopleRepository {
             collapsed += 1;
         }
         sqlx::query(
-            r#"INSERT INTO "HermitMeta" ("Key", "Value") VALUES (?1, '1')
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
                ON CONFLICT("Key") DO UPDATE SET "Value" = '1'"#,
         )
         .bind(META_KEY)
@@ -387,14 +387,14 @@ fn base_query<'a>(cols: &str, filter: &InternalPeopleQuery) -> QueryBuilder<'a, 
 /// non-aggregated columns come from the `MIN("Id")` row — the same
 /// representative the previous `p."Id" IN (SELECT MIN(...) GROUP BY ...)`
 /// shape selected (verified row-identical on the bench library), but in ONE
-/// aggregation pass that the `HermitIX_Peoples_LowerName_Cover` index serves
+/// aggregation pass that the `FerrofinIX_Peoples_LowerName_Cover` index serves
 /// as an index-only scan: 28 ms → 0.85 ms per query on 7.5k people.
 const DEDUP_PEOPLE_FROM: &str = r#"(SELECT MIN(p2."Id") AS "Id", p2."Name", p2."PersonType"
      FROM "Peoples" p2 GROUP BY LOWER(p2."Name"))"#;
 
 /// The total column for an **unnarrowed** by-name listing: the deduped set is
 /// then exactly the distinct lower-cased names, so the total comes off
-/// `HermitIX_Peoples_LowerName_Cover` as a plain index-only distinct count —
+/// `FerrofinIX_Peoples_LowerName_Cover` as a plain index-only distinct count —
 /// no `MIN("Id")` aggregation, no row materialization, and (being an
 /// uncorrelated scalar sub-select) evaluated **once** per statement rather
 /// than per row.
@@ -1300,7 +1300,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|d| d.contains("HermitIX_Peoples_LowerName_Cover")),
+                .any(|d| d.contains("FerrofinIX_Peoples_LowerName_Cover")),
             "the dedup pass must stay index-only, got {details:?}"
         );
 

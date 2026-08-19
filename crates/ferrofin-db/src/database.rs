@@ -227,7 +227,7 @@ impl Database {
     /// Counts library items grouped by their stored (C#) `Type` name.
     ///
     /// Feeds the `ferrofin_library_items{type=…}` metric gauge. Runs on the read
-    /// pool over the `HermitIX_BaseItems_Type_CleanName` index; the placeholder seed
+    /// pool over the `FerrofinIX_BaseItems_Type_CleanName` index; the placeholder seed
     /// row (`Type = 'PLACEHOLDER'`) is included as-is (the metric wiring maps the
     /// stored name to its last `.`-segment, so callers filter as they see fit).
     ///
@@ -241,14 +241,14 @@ impl Database {
         Ok(rows)
     }
 
-    /// Reads a `HermitMeta` value (Ferrofin's own key/value table), or [`None`]
+    /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]
     /// when the key is unset.
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
     pub async fn meta_get(&self, key: &str) -> Result<Option<String>> {
         let value =
-            sqlx::query_scalar(r#"SELECT "Value" FROM "HermitMeta" WHERE "Key" = ?1 LIMIT 1"#)
+            sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1 LIMIT 1"#)
                 .bind(key)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -602,7 +602,7 @@ mod tests {
         "ItemValues",
         "ItemValuesMap",
         "KeyframeData",
-        "HermitLinkedChildren",
+        "FerrofinLinkedChildren",
         "MediaSegments",
         "MediaStreamInfos",
         "PeopleBaseItemMap",
@@ -847,12 +847,12 @@ mod tests {
         // Columns that are lowercase-hyphenated BY DESIGN, not join keys:
         //  - `UserData.CustomDataKey` — real Jellyfin stores the key lowercase
         //    while `ItemId` is uppercase (verified against a real 10.11.8 DB).
-        //  - `HermitPlaybackSessions.PlaySessionId` — an opaque self-referential
+        //  - `FerrofinPlaybackSessions.PlaySessionId` — an opaque self-referential
         //    session id (written and matched as the same raw string, never
         //    cross-joined to a Jellyfin-owned uppercase id).
         let allowed_lowercase: &[(&str, &str)] = &[
             ("UserData", "CustomDataKey"),
-            ("HermitPlaybackSessions", "PlaySessionId"),
+            ("FerrofinPlaybackSessions", "PlaySessionId"),
         ];
 
         let mut offenders = Vec::new();
@@ -900,8 +900,8 @@ mod tests {
         );
         // The Live TV channel↔programme join key matches (both uppercase).
         let joined: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "HermitLiveTvPrograms" p
-               JOIN "HermitLiveTvChannels" c ON c."Id" = p."ChannelId""#,
+            r#"SELECT COUNT(*) FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#,
         )
         .fetch_one(db.pool())
         .await

@@ -456,7 +456,7 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
         .await
         .expect("ancestor");
     sqlx::query(
-        r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType")
+        r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
            VALUES (?1, ?2, 0)"#,
     )
     .bind(in_lib_set.to_string().to_uppercase())

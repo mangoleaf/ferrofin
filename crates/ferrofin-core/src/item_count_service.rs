@@ -3,7 +3,7 @@
 //! Port of `ItemCountService`. Counts items matching an [`InternalItemsQuery`]
 //! and rolls the per-`Type` counts up into an [`ItemCounts`] the same way C#
 //! `GetItemCounts` does. The played/total *descendant* counts in C# recurse the
-//! `AncestorIds`/`HermitLinkedChildren` closure through the library manager; here the
+//! `AncestorIds`/`FerrofinLinkedChildren` closure through the library manager; here the
 //! descendant methods use the `AncestorIds` closure table directly for the
 //! common hierarchical case, and the deeper linked-folder roll-up is deferred.
 
@@ -383,7 +383,7 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        // Linked-children played/total: count the parent's HermitLinkedChildren that
+        // Linked-children played/total: count the parent's FerrofinLinkedChildren that
         // match the filter and are played. Only the direct linked children are
         // counted; recursive linked-folder descent is deferred.
         let matching = {
@@ -397,7 +397,7 @@ impl ItemCountService for FerrofinItemCountService {
             return Ok(PlayedAndTotal::default());
         }
         let mut sql = String::from(
-            r#"SELECT lc."ChildId" FROM "HermitLinkedChildren" lc WHERE lc."ParentId" = ? AND lc."ChildId" IN ("#,
+            r#"SELECT lc."ChildId" FROM "FerrofinLinkedChildren" lc WHERE lc."ParentId" = ? AND lc."ChildId" IN ("#,
         );
         sql.push_str(&placeholders(matching.len()));
         sql.push(')');
@@ -515,7 +515,7 @@ impl ItemCountService for FerrofinItemCountService {
             return Ok(HashMap::new());
         }
         // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
-        // `BaseItems` children plus one of `HermitLinkedChildren` rows; a parent with
+        // `BaseItems` children plus one of `FerrofinLinkedChildren` rows; a parent with
         // linked children reports those instead of its hierarchical children.
         let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
         let grouped_count = |table: &str| {
@@ -529,7 +529,7 @@ impl ItemCountService for FerrofinItemCountService {
         let mut linked: HashMap<String, i64> = HashMap::new();
         for (table, into) in [
             ("BaseItems", &mut hierarchical),
-            ("HermitLinkedChildren", &mut linked),
+            ("FerrofinLinkedChildren", &mut linked),
         ] {
             let mut sql = grouped_count(table);
             if table == "BaseItems" {
@@ -740,7 +740,7 @@ mod tests {
             seed_item(&db, child, BaseItemKind::Movie).await;
             if linked {
                 sqlx::query(
-                    r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType")
+                    r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
                        VALUES (?1, ?2, 0)"#,
                 )
                 .bind(guid_to_db(boxset))
@@ -778,7 +778,7 @@ mod tests {
 
         for child in [played, unplayed] {
             sqlx::query(
-                r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType")
+                r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType")
                    VALUES (?1, ?2, 0)"#,
             )
             .bind(guid_to_db(parent))

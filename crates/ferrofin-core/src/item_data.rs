@@ -17,8 +17,8 @@
 //!    {"Path":"/media/…/M.mkv","Type":"Manual"}], …}
 //! ```
 //!
-//! Ferrofin's query paths keep using the `HermitLinkedChildren` /
-//! `HermitPlaylists` / `HermitPlaylistShares` tables as a **derived cache**;
+//! Ferrofin's query paths keep using the `FerrofinLinkedChildren` /
+//! `FerrofinPlaylists` / `FerrofinPlaylistShares` tables as a **derived cache**;
 //! every membership/ownership mutation writes through to `Data` via
 //! [`sync_container_data`], and [`reconcile_container_data`] rebuilds the
 //! cache from `Data` (adopted Jellyfin databases) or backfills `Data` from the
@@ -67,7 +67,7 @@ pub struct ShareJson {
     pub can_edit: bool,
 }
 
-/// The stored `HermitLinkedChildren.ChildType` discriminants and their JSON
+/// The stored `FerrofinLinkedChildren.ChildType` discriminants and their JSON
 /// enum-string forms.
 const CHILD_TYPES: [(i64, &str); 2] = [(0, "Manual"), (1, "Shortcut")];
 
@@ -230,7 +230,7 @@ pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), S
     // Cache edges (with each child's path) in stored order.
     let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
         r#"SELECT lc."ChildId", lc."ChildType", bi."Path"
-           FROM "HermitLinkedChildren" lc
+           FROM "FerrofinLinkedChildren" lc
            LEFT JOIN "BaseItems" bi ON bi."Id" = lc."ChildId"
            WHERE lc."ParentId" = ?1
            ORDER BY lc."SortOrder""#,
@@ -296,7 +296,7 @@ async fn sync_playlist_meta(
     map: &mut Map<String, Value>,
 ) -> Result<(), ServiceError> {
     let meta: Option<(Option<String>, bool)> = sqlx::query_as(
-        r#"SELECT "OwnerUserId", "OpenAccess" FROM "HermitPlaylists" WHERE "PlaylistId" = ?1"#,
+        r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
     )
     .bind(container_db)
     .fetch_optional(db.pool())
@@ -309,7 +309,7 @@ async fn sync_playlist_meta(
         map.insert("OpenAccess".to_owned(), Value::Bool(open_access));
     }
     let shares: Vec<(String, bool)> = sqlx::query_as(
-        r#"SELECT "UserId", "CanEdit" FROM "HermitPlaylistShares"
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
            WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
     )
     .bind(container_db)
@@ -420,7 +420,7 @@ async fn import_container(
     let children = read_linked_children(map);
 
     let mut tx = db.writer().begin().await.map_err(db_err)?;
-    sqlx::query(r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1"#)
+    sqlx::query(r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#)
         .bind(&container_db)
         .execute(&mut *tx)
         .await
@@ -451,7 +451,7 @@ async fn import_container(
             .map_or(0, |(d, _)| *d);
         let order = i64::try_from(order).unwrap_or(i64::MAX);
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, ?3, ?4)
                ON CONFLICT("ParentId", "ChildId") DO UPDATE
                SET "ChildType" = excluded."ChildType", "SortOrder" = excluded."SortOrder""#,
@@ -475,7 +475,7 @@ async fn import_container(
             .and_then(Value::as_bool)
             .unwrap_or(false);
         sqlx::query(
-            r#"INSERT INTO "HermitPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, ?3)
                ON CONFLICT("PlaylistId") DO UPDATE
                SET "OwnerUserId" = excluded."OwnerUserId",
@@ -493,7 +493,7 @@ async fn import_container(
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        sqlx::query(r#"DELETE FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
             .bind(&container_db)
             .execute(&mut *tx)
             .await
@@ -503,7 +503,7 @@ async fn import_container(
                 continue;
             };
             sqlx::query(
-                r#"INSERT INTO "HermitPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
+                r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
                    VALUES (?1, ?2, ?3)
                    ON CONFLICT("PlaylistId", "UserId") DO UPDATE
                    SET "CanEdit" = excluded."CanEdit""#,
@@ -545,7 +545,7 @@ mod tests {
         seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
         seed_movie_with_path(&db, child, "/m/a.mkv").await;
         sqlx::query(
-            r#"INSERT INTO "HermitPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, 1)"#,
         )
         .bind(guid_to_db(playlist))
@@ -554,7 +554,7 @@ mod tests {
         .await
         .expect("meta");
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, 0, 0)"#,
         )
         .bind(guid_to_db(playlist))
@@ -595,7 +595,7 @@ mod tests {
         seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Set").await;
         seed_movie_with_path(&db, child, "/m/b.mkv").await;
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, 0, 0)"#,
         )
         .bind(guid_to_db(boxset))
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(imported, 1);
 
         let edges: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT "ChildId", "SortOrder" FROM "HermitLinkedChildren"
+            r#"SELECT "ChildId", "SortOrder" FROM "FerrofinLinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(guid_to_db(playlist))
@@ -664,7 +664,7 @@ mod tests {
             "id-linked and path-only children both resolve, in order"
         );
         let (stored_owner, open): (Option<String>, bool) = sqlx::query_as(
-            r#"SELECT "OwnerUserId", "OpenAccess" FROM "HermitPlaylists" WHERE "PlaylistId" = ?1"#,
+            r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
         )
         .bind(guid_to_db(playlist))
         .fetch_one(db.pool())
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(stored_owner.as_deref(), Some(guid_to_db(owner).as_str()));
         assert!(!open);
         let share: (String, bool) = sqlx::query_as(
-            r#"SELECT "UserId", "CanEdit" FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1"#,
+            r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#,
         )
         .bind(guid_to_db(playlist))
         .fetch_one(db.pool())
@@ -692,7 +692,7 @@ mod tests {
         // Cache rows exist but Data has no LinkedChildren key — a pre-Data
         // Ferrofin database.
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, 0, 0)"#,
         )
         .bind(guid_to_db(boxset))

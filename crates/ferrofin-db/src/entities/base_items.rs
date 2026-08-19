@@ -4,7 +4,7 @@
 //! Covered tables: `BaseItems`, `BaseItemImageInfos`, `BaseItemMetadataFields`,
 //! `BaseItemProviders`, `BaseItemTrailerTypes`, `Chapters`, `AncestorIds`,
 //! `ItemValues`, `ItemValuesMap`, `Peoples`, `PeopleBaseItemMap`,
-//! `HermitLinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
+//! `FerrofinLinkedChildren`, `AttachmentStreamInfos`, `MediaStreamInfos`, and
 //! `KeyframeData`.
 //!
 //! Each struct mirrors one table one-to-one: field names and order match the

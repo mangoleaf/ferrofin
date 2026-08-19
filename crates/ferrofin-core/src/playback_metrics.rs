@@ -1,6 +1,6 @@
 //! [`FerrofinPlaybackMetrics`] — the concrete [`PlaybackMetrics`] over SQLite.
 //!
-//! Writes one `HermitPlaybackSessions` row per PlaybackInfo decision and updates it
+//! Writes one `FerrofinPlaybackSessions` row per PlaybackInfo decision and updates it
 //! on playstate start/stop. The point is ranking `TranscodeReasons` by
 //! frequency and cost to find transcodes that
 //! a better profile decision would have avoided.
@@ -42,7 +42,7 @@ impl FerrofinPlaybackMetrics {
 impl PlaybackMetrics for FerrofinPlaybackMetrics {
     async fn record_decision(&self, decision: &PlaybackDecision) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"INSERT INTO "HermitPlaybackSessions"
+            r#"INSERT INTO "FerrofinPlaybackSessions"
                ("PlaySessionId", "ItemId", "UserId", "Client", "DeviceId",
                 "PlayMethod", "TranscodeReasons", "Container", "VideoCodec",
                 "AudioCodec", "TargetContainer", "TargetVideoCodec",
@@ -74,7 +74,7 @@ impl PlaybackMetrics for FerrofinPlaybackMetrics {
 
     async fn record_started(&self, play_session_id: &str) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"UPDATE "HermitPlaybackSessions" SET "StartedAt" = COALESCE("StartedAt", ?2)
+            r#"UPDATE "FerrofinPlaybackSessions" SET "StartedAt" = COALESCE("StartedAt", ?2)
                WHERE "PlaySessionId" = ?1"#,
         )
         .bind(play_session_id)
@@ -93,7 +93,7 @@ impl PlaybackMetrics for FerrofinPlaybackMetrics {
         position_ticks: Option<i64>,
     ) -> Result<(), ServiceError> {
         let result = sqlx::query(
-            r#"UPDATE "HermitPlaybackSessions"
+            r#"UPDATE "FerrofinPlaybackSessions"
                SET "StoppedAt" = ?2, "PositionTicks" = ?3
                WHERE "PlaySessionId" = ?1"#,
         )
@@ -149,7 +149,7 @@ mod tests {
         let row: (String, String, Option<String>, Option<String>, Option<i64>) = sqlx::query_as(
             r#"SELECT "PlayMethod", "TranscodeReasons", "StartedAt", "StoppedAt",
                           "PositionTicks"
-                   FROM "HermitPlaybackSessions" WHERE "PlaySessionId" = ?1"#,
+                   FROM "FerrofinPlaybackSessions" WHERE "PlaySessionId" = ?1"#,
         )
         .bind(&psid)
         .fetch_one(db.pool())

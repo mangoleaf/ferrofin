@@ -41,7 +41,7 @@
 //!   ([`ferrofin_traits::persistence::PeopleRepository`]);
 //! - [`keyframe_repository`] — [`FerrofinKeyframeRepository`]
 //!   ([`ferrofin_traits::persistence::KeyframeRepository`]);
-//! - [`linked_children_service`] — [`HermitLinkedChildrenService`]
+//! - [`linked_children_service`] — [`FerrofinLinkedChildrenService`]
 //!   ([`ferrofin_traits::persistence::LinkedChildrenService`]);
 //! - [`next_up_service`] — [`FerrofinNextUpService`]
 //!   ([`ferrofin_traits::persistence::NextUpService`]), whose
@@ -244,7 +244,7 @@ pub use library_monitor::{
     FerrofinLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
 };
 pub use library_scan::LibraryScanner;
-pub use linked_children_service::HermitLinkedChildrenService;
+pub use linked_children_service::FerrofinLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::FerrofinLyricManager;
 pub use media_attachment_repository::FerrofinMediaAttachmentRepository;

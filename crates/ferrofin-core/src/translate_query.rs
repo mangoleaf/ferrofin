@@ -16,7 +16,7 @@
 //! ordering table are ported directly. The deep recursive-descendant `EXISTS`
 //! folders (per-series played/resumable aggregation, box-set collapsing,
 //! chapter/subtitle folder roll-ups) are **not** expanded here — they need the
-//! `AncestorIds`/`HermitLinkedChildren` recursive CTEs that belong with the library
+//! `AncestorIds`/`FerrofinLinkedChildren` recursive CTEs that belong with the library
 //! manager (a later unit). Those filters are skipped rather than mistranslated;
 //! see the inline `// deferred:` notes. Everything ported matches the C#
 //! predicate exactly for non-folder items.
@@ -205,7 +205,7 @@ pub(crate) fn append_predicates<'a>(
             .push_bind(guid_to_db(filter.parent_id))
             .push(")");
         } else if filter.physical_children_only {
-            // Physical children only (delete-cascade): NEVER merge HermitLinkedChildren, so
+            // Physical children only (delete-cascade): NEVER merge FerrofinLinkedChildren, so
             // deleting a box-set/playlist removes only the container, not the items it
             // references (linked children are references, not owned children).
             qb.push(r#" AND bi."ParentId" = "#)
@@ -213,13 +213,13 @@ pub(crate) fn append_predicates<'a>(
         } else {
             // Direct children: the physical `ParentId`, plus manually linked
             // members (C# `Folder.GetChildren` merges `LinkedChildren`). Only
-            // box-sets and playlists carry `HermitLinkedChildren` rows, so the `IN`
+            // box-sets and playlists carry `FerrofinLinkedChildren` rows, so the `IN`
             // subquery is empty for ordinary folders and this stays identical to
             // a plain `ParentId` equality for non-collection browses.
             qb.push(r#" AND (bi."ParentId" = "#)
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(
-                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "HermitLinkedChildren" WHERE "ParentId" = "#,
+                    r#" OR bi."Id" IN (SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = "#,
                 )
                 .push_bind(guid_to_db(filter.parent_id))
                 .push(r#" AND "ChildType" = 0))"#);
@@ -987,10 +987,10 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
     // children descend from any of the requested ancestors — the Collections
     // tab's re-rooted query (C# TranslateQuery `LinkedChildAncestorIds` over
     // `context.LinkedChildren`; the manual links live in Ferrofin's
-    // `HermitLinkedChildren`).
+    // `FerrofinLinkedChildren`).
     if !filter.linked_child_ancestor_ids.is_empty() {
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "HermitLinkedChildren" lc
+            r#" AND EXISTS (SELECT 1 FROM "FerrofinLinkedChildren" lc
                 JOIN "AncestorIds" la ON la."ItemId" = lc."ChildId"
                 WHERE lc."ParentId" = bi."Id" AND "#,
         );

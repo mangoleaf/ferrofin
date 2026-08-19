@@ -115,7 +115,7 @@ The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whos
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 10.11.8 database** — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place; swapping back to Jellyfin is safe). Ferrofin-own tables/indexes live in a
-collision-proof `Hermit*`/`HermitIX_*` namespace. The `schema_conformance` test guards the
+collision-proof `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the
 pin; see `suite/roundtrip.sh` for the two-way swap test.
 
 ### Errors

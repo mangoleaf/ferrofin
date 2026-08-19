@@ -177,20 +177,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // Containers whose membership shrinks need their Data JSON
             // re-synced after the delete (captured before the edges go).
             let parents: Vec<String> = sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren" WHERE "ChildId" = ?1"#,
+                r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren" WHERE "ChildId" = ?1"#,
             )
             .bind(&id_db)
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
             touched_parents.extend(parents.iter().filter_map(|p| Uuid::parse_str(p).ok()));
-            // `HermitLinkedChildren` is the one BaseItems FK without `ON DELETE
+            // `FerrofinLinkedChildren` is the one BaseItems FK without `ON DELETE
             // CASCADE` (it references the item as both parent and child), so
             // clear those links first — otherwise deleting a
             // playlist/collection, or an item that belongs to one, trips a
             // FOREIGN KEY constraint (787).
             sqlx::query(
-                r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
+                r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
             )
             .bind(&id_db)
             .execute(self.db.writer())
@@ -657,7 +657,7 @@ mod tests {
     use ferrofin_traits::persistence::{ItemPersistenceService, LinkedChildrenService};
     use uuid::Uuid;
 
-    use crate::linked_children_service::HermitLinkedChildrenService;
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{seed_item, test_db};
 
     use super::FerrofinItemPersistenceService;
@@ -674,7 +674,7 @@ mod tests {
         seed_item(&db, member_a, BaseItemKind::Movie).await;
         seed_item(&db, member_b, BaseItemKind::Movie).await;
 
-        let links = HermitLinkedChildrenService::new(db.clone());
+        let links = FerrofinLinkedChildrenService::new(db.clone());
         links
             .upsert_linked_child(playlist, member_a, 0)
             .await
@@ -702,7 +702,7 @@ mod tests {
         assert!(!svc.item_exists(playlist).await.expect("exists p"));
         assert!(svc.item_exists(member_b).await.expect("member_b survives"));
 
-        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "HermitLinkedChildren""#)
+        let remaining: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinLinkedChildren""#)
             .fetch_one(db.pool())
             .await
             .expect("count");

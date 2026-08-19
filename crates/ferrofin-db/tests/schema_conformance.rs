@@ -14,7 +14,7 @@
 //! - Ferrofin-own objects (`Ferrofin*` tables, `_sqlx_migrations`) are additive
 //!   and excluded; Jellyfin's EF bookkeeping exists only on real databases;
 //! - indexes: Jellyfin's named index set must exist verbatim; Ferrofin may add
-//!   only `HermitIX_`-prefixed indexes (EF-invisible, collision-proof).
+//!   only `FerrofinIX_`-prefixed indexes (EF-invisible, collision-proof).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,7 +45,7 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
     let mut shapes = BTreeMap::new();
     let mut indexes = BTreeSet::new();
     for table in tables {
-        if table.starts_with("__") || table == "_sqlx_migrations" || table.starts_with("Hermit") {
+        if table.starts_with("__") || table == "_sqlx_migrations" || table.starts_with("Ferrofin") {
             continue;
         }
         let mut columns = BTreeMap::new();
@@ -154,10 +154,10 @@ async fn fresh_ferrofin_schema_equals_real_jellyfin_10_11_8() {
     );
     let extra: Vec<_> = hm_indexes
         .difference(&jf_indexes)
-        .filter(|(name, _, _)| !name.starts_with("HermitIX_"))
+        .filter(|(name, _, _)| !name.starts_with("FerrofinIX_"))
         .collect();
     assert!(
         extra.is_empty(),
-        "non-HermitIX_ index surplus on Jellyfin-owned tables: {extra:?}"
+        "non-FerrofinIX_ index surplus on Jellyfin-owned tables: {extra:?}"
     );
 }

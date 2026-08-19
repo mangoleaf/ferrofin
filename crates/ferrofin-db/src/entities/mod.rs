@@ -628,7 +628,7 @@ mod tests {
         insert_base_item(&db, child_id).await;
 
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType",
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType",
                 "SortOrder") VALUES (?1, ?2, 1, 5)"#,
         )
         .bind(guid_to_db(item_id))
@@ -667,7 +667,7 @@ mod tests {
         .expect("insert keyframe data");
 
         let link: LinkedChildEntity =
-            sqlx::query_as(r#"SELECT * FROM "HermitLinkedChildren" WHERE "ParentId" = ?1"#)
+            sqlx::query_as(r#"SELECT * FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#)
                 .bind(guid_to_db(item_id))
                 .fetch_one(db.pool())
                 .await

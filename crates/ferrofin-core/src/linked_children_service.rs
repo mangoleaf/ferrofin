@@ -1,4 +1,4 @@
-//! [`HermitLinkedChildrenService`] — the concrete [`LinkedChildrenService`] over
+//! [`FerrofinLinkedChildrenService`] — the concrete [`LinkedChildrenService`] over
 //! `ferrofin-db`.
 //!
 //! Port of `LinkedChildrenService`. Operates on the `LinkedChildren` table (a
@@ -29,24 +29,24 @@ use crate::db_error::db_err;
 use crate::item_data;
 use crate::item_type_lookup::stored_type_name;
 
-/// The stored `HermitLinkedChildren.ChildType` discriminant for a manually linked
+/// The stored `FerrofinLinkedChildren.ChildType` discriminant for a manually linked
 /// child (C# `LinkedChildType.Manual`).
 const MANUAL_CHILD_TYPE: i32 = 0;
 
 /// The concrete linked-children service.
 #[derive(Clone)]
-pub struct HermitLinkedChildrenService {
+pub struct FerrofinLinkedChildrenService {
     db: Database,
 }
 
-impl std::fmt::Debug for HermitLinkedChildrenService {
+impl std::fmt::Debug for FerrofinLinkedChildrenService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HermitLinkedChildrenService")
+        f.debug_struct("FerrofinLinkedChildrenService")
             .finish_non_exhaustive()
     }
 }
 
-impl HermitLinkedChildrenService {
+impl FerrofinLinkedChildrenService {
     /// Creates a linked-children service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
@@ -55,14 +55,14 @@ impl HermitLinkedChildrenService {
 }
 
 #[async_trait]
-impl LinkedChildrenService for HermitLinkedChildrenService {
+impl LinkedChildrenService for FerrofinLinkedChildrenService {
     async fn get_linked_children_ids(
         &self,
         parent_id: Uuid,
         child_type: Option<i32>,
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut sql =
-            String::from(r#"SELECT "ChildId" FROM "HermitLinkedChildren" WHERE "ParentId" = ?1"#);
+            String::from(r#"SELECT "ChildId" FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1"#);
         if child_type.is_some() {
             sql.push_str(r#" AND "ChildType" = ?2"#);
         }
@@ -138,7 +138,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
 
         let ids: Vec<String> = if let Some(type_name) = parent_type_name {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT lc."ParentId" FROM "HermitLinkedChildren" lc
+                r#"SELECT DISTINCT lc."ParentId" FROM "FerrofinLinkedChildren" lc
                    JOIN "BaseItems" bi ON bi."Id" = lc."ParentId"
                    WHERE lc."ChildId" = ?1 AND lc."ChildType" = ?2 AND bi."Type" = ?3"#,
             )
@@ -150,7 +150,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
             .map_err(db_err)?
         } else {
             sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren"
+                r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren"
                    WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
             )
             .bind(guid_to_db(child_id))
@@ -170,7 +170,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
-            r#"SELECT DISTINCT "ParentId" FROM "HermitLinkedChildren"
+            r#"SELECT DISTINCT "ParentId" FROM "FerrofinLinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -187,9 +187,9 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         // Delete edges whose parent already links the target (would collide on the
         // (ParentId, ChildId) primary key), then retarget the rest.
         sqlx::query(
-            r#"DELETE FROM "HermitLinkedChildren"
+            r#"DELETE FROM "FerrofinLinkedChildren"
                WHERE "ChildId" = ?1 AND "ChildType" = ?2
-                 AND "ParentId" IN (SELECT "ParentId" FROM "HermitLinkedChildren"
+                 AND "ParentId" IN (SELECT "ParentId" FROM "FerrofinLinkedChildren"
                      WHERE "ChildId" = ?3 AND "ChildType" = ?2)"#,
         )
         .bind(guid_to_db(from_child_id))
@@ -200,7 +200,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         .map_err(db_err)?;
 
         sqlx::query(
-            r#"UPDATE "HermitLinkedChildren" SET "ChildId" = ?1
+            r#"UPDATE "FerrofinLinkedChildren" SET "ChildId" = ?1
                WHERE "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
         .bind(guid_to_db(to_child_id))
@@ -235,10 +235,10 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
         // order is insertion order and reordering (`move_item`) has stable
         // ordinals to rewrite. An existing edge keeps its position.
         sqlx::query(
-            r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+            r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                VALUES (?1, ?2, ?3,
                    (SELECT COALESCE(MAX("SortOrder"), -1) + 1
-                    FROM "HermitLinkedChildren" WHERE "ParentId" = ?1))
+                    FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1))
                ON CONFLICT("ParentId", "ChildId") DO UPDATE SET "ChildType" = excluded."ChildType""#,
         )
         .bind(guid_to_db(parent_id))
@@ -254,7 +254,7 @@ impl LinkedChildrenService for HermitLinkedChildrenService {
 
 #[cfg(test)]
 mod tests {
-    use super::{HermitLinkedChildrenService, MANUAL_CHILD_TYPE};
+    use super::{FerrofinLinkedChildrenService, MANUAL_CHILD_TYPE};
     use crate::test_support::{seed_item, seed_named_item, test_db};
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::LinkedChildrenService;
@@ -269,7 +269,7 @@ mod tests {
         for id in [parent, child_a, child_b] {
             seed_item(&db, id, BaseItemKind::Playlist).await;
         }
-        let svc = HermitLinkedChildrenService::new(db);
+        let svc = FerrofinLinkedChildrenService::new(db);
 
         svc.upsert_linked_child(parent, child_a, MANUAL_CHILD_TYPE)
             .await
@@ -312,7 +312,7 @@ mod tests {
         seed_item(&db, parent2, BaseItemKind::BoxSet).await;
         seed_item(&db, from_child, BaseItemKind::Movie).await;
         seed_item(&db, to_child, BaseItemKind::Movie).await;
-        let svc = HermitLinkedChildrenService::new(db);
+        let svc = FerrofinLinkedChildrenService::new(db);
 
         svc.upsert_linked_child(parent1, from_child, MANUAL_CHILD_TYPE)
             .await
@@ -362,7 +362,7 @@ mod tests {
         let a2 = Uuid::new_v4();
         seed_named_item(&db, a1, BaseItemKind::MusicArtist, "The Beatles").await;
         seed_named_item(&db, a2, BaseItemKind::MusicArtist, "Queen").await;
-        let svc = HermitLinkedChildrenService::new(db);
+        let svc = FerrofinLinkedChildrenService::new(db);
 
         let found = svc
             .find_artists(&["the beatles".to_owned(), "Unknown".to_owned()])

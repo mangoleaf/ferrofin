@@ -3,7 +3,7 @@
 //! Not a port of a Jellyfin interface: upstream throws the per-request
 //! `StreamInfo` decision away, which is exactly why avoidable transcodes are
 //! invisible there. Ferrofin records every PlaybackInfo decision (play method +
-//! `TranscodeReasons`) into the `HermitPlaybackSessions` table so transcode
+//! `TranscodeReasons`) into the `FerrofinPlaybackSessions` table so transcode
 //! causes can be ranked by cost.
 //!
 //! Recording must never break playback: implementations swallow and log their
