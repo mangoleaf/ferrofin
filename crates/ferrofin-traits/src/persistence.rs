@@ -107,6 +107,36 @@ pub struct NextUpEpisodeBatchResult {
     pub next_played_for_rewatching: Option<BaseItemEntity>,
 }
 
+/// The playlist-access columns a playlist read carries alongside its member
+/// rows: the `FerrofinPlaylists` meta row (owner + open-access) and the caller's
+/// own `FerrofinPlaylistShares` row, exactly as stored.
+///
+/// Left as raw storage values because the visibility rules (C#
+/// `Playlist.IsVisible` plus the owner/`CanEdit` split) are the playlist
+/// manager's to apply — the repository only reads.
+#[derive(Debug, Clone)]
+pub struct PlaylistAccessColumns {
+    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy or API-key playlist).
+    pub owner_user_id: Option<String>,
+    /// `FerrofinPlaylists.OpenAccess` (`None` only when the meta row is absent).
+    pub open_access: Option<i64>,
+    /// The caller's `FerrofinPlaylistShares.CanEdit` (`None` when not shared).
+    pub share_can_edit: Option<i64>,
+}
+
+/// A playlist's member rows in link order, plus the caller's access columns.
+///
+/// `access` is `None` exactly when the playlist has no member rows — the join
+/// then cannot tell "empty playlist" from "missing/invisible playlist", so the
+/// caller resolves access separately.
+#[derive(Debug, Clone)]
+pub struct PlaylistItemsWithAccess {
+    /// The member item rows, in playlist (link) order.
+    pub items: Vec<BaseItemEntity>,
+    /// The access columns repeated on every member row (`None` if there are none).
+    pub access: Option<PlaylistAccessColumns>,
+}
+
 /// Reads and queries persisted [`BaseItemEntity`] rows.
 ///
 /// Port of `IItemRepository`. Generic C# helpers (`GetGenres`/`GetStudios`/…)
@@ -308,6 +338,21 @@ pub trait ItemRepository: Send + Sync {
         id: Uuid,
         recursive: bool,
     ) -> Result<bool, ServiceError>;
+
+    /// Reads a playlist's linked members of `child_type` in link order, each
+    /// joined with the caller's playlist-access columns, in a **single**
+    /// statement (`GET /Playlists/{id}/Items`).
+    ///
+    /// One round-trip is load-bearing: the previous shape took one reader-pool
+    /// connection for the access check, another for the child-id list, and
+    /// another for the detail fetch, so one request queued three times on a
+    /// pool sized to the core count.
+    async fn get_playlist_items_with_access(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+        child_type: i32,
+    ) -> Result<PlaylistItemsWithAccess, ServiceError>;
 }
 
 fn _assert_object_safe_item_repository(_: &dyn ItemRepository) {}

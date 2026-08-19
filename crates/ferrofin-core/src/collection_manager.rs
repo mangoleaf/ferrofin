@@ -12,9 +12,9 @@
 //! [`LibraryManager`](ferrofin_traits::library::LibraryManager) so the same
 //! persistence seam backs everything.
 //!
-//! Playlist **ownership and access** are real: the `HermitPlaylists` table records the
+//! Playlist **ownership and access** are real: the `FerrofinPlaylists` table records the
 //! owner + open-access flag (C# `Playlist.OwnerUserId`/`OpenAccess`), the
-//! `HermitPlaylistShares` table records per-user share permissions (`Playlist.Shares`),
+//! `FerrofinPlaylistShares` table records per-user share permissions (`Playlist.Shares`),
 //! and every read resolves the caller's [`PlaylistAccess`] — owner, `CanEdit`
 //! share, read-only share, or open-access — with invisible playlists reported as
 //! `NotFound` (the C# `GetPlaylistForUser` null). A playlist with no `Playlists`
@@ -45,7 +45,6 @@ use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
     PlaylistUserUpdateRequest,
 };
-use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
 use ferrofin_traits::collections::{
@@ -54,7 +53,7 @@ use ferrofin_traits::collections::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
-use ferrofin_traits::persistence::LinkedChildrenService;
+use ferrofin_traits::persistence::{ItemRepository, LinkedChildrenService};
 
 use crate::db_error::db_err;
 use crate::item_data;
@@ -63,56 +62,6 @@ use crate::item_type_lookup::stored_type_name;
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
 const LINKED_CHILD_MANUAL: i32 = 0;
-
-/// The one query behind `GET /Playlists/{id}/Items`: every member row of the
-/// playlist, in link order, each carrying the caller's access columns.
-///
-/// Collapsing the read into a single statement is load-bearing under open-loop
-/// load — the previous shape took one reader-pool connection for the access
-/// check, another for the child-id list, and another for the `IN (…)` detail
-/// fetch, so a single request queued three times on a pool sized to the core
-/// count. `?1` = playlist id, `?2` = caller, `?3` = the manual child type.
-///
-/// `pl` proves the playlist's own `BaseItems` row exists (a member edge without
-/// its container must still read as missing, exactly as the access query does);
-/// `p`/`s` are LEFT-joined so a legacy playlist with no meta row and a caller
-/// with no share row both come back as NULLs [`decide_access`] interprets.
-const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
-       p."OwnerUserId" AS "PlaylistOwnerUserId",
-       p."OpenAccess"  AS "PlaylistOpenAccess",
-       s."CanEdit"     AS "PlaylistShareCanEdit"
-   FROM "HermitLinkedChildren" lc
-   JOIN "BaseItems" pl ON pl."Id" = lc."ParentId"
-   JOIN "BaseItems" ch ON ch."Id" = lc."ChildId"
-   LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = lc."ParentId"
-   LEFT JOIN "HermitPlaylistShares" s
-          ON s."PlaylistId" = lc."ParentId" AND s."UserId" = ?2
-   WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
-   ORDER BY lc."SortOrder""#;
-
-/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
-/// access columns (identical on every row of a given playlist).
-struct PlaylistItemRow {
-    /// The member item row.
-    item: BaseItemEntity,
-    /// `HermitPlaylists.OwnerUserId` (NULL for a legacy or API-key playlist).
-    owner: Option<String>,
-    /// `HermitPlaylists.OpenAccess` (NULL only when the meta row is absent).
-    open_access: Option<i64>,
-    /// The caller's `HermitPlaylistShares.CanEdit` (NULL when not shared).
-    can_edit: Option<i64>,
-}
-
-impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
-    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            item: BaseItemEntity::from_row(row)?,
-            owner: row.try_get("PlaylistOwnerUserId")?,
-            open_access: row.try_get("PlaylistOpenAccess")?,
-            can_edit: row.try_get("PlaylistShareCanEdit")?,
-        })
-    }
-}
 
 /// Decides the caller's [`PlaylistAccess`] from the three joined access columns
 /// (C# `Playlist.IsVisible` plus the owner/`CanEdit` split the controller checks
@@ -262,7 +211,7 @@ impl CollectionManager for FerrofinCollectionManager {
     ) -> Result<(), ServiceError> {
         for item_id in item_ids {
             sqlx::query(
-                r#"DELETE FROM "HermitLinkedChildren"
+                r#"DELETE FROM "FerrofinLinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(guid_to_db(collection_id))
@@ -311,6 +260,7 @@ pub struct FerrofinPlaylistManager {
     db: Database,
     library_manager: Arc<dyn LibraryManager>,
     linked_children: Arc<dyn LinkedChildrenService>,
+    items: Arc<dyn ItemRepository>,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -327,11 +277,13 @@ impl FerrofinPlaylistManager {
         db: Database,
         library_manager: Arc<dyn LibraryManager>,
         linked_children: Arc<dyn LinkedChildrenService>,
+        items: Arc<dyn ItemRepository>,
     ) -> Self {
         Self {
             db,
             library_manager,
             linked_children,
+            items,
         }
     }
 
@@ -346,8 +298,8 @@ impl FerrofinPlaylistManager {
     /// Resolves the caller's access to a playlist (C# `Playlist.IsVisible` plus
     /// the owner/`CanEdit` split the controller checks derive from it).
     ///
-    /// One LEFT-JOIN query: the base row proves existence, the `HermitPlaylists` meta
-    /// row carries owner/open-access, and the caller's own `HermitPlaylistShares` row
+    /// One LEFT-JOIN query: the base row proves existence, the `FerrofinPlaylists` meta
+    /// row carries owner/open-access, and the caller's own `FerrofinPlaylistShares` row
     /// (if any) carries `CanEdit`. Missing **or invisible** → `NotFound`.
     async fn access(
         &self,
@@ -357,8 +309,8 @@ impl FerrofinPlaylistManager {
         let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
             r#"SELECT p."OwnerUserId", p."OpenAccess", s."CanEdit"
                FROM "BaseItems" bi
-               LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = bi."Id"
-               LEFT JOIN "HermitPlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
+               LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = bi."Id"
+               LEFT JOIN "FerrofinPlaylistShares" s ON s."PlaylistId" = bi."Id" AND s."UserId" = ?2
                WHERE bi."Id" = ?1"#,
         )
         .bind(guid_to_db(playlist_id))
@@ -403,7 +355,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // The ownership meta row (C# `OwnerUserId`/`OpenAccess`). A nil user id
         // (API-key create) stores NULL — unowned, visible to all.
         sqlx::query(
-            r#"INSERT INTO "HermitPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+            r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                VALUES (?1, ?2, ?3)"#,
         )
         .bind(guid_to_db(id))
@@ -455,7 +407,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         if let Some(public) = request.public {
             // A legacy playlist has no meta row; updating 0 rows is harmless.
             sqlx::query(
-                r#"UPDATE "HermitPlaylists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#,
+                r#"UPDATE "FerrofinPlaylists" SET "OpenAccess" = ?2 WHERE "PlaylistId" = ?1"#,
             )
             .bind(guid_to_db(request.id))
             .bind(i64::from(public))
@@ -465,7 +417,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         if let Some(users) = &request.users {
             // C# replaces `Shares` wholesale on update.
-            sqlx::query(r#"DELETE FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1"#)
+            sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
                 .bind(guid_to_db(request.id))
                 .execute(self.db.writer())
                 .await
@@ -497,13 +449,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // open-access, owned by the caller, or shared with the caller.
         let rows = sqlx::query_as::<_, BaseItemEntity>(
             r#"SELECT bi.* FROM "BaseItems" bi
-               LEFT JOIN "HermitPlaylists" p ON p."PlaylistId" = bi."Id"
+               LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = bi."Id"
                WHERE bi."Type" = ?1 AND (
                    p."PlaylistId" IS NULL
                    OR p."OwnerUserId" IS NULL
                    OR p."OpenAccess" = 1
                    OR p."OwnerUserId" = ?2
-                   OR EXISTS (SELECT 1 FROM "HermitPlaylistShares" s
+                   OR EXISTS (SELECT 1 FROM "FerrofinPlaylistShares" s
                               WHERE s."PlaylistId" = bi."Id" AND s."UserId" = ?2))
                ORDER BY bi."Name""#,
         )
@@ -520,20 +472,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: Uuid,
         user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // One round-trip ([`PLAYLIST_ITEMS_SQL`]): the member rows already in
-        // link order (`ORDER BY lc."SortOrder"` — the same ordering
-        // `get_linked_children_ids` applies), each carrying the caller's access
-        // columns, so the visibility gate costs no extra query. The C# `Forbid()`
-        // branch is unreachable here because visible ⇔ permitted-to-read;
-        // per-member parental-control filtering stays deferred.
-        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
-            .bind(guid_to_db(playlist_id))
-            .bind(guid_to_db(user_id))
-            .bind(i64::from(LINKED_CHILD_MANUAL))
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        let Some(first) = rows.first() else {
+        // One round-trip through the repository seam: the member rows already
+        // in link order (the same ordering `get_linked_children_ids` applies),
+        // each carrying the caller's access columns, so the visibility gate
+        // costs no extra query. The C# `Forbid()` branch is unreachable here
+        // because visible ⇔ permitted-to-read; per-member parental-control
+        // filtering stays deferred.
+        let page = self
+            .items
+            .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
+            .await?;
+        let Some(access) = page.access else {
             // No member rows: the join can't tell "empty playlist" from
             // "missing/invisible playlist", so resolve access on its own. Only
             // empty playlists pay for this second query.
@@ -542,16 +491,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
         };
         // Every row repeats the same access columns; the first decides.
         if decide_access(
-            first.owner.as_deref(),
-            first.open_access,
-            first.can_edit,
+            access.owner_user_id.as_deref(),
+            access.open_access,
+            access.share_can_edit,
             user_id,
         )
         .is_none()
         {
             return Err(ServiceError::not_found(format!("playlist {playlist_id}")));
         }
-        Ok(rows.into_iter().map(|r| r.item).collect())
+        Ok(page.items)
     }
 
     async fn add_user_to_shares(
@@ -560,7 +509,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
     ) -> Result<(), ServiceError> {
         // Upsert the share row (POST is idempotent — re-sharing updates CanEdit).
         sqlx::query(
-            r#"INSERT INTO "HermitPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
+            r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit") VALUES (?1, ?2, ?3)
                ON CONFLICT ("PlaylistId", "UserId") DO UPDATE SET "CanEdit" = excluded."CanEdit""#,
         )
         .bind(guid_to_db(request.id))
@@ -580,7 +529,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
         sqlx::query(
-            r#"DELETE FROM "HermitPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
+            r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,
         )
         .bind(guid_to_db(playlist_id))
         .bind(guid_to_db(user_id))
@@ -596,7 +545,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         playlist_id: Uuid,
     ) -> Result<Vec<PlaylistUserPermissions>, ServiceError> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT "UserId", "CanEdit" FROM "HermitPlaylistShares"
+            r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
                WHERE "PlaylistId" = ?1 ORDER BY "UserId""#,
         )
         .bind(guid_to_db(playlist_id))
@@ -636,7 +585,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let pid = guid_to_db(playlist_id);
         let added: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
         let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "HermitLinkedChildren"
+            r#"SELECT "ChildId" FROM "FerrofinLinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(&pid)
@@ -675,7 +624,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 continue;
             };
             sqlx::query(
-                r#"DELETE FROM "HermitLinkedChildren"
+                r#"DELETE FROM "FerrofinLinkedChildren"
                    WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
             )
             .bind(&pid)
@@ -705,7 +654,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // caller-formatted string — normalise to the stored canonical form.
         let pid = Uuid::parse_str(playlist_id).map_or_else(|_| playlist_id.to_owned(), guid_to_db);
         let mut order: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "ChildId" FROM "HermitLinkedChildren"
+            r#"SELECT "ChildId" FROM "FerrofinLinkedChildren"
                WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
         )
         .bind(&pid)
@@ -737,7 +686,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 
     async fn remove_playlists(&self, _user_id: Uuid) -> Result<(), ServiceError> {
-        // Ownership is recorded (the `HermitPlaylists` table), but the user-deletion
+        // Ownership is recorded (the `FerrofinPlaylists` table), but the user-deletion
         // cascade — delete owned playlists, transfer shared ones (C#
         // `RemovePlaylists`) — is still deferred; nothing is removed.
         Ok(())
@@ -754,7 +703,7 @@ async fn write_sort_order(
     let mut tx = pool.begin().await.map_err(db_err)?;
     for (ordinal, child) in order.iter().enumerate() {
         sqlx::query(
-            r#"UPDATE "HermitLinkedChildren" SET "SortOrder" = ?1
+            r#"UPDATE "FerrofinLinkedChildren" SET "SortOrder" = ?1
                WHERE "ParentId" = ?2 AND "ChildId" = ?3"#,
         )
         .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
@@ -779,8 +728,8 @@ mod tests {
         CollectionCreationOptions, CollectionManager, PlaylistManager,
     };
 
-    use crate::linked_children_service::HermitLinkedChildrenService;
-    use crate::test_support::{library_manager_over, seed_item, test_db};
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use crate::test_support::{item_repository_over, library_manager_over, seed_item, test_db};
 
     use super::{FerrofinCollectionManager, FerrofinPlaylistManager};
 
@@ -795,7 +744,7 @@ mod tests {
         let mgr = FerrofinCollectionManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
         );
 
         let options = CollectionCreationOptions {
@@ -845,7 +794,7 @@ mod tests {
         let mgr = FerrofinCollectionManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
         );
         let created = mgr
             .create_collection(&CollectionCreationOptions {
@@ -892,7 +841,7 @@ mod tests {
         let mgr = FerrofinCollectionManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
         );
         let created = mgr
             .create_collection(&CollectionCreationOptions {
@@ -930,7 +879,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
 
         // Reads below must come from the owner: playlists are visible only to
@@ -987,7 +937,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
 
         let owner = Uuid::new_v4();
@@ -1030,7 +981,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
         let owner = Uuid::new_v4();
         let created = mgr
@@ -1066,7 +1018,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
 
         let owner = Uuid::new_v4();
@@ -1114,7 +1067,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
         let owner = Uuid::new_v4();
         let created = mgr
@@ -1394,7 +1348,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_playlist_items_legacy_playlist_without_meta_row_reads() {
-        // A pre-ownership playlist (no `HermitPlaylists` row) keeps granting
+        // A pre-ownership playlist (no `FerrofinPlaylists` row) keeps granting
         // owner-equivalent access on the joined path — the LEFT JOIN's NULLs must
         // be read as "legacy", not "denied".
         let db = test_db().await;
@@ -1437,7 +1391,7 @@ mod tests {
             .await
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
-        let links = HermitLinkedChildrenService::new(db.clone());
+        let links = FerrofinLinkedChildrenService::new(db.clone());
         ferrofin_traits::persistence::LinkedChildrenService::upsert_linked_child(
             &links,
             playlist_id,
@@ -1463,7 +1417,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
         let err = mgr
             .get_playlist_items(Uuid::new_v4(), Uuid::new_v4())
@@ -1481,7 +1436,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
         let err = mgr
             .get_playlist_for_user(Uuid::new_v4(), Uuid::new_v4())
@@ -1502,7 +1458,8 @@ mod tests {
         let mgr = FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         );
         let playlist_id = Uuid::parse_str(
             &mgr.create_playlist(&PlaylistCreationRequest {
@@ -1564,7 +1521,8 @@ mod tests {
         FerrofinPlaylistManager::new(
             db.clone(),
             library_manager_over(db.clone()),
-            Arc::new(HermitLinkedChildrenService::new(db.clone())),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            item_repository_over(db.clone()),
         )
     }
 
@@ -1642,7 +1600,7 @@ mod tests {
 
         let db = test_db().await;
         let mgr = playlist_manager(&db);
-        // A pre-ownership row: the BaseItems row exists with no `HermitPlaylists` meta.
+        // A pre-ownership row: the BaseItems row exists with no `FerrofinPlaylists` meta.
         let legacy = Uuid::new_v4();
         seed_item(&db, legacy, BaseItemKind::Playlist).await;
 

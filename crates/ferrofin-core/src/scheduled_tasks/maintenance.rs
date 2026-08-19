@@ -1239,9 +1239,9 @@ mod tests {
 
     #[tokio::test]
     async fn collections_cleanup_removes_dead_children_only() {
-        use crate::test_support::{library_manager_over, seed_named_item};
+        use crate::test_support::{item_repository_over, library_manager_over, seed_named_item};
         use crate::{
-            FerrofinCollectionManager, FerrofinPlaylistManager, HermitLinkedChildrenService,
+            FerrofinCollectionManager, FerrofinLinkedChildrenService, FerrofinPlaylistManager,
         };
         use ferrofin_model::data::BaseItemKind;
         use uuid::Uuid;
@@ -1250,7 +1250,7 @@ mod tests {
         let media_dir = tempfile::tempdir().expect("tempdir");
         let library = library_manager_over(db.clone());
         let linked: Arc<dyn LinkedChildrenService> =
-            Arc::new(HermitLinkedChildrenService::new(db.clone()));
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
         let collections: Arc<dyn CollectionManager> = Arc::new(FerrofinCollectionManager::new(
             db.clone(),
             Arc::clone(&library),
@@ -1260,6 +1260,7 @@ mod tests {
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked),
+            item_repository_over(db.clone()),
         ));
 
         // A box set with one live child (file on disk) and one dead child
@@ -1291,7 +1292,7 @@ mod tests {
 
         for (parent, child) in [(boxset, live), (boxset, dead), (playlist, dead)] {
             sqlx::query(
-                r#"INSERT INTO "HermitLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+                r#"INSERT INTO "FerrofinLinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
                    VALUES (?1, ?2, 0, 0)"#,
             )
             .bind(guid_to_db(parent))

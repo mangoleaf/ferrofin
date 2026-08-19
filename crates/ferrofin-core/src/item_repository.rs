@@ -30,14 +30,16 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemRepository, ItemTypeLookup, ItemWithCounts};
+use ferrofin_traits::persistence::{
+    ItemRepository, ItemTypeLookup, ItemWithCounts, PlaylistAccessColumns, PlaylistItemsWithAccess,
+};
 
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_query, push_in_list,
 };
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
 /// The concrete item repository.
 ///
@@ -346,6 +348,56 @@ const SEARCH_WILDCARD_TERMS: &[char] = &['%', '_', '[', ']', '^'];
 /// Hard cap on the ancestor-chain CTE depth — prevents unbounded recursion on
 /// a cyclic `ParentId` chain (real libraries are <10 levels deep).
 const MAX_ANCESTOR_DEPTH: i32 = 32;
+
+/// The one query behind `GET /Playlists/{id}/Items`: every member row of the
+/// playlist, in link order, each carrying the caller's access columns.
+///
+/// Collapsing the read into a single statement is load-bearing under open-loop
+/// load — the previous shape took one reader-pool connection for the access
+/// check, another for the child-id list, and another for the `IN (…)` detail
+/// fetch, so a single request queued three times on a pool sized to the core
+/// count. `?1` = playlist id, `?2` = caller, `?3` = the linked-child type.
+///
+/// `pl` proves the playlist's own `BaseItems` row exists (a member edge without
+/// its container must still read as missing, exactly as the access query does);
+/// `p`/`s` are LEFT-joined so a legacy playlist with no meta row and a caller
+/// with no share row both come back as NULLs the playlist manager interprets.
+const PLAYLIST_ITEMS_SQL: &str = r#"SELECT ch.*,
+       p."OwnerUserId" AS "PlaylistOwnerUserId",
+       p."OpenAccess"  AS "PlaylistOpenAccess",
+       s."CanEdit"     AS "PlaylistShareCanEdit"
+   FROM "FerrofinLinkedChildren" lc
+   JOIN "BaseItems" pl ON pl."Id" = lc."ParentId"
+   JOIN "BaseItems" ch ON ch."Id" = lc."ChildId"
+   LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = lc."ParentId"
+   LEFT JOIN "FerrofinPlaylistShares" s
+          ON s."PlaylistId" = lc."ParentId" AND s."UserId" = ?2
+   WHERE lc."ParentId" = ?1 AND lc."ChildType" = ?3
+   ORDER BY lc."SortOrder""#;
+
+/// One row of [`PLAYLIST_ITEMS_SQL`]: a member's `BaseItems` row plus the three
+/// access columns (identical on every row of a given playlist).
+struct PlaylistItemRow {
+    /// The member item row.
+    item: BaseItemEntity,
+    /// `FerrofinPlaylists.OwnerUserId` (NULL for a legacy or API-key playlist).
+    owner: Option<String>,
+    /// `FerrofinPlaylists.OpenAccess` (NULL only when the meta row is absent).
+    open_access: Option<i64>,
+    /// The caller's `FerrofinPlaylistShares.CanEdit` (NULL when not shared).
+    can_edit: Option<i64>,
+}
+
+impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            item: BaseItemEntity::from_row(row)?,
+            owner: row.try_get("PlaylistOwnerUserId")?,
+            open_access: row.try_get("PlaylistOpenAccess")?,
+            can_edit: row.try_get("PlaylistShareCanEdit")?,
+        })
+    }
+}
 
 /// Appends the caller's name filters against the by-name `bi` row (C#
 /// `TranslateQuery`'s name predicates on the outer query).
@@ -972,6 +1024,33 @@ impl ItemRepository for FerrofinItemRepository {
             .map_err(db_err)?;
         Ok(all_played != 0)
     }
+
+    async fn get_playlist_items_with_access(
+        &self,
+        playlist_id: Uuid,
+        user_id: Uuid,
+        child_type: i32,
+    ) -> Result<PlaylistItemsWithAccess, ServiceError> {
+        let rows: Vec<PlaylistItemRow> = sqlx::query_as(PLAYLIST_ITEMS_SQL)
+            .bind(guid_to_db(playlist_id))
+            .bind(guid_to_db(user_id))
+            .bind(i64::from(child_type))
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        // Every row repeats the same access columns; the first carries them.
+        // No rows at all means the join matched nothing — the caller decides
+        // whether that is an empty playlist or a missing/invisible one.
+        let access = rows.first().map(|first| PlaylistAccessColumns {
+            owner_user_id: first.owner.clone(),
+            open_access: first.open_access,
+            share_can_edit: first.can_edit,
+        });
+        Ok(PlaylistItemsWithAccess {
+            items: rows.into_iter().map(|r| r.item).collect(),
+            access,
+        })
+    }
 }
 
 impl FerrofinItemRepository {
@@ -1170,7 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn boxset_parent_browse_surfaces_linked_children() {
-        use crate::linked_children_service::HermitLinkedChildrenService;
+        use crate::linked_children_service::FerrofinLinkedChildrenService;
         use ferrofin_traits::persistence::LinkedChildrenService;
 
         let db = test_db().await;
@@ -1183,7 +1262,7 @@ mod tests {
         seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Trilogy").await;
         seed_named_item(&db, movie, BaseItemKind::Movie, "Part One").await;
 
-        let links = HermitLinkedChildrenService::new(db.clone());
+        let links = FerrofinLinkedChildrenService::new(db.clone());
         // `add_to_collection` inserts a manual (ChildType = 0) edge.
         links
             .upsert_linked_child(boxset, movie, 0)
@@ -1200,7 +1279,7 @@ mod tests {
 
         // Removing the membership makes the browse empty again.
         sqlx::query(
-            r#"DELETE FROM "HermitLinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
+            r#"DELETE FROM "FerrofinLinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
         )
         .bind(guid_to_db(boxset))
         .bind(guid_to_db(movie))

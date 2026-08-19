@@ -27,15 +27,15 @@ use ferrofin_core::{
     FerrofinDisplayPreferencesManager, FerrofinDtoService, FerrofinEventManager,
     FerrofinExternalDataManager, FerrofinFileSystem, FerrofinItemCountService,
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinKeyframeRepository,
-    FerrofinLibraryManager, FerrofinLyricManager, FerrofinMediaAttachmentRepository,
-    FerrofinMediaSegmentManager, FerrofinMediaSourceManager, FerrofinMediaStreamRepository,
-    FerrofinMusicManager, FerrofinNextUpService, FerrofinPathManager, FerrofinPeopleRepository,
-    FerrofinPlaylistManager, FerrofinQuickConnect, FerrofinSearchManager,
-    FerrofinServerApplicationHost, FerrofinServerConfigurationManager, FerrofinSessionManager,
-    FerrofinSimilarItemsManager, FerrofinSubtitleManager, FerrofinSystemManager,
-    FerrofinTaskManager, FerrofinTrickplayManager, FerrofinTvSeriesManager,
-    FerrofinUserDataManager, FerrofinUserManager, FerrofinUserViewManager,
-    HermitLinkedChildrenService, ItemTypeLookup, LocalizationManager,
+    FerrofinLibraryManager, FerrofinLinkedChildrenService, FerrofinLyricManager,
+    FerrofinMediaAttachmentRepository, FerrofinMediaSegmentManager, FerrofinMediaSourceManager,
+    FerrofinMediaStreamRepository, FerrofinMusicManager, FerrofinNextUpService,
+    FerrofinPathManager, FerrofinPeopleRepository, FerrofinPlaylistManager, FerrofinQuickConnect,
+    FerrofinSearchManager, FerrofinServerApplicationHost, FerrofinServerConfigurationManager,
+    FerrofinSessionManager, FerrofinSimilarItemsManager, FerrofinSubtitleManager,
+    FerrofinSystemManager, FerrofinTaskManager, FerrofinTrickplayManager, FerrofinTvSeriesManager,
+    FerrofinUserDataManager, FerrofinUserManager, FerrofinUserViewManager, ItemTypeLookup,
+    LocalizationManager,
 };
 use ferrofin_db::Database;
 use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
@@ -249,7 +249,7 @@ pub async fn build_app_state(
     // The per-database item-id derivation mode: Jellyfin 10.11.8 parity
     // (case-sensitive + data-dir-relative rewrite) for fresh and adopted
     // databases, grandfathered lowercase for pre-parity Ferrofin ones
-    // (`HermitMeta.item_id_derivation`, seeded by migration 0009). Resolved
+    // (`FerrofinMeta.item_id_derivation`, seeded by migration 0009). Resolved
     // here because the people repository needs it for per-name person ids.
     let id_derivation = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
         db.meta_get("item_id_derivation")
@@ -286,7 +286,7 @@ pub async fn build_app_state(
     let keyframe_repository: Arc<dyn ferrofin_traits::persistence::KeyframeRepository> =
         Arc::new(FerrofinKeyframeRepository::new(db.clone()));
     let linked_children_service: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService> =
-        Arc::new(HermitLinkedChildrenService::new(db.clone()));
+        Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
     let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
         Arc::new(FerrofinNextUpService::new(db.clone()));
 
@@ -796,6 +796,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&linked_children_service),
+            Arc::clone(&item_repository),
         ));
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

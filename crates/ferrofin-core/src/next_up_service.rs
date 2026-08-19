@@ -530,7 +530,10 @@ fn first_after(positions: &[EpisodePos], after: Option<(i64, i64)>) -> Option<Uu
 #[cfg(test)]
 mod tests {
     use super::FerrofinNextUpService;
-    use crate::test_support::{seed_episode, seed_user, seed_user_data, test_db};
+    use crate::test_support::{
+        clear_index_number, corrupt_last_played_date, seed_episode, seed_user, seed_user_data,
+        test_db,
+    };
     use chrono::{DateTime, Utc};
     use ferrofin_db::entities::users::UserEntity;
     use ferrofin_db::store::guid_to_db;
@@ -642,15 +645,6 @@ mod tests {
     }
 
     // ── Semantics pinned below: which episode is "next", and over which pool ──
-
-    /// Clears an episode's `IndexNumber`, so the position is only half-known.
-    async fn clear_index_number(db: &ferrofin_db::Database, id: Uuid) {
-        sqlx::query(r#"UPDATE "BaseItems" SET "IndexNumber" = NULL WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
-            .execute(db.writer())
-            .await
-            .expect("clear index number");
-    }
 
     /// Runs the batch with specials and rewatching off — the default shape.
     async fn batch_of(
@@ -1000,21 +994,11 @@ mod tests {
         );
     }
 
-    /// Overwrites a user-data row's `LastPlayedDate` with a value no timestamp
-    /// decoder accepts. `LastPlayedDate` is selected by exactly one query in the
-    /// batch path — the play-date projection the rewatching flag gates — so a
-    /// batch that still succeeds is proof that round-trip was never issued.
-    async fn corrupt_last_played_date(db: &ferrofin_db::Database, user: Uuid, item: Uuid) {
-        sqlx::query(
-            r#"UPDATE "UserData" SET "LastPlayedDate" = 'not-a-timestamp'
-               WHERE "UserId" = ?1 AND "ItemId" = ?2"#,
-        )
-        .bind(guid_to_db(user))
-        .bind(guid_to_db(item))
-        .execute(db.writer())
-        .await
-        .expect("corrupt last played date");
-    }
+    // `corrupt_last_played_date` (in `test_support`) is what the play-date gate
+    // below rests on: `LastPlayedDate` is selected by exactly one query in the
+    // batch path — the play-date projection the rewatching flag gates — so a
+    // batch that still succeeds against the corrupted column is proof that
+    // round-trip was never issued.
 
     /// Seeds `series-a` as watched through episode 2 with episode 1 re-watched
     /// most recently, so both rewatching fields have a real answer to report

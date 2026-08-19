@@ -1641,6 +1641,14 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             unimplemented!()
         }
+        async fn get_playlist_items_with_access(
+            &self,
+            _playlist_id: Uuid,
+            _user_id: Uuid,
+            _child_type: i32,
+        ) -> Result<ferrofin_traits::persistence::PlaylistItemsWithAccess, ServiceError> {
+            unimplemented!()
+        }
     }
 
     /// A minimal row of the given stored C# type name.

@@ -1986,7 +1986,10 @@ mod tests {
     use ferrofin_traits::drawing::ProcessedImage;
     use ferrofin_traits::dto::DtoService as _;
 
-    use crate::test_support::{seed_named_item, seed_user, test_db};
+    use crate::test_support::{
+        fetch_item, fetch_item_opt, image_info, seed_folder_item, seed_images, seed_named_item,
+        seed_provider_id, seed_user, test_db,
+    };
 
     // ---- Fakes for the injected siblings -------------------------------------
     //
@@ -2262,42 +2265,33 @@ mod tests {
     async fn folder_user_data_carries_unplayed_item_count() {
         let db = test_db().await;
         let folder_id = Uuid::new_v4();
-        seed_named_item(&db, folder_id, BaseItemKind::Season, "Season 1").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(folder_id))
-            .execute(db.writer())
-            .await
-            .expect("mark folder");
+        seed_folder_item(&db, folder_id, BaseItemKind::Season, "Season 1", None).await;
         let leaf_id = Uuid::new_v4();
         seed_named_item(&db, leaf_id, BaseItemKind::Movie, "A Movie").await;
         // A by-name row (Genre) stored IsFolder=1 but with no ancestor closure.
         let genre_id = Uuid::new_v4();
-        seed_named_item(&db, genre_id, BaseItemKind::Genre, "Drama").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(genre_id))
-            .execute(db.writer())
-            .await
-            .expect("mark by-name folder");
-        // Two MusicArtist rows: accessed-by-name (no parent — C# `IsFolder` false)
-        // and a physical artist folder (parented — C# `IsFolder` true).
+        seed_folder_item(&db, genre_id, BaseItemKind::Genre, "Drama", None).await;
+        // Two MusicArtist rows, both IsFolder=1: accessed-by-name (no parent —
+        // C# `IsFolder` false) and a physical artist folder (parented — C#
+        // `IsFolder` true).
         let byname_artist_id = Uuid::new_v4();
-        seed_named_item(&db, byname_artist_id, BaseItemKind::MusicArtist, "ByName").await;
-        let physical_artist_id = Uuid::new_v4();
-        seed_named_item(&db, physical_artist_id, BaseItemKind::MusicArtist, "OnDisk").await;
-        // One statement marks both artists IsFolder=1 and parents only the
-        // physical one (the by-name artist keeps a NULL ParentId).
-        sqlx::query(
-            r#"UPDATE "BaseItems"
-               SET "IsFolder" = 1,
-                   "ParentId" = CASE "Id" WHEN ?2 THEN ?3 ELSE "ParentId" END
-               WHERE "Id" IN (?1, ?2)"#,
+        seed_folder_item(
+            &db,
+            byname_artist_id,
+            BaseItemKind::MusicArtist,
+            "ByName",
+            None,
         )
-        .bind(guid_to_db(byname_artist_id))
-        .bind(guid_to_db(physical_artist_id))
-        .bind(guid_to_db(folder_id))
-        .execute(db.writer())
-        .await
-        .expect("mark artist folders");
+        .await;
+        let physical_artist_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            physical_artist_id,
+            BaseItemKind::MusicArtist,
+            "OnDisk",
+            Some(folder_id),
+        )
+        .await;
         let user = seed_user(&db, Uuid::new_v4()).await;
         let folder = fetch_item(&db, folder_id).await;
         let leaf = fetch_item(&db, leaf_id).await;
@@ -2991,38 +2985,6 @@ mod tests {
         service_with(db, Arc::new(FakeLibrary::default()))
     }
 
-    /// Seeds one image row on an item.
-    async fn seed_image(
-        db: &Database,
-        item_id: Uuid,
-        image_type: i32,
-        path: &str,
-        blur: Option<&str>,
-    ) {
-        sqlx::query(
-            r#"INSERT INTO "BaseItemImageInfos"
-               ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash")
-               VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)"#,
-        )
-        .bind(guid_to_db(Uuid::new_v4()))
-        .bind(guid_to_db(item_id))
-        .bind(image_type)
-        .bind(path)
-        .bind(blur.map(|b| b.as_bytes().to_vec()))
-        .execute(db.writer())
-        .await
-        .expect("insert image");
-    }
-
-    /// Reads back a full item row.
-    async fn fetch_item(db: &Database, id: Uuid) -> BaseItemEntity {
-        sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
-            .fetch_one(db.pool())
-            .await
-            .expect("fetch item")
-    }
-
     // Clients gate the chapter-thumbnail request on `ImageTag`; without it the
     // extracted images are never fetched, however well the extraction ran.
     #[tokio::test]
@@ -3239,14 +3201,7 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
-        sqlx::query(
-            r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
-               VALUES (?1, 'Imdb', 'tt1375666')"#,
-        )
-        .bind(guid_to_db(id))
-        .execute(db.writer())
-        .await
-        .unwrap();
+        seed_provider_id(&db, id, "Imdb", "tt1375666").await;
         let item = fetch_item(&db, id).await;
         let svc = service(db);
         let dto = svc
@@ -3276,15 +3231,13 @@ mod tests {
         let user_id = Uuid::new_v4();
         let user = seed_user(&db, user_id).await;
         seed_named_item(&db, id, BaseItemKind::Movie, "Twice").await;
-        seed_image(&db, id, 0, "/primary.jpg", Some("LKO2")).await;
-        sqlx::query(
-            r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
-               VALUES (?1, 'Imdb', 'tt1375666')"#,
+        seed_images(
+            &db,
+            id,
+            &[image_info(ImageType::Primary, "/primary.jpg", Some("LKO2"))],
         )
-        .bind(guid_to_db(id))
-        .execute(db.writer())
-        .await
-        .unwrap();
+        .await;
+        seed_provider_id(&db, id, "Imdb", "tt1375666").await;
         let item = fetch_item(&db, id).await;
         // Backs the chapter repository, so `chapters` is a populated map.
         let svc = service_with_chapters(db);
@@ -3442,8 +3395,15 @@ mod tests {
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
         // Primary (single) + backdrop (multiple) images, one with a blurhash.
-        seed_image(&db, id, 0, "/primary.jpg", Some("LKO2")).await;
-        seed_image(&db, id, 2, "/backdrop.jpg", None).await;
+        seed_images(
+            &db,
+            id,
+            &[
+                image_info(ImageType::Primary, "/primary.jpg", Some("LKO2")),
+                image_info(ImageType::Backdrop, "/backdrop.jpg", None),
+            ],
+        )
+        .await;
         let item = fetch_item(&db, id).await;
         let svc = service(db);
         let dto = svc
@@ -3498,7 +3458,12 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
-        seed_image(&db, id, 0, "/primary.jpg", None).await;
+        seed_images(
+            &db,
+            id,
+            &[image_info(ImageType::Primary, "/primary.jpg", None)],
+        )
+        .await;
         let svc = service(db);
         let ratio = svc.get_primary_image_aspect_ratio(id).await.unwrap();
         assert_eq!(ratio, Some(2.0));
@@ -3542,12 +3507,7 @@ mod tests {
     async fn child_count_attaches_to_folders_when_requested() {
         let db = test_db().await;
         let id = Uuid::new_v4();
-        seed_named_item(&db, id, BaseItemKind::Season, "Season 1").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
-            .execute(db.writer())
-            .await
-            .expect("mark folder");
+        seed_folder_item(&db, id, BaseItemKind::Season, "Season 1", None).await;
         let user = seed_user(&db, Uuid::new_v4()).await;
         let item = fetch_item(&db, id).await;
         let svc = service(db);
@@ -3599,12 +3559,7 @@ mod tests {
         // user views instead of a real count; the port derives a stable 1..=9.
         let db = test_db().await;
         let id = Uuid::new_v4();
-        seed_named_item(&db, id, BaseItemKind::CollectionFolder, "Shows").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "IsFolder" = 1 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
-            .execute(db.writer())
-            .await
-            .expect("mark folder");
+        seed_folder_item(&db, id, BaseItemKind::CollectionFolder, "Shows", None).await;
         let user = seed_user(&db, Uuid::new_v4()).await;
         let item = fetch_item(&db, id).await;
         let svc = service(db);
@@ -3657,11 +3612,7 @@ mod tests {
     #[async_trait]
     impl LibraryManager for DbBackedLibrary {
         async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-            sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(guid_to_db(id))
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)
+            Ok(fetch_item_opt(&self.db, id).await)
         }
         async fn get_item_images(
             &self,
