@@ -6,7 +6,7 @@
 //! never touches reuse the `test_support` panic fakes, catching a handler that
 //! strays.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -330,7 +330,15 @@ impl DtoService for OkDto {
 
 /// A [`LibraryManager`] backing the filters/filters2 facet routes; unused methods
 /// panic.
-struct StubLibrary;
+///
+/// It also **records** the [`InternalItemsQuery`] each facet call is handed. That
+/// query is the handler's own output (the facet lists it returns are canned), so
+/// asserting on it tests the code under test rather than the stub.
+#[derive(Default)]
+struct StubLibrary {
+    /// The last query passed to [`LibraryManager::get_genres`].
+    last_genre_query: Mutex<Option<InternalItemsQuery>>,
+}
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
@@ -349,8 +357,9 @@ impl LibraryManager for StubLibrary {
     }
     async fn get_genres(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        *self.last_genre_query.lock().expect("genre query lock") = Some(query.clone());
         Ok(QueryResult::new(
             Some(0),
             Some(1),
@@ -593,10 +602,10 @@ impl SearchManager for StubSearch {
     }
 }
 
-/// Builds an [`AppState`] wired with the filter stubs.
-fn state() -> AppState {
+/// Builds an [`AppState`] wired with the filter stubs around `library`.
+fn state_with(library: Arc<StubLibrary>) -> AppState {
     AppState::new(
-        Arc::new(StubLibrary),
+        library,
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -631,9 +640,10 @@ fn state() -> AppState {
     )
 }
 
-/// Drives one GET request through the router and returns (status, body bytes).
-async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state());
+/// Drives one GET request through a router built over `library`, returning
+/// (status, body bytes).
+async fn get_with(library: Arc<StubLibrary>, uri: &str) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state_with(library));
     let response = router
         .oneshot(
             Request::builder()
@@ -649,6 +659,11 @@ async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
         .await
         .expect("body");
     (status, bytes.to_vec())
+}
+
+/// [`get_with`] over a throwaway library stub.
+async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
+    get_with(Arc::new(StubLibrary::default()), uri).await
 }
 
 #[tokio::test]
@@ -693,4 +708,94 @@ async fn items_filters2_music_type_uses_music_genres() {
         filters.genres.first().and_then(|p| p.name.clone()),
         Some("Jazz".to_owned())
     );
+}
+
+#[tokio::test]
+async fn items_filters2_leaves_tags_empty() {
+    // Parity lock, not a gap: Jellyfin 10.11.8's `FilterController.GetQueryFilters`
+    // assigns only `filters.Genres`, so `Tags` stays at the `QueryFilters`
+    // constructor's `Array.Empty<string>()` and Filters2 always answers `"Tags": []`.
+    // Tags are the LEGACY `/Items/Filters` facet (asserted below). Populating them
+    // here would be a fabricated field, not a fix.
+    let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
+    assert_eq!(status, StatusCode::OK);
+    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+    assert!(
+        filters.tags.is_empty(),
+        "Filters2 must not invent a tag facet Jellyfin never populates: {:?}",
+        filters.tags
+    );
+    // ...while the legacy route does carry tags, so the assertion above is a real
+    // constraint on Filters2 and not just an empty stub bleeding through.
+    let (_, legacy_body) = get("/Items/Filters?includeItemTypes=Movie").await;
+    let legacy: QueryFiltersLegacy = serde_json::from_slice(&legacy_body).expect("legacy filters");
+    assert_eq!(legacy.tags, vec!["Cult".to_owned()]);
+}
+
+#[tokio::test]
+async fn items_filters2_non_recursive_still_scopes_to_the_parent() {
+    // `recursive=false` selects Jellyfin's `genreQuery.Parent = parentItem` branch
+    // (direct children) — and the `AncestorIds` branch anyway when the parent is a
+    // `UserView`/`ICollectionFolder`, which is what every client passes. Either way
+    // the aggregate stays scoped to the parent; dropping the parent id widened the
+    // facet out to the whole library.
+    let library = Arc::new(StubLibrary::default());
+    let parent = Uuid::from_u128(0xF00D);
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters2?includeItemTypes=Movie&parentId={parent}&recursive=false"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_genre_query
+        .lock()
+        .expect("genre query lock")
+        .clone()
+        .expect("get_genres called");
+    assert_eq!(
+        query.ancestor_ids,
+        vec![parent],
+        "recursive=false must still scope the genre aggregate to parentId"
+    );
+}
+
+#[tokio::test]
+async fn items_filters2_recursive_scopes_to_the_parent() {
+    let library = Arc::new(StubLibrary::default());
+    let parent = Uuid::from_u128(0xF00D);
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters2?includeItemTypes=Movie&parentId={parent}&recursive=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_genre_query
+        .lock()
+        .expect("genre query lock")
+        .clone()
+        .expect("get_genres called");
+    assert_eq!(query.ancestor_ids, vec![parent]);
+}
+
+#[tokio::test]
+async fn items_filters2_trailer_type_skips_the_parent() {
+    // C#: a lone Trailer/Program type set forces `parentItem = null`, so the
+    // ancestor scope stays empty even when the caller passes a parentId.
+    let library = Arc::new(StubLibrary::default());
+    let parent = Uuid::from_u128(0xF00D);
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters2?includeItemTypes=Trailer&parentId={parent}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_genre_query
+        .lock()
+        .expect("genre query lock")
+        .clone()
+        .expect("get_genres called");
+    assert!(query.ancestor_ids.is_empty());
 }

@@ -5,7 +5,10 @@
 //! - `GET /Items/Filters`  — the legacy flat-string facets ([`QueryFiltersLegacy`]:
 //!   genres, tags, official ratings, years) aggregated over a parent's items.
 //! - `GET /Items/Filters2` — the richer facets ([`QueryFilters`]: genre
-//!   name/id pairs plus tags) for a query.
+//!   name/id pairs) for a query. Its `Tags` array is **always empty**, exactly as
+//!   in Jellyfin: `FilterController.GetQueryFilters` assigns only `filters.Genres`
+//!   and leaves `Tags` at the `QueryFilters` constructor's `Array.Empty<string>()`.
+//!   Only the legacy `/Items/Filters` facet set carries tags.
 //!
 //! Both endpoints scope to an optional parent and honor the `includeItemTypes`
 //! restriction (a lone `Trailer`/`Program` type skips the parent lookup, exactly
@@ -127,7 +130,12 @@ struct FiltersQuery {
     #[serde(default)]
     is_series: Option<bool>,
     /// Whether to aggregate recursively (defaults `true`).
+    ///
+    /// Accepted for wire compatibility but not applied: it selects between
+    /// Jellyfin's two parent-scoping branches, and telling them apart needs the
+    /// un-ported domain tree (documented deferral — see [`get_query_filters`]).
     #[serde(default)]
+    #[allow(dead_code)]
     recursive: Option<bool>,
 }
 
@@ -147,7 +155,21 @@ fn is_music_type_set(types: &[BaseItemKind]) -> bool {
 /// `GET /Items/Filters2` — the richer genre filter facets.
 ///
 /// Port of `FilterController.GetQueryFilters`. The genre facet routes to the
-/// music-genre aggregate for a music-only type set.
+/// music-genre aggregate for a music-only type set. `Tags` is left empty — the
+/// C# controller assigns only `filters.Genres`.
+///
+/// A `parentId` always becomes an **ancestor** scope. Jellyfin picks between two
+/// branches — `genreQuery.AncestorIds = [parent]` when
+/// `(recursive ?? true) || parentItem is UserView || parentItem is ICollectionFolder`,
+/// else `genreQuery.Parent = parentItem` (direct children only) — and Ferrofin has
+/// no domain tree to tell a `UserView`/`ICollectionFolder` from a plain folder. So
+/// the ancestor branch is taken unconditionally: byte-identical to Jellyfin for
+/// every recursive request and for the `recursive=false` requests clients actually
+/// send (clients pass a library-view id, which *is* a `UserView`/`CollectionFolder`
+/// and so takes the ancestor branch there too), and a superset — the whole subtree
+/// instead of the direct children — only for `recursive=false` against a plain
+/// folder. What it must never be is *unscoped*: Jellyfin never widens a `parentId`
+/// request back out to the entire library.
 #[utoipa::path(
     get,
     path = "/Items/Filters2",
@@ -163,10 +185,10 @@ async fn get_query_filters(
     let include_item_types: Vec<BaseItemKind> =
         parse_csv_enums_lenient(query.include_item_types.as_deref());
 
-    // Trailer/Program skip the parent; otherwise the parent scopes the aggregate.
+    // Trailer/Program skip the parent; otherwise the parent scopes the aggregate
+    // (as an ancestor, regardless of `recursive` — see the doc comment).
     let mut ancestor_ids = Vec::new();
     if !is_trailer_or_program(&include_item_types)
-        && (query.recursive.unwrap_or(true))
         && let Some(parent) = query.parent_id
     {
         ancestor_ids.push(parent);
