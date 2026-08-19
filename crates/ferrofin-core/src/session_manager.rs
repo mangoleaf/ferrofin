@@ -157,8 +157,11 @@ struct OutboundMessage<'a> {
 /// The concrete session manager.
 ///
 /// Holds injected siblings and the in-memory session table. The table is an
-/// async [`Mutex`] because a broadcast holds it while `.await`ing sends to the
-/// sessions' WebSocket connections.
+/// async [`Mutex`] so the managers' `async fn`s can take it without blocking a
+/// runtime worker; it is **never** held across an `.await` on a client socket —
+/// [`FerrofinSessionManager::broadcast`] snapshots its targets and releases the
+/// guard before sending, so one stalled WebSocket client cannot stall session
+/// state for everyone else.
 #[derive(Clone)]
 pub struct FerrofinSessionManager {
     user_manager: Arc<dyn UserManager>,
@@ -307,6 +310,13 @@ impl FerrofinSessionManager {
 
     /// Records session activity, creating the session on first contact
     /// (C# `LogSessionActivity` → `GetSessionInfo`/`CreateSessionInfo`).
+    ///
+    /// Returns the session's wire [`SessionInfoDto`] rather than a clone of the
+    /// in-memory [`SessionInfo`]: this runs on every authenticated request and
+    /// every websocket token resolve, and the DTO (plus, on first contact, the
+    /// `SessionStarted` payload) is all any caller wants — cloning the whole
+    /// session (additional users, capabilities, connection handles, ~8 options)
+    /// only to project it was pure per-request garbage.
     async fn upsert_session(
         &self,
         app_name: &str,
@@ -315,7 +325,7 @@ impl FerrofinSessionManager {
         device_name: &str,
         remote_endpoint: &str,
         user: Option<&UserEntity>,
-    ) -> Result<SessionInfo, ServiceError> {
+    ) -> Result<SessionInfoDto, ServiceError> {
         if device_id.is_empty() {
             return Err(ServiceError::invalid_input("deviceId is required"));
         }
@@ -390,19 +400,19 @@ impl FerrofinSessionManager {
             session.additional_users.clear();
         }
 
-        let snapshot = session.clone();
+        // Project everything the callers need while the guard is still held, so
+        // no clone of the session itself escapes.
+        let dto = self.to_dto(session);
+        let started_payload = is_new.then(|| session_started_payload(session));
         drop(sessions);
 
-        if is_new {
+        if let Some(payload) = started_payload {
             // C# `OnSessionStarted` publishes `SessionStarted`; consumers are
             // registered on the injected event manager.
-            let _ = self
-                .event_manager
-                .publish("SessionStarted", &session_started_payload(&snapshot))
-                .await;
+            let _ = self.event_manager.publish("SessionStarted", &payload).await;
         }
 
-        Ok(snapshot)
+        Ok(dto)
     }
 
     /// Looks up a live session by its **session id** (not key), cloning a
@@ -437,7 +447,18 @@ impl FerrofinSessionManager {
     }
 
     /// Sends a pre-serialized message to a set of sessions, matching them with a
-    /// predicate over a snapshot. Holds the session lock across the sends.
+    /// predicate over a snapshot.
+    ///
+    /// The session lock is **never held across a send**: the matching sessions'
+    /// ids and open connection handles are snapshotted under the lock, the guard
+    /// is dropped, and only then are the frames pushed. Holding it across the
+    /// `.await` used to serialize every session operation (playback reports,
+    /// `upsert_session`, capability reports, websocket attach) behind the
+    /// slowest WebSocket client — one stalled socket blocked all session state.
+    ///
+    /// Delivery semantics are unchanged: the same sessions receive, in the same
+    /// order, and a session with no open direct connection still falls back to
+    /// the session bus.
     async fn broadcast<P>(
         &self,
         message_type: SessionMessageType,
@@ -448,26 +469,41 @@ impl FerrofinSessionManager {
         P: FnMut(&SessionInfo) -> bool,
     {
         let payload = envelope_bytes(message_type, data)?;
-        let sessions = self.sessions.lock().await;
-        for session in sessions.values().filter(|s| predicate(s)) {
-            let mut delivered = false;
-            for connection in &session.connections {
-                if !connection.is_open() {
-                    continue;
+        // (session id, its open connections) for every matching session, in the
+        // pool's iteration order — captured under the lock, sent without it.
+        let targets: Vec<(String, Vec<Arc<dyn WebSocketConnection>>)> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .filter(|s| predicate(s))
+                .map(|s| {
+                    let open: Vec<Arc<dyn WebSocketConnection>> = s
+                        .connections
+                        .iter()
+                        .filter(|c| c.is_open())
+                        .map(Arc::clone)
+                        .collect();
+                    (s.id.clone(), open)
+                })
+                .collect()
+        };
+
+        for (session_id, connections) in targets {
+            if connections.is_empty() {
+                // No direct connection — deliver over the session bus (the HTTP
+                // WebSocket handler's sink), so remote-control pushes reach
+                // clients connected through `/socket`.
+                if let Some(bus) = &self.bus
+                    && let Ok(text) = std::str::from_utf8(&payload)
+                {
+                    bus.send(&session_id, text.to_owned());
                 }
-                if let Err(err) = connection.send(&payload).await {
-                    error!(session_id = %session.id, %err, "failed to push message to session");
-                }
-                delivered = true;
+                continue;
             }
-            // No direct connection — deliver over the session bus (the HTTP
-            // WebSocket handler's sink), so remote-control pushes reach clients
-            // connected through `/socket`.
-            if !delivered
-                && let Some(bus) = &self.bus
-                && let Ok(text) = std::str::from_utf8(&payload)
-            {
-                bus.send(&session.id, text.to_owned());
+            for connection in &connections {
+                if let Err(err) = connection.send(&payload).await {
+                    error!(session_id = %session_id, %err, "failed to push message to session");
+                }
             }
         }
         Ok(())
@@ -538,17 +574,15 @@ impl SessionManager for FerrofinSessionManager {
         remote_endpoint: &str,
         user: &UserEntity,
     ) -> Result<SessionInfoDto, ServiceError> {
-        let session = self
-            .upsert_session(
-                app_name,
-                app_version,
-                device_id,
-                device_name,
-                remote_endpoint,
-                Some(user),
-            )
-            .await?;
-        Ok(self.to_dto(&session))
+        self.upsert_session(
+            app_name,
+            app_version,
+            device_id,
+            device_name,
+            remote_endpoint,
+            Some(user),
+        )
+        .await
     }
 
     async fn update_device_name(
@@ -1114,17 +1148,15 @@ impl SessionManager for FerrofinSessionManager {
             device.app_version.as_str()
         };
 
-        let session = self
-            .upsert_session(
-                &device.app_name,
-                app_version,
-                effective_device_id,
-                &device.device_name,
-                remote_endpoint,
-                user.as_ref(),
-            )
-            .await?;
-        Ok(self.to_dto(&session))
+        self.upsert_session(
+            &device.app_name,
+            app_version,
+            effective_device_id,
+            &device.device_name,
+            remote_endpoint,
+            user.as_ref(),
+        )
+        .await
     }
 
     async fn logout(&self, access_token: &str) -> Result<(), ServiceError> {
@@ -1286,7 +1318,7 @@ impl FerrofinSessionManager {
         };
         let created = self.device_manager.create_device(&new_device).await?;
 
-        let session = self
+        let mut dto = self
             .upsert_session(
                 app,
                 app_version,
@@ -1296,8 +1328,6 @@ impl FerrofinSessionManager {
                 Some(&user),
             )
             .await?;
-
-        let mut dto = self.to_dto(&session);
         dto.server_id = Some(self.server_id.clone());
         // The full `AuthenticationResult` envelope (UserDto + ServerId) is
         // assembled by the caller from this data; the freshly minted token
@@ -1307,7 +1337,10 @@ impl FerrofinSessionManager {
 
         let _ = self
             .event_manager
-            .publish("AuthenticationSucceeded", &session.id)
+            .publish(
+                "AuthenticationSucceeded",
+                dto.id.as_deref().unwrap_or_default(),
+            )
             .await;
         Ok(AuthenticationResultData {
             session: dto,
@@ -1433,5 +1466,618 @@ fn playback_event_payload(
     .to_string()
 }
 
+/// Tests for the **bus-fallback exclusivity** rule of [`FerrofinSessionManager::broadcast`]:
+/// a session that has a live direct [`WebSocketConnection`] must receive a broadcast
+/// **exactly once, over that connection only** — never additionally over the session bus.
+/// Duplicate delivery would double every remote-control command and SyncPlay message.
+///
+/// These live inline (rather than in `session_manager/tests.rs`) because they need their
+/// own fixtures: a fake connection whose `is_open()` is configurable, and a bus whose
+/// per-session deliveries are recorded.
+#[cfg(test)]
+mod bus_fallback_tests {
+    use std::sync::Mutex as StdMutex;
+
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::branding::BrandingOptions;
+    use ferrofin_model::configuration::ServerConfiguration;
+    use ferrofin_model::dto::BaseItemDto;
+    use ferrofin_traits::configuration::ServerConfigurationManager;
+    use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+    use ferrofin_traits::session_bus::SessionMessageBus;
+    use ferrofin_traits::system::ServerApplicationPaths;
+
+    use super::{
+        Arc, Database, DtoService, FerrofinSessionManager, ServiceError, SessionManager,
+        SessionMessageType, Uuid, WebSocketConnection, async_trait,
+    };
+    use crate::configuration_manager::default_server_configuration;
+    use crate::device_manager::FerrofinDeviceManager;
+    use crate::event_manager::FerrofinEventManager;
+    use crate::session_bus::FerrofinSessionMessageBus;
+    use crate::user_data_manager::FerrofinUserDataManager;
+    use crate::user_manager::FerrofinUserManager;
+
+    /// A configuration manager returning the factory defaults.
+    struct FixedConfig;
+
+    #[async_trait]
+    impl ServerConfigurationManager for FixedConfig {
+        fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
+            unreachable!("not used by broadcast")
+        }
+        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+            Ok(default_server_configuration())
+        }
+        async fn update_configuration(
+            &self,
+            _configuration: &ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
+            Ok(BrandingOptions::default())
+        }
+        async fn update_branding(&self, _branding: &BrandingOptions) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A DTO service the broadcast path never touches.
+    struct UnusedDtoService;
+
+    #[async_trait]
+    impl DtoService for UnusedDtoService {
+        async fn get_primary_image_aspect_ratio(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Option<f64>, ServiceError> {
+            unreachable!("dto service is not exercised by broadcast")
+        }
+        async fn get_base_item_dto(
+            &self,
+            _item: &BaseItemEntity,
+            _options: &DtoOptions,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
+            _owner_id: Option<Uuid>,
+        ) -> Result<BaseItemDto, ServiceError> {
+            unreachable!("dto service is not exercised by broadcast")
+        }
+        async fn get_base_item_dtos(
+            &self,
+            _items: &[BaseItemEntity],
+            _options: &DtoOptions,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
+            _owner_id: Option<Uuid>,
+            _skip_visibility_check: bool,
+        ) -> Result<Vec<BaseItemDto>, ServiceError> {
+            unreachable!("dto service is not exercised by broadcast")
+        }
+        async fn get_item_by_name_dto(
+            &self,
+            _item: &BaseItemEntity,
+            _options: &DtoOptions,
+            _tagged_item_ids: Option<&[Uuid]>,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
+        ) -> Result<BaseItemDto, ServiceError> {
+            unreachable!("dto service is not exercised by broadcast")
+        }
+    }
+
+    /// A fake connection recording every frame pushed to it, with a fixed
+    /// `is_open()` answer so the "connection reports closed" path is reachable.
+    struct FakeConnection {
+        auth: AuthorizationInfo,
+        open: bool,
+        sent: StdMutex<Vec<Vec<u8>>>,
+    }
+
+    impl FakeConnection {
+        fn new(open: bool) -> Arc<Self> {
+            Arc::new(Self {
+                auth: AuthorizationInfo::default(),
+                open,
+                sent: StdMutex::new(Vec::new()),
+            })
+        }
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().expect("fake connection mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl WebSocketConnection for FakeConnection {
+        fn remote_endpoint(&self) -> Option<&str> {
+            None
+        }
+        fn authorization_info(&self) -> &AuthorizationInfo {
+            &self.auth
+        }
+        fn is_open(&self) -> bool {
+            self.open
+        }
+        async fn send(&self, message: &[u8]) -> Result<(), ServiceError> {
+            self.sent
+                .lock()
+                .expect("fake connection mutex")
+                .push(message.to_vec());
+            Ok(())
+        }
+        async fn apply_request_culture(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// Every `(session_id, message)` pair the bus delivered, in order.
+    type BusLog = Arc<StdMutex<Vec<(String, String)>>>;
+
+    /// Builds a session manager over `db` wired to `bus`.
+    fn manager_with_bus(
+        db: &Database,
+        bus: &Arc<FerrofinSessionMessageBus>,
+    ) -> FerrofinSessionManager {
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig);
+        FerrofinSessionManager::new(
+            Arc::new(FerrofinUserManager::new(db.clone())),
+            Arc::new(FerrofinDeviceManager::new(db.clone())),
+            Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+            crate::test_support::library_manager_over(db.clone()),
+            Arc::new(UnusedDtoService),
+            Arc::new(FerrofinEventManager::new()),
+            db.clone(),
+            "server-1",
+        )
+        .with_session_bus(
+            Arc::clone(bus) as Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>
+        )
+    }
+
+    /// Registers a bus sink for `session_id` that appends to `log`.
+    fn register_sink(bus: &FerrofinSessionMessageBus, session_id: &str, log: &BusLog) {
+        let id = session_id.to_owned();
+        let log = Arc::clone(log);
+        bus.register(
+            session_id.to_owned(),
+            Box::new(move |msg| {
+                log.lock()
+                    .expect("bus log mutex")
+                    .push((id.clone(), msg.clone()));
+            }),
+        );
+    }
+
+    /// The three delivery regimes in one broadcast, all for the same user and all
+    /// with a bus sink registered:
+    ///
+    /// - **open direct connection** → the frame lands on the connection exactly once
+    ///   and **nothing** reaches the bus for that session (the exclusivity rule);
+    /// - **no connection at all** → exactly one bus delivery;
+    /// - **connection reporting `is_open() == false`** → nothing on the connection,
+    ///   exactly one bus delivery (a dead socket must not swallow the message).
+    #[tokio::test]
+    async fn open_connection_suppresses_the_bus_fallback() {
+        let db = crate::test_support::test_db().await;
+        let bus = Arc::new(FerrofinSessionMessageBus::new());
+        let mgr = manager_with_bus(&db, &bus);
+
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user(&db, user_id).await;
+
+        // Three sessions of the same user, one per regime.
+        let direct = mgr
+            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", &user)
+            .await
+            .expect("direct session")
+            .id
+            .expect("direct session id");
+        let busonly = mgr
+            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", &user)
+            .await
+            .expect("bus session")
+            .id
+            .expect("bus session id");
+        let stale = mgr
+            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", &user)
+            .await
+            .expect("stale session")
+            .id
+            .expect("stale session id");
+
+        let open_conn = FakeConnection::new(true);
+        mgr.add_web_socket(
+            &direct,
+            Arc::clone(&open_conn) as Arc<dyn WebSocketConnection>,
+        )
+        .await
+        .expect("attach open connection");
+        let closed_conn = FakeConnection::new(false);
+        mgr.add_web_socket(
+            &stale,
+            Arc::clone(&closed_conn) as Arc<dyn WebSocketConnection>,
+        )
+        .await
+        .expect("attach closed connection");
+
+        // Every session — including the directly connected one — has a bus sink,
+        // so a bus delivery to it is possible and only the exclusivity rule
+        // prevents it.
+        let log: BusLog = Arc::new(StdMutex::new(Vec::new()));
+        for id in [&direct, &busonly, &stale] {
+            register_sink(&bus, id, &log);
+        }
+
+        mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+            .await
+            .expect("broadcast");
+
+        // 1. The open direct connection got the payload exactly once …
+        let frames = open_conn.frames();
+        assert_eq!(
+            frames.len(),
+            1,
+            "session with an open connection must receive exactly one direct frame"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&frames[0]).expect("frame is a JSON envelope");
+        assert_eq!(envelope["MessageType"], "RestartRequired");
+
+        // 2. … and the closed connection got nothing.
+        assert!(
+            closed_conn.frames().is_empty(),
+            "a connection reporting is_open() == false must not be written to"
+        );
+
+        // 3. Bus deliveries: exactly one each for the bus-only and stale sessions,
+        //    and NONE for the directly connected one.
+        let delivered = log.lock().expect("bus log mutex").clone();
+        let for_direct: Vec<_> = delivered.iter().filter(|(id, _)| id == &direct).collect();
+        assert!(
+            for_direct.is_empty(),
+            "a session with an open direct connection must NEVER also receive the \
+             message over the bus (duplicate delivery); got {for_direct:?}"
+        );
+        assert_eq!(
+            delivered.iter().filter(|(id, _)| id == &busonly).count(),
+            1,
+            "a session with no connection must fall back to the bus exactly once"
+        );
+        assert_eq!(
+            delivered.iter().filter(|(id, _)| id == &stale).count(),
+            1,
+            "a session whose connection is closed must take the bus path exactly once"
+        );
+        assert_eq!(
+            delivered.len(),
+            2,
+            "exactly two of the three sessions may use the bus: {delivered:?}"
+        );
+
+        // The bus payload is the same envelope the direct path sends.
+        let (_, bus_text) = delivered
+            .iter()
+            .find(|(id, _)| id == &busonly)
+            .expect("bus delivery for the connection-less session");
+        let bus_envelope: serde_json::Value =
+            serde_json::from_str(bus_text).expect("bus payload is a JSON envelope");
+        assert_eq!(bus_envelope["MessageType"], "RestartRequired");
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod broadcast_lock_tests {
+    //! Lock-discipline tests for [`FerrofinSessionManager::broadcast`].
+    //!
+    //! The rest of the session-manager tests live in `session_manager/tests.rs`;
+    //! these need a WebSocket connection whose `send` *parks*, which is what
+    //! distinguishes "the lock is held across the await" from "it isn't", so they
+    //! carry their own fixtures.
+
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use ferrofin_db::Database;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_db::entities::users::UserEntity;
+    use ferrofin_model::configuration::ServerConfiguration;
+    use ferrofin_model::dto::BaseItemDto;
+    use ferrofin_model::session::SessionMessageType;
+    use tokio::sync::{Semaphore, mpsc};
+    use tokio::time::timeout;
+    use uuid::Uuid;
+
+    use ferrofin_traits::configuration::ServerConfigurationManager;
+    use ferrofin_traits::dto::DtoService;
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::net::WebSocketConnection;
+    use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+    use ferrofin_traits::session::SessionManager;
+    use ferrofin_traits::session_bus::SessionMessageBus;
+    use ferrofin_traits::system::ServerApplicationPaths;
+
+    use super::FerrofinSessionManager;
+    use crate::configuration_manager::default_server_configuration;
+    use crate::device_manager::FerrofinDeviceManager;
+    use crate::event_manager::FerrofinEventManager;
+    use crate::user_data_manager::FerrofinUserDataManager;
+    use crate::user_manager::FerrofinUserManager;
+
+    /// The wall-clock budget a "must still make progress" assertion gets. Under
+    /// the pre-fix code the operation deadlocks, so any finite budget fails the
+    /// test; this one is only generous enough not to flake on a loaded CI box.
+    const PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// A config manager returning the factory-default configuration.
+    struct FixedConfig;
+
+    #[async_trait]
+    impl ServerConfigurationManager for FixedConfig {
+        fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
+            unreachable!("not used in these tests")
+        }
+        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+            Ok(default_server_configuration())
+        }
+        async fn update_configuration(
+            &self,
+            _configuration: &ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _branding: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A DTO service the tested paths never invoke.
+    struct UnusedDtoService;
+
+    #[async_trait]
+    impl DtoService for UnusedDtoService {
+        async fn get_primary_image_aspect_ratio(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Option<f64>, ServiceError> {
+            unreachable!("dto service is not exercised by these tests")
+        }
+        async fn get_base_item_dto(
+            &self,
+            _item: &BaseItemEntity,
+            _options: &DtoOptions,
+            _user: Option<&UserEntity>,
+            _owner_id: Option<Uuid>,
+        ) -> Result<BaseItemDto, ServiceError> {
+            unreachable!("dto service is not exercised by these tests")
+        }
+        async fn get_base_item_dtos(
+            &self,
+            _items: &[BaseItemEntity],
+            _options: &DtoOptions,
+            _user: Option<&UserEntity>,
+            _owner_id: Option<Uuid>,
+            _skip_visibility_check: bool,
+        ) -> Result<Vec<BaseItemDto>, ServiceError> {
+            unreachable!("dto service is not exercised by these tests")
+        }
+        async fn get_item_by_name_dto(
+            &self,
+            _item: &BaseItemEntity,
+            _options: &DtoOptions,
+            _tagged_item_ids: Option<&[Uuid]>,
+            _user: Option<&UserEntity>,
+        ) -> Result<BaseItemDto, ServiceError> {
+            unreachable!("dto service is not exercised by these tests")
+        }
+    }
+
+    /// A connection that stands in for a slow/stalled WebSocket client: `send`
+    /// announces that it was entered, then parks on `gate` until the test opens
+    /// it. This is the shape a real client that stops reading its socket takes.
+    struct GatedConnection {
+        auth: AuthorizationInfo,
+        open: bool,
+        entered: mpsc::UnboundedSender<()>,
+        gate: Arc<Semaphore>,
+        sent: StdMutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl WebSocketConnection for GatedConnection {
+        fn remote_endpoint(&self) -> Option<&str> {
+            None
+        }
+        fn authorization_info(&self) -> &AuthorizationInfo {
+            &self.auth
+        }
+        fn is_open(&self) -> bool {
+            self.open
+        }
+        async fn send(&self, message: &[u8]) -> Result<(), ServiceError> {
+            let _ = self.entered.send(());
+            let _permit = self.gate.acquire().await.expect("gate is not closed");
+            self.sent
+                .lock()
+                .expect("sent frames")
+                .push(message.to_vec());
+            Ok(())
+        }
+        async fn apply_request_culture(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// Builds a session manager over `db` with the real sibling managers.
+    fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
+        Arc::new(FerrofinSessionManager::new(
+            Arc::new(FerrofinUserManager::new(db.clone())),
+            Arc::new(FerrofinDeviceManager::new(db.clone())),
+            Arc::new(FerrofinUserDataManager::new(
+                db.clone(),
+                Arc::new(FixedConfig),
+            )),
+            crate::test_support::library_manager_over(db.clone()),
+            Arc::new(UnusedDtoService),
+            Arc::new(FerrofinEventManager::new()),
+            db.clone(),
+            "server-1".to_owned(),
+        ))
+    }
+
+    /// A broadcast must not wedge the session table while one client is slow to
+    /// accept its frame.
+    ///
+    /// Before the fix, `broadcast` held the `sessions` mutex across
+    /// `connection.send(..).await`, so a single stalled WebSocket client froze
+    /// **every** session operation — playback start/progress/stop, session
+    /// upsert on each authenticated request, capability reports, socket attach.
+    /// With the guard released before the sends, the stalled client delays only
+    /// its own frame.
+    #[tokio::test]
+    async fn broadcast_does_not_hold_the_session_lock_across_a_socket_send() {
+        let db = crate::test_support::test_db().await;
+        let mgr = manager(&db);
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user(&db, user_id).await;
+
+        let stalled = mgr
+            .log_session_activity("Stalled Client", "1.0", "dev-stalled", "TV", "e", &user)
+            .await
+            .expect("session created");
+        let stalled_id = stalled.id.clone().expect("session id");
+
+        let gate = Arc::new(Semaphore::new(0));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let conn = Arc::new(GatedConnection {
+            auth: AuthorizationInfo::default(),
+            open: true,
+            entered: entered_tx,
+            gate: Arc::clone(&gate),
+            sent: StdMutex::new(Vec::new()),
+        });
+        mgr.add_web_socket(
+            &stalled_id,
+            Arc::clone(&conn) as Arc<dyn WebSocketConnection>,
+        )
+        .await
+        .expect("socket attached");
+
+        // Push a message; it parks inside the stalled client's `send`.
+        let broadcaster = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.send_message_to_user_sessions(
+                    &[user_id],
+                    SessionMessageType::RestartRequired,
+                    "",
+                )
+                .await
+            })
+        };
+
+        // Wait until the send is genuinely in flight — this is precisely the
+        // point at which the old code was still holding the session lock.
+        timeout(PROGRESS_TIMEOUT, entered_rx.recv())
+            .await
+            .expect("the stalled client's send was entered")
+            .expect("entered signal");
+
+        // …and now every other session operation must still complete.
+        timeout(PROGRESS_TIMEOUT, async {
+            assert!(!mgr.has_active_playback().await.expect("playback probe"));
+            let other = mgr
+                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", &user)
+                .await
+                .expect("second session created");
+            assert_ne!(other.id, stalled.id);
+            let listed = mgr
+                .get_sessions(Uuid::nil(), None, None, None, true)
+                .await
+                .expect("sessions listed");
+            assert_eq!(listed.len(), 2);
+        })
+        .await
+        .expect("session operations proceed while one client's socket is stalled");
+
+        // Releasing the client completes the delivery — the frame is not lost.
+        gate.add_permits(1);
+        broadcaster
+            .await
+            .expect("broadcast task joins")
+            .expect("broadcast succeeds");
+        let frames = conn.sent.lock().expect("sent frames");
+        assert_eq!(frames.len(), 1);
+        let frame: serde_json::Value = serde_json::from_slice(&frames[0]).expect("frame is JSON");
+        assert_eq!(frame["MessageType"], "RestartRequired");
+    }
+
+    /// Delivery parity: a session whose only direct connection is **closed**
+    /// counts as having no direct connection, so the message falls back to the
+    /// session bus (and the closed socket is not written to).
+    #[tokio::test]
+    async fn a_closed_direct_connection_falls_back_to_the_bus() {
+        let db = crate::test_support::test_db().await;
+        let bus: Arc<dyn SessionMessageBus> = Arc::new(crate::FerrofinSessionMessageBus::new());
+        let mgr = Arc::new(
+            manager(&db)
+                .as_ref()
+                .clone()
+                .with_session_bus(Arc::clone(&bus)),
+        );
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user(&db, user_id).await;
+        let session = mgr
+            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", &user)
+            .await
+            .expect("session created");
+        let session_id = session.id.clone().expect("session id");
+
+        // A stale (closed) controller is still attached to the session.
+        let (entered_tx, _entered_rx) = mpsc::unbounded_channel();
+        let closed = Arc::new(GatedConnection {
+            auth: AuthorizationInfo::default(),
+            open: false,
+            entered: entered_tx,
+            gate: Arc::new(Semaphore::new(16)),
+            sent: StdMutex::new(Vec::new()),
+        });
+        mgr.add_web_socket(
+            &session_id,
+            Arc::clone(&closed) as Arc<dyn WebSocketConnection>,
+        )
+        .await
+        .expect("socket attached");
+
+        let received = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&received);
+        bus.register(
+            session_id.clone(),
+            Box::new(move |msg| sink.lock().expect("bus messages").push(msg)),
+        );
+
+        mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+            .await
+            .expect("broadcast succeeds");
+
+        assert!(
+            closed.sent.lock().expect("sent frames").is_empty(),
+            "a closed connection is never written to"
+        );
+        let messages = received.lock().expect("bus messages");
+        assert_eq!(messages.len(), 1);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&messages[0]).expect("envelope is JSON");
+        assert_eq!(envelope["MessageType"], "RestartRequired");
+    }
+}
