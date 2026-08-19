@@ -266,9 +266,13 @@ async fn update_display_preferences(
     prefs.skip_forward_length = take_pref(&mut dto.custom_prefs, "skipForwardLength")
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(DEFAULT_SKIP_LENGTH_MS);
-    prefs.dashboard_theme =
-        Some(take_pref(&mut dto.custom_prefs, "dashboardTheme").unwrap_or_default());
-    prefs.tv_home = Some(take_pref(&mut dto.custom_prefs, "tvhome").unwrap_or_default());
+    // C# `TryGetValue(key, out var v) ? v : string.Empty` over a
+    // `Dictionary<string, string?>`: an absent key stores the empty string, but a
+    // key present with an explicit JSON `null` stores null — and the GET path
+    // hands that null straight back (see above), so the distinction is
+    // client-visible.
+    prefs.dashboard_theme = take_nullable_pref(&mut dto.custom_prefs, "dashboardTheme");
+    prefs.tv_home = take_nullable_pref(&mut dto.custom_prefs, "tvhome");
 
     // Drop the home-section and landing keys: home-section persistence is
     // deferred with the flat display-preferences seam (see the module docs).
@@ -302,6 +306,13 @@ async fn update_display_preferences(
 /// Removes a custom-preference key, returning its value if present + non-null.
 fn take_pref(prefs: &mut HashMap<String, Option<String>>, key: &str) -> Option<String> {
     prefs.remove(key).flatten()
+}
+
+/// Removes a custom-preference key whose stored column is nullable, preserving
+/// the present-but-null case: absent ⇒ `Some("")`, present-and-null ⇒ `None`,
+/// present ⇒ the value (C# `TryGetValue(…, out var v) ? v : string.Empty`).
+fn take_nullable_pref(prefs: &mut HashMap<String, Option<String>>, key: &str) -> Option<String> {
+    prefs.remove(key).unwrap_or_else(|| Some(String::new()))
 }
 
 /// The `ChromecastVersion` display name for a stored discriminant.

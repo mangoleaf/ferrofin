@@ -483,3 +483,161 @@ async fn display_preferences_post_parses_scalars_back() {
     assert!(!custom.contains_key("chromecastVersion"));
     assert!(!custom.contains_key("homesection0"));
 }
+
+/// A display-preferences manager that actually round-trips: `get` returns the
+/// last row `update` saved (falling back to the canned row), so a POST→GET test
+/// observes the write path rather than a canned answer.
+#[derive(Default)]
+struct RoundTripDisplayPreferences {
+    row: Mutex<Option<DisplayPreferencesEntity>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::configuration::DisplayPreferencesManager for RoundTripDisplayPreferences {
+    async fn get_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<DisplayPreferencesEntity, ServiceError> {
+        Ok(self
+            .row
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(canned_prefs))
+    }
+    async fn get_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
+        Ok(canned_item_prefs())
+    }
+    async fn list_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _client: &str,
+    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
+        Ok(vec![canned_item_prefs()])
+    }
+    async fn list_custom_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+    ) -> Result<std::collections::HashMap<String, Option<String>>, ServiceError> {
+        Ok(std::collections::HashMap::new())
+    }
+    async fn set_custom_item_display_preferences(
+        &self,
+        _user_id: Uuid,
+        _item_id: Uuid,
+        _client: &str,
+        _custom_preferences: &std::collections::HashMap<String, Option<String>>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn update_display_preferences(
+        &self,
+        display_preferences: &DisplayPreferencesEntity,
+    ) -> Result<(), ServiceError> {
+        *self.row.lock().unwrap() = Some(display_preferences.clone());
+        Ok(())
+    }
+    async fn update_item_display_preferences(
+        &self,
+        _item_display_preferences: &ItemDisplayPreferencesEntity,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// POSTs `body` then GETs, against one round-tripping manager; returns the GET
+/// body as JSON plus the saved row.
+async fn round_trip(body: &'static str) -> (serde_json::Value, DisplayPreferencesEntity) {
+    let prefs = Arc::new(RoundTripDisplayPreferences::default());
+    let (status, _) = send(
+        state_with_display_prefs(prefs.clone()),
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(body),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, get_body) = get(
+        state_with_display_prefs(prefs.clone()),
+        "/DisplayPreferences/home?client=web",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let saved = prefs.row.lock().unwrap().clone().expect("row was saved");
+    (json(&get_body), saved)
+}
+
+/// An explicit JSON `null` for `dashboardTheme`/`tvhome` must survive the POST →
+/// GET round trip as `null`, not be flattened into `""`. Upstream stores the
+/// dictionary's null verbatim (`TryGetValue(…, out var theme) ? theme : …` over
+/// a `Dictionary<string, string?>`, `DisplayPreferences.DashboardTheme` being
+/// `string?`), and the GET path hands the stored value back unchanged.
+#[tokio::test]
+async fn display_preferences_round_trip_preserves_explicit_null() {
+    let (v, saved) = round_trip(
+        r#"{
+            "CustomPrefs": { "dashboardTheme": null, "tvhome": null },
+            "ScrollDirection": "Horizontal",
+            "SortOrder": "Ascending",
+            "ShowBackdrop": false,
+            "ShowSidebar": true,
+            "RememberIndexing": false,
+            "RememberSorting": true,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250
+        }"#,
+    )
+    .await;
+
+    // The stored column stays NULL...
+    assert_eq!(saved.dashboard_theme, None);
+    assert_eq!(saved.tv_home, None);
+
+    // ...and — the client-visible half — serializes as JSON `null`. Index-only
+    // assertions would also pass for a *missing* key, so require the key first.
+    let custom = v["CustomPrefs"].as_object().expect("CustomPrefs object");
+    assert!(custom.contains_key("dashboardTheme"));
+    assert!(custom.contains_key("tvhome"));
+    assert_eq!(custom["dashboardTheme"], serde_json::Value::Null);
+    assert_eq!(custom["tvhome"], serde_json::Value::Null);
+    assert_ne!(custom["dashboardTheme"], serde_json::json!(""));
+    assert_ne!(custom["tvhome"], serde_json::json!(""));
+}
+
+/// The *absent* key is the opposite case and must NOT become null: upstream's
+/// `TryGetValue(…) ? theme : string.Empty` stores the empty string when the
+/// client omits the key, so the round trip yields `""`. Pinned so the null fix
+/// above is not over-applied to absence.
+#[tokio::test]
+async fn display_preferences_round_trip_absent_key_is_empty_string() {
+    let (v, saved) = round_trip(
+        r#"{
+            "CustomPrefs": { "keepMe": "yes" },
+            "ScrollDirection": "Horizontal",
+            "SortOrder": "Ascending",
+            "ShowBackdrop": false,
+            "ShowSidebar": true,
+            "RememberIndexing": false,
+            "RememberSorting": true,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250
+        }"#,
+    )
+    .await;
+
+    assert_eq!(saved.dashboard_theme.as_deref(), Some(""));
+    assert_eq!(saved.tv_home.as_deref(), Some(""));
+    assert_eq!(v["CustomPrefs"]["dashboardTheme"], serde_json::json!(""));
+    assert_eq!(v["CustomPrefs"]["tvhome"], serde_json::json!(""));
+}
