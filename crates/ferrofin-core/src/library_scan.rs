@@ -3799,7 +3799,6 @@ impl LibraryScanner {
         self.plan_music_album(dir, cf, naming, out);
     }
 
-
     /// Persists an item's probed chapter markers, when there are any and a
     /// chapter repository is wired.
     async fn save_chapters(
