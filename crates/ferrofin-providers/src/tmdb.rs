@@ -1227,6 +1227,80 @@ mod tests {
     // GuestStar), then the wanted crew — the shape upstream's
     // TmdbEpisodeProvider produces.
     #[tokio::test]
+    async fn collection_search_and_details_map_the_box_set_shape() {
+        let search = r#"{"results":[
+            {"id":2344,"name":"The Matrix Collection","poster_path":"/c.jpg","overview":"Neo."},
+            {"id":9,"name":"Other","poster_path":null,"overview":""}
+        ]}"#;
+        let collection = r#"{"id":2344,"name":"The Matrix Collection","overview":"Neo.",
+            "poster_path":"/pick.jpg","backdrop_path":"/back.jpg",
+            "images":{"posters":[{"file_path":"/alt.jpg"}],
+                      "backdrops":[{"file_path":"/alt-back.jpg"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/search/collection", search.to_owned()),
+            ("/collection/", collection.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let hits = client.search_collection("Matrix").await;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].tmdb_id, 2344);
+        assert_eq!(
+            hits[0].poster_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/c.jpg")
+        );
+        // An empty poster path / overview is `None`, not an empty string.
+        assert_eq!(hits[1].poster_url, None);
+        assert_eq!(hits[1].overview, None);
+
+        let details = client.collection(2344).await.expect("collection");
+        assert_eq!(details.name, "The Matrix Collection");
+        assert_eq!(details.overview.as_deref(), Some("Neo."));
+        // TMDB's own pick first, then the rest of each list.
+        let urls: Vec<&str> = details.images.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://image.tmdb.org/t/p/original/pick.jpg",
+                "https://image.tmdb.org/t/p/original/back.jpg",
+                "https://image.tmdb.org/t/p/original/alt.jpg",
+                "https://image.tmdb.org/t/p/original/alt-back.jpg",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_collection_search_term_makes_no_request() {
+        let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
+        assert!(client.search_collection("  ").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn similar_pages_yield_their_ids_and_page_count() {
+        let body = r#"{"page":1,"total_pages":3,"results":[{"id":603},{"id":604}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![("/similar", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (ids, total) = client.similar_page(TmdbKind::Movie, 27205, 1).await;
+        assert_eq!(ids, [603, 604]);
+        assert_eq!(total, 3);
+        // The TV path is the same shape.
+        let (ids, _) = client.similar_page(TmdbKind::Series, 1396, 1).await;
+        assert_eq!(ids, [603, 604]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_similar_request_yields_no_ids() {
+        // Nothing listening: the client must degrade, not error.
+        let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
+        assert_eq!(
+            client.similar_page(TmdbKind::Movie, 1, 1).await,
+            (vec![], 0)
+        );
+        assert!(client.collection(1).await.is_none());
+    }
+
+    #[tokio::test]
     async fn episode_credits_map_cast_guests_and_crew() {
         use crate::mock_http::MockServer;
 

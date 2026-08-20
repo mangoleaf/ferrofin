@@ -764,6 +764,165 @@ mod tests {
         assert_eq!(opf_identifier_key(" AMAZON "), Some("Amazon"));
     }
 
+    /// Writes a zip archive of `(name, bytes)` entries, optionally with an
+    /// archive comment, and returns its path.
+    fn write_archive(
+        dir: &tempfile::TempDir,
+        name: &str,
+        entries: &[(&str, &[u8])],
+        comment: Option<&str>,
+    ) -> String {
+        use std::io::Write as _;
+        let path = dir.path().join(name);
+        let file = std::fs::File::create(&path).expect("create archive");
+        let mut writer = zip::ZipWriter::new(file);
+        if let Some(comment) = comment {
+            writer.set_comment(comment).expect("set comment");
+        }
+        for (entry, bytes) in entries {
+            writer
+                .start_file(*entry, zip::write::SimpleFileOptions::default())
+                .expect("start entry");
+            writer.write_all(bytes).expect("write entry");
+        }
+        writer.finish().expect("finish archive");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_cbz_is_read_from_its_internal_comic_info() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "batman.cbz",
+            &[
+                (
+                    "ComicInfo.xml",
+                    b"<ComicInfo><Title>The Killing Joke</Title><Number>1</Number></ComicInfo>",
+                ),
+                ("002.jpg", b"second page"),
+                ("001.jpg", b"first page"),
+            ],
+            None,
+        );
+        let book = read_book_metadata(&path).expect("metadata");
+        assert_eq!(book.name.as_deref(), Some("The Killing Joke"));
+        assert_eq!(book.index_number, Some(1));
+
+        // The cover is the first page in name order, not archive order.
+        let (name, bytes) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "001.jpg");
+        assert_eq!(bytes, b"first page");
+    }
+
+    #[test]
+    fn a_cbz_falls_back_to_a_sidecar_then_to_the_archive_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // No internal ComicInfo, but a sidecar next to it.
+        let path = write_archive(&dir, "a.cbz", &[("001.jpg", b"page")], None);
+        std::fs::write(
+            dir.path().join("ComicInfo.xml"),
+            "<ComicInfo><Title>From the sidecar</Title></ComicInfo>",
+        )
+        .expect("write sidecar");
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            Some("From the sidecar")
+        );
+
+        // A different directory, with only the archive comment.
+        let other = tempfile::tempdir().expect("tempdir");
+        let commented = write_archive(
+            &other,
+            "b.cbz",
+            &[("001.jpg", b"page")],
+            Some(r#"{"ComicBookInfo/1.0":{"title":"From the comment"}}"#),
+        );
+        assert_eq!(
+            read_book_metadata(&commented)
+                .and_then(|b| b.name)
+                .as_deref(),
+            Some("From the comment")
+        );
+    }
+
+    #[test]
+    fn a_comic_with_no_metadata_anywhere_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(&dir, "bare.cbz", &[("001.jpg", b"page")], None);
+        assert!(read_book_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn an_epub_is_read_through_its_container_and_opf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "dune.epub",
+            &[
+                (
+                    "META-INF/container.xml",
+                    br#"<container><rootfiles>
+                          <rootfile full-path="OEBPS/content.opf"/>
+                        </rootfiles></container>"#,
+                ),
+                (
+                    "OEBPS/content.opf",
+                    br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                          <metadata>
+                            <dc:title>Dune</dc:title>
+                            <meta name="cover" content="cover-image"/>
+                          </metadata>
+                          <manifest><item id="cover-image" href="cover.jpg"/></manifest>
+                        </package>"#,
+                ),
+                ("OEBPS/cover.jpg", b"cover bytes"),
+            ],
+            None,
+        );
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            Some("Dune")
+        );
+        let (name, bytes) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "cover.jpg");
+        assert_eq!(bytes, b"cover bytes");
+    }
+
+    #[test]
+    fn an_unreadable_archive_format_yields_nothing() {
+        // .cbr is RAR: recognized as a comic, but nothing is extracted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x.cbr");
+        std::fs::write(&path, b"Rar!\x1a\x07\x00").expect("write");
+        let path = path.to_string_lossy().into_owned();
+        assert!(read_book_metadata(&path).is_none());
+        assert!(read_book_cover(&path).is_none());
+    }
+
+    #[test]
+    fn a_book_with_an_opf_sidecar_is_read_from_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("dune.mobi"), b"book").expect("write");
+        std::fs::write(
+            dir.path().join("dune.opf"),
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>Dune</dc:title></metadata></package>"#,
+        )
+        .expect("write opf");
+        let path = dir.path().join("dune.mobi").to_string_lossy().into_owned();
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            Some("Dune")
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_never_an_error() {
+        assert!(read_book_metadata("/nope/missing.cbz").is_none());
+        assert!(read_book_cover("/nope/missing.epub").is_none());
+    }
+
     #[test]
     fn extensions_are_read_case_insensitively() {
         assert_eq!(extension_of("/b/Book.EPUB"), "epub");

@@ -249,8 +249,9 @@ classified as accepted divergences. Working end-to-end: authentication/users/Qui
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 17 scheduled tasks,
-metrics/tracing, trickplay/chapters/lyrics/media segments, and backup/restore. See
-`docs/FEATURES.md` for the tiered status matrix.
+metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
+(EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
+status matrix.
 
 The real remaining gaps are **by design**, not un-ported routes:
 - **.NET-style native plugin loading** — never (no stable Rust ABI, and full-trust loading is

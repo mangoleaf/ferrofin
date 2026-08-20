@@ -3277,7 +3277,7 @@ impl LibraryScanner {
                                 .as_ref()
                                 .is_none_or(|o| o.enable_photos)
                         {
-                            self.plan_photos(location, cf, cf, &naming, &mut out);
+                            self.plan_photos(location, location, cf, cf, &naming, &mut out);
                         }
                     }
                     Some(CollectionTypeOptions::books) => {
@@ -3945,6 +3945,7 @@ impl LibraryScanner {
     fn plan_photos(
         &self,
         dir: &str,
+        root: &str,
         cf: Uuid,
         parent: Uuid,
         naming: &NamingOptions,
@@ -3964,8 +3965,9 @@ impl LibraryScanner {
             .collect();
 
         // A sub-directory with photos in it is a PhotoAlbum; the library root
-        // parents its loose photos directly.
-        let (photo_parent, ancestors) = if !photos.is_empty() && parent != cf {
+        // is the collection folder itself and never an album, so its loose
+        // photos hang off it directly.
+        let (photo_parent, ancestors) = if !photos.is_empty() && dir != root {
             let name = file_stem(dir);
             match self.base_item(BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
                 Some((album_id, album)) => {
@@ -4008,7 +4010,7 @@ impl LibraryScanner {
 
         for entry in &entries {
             if entry.type_ == FileSystemEntryType::Directory {
-                self.plan_photos(&entry.path, cf, photo_parent, naming, out);
+                self.plan_photos(&entry.path, root, cf, photo_parent, naming, out);
             }
         }
     }
@@ -5487,6 +5489,75 @@ mod tests {
             crate::item_data::read_data_string(&parsed, "Software").as_deref(),
             Some("Darktable")
         );
+    }
+
+    // A sub-directory holding photos is a PhotoAlbum the photos hang off; the
+    // library root is the collection folder itself and never an album.
+    #[tokio::test]
+    async fn photo_albums_are_the_sub_directories_not_the_library_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("loose.jpg"), b"x").expect("write");
+        std::fs::create_dir(root.join("Holiday")).expect("mkdir");
+        std::fs::write(root.join("Holiday").join("DSC_0001.jpg"), b"x").expect("write");
+        // Artwork prefixes are still excluded inside an album folder.
+        std::fs::write(root.join("Holiday").join("folder.jpg"), b"x").expect("write");
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(dir.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let mut out = Vec::new();
+        let root_str = root.to_string_lossy().into_owned();
+        let cf = uuid::Uuid::from_u128(0x7000);
+        scanner.plan_photos(
+            &root_str,
+            &root_str,
+            cf,
+            cf,
+            &super::NamingOptions::new(),
+            &mut out,
+        );
+
+        let kinds: Vec<(&str, String)> = out
+            .iter()
+            .map(|p| {
+                (
+                    p.entity.type_.rsplit('.').next().unwrap_or_default(),
+                    p.entity.name.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("Photo", "loose".to_owned())),
+            "a root photo is parented to the library: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("PhotoAlbum", "Holiday".to_owned())),
+            "the sub-directory became an album: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Photo", "DSC_0001".to_owned())),
+            "the album's photo was resolved: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|(_, name)| name == "folder"),
+            "artwork inside an album folder is not a photo: {kinds:?}"
+        );
+        // The album's photo is parented to the album, not the library.
+        let album = out
+            .iter()
+            .find(|p| p.entity.type_.ends_with(".PhotoAlbum"))
+            .expect("album");
+        let child = out
+            .iter()
+            .find(|p| p.entity.name.as_deref() == Some("DSC_0001"))
+            .expect("child");
+        assert!(child.ancestors.contains(&album.id));
     }
 
     // BookResolver's extension set, matched case-insensitively.
