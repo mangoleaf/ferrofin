@@ -30,7 +30,10 @@ Deep-verified against a real Jellyfin server:
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
-  path-scoped ingest; virtual folders; item read + write/edit + delete.
+  path-scoped ingest; virtual folders; item read + write/edit + delete. Library types
+  scanned: `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` /
+  untyped, and **`books`** (documents → `Book`, audio → `AudioBook`; see the divergence
+  below). `photos` and `boxsets` libraries are not scanned.
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
@@ -61,6 +64,21 @@ Wired and working, with a documented limitation or lighter verification:
   **feature-gated off by default**; they return empty results until enabled with an API key.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
+- **Books / audiobooks** — a `books` library resolves documents (`.azw .azw3 .cb7 .cbr .cbt
+  .cbz .epub .mobi .pdf`) to `Book` and audio files to `AudioBook`, and serves them through
+  `/Items/{id}/File` + `/Items/{id}/Download`, which is what jellyfin-web's epub/comic/pdf
+  readers fetch. Three things to know:
+  - **Accepted divergence (ahead of the contract):** name / series / index / year come from
+    `Emby.Naming.Book.BookFileNameParser`, which is on upstream `master` and **not** in the
+    pinned 10.11.8 contract. Against 10.11.8 a book is named from its bare filename; Ferrofin
+    parses `A Study in Scarlet (Sherlock Holmes, #1) (1887)` into its parts.
+  - **Faithful upstream limitation:** a multi-file audiobook is **one item per file**, not one
+    stacked item. `AudioResolver` skips stacked results outright ("until multi-part books are
+    handled"), and `ResolvePaths` then falls back to per-file resolution — Ferrofin reproduces
+    that rather than inventing stacking Jellyfin clients have never seen.
+  - No book metadata provider: upstream core has none either (no book NFO parser, no remote
+    book provider — that is the third-party Bookshelf plugin), so metadata is filename +
+    local images.
 
 ## Not implemented (by design)
 

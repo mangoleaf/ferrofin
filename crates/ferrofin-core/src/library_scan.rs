@@ -31,9 +31,11 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
-use ferrofin_model::io::FileSystemEntryType;
+use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_model::media_info::MediaInfo;
 use ferrofin_naming::audio::is_audio_file;
+use ferrofin_naming::audiobook::AudioBookListResolver;
+use ferrofin_naming::book::book_file_name_parser;
 use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
@@ -1279,7 +1281,7 @@ impl LibraryScanner {
     /// share, detached drive) walks as empty, which is indistinguishable from
     /// "everything was deleted" — such libraries are skipped with a warning
     /// rather than mass-pruned. Collection types the planner doesn't scan
-    /// (books/photos/…) are also skipped: their empty plan means "not
+    /// (photos/boxsets/…) are also skipped: their empty plan means "not
     /// managed", not "deleted".
     ///
     /// Returns the deleted item ids per library, feeding the scan-end
@@ -1315,6 +1317,7 @@ impl LibraryScanner {
                         | CollectionTypeOptions::homevideos
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed
+                        | CollectionTypeOptions::books
                 )
             );
             if !planner_scans_type {
@@ -2996,8 +2999,9 @@ impl LibraryScanner {
     /// Dispatches by the library's collection type: `tvshows` builds the
     /// Series→Season→Episode hierarchy, `music` builds MusicAlbum→Audio, and the
     /// video types (`movies`/`homevideos`/`musicvideos`/`mixed`) plus an untyped
-    /// library flatten every video file to a `Movie`. Other types (books, photos,
-    /// …) are not scanned yet.
+    /// library flatten every video file to a `Movie`, and `books` flattens every
+    /// document to a `Book` and every audio file to an `AudioBook`. Other types
+    /// (photos, boxsets, …) are not scanned yet.
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
         let naming = NamingOptions::new();
         let mut out = Vec::new();
@@ -3013,6 +3017,9 @@ impl LibraryScanner {
                     Some(CollectionTypeOptions::music) => {
                         self.plan_music(location, cf, &naming, &mut out);
                     }
+                    Some(CollectionTypeOptions::books) => {
+                        self.plan_books(location, location, cf, &naming, &mut out);
+                    }
                     None
                     | Some(
                         CollectionTypeOptions::movies
@@ -3020,7 +3027,7 @@ impl LibraryScanner {
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
                     ) => self.plan_movies(location, location, cf, &naming, &mut out),
-                    // books / photos / boxsets / … aren't scanned in v1.
+                    // photos / boxsets / … aren't scanned in v1.
                     Some(_) => {}
                 }
             }
@@ -3670,6 +3677,178 @@ impl LibraryScanner {
         }
         disc_subfolders > 0
     }
+
+    /// Books library: every document flattens to a `Book` and every audio file
+    /// to an `AudioBook`, both directly under the collection folder — the same
+    /// flattening the video libraries use, and what upstream itself ends up with
+    /// for everything but the single-item folder shapes handled first.
+    ///
+    /// Port of `BookResolver` + the `books` arms of `AudioResolver`:
+    /// - a directory holding **exactly one** document *is* that book, named
+    ///   after the directory ("other library structures with multiple books to
+    ///   a directory will get picked up as individual files");
+    /// - a directory whose audio resolves to a single one-file audiobook *is*
+    ///   that audiobook, named after the directory
+    ///   (`AudioResolver.FindAudioBook`);
+    /// - anything else recurses, and each loose file becomes its own row.
+    ///
+    /// The name/series/index/year parsing comes from `BookFileNameParser`, which
+    /// post-dates the pinned 10.11.8 contract (it is on upstream `master`) — see
+    /// the accepted divergence note in `docs/FEATURES.md`.
+    fn plan_books(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        let entries = self.file_system.get_file_system_entries(dir);
+        // The library root itself is the CollectionFolder, never an item.
+        if dir != root {
+            if let Some(book) = single_book_file(&entries) {
+                self.push_book(&book, folder_name(dir), cf, out);
+                return;
+            }
+            if let Some(audio) = single_audio_book(&entries, naming) {
+                self.push_audio_book(&audio, folder_name(dir), cf, out);
+                return;
+            }
+        }
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_books(&entry.path, root, cf, naming, out);
+            } else if is_book_file(&entry.path) {
+                self.push_book(&entry.path, None, cf, out);
+            } else if is_audio_file(&entry.path, naming) {
+                self.push_audio_book(&entry.path, None, cf, out);
+            }
+        }
+    }
+
+    /// Emits the `Book` row for the document at `path`.
+    ///
+    /// `folder` is the directory name when the containing directory *is* the
+    /// book (`BookResolver.GetBook`): the name is parsed from it and a missing
+    /// series stays empty. Otherwise the file's own stem is parsed and the
+    /// containing directory name stands in for a missing series
+    /// (`BookResolver.Resolve`).
+    fn push_book(&self, path: &str, folder: Option<String>, cf: Uuid, out: &mut Vec<Planned>) {
+        let (parsed_from, series_fallback) = match folder {
+            Some(name) => (name, None),
+            None => (file_stem(path), parent_folder_name(path)),
+        };
+        let parsed = book_file_name_parser::parse(Some(&parsed_from));
+        // Upstream leaves an unparsed name empty and lets
+        // `ResolverHelper.EnsureName` fill it from the file/folder name.
+        let name = parsed
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| parsed_from.clone());
+        let Some((id, mut entity)) = self.base_item(BaseItemKind::Book, cf, cf, name, path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some("Book".to_owned());
+        entity.run_time_ticks = Some(BOOK_RUN_TIME_TICKS);
+        entity.index_number = parsed.index.map(i64::from);
+        entity.parent_index_number = parsed.parent_index.map(i64::from);
+        entity.production_year = parsed.year.map(i64::from);
+        entity.series_name = parsed.series_name.or(series_fallback);
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        });
+    }
+
+    /// Emits the `AudioBook` row for the audio file at `path`, named after
+    /// `folder` when the containing directory is the audiobook and after the
+    /// file otherwise. `MediaType = Audio` is what makes the scan ffprobe it,
+    /// so it gets a runtime, streams, and its embedded tags — upstream probes
+    /// `AudioBook` through the same `ProbeProvider` as `Audio`.
+    fn push_audio_book(
+        &self,
+        path: &str,
+        folder: Option<String>,
+        cf: Uuid,
+        out: &mut Vec<Planned>,
+    ) {
+        let name = folder.unwrap_or_else(|| file_stem(path));
+        let Some((id, mut entity)) =
+            self.base_item(BaseItemKind::AudioBook, cf, cf, name, path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some("Audio".to_owned());
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        });
+    }
+}
+
+/// The document extensions a `books` library resolves as a `Book` — copied from
+/// `BookResolver._validExtensions`.
+const BOOK_EXTENSIONS: &[&str] = &[
+    "azw", "azw3", "cb7", "cbr", "cbt", "cbz", "epub", "mobi", "pdf",
+];
+
+/// A `Book`'s runtime: upstream's `Book()` constructor hardcodes
+/// `TimeSpan.TicksPerSecond`, so a book is nominally one second long and
+/// position-ticks resume has a non-zero denominator to work against.
+const BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
+
+/// Whether `path` is one of the [`BOOK_EXTENSIONS`] documents.
+fn is_book_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| BOOK_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext)))
+}
+
+/// The one document in `entries`, or `None` when there is none or several —
+/// port of `BookResolver.GetBook`'s `bookFiles.Count != 1` guard.
+fn single_book_file(entries: &[FileSystemEntryInfo]) -> Option<String> {
+    let mut books = entries
+        .iter()
+        .filter(|e| e.type_ != FileSystemEntryType::Directory && is_book_file(&e.path));
+    let first = books.next()?.path.clone();
+    books.next().is_none().then_some(first)
+}
+
+/// The single audio file a directory resolves to as one `AudioBook`, or `None`
+/// when it holds none or several.
+///
+/// Port of `AudioResolver.FindAudioBook`: the directory's audio must group into
+/// exactly one audiobook, of exactly one file, with no extras and no alternate
+/// versions — upstream skips the rest "until multi-part books are handled", so
+/// a multi-file audiobook folder falls back to a row per file, exactly as
+/// `ResolvePaths` does when the multi-item resolver claims nothing.
+fn single_audio_book(entries: &[FileSystemEntryInfo], naming: &NamingOptions) -> Option<String> {
+    let files: Vec<ferrofin_naming::io::FileSystemMetadata> = entries
+        .iter()
+        .filter(|e| e.type_ != FileSystemEntryType::Directory)
+        .map(|e| ferrofin_naming::io::FileSystemMetadata::new(e.path.clone(), false))
+        .collect();
+    let mut resolved = AudioBookListResolver::new(naming).resolve(&files);
+    if resolved.len() != 1 {
+        return None;
+    }
+    let info = resolved.remove(0);
+    (info.files.len() == 1 && info.extras.is_empty() && info.alternate_versions.is_empty())
+        .then(|| info.files[0].path.clone())
+}
+
+/// The name of the directory containing `path`, if any (C#
+/// `Path.GetFileName(Path.GetDirectoryName(path))`).
+fn parent_folder_name(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
 }
 
 /// The album name the tracks agree on: the `Album` tag every tagged track
@@ -7746,5 +7925,194 @@ mod tests {
             "a non-jpg upload is found by stem"
         );
         assert_eq!(super::existing_art_file(tmp.path(), "backdrop"), None);
+    }
+
+    // A books library resolves BOTH kinds it can hold — documents to `Book`,
+    // audio to `AudioBook` — across every structural shape upstream handles:
+    // a loose file, a folder that IS one book, a folder holding several
+    // (which flattens to one row per file), a single-file audiobook folder,
+    // and a multi-part one (which upstream deliberately does not stack).
+    #[tokio::test]
+    async fn scan_builds_books_and_audiobooks() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+        let write = |dir: &std::path::Path, file: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(file), b"").unwrap();
+        };
+
+        // A loose document names and dates itself from its own filename.
+        write(
+            &media,
+            "A Study in Scarlet (Sherlock Holmes, #1) (1887).epub",
+        );
+        // A folder holding exactly one document IS that book, named after the
+        // folder — the file inside can be called anything.
+        write(&media.join("Dracula"), "dracula-text-final.epub");
+        // Two documents in one folder are two books; the folder name stands in
+        // for a series the filename does not name.
+        let holmes = media.join("Sherlock Holmes");
+        write(&holmes, "Sherlock Holmes #2.epub");
+        write(&holmes, "The Hound of the Baskervilles.epub");
+        // One audio file in a folder is one audiobook, named after the folder.
+        write(&media.join("The Hobbit"), "hobbit.mp3");
+        // A multi-part audiobook is a row per file (upstream skips the stack
+        // "until multi-part books are handled").
+        let neuromancer = media.join("Neuromancer");
+        write(&neuromancer, "Neuromancer Part 1.mp3");
+        write(&neuromancer, "Neuromancer Part 2.mp3");
+        // Neither a document nor audio — never an item.
+        write(&media, "README.txt");
+
+        let (db, cf) = scan_one(CollectionTypeOptions::books, "Books", &media).await;
+
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let by_kind = async |kind| {
+            let mut items = repo
+                .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![kind],
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("items");
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            items
+        };
+
+        let books = by_kind(BaseItemKind::Book).await;
+        assert_eq!(
+            books.iter().map(|b| b.name.as_deref()).collect::<Vec<_>>(),
+            vec![
+                Some("A Study in Scarlet"),
+                Some("Dracula"),
+                // The series/index pattern captures no title of its own, so
+                // upstream's empty `Name` falls back to the file stem
+                // (`ResolverHelper.EnsureName`) rather than to the series.
+                Some("Sherlock Holmes #2"),
+                Some("The Hound of the Baskervilles"),
+            ],
+            "README.txt must not resolve, and each shape must name itself"
+        );
+
+        let study = &books[0];
+        assert_eq!(study.series_name.as_deref(), Some("Sherlock Holmes"));
+        assert_eq!(study.index_number, Some(1));
+        assert_eq!(study.production_year, Some(1887));
+        assert_eq!(study.media_type.as_deref(), Some("Book"));
+        // Upstream's `Book()` gives every book a one-second runtime.
+        assert_eq!(study.run_time_ticks, Some(super::BOOK_RUN_TIME_TICKS));
+        assert!(!study.is_folder);
+
+        // The single-document folder points at the file, not the folder.
+        assert!(
+            books[1]
+                .path
+                .as_deref()
+                .unwrap()
+                .ends_with("dracula-text-final.epub"),
+            "path is the document: {:?}",
+            books[1].path
+        );
+        assert_eq!(books[1].series_name, None);
+
+        // "Sherlock Holmes #2" parses its own series; its neighbour does not,
+        // so the containing folder name is the fallback.
+        assert_eq!(books[2].series_name.as_deref(), Some("Sherlock Holmes"));
+        assert_eq!(books[2].index_number, Some(2));
+        assert_eq!(books[3].series_name.as_deref(), Some("Sherlock Holmes"));
+
+        let audiobooks = by_kind(BaseItemKind::AudioBook).await;
+        assert_eq!(
+            audiobooks
+                .iter()
+                .map(|b| b.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("Neuromancer Part 1"),
+                Some("Neuromancer Part 2"),
+                Some("The Hobbit"),
+            ],
+        );
+        // MediaType=Audio is what makes the scan ffprobe them for a runtime.
+        assert!(
+            audiobooks
+                .iter()
+                .all(|a| a.media_type.as_deref() == Some("Audio"))
+        );
+
+        // Everything hangs off the library, so `?ParentId=<library>` lists it.
+        assert!(
+            books
+                .iter()
+                .chain(audiobooks.iter())
+                .all(|i| i.top_parent_id.as_deref() == Some(cf.as_str())),
+        );
+    }
+
+    // A books library takes part in the deleted-item prune like any other; it
+    // used to be excluded, which would leave removed books in the library
+    // forever now that the scan produces them.
+    #[tokio::test]
+    async fn books_library_prunes_deleted_items() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("Dune.epub"), b"").unwrap();
+        std::fs::write(media.join("Emma.epub"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join(".views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Books",
+            Some(CollectionTypeOptions::books),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = Arc::new(crate::FerrofinItemRepository::new(db.clone(), lookup));
+        let scanner = LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(repo.clone());
+
+        scanner.scan_all().await.unwrap();
+        let count = async || {
+            repo.get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Book],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .expect("items")
+            .len()
+        };
+        assert_eq!(count().await, 2);
+
+        std::fs::remove_file(media.join("Emma.epub")).unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(count().await, 1, "the deleted book must be pruned");
     }
 }
