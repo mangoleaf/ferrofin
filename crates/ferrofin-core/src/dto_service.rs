@@ -23,8 +23,10 @@
 //! [`LibraryManager`] (people/artist/name-id lookups + name-item counts),
 //! [`UserDataManager`] (play-state), [`ItemCountService`] (child counts),
 //! [`ImageProcessor`] (cache tags + blurhashes), [`MediaSourceManager`] (media
-//! sources/streams), [`ChapterManager`], [`TrickplayManager`], and
-//! [`ProviderManager`] (external URLs). The `server_id` string the C# code reads
+//! sources/streams), [`ChapterManager`] and [`TrickplayManager`]. The
+//! "Links" row (`ExternalUrls`) is built in-crate from the page's already
+//! batched provider ids — see [`ferrofin_providers::external_urls`]. The
+//! `server_id` string the C# code reads
 //! from `IApplicationHost.SystemId` is supplied at construction (the app host is
 //! not part of this seam). Item images (`BaseItemImageInfos`) have no repository
 //! trait, so they are read directly through the injected [`Database`] handle,
@@ -71,7 +73,6 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager};
 use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemCountService, NameItemRow};
-use ferrofin_traits::providers::ProviderManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
@@ -90,9 +91,14 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a page builds them in one
     /// query instead of N. Read three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
-    /// Provider-id maps per item id (populated only when the `ProviderIds`
-    /// field is requested).
+    /// Provider-id maps per item id (populated when EITHER the `ProviderIds`
+    /// or the `ExternalUrls` field is requested — the "Links" row is built from
+    /// the same ids, so one batch read serves both).
     provider_ids: HashMap<Uuid, HashMap<String, String>>,
+    /// Provider-id maps per *series* id, for the seasons/episodes on the page:
+    /// their IMDb/TMDB links are built from the owning series' id, not their
+    /// own (C# `ImdbExternalUrlProvider`/`TmdbExternalUrlProvider`).
+    series_provider_ids: HashMap<Uuid, HashMap<String, String>>,
     /// Credited people per item id (populated only when the `People` field is
     /// requested), so a page's cast/crew loads in one query.
     people: HashMap<Uuid, Vec<ferrofin_db::entities::base_items::PeopleEntity>>,
@@ -444,7 +450,9 @@ pub struct FerrofinDtoService {
     media_sources: Arc<dyn MediaSourceManager>,
     chapters: Arc<dyn ChapterManager>,
     trickplay: Arc<dyn TrickplayManager>,
-    providers: Arc<dyn ProviderManager>,
+    /// The MusicBrainz root the "Links" row points music items at — the
+    /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
+    musicbrainz_server: String,
 }
 
 impl std::fmt::Debug for FerrofinDtoService {
@@ -472,7 +480,6 @@ impl FerrofinDtoService {
         media_sources: Arc<dyn MediaSourceManager>,
         chapters: Arc<dyn ChapterManager>,
         trickplay: Arc<dyn TrickplayManager>,
-        providers: Arc<dyn ProviderManager>,
     ) -> Self {
         Self {
             db,
@@ -484,8 +491,19 @@ impl FerrofinDtoService {
             media_sources,
             chapters,
             trickplay,
-            providers,
+            musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
         }
+    }
+
+    /// Points the music "Links" row at a configured MusicBrainz mirror. Empty
+    /// (or unset) keeps the canonical `https://musicbrainz.org`.
+    #[must_use]
+    pub fn with_musicbrainz_server(mut self, server: &str) -> Self {
+        let server = server.trim().trim_end_matches('/');
+        if !server.is_empty() {
+            self.musicbrainz_server = server.to_owned();
+        }
+        self
     }
 
     /// Loads an item's image rows from `BaseItemImageInfos`, ordered by type then
@@ -1053,7 +1071,29 @@ impl FerrofinDtoService {
         // Jellyfin emits an empty [] / {} for these when the field is requested but the item has
         // none (its DtoService always assigns the collection), so populate the empty default.
         if options.contains_field(ItemFields::ExternalUrls) {
-            dto.external_urls = Some(self.providers.get_external_urls(item_id).await?);
+            // Built here rather than behind a manager seam, so a page
+            // of items costs the one batched id read the prefetch already did
+            // instead of a query per item (C# builds them inside `DtoService`
+            // from the item's already-loaded `ProviderIds` for the same reason).
+            let empty = HashMap::new();
+            let series_ids = item
+                .series_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| prefetched.series_provider_ids.get(&id));
+            dto.external_urls = Some(ferrofin_providers::external_urls(
+                &ferrofin_providers::ExternalIdItem {
+                    kind,
+                    provider_ids: prefetched.provider_ids.get(&item_id).unwrap_or(&empty),
+                    index_number: item.index_number.and_then(|n| i32::try_from(n).ok()),
+                    parent_index_number: item
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    series_provider_ids: series_ids,
+                    series_display_order: None,
+                    musicbrainz_server: &self.musicbrainz_server,
+                },
+            ));
         }
 
         if options.contains_field(ItemFields::Tags) {
@@ -1756,8 +1796,26 @@ impl FerrofinDtoService {
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> =
             alternates.values().flatten().map(row_id).collect();
-        let provider_ids = if options.contains_field(ItemFields::ProviderIds) {
+        let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
+        let provider_ids = if options.contains_field(ItemFields::ProviderIds) || want_external_urls
+        {
             self.load_provider_ids_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
+        // A season/episode's links come from its series' ids, so collect the
+        // distinct series on the page and read their ids in the same batched
+        // way (one extra query for a page of episodes, none otherwise).
+        let series_provider_ids = if want_external_urls {
+            let mut series_ids: Vec<Uuid> = items
+                .iter()
+                .filter(|i| matches!(row_kind(i), BaseItemKind::Season | BaseItemKind::Episode))
+                .filter_map(|i| i.series_id.as_deref())
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            series_ids.sort_unstable();
+            series_ids.dedup();
+            self.load_provider_ids_batch(&series_ids).await?
         } else {
             HashMap::new()
         };
@@ -1999,6 +2057,7 @@ impl FerrofinDtoService {
             user_data,
             media_streams,
             provider_ids,
+            series_provider_ids,
             people,
             person_images,
             value_ids,
@@ -2058,7 +2117,6 @@ mod tests {
     use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
     use ferrofin_model::dto::{MediaSourceInfo, UserItemDataDto};
     use ferrofin_model::entities_media::{ChapterInfo, MediaAttachment, MediaStream};
-    use ferrofin_model::providers::ExternalUrl;
     use ferrofin_traits::drawing::ProcessedImage;
     use ferrofin_traits::dto::DtoService as _;
 
@@ -2940,105 +2998,6 @@ mod tests {
         }
     }
 
-    /// A [`ProviderManager`] fake: `get_external_urls` returns one link.
-    #[derive(Default)]
-    struct FakeProviders;
-
-    #[async_trait]
-    impl ProviderManager for FakeProviders {
-        async fn queue_refresh(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-            _priority: ferrofin_traits::providers::RefreshPriority,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_full_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_single_item(
-            &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
-        ) -> Result<ferrofin_traits::providers::ItemUpdateType, ServiceError> {
-            Ok(ferrofin_traits::providers::ItemUpdateType::default())
-        }
-        async fn save_image_from_url(
-            &self,
-            _item_id: Uuid,
-            _url: &str,
-            _image_type: ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn save_image(
-            &self,
-            _item_id: Uuid,
-            _content: &[u8],
-            _mime_type: &str,
-            _image_type: ImageType,
-            _image_index: Option<i32>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_available_remote_images(
-            &self,
-            _item_id: Uuid,
-            _query: &ferrofin_model::providers::RemoteImageQuery,
-        ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
-            Ok(vec![])
-        }
-        async fn get_remote_image_provider_info(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
-            Ok(vec![])
-        }
-        async fn save_metadata(
-            &self,
-            _item_id: Uuid,
-            _update_type: ferrofin_traits::providers::ItemUpdateType,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_external_urls(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ExternalUrl>, ServiceError> {
-            Ok(vec![ExternalUrl {
-                name: Some("IMDb".into()),
-                url: Some("https://imdb.com/title/tt1".into()),
-            }])
-        }
-        async fn get_external_id_infos(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
-            Ok(vec![])
-        }
-        async fn get_all_metadata_plugins(
-            &self,
-        ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError>
-        {
-            Ok(vec![])
-        }
-        async fn get_metadata_options(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
-            Ok(ferrofin_model::configuration::MetadataOptions::default())
-        }
-        async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(vec![])
-        }
-    }
-
     /// Builds a DTO service over `db` wired to the fakes, with an optional custom
     /// library fake (for the people test).
     fn service_with(db: Database, library: Arc<dyn LibraryManager>) -> FerrofinDtoService {
@@ -3052,7 +3011,6 @@ mod tests {
             Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
-            Arc::new(FakeProviders),
         )
     }
 
@@ -3068,7 +3026,6 @@ mod tests {
             Arc::new(FakeSources::default()),
             Arc::new(ChaptersWithImages),
             Arc::new(FakeTrickplay),
-            Arc::new(FakeProviders),
         )
     }
 
@@ -3089,7 +3046,6 @@ mod tests {
             Arc::new(sources),
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
-            Arc::new(FakeProviders),
         )
     }
 

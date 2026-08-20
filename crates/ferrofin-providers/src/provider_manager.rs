@@ -8,6 +8,7 @@
 //! remote images ("Choose Image"), the external-id descriptor set, and the
 //! external-URL ("Links") table.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,12 +19,12 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::net::mime_types;
 use ferrofin_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
-    RemoteImageQuery, RemoteSearchResult,
+    ExternalIdInfo, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo, RemoteImageQuery,
+    RemoteSearchResult,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
     RemoteSearchRequest,
@@ -201,6 +202,10 @@ pub struct LocalProviderManager {
     /// The Studio Images client, used to supply a `Studio` item's thumb from the
     /// artwork repository. Absent → studios contribute no remote images.
     studios: Option<Arc<crate::studios::StudiosClient>>,
+    /// Stored `BaseItems.Type` name → [`BaseItemKind`], inverted once from the
+    /// [`ItemTypeLookup`] table. Present enables the kind-filtered built-in
+    /// external-id descriptors.
+    kind_by_type_name: HashMap<String, BaseItemKind>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -217,6 +222,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_items", &self.items.is_some())
             .field("has_studios", &self.studios.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
+            .field("kind_by_type_name", &self.kind_by_type_name.len())
             .finish()
     }
 }
@@ -239,7 +245,24 @@ impl LocalProviderManager {
             tmdb: None,
             items: None,
             studios: None,
+            kind_by_type_name: HashMap::new(),
         }
+    }
+
+    /// Enables the kind-filtered built-in external-id descriptors by supplying
+    /// the item-type table (inverted once here) — a port of the C#
+    /// `IExternalId.Supports(item)` filter, which needs the item's type.
+    ///
+    /// Without it (and without an item store) only the descriptors handed to
+    /// [`new`](Self::new) are advertised.
+    #[must_use]
+    pub fn with_item_types(mut self, types: &dyn ItemTypeLookup) -> Self {
+        self.kind_by_type_name = types
+            .base_item_kind_names()
+            .into_iter()
+            .map(|(kind, name)| (name, kind))
+            .collect();
+        self
     }
 
     /// Attaches the Studio Images client, so a `Studio` item's remote images
@@ -962,15 +985,23 @@ impl ProviderManager for LocalProviderManager {
         Ok(())
     }
 
-    async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
-        Ok(Vec::new())
-    }
-
     async fn get_external_id_infos(
         &self,
-        _item_id: Uuid,
+        item_id: Uuid,
     ) -> Result<Vec<ExternalIdInfo>, ServiceError> {
-        Ok(self.external_id_infos.clone())
+        // C# filters every registered `IExternalId` by `Supports(item)`, so the
+        // Identify dialog offers only the id fields that apply to the item's
+        // type. That needs the item; without a store (or the type table) fall
+        // back to the descriptors supplied at construction.
+        let mut infos = Vec::new();
+        if let (Some(items), false) = (self.items.as_ref(), self.kind_by_type_name.is_empty())
+            && let Some(item) = items.retrieve_item(item_id).await?
+            && let Some(kind) = self.kind_by_type_name.get(item.type_.as_str())
+        {
+            infos = crate::external_ids::external_id_infos(*kind);
+        }
+        infos.extend(self.external_id_infos.iter().cloned());
+        Ok(infos)
     }
 
     async fn remote_search(
@@ -1287,6 +1318,88 @@ mod tests {
         assert!(infos.is_empty());
     }
 
+    /// An [`ItemTypeLookup`] over the two names the descriptor tests need.
+    struct FakeTypes;
+
+    impl ferrofin_traits::persistence::ItemTypeLookup for FakeTypes {
+        fn music_genre_types(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn base_item_kind_names(&self) -> HashMap<BaseItemKind, String> {
+            HashMap::from([
+                (
+                    BaseItemKind::Movie,
+                    "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+                ),
+                (
+                    BaseItemKind::Book,
+                    "MediaBrowser.Controller.Entities.Book".to_owned(),
+                ),
+            ])
+        }
+    }
+
+    /// Builds a manager over one row of `type_name`, wired for kind filtering.
+    fn manager_over(item_id: Uuid, type_name: &str) -> LocalProviderManager {
+        let mut item = row("Book", "irrelevant");
+        item.id = item_id.to_string();
+        item.type_ = type_name.to_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, item)]),
+            seen: tx,
+        });
+        LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_item_types(&FakeTypes)
+    }
+
+    #[tokio::test]
+    async fn external_id_infos_are_filtered_to_the_items_kind() {
+        let item_id = Uuid::new_v4();
+        let mgr = manager_over(item_id, "MediaBrowser.Controller.Entities.Movies.Movie");
+        let keys: Vec<_> = mgr
+            .get_external_id_infos(item_id)
+            .await
+            .expect("descriptors")
+            .into_iter()
+            .filter_map(|i| i.key)
+            .collect();
+        assert!(keys.contains(&"Imdb".to_owned()));
+        assert!(keys.contains(&"Tmdb".to_owned()));
+        assert!(
+            !keys.contains(&"ISBN".to_owned()),
+            "a movie must not offer a book id field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_book_offers_only_the_book_id_fields() {
+        let item_id = Uuid::new_v4();
+        let mgr = manager_over(item_id, "MediaBrowser.Controller.Entities.Book");
+        let keys: Vec<_> = mgr
+            .get_external_id_infos(item_id)
+            .await
+            .expect("descriptors")
+            .into_iter()
+            .filter_map(|i| i.key)
+            .collect();
+        assert_eq!(keys, vec!["ComicVine", "GoogleBooks", "ISBN"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_item_falls_back_to_the_supplied_descriptors() {
+        let seed = vec![ExternalIdInfo::new("Tmdb".into(), "tmdb".into(), None)];
+        let mgr = LocalProviderManager::new(seed.clone())
+            .with_item_types(&FakeTypes)
+            .with_remote_search_providers(Vec::new());
+        // No item store wired, so the kind is unknowable: only the seed shows.
+        assert_eq!(
+            mgr.get_external_id_infos(Uuid::new_v4()).await.unwrap(),
+            seed
+        );
+    }
+
     #[tokio::test]
     async fn new_advertises_supplied_external_ids_for_every_item() {
         let seed = vec![ExternalIdInfo::new("Tmdb".into(), "tmdb".into(), None)];
@@ -1459,7 +1572,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(mgr.get_external_urls(id).await.unwrap().is_empty());
         // The metadata-plugin registry projects the compiled-in providers, so it
         // is non-empty (covered in detail by `library_options` tests).
         assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());

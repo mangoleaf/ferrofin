@@ -46,7 +46,7 @@ use ferrofin_model::playlists::{
     PlaylistUserUpdateRequest,
 };
 use ferrofin_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
+    ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
 };
 use ferrofin_model::providers::{LyricProviderInfo, RemoteSubtitleInfo, SubtitleProviderInfo};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -1096,9 +1096,6 @@ impl ProviderManager for FakeProviders {
         _item_id: Uuid,
         _update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_external_id_infos(

@@ -370,7 +370,10 @@ pub async fn build_app_state(
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client)),
+            .with_studios(Arc::clone(&studios_client))
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref()),
     );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
@@ -894,18 +897,22 @@ pub async fn build_app_state(
         ));
 
     // ---- dto (consumes many of the above) ---------------------------------
-    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(FerrofinDtoService::new(
-        db.clone(),
-        server_id.clone(),
-        Arc::clone(&library),
-        Arc::clone(&user_data),
-        Arc::clone(&item_count_service),
-        Arc::clone(&image_processor),
-        Arc::clone(&media_sources),
-        Arc::clone(&chapters),
-        Arc::clone(&trickplay),
-        Arc::clone(&providers),
-    ));
+    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(
+        FerrofinDtoService::new(
+            db.clone(),
+            server_id.clone(),
+            Arc::clone(&library),
+            Arc::clone(&user_data),
+            Arc::clone(&item_count_service),
+            Arc::clone(&image_processor),
+            Arc::clone(&media_sources),
+            Arc::clone(&chapters),
+            Arc::clone(&trickplay),
+        )
+        // The music "Links" row points at the configured MusicBrainz mirror, as
+        // Jellyfin's link providers use the plugin's configured server.
+        .with_musicbrainz_server(&config.musicbrainz_base_url),
+    );
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because

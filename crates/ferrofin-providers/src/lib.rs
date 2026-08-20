@@ -11,6 +11,7 @@
 pub mod audiodb;
 pub mod container_types;
 pub mod error;
+pub mod external_ids;
 pub mod fanart;
 pub mod library_options;
 pub mod local_images;
@@ -30,6 +31,7 @@ pub mod tvdb;
 pub mod xbmc;
 
 pub use error::ProvidersError;
+pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};

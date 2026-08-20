@@ -14,7 +14,7 @@
 //!   `.NET` refresh events are dropped.
 //! - Remote-image lookups reuse [`RemoteImageInfo`]/[`RemoteImageQuery`]/
 //!   [`ImageProviderInfo`]; external-link lookups reuse
-//!   [`ExternalUrl`]/[`ExternalIdInfo`]; metadata options reuse
+//!   [`ExternalIdInfo`]; metadata options reuse
 //!   [`MetadataOptions`]/[`MetadataPluginSummary`] from `ferrofin-model`.
 //! - The refresh-request/priority/update value types
 //!   ([`MetadataRefreshOptions`], [`RefreshPriority`], [`ItemUpdateType`]) live
@@ -32,8 +32,8 @@ use ferrofin_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
-    RemoteImageQuery, RemoteSearchResult,
+    ExternalIdInfo, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo, RemoteImageQuery,
+    RemoteSearchResult,
 };
 use uuid::Uuid;
 
@@ -223,9 +223,6 @@ pub trait ProviderManager: Send + Sync {
         item_id: Uuid,
         update_type: ItemUpdateType,
     ) -> Result<(), ServiceError>;
-
-    /// Gets the external links (IMDb, TMDb, …) for an item.
-    async fn get_external_urls(&self, item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError>;
 
     /// Gets the external-id descriptors applicable to an item.
     async fn get_external_id_infos(
