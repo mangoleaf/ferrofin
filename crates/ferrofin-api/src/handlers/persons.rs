@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::by_name::{ByNameItemQuery, project_item_rows};
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
@@ -102,7 +102,7 @@ async fn get_persons(
     Query(query): Query<PersonsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_id = user_uuid(&user)?;
     // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite` is
     // absent (PersonsController: `!isFavorite.HasValue && isFavoriteInFilters`).
     let filters = parse_csv_enums_lenient::<ItemFilter>(query.filters.as_deref());

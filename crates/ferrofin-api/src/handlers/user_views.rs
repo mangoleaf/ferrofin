@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
 /// Maps a library's [`CollectionTypeOptions`] to the DTO [`CollectionType`] the
@@ -81,7 +81,7 @@ async fn get_user_views(
     Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_id = user_uuid(&user)?;
     let folders = state.user_views.get_user_views(user_id).await?;
     let options = DtoOptions::with_all_fields(false);
     let mut dtos = state
@@ -141,7 +141,7 @@ async fn get_grouping_options(
     Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_id = user_uuid(&user)?;
     let folders = state.user_views.get_user_views(user_id).await?;
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()

@@ -53,6 +53,13 @@ Regenerate with `gen-registry.py`; `registry_selftest.py` is the hard gate (ever
 vendored spec, no dup ids, aliases resolve). The parity sweep still enumerates the full spec —
 the registry only adds bench variants on top, never shrinks parity coverage.
 
+`suite/coverage.py` closes the other half: registry.json says what the benchmark **measures**,
+`coverage.py` says why every remaining contract operation is **not** measured, and the check
+fails unless the two partition the spec exactly. So an operation can never fall out of the
+benchmark quietly — adding a spec path, or deleting a bench row, breaks the check until someone
+either measures it or writes down a reason. `python3 suite/coverage.py` prints the split
+(currently **130/412 measured, 282 skipped**, grouped by reason).
+
 ## Gotchas encoded (not tribal)
 
 `suite/lib.sh` is the single copy of the bring-up: modern `MediaBrowser` auth grammar only (no

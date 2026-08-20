@@ -277,8 +277,27 @@ fn to_image_info(row: &BaseItemImageInfoEntity) -> ItemImageInfo {
     }
 }
 
+/// Parses a [`UserEntity`]'s stored `Guid` id into a [`Uuid`].
+///
+/// The id is a lookup key for this user's `UserData`/permissions. Degrading a
+/// malformed one to the nil GUID would scope those reads to a user that does not
+/// exist and return a `200` carrying *someone else's* answer — no favourites, no
+/// resume position, `CanDelete: false` — so a corrupt row is an error instead.
+fn parse_user_id(id: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(id)
+        .map_err(|_| ServiceError::Backend("stored user id is not a guid".to_owned()))
+}
+
 /// Parses the row's stored `Guid` id into a [`Uuid`], or the nil UUID on a
-/// malformed value (a stored id should always parse).
+/// malformed value.
+///
+/// The fallback is unreachable: `BaseItems.Id` is the table's primary key, and
+/// every writer — Ferrofin's `guid_to_db` and Jellyfin's EF `Guid` conversion on
+/// an adopted database — emits canonical hyphenated `Guid` text. It stays
+/// infallible because this is the hottest call in the DTO projection (it also
+/// keys the prefetch maps, so a fallible signature would have to decide "skip
+/// the row" versus "fail the page" at fifteen call sites) — see the
+/// `parse_user_id` sibling for the cases where the fallback *was* observable.
 fn row_id(item: &BaseItemEntity) -> Uuid {
     Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())
 }
@@ -645,11 +664,25 @@ impl FerrofinDtoService {
         for person in people {
             // The by-name item id (one per name, what favorites key on);
             // pre-unification rows fall back to the credit id.
-            let person_id = prefetched
+            //
+            // A credit that resolves to neither has no id a client could follow.
+            // C# `AttachPeople` only ever adds a `BaseItemPerson` once the name
+            // resolved to a `Person` item (`list.Add` sits inside the
+            // `dictionary.TryGetValue` branch), so dropping the credit is the
+            // upstream behaviour — emitting one carrying the nil GUID would give
+            // the client a `People[].Id` that 404s on every follow-up request.
+            let Some(person_id) = prefetched
                 .person_ids_by_name
                 .get(person.name.as_str())
                 .copied()
-                .unwrap_or_else(|| Uuid::parse_str(&person.id).unwrap_or_else(|_| Uuid::nil()));
+                .or_else(|| Uuid::parse_str(&person.id).ok())
+            else {
+                tracing::warn!(
+                    person = %person.name,
+                    "skipping credit: stored person id is not a guid"
+                );
+                continue;
+            };
             // Resolve the person's primary image tag (from the materialized Person
             // item's image rows) so the client renders cast/crew artwork.
             let primary_image_tag = match images_by_person
@@ -1678,7 +1711,7 @@ impl FerrofinDtoService {
         // (this used to be two, and a random page is mostly people).
         let user_data_fut = async {
             if want_user_data && let Some(u) = user {
-                let user_id = Uuid::parse_str(&u.id).unwrap_or_else(|_| Uuid::nil());
+                let user_id = parse_user_id(&u.id)?;
                 self.user_data.get_user_data_dtos(&ids, user_id).await
             } else {
                 Ok(HashMap::new())
@@ -1951,7 +1984,7 @@ impl FerrofinDtoService {
                 if options.contains_field(ItemFields::CanDelete)
                     || options.contains_field(ItemFields::CanDownload) =>
             {
-                let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+                let user_id = parse_user_id(&user.id)?;
                 self.user_data.get_content_permissions(user_id).await?.map(
                     |(can_delete, can_download)| UserContentPermissions {
                         can_delete,
@@ -4250,7 +4283,7 @@ mod tests {
     /// The lookup half of the same convention, pinned in isolation: the map is
     /// keyed by the credit row's name EXACTLY as stored (the contract its doc
     /// comment states), and a name the prefetch never resolved falls back to the
-    /// per-credit row id — or the nil id when that is not a GUID.
+    /// per-credit row id — or is dropped when that is not a GUID.
     #[tokio::test]
     async fn attach_people_looks_up_the_raw_stored_credit_name() {
         let db = test_db().await;
@@ -4282,7 +4315,9 @@ mod tests {
             person_type: Some("Actor".into()),
             ..Default::default()
         });
-        // …and a pre-GUID credit id degrades to nil rather than panicking.
+        // …and a credit whose stored id is not a GUID is dropped entirely
+        // rather than emitted with the nil GUID (C# `AttachPeople` only adds a
+        // `BaseItemPerson` for a credit it could resolve).
         credits.push(PeopleEntity {
             id: "not-a-guid".into(),
             name: "Also Nobody".into(),
@@ -4301,7 +4336,8 @@ mod tests {
             .unwrap();
 
         let people = dto.people.as_ref().expect("people");
-        assert_eq!(people.len(), AWKWARD_CREDITS.len() + 2);
+        // The non-GUID credit is dropped, so only the resolvable ones survive.
+        assert_eq!(people.len(), AWKWARD_CREDITS.len() + 1);
         for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
             assert_eq!(
                 people[i].id, expected[i],
@@ -4314,8 +4350,14 @@ mod tests {
             "unresolved credit keeps its per-credit row id"
         );
         assert!(
-            people[AWKWARD_CREDITS.len() + 1].id.is_nil(),
-            "non-GUID credit id degrades to nil"
+            people.iter().all(|p| !p.id.is_nil()),
+            "no credit is emitted with the nil GUID"
+        );
+        assert!(
+            people
+                .iter()
+                .all(|p| p.name.as_deref() != Some("Also Nobody")),
+            "a credit whose stored id is not a GUID is dropped, not emitted as nil"
         );
     }
 

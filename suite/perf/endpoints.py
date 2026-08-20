@@ -10,7 +10,8 @@ Each entry:
     name      permanent trend key (mirrored by suite/registry.json variant ids)
     path      URL path+query as a format string over the run context — fields:
               {userId} {itemId} {imageItemId} {writeItemId} {seriesId}
-              {playlistId} {taskId} {imageTag}
+              {playlistId} {taskId} {imageTag} {genreName} {studioName}
+              {personName}  (the by-name fields arrive URL-quoted)
     method    default "GET"
     ok        expected status (200 unless stated — 204 for playstate writes);
               only responses with this status enter the latency distribution
@@ -214,6 +215,59 @@ ENDPOINTS = [
     _e("livetv_recordings_series", "/LiveTv/Recordings/Series?userId={userId}"),
     _e("livetv_recording_groups", "/LiveTv/Recordings/Groups"),
     _e("livetv_listing_default", "/LiveTv/ListingProviders/Default"),
+
+    # ── Coverage push (2026-08: 109/412 contract operations were benched) ────
+    # Same admission rule as the block above: a stateless GET whose params
+    # resolve from benchlib.enrich_context and that both servers answer 2xx on
+    # the bench fixture. Everything NOT here is listed with a reason in
+    # suite/coverage.py — that file is the gate that keeps the split honest.
+    #
+    # New rows carry no rates.json entry yet, so compare.py drives them at the
+    # flat default and records source="flat-default"; the next
+    # `--calibrate-rates` fills them in. They are NOT in the 11 perf-gate
+    # sentinels, so the mandatory 5-minute gate is unchanged in length.
+
+    # By-name facet detail — the second half of the /Genres, /Studios, /Persons
+    # browse pair (the list rows above, the single-entity lookup here).
+    _e("genre_detail", "/Genres/{genreName}?userId={userId}"),
+    _e("studio_detail", "/Studios/{studioName}?userId={userId}"),
+    _e("person_detail", "/Persons/{personName}?userId={userId}"),
+
+    # Similar/related shapes the movie rows above don't reach.
+    _e("shows_similar", "/Shows/{seriesId}/Similar?userId={userId}&limit=12"),
+    _e("trailers", "/Trailers?userId={userId}&limit=50"),
+    _e("trailers_similar", "/Trailers/{itemId}/Similar?userId={userId}&limit=12"),
+
+    # Playlist sub-resources (the bench playlist enrich_context resolves).
+    _e("playlist_user", "/Playlists/{playlistId}/Users/{userId}"),
+    _e("playlist_instant_mix", "/Playlists/{playlistId}/InstantMix?userId={userId}&limit=20"),
+
+    # Item detail sub-resources — the metadata-editor blob (parental ratings +
+    # culture tables) and the local provider list. Neither touches the network.
+    _e("item_metadata_editor", "/Items/{itemId}/MetadataEditor"),
+    _e("item_remote_image_providers", "/Items/{itemId}/RemoteImages/Providers"),
+
+    # Per-user display preferences — what jellyfin-web reads on every page load.
+    _e("display_preferences", "/DisplayPreferences/usersettings?userId={userId}&client=emby"),
+
+    # Dashboard / environment reads (no directory listing: its answer depends on
+    # the container image — see coverage.py "host-fs").
+    _e("env_drives", "/Environment/Drives"),
+    _e("env_parent_path", "/Environment/ParentPath?path=%2Ftmp%2Fx"),
+    _e("repositories", "/Repositories"),
+    _e("config_pages", "/web/ConfigurationPages"),
+
+    # Live TV configuration surface (empty-but-real without a tuner, like the
+    # livetv_* rows above).
+    _e("livetv_guide_info", "/LiveTv/GuideInfo"),
+    _e("livetv_channel_mapping_options", "/LiveTv/ChannelMappingOptions"),
+    _e("livetv_timer_defaults", "/LiveTv/Timers/Defaults"),
+    _e("livetv_tuner_types", "/LiveTv/TunerHosts/Types"),
+    _e("livetv_listing_lineups", "/LiveTv/ListingProviders/Lineups"),
+    # The POST twin of livetv_programs: a query, not a mutation — the body is
+    # the filter, so this row is as state-preserving as the GET.
+    _e("livetv_programs_post", "/LiveTv/Programs", method="POST",
+       body={"UserId": "{userId}", "Limit": 20}),
 
     # ── Write surface (tiers 1–2: read-shaped POSTs + idempotent upserts).
     # Rules that keep write rows honest (see README "Write rows"): state writes

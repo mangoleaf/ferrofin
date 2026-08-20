@@ -107,7 +107,7 @@ Mechanics (all enforced, not advisory):
   `clamp(BENCH_MIN_SAMPLES/rate, BENCH_MIN_WINDOW_SECS, BENCH_DURATION_SECS)` —
   identical on both servers (it derives only from the shared rate) and recorded per
   row. A flat 30 s window at calibrated rates collected 10-100× more samples than the
-  tails need, ×118 endpoints ×2 servers ×N runs; this is what keeps a full run in
+  tails need, ×139 endpoint rows ×2 servers ×N runs; this is what keeps a full run in
   hours, not days. Publish runs ≥2 also reuse the scanned volume (`BENCH_KEEP_DATA` —
   DB state is identical by construction; only measurement noise needs independence).
 - **A window that can't hold its rate fails.** If the achieved rate falls below
@@ -355,6 +355,8 @@ jobs:
 | `../bench.conf` | every methodology knob, committed, at its default |
 | `config.py` | knob resolution: code default < bench.conf < env; recorded into meta |
 | `endpoints.py` | THE endpoint table (name/path/method/ok/body) — registry + all legs import it |
+| `../coverage.py` | the other side of that table: why each *unbenched* contract op is skipped |
+| `benchlib_selftest.py` | pins the pure fixture rules (playlist reuse, by-name quoting, fillable templates) |
 | `benchlib.py` | bring-up: wizard → auth → provision → scan-wait → item pick → enrichment |
 | `vegeta.py` | the load-engine seam: targets, open-loop attack, decode, summarize |
 | `compare.py` | the comparison leg: per-endpoint open-loop windows (+ `--calibrate-rates`) |

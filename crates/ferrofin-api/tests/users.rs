@@ -48,6 +48,8 @@ use uuid::Uuid;
 
 const ADMIN_ID: Uuid = Uuid::from_u128(0x0AD1);
 const BOB_ID: Uuid = Uuid::from_u128(0x0B0B);
+/// A user the store returns with a malformed (non-`Guid`) stored id.
+const CORRUPT_ID: Uuid = Uuid::from_u128(0x0C0C);
 
 /// Builds a neutral [`UserEntity`] with the given id + name (no `Default`).
 fn user_entity(id: Uuid, username: &str, password: Option<&str>) -> UserEntity {
@@ -137,6 +139,13 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        // A row whose stored `Id` is not a `Guid` — the corrupt-database shape
+        // `assert_can_update_user` must not mistake for the caller's own row.
+        if id == CORRUPT_ID {
+            let mut user = user_entity(CORRUPT_ID, "corrupt", None);
+            "not-a-guid".clone_into(&mut user.id);
+            return Ok(Some(user));
+        }
         Ok(mem_users().into_iter().find(|u| u.id == id.to_string()))
     }
     async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
@@ -513,6 +522,17 @@ fn state_with_activity(
     config: Arc<MemConfig>,
     activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
 ) -> AppState {
+    state_with_auth(users, config, activity, Arc::new(AdminAuth))
+}
+
+/// [`state_with_activity`] with a caller-supplied [`AuthService`], so a test can
+/// drive a handler as an API-key caller (no user) rather than as the admin.
+fn state_with_auth(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
@@ -529,7 +549,7 @@ fn state_with_activity(
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AdminAuth),
+        auth,
         Arc::new(OkQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1691,4 +1711,38 @@ async fn user_scoped_configuration_forwards() {
     let (id, config) = users.updated_configuration.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
     assert_eq!(config.audio_language_preference.as_deref(), Some("fr"));
+}
+
+/// `assert_can_update_user` compares the caller's id with the target's stored
+/// id. `AuthorizationInfo::user_id()` is the nil GUID for a caller with no user
+/// (an API key), so degrading an unparseable *target* id to nil as well made the
+/// two compare equal and granted the update — C# compares against `User.Id`, a
+/// `Guid` that is never `Guid.Empty` for a loaded user. A userless caller must
+/// be refused whatever the target row looks like.
+#[tokio::test]
+async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state_with_auth(
+        users,
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users?userId={CORRUPT_ID}"))
+                .header("X-Emby-Token", "t")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Name":"pwned"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a caller with no user must not be able to update a corrupt-id row"
+    );
 }

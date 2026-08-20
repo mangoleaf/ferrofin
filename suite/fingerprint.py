@@ -75,6 +75,17 @@ def capture(base, out, token=None, uid=None):
     fills = {"{itemId}": item_id, "{seriesId}": series_id, "{taskId}": task_id,
              "{userId}": uid, "{key}": "encoding"}
 
+    # Ops whose spec path param is spelled {itemId} but whose bench variant
+    # targets a DIFFERENT entity. Filling them from the generic movie id would
+    # hash a different subject than the row measures — a fingerprint that
+    # matches (or drifts) for the wrong reason. '' means "skip this op": a
+    # missing fingerprint only turns the drift check off (merge.py), whereas a
+    # wrong one is an actively misleading signal.
+    per_op = {
+        "GET /Shows/{itemId}/Similar": series_id,
+        "GET /Playlists/{itemId}/InstantMix": "",   # no playlist fixture here
+    }
+
     fp = {}
     for entry in reg:
         op = entry["op"]
@@ -84,6 +95,10 @@ def capture(base, out, token=None, uid=None):
             # the parity write journey (deep_verified) + expected-status instead.
             continue
         path = op.split(" ", 1)[1]
+        if op in per_op:
+            if not per_op[op]:
+                continue
+            path = path.replace("{itemId}", per_op[op])
         for var, val in fills.items():
             if val:
                 path = path.replace(var, val)

@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::{current_session, current_session_id, notify_user_data_changed};
 use crate::state::AppState;
 
@@ -83,7 +83,7 @@ async fn mark_played_item(
     Query(query): Query<MarkPlayedQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = parse_id(&user.id);
+    let user_id = user_uuid(&user)?;
     assert_item_exists(&state, item_id).await?;
 
     let dto = state
@@ -123,7 +123,7 @@ async fn mark_unplayed_item(
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = parse_id(&user.id);
+    let user_id = user_uuid(&user)?;
     assert_item_exists(&state, item_id).await?;
 
     let dto = state.user_data.mark_unplayed(user_id, item_id).await?;
@@ -146,7 +146,7 @@ async fn mark_played_for_user(
     Query(query): Query<MarkPlayedQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
-    let uid = parse_id(&user.id);
+    let uid = user_uuid(&user)?;
     assert_item_exists(&state, item_id).await?;
     let dto = state
         .user_data
@@ -170,7 +170,7 @@ async fn unmark_played_for_user(
     Path((user_id, item_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
-    let uid = parse_id(&user.id);
+    let uid = user_uuid(&user)?;
     assert_item_exists(&state, item_id).await?;
     let dto = state.user_data.mark_unplayed(uid, item_id).await?;
     notify_user_data_changed(&state, uid, &dto).await;
@@ -611,11 +611,6 @@ async fn kill_session_transcodes(
     if let Err(error) = state.hls.stop_encoding(&request).await {
         tracing::warn!(%error, "failed to stop transcodes for a stopped playback session");
     }
-}
-
-/// Parses a stored user-entity id string to a [`Uuid`], falling back to nil.
-fn parse_id(raw: &str) -> Uuid {
-    Uuid::parse_str(raw).unwrap_or_else(|_| Uuid::nil())
 }
 
 /// C# `ValidatePlayMethod`: without a transcoding job (no transcode manager is

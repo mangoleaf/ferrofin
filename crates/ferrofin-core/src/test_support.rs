@@ -106,6 +106,18 @@ struct ItemRow<'a> {
 
 /// The one `BaseItems` insert every item fixture goes through.
 async fn insert_base_item(db: &Database, id: Uuid, kind: BaseItemKind, row: &ItemRow<'_>) {
+    insert_base_item_raw_id(db, &guid_to_db(id), kind, row).await;
+}
+
+/// [`insert_base_item`] taking the `Id` column value verbatim, so a fixture can
+/// store an id that is *not* a `Guid` (the column is plain `TEXT`, so the shape
+/// exists even though no writer produces it).
+async fn insert_base_item_raw_id(
+    db: &Database,
+    raw_id: &str,
+    kind: BaseItemKind,
+    row: &ItemRow<'_>,
+) {
     sqlx::query(
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
@@ -114,7 +126,7 @@ async fn insert_base_item(db: &Database, id: Uuid, kind: BaseItemKind, row: &Ite
             "IndexNumber")
            VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
     )
-    .bind(guid_to_db(id))
+    .bind(raw_id)
     .bind(type_name(kind))
     .bind(i64::from(row.is_folder))
     .bind(i64::from(row.is_virtual))
@@ -131,6 +143,22 @@ async fn insert_base_item(db: &Database, id: Uuid, kind: BaseItemKind, row: &Ite
     .execute(db.writer())
     .await
     .expect("insert item");
+}
+
+/// Inserts a named `BaseItems` row whose stored `Id` is the given raw string
+/// rather than a `Guid` — the corrupt-row shape the read paths must not project
+/// into a DTO carrying the nil GUID.
+pub async fn seed_named_item_raw_id(db: &Database, raw_id: &str, kind: BaseItemKind, name: &str) {
+    insert_base_item_raw_id(
+        db,
+        raw_id,
+        kind,
+        &ItemRow {
+            name,
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts a minimal `BaseItems` row of the given kind.

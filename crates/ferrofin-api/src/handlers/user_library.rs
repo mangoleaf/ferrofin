@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;
 
@@ -138,7 +138,7 @@ async fn resolve_user_and_item(
     item_id: Uuid,
 ) -> Result<(Uuid, Uuid), ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
-    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_uuid = user_uuid(&user)?;
     let resolved_item = resolve_item_id(state, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
@@ -335,7 +335,7 @@ async fn get_item_user_data(
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_uuid = user_uuid(&user)?;
     // C# `GetItemById<BaseItem>` requires a real item (no empty-guid fallback).
     state
         .library
@@ -372,7 +372,7 @@ async fn update_item_user_data(
     Json(update): Json<UpdateUserItemDataDto>,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_uuid = user_uuid(&user)?;
     state
         .library
         .get_item_by_id(item_id)
@@ -565,7 +565,7 @@ async fn get_latest_media(
     use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_uuid = user_uuid(&user)?;
 
     // C#: an unset `isPlayed` defaults to `false` when the user hides played
     // items from the "latest" rows.

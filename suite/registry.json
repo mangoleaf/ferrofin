@@ -156,11 +156,33 @@
       ]
     },
     {
+      "op": "GET /DisplayPreferences/{displayPreferencesId}",
+      "tag": "DisplayPreferences",
+      "variants": [
+        {
+          "id": "display_preferences",
+          "params": "userId={userId}&client=emby",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Environment/DefaultDirectoryBrowser",
       "tag": "Environment",
       "variants": [
         {
           "id": "env_default_browser",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Environment/Drives",
+      "tag": "Environment",
+      "variants": [
+        {
+          "id": "env_drives",
           "params": "",
           "load": "default"
         }
@@ -173,6 +195,17 @@
         {
           "id": "env_network_shares",
           "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Environment/ParentPath",
+      "tag": "Environment",
+      "variants": [
+        {
+          "id": "env_parent_path",
+          "params": "path=%2Ftmp%2Fx",
           "load": "default"
         }
       ]
@@ -194,6 +227,17 @@
       "variants": [
         {
           "id": "genres",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Genres/{genreName}",
+      "tag": "Genres",
+      "variants": [
+        {
+          "id": "genre_detail",
           "params": "userId={userId}",
           "load": "default"
         }
@@ -443,12 +487,34 @@
       ]
     },
     {
+      "op": "GET /Items/{itemId}/MetadataEditor",
+      "tag": "ItemUpdate",
+      "variants": [
+        {
+          "id": "item_metadata_editor",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Items/{itemId}/PlaybackInfo",
       "tag": "MediaInfo",
       "variants": [
         {
           "id": "item_playbackinfo",
           "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Items/{itemId}/RemoteImages/Providers",
+      "tag": "RemoteImage",
+      "variants": [
+        {
+          "id": "item_remote_image_providers",
+          "params": "",
           "load": "default"
         }
       ]
@@ -553,11 +619,33 @@
       ]
     },
     {
+      "op": "GET /LiveTv/ChannelMappingOptions",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_channel_mapping_options",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /LiveTv/Channels",
       "tag": "LiveTv",
       "variants": [
         {
           "id": "livetv_channels",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/GuideInfo",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_guide_info",
           "params": "",
           "load": "default"
         }
@@ -580,6 +668,17 @@
       "variants": [
         {
           "id": "livetv_listing_default",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/ListingProviders/Lineups",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_listing_lineups",
           "params": "",
           "load": "default"
         }
@@ -668,6 +767,28 @@
       "variants": [
         {
           "id": "livetv_timers",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/Timers/Defaults",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_timer_defaults",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /LiveTv/TunerHosts/Types",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_tuner_types",
           "params": "",
           "load": "default"
         }
@@ -773,6 +894,28 @@
       ]
     },
     {
+      "op": "GET /Persons/{name}",
+      "tag": "Persons",
+      "variants": [
+        {
+          "id": "person_detail",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Playlists/{itemId}/InstantMix",
+      "tag": "InstantMix",
+      "variants": [
+        {
+          "id": "playlist_instant_mix",
+          "params": "userId={userId}&limit=20",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Playlists/{playlistId}",
       "tag": "Playlists",
       "variants": [
@@ -806,6 +949,17 @@
       ]
     },
     {
+      "op": "GET /Playlists/{playlistId}/Users/{userId}",
+      "tag": "Playlists",
+      "variants": [
+        {
+          "id": "playlist_user",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Plugins",
       "tag": "Plugins",
       "variants": [
@@ -822,6 +976,17 @@
       "variants": [
         {
           "id": "quick_connect",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Repositories",
+      "tag": "Package",
+      "variants": [
+        {
+          "id": "repositories",
           "params": "",
           "load": "default"
         }
@@ -894,6 +1059,17 @@
       ]
     },
     {
+      "op": "GET /Shows/{itemId}/Similar",
+      "tag": "Library",
+      "variants": [
+        {
+          "id": "shows_similar",
+          "params": "userId={userId}&limit=12",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /Shows/{seriesId}/Episodes",
       "tag": "TvShows",
       "variants": [
@@ -954,6 +1130,17 @@
       "variants": [
         {
           "id": "studios",
+          "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Studios/{name}",
+      "tag": "Studios",
+      "variants": [
+        {
+          "id": "studio_detail",
           "params": "userId={userId}",
           "load": "default"
         }
@@ -1092,6 +1279,28 @@
       ]
     },
     {
+      "op": "GET /Trailers",
+      "tag": "Trailers",
+      "variants": [
+        {
+          "id": "trailers",
+          "params": "userId={userId}&limit=50",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "GET /Trailers/{itemId}/Similar",
+      "tag": "Library",
+      "variants": [
+        {
+          "id": "trailers_similar",
+          "params": "userId={userId}&limit=12",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "GET /UserItems/Resume",
       "tag": "Items",
       "variants": [
@@ -1202,12 +1411,34 @@
       ]
     },
     {
+      "op": "GET /web/ConfigurationPages",
+      "tag": "Dashboard",
+      "variants": [
+        {
+          "id": "config_pages",
+          "params": "",
+          "load": "default"
+        }
+      ]
+    },
+    {
       "op": "POST /Items/{itemId}/PlaybackInfo",
       "tag": "MediaInfo",
       "variants": [
         {
           "id": "item_playbackinfo_post",
           "params": "userId={userId}",
+          "load": "default"
+        }
+      ]
+    },
+    {
+      "op": "POST /LiveTv/Programs",
+      "tag": "LiveTv",
+      "variants": [
+        {
+          "id": "livetv_programs_post",
+          "params": "",
           "load": "default"
         }
       ]

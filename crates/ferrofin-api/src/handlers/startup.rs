@@ -23,9 +23,9 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
 /// The startup-wizard server-configuration DTO (`StartupConfigurationDto`).
@@ -238,7 +238,7 @@ async fn update_startup_user(
         ));
     }
 
-    let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_id = user_uuid(&user)?;
     state.users.update_user(&user).await?;
 
     if let Some(name) = &body.name

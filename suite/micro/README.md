@@ -100,6 +100,10 @@ These are gaps in the harness, not server bugs. Check here before chasing a 0% r
   irrelevant to query/DTO work). Use the real suite for those.
 - **Endpoints needing fixtures the server cannot supply** — a row whose path or body names
   a `{…}` field neither `pick_items` nor `enrich_context` resolves fails loudly rather
-  than measuring the wrong thing.
+  than measuring the wrong thing. (`hit.sh` calls `enrich_context` on demand, so the rows
+  templating on `{seriesId}`, `{playlistId}`, `{genreName}`, `{studioName}` and
+  `{personName}` do resolve here — a `KeyError` means the *library* lacks that shape.)
 
-A row reading `0.0%` ok for one of the above means "not exercised", not "broken".
+A row reading `0.0%` ok for one of the above means "not exercised", not "broken". Those
+three image rows are the ONLY ones: every other row in `endpoints.py` was verified to
+answer its expected status against this harness (2026-08).

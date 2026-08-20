@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::handlers::item_update::opt_i32;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
 /// The server's transcode capabilities, fed to the [`StreamBuilder`] so it knows
@@ -151,7 +151,7 @@ async fn playback_info(
     flags: PlaybackFlags,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
-    let resolved_user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let resolved_user_id = user_uuid(&user)?;
     let mut media_sources = state
         .media_sources
         .get_playback_media_sources(item_id, resolved_user_id, true, true)

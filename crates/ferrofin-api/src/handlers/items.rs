@@ -62,6 +62,23 @@ pub(crate) async fn resolve_user(
         .ok_or_else(|| ApiError::NotFound(format!("user {effective}")))
 }
 
+/// The resolved user's id as a [`Uuid`].
+///
+/// [`UserEntity::id`] holds the hyphenated `Guid` text the row was written with
+/// (`guid_to_db`), so this is exactly the id the lookup used. A row whose id
+/// does not parse means a corrupt `Users` table — a state upstream cannot even
+/// express, because C# `User.Id` *is* a `Guid`. Report it as a backend failure
+/// (`500`) rather than degrading to the nil GUID, which would silently scope the
+/// request to *no* user: empty user data, no parental filtering, and a `UserId`
+/// no client can act on.
+pub(crate) fn user_uuid(user: &UserEntity) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(&user.id).map_err(|_| {
+        ApiError::Service(ferrofin_traits::ServiceError::Backend(
+            "stored user id is not a guid".to_owned(),
+        ))
+    })
+}
+
 /// Resolves the effective user *optionally*: like [`resolve_user`] but a nil
 /// effective id yields [`None`] rather than a `400`.
 ///

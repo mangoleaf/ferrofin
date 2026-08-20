@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAuth};
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
@@ -458,7 +458,7 @@ async fn get_media_folders(
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, None).await?;
-    let user_uuid = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_uuid = user_uuid(&user)?;
     // The media folders are the user-root children — the collection folders plus
     // the auto-provisioned Playlists folder — returned name-sorted by the view seam
     // (C# GetUserRootFolder().Children).

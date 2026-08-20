@@ -826,6 +826,14 @@ impl UserManager for FerrofinUserManager {
             return Ok(dto);
         }
 
+        // `UserDto.Id` is C# `User.Id`, a `Guid` that is never empty. Degrading a
+        // malformed stored id to the nil GUID would hand the client a `UserDto`
+        // it cannot act on — every later `/Users/{id}/…` call 404s — while the
+        // response still looks successful. Fail loudly instead. (Read after the
+        // cache probe so a hit stays free.)
+        let user_uuid = Uuid::parse_str(id)
+            .map_err(|_| ServiceError::Backend("stored user id is not a guid".to_owned()))?;
+
         // Captured before the perms/prefs reads below, so a policy change that
         // lands while this DTO is being assembled cancels the write rather than
         // parking the pre-change policy in the cache for a TTL.
@@ -869,11 +877,11 @@ impl UserManager for FerrofinUserManager {
                 .await,
         };
 
-        let policy = build_user_policy(pool, user, &perms, &prefs).await?;
+        let policy = build_user_policy(pool, user, user_uuid, &perms, &prefs).await?;
 
         let mut dto = UserDto {
             name: Some(user.username.clone()),
-            id: Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil()),
+            id: user_uuid,
             // The manager's own id (set by the composition root) so
             // `UserDto.ServerId` is never null; a caller-supplied id is applied
             // after caching so the cached copy stays caller-independent.
@@ -1173,6 +1181,7 @@ fn guid_pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<Uuid> {
 async fn build_user_policy(
     pool: &sqlx::sqlite::SqlitePool,
     user: &UserEntity,
+    user_uuid: Uuid,
     perms: &HashMap<i32, bool>,
     prefs: &HashMap<i32, String>,
 ) -> Result<UserPolicy, ServiceError> {
@@ -1234,7 +1243,7 @@ async fn build_user_policy(
         enable_collection_management: perm(perms, PermissionKind::EnableCollectionManagement),
         enable_subtitle_management: perm(perms, PermissionKind::EnableSubtitleManagement),
         enable_lyric_management: perm(perms, PermissionKind::EnableLyricManagement),
-        access_schedules: access_schedules(pool, id).await?,
+        access_schedules: access_schedules(pool, id, user_uuid).await?,
         blocked_tags,
         allowed_tags,
         enabled_channels,
@@ -1262,9 +1271,14 @@ async fn set_uuid_preference(
 }
 
 /// Loads a user's access schedules as wire [`AccessSchedule`] rows.
+///
+/// `user_id` is the stored `Guid` text used for the lookup; `uid` is that same
+/// id already parsed by the caller, so the emitted `AccessSchedule.UserId`
+/// cannot silently become the nil GUID.
 async fn access_schedules(
     pool: &sqlx::sqlite::SqlitePool,
     user_id: &str,
+    uid: Uuid,
 ) -> Result<Vec<AccessSchedule>, ServiceError> {
     let rows: Vec<(i64, i32, f64, f64)> = sqlx::query_as(
         r#"SELECT "Id", "DayOfWeek", "StartHour", "EndHour"
@@ -1274,7 +1288,6 @@ async fn access_schedules(
     .fetch_all(pool)
     .await
     .map_err(db_err)?;
-    let uid = Uuid::parse_str(user_id).unwrap_or_else(|_| Uuid::nil());
     Ok(rows
         .into_iter()
         .map(|(id, day, start, end)| AccessSchedule {

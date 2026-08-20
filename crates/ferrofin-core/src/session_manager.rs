@@ -332,7 +332,11 @@ impl FerrofinSessionManager {
 
         let key = Self::session_key(app_name, device_id);
         let now = Utc::now();
-        let user_id = user.map_or(Uuid::nil(), |u| parse_user_id(&u.id));
+        let user_id = match user {
+            // C# `SessionInfo.UserId` is `Guid.Empty` when no user is signed in.
+            None => Uuid::nil(),
+            Some(u) => parse_user_id(&u.id)?,
+        };
         let user_name = user.map(|u| u.username.clone());
 
         // The custom device name, if the device has one persisted.
@@ -670,7 +674,7 @@ impl SessionManager for FerrofinSessionManager {
         // push the change to the user's other devices.
         if !info.item_id.is_nil() {
             for user in self.users_for(&session).await? {
-                let user_id = parse_user_id(&user.id);
+                let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
                     .record_playback_start(user_id, info.item_id)
                     .await?;
@@ -714,7 +718,7 @@ impl SessionManager for FerrofinSessionManager {
         // push the change to the user's other devices.
         if !info.item_id.is_nil() {
             for user in self.users_for(&session).await? {
-                let user_id = parse_user_id(&user.id);
+                let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
                     .update_play_state(user_id, info.item_id, info.position_ticks)
                     .await?;
@@ -753,7 +757,7 @@ impl SessionManager for FerrofinSessionManager {
         // then push the change to the user's other devices.
         if !info.item_id.is_nil() && !info.failed {
             for user in self.users_for(&session).await? {
-                let user_id = parse_user_id(&user.id);
+                let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
                     .update_play_state(user_id, info.item_id, info.position_ticks)
                     .await?;
@@ -874,7 +878,7 @@ impl SessionManager for FerrofinSessionManager {
         let mut admin_ids = Vec::new();
         for user in self.user_manager.get_users().await? {
             if has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await? {
-                admin_ids.push(parse_user_id(&user.id));
+                admin_ids.push(parse_user_id(&user.id)?);
             }
         }
         self.broadcast(message_type, data, |s| {
@@ -1166,7 +1170,7 @@ impl SessionManager for FerrofinSessionManager {
             None
         } else {
             self.user_manager
-                .get_user_by_id(parse_user_id(&device.user_id))
+                .get_user_by_id(parse_user_id(&device.user_id)?)
                 .await?
         };
 
@@ -1308,7 +1312,7 @@ impl FerrofinSessionManager {
         }
 
         // Enforce the per-user max active sessions (C# check).
-        let user_uuid = parse_user_id(&user.id);
+        let user_uuid = parse_user_id(&user.id)?;
         if user.max_active_sessions >= 1 {
             let active = {
                 let sessions = self.sessions.lock().await;
@@ -1410,10 +1414,16 @@ fn require<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, ServiceErr
     }
 }
 
-/// Parses the hyphenated `UserEntity::id` string into a [`Uuid`], defaulting to
-/// the nil uuid on a malformed value (matching the C# `Guid.Empty` fallback).
-fn parse_user_id(id: &str) -> Uuid {
-    Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil())
+/// Parses the hyphenated `UserEntity::id` string into a [`Uuid`].
+///
+/// The nil GUID is *meaningful* in this module — it is C# `Guid.Empty`, a session
+/// with no signed-in user — so a malformed stored id must not degrade to it.
+/// Doing so would silently record playstate against the empty user (losing the
+/// real user's resume position), count another session's active sessions, or
+/// treat a userless session as the admin. A corrupt row is an error instead.
+fn parse_user_id(id: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(id)
+        .map_err(|_| ServiceError::Backend("stored user id is not a guid".to_owned()))
 }
 
 /// Maps the in-memory session state to the wire [`SessionInfoDto`]

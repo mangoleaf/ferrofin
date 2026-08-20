@@ -30,6 +30,9 @@ PATH_VARS = {
     "{taskId}": "{taskId}",
     "{userId}": "{userId}",
     "{imageTag}": "{tag}",
+    "{genreName}": "{genreName}",
+    "{studioName}": "{name}",
+    "{personName}": "{name}",
 }
 
 # Variants whose concrete path carries a literal where the spec has a param (e.g. the image
@@ -41,6 +44,12 @@ OP_OVERRIDES = {
         "/Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}"
         "/{percentPlayed}/{unplayedCount}",
     "/System/Configuration/encoding": "/System/Configuration/{key}",
+    # The spec names these path params after the *generic* item, not the
+    # concrete entity the bench row templates on.
+    "/Shows/{seriesId}/Similar": "/Shows/{itemId}/Similar",
+    "/Playlists/{playlistId}/InstantMix": "/Playlists/{itemId}/InstantMix",
+    # "usersettings" is the well-known displayPreferencesId jellyfin-web reads.
+    "/DisplayPreferences/usersettings": "/DisplayPreferences/{displayPreferencesId}",
 }
 
 

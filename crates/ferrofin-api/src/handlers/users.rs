@@ -55,6 +55,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
 /// The `AuthenticateByName` request body.
@@ -305,7 +306,12 @@ async fn assert_can_update_user(
     target: &UserEntity,
 ) -> Result<(), ApiError> {
     let caller_id = auth.user_id();
-    if caller_id == Uuid::parse_str(&target.id).unwrap_or_else(|_| Uuid::nil()) {
+    // `auth.user_id()` is the nil GUID for a caller with no user (an API key),
+    // and C# compares against `User.Id`, a real `Guid` that is never empty. So
+    // the self-update branch requires a real caller *and* a target whose stored
+    // id parses — degrading an unparseable target id to nil would make it
+    // compare equal to a userless caller and grant the update.
+    if !caller_id.is_nil() && Uuid::parse_str(&target.id).is_ok_and(|id| id == caller_id) {
         return Ok(());
     }
     if let Some(caller) = &auth.user
@@ -641,12 +647,11 @@ async fn create_user_by_name(
     Json(body): Json<CreateUserByName>,
 ) -> Result<Json<UserDto>, ApiError> {
     let new_user = state.users.create_user(&body.name).await?;
+    let id = user_uuid(&new_user)?;
     if let Some(password) = &body.password {
-        let id = Uuid::parse_str(&new_user.id).unwrap_or_else(|_| Uuid::nil());
         state.users.change_password(id, password.expose()).await?;
     }
     // Reload so the DTO reflects the password just set.
-    let id = Uuid::parse_str(&new_user.id).unwrap_or_else(|_| Uuid::nil());
     let reloaded = load_user(&state, id).await?;
     // Port of `UserCreatedLogger`.
     log_activity(

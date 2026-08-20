@@ -130,11 +130,17 @@ fn score(name: &str, term: &str) -> Option<f32> {
     }
 }
 
-/// Maps an item row to a [`SearchHint`] carrying the term that matched.
-fn to_hint(item: &BaseItemEntity, matched_term: &str) -> SearchHint {
-    let id = Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil());
+/// Maps an item row to a [`SearchHint`] carrying the term that matched, or
+/// [`None`] when the row id is not a stored `Guid`.
+///
+/// A hint is pure navigation: the client turns `Id`/`ItemId` straight into an
+/// `/Items/{id}` request. Emitting the nil GUID would hand it a hit that 404s,
+/// so an unparseable id drops the hint — the same choice `get_search_results`
+/// below already makes.
+fn to_hint(item: &BaseItemEntity, matched_term: &str) -> Option<SearchHint> {
+    let id = Uuid::parse_str(&item.id).ok()?;
     let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
-    SearchHint {
+    Some(SearchHint {
         item_id: id,
         id,
         name: item.name.clone(),
@@ -164,7 +170,7 @@ fn to_hint(item: &BaseItemEntity, matched_term: &str) -> SearchHint {
         channel_id: None,
         channel_name: None,
         primary_image_aspect_ratio: None,
-    }
+    })
 }
 
 /// Parses a stored `MediaType` string into the enum, defaulting to
@@ -203,7 +209,8 @@ impl SearchManager for FerrofinSearchManager {
             .iter()
             .filter_map(|item| {
                 let name = item.name.as_deref().unwrap_or_default();
-                score(name, &query.search_term).map(|s| (s, to_hint(item, &query.search_term)))
+                let s = score(name, &query.search_term)?;
+                Some((s, to_hint(item, &query.search_term)?))
             })
             .collect();
         // Highest score first; ties keep query order (stable sort).
@@ -245,7 +252,7 @@ mod tests {
     use super::*;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{seed_named_item, set_clean_name, test_db};
+    use crate::test_support::{seed_named_item, seed_named_item_raw_id, set_clean_name, test_db};
     use ferrofin_db::Database;
 
     fn manager(db: &Database) -> FerrofinSearchManager {
@@ -282,6 +289,44 @@ mod tests {
         assert_eq!(result.items.len(), 2);
         // "Matrix" (exact) ranks above "The Matrix Reloaded" (substring).
         assert_eq!(result.items[0].name.as_deref(), Some("Matrix"));
+    }
+
+    /// A `BaseItems` row whose stored `Id` is not a `Guid` must not surface as a
+    /// hint carrying the nil GUID: the client would turn `Id`/`ItemId` straight
+    /// into an `/Items/00000000-…` request that 404s. It is dropped instead —
+    /// and dropped from `TotalRecordCount` too, matching `get_search_results`.
+    #[tokio::test]
+    async fn hint_with_a_non_guid_row_id_is_dropped_not_emitted_as_nil() {
+        let db = test_db().await;
+        let good = Uuid::from_u128(0x201);
+        seed_named_item(&db, good, BaseItemKind::Movie, "Stalker").await;
+        set_clean_name(&db, good, "Stalker").await;
+        // A row the schema permits (`Id` is plain `TEXT`) but no writer emits.
+        seed_named_item_raw_id(&db, "not-a-guid", BaseItemKind::Movie, "Stalker 2").await;
+
+        let query = SearchQuery {
+            search_term: "stalker".to_owned(),
+            ..Default::default()
+        };
+        let result = manager(&db).get_search_hints(&query).await.expect("hints");
+
+        assert!(
+            result
+                .items
+                .iter()
+                .all(|h| !h.id.is_nil() && !h.item_id.is_nil()),
+            "no hint may carry the nil GUID"
+        );
+        assert_eq!(
+            result.items.len(),
+            1,
+            "only the row with a parseable id is hinted"
+        );
+        assert_eq!(result.items[0].id, good);
+        assert_eq!(
+            result.total_record_count, 1,
+            "the dropped row must not be counted either"
+        );
     }
 
     #[tokio::test]

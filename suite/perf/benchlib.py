@@ -22,6 +22,10 @@ import urllib.request
 USER = os.environ.get("BENCH_ADMIN_USER", "bench")
 PASS = os.environ.get("BENCH_ADMIN_PASSWORD", "benchpass123")
 
+# The playlist the playlist_* rows measure. Named, not id'd, so enrich_context
+# can find an existing one instead of creating a second every time it runs.
+PLAYLIST_NAME = "bench-playlist"
+
 # Modern `Authorization: MediaBrowser …` grammar only: 10.11 ships
 # EnableLegacyAuthorization=false, so X-Emby-Token/X-Emby-Authorization are
 # rejected by a fresh install of either server.
@@ -282,12 +286,35 @@ def pick_items(base, ctx):
     return ctx
 
 
+def first_name(base, ctx, route):
+    """The first by-name facet entry (`/Genres`, `/Studios`, `/Persons`, …),
+    URL-quoted for direct substitution into a path template.
+
+    Both servers sort these routes by SortName ascending, so "first" names the
+    same real-world entity on each even though the ids differ. Quoting happens
+    here, once: person and studio names carry spaces and apostrophes ("'Weird
+    Al' Yankovic"), and an unquoted one produces an invalid vegeta target
+    rather than a measurement. Returns '' when the library has no such facet
+    (the by-name detail row then 404s identically on both servers, matching the
+    rest of enrich_context's missing-shape convention)."""
+    j = get_json(f"{base}/{route}?userId={ctx['userId']}&limit=1", token_headers(ctx["token"])) or {}
+    items = j.get("Items") or []
+    return urllib.parse.quote(items[0].get("Name", "")) if items else ""
+
+
+def find_playlist(items, name):
+    """The id of the playlist called `name` in a `/Items` page, or '' — pure so
+    enrich_context's reuse-don't-recreate rule is unit-testable."""
+    return next((i.get("Id", "") for i in items if i.get("Name") == name), "")
+
+
 def enrich_context(base, ctx):
     """Resolve the extra context ids the expanded endpoint set needs, after
     auth + scan: the first series (TV browse), a scheduled task id, the picked
-    image item's cache tag, and a bench playlist (created if absent — fresh DB
-    per run). Fields default to '' so a library without that shape yields 404s
-    on both servers identically rather than breaking the run."""
+    image item's cache tag, the first genre/studio/person name (by-name detail
+    rows), and a bench playlist (reused if one already exists). Fields default
+    to '' so a library without that shape yields 404s on both servers
+    identically rather than breaking the run."""
     h = token_headers(ctx["token"])
     series = get_json(
         f"{base}/Items?userId={ctx['userId']}&recursive=true&includeItemTypes=Series"
@@ -301,11 +328,24 @@ def enrich_context(base, ctx):
     movies = img.get("Items") or []
     with_image = next((i for i in movies if (i.get("ImageTags") or {}).get("Primary")), None)
     ctx["imageTag"] = with_image["ImageTags"]["Primary"] if with_image else "0"
-    status, created = request(
-        "POST", f"{base}/Playlists",
-        {"Name": "bench-playlist", "UserId": ctx["userId"],
-         "Ids": [ctx["itemId"]] if ctx.get("itemId") else []}, h)
-    ctx["playlistId"] = (json.loads(created).get("Id", "") if status < 300 else "")
+    ctx["genreName"] = first_name(base, ctx, "Genres")
+    ctx["studioName"] = first_name(base, ctx, "Studios")
+    ctx["personName"] = first_name(base, ctx, "Persons")
+    # Reuse the bench playlist if one is already there. Creating unconditionally
+    # was fine for the suite's fresh-DB-per-run legs but not for the fast loop,
+    # which points many ctx refreshes at ONE long-lived database: every refresh
+    # added another "bench-playlist" item, so the Playlists folder — and the
+    # totals the /Items rows measure — drifted upward run over run.
+    existing = get_json(
+        f"{base}/Items?userId={ctx['userId']}&recursive=true&includeItemTypes=Playlist"
+        f"&limit=200", h) or {}
+    ctx["playlistId"] = find_playlist(existing.get("Items") or [], PLAYLIST_NAME)
+    if not ctx["playlistId"]:
+        status, created = request(
+            "POST", f"{base}/Playlists",
+            {"Name": PLAYLIST_NAME, "UserId": ctx["userId"],
+             "Ids": [ctx["itemId"]] if ctx.get("itemId") else []}, h)
+        ctx["playlistId"] = (json.loads(created).get("Id", "") if status < 300 else "")
     # Write rows target the LAST movie by SortName — never ctx.itemId (the read
     # rows' item), so write traffic can't drift a read row's body/fingerprint.
     ctx["writeItemId"] = movies[-1]["Id"] if movies else ctx.get("itemId", "")

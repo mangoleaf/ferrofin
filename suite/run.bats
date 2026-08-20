@@ -18,6 +18,12 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
   [ "$status" -eq 0 ]
 }
 
+@test "every contract operation is either benched or skipped with a reason" {
+  run python3 coverage.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"benchmark coverage OK"* ]]
+}
+
 @test "fingerprint shape hashing self-test passes" {
   run python3 fingerprint.py --selftest
   [ "$status" -eq 0 ]
@@ -25,6 +31,12 @@ setup() { cd "$BATS_TEST_DIRNAME"; }
 
 @test "merge verdict/manifest self-test passes (noise-floor ties + ratio floor)" {
   run python3 merge_selftest.py
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"all assertions passed"* ]]
+}
+
+@test "benchlib fixture self-test passes (playlist reuse + by-name quoting)" {
+  run python3 perf/benchlib_selftest.py
   [ "$status" -eq 0 ]
   [[ "$output" == *"all assertions passed"* ]]
 }

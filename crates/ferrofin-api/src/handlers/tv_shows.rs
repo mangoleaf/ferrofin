@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::{resolve_user, resolve_user_opt};
+use crate::handlers::items::{resolve_user, resolve_user_opt, user_uuid};
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
 
@@ -155,7 +155,7 @@ async fn get_next_up(
     Query(query): Query<NextUpParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil());
+    let user_id = user_uuid(&user)?;
     let options = build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
