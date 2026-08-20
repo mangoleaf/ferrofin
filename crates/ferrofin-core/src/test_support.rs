@@ -102,6 +102,8 @@ struct ItemRow<'a> {
     season: Option<i64>,
     /// `IndexNumber` — the episode number, for episodes.
     episode: Option<i64>,
+    /// `Data` — Jellyfin's serialized-item JSON blob.
+    data: Option<&'a str>,
 }
 
 /// The one `BaseItems` insert every item fixture goes through.
@@ -123,8 +125,8 @@ async fn insert_base_item_raw_id(
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "ParentId",
             "TopParentId", "SeriesPresentationUniqueKey", "ParentIndexNumber",
-            "IndexNumber")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            "IndexNumber", "Data")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
     )
     .bind(raw_id)
     .bind(type_name(kind))
@@ -140,9 +142,33 @@ async fn insert_base_item_raw_id(
     .bind(row.series_key)
     .bind(row.season)
     .bind(row.episode)
+    .bind(row.data)
     .execute(db.writer())
     .await
     .expect("insert item");
+}
+
+/// Inserts a named `BaseItems` row carrying a `Data` JSON blob — the column
+/// Jellyfin serializes an item's non-column properties into (photo EXIF,
+/// playlist membership, `VideoType`, …).
+pub async fn seed_item_with_data(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    data: &str,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            data: Some(data),
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts a minimal `BaseItems` row of the given kind.

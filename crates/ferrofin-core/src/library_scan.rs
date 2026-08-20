@@ -1036,12 +1036,7 @@ impl LibraryScanner {
             // The scan-upsert's `IsLocked` guard backstops the metadata
             // columns; file-derived facts (the probe) still update.
             let locked = self.is_item_locked(item.id).await;
-            let policy = item
-                .ancestors
-                .first()
-                .and_then(|id| fetcher_policies.get(id))
-                .copied()
-                .unwrap_or_default();
+            let policy = policy_for(item, &fetcher_policies);
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
@@ -1067,6 +1062,9 @@ impl LibraryScanner {
                 self.fetch_remote_metadata(&mut entity, &mut art_cache, policy)
                     .await
             };
+            // Photos carry their metadata inside the file, not on any remote
+            // provider; the Primary image this sets is the photo itself.
+            let photo_images = self.enrich_photo(&mut entity, locked).await;
             if people.is_empty() {
                 people = remote.people;
             }
@@ -1119,8 +1117,13 @@ impl LibraryScanner {
             // Artwork — locked items skip the rewrite entirely: their image
             // rows are user-owned.
             if !locked {
-                self.persist_artwork(item.id, &entity, &streams, &mut art_cache, policy)
-                    .await;
+                let art = ArtworkPass {
+                    entity: &entity,
+                    streams: &streams,
+                    policy,
+                    photo_images,
+                };
+                self.persist_artwork(item.id, art, &mut art_cache).await;
             }
             // Per-library refresh % for open dashboards (`RefreshProgress`),
             // at the same bounded cadence as the progress log plus each
@@ -2118,6 +2121,77 @@ impl LibraryScanner {
         RemoteMetadata::default()
     }
 
+    /// The photo embedded-information pass — port of `Emby.Photos.PhotoProvider`.
+    ///
+    /// Sets the Primary image to the photo file itself, reads the EXIF tags off
+    /// it, and writes them onto the row: the dedicated columns Ferrofin has
+    /// (name/overview/rating/dates/width/height) plus the EXIF-only fields,
+    /// which live in the `Data` blob under Jellyfin's own property names.
+    ///
+    /// Returns the Primary image row for the artwork pass to persist. A locked
+    /// item is skipped entirely, as it is for every other provider.
+    async fn enrich_photo(&self, entity: &mut BaseItemEntity, locked: bool) -> Vec<ItemImageInfo> {
+        if !entity.type_.ends_with(".Photo") {
+            return Vec::new();
+        }
+        let Some(processor) = self.image_processor.as_ref() else {
+            return Vec::new();
+        };
+        let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
+            return Vec::new();
+        };
+        let item_id = Uuid::parse_str(&entity.id).unwrap_or_else(|_| Uuid::nil());
+        let mut photo = ferrofin_drawing::photo_provider::PhotoItem {
+            id: item_id,
+            path,
+            is_file_protocol: true,
+            width: entity
+                .width
+                .and_then(|w| i32::try_from(w).ok())
+                .unwrap_or(0),
+            height: entity
+                .height
+                .and_then(|h| i32::try_from(h).ok())
+                .unwrap_or(0),
+            name: entity.name.clone(),
+            name_locked: locked,
+            ..Default::default()
+        };
+        let provider = ferrofin_drawing::photo_provider::PhotoProvider::new(Arc::clone(processor));
+        if let Err(err) = provider.fetch(&mut photo).await {
+            tracing::warn!(%err, item = %entity.id, "photo embedded-information pass failed");
+            return Vec::new();
+        }
+        if photo.width > 0 {
+            entity.width = Some(i64::from(photo.width));
+        }
+        if photo.height > 0 {
+            entity.height = Some(i64::from(photo.height));
+        }
+        if !locked {
+            if let Some(name) = photo.name.filter(|n| !n.is_empty()) {
+                entity.name = Some(name);
+            }
+            if photo.overview.is_some() {
+                entity.overview = photo.overview;
+            }
+            if photo.community_rating.is_some() {
+                entity.community_rating = photo.community_rating;
+            }
+            if let Some(taken) = photo.date_taken {
+                entity.premiere_date = Some(taken);
+                entity.production_year = photo.production_year.map(i64::from);
+            }
+        }
+        if let Some(data) = crate::item_data::merge_data_fields(
+            entity.data.as_deref(),
+            &photo_exif_fields(&photo.exif),
+        ) {
+            entity.data = Some(data);
+        }
+        photo.images
+    }
+
     /// The OMDb fetcher — port of `OmdbItemProvider` and `OmdbEpisodeProvider`.
     ///
     /// Movies and series resolve through OMDb's exact-title endpoint (upstream's
@@ -2638,11 +2712,25 @@ impl LibraryScanner {
     async fn persist_artwork(
         &self,
         item_id: Uuid,
-        entity: &BaseItemEntity,
-        streams: &[MediaStreamInfoEntity],
+        art: ArtworkPass<'_>,
         art_cache: &mut ArtworkCache,
-        policy: FetcherPolicy<'_>,
     ) {
+        let ArtworkPass {
+            entity,
+            streams,
+            policy,
+            photo_images,
+        } = art;
+        // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
+        // before any discovery runs), so it needs none of the chain below.
+        if !photo_images.is_empty() {
+            let mut images = photo_images;
+            self.fill_image_metadata(&mut images).await;
+            if let Err(err) = self.persistence.save_item_images(item_id, &images).await {
+                tracing::warn!(%err, item = %item_id, "failed to persist photo artwork");
+            }
+            return;
+        }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // "Local Images" is the media-adjacent discovery (poster.jpg next
         // to the file); the metadata art dir below is Ferrofin-owned
@@ -3148,8 +3236,21 @@ impl LibraryScanner {
                         | CollectionTypeOptions::homevideos
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
-                    ) => self.plan_movies(location, location, cf, &naming, &mut out),
-                    // books / photos / boxsets / … aren't scanned in v1.
+                    ) => {
+                        self.plan_movies(location, location, cf, &naming, &mut out);
+                        // Upstream folds the separate `photos` collection type
+                        // into `homevideos`, where photos are resolved only when
+                        // the library enables them (`PhotoResolver.Resolve`).
+                        if folder.collection_type == Some(CollectionTypeOptions::homevideos)
+                            && folder
+                                .library_options
+                                .as_ref()
+                                .is_none_or(|o| o.enable_photos)
+                        {
+                            self.plan_photos(location, cf, cf, &naming, &mut out);
+                        }
+                    }
+                    // books / boxsets / … aren't scanned in v1.
                     Some(_) => {}
                 }
             }
@@ -3657,6 +3758,85 @@ impl LibraryScanner {
         self.plan_music_album(dir, cf, naming, out);
     }
 
+    /// Resolves the photos under `dir` — port of `PhotoResolver` and
+    /// `PhotoAlbumResolver`.
+    ///
+    /// Every image file that is not artwork owned by a sibling video becomes a
+    /// `Photo`; a **sub**directory holding at least one such image becomes a
+    /// `PhotoAlbum` its photos hang off (the library root is the collection
+    /// folder itself and never an album, matching upstream's `args.Parent.IsRoot`
+    /// guard elsewhere in the resolver chain).
+    fn plan_photos(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        parent: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        let entries = self.file_system.get_file_system_entries(dir);
+        let files: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.type_ != FileSystemEntryType::Directory)
+            .map(|e| e.path.as_str())
+            .collect();
+        let photos: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|path| is_photo_file(path))
+            .filter(|path| !is_owned_by_media(&files, path, naming))
+            .collect();
+
+        // A sub-directory with photos in it is a PhotoAlbum; the library root
+        // parents its loose photos directly.
+        let (photo_parent, ancestors) = if !photos.is_empty() && parent != cf {
+            let name = file_stem(dir);
+            match self.base_item(BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
+                Some((album_id, album)) => {
+                    let mut ancestors = vec![cf];
+                    if parent != cf {
+                        ancestors.push(parent);
+                    }
+                    out.push(Planned {
+                        id: album_id,
+                        entity: album,
+                        ancestors: ancestors.clone(),
+                    });
+                    ancestors.push(album_id);
+                    (album_id, ancestors)
+                }
+                None => (parent, vec![cf]),
+            }
+        } else {
+            (parent, vec![cf])
+        };
+
+        for path in photos {
+            let Some((id, mut entity)) = self.base_item(
+                BaseItemKind::Photo,
+                cf,
+                photo_parent,
+                file_stem(path),
+                path,
+                false,
+            ) else {
+                continue;
+            };
+            entity.media_type = Some("Photo".to_owned());
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: ancestors.clone(),
+            });
+        }
+
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_photos(&entry.path, cf, photo_parent, naming, out);
+            }
+        }
+    }
+
     /// Resolves one directory beneath a music library: a `MusicAlbum` (port of
     /// `MusicAlbumResolver`), or a container to walk through — an artist folder
     /// or one of its release subfolders (`albums`, `live`, …).
@@ -3847,6 +4027,114 @@ fn collage_item_kinds(folder: &VirtualFolderInfo) -> Vec<BaseItemKind> {
             BaseItemKind::Series,
         ],
     }
+}
+
+/// Projects the EXIF fields onto their `Data` keys, in C#'s `Photo` property
+/// spelling. A `None` clears the key (see
+/// [`merge_data_fields`](crate::item_data::merge_data_fields)).
+fn photo_exif_fields(
+    exif: &ferrofin_drawing::photo_provider::PhotoExif,
+) -> Vec<(&'static str, Option<serde_json::Value>)> {
+    let text = |value: &Option<String>| value.clone().map(serde_json::Value::String);
+    let number = |value: Option<f64>| value.and_then(serde_json::Number::from_f64).map(Into::into);
+    vec![
+        ("CameraMake", text(&exif.camera_make)),
+        ("CameraModel", text(&exif.camera_model)),
+        ("Software", text(&exif.software)),
+        ("ExposureTime", number(exif.exposure_time)),
+        ("FocalLength", number(exif.focal_length)),
+        (
+            "Orientation",
+            exif.orientation
+                .map(|o| serde_json::Value::String(format!("{o:?}"))),
+        ),
+        ("Aperture", number(exif.aperture)),
+        ("ShutterSpeed", number(exif.shutter_speed)),
+        ("Latitude", number(exif.latitude)),
+        ("Longitude", number(exif.longitude)),
+        ("Altitude", number(exif.altitude)),
+        (
+            "IsoSpeedRating",
+            exif.iso_speed_rating.map(serde_json::Value::from),
+        ),
+    ]
+}
+
+/// One item's inputs to the artwork pass, grouped so
+/// [`LibraryScanner::persist_artwork`] keeps a readable signature.
+struct ArtworkPass<'a> {
+    /// The scanned row (already enriched, not yet re-read from the DB).
+    entity: &'a BaseItemEntity,
+    /// The row's probed media streams — the embedded-cover source.
+    streams: &'a [MediaStreamInfoEntity],
+    /// The owning library's image-fetcher gate.
+    policy: FetcherPolicy<'a>,
+    /// A photo's own file as its Primary image, when the row is a photo.
+    photo_images: Vec<ItemImageInfo>,
+}
+
+/// The fetcher policy of the library an item belongs to — every `Planned` item
+/// carries its collection-folder id as its first ancestor. A library with no
+/// resolved options gets the permissive default.
+fn policy_for<'a>(
+    item: &Planned,
+    policies: &'a std::collections::HashMap<Uuid, FetcherPolicy<'a>>,
+) -> FetcherPolicy<'a> {
+    item.ancestors
+        .first()
+        .and_then(|id| policies.get(id))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Filename prefixes that mark an image as *artwork*, never a photo. Port of
+/// `PhotoResolver._ignoreFiles` (matched case-insensitively as a prefix).
+const PHOTO_IGNORE_PREFIXES: [&str; 9] = [
+    "folder",
+    "thumb",
+    "landscape",
+    "fanart",
+    "backdrop",
+    "poster",
+    "cover",
+    "logo",
+    "default",
+];
+
+/// The image extensions a photo may have — port of the C# encoder's
+/// `SupportedInputFormats`, which is what `PhotoResolver.IsImageFile` tests
+/// against.
+const PHOTO_EXTENSIONS: [&str; 17] = [
+    "jpeg", "jpg", "png", "dng", "webp", "gif", "bmp", "ico", "astc", "ktx", "pkm", "wbmp", "cr2",
+    "nef", "arw", "svg", "tiff",
+];
+
+/// Whether `path` is an image file that is not artwork — port of
+/// `PhotoResolver.IsImageFile`.
+fn is_photo_file(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !PHOTO_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        return false;
+    }
+    let stem = stem.to_ascii_lowercase();
+    !PHOTO_IGNORE_PREFIXES
+        .iter()
+        .any(|prefix| stem.starts_with(prefix))
+}
+
+/// Whether `path` is artwork belonging to one of the `siblings` videos — port of
+/// `PhotoResolver.IsOwnedByMedia`: a video file in the same directory whose own
+/// stem is a prefix of the image's stem (so `Movie-thumb.jpg` belongs to
+/// `Movie.mkv`).
+fn is_owned_by_media(siblings: &[&str], path: &str, naming: &NamingOptions) -> bool {
+    let stem = file_stem(path).to_ascii_lowercase();
+    siblings.iter().any(|sibling| {
+        video_resolver::is_video_file(sibling, naming)
+            && stem.starts_with(&file_stem(sibling).to_ascii_lowercase())
+    })
 }
 
 /// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
@@ -4797,6 +5085,136 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    // PhotoResolver.IsImageFile: the extension set, minus the artwork prefixes.
+    #[test]
+    fn photo_files_exclude_artwork_and_non_images() {
+        assert!(super::is_photo_file("/p/DSC_0001.JPG"));
+        assert!(super::is_photo_file("/p/holiday.png"));
+        assert!(super::is_photo_file("/p/raw.cr2"));
+        // Artwork prefixes are never photos, whatever their case.
+        for artwork in [
+            "folder.jpg",
+            "Thumb.png",
+            "landscape.jpg",
+            "fanart.jpg",
+            "backdrop.jpg",
+            "poster.png",
+            "cover.jpg",
+            "logo.png",
+            "default.jpg",
+        ] {
+            assert!(
+                !super::is_photo_file(&format!("/p/{artwork}")),
+                "{artwork} is artwork, not a photo"
+            );
+        }
+        // A prefix match, as upstream does it: "poster-2.jpg" is still artwork.
+        assert!(!super::is_photo_file("/p/poster-2.jpg"));
+        assert!(!super::is_photo_file("/p/clip.mkv"));
+        assert!(!super::is_photo_file("/p/no-extension"));
+    }
+
+    // PhotoResolver.IsOwnedByMedia: an image whose stem starts with a sibling
+    // video's stem is that video's artwork, not a photo of its own.
+    #[test]
+    fn images_owned_by_a_sibling_video_are_not_photos() {
+        let naming = super::NamingOptions::new();
+        let siblings = ["/m/Movie.mkv", "/m/Movie-thumb.jpg", "/m/Sunset.jpg"];
+        assert!(super::is_owned_by_media(
+            &siblings,
+            "/m/Movie-thumb.jpg",
+            &naming
+        ));
+        assert!(!super::is_owned_by_media(
+            &siblings,
+            "/m/Sunset.jpg",
+            &naming
+        ));
+    }
+
+    // The EXIF fields round-trip through the `Data` blob under Jellyfin's own
+    // property names, so an adopted database keeps its photo metadata.
+    #[test]
+    fn photo_exif_fields_use_jellyfins_data_keys() {
+        let exif = ferrofin_drawing::photo_provider::PhotoExif {
+            camera_make: Some("ACME".into()),
+            aperture: Some(2.8),
+            orientation: Some(ferrofin_model::drawing::ImageOrientation::RightTop),
+            iso_speed_rating: Some(400),
+            ..Default::default()
+        };
+        let fields = super::photo_exif_fields(&exif);
+        let keys: Vec<_> = fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            crate::item_data::PHOTO_EXIF_KEYS,
+            "the Data keys must match the ones Jellyfin serializes"
+        );
+        let data = crate::item_data::merge_data_fields(None, &fields).expect("data");
+        let parsed = crate::item_data::parse_data(Some(&data));
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "CameraMake").as_deref(),
+            Some("ACME")
+        );
+        assert_eq!(
+            crate::item_data::read_data_f64(&parsed, "Aperture"),
+            Some(2.8)
+        );
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "Orientation").as_deref(),
+            Some("RightTop")
+        );
+        assert_eq!(
+            crate::item_data::read_data_i32(&parsed, "IsoSpeedRating"),
+            Some(400)
+        );
+        // A field the file has no value for is absent, not null.
+        assert!(!parsed.contains_key("CameraModel"));
+    }
+
+    // A re-scan of a photo whose EXIF was stripped must clear the stale values
+    // rather than leave the old ones behind.
+    #[test]
+    fn re_scanning_a_stripped_photo_clears_its_exif_keys() {
+        let with_exif = crate::item_data::merge_data_fields(
+            None,
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif {
+                camera_make: Some("ACME".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("data");
+        let cleared = crate::item_data::merge_data_fields(
+            Some(&with_exif),
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif::default()),
+        )
+        .expect("data changed");
+        assert!(!crate::item_data::parse_data(Some(&cleared)).contains_key("CameraMake"));
+    }
+
+    // Unrelated Data keys (playlist membership, VideoType, …) survive the merge.
+    #[test]
+    fn merging_exif_preserves_other_data_keys() {
+        let existing = crate::item_data::set_data_field(None, "VideoType", "VideoFile");
+        let merged = crate::item_data::merge_data_fields(
+            existing.as_deref(),
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif {
+                software: Some("Darktable".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("data");
+        let parsed = crate::item_data::parse_data(Some(&merged));
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "VideoType").as_deref(),
+            Some("VideoFile")
+        );
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "Software").as_deref(),
+            Some("Darktable")
+        );
     }
 
     /// An OMDb record parsed from a body shaped like the real API's.

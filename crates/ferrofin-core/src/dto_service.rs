@@ -308,6 +308,57 @@ fn row_id(item: &BaseItemEntity) -> Uuid {
     Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())
 }
 
+/// Copies a photo's EXIF fields out of the row's `Data` blob onto the DTO —
+/// the read side of the scan's `Emby.Photos.PhotoProvider` port.
+///
+/// C# serializes the whole `Photo` object into `Data` and its `DtoService`
+/// copies each property across; Ferrofin stores only the EXIF keys there (under
+/// the same names) and reads them back here. Ungated by `ItemFields`, as the
+/// C# assignments are.
+fn attach_photo_exif(dto: &mut BaseItemDto, item: &BaseItemEntity) {
+    use crate::item_data::{read_data_f64, read_data_i32, read_data_string};
+
+    if dto.type_ != BaseItemKind::Photo {
+        return;
+    }
+    let data = crate::item_data::parse_data(item.data.as_deref());
+    if data.is_empty() {
+        return;
+    }
+    dto.camera_make = read_data_string(&data, "CameraMake");
+    dto.camera_model = read_data_string(&data, "CameraModel");
+    dto.software = read_data_string(&data, "Software");
+    dto.exposure_time = read_data_f64(&data, "ExposureTime");
+    dto.focal_length = read_data_f64(&data, "FocalLength");
+    dto.aperture = read_data_f64(&data, "Aperture");
+    dto.shutter_speed = read_data_f64(&data, "ShutterSpeed");
+    dto.latitude = read_data_f64(&data, "Latitude");
+    dto.longitude = read_data_f64(&data, "Longitude");
+    dto.altitude = read_data_f64(&data, "Altitude");
+    dto.iso_speed_rating = read_data_i32(&data, "IsoSpeedRating");
+    dto.image_orientation = read_data_string(&data, "Orientation")
+        .as_deref()
+        .and_then(image_orientation_from_name);
+}
+
+/// The `ImageOrientation` whose name matches `value` (the `Data` blob stores
+/// the enum as its C# name, e.g. `"RightTop"`).
+fn image_orientation_from_name(value: &str) -> Option<ferrofin_model::drawing::ImageOrientation> {
+    use ferrofin_model::drawing::ImageOrientation as O;
+    [
+        O::TopLeft,
+        O::TopRight,
+        O::BottomRight,
+        O::BottomLeft,
+        O::LeftTop,
+        O::RightTop,
+        O::RightBottom,
+        O::LeftBottom,
+    ]
+    .into_iter()
+    .find(|o| format!("{o:?}").eq_ignore_ascii_case(value))
+}
+
 /// The [`BaseItemKind`] of a row, defaulting to [`BaseItemKind::Folder`] for an
 /// unrecognized stored `Type` (the conservative default used across the crate).
 fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
@@ -1365,6 +1416,8 @@ impl FerrofinDtoService {
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok());
 
+        attach_photo_exif(dto, item);
+
         Ok(())
     }
 
@@ -2121,8 +2174,8 @@ mod tests {
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
-        fetch_item, fetch_item_opt, image_info, seed_folder_item, seed_images, seed_named_item,
-        seed_provider_id, seed_user, test_db,
+        fetch_item, fetch_item_opt, image_info, seed_folder_item, seed_images, seed_item_with_data,
+        seed_named_item, seed_provider_id, seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -3339,6 +3392,65 @@ mod tests {
 
         assert_eq!(dto.provider_ids.as_ref().unwrap()["Imdb"], "tt1375666");
         assert_eq!(dto.external_urls.as_ref().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_photos_exif_fields_come_back_out_of_the_data_blob() {
+        // The scan writes the EXIF under Jellyfin's own property names; the DTO
+        // reads them back so a client's photo detail page has them.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        let data = r#"{"CameraMake":"ACME","CameraModel":"X1","Software":"Darktable",
+            "ExposureTime":0.008,"FocalLength":35.0,"Orientation":"RightTop",
+            "Aperture":2.8,"ShutterSpeed":7.0,"Latitude":51.5,"Longitude":-0.12,
+            "Altitude":11.0,"IsoSpeedRating":400}"#;
+        seed_item_with_data(&db, id, BaseItemKind::Photo, "DSC_0001", data).await;
+
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.camera_make.as_deref(), Some("ACME"));
+        assert_eq!(dto.camera_model.as_deref(), Some("X1"));
+        assert_eq!(dto.software.as_deref(), Some("Darktable"));
+        assert_eq!(dto.exposure_time, Some(0.008));
+        assert_eq!(dto.focal_length, Some(35.0));
+        assert_eq!(dto.aperture, Some(2.8));
+        assert_eq!(dto.shutter_speed, Some(7.0));
+        assert_eq!(dto.latitude, Some(51.5));
+        assert_eq!(dto.longitude, Some(-0.12));
+        assert_eq!(dto.altitude, Some(11.0));
+        assert_eq!(dto.iso_speed_rating, Some(400));
+        assert_eq!(
+            dto.image_orientation,
+            Some(ferrofin_model::drawing::ImageOrientation::RightTop)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_movie_never_grows_photo_fields() {
+        // The EXIF keys only mean anything on a Photo; a movie whose Data blob
+        // happens to carry one must not sprout a camera on its detail page.
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            id,
+            BaseItemKind::Movie,
+            "M",
+            r#"{"CameraMake":"ACME"}"#,
+        )
+        .await;
+        let item = fetch_item(&db, id).await;
+        let svc = service(db);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.camera_make, None);
     }
 
     #[tokio::test]
