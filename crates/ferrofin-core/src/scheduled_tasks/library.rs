@@ -701,32 +701,42 @@ impl ScheduledTask for ChapterImagesTask {
         // blocklist. A misconfigured server must fail the task, loudly and
         // once, and leave the history untouched.
         for dir in [
+            // ffmpeg writes the frame here …
             std::path::PathBuf::from(self.paths.temp_path()),
+            // … and it is then moved under the internal metadata tree. Both
+            // live on the cache/metadata volume, and the outage this guards
+            // against — root-owned directories left by a container that once
+            // ran as root — hits whichever of them it happens to have created.
+            // Probing only the first leaves the same failure one directory
+            // over: extraction succeeds, every move fails, the library is
+            // blocklisted again.
+            std::path::PathBuf::from(self.paths.internal_metadata_path()),
             fail_history_path
                 .parent()
                 .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf),
         ] {
+            // Returned, not logged: the task runner logs a failed task once, at
+            // the outermost layer, and the message names the directory.
             if let Err(e) = ferrofin_util::file_helper::ensure_writable_dir(&dir) {
-                tracing::error!(
-                    directory = %dir.display(),
-                    error = %e,
-                    "chapter image extraction cannot write to a directory it needs; \
-                     no images can be produced until this is fixed"
-                );
                 return Err(ServiceError::backend(format!(
-                    "chapter image extraction needs a writable `{}`: {e}",
+                    "chapter image extraction needs a writable `{}`, so no images \
+                     can be produced until this is fixed: {e}",
                     dir.display()
                 )));
             }
         }
-        let mut failed: Vec<String> = std::fs::read_to_string(&fail_history_path)
-            .map(|text| {
-                text.split('|')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // A set, and lowercased once: the lookup is per video, and a history
+        // that has grown to thousands of entries turns a linear scan per video
+        // into O(videos × history).
+        let mut failed: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(&fail_history_path)
+                .map(|text| {
+                    text.split('|')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_lowercase)
+                        .collect()
+                })
+                .unwrap_or_default();
 
         // A blocklist this large is almost always the fingerprint of a past
         // systemic failure (an unwritable temp directory failing every
@@ -743,7 +753,7 @@ impl ScheduledTask for ChapterImagesTask {
         }
 
         let total = videos.len().max(1);
-        let mut history_write_failed = false;
+        let mut history_dirty = false;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -762,8 +772,8 @@ impl ScheduledTask for ChapterImagesTask {
                 .ok()
                 .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            let history_key = format!("{path}{mtime}");
-            if failed.iter().any(|k| k.eq_ignore_ascii_case(&history_key)) {
+            let history_key = format!("{path}{mtime}").to_lowercase();
+            if failed.contains(&history_key) {
                 continue;
             }
             let outcome = self
@@ -775,21 +785,24 @@ impl ScheduledTask for ChapterImagesTask {
             // A failed video (extraction failure or refresh error) joins the
             // failure history so it is skipped until its file changes.
             if !matches!(outcome, Ok(true)) {
-                failed.push(history_key);
-                if let Err(e) = std::fs::write(&fail_history_path, failed.join("|"))
-                    && !history_write_failed
-                {
-                    // Once per run: the cause is the file, not the video, so a
-                    // per-item warning is one line per video in the library.
-                    history_write_failed = true;
-                    tracing::warn!(
-                        path = %fail_history_path.display(),
-                        error = %e,
-                        "cannot write the chapter failure history; failures will be retried \
-                         on every run until this is fixed"
-                    );
-                }
+                failed.insert(history_key);
+                history_dirty = true;
             }
+        }
+        // Written once, after the loop: rewriting the whole file per failure
+        // made a systemic failure quadratic in the history's own size.
+        if history_dirty
+            && let Err(e) = std::fs::write(
+                &fail_history_path,
+                failed.iter().cloned().collect::<Vec<_>>().join("|"),
+            )
+        {
+            tracing::warn!(
+                path = %fail_history_path.display(),
+                error = %e,
+                "cannot write the chapter failure history; failures will be retried \
+                 on every run until this is fixed"
+            );
         }
         progress.report(100.0);
         Ok(())
