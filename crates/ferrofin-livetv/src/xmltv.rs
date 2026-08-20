@@ -92,29 +92,23 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = local_name(&e);
-                match name.as_str() {
-                    "channel" => {
+                match e.local_name().as_ref() {
+                    b"channel" => {
                         channel = Some(XmltvChannel {
-                            id: attr(&e, "id").unwrap_or_default(),
+                            id: attr(&e, b"id").unwrap_or_default(),
                             ..XmltvChannel::default()
                         });
                     }
-                    "programme" => {
-                        programme = Some(XmltvProgramme {
-                            channel_id: attr(&e, "channel").unwrap_or_default(),
-                            start: attr(&e, "start").as_deref().and_then(parse_xmltv_time),
-                            stop: attr(&e, "stop").as_deref().and_then(parse_xmltv_time),
-                            ..XmltvProgramme::default()
-                        });
+                    b"programme" => {
+                        programme = Some(read_programme(&e));
                     }
                     _ => {}
                 }
                 text.clear();
             }
             Ok(Event::Empty(e)) => {
-                let name = local_name(&e);
-                apply_empty(&name, &e, channel.as_mut(), programme.as_mut());
+                let name = e.local_name();
+                apply_empty(name.as_ref(), &e, channel.as_mut(), programme.as_mut());
             }
             Ok(Event::Text(e)) => {
                 if let Ok(t) = e.unescape() {
@@ -125,15 +119,16 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
                 text.push_str(&String::from_utf8_lossy(e.as_ref()));
             }
             Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                apply_end(&name, &text, channel.as_mut(), programme.as_mut());
-                match name.as_str() {
-                    "channel" => {
+                let name = e.local_name();
+                let name = name.as_ref();
+                apply_end(name, &text, channel.as_mut(), programme.as_mut());
+                match name {
+                    b"channel" => {
                         if let Some(c) = channel.take() {
                             out.channels.push(c);
                         }
                     }
-                    "programme" => {
+                    b"programme" => {
                         if let Some(p) = programme.take() {
                             out.programmes.push(p);
                         }
@@ -150,34 +145,75 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
     out
 }
 
+/// An attribute's value with XML entity references resolved, falling back to the
+/// raw bytes when the value will not unescape.
+///
+/// Resolution matters for parity: `.NET`'s `XmlReader.GetAttribute` — what
+/// Jellyfin's `XmlTvReader` calls — unescapes attribute values, so a
+/// `channel="A&amp;E.us"` has to join against the tuner's `tvg-id="A&E.us"`.
+///
+/// The fallback is what keeps a sloppy guide working. `unescape_value` fails on
+/// a bare `&` (`http://x?a=1&b=2`) and on a reference to an entity XMLTV never
+/// defines, both of which real generators emit. Dropping the attribute there
+/// would empty `channel_id` and silently discard every programme on that
+/// channel — the exact failure this function exists to prevent, just moved to a
+/// different input. Returning the raw text instead keeps the join key that
+/// already matched before entity resolution was added.
+///
+/// This is deliberately more lenient than upstream: `.NET`'s `XmlReader` throws
+/// `XmlException` on a bare `&`, so Jellyfin fails the whole guide refresh. A
+/// guide that mostly parses is more useful than no guide at all.
+fn unescaped_or_raw(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
+    a.unescape_value().map_or_else(
+        |_| String::from_utf8_lossy(a.value.as_ref()).into_owned(),
+        std::borrow::Cow::into_owned,
+    )
+}
+
+/// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
+/// single pass over the attribute list.
+fn read_programme(e: &BytesStart<'_>) -> XmltvProgramme {
+    let mut p = XmltvProgramme::default();
+    for a in e.attributes().flatten() {
+        let value = unescaped_or_raw(&a);
+        match a.key.local_name().as_ref() {
+            b"channel" => p.channel_id = value,
+            b"start" => p.start = parse_xmltv_time(&value),
+            b"stop" => p.stop = parse_xmltv_time(&value),
+            _ => {}
+        }
+    }
+    p
+}
+
 /// Applies a self-closing element (`<icon .../>`, `<new/>`, …) to the channel or
 /// programme currently being built.
 fn apply_empty(
-    name: &str,
+    name: &[u8],
     e: &BytesStart<'_>,
     channel: Option<&mut XmltvChannel>,
     programme: Option<&mut XmltvProgramme>,
 ) {
     match name {
-        "icon" => {
-            let src = attr(e, "src");
+        b"icon" => {
+            let src = attr(e, b"src");
             if let Some(p) = programme {
                 p.icon = src;
             } else if let Some(c) = channel {
                 c.icon = src;
             }
         }
-        "new" => {
+        b"new" => {
             if let Some(p) = programme {
                 p.is_new = true;
             }
         }
-        "premiere" => {
+        b"premiere" => {
             if let Some(p) = programme {
                 p.is_premiere = true;
             }
         }
-        "previously-shown" => {
+        b"previously-shown" => {
             if let Some(p) = programme {
                 p.is_previously_shown = true;
             }
@@ -189,30 +225,30 @@ fn apply_empty(
 /// Applies the closing of a text-bearing element to the channel or programme
 /// currently being built, using the accumulated `text`.
 fn apply_end(
-    name: &str,
+    name: &[u8],
     text: &str,
     channel: Option<&mut XmltvChannel>,
     programme: Option<&mut XmltvProgramme>,
 ) {
     let text = text.trim();
     if let Some(c) = channel {
-        if name == "display-name" && c.display_name.is_empty() && !text.is_empty() {
+        if name == b"display-name" && c.display_name.is_empty() && !text.is_empty() {
             text.clone_into(&mut c.display_name);
         }
         return;
     }
     let Some(p) = programme else { return };
     match name {
-        "title" if p.title.is_empty() => text.clone_into(&mut p.title),
-        "sub-title" if !text.is_empty() => p.sub_title = Some(text.to_owned()),
-        "desc" if !text.is_empty() => p.desc = Some(text.to_owned()),
-        "category" if !text.is_empty() => p.categories.push(text.to_owned()),
-        "date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
-        "episode-num" if !text.is_empty() => {
+        b"title" if p.title.is_empty() => text.clone_into(&mut p.title),
+        b"sub-title" if !text.is_empty() => p.sub_title = Some(text.to_owned()),
+        b"desc" if !text.is_empty() => p.desc = Some(text.to_owned()),
+        b"category" if !text.is_empty() => p.categories.push(text.to_owned()),
+        b"date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
+        b"episode-num" if !text.is_empty() => {
             p.episode_num.get_or_insert_with(|| text.to_owned());
         }
         // <rating><value>TV-PG</value></rating> — the value carries the text.
-        "value" if p.rating.is_none() && !text.is_empty() => p.rating = Some(text.to_owned()),
+        b"value" if p.rating.is_none() && !text.is_empty() => p.rating = Some(text.to_owned()),
         _ => {}
     }
 }
@@ -254,17 +290,17 @@ fn parse_offset(o: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(secs)
 }
 
-/// Reads an attribute by (local) name, unescaped.
-fn attr(e: &BytesStart<'_>, name: &str) -> Option<String> {
+/// Reads an attribute by (local) name, with XML entity references resolved.
+///
+/// The named attribute's value, entity-resolved (see [`unescaped_or_raw`]).
+fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
-        (a.key.local_name().as_ref() == name.as_bytes())
-            .then(|| String::from_utf8_lossy(&a.value).into_owned())
+        if a.key.local_name().as_ref() == name {
+            Some(unescaped_or_raw(&a))
+        } else {
+            None
+        }
     })
-}
-
-/// Returns the local (namespace-stripped) name of a start/empty element.
-fn local_name(e: &BytesStart<'_>) -> String {
-    String::from_utf8_lossy(e.local_name().as_ref()).into_owned()
 }
 
 #[cfg(test)]
@@ -336,5 +372,72 @@ mod tests {
         let g = parse_xmltv("");
         assert!(g.channels.is_empty());
         assert!(g.programmes.is_empty());
+    }
+
+    /// Attribute values carry XML entity references just like element text does,
+    /// and `.NET`'s `XmlReader.GetAttribute` (what Jellyfin's reader calls)
+    /// resolves them. Leaving them raw silently breaks the guide↔tuner join: the
+    /// M3U's `tvg-id` is `A&E.us`, so a channel id kept as `A&amp;E.us` matches
+    /// nothing and every programme on that channel is dropped.
+    #[test]
+    fn attribute_entities_are_resolved() {
+        const ESCAPED: &str = r#"<tv>
+  <channel id="A&amp;E.us">
+    <display-name>A&amp;E</display-name>
+    <icon src="http://x/logo.png?a=1&amp;b=2"/>
+  </channel>
+  <programme start="20260725060000 +0000" stop="20260725070000 +0000" channel="A&amp;E.us">
+    <title>Storage &amp; Wars</title>
+    <icon src="http://x/art.png?a=1&#38;b=2"/>
+  </programme>
+</tv>"#;
+        let g = parse_xmltv(ESCAPED);
+        assert_eq!(g.channels[0].id, "A&E.us");
+        assert_eq!(g.channels[0].display_name, "A&E");
+        assert_eq!(
+            g.channels[0].icon.as_deref(),
+            Some("http://x/logo.png?a=1&b=2")
+        );
+        let p = &g.programmes[0];
+        // The join key must equal the channel's id, or the programme is orphaned.
+        assert_eq!(p.channel_id, g.channels[0].id);
+        assert_eq!(p.title, "Storage & Wars");
+        // Numeric character references resolve too.
+        assert_eq!(p.icon.as_deref(), Some("http://x/art.png?a=1&b=2"));
+    }
+
+    /// An attribute that will not unescape keeps its raw text — it is never
+    /// dropped.
+    ///
+    /// Dropping it is the same silent-programme-loss bug that entity resolution
+    /// was added to fix: an empty `channel_id` joins no tuner channel, so every
+    /// programme on it disappears. A bare `&` in a query string is the common
+    /// real-world case (`.NET`'s `XmlReader` throws outright, so Jellyfin loses
+    /// the whole refresh); an undefined entity reference is the rarer one. Both
+    /// fall back rather than vanish.
+    #[test]
+    fn an_attribute_that_will_not_unescape_keeps_its_raw_text() {
+        // A bare `&` — the input a sloppy generator emits most often.
+        let g = parse_xmltv(
+            r#"<tv><programme start="20260725060000" channel="A&E.us"><title>T</title><icon src="http://x/a.png?a=1&b=2"/></programme></tv>"#,
+        );
+        assert_eq!(g.programmes.len(), 1);
+        assert_eq!(
+            g.programmes[0].channel_id, "A&E.us",
+            "the raw join key still matches a tuner's tvg-id=\"A&E.us\""
+        );
+        assert_eq!(
+            g.programmes[0].icon.as_deref(),
+            Some("http://x/a.png?a=1&b=2")
+        );
+        assert!(g.programmes[0].start.is_some());
+
+        // A reference to an entity no DTD-less document defines.
+        let g = parse_xmltv(
+            r#"<tv><programme start="20260725060000" channel="a&nope;b"><title>T</title></programme></tv>"#,
+        );
+        assert_eq!(g.programmes.len(), 1);
+        assert_eq!(g.programmes[0].channel_id, "a&nope;b");
+        assert_eq!(g.programmes[0].title, "T");
     }
 }

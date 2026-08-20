@@ -1169,6 +1169,58 @@ mod tests {
         );
     }
 
+    /// A channel whose id contains an XML-escapable character must still bind
+    /// its programmes. The M3U carries the raw `A&E.us` (M3U is not XML), the
+    /// XMLTV carries `A&amp;E.us`; if the guide parser left the entity raw the
+    /// `TvgId` join in `insert_programs` would find nothing and every programme
+    /// on that channel would be silently dropped.
+    #[tokio::test]
+    async fn guide_binds_channels_whose_id_needs_xml_escaping() {
+        const M3U_AMP: &str = "#EXTM3U\n\
+            #EXTINF:-1 tvg-id=\"A&E.us\" tvg-chno=\"9\",A&E\nhttp://tuner/ae\n";
+        const XMLTV_AMP: &str = "<tv>\
+            <channel id=\"A&amp;E.us\"><display-name>A&amp;E</display-name></channel>\
+            <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"A&amp;E.us\">\
+            <title>Storage Wars</title></programme>\
+            </tv>";
+
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/ae.m3u".to_owned(), M3U_AMP.to_owned());
+        sources.insert("http://guide/ae.xml".to_owned(), XMLTV_AMP.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/ae.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/ae.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+
+        let channels = mgr
+            .get_channels(&DtoOptions::default())
+            .await
+            .expect("chans");
+        assert_eq!(channels.total_record_count, 1);
+
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("progs");
+        assert_eq!(
+            programs.total_record_count, 1,
+            "the escaped guide id must join the tuner's raw tvg-id"
+        );
+        assert_eq!(programs.items[0].name.as_deref(), Some("Storage Wars"));
+        assert_eq!(programs.items[0].channel_id, Some(channels.items[0].id));
+    }
+
     #[tokio::test]
     async fn bulk_guide_sync_inserts_every_channel_and_program() {
         // 150 channels and 5000 programmes exceed a single insert chunk in both
