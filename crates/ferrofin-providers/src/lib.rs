@@ -3,8 +3,10 @@
 //!
 //! Ports the `ProviderManager` (implements the `ferrofin-traits` trait), the
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
-//! metadata. The remote API plugins (TMDB/MusicBrainz/OMDB/AudioDb/ListenBrainz)
-//! are feature-gated and deferred (enrichment; need keys; not First-Light).
+//! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
+//! Studio Images) are compiled in unconditionally and gated at runtime by the
+//! per-library fetcher checkboxes — OMDb additionally needs an API key before
+//! it does anything.
 
 pub mod audiodb;
 pub mod container_types;

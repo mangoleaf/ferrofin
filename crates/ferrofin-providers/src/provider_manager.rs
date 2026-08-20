@@ -1,18 +1,12 @@
 //! The [`ProviderManager`] trait implementation — port of the
 //! `MediaBrowser.Providers.Manager.ProviderManager` surface.
 //!
-//! Scope note (First-Light): the full C# `ProviderManager` couples the metadata
-//! *refresh orchestration* to the library item store, the image-saving pipeline,
-//! and the (deferred, feature-gated) remote provider plugins — none of which are
-//! available in this wave. The high-value, test-backed deliverable in this crate
-//! is the XbmcMetadata NFO parser subsystem ([`crate::xbmc`]).
-//!
-//! This type therefore implements the [`ferrofin_traits::providers::ProviderManager`]
-//! trait as a thin, dependency-free shell: read-only descriptor queries return
-//! empty/default results, and the operations that require the (not-yet-ported)
-//! library store or network I/O return [`ServiceError::Backend`] describing the
-//! deferral rather than silently succeeding. The external-id descriptor set —
-//! which the NFO parsers consume — is fully wired.
+//! Scope note: the C# `ProviderManager` couples metadata *refresh orchestration*
+//! to the library item store and the image-saving pipeline. Ferrofin splits that
+//! — the scan/refresh pipeline lives in `ferrofin-core`'s library scanner, and
+//! this type carries the client-facing surface: remote search ("Identify"),
+//! remote images ("Choose Image"), the external-id descriptor set, and the
+//! external-URL ("Links") table.
 
 use std::path::PathBuf;
 use std::sync::Arc;

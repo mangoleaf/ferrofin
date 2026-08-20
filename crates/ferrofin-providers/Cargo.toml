@@ -10,20 +10,17 @@ description = "Metadata providers for Ferrofin (port of MediaBrowser.Providers +
 workspace = true
 
 [features]
-# Remote API providers (need keys, network) — deferred/off by default for First-Light.
 # `opensubtitles` is on by default: the provider is compiled in (like a stock
 # Jellyfin with the plugin installed) but inert until credentials are configured
 # via the dashboard plugin page.
 # `lrclib` is on by default: like TMDB (whose client is always compiled and
 # works keyless out of the box), lrclib.net needs no key, so the lyric provider
 # ships enabled — a stock Jellyfin with the LrcLib plugin installed.
+#
+# Everything else (TMDB/TVDB/OMDb/fanart/MusicBrainz/Studio Images) is compiled
+# in unconditionally and gated at runtime by the per-library fetcher checkboxes
+# — there is deliberately no cargo feature for those.
 default = ["opensubtitles", "lrclib"]
-tmdb = []
-musicbrainz = []
-omdb = []
-studios = []
-tvdb = []
-fanart = []
 opensubtitles = []
 lrclib = []
 

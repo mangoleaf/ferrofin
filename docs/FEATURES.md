@@ -57,8 +57,10 @@ Wired and working, with a documented limitation or lighter verification:
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar-items scoring** — a simplified scorer relative to Jellyfin's exact weighting.
-- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / OMDb / fanart) — implemented but
-  **feature-gated off by default**; they return empty results until enabled with an API key.
+- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / AudioDb / fanart / Studio Images)
+  — compiled in and **on by default** with built-in keys, gated per library by the
+  "Metadata downloaders" / "Image fetchers" checkboxes. **OMDb** is the exception: it stays
+  inert until `FERROFIN_OMDB_KEY` (config `omdb_api_key`) is set.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
 

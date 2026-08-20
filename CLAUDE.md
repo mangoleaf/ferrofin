@@ -69,7 +69,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
-| `ferrofin-providers` | metadata providers (local NFO always on; remote TMDB/TVDB/MusicBrainz/OMDb/fanart feature-gated) |
+| `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb needs a key) |
 | `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
@@ -270,8 +270,10 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`FERROFIN_WASM_GUEST_TESTS=1`).
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
-- **Remote metadata providers** (TMDB/TVDB/MusicBrainz/OMDb/fanart) are feature-gated **off**
-  by default and return empty results until enabled with an API key.
+- **OMDb** ships compiled in but **inert without an API key** (`FERROFIN_OMDB_KEY` /
+  config `omdb_api_key`). Every other remote provider (TMDB/TVDB/MusicBrainz/AudioDb/
+  fanart/Studio Images) is on by default with a built-in key, gated per library by the
+  "Metadata downloaders" / "Image fetchers" checkboxes.
 
 The design invariant still holds for any **future** route added to the contract: every path
 is registered, an un-ported one returns `501` (never `404`), and the pattern is — write the
