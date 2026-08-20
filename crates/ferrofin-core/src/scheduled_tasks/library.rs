@@ -495,6 +495,24 @@ impl ScheduledTask for AudioNormalizationTask {
 /// image: there is not enough remaining video for ffmpeg to decode a frame.
 const CHAPTER_IMAGE_EOF_MARGIN_TICKS: i64 = 10 * TICKS_PER_SECOND;
 
+/// How many videos may fail **in a row** before the run gives up and concludes
+/// the server, not the media, is broken.
+///
+/// The pre-flight below can only prove the directories it knows about are
+/// writable. It cannot see a missing or wrong ffmpeg binary, a full disk, or a
+/// codec the build cannot decode — and each of those fails every video, one at
+/// a time, writing a permanent blocklist entry for each. That is how a real
+/// server accumulated ~2950 wrongly-blocklisted videos and then looked, on
+/// every later run, like a task with nothing to do.
+///
+/// A streak rather than a total, so a genuinely bad folder in the middle of a
+/// library costs nothing: any success resets the count. Twenty-five failures
+/// with no success in between is not a media problem on any real library.
+///
+/// A deliberate divergence — upstream `ChapterImagesTask` has no such guard.
+/// Hardcoded for now; see `brain/plans/PLAN_EPISODE_METADATA_AND_CHAPTER_IMAGES.md`.
+const CHAPTER_FAILURE_STREAK_LIMIT: u32 = 25;
+
 /// "Extract Chapter Images" — creates thumbnails for videos that have
 /// chapters. Port of `ChapterImagesTask` + the image half of the upstream
 /// `ChapterManager.RefreshChapterImages`: for every non-virtual library video
@@ -754,6 +772,7 @@ impl ScheduledTask for ChapterImagesTask {
 
         let total = videos.len().max(1);
         let mut history_dirty = false;
+        let mut failure_streak = 0_u32;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -784,28 +803,44 @@ impl ScheduledTask for ChapterImagesTask {
             }
             // A failed video (extraction failure or refresh error) joins the
             // failure history so it is skipped until its file changes.
-            if !matches!(outcome, Ok(true)) {
+            if matches!(outcome, Ok(true)) {
+                failure_streak = 0;
+            } else {
+                failure_streak += 1;
+                // Bail BEFORE recording this one: nothing about a run this
+                // broken says anything about the media, and the entries would
+                // outlive the outage.
+                if failure_streak >= CHAPTER_FAILURE_STREAK_LIMIT {
+                    return Err(ServiceError::backend(format!(
+                        "chapter image extraction failed on {failure_streak} videos in a row, \
+                         which is a server problem rather than a media one (check ffmpeg and \
+                         free disk space); giving up without recording them as failed"
+                    )));
+                }
                 failed.insert(history_key);
                 history_dirty = true;
             }
         }
-        // Written once, after the loop: rewriting the whole file per failure
-        // made a systemic failure quadratic in the history's own size.
-        if history_dirty
-            && let Err(e) = std::fs::write(
-                &fail_history_path,
-                failed.iter().cloned().collect::<Vec<_>>().join("|"),
-            )
-        {
-            tracing::warn!(
-                path = %fail_history_path.display(),
-                error = %e,
-                "cannot write the chapter failure history; failures will be retried \
-                 on every run until this is fixed"
-            );
-        }
+        write_failure_history(&fail_history_path, &failed, history_dirty);
         progress.report(100.0);
         Ok(())
+    }
+}
+
+/// Persists the chapter-image failure history, if the run added to it.
+///
+/// Written once per run rather than per failure: rewriting the whole file each
+/// time made a systemic failure quadratic in the history's own size.
+fn write_failure_history(path: &Path, failed: &std::collections::BTreeSet<String>, dirty: bool) {
+    if dirty
+        && let Err(e) = std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|"))
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "cannot write the chapter failure history; failures will be retried \
+             on every run until this is fixed"
+        );
     }
 }
 
@@ -2362,6 +2397,91 @@ mod tests {
                 .expect("history written");
         assert!(history.contains("film.mkv"));
         drop(media);
+    }
+
+    // A run that fails video after video is a broken server, not a library of
+    // broken files — and the pre-flight cannot see every cause (a missing or
+    // wrong ffmpeg, a full disk, an undecodable codec). Without this guard each
+    // failure writes a permanent blocklist entry, which is how a real server
+    // accumulated ~2950 of them and then looked idle on every later run.
+    #[tokio::test]
+    async fn a_run_that_fails_every_video_gives_up_without_blocklisting_them() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library = library_manager_over(db.clone());
+
+        // Comfortably more videos than the streak limit, so the guard trips
+        // mid-library rather than at the end.
+        let count = CHAPTER_FAILURE_STREAK_LIMIT + 5;
+        for i in 0..count {
+            let id = Uuid::from_u128(u128::from(0xD000 + i));
+            seed_named_item(&db, id, BaseItemKind::Movie, &format!("Film {i}")).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(format!("film-{i}.mkv"));
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+
+        let chapters = Arc::new(FakeChapters {
+            chapters: Mutex::new(vec![chapter_at(0)]),
+        });
+        let streams = FakeStreams(
+            (0..count)
+                .map(|i| MediaStreamInfoEntity {
+                    item_id: Uuid::from_u128(u128::from(0xD000 + i)).to_string(),
+                    stream_index: 0,
+                    stream_type: media_stream_type_disc(StreamTypeEnum::Video),
+                    codec: Some("h264".to_owned()),
+                    ..MediaStreamInfoEntity::default()
+                })
+                .collect(),
+        );
+        let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            media.path().join("data"),
+            media.path().join("logs"),
+            media.path().join("config"),
+            media.path().join("cache"),
+            media.path().join("web"),
+        ));
+        let path_manager: Arc<dyn PathManager> =
+            Arc::new(crate::FerrofinPathManager::new(Arc::clone(&app_paths)));
+        let task = ChapterImagesTask::new(
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_chapter_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                &media.path().to_string_lossy(),
+            )),
+            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+            Arc::new(streams),
+            // Every extraction fails — the shape of an unusable ffmpeg.
+            Arc::new(FakeEncoder { fail_extract: true }),
+            path_manager,
+            app_paths,
+        );
+
+        let err = task
+            .execute(&TaskProgress::default())
+            .await
+            .expect_err("a run that fails everything must fail the task");
+        assert!(
+            err.to_string().contains("in a row"),
+            "the error must say it is a server problem: {err}"
+        );
+
+        // The blocklist holds at most the failures seen before the guard
+        // tripped, and never the whole library.
+        let history =
+            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+                .unwrap_or_default();
+        let entries = history.split('|').filter(|e| !e.is_empty()).count();
+        assert!(
+            entries < count as usize,
+            "a broken server must not blocklist the library: {entries} of {count}"
+        );
     }
 
     // The failure mode that cost a real library every chapter image: the
