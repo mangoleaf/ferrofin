@@ -934,8 +934,14 @@ mod tests {
     }
 
     impl SessionMessageBus for RecordingBus {
-        fn register(&self, _session_id: String, _sink: ferrofin_traits::session_bus::MessageSink) {}
-        fn unregister(&self, _session_id: &str) {}
+        fn register(
+            &self,
+            _session_id: String,
+            _sink: ferrofin_traits::session_bus::MessageSink,
+        ) -> ferrofin_traits::session_bus::SinkToken {
+            0
+        }
+        fn unregister(&self, _session_id: &str, _token: ferrofin_traits::session_bus::SinkToken) {}
         fn send(&self, session_id: &str, message: String) -> bool {
             self.sent.lock().unwrap().push((session_id.into(), message));
             true

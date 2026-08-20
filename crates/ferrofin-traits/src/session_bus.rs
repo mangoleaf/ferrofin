@@ -15,24 +15,36 @@
 
 /// A one-way sink that enqueues a serialized message toward one session's socket.
 ///
-/// Invoking it must be cheap and non-blocking (it typically pushes onto an
-/// unbounded channel drained by the socket's write task). A failed enqueue
-/// (socket already gone) is swallowed by the sink; the socket unregisters on
-/// disconnect.
+/// Invoking it must be cheap and non-blocking (it typically pushes onto a
+/// **bounded** channel drained by the socket's write task). A failed enqueue
+/// (socket already gone, or a client so far behind that its queue is full) is
+/// swallowed by the sink; the socket unregisters on disconnect.
 pub type MessageSink = Box<dyn Fn(String) + Send + Sync>;
+
+/// Identifies one socket's registration on the bus, so a socket that closes
+/// after a newer one opened for the same session cannot unregister the newer
+/// one's sink (Jellyfin's `WebSocketController` removes only the socket that
+/// actually closed).
+pub type SinkToken = u64;
 
 /// Routes server→client messages to connected session sockets by session id.
 ///
 /// Port of the delivery half of `ISessionManager.SendMessageToSession`. The
 /// registry is the missing piece that lets SyncPlay actually reach clients.
 pub trait SessionMessageBus: Send + Sync {
-    /// Registers `sink` as the delivery channel for `session_id`, replacing any
-    /// existing registration for that session (a reconnect supersedes the old
-    /// socket).
-    fn register(&self, session_id: String, sink: MessageSink);
+    /// Registers `sink` as a delivery channel for `session_id` and returns the
+    /// token identifying *this* registration.
+    ///
+    /// A session may have several open sockets at once (two browser tabs share
+    /// one `Client`+`DeviceId`, hence one session id); delivery goes to the most
+    /// recently registered one, matching Jellyfin's
+    /// `WebSocketController.SendMessage`, which picks the most recently active
+    /// open socket.
+    fn register(&self, session_id: String, sink: MessageSink) -> SinkToken;
 
-    /// Removes the session's sink (called when its socket closes).
-    fn unregister(&self, session_id: &str);
+    /// Removes the registration `token` identifies (called when its socket
+    /// closes). A token that is no longer registered is a no-op.
+    fn unregister(&self, session_id: &str, token: SinkToken);
 
     /// Delivers `message` to the session if it is connected, returning whether a
     /// sink existed to receive it.

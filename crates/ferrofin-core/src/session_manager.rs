@@ -472,34 +472,54 @@ impl FerrofinSessionManager {
     where
         P: FnMut(&SessionInfo) -> bool,
     {
-        let payload = envelope_bytes(message_type, data)?;
-        // (session id, its open connections) for every matching session, in the
-        // pool's iteration order — captured under the lock, sent without it.
+        // (session id, its open connections) for every matching session that can
+        // actually receive, in the pool's iteration order — captured under the
+        // lock, sent without it. A matching session with neither an open direct
+        // connection nor a registered bus sink is dropped here: `bus.send` would
+        // miss the map and return `false`, so skipping it delivers the same
+        // messages to the same clients while costing nothing. That matters
+        // because the session pool holds every device that ever authenticated,
+        // live or not.
         let targets: Vec<(String, Vec<Arc<dyn WebSocketConnection>>)> = {
             let sessions = self.sessions.lock().await;
             sessions
                 .values()
                 .filter(|s| predicate(s))
-                .map(|s| {
+                .filter_map(|s| {
                     let open: Vec<Arc<dyn WebSocketConnection>> = s
                         .connections
                         .iter()
                         .filter(|c| c.is_open())
                         .map(Arc::clone)
                         .collect();
-                    (s.id.clone(), open)
+                    if !open.is_empty() {
+                        return Some((s.id.clone(), open));
+                    }
+                    self.bus
+                        .as_ref()
+                        .is_some_and(|bus| bus.is_connected(&s.id))
+                        .then(|| (s.id.clone(), Vec::new()))
                 })
                 .collect()
         };
+        if targets.is_empty() {
+            // Nobody can receive it — don't pay to build a message that would be
+            // dropped (Jellyfin's `SendMessageToUserSessions(…, Func<T> dataFn,
+            // …)` overload exists for exactly this).
+            return Ok(());
+        }
+
+        let payload = envelope_bytes(message_type, data)?;
+        // Validate once, not once per recipient: the envelope is the same bytes
+        // for everyone.
+        let text = std::str::from_utf8(&payload).ok();
 
         for (session_id, connections) in targets {
             if connections.is_empty() {
                 // No direct connection — deliver over the session bus (the HTTP
                 // WebSocket handler's sink), so remote-control pushes reach
                 // clients connected through `/socket`.
-                if let Some(bus) = &self.bus
-                    && let Ok(text) = std::str::from_utf8(&payload)
-                {
+                if let (Some(bus), Some(text)) = (&self.bus, text) {
                     bus.send(&session_id, text.to_owned());
                 }
                 continue;
@@ -1803,6 +1823,73 @@ mod bus_fallback_tests {
         let bus_envelope: serde_json::Value =
             serde_json::from_str(bus_text).expect("bus payload is a JSON envelope");
         assert_eq!(bus_envelope["MessageType"], "RestartRequired");
+    }
+
+    /// A bus with no sinks that counts every delivery *attempt*, so a broadcast
+    /// aimed at unreachable sessions is visible as work rather than as silence.
+    #[derive(Default)]
+    struct CountingBus {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ferrofin_traits::session_bus::SessionMessageBus for CountingBus {
+        fn register(
+            &self,
+            _session_id: String,
+            _sink: ferrofin_traits::session_bus::MessageSink,
+        ) -> ferrofin_traits::session_bus::SinkToken {
+            0
+        }
+        fn unregister(&self, _session_id: &str, _token: ferrofin_traits::session_bus::SinkToken) {}
+        fn send(&self, _session_id: &str, _message: String) -> bool {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+        fn is_connected(&self, _session_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// The session pool keeps every device that ever authenticated, so a
+    /// broadcast's predicate routinely matches sessions that have no live socket
+    /// at all. Those must cost nothing: no bus delivery is attempted for them.
+    #[tokio::test]
+    async fn a_broadcast_no_one_can_receive_attempts_no_delivery() {
+        let db = crate::test_support::test_db().await;
+        let bus = Arc::new(CountingBus::default());
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig);
+        let mgr = FerrofinSessionManager::new(
+            Arc::new(FerrofinUserManager::new(db.clone())),
+            Arc::new(FerrofinDeviceManager::new(db.clone())),
+            Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+            crate::test_support::library_manager_over(db.clone()),
+            Arc::new(UnusedDtoService),
+            Arc::new(FerrofinEventManager::new()),
+            db.clone(),
+            "server-1",
+        )
+        .with_session_bus(
+            Arc::clone(&bus) as Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>
+        );
+
+        let user_id = Uuid::new_v4();
+        let user = crate::test_support::seed_user(&db, user_id).await;
+        for device in ["dev-a", "dev-b", "dev-c"] {
+            mgr.log_session_activity("Web", "1.0", device, "Box", "e", &user)
+                .await
+                .expect("session");
+        }
+
+        mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+            .await
+            .expect("broadcast");
+
+        assert_eq!(
+            bus.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no session has a registered sink, so the bus must never be asked to deliver",
+        );
     }
 }
 

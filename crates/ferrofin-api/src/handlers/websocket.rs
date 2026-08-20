@@ -32,6 +32,19 @@ use crate::state::AppState;
 /// The server keep-alive interval advertised to the client, in seconds.
 const KEEPALIVE_SECS: u64 = 60;
 
+/// How many server→client pushes may sit queued for one socket before the
+/// server gives up on that client.
+///
+/// The queue exists because the bus sink must be non-blocking: a broadcast
+/// enqueues onto every recipient's channel and returns, so one slow reader can
+/// never stall the others. Unbounded, that is a memory bomb — a client that
+/// completes the handshake and then stops reading makes the server buffer every
+/// message aimed at it for as long as it stays connected (measured: 20 such
+/// clients grew RSS by 864 MB over 120k broadcasts, with no ceiling). Bounded,
+/// the worst case is `depth × message size` per socket and the socket is closed
+/// on overflow so the client reconnects and refetches state.
+const PUSH_QUEUE_DEPTH: usize = 256;
+
 /// Registers the WebSocket routes (`/socket` + the legacy `/embywebsocket`).
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -228,6 +241,84 @@ fn subscription_period(data: Option<&str>) -> Duration {
     Duration::from_millis(millis)
 }
 
+/// Builds one socket's bus sink: a non-blocking enqueue onto its bounded push
+/// queue.
+///
+/// The sink must never block (a broadcast calls it once per recipient, in line),
+/// so a client that has stopped draining can only be handled two ways: buffer
+/// for it without limit, or stop. We stop — the message is dropped and
+/// `overflowed` is raised so [`handle_socket`] closes the connection, after
+/// which the client reconnects and refetches state. A `Closed` channel is the
+/// ordinary "socket already gone" race and is simply swallowed.
+fn push_sink(
+    tx: mpsc::Sender<String>,
+    overflowed: std::sync::Arc<tokio::sync::Notify>,
+) -> ferrofin_traits::session_bus::MessageSink {
+    Box::new(move |msg| {
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
+            overflowed.notify_one();
+        }
+    })
+}
+
+/// Logs the one reason the server hangs up on a client of its own accord.
+fn warn_overflow() {
+    tracing::warn!(
+        depth = PUSH_QUEUE_DEPTH,
+        "websocket push queue overflowed; closing the socket",
+    );
+}
+
+/// Writes one frame, abandoning the socket if this client's push queue
+/// overflows while the write is blocked. Returns whether the socket is still
+/// usable.
+///
+/// A client that stops reading shuts its TCP window, so the write blocks
+/// indefinitely and the task never returns to the main `select!` — waiting on
+/// `send` alone would leave such a socket registered on the bus forever,
+/// counting as a live listener while receiving nothing. Racing the write against
+/// the overflow signal is what actually retires it. `WebSocket::send` is not
+/// cancel-safe, but the loser of this race is a socket we are about to drop, so
+/// a half-written frame is irrelevant.
+async fn send_frame(
+    socket: &mut WebSocket,
+    msg: Message,
+    overflowed: &tokio::sync::Notify,
+) -> bool {
+    tokio::select! {
+        result = socket.send(msg) => result.is_ok(),
+        () = overflowed.notified() => {
+            warn_overflow();
+            false
+        }
+    }
+}
+
+/// One socket's bus registration: the session it delivers for, the bus, and the
+/// token that unregisters *this* socket without disturbing the session's others.
+type Registration = (
+    String,
+    std::sync::Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
+    ferrofin_traits::session_bus::SinkToken,
+);
+
+/// Registers an authenticated socket's push sink on the session bus, if the
+/// caller resolved to a session and a bus is wired. An anonymous socket (or a
+/// server with no bus) gets no registration and simply never receives pushes.
+fn register_sink(
+    state: &AppState,
+    caller: Option<&SocketCaller>,
+    tx: &mpsc::Sender<String>,
+    overflowed: &std::sync::Arc<tokio::sync::Notify>,
+) -> Option<Registration> {
+    let (c, bus) = (caller?, state.session_bus.as_ref()?);
+    let token = bus.register(
+        c.session_id.clone(),
+        push_sink(tx.clone(), std::sync::Arc::clone(overflowed)),
+    );
+    Some((c.session_id.clone(), std::sync::Arc::clone(bus), token))
+}
+
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
@@ -245,23 +336,12 @@ async fn handle_socket(
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
     // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
     // (no sink registered) so the forward branch stays pending rather than
-    // closing the loop.
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let registration = match (caller.as_ref().ok(), state.session_bus.as_ref()) {
-        (Some(c), Some(bus)) => {
-            let sink_tx = tx.clone();
-            bus.register(
-                c.session_id.clone(),
-                Box::new(move |msg| {
-                    // Failure means the socket's receiver is gone; the socket
-                    // unregisters on close, so dropping the message is correct.
-                    let _ = sink_tx.send(msg);
-                }),
-            );
-            Some((c.session_id.clone(), std::sync::Arc::clone(bus)))
-        }
-        _ => None,
-    };
+    // closing the loop. The channel is bounded (see `PUSH_QUEUE_DEPTH`) so a
+    // client that stops reading cannot make the server buffer without limit.
+    let (tx, mut rx) = mpsc::channel::<String>(PUSH_QUEUE_DEPTH);
+    // Raised by the sink when the queue is full; the loop closes the socket.
+    let overflowed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let registration = register_sink(&state, caller.as_ref().ok(), &tx, &overflowed);
     match &caller {
         Ok(_) => tracing::info!(
             authenticated = registration.is_some(),
@@ -287,7 +367,7 @@ async fn handle_socket(
         tokio::select! {
             frame = socket.recv() => match action_for(frame) {
                 Action::Pong(payload) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
+                    if !send_frame(&mut socket, Message::Pong(payload), &overflowed).await {
                         break;
                     }
                 }
@@ -295,7 +375,8 @@ async fn handle_socket(
                 Action::Ignore => {}
                 Action::Inbound(Inbound::KeepAlive) => {
                     // Ack the client's ping (C# `SendKeepAliveResponse`).
-                    if socket.send(Message::Text(keep_alive_ack().into())).await.is_err() {
+                    let ack = Message::Text(keep_alive_ack().into());
+                    if !send_frame(&mut socket, ack, &overflowed).await {
                         break;
                     }
                 }
@@ -307,35 +388,39 @@ async fn handle_socket(
             },
             Some(push) = rx.recv() => {
                 // A server→client message (SyncPlay command/update, …).
-                if socket.send(Message::Text(push.into())).await.is_err() {
+                if !send_frame(&mut socket, Message::Text(push.into()), &overflowed).await {
                     break;
                 }
+            },
+            () = overflowed.notified() => {
+                warn_overflow();
+                break;
             },
             _ = keepalive.tick() => {
                 // Jellyfin's `ForceKeepAlive`: tells the client the keep-alive interval.
                 let msg = Message::Text(force_keep_alive_message().into());
-                if socket.send(msg).await.is_err() {
+                if !send_frame(&mut socket, msg, &overflowed).await {
                     break;
                 }
             }
             () = tick(&mut streams.sessions) => {
                 if let Some(c) = caller.as_ref()
                     && let Some(msg) = sessions_message(&state, c.user_id).await
-                    && socket.send(Message::Text(msg.into())).await.is_err()
+                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                 {
                     break;
                 }
             }
             () = tick(&mut streams.tasks) => {
                 if let Some(msg) = tasks_message(&state).await
-                    && socket.send(Message::Text(msg.into())).await.is_err()
+                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                 {
                     break;
                 }
             }
             () = tick(&mut streams.activity) => {
                 if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
-                    && socket.send(Message::Text(msg.into())).await.is_err()
+                    && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                 {
                     break;
                 }
@@ -343,8 +428,10 @@ async fn handle_socket(
         }
     }
 
-    if let Some((sid, bus)) = registration {
-        bus.unregister(&sid);
+    if let Some((sid, bus, token)) = registration {
+        // Scoped to *this* socket's registration: a second tab of the same
+        // client shares the session id, and its sink must survive our close.
+        bus.unregister(&sid, token);
     }
     drop(tx);
     tracing::info!(
@@ -490,11 +577,70 @@ fn force_keep_alive_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_SECS, action_for,
-        force_keep_alive_message, header_token, keep_alive_ack, parse_inbound, query_param,
+        Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_SECS, PUSH_QUEUE_DEPTH, action_for,
+        force_keep_alive_message, header_token, keep_alive_ack, parse_inbound, push_sink,
+        query_param,
     };
     use axum::extract::ws::Message;
     use axum::http::HeaderMap;
+    use tokio::sync::mpsc;
+
+    /// A client that stops reading must not make the server buffer without
+    /// bound: the sink accepts exactly `PUSH_QUEUE_DEPTH` messages, then drops
+    /// the rest and raises the overflow signal that closes the socket.
+    #[tokio::test]
+    async fn a_client_that_never_drains_bounds_the_queue_and_is_dropped() {
+        let (tx, mut rx) = mpsc::channel::<String>(PUSH_QUEUE_DEPTH);
+        let overflowed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sink = push_sink(tx, std::sync::Arc::clone(&overflowed));
+
+        // Fill the queue exactly; nothing is dropped and no overflow is raised.
+        for i in 0..PUSH_QUEUE_DEPTH {
+            sink(format!("msg-{i}"));
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), overflowed.notified())
+                .await
+                .is_err(),
+            "a full-but-not-overflowing queue must not close the socket",
+        );
+
+        // The next 10_000 messages neither block nor grow the queue.
+        for i in 0..10_000 {
+            sink(format!("overflow-{i}"));
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(50), overflowed.notified())
+            .await
+            .expect("overflow raises the close signal");
+
+        let mut drained = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            drained.push(msg);
+        }
+        assert_eq!(
+            drained.len(),
+            PUSH_QUEUE_DEPTH,
+            "queue is capped at the configured depth, whatever the client is sent",
+        );
+        assert_eq!(drained[0], "msg-0", "the oldest queued messages are kept");
+    }
+
+    /// The ordinary "socket already gone" race: a closed receiver is swallowed,
+    /// not reported as an overflow (which would log a warning on every close).
+    #[tokio::test]
+    async fn a_closed_receiver_is_swallowed_without_signalling_overflow() {
+        let (tx, rx) = mpsc::channel::<String>(PUSH_QUEUE_DEPTH);
+        drop(rx);
+        let overflowed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sink = push_sink(tx, std::sync::Arc::clone(&overflowed));
+        sink("gone".to_owned());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), overflowed.notified())
+                .await
+                .is_err(),
+            "a closed socket is not an overflow",
+        );
+    }
 
     #[test]
     fn query_param_extracts_by_exact_key() {
