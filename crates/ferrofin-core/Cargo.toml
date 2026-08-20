@@ -10,6 +10,7 @@ description = "Core manager implementations for Ferrofin (port of Emby/Jellyfin.
 workspace = true
 
 [dependencies]
+ferrofin-util.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true

@@ -971,7 +971,10 @@ pub async fn build_app_state(
         .with_session_bus(Arc::clone(&session_bus))
         // So a playback-stopped report closes the live stream it names (C#
         // `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync`).
-        .with_media_sources(Arc::clone(&media_sources)),
+        .with_media_sources(Arc::clone(&media_sources))
+        // So casting an instant mix expands the seed into the mix (C#
+        // `SendPlayCommand` -> `TranslateItemForInstantMix`).
+        .with_music_manager(Arc::clone(&music)),
     );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -1247,6 +1250,10 @@ pub async fn build_app_state(
     let me_path_manager = Arc::clone(&path_manager);
     // The transcode planner resolves item/library display names for its logs.
     let me_library = Arc::clone(&library);
+    // SyncPlay resolves each member's library access; it is built after the
+    // state below, which takes ownership of these.
+    let sync_play_users = Arc::clone(&users);
+    let sync_play_library = Arc::clone(&library);
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(
@@ -1332,7 +1339,10 @@ pub async fn build_app_state(
     // The SyncPlay manager shares the session message bus (created with the
     // session manager above) to deliver group commands to member sockets.
     let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> = Arc::new(
-        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus)),
+        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus))
+            // So a group whose queue a user cannot see is hidden from them and
+            // refuses their join (C# `Group.HasAccessToPlayQueue`).
+            .with_library_access(sync_play_users, sync_play_library),
     );
     // A session that ended (its last socket closed, or it logged out) leaves its
     // SyncPlay group — port of `SyncPlayManager.OnSessionEnded`. Without it the

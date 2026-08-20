@@ -1004,6 +1004,239 @@ async fn sync_play_returns_501_when_manager_unwired() {
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
+// ── SyncPlay access policy (C# `SyncPlayAccessHandler`) ────────────────────
+
+/// Authenticates as [`USER_ID`] with a chosen stored `SyncPlayAccess` value, so
+/// the policy table can be driven from a test.
+struct PolicyAuth(i32);
+
+impl PolicyAuth {
+    fn info(&self) -> AuthorizationInfo {
+        let mut user = user_entity(USER_ID, "alice");
+        user.sync_play_access = self.0;
+        AuthorizationInfo {
+            user: Some(user),
+            ..authed_info()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for PolicyAuth {
+    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for PolicyAuth {
+    async fn get_authorization_info(
+        &self,
+        _r: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.info())
+    }
+}
+
+/// A SyncPlay manager with a fixed `is_user_active`, recording whether any group
+/// operation was reached — so a test can prove a denial short-circuits.
+struct GatedSyncPlay {
+    active: bool,
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GatedSyncPlay {
+    fn touch(&self) {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SyncPlayManager for GatedSyncPlay {
+    async fn new_group(
+        &self,
+        _s: &SyncPlaySession,
+        _n: &str,
+    ) -> Result<GroupInfoDto, ServiceError> {
+        self.touch();
+        Ok(GroupInfoDto::default())
+    }
+    async fn join_group(&self, _s: &SyncPlaySession, _g: Uuid) -> Result<(), ServiceError> {
+        self.touch();
+        Ok(())
+    }
+    async fn leave_group(&self, _s: &SyncPlaySession) -> Result<(), ServiceError> {
+        self.touch();
+        Ok(())
+    }
+    async fn list_groups(&self, _s: &SyncPlaySession) -> Result<Vec<GroupInfoDto>, ServiceError> {
+        self.touch();
+        Ok(Vec::new())
+    }
+    async fn get_group(&self, _s: &SyncPlaySession, g: Uuid) -> Result<GroupInfoDto, ServiceError> {
+        self.touch();
+        Ok(GroupInfoDto {
+            group_id: g,
+            ..Default::default()
+        })
+    }
+    async fn handle_request(
+        &self,
+        _s: &SyncPlaySession,
+        _r: PlaybackRequest,
+    ) -> Result<(), ServiceError> {
+        self.touch();
+        Ok(())
+    }
+    async fn is_user_active(&self, _u: Uuid) -> Result<bool, ServiceError> {
+        Ok(self.active)
+    }
+}
+
+/// A state whose caller has `access` and whose SyncPlay membership is `active`,
+/// plus the "the manager was reached" flag.
+fn policy_state(access: i32, active: bool) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
+    let (sessions, user_data) = recording();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let auth = Arc::new(PolicyAuth(access));
+    let state = AppState::new(
+        Arc::new(OkLibrary),
+        Arc::new(OkUsers),
+        Arc::new(FakeUserViews),
+        user_data,
+        Arc::new(FakeMediaSources),
+        sessions,
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::clone(&auth) as Arc<dyn AuthorizationContext>,
+        auth,
+        Arc::new(ferrofin_api::test_support::FakeQuickConnect),
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        Arc::new(ferrofin_api::test_support::FakeCollections),
+        Arc::new(ferrofin_api::test_support::FakeTvSeries),
+        Arc::new(ferrofin_api::test_support::FakeSubtitles),
+        Arc::new(ferrofin_api::test_support::FakeLyrics),
+        Arc::new(ferrofin_api::test_support::FakeMediaSegments),
+        Arc::new(ferrofin_api::test_support::FakeTrickplay),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+        Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
+        Arc::new(ferrofin_api::test_support::FakeApiKeys),
+        Arc::new(ferrofin_api::test_support::FakeLocalization),
+        Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(ferrofin_api::test_support::FakeFileSystem),
+        Arc::new(ferrofin_api::test_support::FakeTasks),
+    )
+    .with_sync_play(Arc::new(GatedSyncPlay {
+        active,
+        reached: Arc::clone(&reached),
+    }));
+    (state, reached)
+}
+
+/// Stored `SyncPlayAccess` discriminants (`Users.SyncPlayAccess`).
+const CREATE_AND_JOIN: i32 = 0;
+const JOIN_ONLY: i32 = 1;
+const NO_SYNC_PLAY: i32 = 2;
+
+#[tokio::test]
+async fn sync_play_new_requires_create_access() {
+    for (access, expected) in [
+        (CREATE_AND_JOIN, StatusCode::OK),
+        (JOIN_ONLY, StatusCode::FORBIDDEN),
+        (NO_SYNC_PLAY, StatusCode::FORBIDDEN),
+    ] {
+        let (state, reached) = policy_state(access, false);
+        let (status, _) = send(
+            state,
+            "POST",
+            "/SyncPlay/New",
+            Body::from(r#"{"GroupName":"g"}"#),
+        )
+        .await;
+        assert_eq!(status, expected, "access {access}");
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            expected == StatusCode::OK,
+            "a denied create must not reach the manager (access {access})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_play_join_and_list_require_join_access() {
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/SyncPlay/Join",
+            r#"{"GroupId":"00000000-0000-0000-0000-000000000001"}"#,
+        ),
+        ("GET", "/SyncPlay/List", ""),
+        ("GET", "/SyncPlay/00000000-0000-0000-0000-000000000001", ""),
+    ] {
+        for (access, permitted) in [
+            (CREATE_AND_JOIN, true),
+            (JOIN_ONLY, true),
+            (NO_SYNC_PLAY, false),
+        ] {
+            let (state, reached) = policy_state(access, false);
+            let (status, _) = send(state, method, uri, Body::from(body)).await;
+            if permitted {
+                assert_ne!(status, StatusCode::FORBIDDEN, "{uri} access {access}");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri} access {access}");
+            }
+            assert_eq!(
+                reached.load(std::sync::atomic::Ordering::SeqCst),
+                permitted,
+                "{uri} access {access}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sync_play_playback_verbs_require_group_membership() {
+    // `IsInGroup` is membership alone — a full-access user who is not in a group
+    // is refused, and a user whose policy is `None` but who *is* in a group is
+    // allowed (they were downgraded mid-session; C# lets them keep playing).
+    for (access, active, expected) in [
+        (CREATE_AND_JOIN, true, StatusCode::NO_CONTENT),
+        (CREATE_AND_JOIN, false, StatusCode::FORBIDDEN),
+        (NO_SYNC_PLAY, true, StatusCode::NO_CONTENT),
+        (NO_SYNC_PLAY, false, StatusCode::FORBIDDEN),
+    ] {
+        let (state, reached) = policy_state(access, active);
+        let (status, _) = send(state, "POST", "/SyncPlay/Pause", Body::from("{}")).await;
+        assert_eq!(status, expected, "access {access} active {active}");
+        assert_eq!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            active,
+            "a non-member's playback verb must not reach the manager"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sync_play_leave_requires_group_membership() {
+    let (state, reached) = policy_state(CREATE_AND_JOIN, false);
+    let (status, _) = send(state, "POST", "/SyncPlay/Leave", Body::empty()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
+
+    let (state, reached) = policy_state(CREATE_AND_JOIN, true);
+    let (status, _) = send(state, "POST", "/SyncPlay/Leave", Body::empty()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn mark_played_returns_dto_and_hits_user_data() {
     let (sessions, user_data) = recording();

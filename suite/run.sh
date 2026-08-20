@@ -8,6 +8,7 @@
 #   suite/run.sh publish  parity once, then BENCH_RUNS × (perf + merge) → agg-<sha> distributions
 #   suite/run.sh merge    join the latest parity ledger + perf summaries into the run record
 #   suite/run.sh gate [--measure|--rebaseline]   regression gate over the merged record
+#   suite/run.sh push     against a RUNNING Ferrofin → WebSocket push checks (cast + SyncPlay)
 #
 # Fairness disciplines (non-negotiable, enforced by the sub-scripts they call):
 #   parity runs BOTH servers up (diffing needs simultaneous state); perf runs them ONE AT A TIME
@@ -16,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
 
-usage() { sed -n '2,15p' "$ROOT/suite/run.sh"; exit 1; }
+usage() { sed -n '2,16p' "$ROOT/suite/run.sh"; exit 1; }
 [ $# -ge 1 ] || usage
 stage="$1"; shift || true
 
@@ -45,6 +46,17 @@ case "$stage" in
     ;;
   parity)  exec "$ROOT/suite/parity/sweep.sh" "$@" ;;
   perf)    exec "$ROOT/suite/perf/run.sh" "$@" ;;
+  push)
+    # Server→client pushes (remote control / cast + SyncPlay). The parity sweep
+    # diffs HTTP responses, which cannot see a WebSocket message at all — this
+    # opens two real sockets and asserts on what the receiving client gets.
+    # Needs a Ferrofin already running (it does not manage containers):
+    #   FERROFIN_BASE=http://127.0.0.1:8096 FERROFIN_USER=admin FERROFIN_PASS=… \
+    #     suite/run.sh push
+    : "${FERROFIN_BASE:?set FERROFIN_BASE to a running Ferrofin}"
+    "$ROOT/suite/ws/seed_library.sh"
+    exec python3 "$ROOT/suite/ws/probe_remote_control.py"
+    ;;
   all)
     # B2 (hermetic-enough build): a shareable release record must not trust the
     # incremental BuildKit cache mounts — a poisoned mount once served a stale
