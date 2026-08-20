@@ -488,11 +488,15 @@ fn normalize_imdb_id(imdb_id: &str) -> Option<String> {
     if id.is_empty() {
         return None;
     }
-    Some(if id.len() >= 2 && id[..2].eq_ignore_ascii_case("tt") {
-        id.to_owned()
-    } else {
-        format!("tt{id}")
-    })
+    // `get` rather than a slice: a non-ASCII first character would make
+    // `id[..2]` panic mid-codepoint.
+    Some(
+        if id.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("tt")) {
+            id.to_owned()
+        } else {
+            format!("tt{id}")
+        },
+    )
 }
 
 /// Parses an OMDb percentage string (e.g. `"85%"`) into `0.0`–`100.0`.

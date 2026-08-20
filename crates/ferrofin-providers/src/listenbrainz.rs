@@ -50,22 +50,22 @@ impl SimilarityAlgorithm {
     pub fn as_api_string(self) -> &'static str {
         match self {
             Self::SessionBased1825Days => {
-                "session_based_days_1825_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30"
+                "session_based_days_1825_session_300_contribution_3_threshold_10_limit_100_filter_True_skip_30"
             }
             Self::SessionBased1800Days => {
-                "session_based_days_1800_session_300_contribution_5_threshold_10_limit_100_skip_30"
+                "session_based_days_1800_session_300_contribution_3_threshold_10_limit_100_filter_True_skip_30"
             }
             Self::SessionBased7500Days => {
-                "session_based_days_7500_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30"
+                "session_based_days_7500_session_300_contribution_3_threshold_10_limit_100_filter_True_skip_30"
             }
             Self::SessionBased7500DaysHighContribution => {
-                "session_based_days_7500_session_300_contribution_10_threshold_15_limit_50_filter_True_skip_30"
+                "session_based_days_7500_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30"
             }
             Self::SessionBased9000Days => {
-                "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_filter_True_skip_30"
+                "session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30"
             }
             Self::SessionBased75Days => {
-                "session_based_days_75_session_300_contribution_10_threshold_10_limit_100_filter_True_skip_30"
+                "session_based_days_75_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30"
             }
         }
     }

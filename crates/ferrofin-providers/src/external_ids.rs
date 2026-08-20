@@ -95,7 +95,9 @@ impl<'a> ExternalIdItem<'a> {
     fn series_is_airdate_order(&self) -> bool {
         matches!(
             self.series_display_order.map(str::trim),
-            None | Some("" | "OriginalAirDate" | "Aired")
+            // C# parses this with `Enum.TryParse<TvGroupType>`, whose member
+            // is `OriginalAirDate`; no other spelling parses there.
+            None | Some("" | "OriginalAirDate")
         )
     }
 

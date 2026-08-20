@@ -29,7 +29,7 @@
 //! are therefore not mapped: `Genres` and `Tags` come from TagLib#'s XMP/IPTC
 //! keyword aggregation, which `kamadak-exif` does not parse.
 
-use chrono::{DateTime, NaiveDateTime, TimeZone as _, Utc};
+use chrono::{DateTime, Datelike as _, NaiveDateTime, TimeZone as _, Utc};
 use ferrofin_model::drawing::ImageOrientation;
 use ferrofin_model::entities::ImageType;
 use ferrofin_traits::drawing::ImageProcessor;
@@ -46,10 +46,8 @@ const PROVIDER_NAME: &str = "Embedded Information";
 /// to open.
 ///
 /// Port of the C# `_includeExtensions` set. The C# comment notes the gate
-/// exists because "other extensions might cause taglib to hang"; it is kept
-/// here (and unit-tested) even though the EXIF branch itself is deferred, so
-/// the gate lands byte-for-byte and the later EXIF work only has to fill the
-/// branch body. Compared case-insensitively against the source extension.
+/// exists because "other extensions might cause taglib to hang". Compared
+/// case-insensitively against the source extension.
 const EXIF_INCLUDE_EXTENSIONS: [&str; 7] =
     [".jpg", ".jpeg", ".png", ".tiff", ".cr2", ".webp", ".avif"];
 
@@ -368,10 +366,22 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             _ => None,
         }
     };
+    // Read the raw bytes, never `display_value()`: that renders an ASCII field
+    // quoted with every non-ASCII byte escaped (`café` → `caf\xc3\xa9`), and
+    // renders an unknown BYTE field as a comma-separated list of numbers.
     let text = |tag: Tag| -> Option<String> {
         let field = exif.get_field(tag, In::PRIMARY)?;
-        let value = field.display_value().to_string();
-        let value = value.trim().trim_matches('"').trim();
+        let value = match &field.value {
+            exif::Value::Ascii(parts) => {
+                let bytes: Vec<u8> = parts.concat();
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            // The Windows XP* tags are BYTE arrays holding UTF-16LE.
+            exif::Value::Byte(bytes) => utf16le(bytes),
+            exif::Value::Undefined(bytes, _) => String::from_utf8_lossy(bytes).into_owned(),
+            _ => return None,
+        };
+        let value = value.trim_end_matches('\0').trim();
         (!value.is_empty()).then(|| value.to_owned())
     };
     let integer = |tag: Tag| -> Option<i32> {
@@ -396,16 +406,31 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             altitude: gps_altitude(exif),
             iso_speed_rating: integer(Tag::PhotographicSensitivity),
         },
-        comment: text(Tag::ImageDescription),
+        // TagLib's `ImageTag.Comment` prefers the standard EXIF UserComment and
+        // only falls back to the TIFF ImageDescription.
+        comment: text(Tag::UserComment).or_else(|| text(Tag::ImageDescription)),
         // XPTitle (0x9c9b) and Rating (0x4746) are Windows' TIFF extensions —
         // TagLib# surfaces both as ImageTag.Title/Rating, kamadak-exif has no
         // named constant for either.
-        title: text(XP_TITLE).or_else(|| text(Tag::ImageDescription)),
+        // Only a real title becomes the item name. Falling back to the
+        // description here would set Name == Overview for every photo that
+        // carries only a description.
+        title: text(XP_TITLE),
         rating: integer(RATING).map(f64::from),
         date_taken: exif_datetime(exif),
         width: integer(Tag::PixelXDimension),
         height: integer(Tag::PixelYDimension),
     }
+}
+
+/// Decodes a UTF-16LE byte run, as the Windows `XP*` TIFF tags store text.
+fn utf16le(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// The Windows `XPTitle` TIFF tag (`0x9c9b`).
@@ -513,7 +538,7 @@ fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     }
     if let Some(taken) = tags.date_taken {
         item.date_taken = Some(taken);
-        item.production_year = Some(taken.format("%Y").to_string().parse().unwrap_or_default());
+        item.production_year = Some(taken.year());
     }
 }
 
@@ -953,6 +978,91 @@ mod tests {
         };
         provider.fetch(&mut item).await.expect("fetch");
         assert_eq!(item.exif.camera_make, None);
+    }
+
+    #[tokio::test]
+    async fn text_fields_decode_utf8_and_utf16_rather_than_debug_rendering() {
+        // Two real hazards: an ASCII field holding UTF-8 bytes (`display_value`
+        // escapes them), and the Windows XPTitle BYTE array holding UTF-16LE
+        // (`display_value` renders it as a list of numbers).
+        let make = "café".as_bytes();
+        let xp_title: Vec<u8> = "Sunset"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect();
+        let entries = [
+            (0x010f, 2u16, u32::try_from(make.len()).unwrap(), 0u32),
+            (0x9c9b, 1, u32::try_from(xp_title.len()).unwrap(), 0),
+        ];
+        let base = 8 + 2 + entries.len() * 12 + 4;
+        let mut extra = Vec::new();
+        extra.extend_from_slice(make);
+        let xp_offset = base + extra.len();
+        extra.extend_from_slice(&xp_title);
+        let entries = [
+            (
+                0x010f,
+                2u16,
+                u32::try_from(make.len()).unwrap(),
+                u32::try_from(base).unwrap().to_le_bytes(),
+            ),
+            (
+                0x9c9b,
+                1,
+                u32::try_from(xp_title.len()).unwrap(),
+                u32::try_from(xp_offset).unwrap().to_le_bytes(),
+            ),
+        ];
+        let jpeg = jpeg_with_exif(&entries, &extra, u32::try_from(base).unwrap());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &jpeg);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+
+        assert_eq!(
+            item.exif.camera_make.as_deref(),
+            Some("café"),
+            "a UTF-8 ASCII field must not come back escaped"
+        );
+        assert_eq!(
+            item.name.as_deref(),
+            Some("Sunset"),
+            "XPTitle is UTF-16LE, not a list of byte values"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_only_photo_keeps_its_filename_derived_name() {
+        // ImageDescription is a comment, not a title: it must fill Overview
+        // without overwriting the name.
+        let description = b"On the pier";
+        let entries = [(
+            0x010e,
+            2u16,
+            u32::try_from(description.len()).unwrap(),
+            50u32.to_le_bytes(),
+        )];
+        let jpeg = jpeg_with_exif(&entries, description, 26);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &jpeg);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            name: Some("DSC_0001".into()),
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.name.as_deref(), Some("DSC_0001"));
     }
 
     #[test]

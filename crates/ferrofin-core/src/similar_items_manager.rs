@@ -49,8 +49,16 @@ use crate::similar_items_repository::SimilarItemsRepository;
 /// Reads an unexpired reference cache, or `None` when it is missing, stale or
 /// unparseable.
 fn read_reference_cache(path: &Path) -> Option<Vec<SimilarItemReference>> {
+    // A missing entry is the normal cache miss and says nothing; an entry that
+    // exists but will not parse is worth one warning (C# logs the same).
     let raw = std::fs::read_to_string(path).ok()?;
-    let cache: SimilarItemsCache = serde_json::from_str(&raw).ok()?;
+    let cache: SimilarItemsCache = match serde_json::from_str(&raw) {
+        Ok(cache) => cache,
+        Err(err) => {
+            tracing::warn!(%err, path = %path.display(), "similar-items cache is unreadable");
+            return None;
+        }
+    };
     if cache.expires_at <= chrono::Utc::now() {
         return None;
     }
@@ -90,8 +98,10 @@ fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: 
             .collect(),
         expires_at: chrono::Utc::now() + ttl,
     };
-    if let Ok(json) = serde_json::to_string(&cache) {
-        let _ = std::fs::write(path, json);
+    if let Ok(json) = serde_json::to_string(&cache)
+        && let Err(err) = std::fs::write(path, json)
+    {
+        tracing::warn!(%err, path = %path.display(), "could not write similar-items cache");
     }
 }
 
@@ -146,6 +156,11 @@ struct CachedReference {
 fn kind_of(entity: &BaseItemEntity) -> BaseItemKind {
     crate::item_type_lookup::kind_from_type_name(&entity.type_).unwrap_or(BaseItemKind::Folder)
 }
+
+/// The display name of the built-in local similarity scorer — the string a
+/// library's `SimilarItemProviders` order lists it under. Must match the name
+/// `ferrofin-providers`' library-options registry advertises.
+const LOCAL_SIMILARITY_PROVIDER: &str = "Local Genre/Tag";
 
 /// The default number of similar items returned when the caller gives no limit.
 const DEFAULT_SIMILAR_LIMIT: i32 = 10;
@@ -231,21 +246,36 @@ impl FerrofinSimilarItemsManager {
         let (Some(library), false) = (self.library.as_ref(), self.remote.is_empty()) else {
             return Vec::new();
         };
+        // Resolving the library reads the filesystem, so narrow to the
+        // providers that could serve this kind at all first — most kinds have
+        // none, and those must not pay for a `get_virtual_folders` call.
+        let candidates: Vec<&Arc<dyn RemoteSimilarItemsProvider>> =
+            self.remote.iter().filter(|p| p.supports(kind)).collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
         let Some(type_name) = seed.type_.rsplit('.').next() else {
+            return Vec::new();
+        };
+        // The row's `TopParentId` is stored in the DB GUID form (uppercase,
+        // hyphenated) while `VirtualFolderInfo.item_id` is the display form
+        // (lowercase). Compare as parsed `Uuid`s, never as bytes.
+        let Some(top_parent) = seed
+            .top_parent_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
             return Vec::new();
         };
         let Ok(folders) = library.get_virtual_folders().await else {
             return Vec::new();
         };
-        let options = seed
-            .top_parent_id
-            .as_deref()
-            .and_then(|top| {
-                folders
-                    .iter()
-                    .find(|f| f.item_id.as_deref() == Some(top))
-                    .and_then(|f| f.library_options.as_ref())
+        let options = folders
+            .iter()
+            .find(|f| {
+                f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(top_parent)
             })
+            .and_then(|f| f.library_options.as_ref())
             .and_then(|o| {
                 o.type_options.iter().find(|t| {
                     t.type_
@@ -262,10 +292,8 @@ impl FerrofinSimilarItemsManager {
         } else {
             &options.similar_item_provider_order
         };
-        let mut enabled: Vec<Arc<dyn RemoteSimilarItemsProvider>> = self
-            .remote
-            .iter()
-            .filter(|p| p.supports(kind))
+        let mut enabled: Vec<Arc<dyn RemoteSimilarItemsProvider>> = candidates
+            .into_iter()
             .filter(|p| {
                 options
                     .similar_item_providers
@@ -281,6 +309,83 @@ impl FerrofinSimilarItemsManager {
                 .unwrap_or(usize::MAX)
         });
         enabled
+    }
+
+    /// Where the library ranked the local scorer among its similarity
+    /// providers — port of `GetConfiguredSimilarProviderOrder("Local Genre/Tag")`.
+    ///
+    /// A library that never saved an order (or omits the local provider from
+    /// it) leaves it first, which is where upstream's default puts it.
+    async fn local_provider_order(&self, seed: &BaseItemEntity) -> usize {
+        let Some(library) = self.library.as_ref() else {
+            return 0;
+        };
+        let (Some(type_name), Some(top_parent)) = (
+            seed.type_.rsplit('.').next(),
+            seed.top_parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
+        ) else {
+            return 0;
+        };
+        let Ok(folders) = library.get_virtual_folders().await else {
+            return 0;
+        };
+        folders
+            .iter()
+            .find(|f| {
+                f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(top_parent)
+            })
+            .and_then(|f| f.library_options.as_ref())
+            .and_then(|o| {
+                o.type_options.iter().find(|t| {
+                    t.type_
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(type_name))
+                })
+            })
+            .and_then(|t| {
+                let order = if t.similar_item_provider_order.is_empty() {
+                    &t.similar_item_providers
+                } else {
+                    &t.similar_item_provider_order
+                };
+                order
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(LOCAL_SIMILARITY_PROVIDER))
+            })
+            .unwrap_or(0)
+    }
+
+    /// Runs the local weighted-overlap scorer and appends its results at
+    /// `provider_order`, skipping anything already taken.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_local_results(
+        &self,
+        item_id: Uuid,
+        seed: &BaseItemEntity,
+        exclude_artist_ids: &[Uuid],
+        wanted: i32,
+        provider_order: usize,
+        taken: &mut std::collections::HashSet<Uuid>,
+        scored: &mut Vec<(BaseItemEntity, f32)>,
+    ) -> Result<(), ServiceError> {
+        let remaining = wanted - i32::try_from(scored.len()).unwrap_or(0);
+        if remaining <= 0 {
+            return Ok(());
+        }
+        let by_overlap = self
+            .repo
+            .weighted_similar_items(item_id, &seed.type_, exclude_artist_ids, remaining)
+            .await?;
+        for (position, entity) in by_overlap.into_iter().enumerate() {
+            if let Ok(id) = Uuid::parse_str(&entity.id)
+                && taken.insert(id)
+            {
+                scored.push((entity, calculate_score(None, provider_order, position)));
+            }
+        }
+        Ok(())
     }
 
     /// One provider's references for `seed`, read from the disk cache when it
@@ -379,12 +484,20 @@ impl FerrofinSimilarItemsManager {
 
         let mut out = Vec::new();
         for (provider_key, values) in by_provider {
-            let Ok(rows) = self
+            let rows = match self
                 .repo
                 .items_with_provider_values(provider_key, &values)
                 .await
-            else {
-                continue;
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        provider = provider_key,
+                        "resolving similar-item references failed"
+                    );
+                    continue;
+                }
             };
             for (item_id, value) in rows {
                 let key = (provider_key.to_lowercase(), value.to_lowercase());
@@ -492,33 +605,41 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         };
         let wanted = limit.unwrap_or(DEFAULT_SIMILAR_LIMIT);
-        // The local scorer always runs first (C#: "Local providers are always
-        // enabled"), and is provider-order 0.
-        let by_overlap = self
-            .repo
-            .weighted_similar_items(item_id, &seed.type_, exclude_artist_ids, wanted)
-            .await?;
-        let mut taken: std::collections::HashSet<Uuid> = std::collections::HashSet::from([item_id]);
-        let mut scored: Vec<(BaseItemEntity, f32)> = Vec::with_capacity(by_overlap.len());
-        for (position, entity) in by_overlap.into_iter().enumerate() {
-            if let Ok(id) = Uuid::parse_str(&entity.id)
-                && taken.insert(id)
-            {
-                scored.push((entity, calculate_score(None, 0, position)));
-            }
-        }
-
-        // Then each remote provider the library ticked, in its configured
-        // order, until enough results are resolved.
         let kind = kind_of(&seed);
+        // The local scorer is always enabled, but it takes its place in the
+        // SAME order list as the remote providers (C# puts local and remote
+        // into one `matchingProviders` list and sorts the lot by
+        // `SimilarItemProviderOrder`), so a library that ranks TheMovieDb
+        // above "Local Genre/Tag" really does get TMDB's results first.
         let providers = self.enabled_remote_providers(&seed, kind).await;
+        let local_order = self.local_provider_order(&seed).await;
         let seed_provider_ids = if providers.is_empty() {
             HashMap::new()
         } else {
             self.repo.provider_ids(item_id).await.unwrap_or_default()
         };
+
+        let mut taken: std::collections::HashSet<Uuid> = std::collections::HashSet::from([item_id]);
+        let mut scored: Vec<(BaseItemEntity, f32)> = Vec::new();
+        let mut ran_local = false;
+        let wanted_len = usize::try_from(wanted.max(0)).unwrap_or(0);
+
         for (index, provider) in providers.into_iter().enumerate() {
-            if scored.len() >= usize::try_from(wanted.max(0)).unwrap_or(0) {
+            // Run the local scorer once, at its configured position.
+            if !ran_local && local_order <= index {
+                ran_local = true;
+                self.push_local_results(
+                    item_id,
+                    &seed,
+                    exclude_artist_ids,
+                    wanted,
+                    index,
+                    &mut taken,
+                    &mut scored,
+                )
+                .await?;
+            }
+            if scored.len() >= wanted_len {
                 break;
             }
             let order = index + 1;
@@ -538,6 +659,18 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 self.resolve_remote_references(&references, order, kind, &mut taken)
                     .await,
             );
+        }
+        if !ran_local {
+            self.push_local_results(
+                item_id,
+                &seed,
+                exclude_artist_ids,
+                wanted,
+                usize::MAX,
+                &mut taken,
+                &mut scored,
+            )
+            .await?;
         }
 
         // Highest score first. The sort is deliberately left STABLE with no
@@ -768,7 +901,10 @@ mod tests {
                 .to_owned(),
             name: Some(name.to_owned()),
             genres: Some(genres.to_owned()),
-            top_parent_id: library.map(|l| l.to_string()),
+            // The scanner writes this through `guid_to_db`, i.e. the uppercase
+            // hyphenated DB form — NOT the lowercase display form. A test that
+            // seeds the display form hides any format mismatch in the lookup.
+            top_parent_id: library.map(ferrofin_db::store::guid_to_db),
             ..Default::default()
         };
         FerrofinItemPersistenceService::new(db.clone())
@@ -825,6 +961,9 @@ mod tests {
             &self,
         ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
             Ok(vec![ferrofin_model::entities_media::VirtualFolderInfo {
+                // The real `VirtualFolderManager` reports the display form
+                // (lowercase), while rows store the DB form — the two must
+                // still resolve to the same library.
                 item_id: Some(self.library_id.to_string()),
                 library_options: Some(ferrofin_model::configuration::LibraryOptions {
                     type_options: vec![ferrofin_model::configuration::TypeOptions {
@@ -917,7 +1056,7 @@ mod tests {
                 calls: Arc::clone(&calls),
             })],
             Arc::new(FakeFolders {
-                library_id: Uuid::from_u128(0x900),
+                library_id: Uuid::from_u128(0x9ab_cdd),
                 // Saved options that do NOT list the provider.
                 providers: vec!["Local Genre/Tag".to_owned()],
             }),
@@ -931,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn a_ticked_remote_providers_matches_join_the_results() {
         let db = test_db().await;
-        let library = Uuid::from_u128(0x910);
+        let library = Uuid::from_u128(0x9ab_cde);
         let seed = Uuid::from_u128(0x911);
         let remote_match = Uuid::from_u128(0x912);
         seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
@@ -973,9 +1112,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_cache_path_matches_jellyfins_layout() {
+        // `{cache}/{provider}-similar-{type}/{itemId:N}.json`, all lowercased —
+        // a shared cache directory has to stay valid for both servers.
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x930);
+        let mgr = manager(&db).with_cache_dir(PathBuf::from("/cache"));
+        let seed = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: id.to_string(),
+            type_: stored_type_name(BaseItemKind::Movie)
+                .expect("movie type name")
+                .to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            mgr.cache_path("TheMovieDb", &seed),
+            Some(PathBuf::from(format!(
+                "/cache/themoviedb-similar-movie/{}.json",
+                id.simple()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_library_order_can_rank_a_remote_provider_above_the_local_scorer() {
+        // A library that lists TheMovieDb before "Local Genre/Tag" must get
+        // TMDB's match first, even though the local scorer also has results.
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_ce0);
+        let seed = Uuid::from_u128(0x941);
+        let local_match = Uuid::from_u128(0x942);
+        let remote_match = Uuid::from_u128(0x943);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_in(&db, local_match, "Aliens", "SciFi", Some(library)).await;
+        seed_movie_in(&db, remote_match, "Solaris", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(remote_match, "Tmdb", "348")
+            .await
+            .expect("save id");
+
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![SimilarItemReference {
+                    provider_name: "Tmdb".to_owned(),
+                    provider_id: "348".to_owned(),
+                    score: None,
+                }],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec!["TheMovieDb".to_owned(), "Local Genre/Tag".to_owned()],
+            }),
+        );
+        let names: Vec<_> = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
+            .await
+            .expect("similar")
+            .iter()
+            .filter_map(|r| r.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["Solaris"],
+            "the remote provider was ranked first, so its match wins the single slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_local_scorer_still_wins_when_it_is_ranked_first() {
+        // The mirror of the test above: same data, opposite order.
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_ce1);
+        let seed = Uuid::from_u128(0x951);
+        let local_match = Uuid::from_u128(0x952);
+        let remote_match = Uuid::from_u128(0x953);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_in(&db, local_match, "Aliens", "SciFi", Some(library)).await;
+        seed_movie_in(&db, remote_match, "Solaris", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(remote_match, "Tmdb", "348")
+            .await
+            .expect("save id");
+
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![SimilarItemReference {
+                    provider_name: "Tmdb".to_owned(),
+                    provider_id: "348".to_owned(),
+                    score: None,
+                }],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec!["Local Genre/Tag".to_owned(), "TheMovieDb".to_owned()],
+            }),
+        );
+        let names: Vec<_> = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
+            .await
+            .expect("similar")
+            .iter()
+            .filter_map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["Aliens"]);
+    }
+
+    #[tokio::test]
     async fn a_reference_that_matches_no_library_item_is_dropped() {
         let db = test_db().await;
-        let library = Uuid::from_u128(0x920);
+        let library = Uuid::from_u128(0x9ab_cdf);
         let seed = Uuid::from_u128(0x921);
         seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
         let mgr = manager(&db).with_remote_providers(

@@ -1637,7 +1637,11 @@ impl LibraryScanner {
                     .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
                     .await;
             }
-            apply_release_details(&mut updated, mb, resolved.release_id.as_deref()).await;
+            // The save below lives in `enrich_album_artwork` and is gated on
+            // its own change flag, so a date applied here has to be reported —
+            // otherwise it is fetched and silently discarded.
+            let dated =
+                apply_release_details(&mut updated, mb, resolved.release_id.as_deref()).await;
 
             self.enrich_album_artwork(
                 album_uuid,
@@ -1646,6 +1650,7 @@ impl LibraryScanner {
                 album_artist.as_deref(),
                 artist_mbid,
                 policy,
+                dated,
             )
             .await?;
             // Last resort: an album with no artwork takes its first track's
@@ -1657,6 +1662,7 @@ impl LibraryScanner {
 
     /// AudioDb album metadata (description/year) + AudioDb/fanart album artwork,
     /// keyed by the release-group id (fanart also needs the album-artist's mbid).
+    #[allow(clippy::too_many_arguments)]
     async fn enrich_album_artwork(
         &self,
         album_uuid: Uuid,
@@ -1665,8 +1671,9 @@ impl LibraryScanner {
         album_artist: Option<&str>,
         artist_mbid: &HashMap<String, String>,
         policy: FetcherPolicy<'_>,
+        already_changed: bool,
     ) -> Result<(), ServiceError> {
-        let mut changed = false;
+        let mut changed = already_changed;
         let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
         if policy.metadata_enabled("MusicAlbum", fetcher_names::AUDIODB)
             && let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
@@ -2128,10 +2135,17 @@ impl LibraryScanner {
                 return result;
             }
         }
-        if !tmdb_on {
-            return RemoteMetadata::default();
-        }
         let omdb_on = policy.metadata_enabled(&short, fetcher_names::OMDB);
+        if !tmdb_on {
+            // Each fetcher's checkbox gates only itself: unchecking TheMovieDb
+            // must not silently disable OMDb as well.
+            return if omdb_on {
+                self.fetch_omdb_metadata(entity, &short, cache, policy)
+                    .await
+            } else {
+                RemoteMetadata::default()
+            };
+        }
         if let Some(result) = self.fetch_tmdb_metadata(entity, &short, omdb_on).await {
             return result;
         }
@@ -2202,6 +2216,9 @@ impl LibraryScanner {
         }
         if !locked {
             if let Some(name) = photo.name.filter(|n| !n.is_empty()) {
+                // The sort name follows the title, or the album keeps sorting
+                // by filename while displaying the EXIF title.
+                entity.sort_name = Some(derived_sort_name(entity, &name));
                 entity.name = Some(name);
             }
             if photo.overview.is_some() {
@@ -2304,7 +2321,15 @@ impl LibraryScanner {
             provider_ids.push(("Imdb".to_owned(), id.to_owned()));
         }
         RemoteMetadata {
-            people: omdb_people(&item),
+            // C# `ParseAdditionalMetadata` returns before adding the
+            // director/writer/actors unless the OMDb plugin's `CastAndCrew`
+            // flag is set, and that bool has no initializer — so upstream's
+            // default is OFF and Ferrofin matches it.
+            people: if OMDB_CAST_AND_CREW {
+                omdb_people(&item)
+            } else {
+                Vec::new()
+            },
             provider_ids,
         }
     }
@@ -2753,18 +2778,38 @@ impl LibraryScanner {
             policy,
             embedded_images,
         } = art;
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
-        // before any discovery runs), and a book's cover comes out of its own
-        // archive — neither needs the discovery chain below.
+        // before any discovery runs) and a book's cover comes out of its own
+        // archive, so neither needs the *remote* chain. They still get local
+        // discovery, the metadata art dir (uploads and earlier downloads) and
+        // the dynamic providers, exactly like every other kind — upstream runs
+        // `ILocalImageProvider` ahead of the embedded-cover providers, so a
+        // sidecar `folder.jpg` wins over the extracted cover.
         if !embedded_images.is_empty() {
-            let mut images = embedded_images;
+            let mut images = if policy.image_enabled(short, fetcher_names::LOCAL_IMAGES) {
+                discover_local_images(entity)
+            } else {
+                Vec::new()
+            };
+            // Local discovery wins per type; the embedded cover fills what it
+            // left empty (`dedup_images_by_type` is the `RemoteImage` twin of
+            // this, which cannot be reused for `ItemImageInfo`).
+            let mut seen: std::collections::HashSet<ImageType> =
+                images.iter().map(|i| i.image_type).collect();
+            images.extend(
+                embedded_images
+                    .into_iter()
+                    .filter(|i| seen.insert(i.image_type)),
+            );
+            self.append_art_dir_images(entity, &mut images);
+            self.apply_dynamic_images(entity, &mut images, policy).await;
             self.fill_image_metadata(&mut images).await;
             if let Err(err) = self.persistence.save_item_images(item_id, &images).await {
                 tracing::warn!(%err, item = %item_id, "failed to persist embedded artwork");
             }
             return;
         }
-        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // "Local Images" is the media-adjacent discovery (poster.jpg next
         // to the file); the metadata art dir below is Ferrofin-owned
         // (uploads + earlier downloads) and is never gated.
@@ -4843,26 +4888,40 @@ async fn apply_release_details(
     album: &mut BaseItemEntity,
     mb: &ferrofin_providers::MusicBrainzClient,
     release_id: Option<&str>,
-) {
+) -> bool {
     if album.premiere_date.is_some() {
-        return;
+        return false;
     }
     let Some(release) = release_id else {
-        return;
+        return false;
     };
     let Some(details) = mb.release_details(release).await else {
-        return;
+        return false;
     };
+    let mut changed = false;
     if let Some(date) = details
         .premiere_date
         .and_then(ferrofin_providers::PartialDate::to_utc)
     {
         album.premiere_date = Some(date);
+        changed = true;
     }
-    if album.production_year.is_none() {
-        album.production_year = details.production_year.map(i64::from);
+    if album.production_year.is_none()
+        && let Some(year) = details.production_year
+    {
+        album.production_year = Some(i64::from(year));
+        changed = true;
     }
+    changed
 }
+
+/// Whether OMDb's director/writer/actor credits are added to an item.
+///
+/// Port of the OMDb plugin's `PluginConfiguration.CastAndCrew`, an
+/// uninitialized `bool` — so upstream's default is `false` and OMDb adds no
+/// people. Ferrofin has no per-plugin config page for OMDb, so it matches the
+/// upstream default rather than inventing a different one.
+const OMDB_CAST_AND_CREW: bool = false;
 
 /// Applies an OMDb record to the row, filling only what is still empty (a local
 /// NFO, an earlier fetcher, or a prior scan wins), mirroring [`apply_details`].

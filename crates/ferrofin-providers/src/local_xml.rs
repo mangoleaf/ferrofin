@@ -147,6 +147,21 @@ fn write_container_xml(
     if let Some(name) = container.name.as_deref().filter(|v| !v.is_empty()) {
         push_element(&mut xml, 2, "LocalTitle", name);
     }
+    if !container.children.is_empty() {
+        let _ = writeln!(xml, "  <{list_element}>");
+        for child in &container.children {
+            let _ = writeln!(xml, "    <{item_element}>");
+            // C# `AddLinkedChildren` writes only `<Path>` — it resolves ids to
+            // paths first. The reader accepts both, as upstream's does.
+            if let Some(path) = child.path.as_deref().filter(|v| !v.is_empty()) {
+                push_element(&mut xml, 6, "Path", path);
+            }
+            let _ = writeln!(xml, "    </{item_element}>");
+        }
+        let _ = writeln!(xml, "  </{list_element}>");
+    }
+    // C# emits this from `WriteCustomElementsAsync`, which runs *after*
+    // `AddCommonNodesAsync` writes the item list.
     if write_media_type
         && let Some(media_type) = container
             .playlist_media_type
@@ -154,20 +169,6 @@ fn write_container_xml(
             .filter(|v| !v.is_empty())
     {
         push_element(&mut xml, 2, "PlaylistMediaType", media_type);
-    }
-    if !container.children.is_empty() {
-        let _ = writeln!(xml, "  <{list_element}>");
-        for child in &container.children {
-            let _ = writeln!(xml, "    <{item_element}>");
-            if let Some(path) = child.path.as_deref().filter(|v| !v.is_empty()) {
-                push_element(&mut xml, 6, "Path", path);
-            }
-            if let Some(item_id) = child.item_id.as_deref().filter(|v| !v.is_empty()) {
-                push_element(&mut xml, 6, "ItemId", item_id);
-            }
-            let _ = writeln!(xml, "    </{item_element}>");
-        }
-        let _ = writeln!(xml, "  </{list_element}>");
     }
     xml.push_str("</Item>");
     xml
@@ -277,7 +278,31 @@ mod tests {
         };
         let xml = save_playlist_xml(&original);
         assert!(xml.contains("<PlaylistMediaType>Audio</PlaylistMediaType>"));
-        assert_eq!(parse_container_xml(&xml).expect("reparse"), original);
+        // C# writes the media type from `WriteCustomElementsAsync`, which runs
+        // after the common nodes have emitted the item list.
+        assert!(
+            xml.find("<PlaylistItems>") < xml.find("<PlaylistMediaType>"),
+            "the item list comes first: {xml}"
+        );
+        // Only `<Path>` is written (C# `AddLinkedChildren` resolves ids to
+        // paths), so an id does not survive the round trip — the reader still
+        // accepts one, because a Jellyfin-written file may carry it.
+        let reparsed = parse_container_xml(&xml).expect("reparse");
+        assert_eq!(
+            reparsed.children,
+            vec![
+                LocalLinkedChild {
+                    path: Some("/music/a.flac".into()),
+                    item_id: None,
+                },
+                LocalLinkedChild {
+                    path: Some("/music/b.flac".into()),
+                    item_id: None,
+                },
+            ]
+        );
+        assert_eq!(reparsed.name, original.name);
+        assert_eq!(reparsed.playlist_media_type, original.playlist_media_type);
     }
 
     #[test]

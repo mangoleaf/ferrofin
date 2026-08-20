@@ -32,6 +32,12 @@ pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
 /// embedded metadata or cover.
 const READABLE_ARCHIVE_EXTENSIONS: [&str; 2] = ["cbz", "cbt"];
 
+/// The largest single archive entry this module will decompress into memory.
+///
+/// A cover page or an OPF document is kilobytes; the cap is what stops a
+/// malicious `.cbz`/`.epub` from turning a scan into an OOM abort.
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+
 /// The image extensions a comic page may have, for the cover extractor.
 const PAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 
@@ -240,7 +246,9 @@ pub fn parse_comic_book_info(json: &str) -> Option<BookMetadata> {
         book.studios = vec![publisher];
     }
     book.premiere_date = match (comic.publication_year, comic.publication_month) {
-        (Some(year), Some(month)) => three_part_date(Some(year), u32::try_from(month).ok(), None),
+        (Some(year), Some(month)) => u32::try_from(month)
+            .ok()
+            .and_then(|m| two_part_date(year, m)),
         _ => None,
     };
     for credit in comic.credits {
@@ -252,13 +260,7 @@ pub fn parse_comic_book_info(json: &str) -> Option<BookMetadata> {
             Some((last, first)) => format!("{} {}", first.trim(), last.trim()),
             None => person,
         };
-        // C# parses the role as a PersonKind, mapping the "Colorer" spelling.
-        let kind = if role.eq_ignore_ascii_case("Colorer") {
-            "Colorist".to_owned()
-        } else {
-            role
-        };
-        book.people.push((name, kind));
+        book.people.push((name, person_kind(&role)));
     }
     book.has_metadata().then_some(book)
 }
@@ -300,7 +302,21 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
                 .to_owned();
             match meta_name.to_ascii_lowercase().as_str() {
                 "calibre:series" => book.series_name = non_empty(Some(content)),
-                "calibre:series_index" => book.index_number = content.trim().parse().ok(),
+                // Calibre writes this as a float (`1.0`); C# rounds via
+                // `Convert.ToInt32(Convert.ToDouble(value))`.
+                "calibre:series_index" => {
+                    book.index_number = content
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .map(f64::round)
+                        .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
+                        .map(|v| {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let rounded = v as i32;
+                            rounded
+                        });
+                }
                 "calibre:rating" => book.community_rating = content.trim().parse().ok(),
                 _ => {}
             }
@@ -326,7 +342,9 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
             "description" => book.overview = Some(value.to_owned()),
             "publisher" => book.studios.push(value.to_owned()),
             "language" => book.language = Some(value.to_owned()),
-            "subject" => book.genres.extend(split_commas(value)),
+            // "specification has no rules about content and some books combine
+            // every genre into a single element" — C# splits on all five.
+            "subject" => book.genres.extend(split_genres(value)),
             "date" => {
                 if let Some(date) = parse_opf_date(value) {
                     book.production_year = Some(date.year());
@@ -339,8 +357,10 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
                 }
             }
             "creator" => {
-                book.people
-                    .push((value.to_owned(), opf_role(role.as_deref())));
+                let kind = opf_role(role.as_deref());
+                for name in split_creators(value) {
+                    book.people.push((name, kind.clone()));
+                }
             }
             _ => {}
         }
@@ -359,13 +379,109 @@ fn opf_identifier_key(scheme: &str) -> Option<&'static str> {
     }
 }
 
-/// The person kind an OPF `opf:role` marks. Jellyfin maps the MARC relator
-/// `aut` to an author and treats everything else as an unknown credit.
+/// A ComicBookInfo credit role as a `PersonKind` name — port of C#'s
+/// `Enum.TryParse<PersonKind>(role)` with its `Unknown` fallback and the
+/// explicit `"Colorer"` → `Colorist` special case.
+fn person_kind(role: &str) -> String {
+    if role.eq_ignore_ascii_case("Colorer") {
+        return "Colorist".to_owned();
+    }
+    PERSON_KINDS
+        .iter()
+        .find(|kind| kind.eq_ignore_ascii_case(role))
+        .map_or_else(|| "Unknown".to_owned(), |kind| (*kind).to_owned())
+}
+
+/// The `PersonKind` names `Enum.TryParse` accepts, from
+/// `Jellyfin.Data/Enums/PersonKind.cs`.
+const PERSON_KINDS: [&str; 25] = [
+    "Unknown",
+    "Actor",
+    "Director",
+    "Composer",
+    "Writer",
+    "GuestStar",
+    "Producer",
+    "Conductor",
+    "Lyricist",
+    "Arranger",
+    "Engineer",
+    "Mixer",
+    "Remixer",
+    "Creator",
+    "Artist",
+    "AlbumArtist",
+    "Author",
+    "Illustrator",
+    "Penciller",
+    "Inker",
+    "Colorist",
+    "Letterer",
+    "CoverArtist",
+    "Editor",
+    "Translator",
+];
+
+/// The person kind an OPF `opf:role` MARC relator marks — port of
+/// `OpfReader.GetRole`, including its default-to-`Author` fallthrough.
 fn opf_role(role: Option<&str>) -> String {
     match role.map(str::trim) {
-        Some("aut") | None => "Author".to_owned(),
-        Some(other) => other.to_owned(),
+        Some("arr") => "Arranger",
+        Some("art") => "Artist",
+        Some("edt") => "Editor",
+        Some("ill") => "Illustrator",
+        Some("lyr") => "Lyricist",
+        Some("mus") => "AlbumArtist",
+        Some("nrt") => "Narrator",
+        Some("oth") => "Unknown",
+        Some("trl") => "Translator",
+        // `aut`/`aqt`/`aft`/`aui`, an unknown relator, and no role at all.
+        _ => "Author",
     }
+    .to_owned()
+}
+
+/// Splits one `<dc:creator>` into names — port of `FindAuthors`: entries are
+/// separated by `;`, a `"Last, First"` pair is flipped, and an initial that is
+/// not already followed by a space gets one (`"J.R.R. Tolkien"`).
+fn split_creators(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let flipped = match entry.split_once(',') {
+                Some((last, first)) if !last.trim().is_empty() && !first.trim().is_empty() => {
+                    format!("{} {}", first.trim(), last.trim())
+                }
+                _ => entry.to_owned(),
+            };
+            expand_initials(&flipped)
+        })
+        .collect()
+}
+
+/// C# `InitialsRegex` — `(?<=\p{L})\.(?!\s|$)` replaced by `". "`: a period
+/// that follows a letter and is not already followed by whitespace or the end
+/// of the string gains a space.
+fn expand_initials(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    for (index, ch) in chars.iter().enumerate() {
+        out.push(*ch);
+        if *ch != '.' {
+            continue;
+        }
+        let follows_letter = index
+            .checked_sub(1)
+            .and_then(|i| chars.get(i))
+            .is_some_and(|prev| prev.is_alphabetic());
+        let next_is_space_or_end = chars.get(index + 1).is_none_or(|next| next.is_whitespace());
+        if follows_letter && !next_is_space_or_end {
+            out.push(' ');
+        }
+    }
+    out
 }
 
 /// A parsed OPF `<dc:date>`.
@@ -423,7 +539,15 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
     pages.sort();
     let first = pages.into_iter().next()?;
     let mut entry = archive.by_name(&first).ok()?;
-    let mut bytes = Vec::new();
+    if entry.size() > MAX_ARCHIVE_ENTRY_BYTES {
+        tracing::warn!(
+            entry = entry.name(),
+            size = entry.size(),
+            "comic cover page is implausibly large; skipping"
+        );
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
     entry.read_to_end(&mut bytes).ok()?;
     Some((first, bytes))
 }
@@ -432,8 +556,13 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
 fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     let opf_path = read_epub_content_path(path)?;
     let opf = read_archive_entry_text(path, &opf_path.to_lowercase())?;
-    let cover_id = epub_cover_id(&opf)?;
-    let href = epub_manifest_href(&opf, &cover_id)?;
+    // C# `ReadCoverPath` probes in order: a manifest item with
+    // `properties="cover-image"` (the EPUB 3 way), then id `cover-image`,
+    // then id `cover`, and only then `<meta name="cover" content="…"/>`.
+    let href = epub_manifest_href_by_property(&opf, "cover-image")
+        .or_else(|| epub_manifest_href(&opf, "cover-image"))
+        .or_else(|| epub_manifest_href(&opf, "cover"))
+        .or_else(|| epub_cover_id(&opf).and_then(|id| epub_manifest_href(&opf, &id)))?;
     // Manifest hrefs are relative to the OPF's own directory.
     let root = Path::new(&opf_path)
         .parent()
@@ -464,6 +593,30 @@ fn epub_cover_id(opf: &str) -> Option<String> {
             let content = content.trim().to_owned();
             if !content.is_empty() {
                 return Some(content);
+            }
+        }
+        cursor.read();
+    }
+    None
+}
+
+/// The `href` of the manifest item carrying `properties="…"` — the EPUB 3
+/// declaration, which most modern books use instead of the `<meta>` pointer.
+fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
+    let Ok(mut cursor) = XmlCursor::new(opf) else {
+        return None;
+    };
+    while !cursor.eof() {
+        if cursor.is_element()
+            && cursor.name().eq_ignore_ascii_case("item")
+            && cursor
+                .get_attribute("properties")
+                .is_some_and(|v| v.split_whitespace().any(|p| p == property))
+            && let Some(href) = cursor.get_attribute("href")
+        {
+            let href = href.trim().to_owned();
+            if !href.is_empty() {
+                return Some(href);
             }
         }
         cursor.read();
@@ -508,7 +661,19 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
             .is_some_and(|e| e.name().to_lowercase() == wanted_lower)
     })?;
     let mut entry = archive.by_index(index).ok()?;
-    let mut bytes = Vec::new();
+    // A comic page or an OPF is kilobytes; refuse anything that claims to
+    // decompress to more than this rather than reading it into memory. C#
+    // catches the resulting exception; an unbounded read here would abort the
+    // process on OOM instead.
+    if entry.size() > MAX_ARCHIVE_ENTRY_BYTES {
+        tracing::warn!(
+            entry = entry.name(),
+            size = entry.size(),
+            "archive entry is implausibly large; skipping"
+        );
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
     entry.read_to_end(&mut bytes).ok()?;
     Some(bytes)
 }
@@ -536,6 +701,19 @@ fn extension_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Splits an OPF `<dc:subject>` on the separators C# uses (`/`, `&`, `,`, `;`
+/// and `" - "`), trimming and dropping empties.
+fn split_genres(value: &str) -> Vec<String> {
+    value
+        .replace(" - ", ",")
+        .replace(['/', '&', ';'], ",")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Splits a comma-separated list, trimming and dropping empties.
 fn split_commas(value: &str) -> Vec<String> {
     value
@@ -558,14 +736,25 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
-/// A `(year, month, day)` triple as a UTC instant; a missing month or day
-/// defaults to 1, as C# `ReadThreePartDateInto` does.
+/// A `(year, month, day)` triple as a UTC instant.
+///
+/// C# `ReadThreePartDateInto` initialises all three parts to `0` and lets
+/// `new DateTime(year, month, day)` throw for a missing part, catching the
+/// exception and recording no date — so a `ComicInfo.xml` carrying only
+/// `<Year>` yields **no** `PremiereDate`, not January 1st.
 fn three_part_date(
     year: Option<i32>,
     month: Option<u32>,
     day: Option<u32>,
 ) -> Option<DateTime<Utc>> {
-    let date = NaiveDate::from_ymd_opt(year?, month.unwrap_or(1), day.unwrap_or(1))?;
+    let date = NaiveDate::from_ymd_opt(year?, month?, day?)?;
+    Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
+}
+
+/// A `(year, month)` pair as a UTC instant — C# `ReadTwoPartDateInto`, which
+/// passes `1` for the day, so a year+month pair *does* yield a date.
+fn two_part_date(year: i32, month: u32) -> Option<DateTime<Utc>> {
+    let date = NaiveDate::from_ymd_opt(year, month, 1)?;
     Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
 }
 
@@ -755,6 +944,95 @@ mod tests {
         )
         .expect("metadata");
         assert_eq!(book.production_year, Some(1965));
+    }
+
+    #[test]
+    fn a_year_only_comic_info_has_no_premiere_date() {
+        // C# builds the date from three parts initialised to 0 and lets the
+        // DateTime constructor throw, so a Year on its own yields no date —
+        // NOT January 1st.
+        let book = parse_comic_info(r"<ComicInfo><Title>T</Title><Year>1988</Year></ComicInfo>")
+            .expect("metadata");
+        assert_eq!(book.production_year, Some(1988));
+        assert_eq!(book.premiere_date, None);
+
+        // All three parts present still yields a date.
+        let full = parse_comic_info(
+            r"<ComicInfo><Year>1988</Year><Month>3</Month><Day>29</Day></ComicInfo>",
+        )
+        .expect("metadata");
+        assert_eq!(
+            full.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("1988-03-29".to_owned())
+        );
+    }
+
+    #[test]
+    fn comic_book_info_credits_map_to_real_person_kinds() {
+        let book = parse_comic_book_info(
+            r#"{"ComicBookInfo/1.0":{"title":"T","credits":[
+                {"person":"A","role":"Penciller"},
+                {"person":"B","role":"Colorer"},
+                {"person":"C","role":"Chief Vibes Officer"}]}}"#,
+        )
+        .expect("metadata");
+        let kinds: Vec<&str> = book.people.iter().map(|(_, k)| k.as_str()).collect();
+        // A real PersonKind survives, "Colorer" is normalized, and anything
+        // Enum.TryParse would reject becomes Unknown rather than a raw string.
+        assert_eq!(kinds, ["Penciller", "Colorist", "Unknown"]);
+    }
+
+    #[test]
+    fn opf_roles_map_marc_relators_and_default_to_author() {
+        assert_eq!(opf_role(Some("edt")), "Editor");
+        assert_eq!(opf_role(Some("ill")), "Illustrator");
+        assert_eq!(opf_role(Some("trl")), "Translator");
+        assert_eq!(opf_role(Some("oth")), "Unknown");
+        // `aut` and every unknown relator fall through to Author, as C# does.
+        assert_eq!(opf_role(Some("aut")), "Author");
+        assert_eq!(opf_role(Some("zzz")), "Author");
+        assert_eq!(opf_role(None), "Author");
+    }
+
+    #[test]
+    fn opf_creators_are_split_flipped_and_initial_spaced() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata>
+                   <dc:title>T</dc:title>
+                   <dc:creator>Herbert, Frank; Tolkien, J.R.R.</dc:creator>
+                 </metadata></package>"#,
+        )
+        .expect("metadata");
+        let names: Vec<&str> = book.people.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Frank Herbert", "J. R. R. Tolkien"]);
+    }
+
+    #[test]
+    fn a_calibre_float_series_index_is_rounded() {
+        // Calibre writes `1.0`, which an integer parse would reject outright.
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>T</dc:title>
+                 <meta name="calibre:series_index" content="1.0"/></metadata></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.index_number, Some(1));
+    }
+
+    #[test]
+    fn a_combined_subject_element_is_split_on_every_upstream_separator() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>T</dc:title>
+                 <dc:subject>Fantasy / Adventure &amp; Myth; Epic - Classic</dc:subject>
+                 </metadata></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(
+            book.genres,
+            ["Fantasy", "Adventure", "Myth", "Epic", "Classic"]
+        );
     }
 
     #[test]

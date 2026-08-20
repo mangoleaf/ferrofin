@@ -149,12 +149,19 @@ fn local_providers() -> Vec<Provider> {
 
 /// The providers that fetch from an external service.
 fn remote_providers() -> Vec<Provider> {
+    let mut provs = metadata_providers();
+    provs.extend(similarity_providers());
+    provs
+}
+
+/// The remote providers that supply metadata or artwork.
+fn metadata_providers() -> Vec<Provider> {
     vec![
         Provider {
             // Always wired by the composition root (its client is created
             // unconditionally); the `tmdb` cargo feature gates nothing.
             name: "TheMovieDb",
-            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher, Cap::Similarity],
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
             default_enabled: true,
             compiled: true,
@@ -239,6 +246,22 @@ fn remote_providers() -> Vec<Provider> {
                 "Trailer",
             ],
             default_enabled: true,
+            compiled: true,
+        },
+    ]
+}
+
+/// The remote providers that answer "what is similar to this".
+fn similarity_providers() -> Vec<Provider> {
+    vec![
+        Provider {
+            // Upstream registers only `TmdbMovieSimilarProvider` and
+            // `TmdbSeriesSimilarProvider`, so TMDB's similarity capability
+            // covers those two kinds and not the rest of its metadata types.
+            name: "TheMovieDb",
+            caps: &[Cap::Similarity],
+            types: &["Movie", "Series"],
+            default_enabled: false,
             compiled: true,
         },
         Provider {

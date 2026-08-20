@@ -191,8 +191,12 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                 name: Some(hit.name),
                 overview: hit.overview,
                 image_url: hit.poster_url,
+                // C# `TmdbBoxSetProvider` sets `MetadataProvider.Tmdb` on the
+                // box set itself — `TmdbCollection` is the key a *movie* uses
+                // to point at its collection, and is not read back for a
+                // BoxSet by the links table or the image path.
                 provider_ids: Some(std::collections::HashMap::from([(
-                    "TmdbCollection".to_owned(),
+                    "Tmdb".to_owned(),
                     hit.tmdb_id.to_string(),
                 )])),
                 search_provider_name: Some("TheMovieDb".to_owned()),
@@ -1201,7 +1205,19 @@ impl ProviderManager for LocalProviderManager {
         {
             infos = crate::external_ids::external_id_infos(*kind);
         }
-        infos.extend(self.external_id_infos.iter().cloned());
+        // Supplied descriptors are *extra* providers (a host registering its
+        // own), so skip any that the kind-filtered set already advertises.
+        let extras: Vec<ExternalIdInfo> = self
+            .external_id_infos
+            .iter()
+            .filter(|extra| {
+                !infos
+                    .iter()
+                    .any(|known| known.key == extra.key && known.type_ == extra.type_)
+            })
+            .cloned()
+            .collect();
+        infos.extend(extras);
         Ok(infos)
     }
 
@@ -2320,10 +2336,9 @@ mod tests {
             .expect("results");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("The Matrix Collection"));
-        assert_eq!(
-            results[0].provider_ids.as_ref().unwrap()["TmdbCollection"],
-            "2344"
-        );
+        // The box set carries `Tmdb`, as C# `TmdbBoxSetProvider` sets it —
+        // `TmdbCollection` is a *movie*'s pointer at its collection.
+        assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "2344");
     }
 
     #[test]

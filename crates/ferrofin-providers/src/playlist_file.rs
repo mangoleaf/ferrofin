@@ -20,7 +20,7 @@ pub fn is_playlist_file(path: &str) -> bool {
 }
 
 /// The media paths a playlist file lists, in order, each resolved against the
-/// playlist's own directory and de-duplicated.
+/// playlist's own directory.
 ///
 /// Port of `PlaylistItemsProvider.GetItems` plus its per-format readers. The
 /// caller resolves each path to a library item (C# `FindByPath`), which is the
@@ -34,14 +34,12 @@ pub fn read_playlist_file(path: &str, contents: &str) -> Vec<PathBuf> {
         _ => Vec::new(),
     };
     let dir = Path::new(path).parent().map(Path::to_path_buf);
-    let mut out: Vec<PathBuf> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let resolved = make_absolute(dir.as_deref(), &entry);
-        if !out.contains(&resolved) {
-            out.push(resolved);
-        }
-    }
-    out
+    // Repeats are kept: `PlaylistItemsProvider` does not de-duplicate, and a
+    // playlist that legitimately lists a track twice must keep both entries.
+    entries
+        .into_iter()
+        .map(|entry| make_absolute(dir.as_deref(), &entry))
+        .collect()
 }
 
 /// An `.m3u`/`.m3u8` file: one path per line, `#` lines are directives.
@@ -90,8 +88,19 @@ fn parse_wpl(contents: &str) -> Vec<String> {
 
 /// The value of `name="…"` (or `name='…'`) inside an element's attribute text.
 fn attribute_value(tag: &str, name: &str) -> Option<String> {
+    // Match the attribute name at a word boundary: a bare `find("src=")` also
+    // matches the tail of `xsrc="…"`.
     let lower = tag.to_ascii_lowercase();
-    let at = lower.find(&format!("{name}="))? + name.len() + 1;
+    let needle = format!("{name}=");
+    let at = lower.match_indices(&needle).find_map(|(index, _)| {
+        let preceded_by_space = index == 0
+            || lower[..index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        preceded_by_space.then_some(index)
+    })? + name.len()
+        + 1;
     let rest = &tag[at..];
     let quote = rest.chars().next()?;
     if quote != '"' && quote != '\'' {
@@ -222,9 +231,18 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_entry_is_listed_once() {
+    fn a_repeated_entry_is_kept_as_upstream_keeps_it() {
+        // `PlaylistItemsProvider` does not de-duplicate; a playlist that lists
+        // the same track twice plays it twice in Jellyfin.
         let paths = read_playlist_file("/m/l.m3u", "a.flac\na.flac\n./a.flac\n");
-        assert_eq!(paths, [PathBuf::from("/m/a.flac")]);
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/m/a.flac"),
+                PathBuf::from("/m/a.flac"),
+                PathBuf::from("/m/a.flac")
+            ]
+        );
     }
 
     #[test]
