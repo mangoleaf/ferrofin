@@ -928,7 +928,10 @@ pub async fn build_app_state(
         .with_session_bus(Arc::clone(&session_bus))
         // So a playback-stopped report closes the live stream it names (C#
         // `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync`).
-        .with_media_sources(Arc::clone(&media_sources)),
+        .with_media_sources(Arc::clone(&media_sources))
+        // So casting an instant mix expands the seed into the mix (C#
+        // `SendPlayCommand` -> `TranslateItemForInstantMix`).
+        .with_music_manager(Arc::clone(&music)),
     );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
