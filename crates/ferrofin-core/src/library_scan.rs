@@ -4570,12 +4570,20 @@ fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetada
         entity.name = Some(name.to_owned());
         entity.sort_name = Some(derived_sort_name(entity, name));
     }
+    // An OPF's `file-as` / `calibre:title_sort` is C#'s `ForcedSortName`: it is
+    // the whole point of a Calibre library's "Tolkien, J.R.R." ordering, and
+    // outranks the name-derived sort key set just above.
+    if let Some(sort) = book
+        .sort_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        entity.sort_name = Some(sort.to_owned());
+    }
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&book.original_title);
     }
-    // C# `BookMetadataService.MergeData` fills SeriesName when the target's is
-    // empty. The resolver writes `Some("")` for the folder shape, so an
-    // `is_none()` guard would never fire.
     // C# `BookMetadataService.MergeData` assigns SeriesName when `replaceData`
     // OR the target is empty, and a default scan passes `replaceData: true`
     // (`MetadataService.cs` `shouldReplace`). So the embedded value WINS over

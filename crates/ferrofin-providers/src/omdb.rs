@@ -94,22 +94,58 @@ impl OmdbClient {
         item.is_found().then_some(item)
     }
 
-    /// The Identify-dialog result list for a title, from OMDb's search
-    /// endpoint (`&s=`) — the `isSearch` branch of the same C# method.
+    /// The Identify-dialog candidates for a title — port of
+    /// `OmdbItemProvider.GetSearchResultsInternal`.
+    ///
+    /// A known IMDb id short-circuits the whole search: C# sets
+    /// `isSearch = false` and asks for `&i=<id>`, so an item the user already
+    /// pinned resolves to exactly itself instead of a list of fuzzy title
+    /// matches. `episode` narrows that lookup with `&Season=`/`&Episode=`,
+    /// keyed by the SERIES' id rather than the episode's own.
     pub async fn search(
         &self,
         kind: OmdbKind,
         name: &str,
         year: Option<i32>,
+        known: &OmdbSearchKey<'_>,
     ) -> Vec<OmdbSearchHit> {
+        let season = known.season.map(|n| n.to_string());
+        let episode = known.episode.map(|n| n.to_string());
+        if let Some(imdb_id) = known.imdb_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let mut params = vec![("i", imdb_id), ("plot", "full"), ("r", "json")];
+            if let Some(episode) = episode.as_deref() {
+                params.push(("Episode", episode));
+            }
+            if let Some(season) = season.as_deref() {
+                params.push(("Season", season));
+            }
+            // The id branch answers with ONE record, not a `Search` array.
+            return self
+                .get::<OmdbSearchHit>(imdb_id, &params)
+                .await
+                .filter(|hit| hit.imdb_id.is_some() || hit.title.is_some())
+                .into_iter()
+                .collect();
+        }
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
         }
         let year = year.map(|y| y.to_string());
-        let mut params = vec![("s", name), ("type", kind.as_str()), ("r", "json")];
+        let mut params = vec![
+            ("plot", "full"),
+            ("r", "json"),
+            ("s", name),
+            ("type", kind.as_str()),
+        ];
         if let Some(year) = year.as_deref() {
             params.push(("y", year));
+        }
+        if let Some(episode) = episode.as_deref() {
+            params.push(("Episode", episode));
+        }
+        if let Some(season) = season.as_deref() {
+            params.push(("Season", season));
         }
         self.get::<OmdbSearchResults>(name, &params)
             .await
@@ -289,6 +325,19 @@ fn parse_release_date(value: &str) -> Option<DateTime<Utc>> {
         .or_else(|_| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
         .ok()?;
     Some(Utc.from_utc_datetime(&date.into()))
+}
+
+/// What an Identify request already knows about the item being searched for —
+/// C#'s `ItemLookupInfo` reduced to the three fields OMDb's query uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OmdbSearchKey<'a> {
+    /// The IMDb id already recorded for the item — for an episode, its SERIES'
+    /// id, as `GetSearchResultsInternal` reads `SeriesProviderIds`.
+    pub imdb_id: Option<&'a str>,
+    /// `ParentIndexNumber`, for an episode.
+    pub season: Option<i32>,
+    /// `IndexNumber`, for an episode.
+    pub episode: Option<i32>,
 }
 
 /// One season listing (`&season=N`) — port of `OmdbProvider.SeasonRootObject`.
@@ -711,7 +760,44 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(client.search(OmdbKind::Movie, "", None).await.is_empty());
+        assert!(
+            client
+                .search(OmdbKind::Movie, "", None, &OmdbSearchKey::default())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_id_resolves_to_itself_instead_of_a_title_search() {
+        // C# `GetSearchResultsInternal` sets `isSearch = false` and queries
+        // `&i=<id>` whenever the item already carries an IMDb id, so Identify
+        // on a pinned item offers exactly that title — not fuzzy matches.
+        let body = r#"{"Title":"Inception","Year":"2010","imdbID":"tt1375666",
+            "Released":"16 Jul 2010","Response":"True"}"#;
+        let server = MockServer::start(vec![("/", body.to_owned())]).await;
+        let client = OmdbClient::new("key").with_base_url(&server.base_url);
+        let hits = client
+            .search(
+                OmdbKind::Movie,
+                // A deliberately wrong name: the id must win over it.
+                "Not The Title",
+                None,
+                &OmdbSearchKey {
+                    imdb_id: Some("tt1375666"),
+                    ..OmdbSearchKey::default()
+                },
+            )
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].imdb_id.as_deref(), Some("tt1375666"));
+        assert_eq!(hits[0].title.as_deref(), Some("Inception"));
+
+        // With no id and no name there is nothing to ask for.
+        let empty = client
+            .search(OmdbKind::Movie, "  ", None, &OmdbSearchKey::default())
+            .await;
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]
@@ -722,7 +808,14 @@ mod tests {
         ],"totalResults":"2","Response":"True"}"#;
         let server = MockServer::start(vec![("/", body.to_owned())]).await;
         let client = OmdbClient::new("key").with_base_url(&server.base_url);
-        let hits = client.search(OmdbKind::Movie, "Inception", None).await;
+        let hits = client
+            .search(
+                OmdbKind::Movie,
+                "Inception",
+                None,
+                &OmdbSearchKey::default(),
+            )
+            .await;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].imdb_id.as_deref(), Some("tt1375666"));
         assert_eq!(hits[0].production_year(), Some(2010));

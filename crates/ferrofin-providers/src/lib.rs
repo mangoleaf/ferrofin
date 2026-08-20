@@ -54,7 +54,7 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{AlbumIds, ArtistDetails, MusicBrainzClient, PartialDate, ReleaseDetails};
-pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
+pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
 pub use similarity::{
     ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
 };

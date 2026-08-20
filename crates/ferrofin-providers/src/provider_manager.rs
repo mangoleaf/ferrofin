@@ -247,12 +247,24 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         &self,
         search_info: &ItemLookupInfo,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
-            return Ok(Vec::new());
+        // An id already on the item resolves it exactly; only a nameless item
+        // with no id has nothing to search on at all.
+        let known = crate::OmdbSearchKey {
+            imdb_id: search_info
+                .provider_ids
+                .as_ref()
+                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
+                .map(|(_, value)| value.as_str()),
+            season: search_info.parent_index_number,
+            episode: search_info.index_number,
         };
+        let name = search_info.name.as_deref().unwrap_or_default();
+        if name.is_empty() && known.imdb_id.is_none() {
+            return Ok(Vec::new());
+        }
         Ok(self
             .omdb
-            .search(self.kind, name, search_info.year)
+            .search(self.kind, name, search_info.year, &known)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {

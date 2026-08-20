@@ -131,47 +131,137 @@ fn unescape(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Serializes `paths` as the playlist format `path`'s extension implies —
+/// One playlist entry: the media path plus the tags `PlaylistManager` fills in
+/// before handing the list to PlaylistsNET.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    /// The item's absolute path on disk.
+    pub path: String,
+    /// `TrackTitle` — the item's name.
+    pub title: Option<String>,
+    /// `AlbumTitle` — the item's album, for the audio kinds that have one.
+    pub album: Option<String>,
+    /// `AlbumArtist` — the first album artist, when the item has any.
+    pub album_artist: Option<String>,
+    /// `TrackArtist` — the first artist, when the item has any.
+    pub artist: Option<String>,
+    /// `Duration` in whole seconds, from `RunTimeTicks`.
+    pub duration_seconds: Option<i64>,
+}
+
+impl PlaylistEntry {
+    /// A bare entry carrying only its path — what a caller with no item
+    /// metadata to hand can still write.
+    #[must_use]
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Serializes `entries` as the playlist format `path`'s extension implies —
 /// the write side C# calls `SavePlaylistFile`.
 ///
-/// Entries are written **relative to the playlist's own directory**, as
-/// `PlaylistManager.NormalizeItemPath` does: that is what survives the whole
-/// library being moved, and it is what the reader resolves.
+/// Paths are written **relative to the playlist's own directory**, as
+/// `PlaylistManager.NormalizeItemPath` does via `Uri.MakeRelativeUri`: an item
+/// outside that directory gets `../` segments rather than staying absolute,
+/// because two local paths always share the `file` scheme and the absolute
+/// fallback there only fires when the schemes differ.
+///
+/// Every format is written in its EXTENDED form, as `PlaylistManager` does by
+/// setting `IsExtended` and filling each entry's title/album/artist/duration:
+/// rewriting a playlist must not strip the tags the player wrote into it.
 #[must_use]
-pub fn write_playlist_file(path: &str, paths: &[String]) -> String {
+pub fn write_playlist_file(path: &str, entries: &[PlaylistEntry]) -> String {
     let dir = Path::new(path).parent().map(Path::to_path_buf);
-    let paths: Vec<String> = paths
+    let rel: Vec<String> = entries
         .iter()
-        .map(|entry| relative_to(dir.as_deref(), entry))
+        .map(|entry| relative_to(dir.as_deref(), &entry.path))
         .collect();
-    let paths = &paths;
+    let rows: Vec<(&PlaylistEntry, &String)> = entries.iter().zip(rel.iter()).collect();
     match extension_of(path).as_deref() {
         Some("pls") => {
             let mut out = String::from("[playlist]\n");
-            for (index, entry) in paths.iter().enumerate() {
-                let _ = writeln!(out, "File{}={entry}", index + 1);
+            for (index, (entry, rel)) in rows.iter().enumerate() {
+                let n = index + 1;
+                let _ = writeln!(out, "File{n}={rel}");
+                if let Some(title) = display_title(entry) {
+                    let _ = writeln!(out, "Title{n}={title}");
+                }
+                if let Some(seconds) = entry.duration_seconds {
+                    let _ = writeln!(out, "Length{n}={seconds}");
+                }
             }
-            let _ = writeln!(out, "NumberOfEntries={}\nVersion=2", paths.len());
+            let _ = writeln!(out, "NumberOfEntries={}\nVersion=2", rows.len());
             out
         }
-        Some("wpl" | "zpl") => {
-            let mut out = String::from("<?wpl version=\"1.0\"?>\n<smil>\n  <body>\n    <seq>\n");
-            for entry in paths {
-                let _ = writeln!(out, "      <media src=\"{}\"/>", escape(entry));
+        Some(kind @ ("wpl" | "zpl")) => {
+            // `ZplContent` declares `zpl version="2.0"`; only `.wpl` is `wpl 1.0`.
+            let header = if kind == "zpl" {
+                "<?zpl version=\"2.0\"?>"
+            } else {
+                "<?wpl version=\"1.0\"?>"
+            };
+            let mut out = format!("{header}\n<smil>\n  <body>\n    <seq>\n");
+            for (entry, rel) in &rows {
+                let _ = write!(out, "      <media src=\"{}\"", escape(rel));
+                for (attribute, value) in [
+                    ("albumTitle", entry.album.as_deref()),
+                    ("albumArtist", entry.album_artist.as_deref()),
+                    ("trackArtist", entry.artist.as_deref()),
+                    ("trackTitle", entry.title.as_deref()),
+                ] {
+                    if let Some(value) = value.filter(|v| !v.is_empty()) {
+                        let _ = write!(out, " {attribute}=\"{}\"", escape(value));
+                    }
+                }
+                out.push_str("/>\n");
             }
             out.push_str("    </seq>\n  </body>\n</smil>\n");
             out
         }
-        // `.m3u`/`.m3u8` and anything else fall back to the plain list, which is
-        // what upstream's writer emits.
+        // `.m3u`/`.m3u8` and anything else fall back to the M3U writer.
         _ => {
             let mut out = String::from("#EXTM3U\n");
-            for entry in paths {
-                out.push_str(entry);
+            for (entry, rel) in &rows {
+                if let Some(album) = entry.album.as_deref().filter(|a| !a.is_empty()) {
+                    let _ = writeln!(out, "#EXTALB:{album}");
+                }
+                if let Some(artist) = entry.album_artist.as_deref().filter(|a| !a.is_empty()) {
+                    let _ = writeln!(out, "#EXTART:{artist}");
+                }
+                if let Some(title) = display_title(entry) {
+                    // `#EXTINF:<seconds>,<title>` — PlaylistsNET writes -1 for
+                    // an unknown duration.
+                    let _ = writeln!(
+                        out,
+                        "#EXTINF:{},{title}",
+                        entry.duration_seconds.unwrap_or(-1)
+                    );
+                }
+                out.push_str(rel);
                 out.push('\n');
             }
             out
         }
+    }
+}
+
+/// The `Artist - Title` an extended playlist labels an entry with, or just the
+/// title when there is no artist. `None` when the entry has neither.
+fn display_title(entry: &PlaylistEntry) -> Option<String> {
+    let title = entry.title.as_deref().filter(|t| !t.is_empty());
+    let artist = entry
+        .artist
+        .as_deref()
+        .or(entry.album_artist.as_deref())
+        .filter(|a| !a.is_empty());
+    match (artist, title) {
+        (Some(artist), Some(title)) => Some(format!("{artist} - {title}")),
+        (None, Some(title)) => Some(title.to_owned()),
+        _ => None,
     }
 }
 
@@ -185,16 +275,37 @@ fn escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// `entry` expressed relative to `dir` when it lies underneath it, else
-/// unchanged — the write-side twin of [`make_absolute`].
+/// `entry` expressed relative to `dir` — the write-side twin of
+/// [`make_absolute`], and a port of `PlaylistManager.MakeRelativePath`.
+///
+/// `Uri.MakeRelativeUri` walks up out of the folder with `../` segments when
+/// the target lies outside it; it returns the absolute path only when the two
+/// URIs have different SCHEMES, which two local files never do. A relative
+/// entry is also only meaningful when both paths are absolute — a relative
+/// `entry` is already relative to the same directory and is left alone.
 fn relative_to(dir: Option<&Path>, entry: &str) -> String {
-    let (Some(dir), path) = (dir, Path::new(entry)) else {
+    let path = Path::new(entry);
+    let (Some(dir), true) = (
+        dir,
+        path.is_absolute() && dir.is_some_and(Path::is_absolute),
+    ) else {
         return entry.to_owned();
     };
-    path.strip_prefix(dir).map_or_else(
-        |_| entry.to_owned(),
-        |rest| rest.to_string_lossy().into_owned(),
-    )
+    let mut from = dir.components().peekable();
+    let mut to = path.components().peekable();
+    while from.peek().is_some() && from.peek() == to.peek() {
+        from.next();
+        to.next();
+    }
+    let mut out = PathBuf::new();
+    for _ in from {
+        out.push("..");
+    }
+    out.extend(to);
+    if out.as_os_str().is_empty() {
+        return entry.to_owned();
+    }
+    out.to_string_lossy().into_owned()
 }
 
 /// Resolves `entry` against the playlist's directory — port of
@@ -308,28 +419,103 @@ mod tests {
 
     #[test]
     fn each_format_round_trips_through_its_writer() {
-        let paths = vec!["/m/a.flac".to_owned(), "/m/b & c.flac".to_owned()];
+        // Including one entry OUTSIDE the playlist's directory, which
+        // `MakeRelativeUri` writes with `../` segments — the reader has to
+        // resolve them back.
+        let entries = vec![
+            PlaylistEntry::new("/m/a.flac"),
+            PlaylistEntry::new("/m/b & c.flac"),
+            PlaylistEntry::new("/other/d.flac"),
+        ];
         for name in ["l.m3u", "l.m3u8", "l.pls", "l.wpl", "l.zpl"] {
             let path = format!("/m/{name}");
-            let written = write_playlist_file(&path, &paths);
+            let written = write_playlist_file(&path, &entries);
             let read_back = read_playlist_file(&path, &written);
             assert_eq!(
                 read_back,
-                [PathBuf::from("/m/a.flac"), PathBuf::from("/m/b & c.flac")],
+                [
+                    PathBuf::from("/m/a.flac"),
+                    PathBuf::from("/m/b & c.flac"),
+                    PathBuf::from("/other/d.flac")
+                ],
                 "{name} round trip: {written}"
             );
         }
     }
 
     #[test]
-    fn the_pls_writer_emits_the_entry_count() {
-        let written = write_playlist_file("/m/l.pls", &["/m/a.flac".to_owned()]);
+    fn an_entry_outside_the_playlist_directory_walks_up() {
+        // C# `MakeRelativePath` returns the absolute path only when the two
+        // URIs' SCHEMES differ, which two local files never do — so a sibling
+        // directory is reached with `../`, not left absolute.
+        let written = write_playlist_file("/m/l.pls", &[PlaylistEntry::new("/other/b.flac")]);
+        assert!(written.contains("File1=../other/b.flac"), "{written}");
+        // An entry under the playlist's own directory is a bare relative path.
+        let written = write_playlist_file("/m/l.pls", &[PlaylistEntry::new("/m/sub/a.flac")]);
+        assert!(written.contains("File1=sub/a.flac"), "{written}");
+    }
+
+    #[test]
+    fn the_pls_writer_emits_the_entry_count_and_tags() {
+        let written = write_playlist_file(
+            "/m/l.pls",
+            &[PlaylistEntry {
+                path: "/m/a.flac".to_owned(),
+                title: Some("Airbag".to_owned()),
+                artist: Some("Radiohead".to_owned()),
+                duration_seconds: Some(284),
+                ..PlaylistEntry::default()
+            }],
+        );
         assert!(written.contains("NumberOfEntries=1"));
-        // Relative to the playlist's own directory, as
-        // `PlaylistManager.NormalizeItemPath` writes it.
         assert!(written.contains("File1=a.flac"), "{written}");
-        // A path outside that directory stays absolute.
-        let outside = write_playlist_file("/m/l.pls", &["/other/b.flac".to_owned()]);
-        assert!(outside.contains("File1=/other/b.flac"), "{outside}");
+        assert!(written.contains("Title1=Radiohead - Airbag"), "{written}");
+        assert!(written.contains("Length1=284"), "{written}");
+    }
+
+    #[test]
+    fn the_m3u_writer_emits_the_extended_directives() {
+        // C# sets `IsExtended` and fills the per-entry tags, so PlaylistsNET
+        // writes #EXTALB/#EXTART/#EXTINF. Emitting a bare path list would strip
+        // them from any playlist Ferrofin rewrites.
+        let written = write_playlist_file(
+            "/m/l.m3u",
+            &[PlaylistEntry {
+                path: "/m/a.flac".to_owned(),
+                title: Some("Airbag".to_owned()),
+                album: Some("OK Computer".to_owned()),
+                album_artist: Some("Radiohead".to_owned()),
+                artist: Some("Radiohead".to_owned()),
+                duration_seconds: Some(284),
+            }],
+        );
+        assert!(written.contains("#EXTALB:OK Computer"), "{written}");
+        assert!(written.contains("#EXTART:Radiohead"), "{written}");
+        assert!(
+            written.contains("#EXTINF:284,Radiohead - Airbag"),
+            "{written}"
+        );
+        // An entry with no tags at all still writes just its path.
+        let bare = write_playlist_file("/m/l.m3u", &[PlaylistEntry::new("/m/a.flac")]);
+        assert_eq!(bare, "#EXTM3U\na.flac\n");
+    }
+
+    #[test]
+    fn a_zpl_declares_its_own_version_and_carries_track_tags() {
+        // `ZplContent` writes `<?zpl version="2.0"?>`, not the wpl header.
+        let written = write_playlist_file(
+            "/m/l.zpl",
+            &[PlaylistEntry {
+                path: "/m/a.flac".to_owned(),
+                title: Some("Airbag".to_owned()),
+                album: Some("OK Computer".to_owned()),
+                ..PlaylistEntry::default()
+            }],
+        );
+        assert!(written.starts_with("<?zpl version=\"2.0\"?>"), "{written}");
+        assert!(written.contains("albumTitle=\"OK Computer\""), "{written}");
+        assert!(written.contains("trackTitle=\"Airbag\""), "{written}");
+        let wpl = write_playlist_file("/m/l.wpl", &[PlaylistEntry::new("/m/a.flac")]);
+        assert!(wpl.starts_with("<?wpl version=\"1.0\"?>"), "{wpl}");
     }
 }
