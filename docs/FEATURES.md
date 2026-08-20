@@ -30,7 +30,11 @@ Deep-verified against a real Jellyfin server:
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
-  path-scoped ingest; virtual folders; item read + write/edit + delete.
+  path-scoped ingest; virtual folders; item read + write/edit + delete. Deep-verified for
+  `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
+  libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
+  `boxsets` is the one library type not resolved off disk (its members are curated through
+  the collection API).
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
@@ -61,6 +65,32 @@ Wired and working, with a documented limitation or lighter verification:
   **feature-gated off by default**; they return empty results until enabled with an API key.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
+- **Books / audiobooks** — a `books` library resolves documents (`.azw .azw3 .cb7 .cbr .cbt
+  .cbz .epub .mobi .pdf`) to `Book` and audio files to `AudioBook`, and serves them through
+  `/Items/{id}/File` + `/Items/{id}/Download`, which is what jellyfin-web's epub/comic/pdf
+  readers fetch. Verified against Ferrofin over real HTTP and in unit tests, but **not
+  diffed against a live Jellyfin server** — treat it as the least-verified entry here.
+  Notable behaviours and divergences:
+  - **Accepted divergence (ahead of the contract):** name / series / index / year come from
+    `Emby.Naming.Book.BookFileNameParser`, which is on upstream `master` and **not** in the
+    pinned 10.11.8 contract. Against 10.11.8 a book is named from its bare filename; Ferrofin
+    parses `A Study in Scarlet (Sherlock Holmes, #1) (1887)` into its parts.
+  - **Faithful upstream limitation:** a multi-file audiobook is **one item per file**, not one
+    stacked item. `AudioResolver` skips stacked results outright ("until multi-part books are
+    handled"), and `ResolvePaths` then falls back to per-file resolution — Ferrofin reproduces
+    that rather than inventing stacking Jellyfin clients have never seen.
+  - **Flattening divergence:** upstream turns a folder it cannot resolve to a book into a
+    `Folder` item and parents the books under it; Ferrofin parents every book directly to the
+    collection folder, exactly as the movie scan does. This scanner materializes no
+    intermediate `Folder` rows.
+  - **Naming divergence at the library root:** a books library whose *root* holds exactly one
+    audio file is named after the **library folder** by Jellyfin (and dated from it) — an
+    artefact of the root going through the multi-item resolver. Ferrofin names it from the
+    file, with no year. Naming a book after the library it sits in is an upstream wart, not
+    behaviour worth reproducing; every other shape matches upstream exactly.
+  - No book metadata provider: upstream core has none either (no book NFO parser, no remote
+    book provider — that is the third-party Bookshelf plugin), so metadata is filename +
+    local images.
 
 ## Not implemented (by design)
 
