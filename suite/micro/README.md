@@ -51,3 +51,20 @@ read files (images, streaming) will misreport; do not use this harness for those
 ./hit.sh playlist_items 2000     # drive it while the profiler samples
                                  # ctrl-c serve.sh -> opens the Firefox Profiler UI
 ```
+
+## What this harness cannot measure (and will report as a failure)
+
+These are gaps in the harness, not server bugs. Check here before chasing a 0% row.
+
+- **Endpoints needing media files** — `image_primary`, `item_image_indexed` and the other
+  image/streaming routes return 404 because `/tmp/ffdb2` holds only the database. The
+  media, metadata and image directories are deliberately not copied (they are ~1.3 GB and
+  irrelevant to query/DTO work). Use the real suite for those.
+- **POST endpoints needing a body** — `playstate_progress` returns 415: `hit.sh` sends the
+  method and URL but no JSON body or content-type. Anything in the registry with a
+  request body needs a body added here before it means anything.
+- **Endpoints needing fixtures `pick_items` does not supply** — `playlist_items` and
+  `shows_seasons` need `playlistId` / `seriesId`, which `benchlib.pick_items` does not
+  populate; `hit.sh` fails loudly rather than measuring the wrong thing.
+
+A row reading `0.0%` ok for one of the above means "not exercised", not "broken".
