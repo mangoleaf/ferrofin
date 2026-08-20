@@ -74,7 +74,7 @@ impl Database {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(30))
-            .pragma("mmap_size", "1073741824")
+            .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
             .foreign_keys(true);
         let write_options = read_options
             .clone()
@@ -576,6 +576,28 @@ fn quota_cores(quota: i64, period: i64) -> Option<u32> {
     u32::try_from((quota + period - 1) / period).ok() // ceil; i64 div_ceil is unstable
 }
 
+/// The `mmap_size` ceiling requested on every read connection.
+///
+/// This is a **maximum, not a reservation**: SQLite maps `min(mmap_size, file
+/// size)` and extends the mapping as the database grows, so a generous ceiling
+/// costs nothing on a small database and needs no adjustment as a library fills
+/// up. Verified by growing a database from 0 to 183 MB with the pragma
+/// untouched — resident memory tracked the file, not the ceiling, and reads
+/// kept using the mapping. That is why this is a constant rather than a tunable
+/// or something recomputed after a scan: there is no value to adapt.
+///
+/// SQLite clamps the request to its own compile-time `SQLITE_MAX_MMAP_SIZE`
+/// (0x7FFF0000, just under 2 GiB), so asking for more is harmless and simply
+/// resolves to that limit. A database larger than the clamp is still served
+/// correctly — only the portion beyond it reads through the page cache.
+///
+/// Why it matters: without it, SQLite's page cache serves reads from the
+/// process heap, and every connection contends on the shared page-cache mutex.
+/// Measured on a 100-item list endpoint at 1500 req/s: 14,021 ms p50 with
+/// 1,564 MB anonymous heap versus 2.9 ms p50 with 264 MB. See
+/// `suite/micro/FINDINGS.md`.
+const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
+
 /// Turns off SQLite's global memory-statistics bookkeeping, once per process.
 ///
 /// SQLite's default build wraps every `sqlite3Malloc`/`sqlite3_free` in a global
@@ -616,6 +638,65 @@ fn configure_sqlite_for_concurrency() {
 
 #[cfg(test)]
 mod tests {
+
+    /// The `mmap_size` ceiling must survive database growth without being
+    /// re-applied, because nothing re-applies it: it is set once when a pooled
+    /// connection opens, and a fresh install whose library is imported later
+    /// would otherwise be stuck with whatever was right at first boot.
+    ///
+    /// Asserts the two properties that make the fixed ceiling correct: SQLite
+    /// clamps the request to its own maximum rather than rejecting it, and the
+    /// effective value is unchanged after the file grows by orders of magnitude.
+    #[tokio::test]
+    async fn mmap_ceiling_is_clamped_and_survives_database_growth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("grow.db");
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect(&url).await.expect("connect");
+
+        let effective: i64 = sqlx::query_scalar("PRAGMA mmap_size")
+            .fetch_one(db.pool())
+            .await
+            .expect("read mmap_size");
+        assert!(
+            effective > 0,
+            "mmap must be enabled — with it off, list endpoints collapse under load"
+        );
+        assert!(
+            effective <= MMAP_SIZE_BYTES,
+            "SQLite clamps to its own maximum; asking for more must not error"
+        );
+
+        sqlx::query("CREATE TABLE grow (id INTEGER PRIMARY KEY, blob TEXT)")
+            .execute(db.writer())
+            .await
+            .expect("create");
+        let payload = "x".repeat(2048);
+        for _ in 0..2000 {
+            sqlx::query("INSERT INTO grow (blob) VALUES (?1)")
+                .bind(&payload)
+                .execute(db.writer())
+                .await
+                .expect("insert");
+        }
+
+        // The pragma was never re-applied, and the reads below must still work
+        // against the now much larger file.
+        let after: i64 = sqlx::query_scalar("PRAGMA mmap_size")
+            .fetch_one(db.pool())
+            .await
+            .expect("read mmap_size after growth");
+        assert_eq!(
+            after, effective,
+            "the ceiling must not need re-applying as the database grows"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grow")
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 2000);
+    }
+
     use super::*;
     use sqlx::Row as _;
 
