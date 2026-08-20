@@ -213,8 +213,17 @@ impl UserViewManager for FerrofinUserViewManager {
                 continue;
             }
             let latest_query = InternalItemsQuery {
-                parent_id: view_id,
-                recursive: true,
+                // A view is a `CollectionFolder`/`UserView`, i.e. a *top parent*:
+                // C# `LibraryManager.SetTopParentOrAncestorIds` swaps an ancestor
+                // scope for `TopParentIds` whenever every ancestor is one of those
+                // two kinds, and the rows here are exactly that set (see
+                // `get_user_views`). The swap is semantically identical — the
+                // scanner stamps every scanned entity's `TopParentId` with its
+                // collection folder — but it turns a full `BaseItems` scan with a
+                // correlated `AncestorIds` lookup per row plus a temp-B-tree sort
+                // into an index seek on
+                // `FerrofinIX_BaseItems_TopParentId_IsFolder_IsVirtualItem_DateCreated`.
+                top_parent_ids: vec![view_id],
                 is_folder: Some(false),
                 // C# also excludes virtual rows (NFO-declared missing episodes).
                 is_virtual_item: Some(false),
@@ -238,7 +247,7 @@ mod tests {
     use crate::item_persistence_service::FerrofinItemPersistenceService;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{seed_item, seed_named_item, test_db};
+    use crate::test_support::{seed_episode, seed_item, seed_named_item, test_db};
     use ferrofin_db::Database;
 
     fn manager(db: &Database) -> FerrofinUserViewManager {
@@ -304,6 +313,50 @@ mod tests {
             .expect("latest");
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].0.id, view.to_string());
+    }
+
+    #[tokio::test]
+    async fn latest_items_are_scoped_to_their_view_by_top_parent() {
+        let db = test_db().await;
+        let movies = Uuid::from_u128(0x101);
+        let shows = Uuid::from_u128(0x102);
+        seed_named_item(&db, movies, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, shows, BaseItemKind::CollectionFolder, "Shows").await;
+        // Every scanned row carries its collection folder in `TopParentId`, and
+        // that is the ONLY scope the per-view latest query applies (C#
+        // `SetTopParentOrAncestorIds` swaps an ancestor scope for the top-parent
+        // one when the ancestors are views) — no `AncestorIds` closure row is
+        // seeded here, and each view must still see exactly its own item.
+        let a_movie = Uuid::from_u128(0x201);
+        let an_episode = Uuid::from_u128(0x202);
+        seed_episode(&db, a_movie, "movies-key", 1, 1, false, Some(movies)).await;
+        seed_episode(&db, an_episode, "shows-key", 1, 1, false, Some(shows)).await;
+        let mgr = manager(&db);
+
+        let query = LatestItemsQuery {
+            user_id: Uuid::from_u128(9),
+            ..LatestItemsQuery::default()
+        };
+        let grouped = mgr
+            .get_latest_items(&query, &DtoOptions::default())
+            .await
+            .expect("latest");
+
+        assert_eq!(grouped.len(), 2, "one group per view");
+        for (view, items) in grouped {
+            let expected = if view.id.eq_ignore_ascii_case(&movies.to_string()) {
+                a_movie
+            } else {
+                an_episode
+            };
+            let ids: Vec<String> = items.iter().map(|i| i.id.to_lowercase()).collect();
+            assert_eq!(
+                ids,
+                vec![expected.to_string()],
+                "view {:?} leaked another library's items",
+                view.name
+            );
+        }
     }
 
     #[tokio::test]

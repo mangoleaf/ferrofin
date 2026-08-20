@@ -317,15 +317,12 @@ impl UserDataManager for FerrofinUserDataManager {
         item_ids: &[Uuid],
         user_id: Uuid,
     ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        let mut result = HashMap::with_capacity(item_ids.len());
-        for &item_id in item_ids {
-            let row = self
-                .read_row(item_id, user_id)
-                .await?
-                .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-            result.insert(item_id, to_dto(&row, item_id));
-        }
-        Ok(result)
+        // Identical semantics to the per-item loop this used to run (the stored
+        // row when present, the empty row otherwise) in one chunked `IN` query —
+        // the loop was an N+1 that issued one round trip per candidate item
+        // (~100 per `/Items/Latest` request, which post-filters the whole
+        // candidate set by played state).
+        self.get_user_data_dtos(item_ids, user_id).await
     }
 
     async fn update_play_state(
@@ -653,6 +650,15 @@ mod tests {
         }
         assert!(batch[&with_row].is_favorite);
         assert!(!batch[&without_row].is_favorite);
+
+        // `get_user_data_batch` is the same read (it was a per-item loop —
+        // ~100 round trips per `/Items/Latest` request — and now delegates), so
+        // it must return exactly the same map, empty rows included.
+        let also_batch = mgr
+            .get_user_data_batch(&[with_row, without_row], user)
+            .await
+            .expect("batch");
+        assert_eq!(also_batch, batch);
     }
 
     #[tokio::test]
