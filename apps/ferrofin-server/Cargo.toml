@@ -70,6 +70,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # First-Light integration test: drive the real router via tower oneshot and
 # assert JSON bodies.
 tower.workspace = true
+# Decodes the gzip the response-compression layer produced, to prove the
+# `/web` bundle survives it byte for byte.
+flate2.workspace = true
 # wasm_plugins integration test: compile the inline-WAT fixture component.
 wat.workspace = true
 # `testing` unlocks the in-memory span exporter for the tracing→OTel bridge smoke test.

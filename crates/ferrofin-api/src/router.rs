@@ -17,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 
 use crate::auth::auth_context_layer;
+use crate::compression::compression_layer;
 use crate::handlers;
 use crate::openapi::ApiDoc;
 use crate::routes::{axum_routes, not_implemented};
@@ -86,6 +87,11 @@ pub fn create_router(state: AppState) -> Router {
             .on_response(record_status),
     )
     .layer(CorsLayer::permissive())
+    // Jellyfin's `UseResponseCompression()`. Outermost so it also covers the
+    // health and OpenAPI routes, exactly as ASP.NET's middleware covers
+    // everything mounted under the base URL. Only the allow-listed media types
+    // are touched, so images and the streaming paths are unaffected.
+    .layer(compression_layer())
 }
 
 /// Whether an OTLP endpoint is configured, i.e. whether a span exporter will

@@ -35,7 +35,7 @@ axum = { workspace = true, features = ["ws", "macros"] }
 axum-extra.workspace = true
 chrono.workspace = true
 tower.workspace = true
-tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
+tower-http = { workspace = true, features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 tokio = { workspace = true }
 async-trait.workspace = true
 serde.workspace = true
@@ -64,3 +64,7 @@ tempfile.workspace = true
 # Trace-correlation test: an in-memory span exporter + a scoped OTel subscriber.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
+# Response-compression tests decode what the layer encoded, to prove the
+# decompressed bytes are byte-identical to the uncompressed response.
+flate2.workspace = true
+brotli.workspace = true

@@ -18,6 +18,7 @@
 //! utoipa [`openapi::ApiDoc`].
 
 pub mod auth;
+pub mod compression;
 mod contract_routes;
 pub mod error;
 pub mod handlers;

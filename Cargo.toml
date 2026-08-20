@@ -79,7 +79,11 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 axum = "0.8"
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+# Decoders for the response-compression tests only (the server never decodes a
+# response it just encoded). Same versions tower-http already links.
+flate2 = "1.1"
+brotli = "8.0"
 tokio = { version = "1", features = ["full"] }
 notify = "8.2"
 

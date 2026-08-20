@@ -529,6 +529,15 @@ fn mount_web(
         .route("/", get(|| async { Redirect::permanent("/web/") }))
         .layer(axum::middleware::from_fn(redirect_bare_web))
         .layer(transform_layer)
+        // Jellyfin's `UseResponseCompression()` sits above BOTH its API and its
+        // static-file middleware, and jellyfin-web's bundles are the payloads
+        // that gain most from it. `nest_service` mounts a service the API
+        // router's own compression layer never sees, and a transformed file is
+        // answered by the middleware above rather than by `ServeDir`, so the
+        // layer goes here — outside both. An API response arrives already
+        // carrying `Content-Encoding`, and `tower_http` never re-encodes one,
+        // so the two layers cannot compound.
+        .layer(ferrofin_api::compression::compression_layer())
 }
 
 /// Serves a `/web` file through the File Transformation pipeline when a
@@ -692,6 +701,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(asset.status(), StatusCode::OK);
+    }
+
+    /// The static bundle is served compressed when the client negotiates it —
+    /// Jellyfin gzips/brotlis jellyfin-web's assets, and `nest_service` puts
+    /// `ServeDir` outside the API router's own compression layer.
+    #[tokio::test]
+    async fn web_assets_are_compressed_and_decode_identically() {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        // Repetitive, comfortably above the minimum compressible size.
+        let js = "function chunk(){return 'ferrofin';}\n".repeat(200);
+        std::fs::write(dir.path().join("bundle.js"), &js).unwrap();
+
+        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+
+        let plain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/bundle.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::OK);
+        assert!(plain.headers().get("content-encoding").is_none());
+        let plain_body = axum::body::to_bytes(plain.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let gz = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/bundle.js")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gz.status(), StatusCode::OK);
+        assert_eq!(gz.headers()["content-encoding"], "gzip");
+        let gz_body = axum::body::to_bytes(gz.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            gz_body.len() < plain_body.len(),
+            "compressed asset should be smaller: {} vs {}",
+            gz_body.len(),
+            plain_body.len()
+        );
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&gz_body[..])
+            .read_to_end(&mut decoded)
+            .expect("valid gzip stream");
+        assert_eq!(
+            decoded,
+            plain_body.to_vec(),
+            "decoded asset must be identical"
+        );
+        assert_eq!(String::from_utf8(decoded).unwrap(), js);
+    }
+
+    /// A file rewritten by the File Transformation pipeline is answered by the
+    /// middleware rather than `ServeDir`, so it needs the compression layer to
+    /// sit outside that middleware too.
+    #[tokio::test]
+    async fn transformed_web_files_are_compressed_too() {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("a.js"), "hello world\n".repeat(100)).unwrap();
+
+        let service = transformations(dir.path());
+        service
+            .add_transformation(uuid::Uuid::from_u128(11), "a.js", Arc::new(Upper))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+
+        let gz = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/a.js")
+                    .header("accept-encoding", "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gz.status(), StatusCode::OK);
+        assert_eq!(gz.headers()["content-encoding"], "gzip");
+        let gz_body = axum::body::to_bytes(gz.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&gz_body[..])
+            .read_to_end(&mut decoded)
+            .expect("valid gzip stream");
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "HELLO WORLD\n".repeat(100),
+            "the transformed text must survive compression unchanged"
+        );
     }
 
     #[tokio::test]
