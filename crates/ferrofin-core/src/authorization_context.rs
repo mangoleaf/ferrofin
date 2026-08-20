@@ -191,6 +191,13 @@ impl FerrofinAuthorizationContext {
             return Ok(true);
         }
 
+        // Captured BEFORE the read below: everything from here to the `put` at
+        // the tail is in-flight work over a device row that a concurrent
+        // logout/delete/rename may revoke. Storing that read afterwards would
+        // resurrect the revoked token for a full TTL; tagging the write with the
+        // generation makes the cache drop it instead.
+        let generation = self.auth_cache.generation();
+
         let Some(mut device) = self.device_by_token(token).await? else {
             return Ok(false);
         };
@@ -248,7 +255,8 @@ impl FerrofinAuthorizationContext {
         }
         // Cache the row exactly as it now exists (post-refresh), so a hit
         // serves what a re-read would.
-        self.auth_cache.put(token, device, info.user.clone());
+        self.auth_cache
+            .put(generation, token, device, info.user.clone());
         Ok(true)
     }
 
@@ -1308,6 +1316,52 @@ mod tests {
             .unwrap();
         let info = ctx.get_authorization_info(&token_request()).await.unwrap();
         assert!(!info.is_authenticated, "revoked token rejected immediately");
+    }
+
+    /// The read-through window: a request misses the cache and reads the (still
+    /// valid) device row, the admin revokes the device while that request is
+    /// mid-flight, and only then does the request store what it read. The
+    /// revocation must still win.
+    ///
+    /// The interleaving is staged rather than scheduled — `resolve_device_token`
+    /// has a user lookup and (on a name/version/activity refresh) a device write
+    /// between its read and its `put`, and this test replays that order against
+    /// the real revocation path. Without the generation tag on the write the
+    /// deleted token authenticates for a full `AUTH_CACHE_TTL`.
+    #[tokio::test]
+    async fn a_revocation_beats_a_resolution_that_was_already_in_flight() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x9f);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+        let device = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+
+        // The in-flight request: it captured the generation and has read the
+        // device row, but has not stored it yet.
+        let generation = cache.generation();
+
+        // Meanwhile the device is revoked through the real manager path.
+        ferrofin_traits::devices::DeviceManager::delete_device(&devices, &device)
+            .await
+            .unwrap();
+
+        // Now the in-flight request finishes and caches what it read.
+        cache.put(generation, "dev-tok", device, None);
+
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "a revoked token must not be re-seated by a resolution that raced the revocation"
+        );
     }
 
     #[tokio::test]

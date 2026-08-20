@@ -514,23 +514,19 @@ impl DeviceManager for FerrofinDeviceManager {
         device_id: &str,
         device_name: Option<&str>,
     ) -> Result<(), ServiceError> {
-        if self.options_row(device_id).await?.is_some() {
-            sqlx::query(r#"UPDATE "DeviceOptions" SET "CustomName" = ?2 WHERE "DeviceId" = ?1"#)
-                .bind(device_id)
-                .bind(device_name)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-        } else {
-            sqlx::query(
-                r#"INSERT INTO "DeviceOptions" ("CustomName", "DeviceId") VALUES (?2, ?1)"#,
-            )
-            .bind(device_id)
-            .bind(device_name)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        }
+        // ONE statement: `IX_DeviceOptions_DeviceId` is unique, so a
+        // read-then-branch let two concurrent renames of a device that has no
+        // options row yet both take the insert leg, and the loser failed the
+        // index (a 500 on `POST /Devices/Options`).
+        sqlx::query(
+            r#"INSERT INTO "DeviceOptions" ("CustomName", "DeviceId") VALUES (?2, ?1)
+               ON CONFLICT("DeviceId") DO UPDATE SET "CustomName" = excluded."CustomName""#,
+        )
+        .bind(device_id)
+        .bind(device_name)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -647,6 +643,36 @@ mod tests {
             .expect("get")
             .expect("some");
         assert_eq!(opts.custom_name.as_deref(), Some("Bedroom"));
+    }
+
+    /// Two renames of a device with no options row yet must both succeed:
+    /// read-then-branch let both take the insert leg and the loser failed the
+    /// unique `IX_DeviceOptions_DeviceId`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_option_writes_do_not_collide() {
+        let db = test_db().await;
+        let mgr = Arc::new(FerrofinDeviceManager::new(db));
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let mgr = Arc::clone(&mgr);
+            tasks.push(tokio::spawn(async move {
+                mgr.update_device_options("dev-1", Some(&format!("Room {i}")))
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("join")
+                .expect("a concurrent first option write must not fail");
+        }
+        assert!(
+            mgr.get_device_options("dev-1")
+                .await
+                .expect("get")
+                .is_some(),
+            "exactly one options row, whichever writer landed last"
+        );
     }
 
     #[tokio::test]

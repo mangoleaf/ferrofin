@@ -111,35 +111,33 @@ impl FerrofinUserDataManager {
 
     /// Inserts or updates the row for an item/user pair from the supplied
     /// [`UserDataEntity`] (keyed by the item id).
+    ///
+    /// ONE statement, not a `SELECT EXISTS` followed by a branch: this is the
+    /// busiest write path on the server (every playback progress report, every
+    /// favorite/rating toggle), so two requests routinely reach it for the same
+    /// `(item, user)` at once. Read-then-branch let both see "absent" and both
+    /// run the `INSERT`, and the loser failed `PK_UserData` — a 500 on a
+    /// playback report. `ON CONFLICT … DO UPDATE` resolves that inside SQLite.
+    /// `RetentionDate` stays untouched on the update leg, exactly as the
+    /// previous `UPDATE` did.
     async fn upsert_row(&self, row: &UserDataEntity) -> Result<(), ServiceError> {
-        let exists: bool = sqlx::query_scalar(
-            r#"SELECT EXISTS(SELECT 1 FROM "UserData"
-               WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3)"#,
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+                ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex",
+                 "IsFavorite", "LastPlayedDate", "Likes", "PlayCount",
+                 "PlaybackPositionTicks", "Played", "Rating", "SubtitleStreamIndex")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+               ON CONFLICT("ItemId", "UserId", "CustomDataKey") DO UPDATE SET
+                 "AudioStreamIndex" = excluded."AudioStreamIndex",
+                 "IsFavorite" = excluded."IsFavorite",
+                 "LastPlayedDate" = excluded."LastPlayedDate",
+                 "Likes" = excluded."Likes",
+                 "PlayCount" = excluded."PlayCount",
+                 "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
+                 "Played" = excluded."Played",
+                 "Rating" = excluded."Rating",
+                 "SubtitleStreamIndex" = excluded."SubtitleStreamIndex""#,
         )
-        .bind(&row.item_id)
-        .bind(&row.user_id)
-        .bind(&row.custom_data_key)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        if exists {
-            sqlx::query(
-                r#"UPDATE "UserData" SET
-                    "AudioStreamIndex" = ?4, "IsFavorite" = ?5, "LastPlayedDate" = ?6,
-                    "Likes" = ?7, "PlayCount" = ?8, "PlaybackPositionTicks" = ?9,
-                    "Played" = ?10, "Rating" = ?11, "SubtitleStreamIndex" = ?12
-                   WHERE "ItemId" = ?1 AND "UserId" = ?2 AND "CustomDataKey" = ?3"#,
-            )
-        } else {
-            sqlx::query(
-                r#"INSERT INTO "UserData"
-                    ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex",
-                     "IsFavorite", "LastPlayedDate", "Likes", "PlayCount",
-                     "PlaybackPositionTicks", "Played", "Rating", "SubtitleStreamIndex")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
-            )
-        }
         .bind(&row.item_id)
         .bind(&row.user_id)
         .bind(&row.custom_data_key)
@@ -584,6 +582,41 @@ mod tests {
             .expect("set runtime");
     }
 
+    /// Two concurrent first-time saves for the same `(item, user)` must both
+    /// succeed. `upsert_row` used to `SELECT EXISTS` and then branch on the
+    /// answer, so racing callers both saw "absent" and both ran the `INSERT` —
+    /// the loser hit `PK_UserData` and the playback report 500'd.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_saves_do_not_collide() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = Arc::new(FerrofinUserDataManager::new(db, config()));
+
+        let mut tasks = Vec::new();
+        for i in 0..8_i64 {
+            let mgr = Arc::clone(&mgr);
+            tasks.push(tokio::spawn(async move {
+                mgr.save_user_data(
+                    user,
+                    item,
+                    &UpdateUserItemDataDto {
+                        playback_position_ticks: Some(i * 100),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("join")
+                .expect("a concurrent first save must not fail");
+        }
+    }
+
     #[tokio::test]
     async fn save_then_read_round_trips() {
         let db = test_db().await;
@@ -942,5 +975,47 @@ mod tests {
         assert_eq!(dto.play_count, 0);
         assert_eq!(dto.playback_position_ticks, 0);
         assert_eq!(dto.last_played_date, None);
+    }
+
+    // Two clients reporting on the SAME item/user with no row yet must both
+    // succeed. The read-then-INSERT-or-UPDATE this replaced could have both
+    // callers observe "absent" and the loser's INSERT hit `PK_UserData` — a 500
+    // mid-playback. The single `ON CONFLICT` upsert makes that unrepresentable.
+    #[tokio::test]
+    async fn concurrent_first_writes_to_one_row_all_succeed() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = Arc::new(FerrofinUserDataManager::new(db.clone(), config()));
+
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..16 {
+            let mgr = Arc::clone(&mgr);
+            writes.spawn(async move {
+                mgr.save_user_data(
+                    user,
+                    item,
+                    &UpdateUserItemDataDto {
+                        play_count: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+            });
+        }
+        while let Some(joined) = writes.join_next().await {
+            joined
+                .expect("task panicked")
+                .expect("concurrent save must not collide on the primary key");
+        }
+
+        // …and exactly one row exists afterwards.
+        let rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "UserData""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
     }
 }

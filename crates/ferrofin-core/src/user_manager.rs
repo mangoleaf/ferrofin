@@ -826,6 +826,11 @@ impl UserManager for FerrofinUserManager {
             return Ok(dto);
         }
 
+        // Captured before the perms/prefs reads below, so a policy change that
+        // lands while this DTO is being assembled cancels the write rather than
+        // parking the pre-change policy in the cache for a TTL.
+        let generation = self.auth_cache.generation();
+
         // Bulk-load this user's permissions and preferences up front — ONE
         // round-trip — instead of the ~40 per-kind lookups the policy/config
         // build otherwise fans out (an N+1 that convoyed the pool under
@@ -882,7 +887,7 @@ impl UserManager for FerrofinUserManager {
             policy: Some(policy),
             ..UserDto::default()
         };
-        self.auth_cache.put_user_dto(user, dto.clone());
+        self.auth_cache.put_user_dto(generation, user, dto.clone());
         if server_id.is_some() {
             dto.server_id = server_id;
         }

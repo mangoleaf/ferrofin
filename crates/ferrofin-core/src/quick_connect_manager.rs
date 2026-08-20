@@ -213,26 +213,32 @@ impl QuickConnect for FerrofinQuickConnect {
         self.assert_active().await?;
         self.expire_stale();
 
-        // Snapshot the pending request (release the lock before the async call).
+        // Snapshot the pending request AND claim it in the same critical
+        // section, then release the lock for the async call below. Checking
+        // "already authorized" against a snapshot and only flipping the flag
+        // after the await let two concurrent authorizations of one code both
+        // pass the check and both mint a session — the guard is only a guard if
+        // the winner is decided before anyone awaits.
         let request = {
-            let requests = self
+            let mut requests = self
                 .current_requests
                 .lock()
                 .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
-            requests
-                .get(code)
-                .cloned()
-                .ok_or_else(|| ServiceError::not_found("unable to find request"))?
+            let pending = requests
+                .get_mut(code)
+                .ok_or_else(|| ServiceError::not_found("unable to find request"))?;
+            if pending.authenticated {
+                return Err(ServiceError::invalid_input("request is already authorized"));
+            }
+            pending.authenticated = true;
+            pending.clone()
         };
-        if request.authenticated {
-            return Err(ServiceError::invalid_input("request is already authorized"));
-        }
 
         // Open a session for the authorizing user with the request's device.
         // The minted access token is not carried through the Quick Connect seam
         // (its `get_authorized_request` surfaces only the session DTO), so only
         // the session is retained here.
-        let session = self
+        let session = match self
             .session_manager
             .authenticate_direct(&AuthenticationRequest {
                 user_id: Some(user_id),
@@ -242,12 +248,24 @@ impl QuickConnect for FerrofinQuickConnect {
                 app_version: Some(request.app_version.clone()),
                 ..AuthenticationRequest::default()
             })
-            .await?
-            .session;
+            .await
+        {
+            Ok(result) => result.session,
+            Err(err) => {
+                // The claim above must not outlive a failed authorization, or a
+                // transient error would burn the code for good.
+                if let Ok(mut requests) = self.current_requests.lock()
+                    && let Some(pending) = requests.get_mut(code)
+                {
+                    pending.authenticated = false;
+                }
+                return Err(err);
+            }
+        };
 
-        // Record the authorized secret and flip the request's flag. Push the
-        // expiry one minute out so the client can still observe authorization
-        // (mirrors the C# `DateAdded = UtcNow + 1min`).
+        // Record the authorized secret, then push the request's expiry one
+        // minute out so the client can still observe authorization (mirrors the
+        // C# `DateAdded = UtcNow + 1min`); the flag itself was set above.
         self.authorized_secrets
             .lock()
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?
@@ -346,7 +364,15 @@ mod tests {
 
     /// A session manager whose `authenticate_direct` returns a DTO tagged with
     /// the authenticated user's id; every other method is an unused stub.
-    struct FakeSessionManager;
+    ///
+    /// The two optional gates let a test pin one authorization *inside* the
+    /// await — `entered` fires on entry, `release` is awaited before returning —
+    /// so a second authorization can be raced against it deterministically.
+    #[derive(Default)]
+    struct FakeSessionManager {
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
 
     #[async_trait]
     impl SessionManager for FakeSessionManager {
@@ -354,6 +380,12 @@ mod tests {
             &self,
             request: &AuthenticationRequest,
         ) -> Result<AuthenticationResultData, ServiceError> {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
             Ok(AuthenticationResultData {
                 session: SessionInfoDto {
                     user_id: request.user_id.unwrap_or_default(),
@@ -542,7 +574,7 @@ mod tests {
     fn manager(enabled: bool) -> FerrofinQuickConnect {
         FerrofinQuickConnect::new(
             Arc::new(FixedConfig { enabled }),
-            Arc::new(FakeSessionManager),
+            Arc::new(FakeSessionManager::default()),
         )
     }
 
@@ -593,6 +625,56 @@ mod tests {
             .await
             .expect_err("double");
         assert!(matches!(err, ServiceError::InvalidInput(_)));
+    }
+
+    /// One code, two simultaneous authorizations: the "already authorized"
+    /// guard must reject the second even though the first has not returned yet.
+    ///
+    /// The first authorization is held inside `authenticate_direct` while the
+    /// second runs, which is exactly the window two `POST /QuickConnect/Authorize`
+    /// requests occupy. Checking the flag on a snapshot and only setting it
+    /// after the await let both through, minting two sessions for one code and
+    /// leaving whichever landed last bound to the secret.
+    #[tokio::test]
+    async fn a_second_authorization_cannot_slip_past_the_first_mid_flight() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mgr = Arc::new(FerrofinQuickConnect::new(
+            Arc::new(FixedConfig { enabled: true }),
+            Arc::new(FakeSessionManager {
+                entered: Some(Arc::clone(&entered)),
+                release: Some(Arc::clone(&release)),
+            }),
+        ));
+
+        let request = mgr.try_connect(&auth_info()).await.expect("connect");
+
+        let first = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            let code = request.code.clone();
+            async move { mgr.authorize_request(Uuid::new_v4(), &code).await }
+        });
+
+        // The first authorization is now parked inside the session mint.
+        entered.notified().await;
+
+        // Bounded: an unclaimed code lets the second authorization walk into
+        // the session mint too, where it parks behind the same gate — the
+        // timeout turns that deadlock into a readable failure.
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mgr.authorize_request(Uuid::new_v4(), &request.code),
+        )
+        .await
+        .expect("the loser must be refused without entering the session mint")
+        .expect_err("the second authorization must lose");
+        assert!(
+            matches!(second, ServiceError::InvalidInput(_)),
+            "the loser is refused as already authorized, not served: {second:?}"
+        );
+
+        release.notify_one();
+        assert!(first.await.expect("join").expect("first authorization"));
     }
 
     #[tokio::test]

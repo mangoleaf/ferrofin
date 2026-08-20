@@ -16,6 +16,14 @@
 //! edited by hand in the DB); it is deliberately short. A revoked token never
 //! waits for the TTL — the delete path clears synchronously before it returns.
 //!
+//! Clearing alone is not enough, because this is a **read-through** cache: a
+//! request that missed is *already holding* a database read taken before the
+//! clear, and it stores that read afterwards. [`AuthCache::clear`] therefore
+//! bumps a **generation**; a writer passes the generation it read at
+//! ([`AuthCache::generation`], captured before its database read) and a write
+//! whose generation is stale is dropped instead of resurrecting a revoked
+//! token for a whole TTL.
+//!
 //! The cache also holds the assembled [`UserDto`] per user (the other half of
 //! Jellyfin's in-memory `UserManager`): building it costs two more round-trips
 //! (permissions/preferences union + access schedules) on every `/Users*`
@@ -26,6 +34,7 @@
 //! contract (every mutating path clears) plus the TTL.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -75,6 +84,10 @@ struct CachedUserDto {
 #[derive(Debug)]
 pub struct AuthCache {
     ttl: Duration,
+    /// Bumped by [`AuthCache::clear`] before it empties the maps. A `put` whose
+    /// caller-captured generation no longer matches is dropped — see the module
+    /// docs for why a read-through cache needs this on top of the clear.
+    generation: AtomicU64,
     entries: RwLock<HashMap<String, CachedAuth>>,
     user_dtos: RwLock<HashMap<String, CachedUserDto>>,
 }
@@ -91,9 +104,32 @@ impl AuthCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
+            generation: AtomicU64::new(0),
             entries: RwLock::new(HashMap::new()),
             user_dtos: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The cache's current generation.
+    ///
+    /// A read-through caller captures this **before** the database read it is
+    /// about to cache, and hands it back to [`AuthCache::put`] /
+    /// [`AuthCache::put_user_dto`]. Anything cleared in between makes the write
+    /// a no-op, so a revocation can never be undone by a request that was
+    /// already in flight when it landed.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether a write tagged `generation` is still current.
+    ///
+    /// Called with the target map's write guard held: [`AuthCache::clear`]
+    /// bumps the generation *before* it takes that guard, so either this load
+    /// already sees the bump (the write is dropped) or the clear is still
+    /// waiting on the guard and will drop the just-written entry itself.
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
     }
 
     /// The cached resolution for `token`, if present and fresher than the TTL.
@@ -114,9 +150,19 @@ impl AuthCache {
         Some((Arc::clone(&hit.device), hit.user.clone()))
     }
 
-    /// Caches a successful token resolution.
-    pub fn put(&self, token: &str, device: DeviceEntity, user: Option<UserEntity>) {
+    /// Caches a successful token resolution, unless the cache was cleared since
+    /// `generation` was captured (see [`AuthCache::generation`]).
+    pub fn put(
+        &self,
+        generation: u64,
+        token: &str,
+        device: DeviceEntity,
+        user: Option<UserEntity>,
+    ) {
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        if !self.is_current(generation) {
+            return;
+        }
         if entries.len() >= AUTH_CACHE_MAX_ENTRIES {
             entries.clear();
         }
@@ -146,12 +192,18 @@ impl AuthCache {
         Some(hit.dto.clone())
     }
 
-    /// Caches a user's assembled DTO alongside the entity it was built from.
-    pub fn put_user_dto(&self, entity: &UserEntity, dto: UserDto) {
+    /// Caches a user's assembled DTO alongside the entity it was built from,
+    /// unless the cache was cleared since `generation` was captured (a policy
+    /// or permission change lands as a clear, and the DTO's perms/prefs inputs
+    /// are not covered by the entity comparison).
+    pub fn put_user_dto(&self, generation: u64, entity: &UserEntity, dto: UserDto) {
         let mut dtos = self
             .user_dtos
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        if !self.is_current(generation) {
+            return;
+        }
         if dtos.len() >= AUTH_CACHE_MAX_ENTRIES {
             dtos.clear();
         }
@@ -167,7 +219,12 @@ impl AuthCache {
 
     /// Drops every cached resolution. Called by the user/device managers on any
     /// auth-relevant mutation — revocation must be immediate, never TTL-bounded.
+    ///
+    /// The generation bump comes FIRST and outside both locks: that is what
+    /// also cancels the writes of requests that read the database before this
+    /// call and have not stored their result yet.
     pub fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.entries
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -217,7 +274,7 @@ mod tests {
     #[test]
     fn hit_within_ttl_miss_after_expiry() {
         let cache = AuthCache::new(Duration::from_millis(30));
-        cache.put("tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None);
         assert!(cache.get("tok").is_some(), "fresh entry hits");
         std::thread::sleep(Duration::from_millis(40));
         assert!(cache.get("tok").is_none(), "expired entry misses");
@@ -229,7 +286,7 @@ mod tests {
     #[test]
     fn hits_share_the_device_row_instead_of_deep_copying_it() {
         let cache = AuthCache::default();
-        cache.put("tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None);
 
         let (first, _) = cache.get("tok").expect("first hit");
         let (second, _) = cache.get("tok").expect("second hit");
@@ -249,21 +306,75 @@ mod tests {
     #[test]
     fn clear_revokes_immediately() {
         let cache = AuthCache::default();
-        cache.put("tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None);
         assert!(cache.get("tok").is_some());
         cache.clear();
         assert!(cache.get("tok").is_none(), "cleared entry never served");
         assert!(cache.is_empty());
     }
 
+    /// The read-through race: a request misses, reads the (still valid) device
+    /// row, and only *then* stores it — a revocation that lands in between must
+    /// win. Without the generation tag the `put` re-seats the revoked token and
+    /// it authenticates for a whole TTL.
+    #[test]
+    fn a_put_that_started_before_a_clear_is_dropped() {
+        let cache = AuthCache::default();
+
+        // What the resolver captures before its database read.
+        let generation = cache.generation();
+        // …the revocation lands while that read is in flight…
+        cache.clear();
+        // …and the in-flight resolver stores what it read.
+        cache.put(generation, "tok", device("tok"), None);
+
+        assert!(
+            cache.get("tok").is_none(),
+            "a revoked token must not be resurrected by an in-flight resolution"
+        );
+        assert!(cache.is_empty());
+    }
+
+    /// The same window on the user-DTO half: a policy/permission change clears,
+    /// and an assembly that read the pre-change rows must not store them (the
+    /// entity comparison cannot catch it — permissions live in other tables).
+    #[tokio::test]
+    async fn a_user_dto_put_that_started_before_a_clear_is_dropped() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x5e)).await;
+        let cache = AuthCache::default();
+
+        let generation = cache.generation();
+        cache.clear();
+        cache.put_user_dto(generation, &entity, UserDto::default());
+
+        assert!(
+            cache.get_user_dto(&entity).is_none(),
+            "a stale policy assembly must not survive the clear that raced it"
+        );
+    }
+
+    /// A write that started *after* the clear is current and must be kept —
+    /// the guard above must not degrade the cache into a no-op.
+    #[test]
+    fn a_put_after_a_clear_is_kept() {
+        let cache = AuthCache::default();
+        cache.clear();
+        cache.put(cache.generation(), "tok", device("tok"), None);
+        assert!(
+            cache.get("tok").is_some(),
+            "a fresh resolution still caches"
+        );
+    }
+
     #[test]
     fn cap_drops_the_map_instead_of_growing() {
         let cache = AuthCache::default();
         for i in 0..AUTH_CACHE_MAX_ENTRIES {
-            cache.put(&format!("t{i}"), device("t"), None);
+            cache.put(cache.generation(), &format!("t{i}"), device("t"), None);
         }
         assert_eq!(cache.len(), AUTH_CACHE_MAX_ENTRIES);
-        cache.put("one-more", device("t"), None);
+        cache.put(cache.generation(), "one-more", device("t"), None);
         assert_eq!(
             cache.len(),
             1,
