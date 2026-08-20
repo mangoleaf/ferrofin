@@ -55,6 +55,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
@@ -669,7 +670,7 @@ impl FerrofinSessionManager {
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut out = Vec::new();
         for member in self.flatten_linked_containers(id, user).await? {
-            out.extend(self.expand_one_for_playback(member, user).await?);
+            out.extend(self.expand_one_for_playback(&member, user).await?);
         }
         Ok(out)
     }
@@ -681,63 +682,91 @@ impl FerrofinSessionManager {
     /// physical `AncestorIds` closure the recursive child query walks — so the
     /// folder expansion below cannot see it and a box set would resolve to an
     /// empty queue. Anything else passes straight through.
+    /// Carries the loaded rows, not ids: the caller needs each item's kind and
+    /// `IsFolder` next, so re-fetching them there would double every read.
+    ///
+    /// Members come back in `SortName` order, not playlist link order, which
+    /// *is* upstream's behaviour and was checked rather than assumed:
+    /// `TranslateItemForPlayback` calls `Folder.GetItemList`, which for a
+    /// recursive query goes to `Folder.QueryRecursive` -> the repository with
+    /// the request's `OrderBy`. `Playlist.GetRecursiveChildren` (which would
+    /// preserve link order) is not on that path. So a cast playlist plays
+    /// alphabetically on both servers, even though `/Playlists/{id}/Items`
+    /// serves link order.
     async fn flatten_linked_containers(
         &self,
         id: Uuid,
         user: Option<&UserEntity>,
-    ) -> Result<Vec<Uuid>, ServiceError> {
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         /// A box set inside a box set is legal; a cycle is not, but the depth
         /// cap makes one terminate anyway.
         const MAX_NESTING: usize = 4;
 
-        let mut frontier = vec![id];
+        let Some(root) = self.library_manager.get_item_by_id(id).await? else {
+            error!(item_id = %id, "nonexistent item id passed to play translation");
+            return Ok(Vec::new());
+        };
+        // Ordering matters (this is a play queue), so dedup with a side set
+        // rather than by collecting into one. Upstream dedupes the same way,
+        // accumulating recursive children into a keyed map.
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        seen.insert(id);
+        let mut frontier = vec![root];
         for _ in 0..MAX_NESTING {
-            let mut next = Vec::with_capacity(frontier.len());
-            let mut expanded = false;
-            for current in frontier {
-                let Some(item) = self.library_manager.get_item_by_id(current).await? else {
-                    // Reported once, by the expansion step below.
-                    next.push(current);
-                    continue;
-                };
-                let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
-                if !matches!(kind, Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)) {
-                    next.push(current);
-                    continue;
-                }
-                expanded = true;
-                // The non-recursive parent query is the one that merges manual
-                // linked children (see `translate_query`).
-                next.extend(
-                    self.library_manager
-                        .get_item_ids(&InternalItemsQuery {
-                            parent_id: current,
-                            is_virtual_item: Some(false),
-                            user: user.cloned(),
-                            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
-                            ..InternalItemsQuery::default()
-                        })
-                        .await?,
-                );
-            }
-            frontier = next;
-            if !expanded {
+            if !frontier.iter().any(Self::is_linked_container) {
                 break;
             }
+            let mut next = Vec::with_capacity(frontier.len());
+            for item in frontier {
+                if !Self::is_linked_container(&item) {
+                    next.push(item);
+                    continue;
+                }
+                let parent_id = Uuid::parse_str(&item.id).unwrap_or_default();
+                // The non-recursive parent query is the one that merges manual
+                // linked children (see `translate_query`).
+                let child_ids = self
+                    .library_manager
+                    .get_item_ids(&InternalItemsQuery {
+                        parent_id,
+                        is_virtual_item: Some(false),
+                        user: user.cloned(),
+                        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await?;
+                for child_id in child_ids {
+                    // A member reachable twice (linked directly *and* through a
+                    // nested container) belongs in the queue once.
+                    if !seen.insert(child_id) {
+                        continue;
+                    }
+                    if let Some(child) = self.library_manager.get_item_by_id(child_id).await? {
+                        next.push(child);
+                    }
+                }
+            }
+            frontier = next;
         }
         Ok(frontier)
     }
 
-    /// The playable ids behind one already-flattened item.
+    /// Whether this item's members are manual `FerrofinLinkedChildren` edges
+    /// rather than the physical `AncestorIds` closure.
+    fn is_linked_container(item: &BaseItemEntity) -> bool {
+        matches!(
+            crate::item_type_lookup::kind_from_type_name(&item.type_),
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        )
+    }
+
+    /// The playable ids behind one already-flattened, already-loaded item.
     async fn expand_one_for_playback(
         &self,
-        id: Uuid,
+        item: &BaseItemEntity,
         user: Option<&UserEntity>,
     ) -> Result<Vec<Uuid>, ServiceError> {
-        let Some(item) = self.library_manager.get_item_by_id(id).await? else {
-            error!(item_id = %id, "nonexistent item id passed to play translation");
-            return Ok(Vec::new());
-        };
+        let id = Uuid::parse_str(&item.id).unwrap_or_default();
         let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
 
         // The persisted `IsFolder` column is authoritative for a specific row;

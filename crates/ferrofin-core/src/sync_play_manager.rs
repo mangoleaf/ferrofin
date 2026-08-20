@@ -707,18 +707,40 @@ impl FerrofinSyncPlayManager {
         if ids.is_empty() {
             return Some(std::collections::HashSet::new());
         }
-        let Ok(Some(user)) = access.users.get_user_by_id(user_id).await else {
-            return Some(std::collections::HashSet::new());
+        // Failing closed is right, but failing closed *silently* is not: a
+        // transient fault here hides every group from `List` and turns every
+        // join into `LibraryAccessDenied`, which is indistinguishable from a
+        // genuinely inaccessible queue. Say which it was.
+        let user = match access.users.get_user_by_id(user_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                tracing::warn!(%user_id, "sync-play access check: no such user — denying");
+                return Some(std::collections::HashSet::new());
+            }
+            Err(err) => {
+                tracing::warn!(%user_id, %err, "sync-play access check: user lookup failed — denying");
+                return Some(std::collections::HashSet::new());
+            }
         };
         let query = InternalItemsQuery {
             item_ids: ids.to_vec(),
             user: Some(user),
             ..InternalItemsQuery::default()
         };
-        let Ok(visible) = access.library.get_item_ids(&query).await else {
-            return Some(std::collections::HashSet::new());
-        };
-        Some(visible.into_iter().collect())
+        match access.library.get_item_ids(&query).await {
+            Ok(visible) => Some(visible.into_iter().collect()),
+            Err(err) => {
+                // One bound parameter per id, so a large enough aggregate queue
+                // trips SQLite's variable ceiling and lands here.
+                tracing::warn!(
+                    %user_id,
+                    items = ids.len(),
+                    %err,
+                    "sync-play access check: item lookup failed — denying"
+                );
+                Some(std::collections::HashSet::new())
+            }
+        }
     }
 
     /// Whether every member of the group may see `items` (C#

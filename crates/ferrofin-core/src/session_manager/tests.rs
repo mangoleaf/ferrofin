@@ -1444,6 +1444,69 @@ async fn casting_a_playlist_expands_through_a_nested_box_set() {
 }
 
 #[tokio::test]
+async fn a_member_reachable_twice_is_queued_once() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // The movie is linked into the playlist directly AND through a nested box
+    // set, so a blind flatten would queue it twice.
+    let playlist = Uuid::new_v4();
+    let boxset = Uuid::new_v4();
+    for (id, kind, name) in [
+        (
+            playlist,
+            ferrofin_model::data::BaseItemKind::Playlist,
+            "Mix",
+        ),
+        (
+            boxset,
+            ferrofin_model::data::BaseItemKind::BoxSet,
+            "Trilogy",
+        ),
+    ] {
+        crate::test_support::seed_folder_item(&db, id, kind, name, None).await;
+    }
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    links
+        .upsert_linked_child(playlist, movie, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(playlist, boxset, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(boxset, movie, 0)
+        .await
+        .expect("link");
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![playlist]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![movie],
+        "a member reachable by two paths appears once, as upstream's keyed accumulation gives"
+    );
+}
+
+#[tokio::test]
 async fn casting_a_plain_item_passes_through_unexpanded() {
     let db = test_db().await;
     let (mgr, bus) = cast_manager(&db);
