@@ -8,6 +8,22 @@
 //! and a `<CollectionItems>`/`<PlaylistItems>` list of `<Path>`/`<ItemId>`
 //! links. Reading it is what lets Ferrofin adopt a library Jellyfin populated;
 //! writing it is what keeps the reverse true.
+//!
+//! # Not yet reachable from the server
+//!
+//! Both C# savers write to `Path.Combine(item.Path, …)`, and both parsers run
+//! against an item resolved from a folder on disk. Ferrofin creates a `BoxSet`
+//! or `Playlist` as a **pathless** DB row (`collection_manager`'s
+//! `insert_named_item` writes no `Path`), and the scanner resolves no
+//! collection/playlist folders — so today there is no on-disk file for either
+//! side to touch, and nothing in the server calls into this module. Membership
+//! lives in `BaseItems."Data"`, which is Jellyfin's own DB source of truth and
+//! is what makes the drop-in round trip work.
+//!
+//! This module is the complete, tested reader/writer pair, ready for the day
+//! Ferrofin materializes folder-backed containers. It is deliberately NOT
+//! wired to a synthetic path: writing `collection.xml` somewhere Jellyfin
+//! would not look for it would be worse than not writing it.
 
 use std::fmt::Write as _;
 

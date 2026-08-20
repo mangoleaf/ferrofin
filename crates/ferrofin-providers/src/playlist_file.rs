@@ -6,6 +6,16 @@
 //! media paths, absolute or relative to the playlist's own directory. The
 //! provider resolves each to a library item; the writer emits the same list back
 //! so a playlist edited in Ferrofin stays readable by the player that wrote it.
+//!
+//! # Not yet reachable from the server
+//!
+//! `PlaylistItemsProvider` runs against a `Playlist` item whose `Path` is the
+//! playlist file, and `SavePlaylistFile` writes back to that same path.
+//! Ferrofin creates playlists as **pathless** DB rows and its scanner resolves
+//! no playlist files, so nothing in the server calls into this module yet —
+//! the deferral `collection_manager` records for `SavePlaylistFile` is about
+//! this same missing path, not about the format handling, which is here and
+//! tested.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

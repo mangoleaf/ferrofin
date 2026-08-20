@@ -109,6 +109,11 @@ Wired and working, with a documented limitation or lighter verification:
     worth the dependency. `.cbz` and `.cbt` are fully read.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
+- **`collection.xml` / `playlist.xml` / `.m3u` playlist files** — the readers and writers are
+  ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
+  pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
+  is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
+  source of truth), which is what makes the drop-in round trip work.
 
 ## Not implemented (by design)
 
