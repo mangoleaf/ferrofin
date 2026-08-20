@@ -177,6 +177,65 @@ pub fn set_data_field(data: Option<&str>, key: &str, value: &str) -> Option<Stri
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// The `Data` keys a photo's EXIF fields round-trip through, in the C# `Photo`
+/// property spelling — the same names Jellyfin serializes, so a database
+/// adopted in either direction keeps its photo metadata.
+pub const PHOTO_EXIF_KEYS: [&str; 12] = [
+    "CameraMake",
+    "CameraModel",
+    "Software",
+    "ExposureTime",
+    "FocalLength",
+    "Orientation",
+    "Aperture",
+    "ShutterSpeed",
+    "Latitude",
+    "Longitude",
+    "Altitude",
+    "IsoSpeedRating",
+];
+
+/// Merges `fields` into the row's `Data` blob, dropping any key whose value is
+/// `None` so a re-scan of a photo whose EXIF was stripped clears the stale
+/// value. Returns `None` when nothing changed.
+#[must_use]
+pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -> Option<String> {
+    let mut object = parse_data(data);
+    let before = object.clone();
+    for (key, value) in fields {
+        match value {
+            Some(value) => {
+                object.insert((*key).to_owned(), value.clone());
+            }
+            None => {
+                object.remove(*key);
+            }
+        }
+    }
+    if object == before {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
+/// Reads one `Data` field as a string.
+#[must_use]
+pub fn read_data_string(data: &Map<String, Value>, key: &str) -> Option<String> {
+    data.get(key)?.as_str().map(str::to_owned)
+}
+
+/// Reads one `Data` field as an `f64` (accepting the JSON number form).
+#[must_use]
+pub fn read_data_f64(data: &Map<String, Value>, key: &str) -> Option<f64> {
+    data.get(key)?.as_f64()
+}
+
+/// Reads one `Data` field as an `i32`.
+#[must_use]
+pub fn read_data_i32(data: &Map<String, Value>, key: &str) -> Option<i32> {
+    i32::try_from(data.get(key)?.as_i64()?).ok()
+}
+
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —
 /// the presence signal that Jellyfin (or a prior Ferrofin sync) owns this blob.
 #[must_use]

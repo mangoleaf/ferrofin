@@ -17,6 +17,15 @@ use super::xml_reader::XmlCursor;
 
 /// NFO parser for movies (and music videos) — port of `MovieNfoParser`.
 ///
+/// The base parser with no per-kind extensions.
+///
+/// C# reads `album.nfo`/`artist.nfo` through `BaseNfoParser<T>` directly —
+/// neither has custom elements — so the music kinds parse with this.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlainNfoParser;
+
+impl NfoParser for PlainNfoParser {}
+
 /// Adds `<id>` attribute parsing, `<set>` (collection) handling, and the
 /// music-video `<artist>`/`<album>` tags on top of the base switch, and enables
 /// the URL-after-closing-tag path.

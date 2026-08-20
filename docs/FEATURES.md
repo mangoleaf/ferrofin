@@ -52,6 +52,12 @@ Deep-verified against a real Jellyfin server:
 - **Scheduled tasks** — all 17 dashboard tasks plus the trigger scheduler.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
+- **Photos & books** — a home-videos library resolves its images into `Photo` items with
+  their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
+  library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
+  metadata and the cover extracted from the archive.
+- **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
+  external-id fields the Identify dialog offers.
 - **Backup & restore.**
 
 ## Implemented, less battle-tested / known partial
@@ -60,9 +66,15 @@ Wired and working, with a documented limitation or lighter verification:
 
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
-- **Similar-items scoring** — a simplified scorer relative to Jellyfin's exact weighting.
-- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / OMDb / fanart) — implemented but
-  **feature-gated off by default**; they return empty results until enabled with an API key.
+- **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
+  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  that ticked them under "Similarity providers", and resolve against items already in the
+  library. The local scorer is a single query rather than upstream's six per-kind
+  providers, which are identical in behaviour.
+- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / AudioDb / fanart / Studio Images)
+  — compiled in and **on by default** with built-in keys, gated per library by the
+  "Metadata downloaders" / "Image fetchers" checkboxes. **OMDb** is the exception: it stays
+  inert until `FERROFIN_OMDB_KEY` (config `omdb_api_key`) is set.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
 - **Books / audiobooks** — a `books` library resolves documents (`.azw .azw3 .cb7 .cbr .cbt
@@ -88,9 +100,15 @@ Wired and working, with a documented limitation or lighter verification:
     artefact of the root going through the multi-item resolver. Ferrofin names it from the
     file, with no year. Naming a book after the library it sits in is an upstream wart, not
     behaviour worth reproducing; every other shape matches upstream exactly.
-  - No book metadata provider: upstream core has none either (no book NFO parser, no remote
-    book provider — that is the third-party Bookshelf plugin), so metadata is filename +
-    local images.
+  - Metadata comes from the file itself: `ComicInfo.xml` (inside the archive or beside it),
+    the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
+    fields, with the cover extracted from the archive. There is still no *remote* book
+    provider — that is the third-party Bookshelf plugin.
+  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
+    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
+    worth the dependency. `.cbz` and `.cbt` are fully read.
+- **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
+  `Tags`, which upstream aggregates from XMP/IPTC keywords.
 
 ## Not implemented (by design)
 

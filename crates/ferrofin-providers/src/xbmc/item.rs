@@ -41,6 +41,10 @@ pub enum NfoItemKind {
     Season,
     /// A TV episode (`Episode`).
     Episode,
+    /// A music album (`MusicAlbum`).
+    MusicAlbum,
+    /// A music artist (`MusicArtist`).
+    MusicArtist,
 }
 
 impl NfoItemKind {
@@ -157,6 +161,10 @@ pub struct NfoBaseItem {
     // ----- MusicVideo -----
     /// The artists (`Artists`).
     pub artists: Vec<String>,
+
+    /// `AlbumArtists` — an album's credited album artists, written as
+    /// `<albumartist>` by the album saver.
+    pub album_artists: Vec<String>,
     /// The album (`Album`).
     pub album: Option<String>,
 

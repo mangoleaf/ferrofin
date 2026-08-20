@@ -97,6 +97,63 @@ impl SimilarItemsRepository {
 
     /// Loads the full user row for the watch-state (`IsPlayed`/`IsFavorite`)
     /// predicates, which are `EXISTS` sub-selects scoped to the query's user.
+    /// One item's provider ids, keyed by provider name.
+    ///
+    /// A remote similarity provider is keyed by the seed's external id (TMDB,
+    /// MusicBrainz), which lives in `BaseItemProviders` rather than on the row.
+    pub(crate) async fn provider_ids(
+        &self,
+        item_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, String>, ServiceError> {
+        let rows = sqlx::query_as::<_, (String, String)>(
+            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// The items whose `provider_key` id is one of `values`, as
+    /// `(item_id, value)` pairs.
+    ///
+    /// The targeted form of `ItemRepository::get_items_with_provider_id`: a
+    /// remote provider returns tens of ids, and loading every item that has a
+    /// TMDB id to intersect them would read the whole library.
+    pub(crate) async fn items_with_provider_values(
+        &self,
+        provider_key: &str,
+        values: &[String],
+    ) -> Result<Vec<(Uuid, String)>, ServiceError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for chunk in values.chunks(500) {
+            let placeholders = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ProviderId" = ?1 COLLATE NOCASE
+                     AND "ProviderValue" IN ({placeholders}) COLLATE NOCASE"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(provider_key);
+            for value in chunk {
+                query = query.bind(value);
+            }
+            for (item_id, value) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&item_id) {
+                    out.push((id, value));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn fetch_user(
         &self,
         user_id: Uuid,

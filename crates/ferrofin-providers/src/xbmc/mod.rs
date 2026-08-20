@@ -60,6 +60,28 @@ pub fn fetch_movie(
     Ok(())
 }
 
+/// Parses an `album.nfo` or `artist.nfo` document into `result`.
+///
+/// C# routes both through `BaseNfoParser<T>` with no per-kind extensions
+/// (`AlbumNfoProvider`/`ArtistNfoProvider` construct the base parser directly),
+/// so this is the same read with no custom element switch.
+///
+/// # Errors
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+pub fn fetch_music(
+    result: &mut MetadataResult<NfoBaseItem>,
+    metadata_file: &str,
+    xml: &str,
+    config: &NfoConfiguration,
+    external_ids: &dyn ExternalIdSource,
+    directory_service: &dyn DirectoryService,
+) -> FetchResult {
+    check_fetch(metadata_file)?;
+    let base = BaseNfoParser::new(config, external_ids, directory_service);
+    base.fetch(&crate::xbmc::parsers::PlainNfoParser, result, xml);
+    Ok(())
+}
+
 /// Parses a series NFO document into `result` (`SeriesNfoParser.Fetch`).
 ///
 /// # Errors

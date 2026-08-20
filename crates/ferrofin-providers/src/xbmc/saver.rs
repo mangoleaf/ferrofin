@@ -747,6 +747,162 @@ pub fn save_season(result: &MetadataResult<NfoBaseItem>, config: &NfoConfigurati
     writer.finish()
 }
 
+/// One track of an album NFO's `<track>` list (`AlbumNfoSaver.AddTracks`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NfoTrack {
+    /// `ParentIndexNumber` — the disc number; `0`/absent is not written.
+    pub disc: Option<i32>,
+    /// `IndexNumber` — the position within the disc; `0`/absent is not written.
+    pub position: Option<i32>,
+    /// The track title.
+    pub title: Option<String>,
+    /// `RunTimeTicks`, written as `mm:ss`.
+    pub run_time_ticks: Option<i64>,
+    /// The track's sort name, used only for the tie-break ordering.
+    pub sort_name: Option<String>,
+}
+
+/// One album of an artist NFO's `<album>` list (`ArtistNfoSaver.AddAlbums`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NfoAlbum {
+    /// The album title.
+    pub title: Option<String>,
+    /// The album's production year.
+    pub year: Option<i32>,
+    /// The album's sort name, used only for the tie-break ordering.
+    pub sort_name: Option<String>,
+}
+
+/// Serializes an `album.nfo` document (`AlbumNfoSaver`; root `album`).
+///
+/// After the common nodes come the album's artists, its album-artists, and one
+/// `<track>` block per track ordered by disc, then position, then sort name,
+/// then name — the exact C# `OrderBy`/`ThenBy` chain.
+#[must_use]
+pub fn save_album(
+    result: &MetadataResult<NfoBaseItem>,
+    tracks: &[NfoTrack],
+    config: &NfoConfiguration,
+) -> String {
+    let item = &result.item;
+    let mut writer = NfoWriter::new();
+    writer.start_element("album");
+    add_common_nodes(&mut writer, item, people_slice(result), config);
+
+    for artist in sorted_trimmed(&item.artists) {
+        writer.element("artist", &artist);
+    }
+    for artist in sorted_trimmed(&item.album_artists) {
+        writer.element("albumartist", &artist);
+    }
+
+    let mut ordered: Vec<&NfoTrack> = tracks.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.disc
+            .unwrap_or(0)
+            .cmp(&b.disc.unwrap_or(0))
+            .then(a.position.unwrap_or(0).cmp(&b.position.unwrap_or(0)))
+            .then_with(|| {
+                sort_name_or_name(a.sort_name.as_deref(), a.title.as_deref()).cmp(
+                    &sort_name_or_name(b.sort_name.as_deref(), b.title.as_deref()),
+                )
+            })
+            .then_with(|| trimmed_name(a.title.as_deref()).cmp(&trimmed_name(b.title.as_deref())))
+    });
+
+    for track in ordered {
+        writer.start_element("track");
+        if let Some(disc) = track.disc.filter(|d| *d != 0) {
+            writer.element("disc", &disc.to_string());
+        }
+        if let Some(position) = track.position.filter(|p| *p != 0) {
+            writer.element("position", &position.to_string());
+        }
+        if let Some(title) = track.title.as_deref().filter(|t| !t.is_empty()) {
+            writer.element("title", title);
+        }
+        if let Some(ticks) = track.run_time_ticks {
+            writer.element("duration", &mm_ss(ticks));
+        }
+        writer.end_element("track");
+    }
+
+    writer.end_element("album");
+    writer.finish()
+}
+
+/// Serializes an `artist.nfo` document (`ArtistNfoSaver`; root `artist`).
+///
+/// Adds `<disbanded>` (the artist's end date, in the configured release-date
+/// format) and one `<album>` block per album, ordered by year, then sort name,
+/// then name.
+#[must_use]
+pub fn save_artist(
+    result: &MetadataResult<NfoBaseItem>,
+    albums: &[NfoAlbum],
+    config: &NfoConfiguration,
+) -> String {
+    let item = &result.item;
+    let mut writer = NfoWriter::new();
+    writer.start_element("artist");
+    add_common_nodes(&mut writer, item, people_slice(result), config);
+
+    if let Some(end) = item.end_date {
+        let fmt = release_date_strftime(&config.release_date_format);
+        writer.element("disbanded", &format_date(end, fmt));
+    }
+
+    let mut ordered: Vec<&NfoAlbum> = albums.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.year
+            .unwrap_or(0)
+            .cmp(&b.year.unwrap_or(0))
+            .then_with(|| {
+                sort_name_or_name(a.sort_name.as_deref(), a.title.as_deref()).cmp(
+                    &sort_name_or_name(b.sort_name.as_deref(), b.title.as_deref()),
+                )
+            })
+            .then_with(|| trimmed_name(a.title.as_deref()).cmp(&trimmed_name(b.title.as_deref())))
+    });
+
+    for album in ordered {
+        writer.start_element("album");
+        if let Some(title) = album.title.as_deref().filter(|t| !t.is_empty()) {
+            writer.element("title", title);
+        }
+        if let Some(year) = album.year {
+            writer.element("year", &year.to_string());
+        }
+        writer.end_element("album");
+    }
+
+    writer.end_element("artist");
+    writer.finish()
+}
+
+/// C# `SortNameOrName`: the sort name when set, else the name.
+fn sort_name_or_name(sort_name: Option<&str>, name: Option<&str>) -> String {
+    sort_name
+        .filter(|s| !s.is_empty())
+        .or(name)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The trimmed name, for the final `ThenBy(i => i.Name?.Trim())` tie-break.
+fn trimmed_name(name: Option<&str>) -> String {
+    name.unwrap_or_default().trim().to_owned()
+}
+
+/// A run time as `mm:ss` — C# `TimeSpan.FromTicks(...).ToString(@"mm\:ss")`,
+/// which formats the minutes *component*, so a track over an hour wraps.
+fn mm_ss(ticks: i64) -> String {
+    let total_seconds = ticks / 10_000_000;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
+}
+
 /// Borrows the result's people as a slice, treating a never-populated list as
 /// empty (`libraryManager.GetPeople` returns an empty list, never null).
 fn people_slice(result: &MetadataResult<NfoBaseItem>) -> &[PersonInfo] {

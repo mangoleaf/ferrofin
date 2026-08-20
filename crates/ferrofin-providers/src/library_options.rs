@@ -75,6 +75,10 @@ enum Cap {
     Subtitle,
     Lyric,
     MediaSegment,
+    /// A local (library-side) similarity provider.
+    LocalSimilarity,
+    /// A remote similarity provider.
+    Similarity,
 }
 
 impl Cap {
@@ -89,6 +93,8 @@ impl Cap {
             Cap::Subtitle => MetadataPluginType::SubtitleFetcher,
             Cap::Lyric => MetadataPluginType::LyricFetcher,
             Cap::MediaSegment => MetadataPluginType::MediaSegmentProvider,
+            Cap::LocalSimilarity => MetadataPluginType::LocalSimilarityProvider,
+            Cap::Similarity => MetadataPluginType::SimilarityProvider,
         }
     }
 }
@@ -118,26 +124,37 @@ impl Provider {
 
 /// The compiled-in provider registry (features resolved for this build).
 fn providers() -> Vec<Provider> {
+    let mut provs = local_providers();
+    provs.extend(remote_providers());
+    provs
+}
+
+/// The providers that read from the library's own files.
+fn local_providers() -> Vec<Provider> {
+    vec![Provider {
+        name: "Nfo",
+        caps: &[Cap::LocalMetadata, Cap::MetadataSaver, Cap::LocalImage],
+        types: &[
+            "Movie",
+            "Series",
+            "Season",
+            "Episode",
+            "MusicVideo",
+            "BoxSet",
+        ],
+        default_enabled: true,
+        compiled: true,
+    }]
+}
+
+/// The providers that fetch from an external service.
+fn remote_providers() -> Vec<Provider> {
     vec![
-        Provider {
-            name: "Nfo",
-            caps: &[Cap::LocalMetadata, Cap::MetadataSaver, Cap::LocalImage],
-            types: &[
-                "Movie",
-                "Series",
-                "Season",
-                "Episode",
-                "MusicVideo",
-                "BoxSet",
-            ],
-            default_enabled: true,
-            compiled: true,
-        },
         Provider {
             // Always wired by the composition root (its client is created
             // unconditionally); the `tmdb` cargo feature gates nothing.
             name: "TheMovieDb",
-            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
+            caps: &[Cap::MetadataFetcher, Cap::ImageFetcher, Cap::Similarity],
             types: &["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
             default_enabled: true,
             compiled: true,
@@ -205,6 +222,30 @@ fn providers() -> Vec<Provider> {
             caps: &[Cap::LocalImage],
             types: &[],
             default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            // Upstream registers six identically-named local providers (one per
+            // kind); Ferrofin's single weighted genre/tag/people scorer is the
+            // same thing, so it is advertised once for every kind it serves.
+            name: "Local Genre/Tag",
+            caps: &[Cap::LocalSimilarity],
+            types: &[
+                "Movie",
+                "Series",
+                "Audio",
+                "MusicAlbum",
+                "MusicArtist",
+                "Trailer",
+            ],
+            default_enabled: true,
+            compiled: true,
+        },
+        Provider {
+            name: "ListenBrainz",
+            caps: &[Cap::Similarity],
+            types: &["MusicArtist"],
+            default_enabled: false,
             compiled: true,
         },
         Provider {
@@ -322,10 +363,18 @@ pub fn library_options_info(
                     .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
                     .map(|(name, _)| dynamic_info(name)),
             );
+            // C# `LibraryController`: local similarity providers are ticked by
+            // default, remote ones are not.
+            let mut similar_item_providers = per_type(Cap::LocalSimilarity);
+            similar_item_providers.extend(per_type(Cap::Similarity).into_iter().map(|mut info| {
+                info.default_enabled = false;
+                info
+            }));
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
                 metadata_fetchers,
                 image_fetchers,
+                similar_item_providers,
                 supported_image_types: supported_image_types(type_name),
                 default_image_options: default_image_options(type_name),
             }

@@ -548,12 +548,6 @@ impl ProviderManager for RecordingProviders {
     ) -> Result<(), ServiceError> {
         unimplemented!()
     }
-    async fn get_external_urls(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Vec<ferrofin_model::providers::ExternalUrl>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_all_metadata_plugins(
         &self,
     ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError> {

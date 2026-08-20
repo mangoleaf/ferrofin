@@ -207,6 +207,11 @@ pub struct LibraryTypeOptionsDto {
     /// Gets or sets the available image fetchers.
     pub image_fetchers: Vec<LibraryOptionInfoDto>,
 
+    /// Gets or sets the available similarity providers. Local ones are
+    /// default-enabled; remote ones must be ticked.
+    #[serde(default)]
+    pub similar_item_providers: Vec<LibraryOptionInfoDto>,
+
     /// Gets or sets the supported image types.
     pub supported_image_types: Vec<ImageType>,
 
@@ -470,6 +475,16 @@ pub struct TypeOptions {
 
     /// Gets or sets the image options.
     pub image_options: Vec<ImageOption>,
+
+    /// The similarity providers enabled for this type. A remote provider runs
+    /// only when listed here (local similarity is always on).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub similar_item_providers: Vec<String>,
+
+    /// The admin-chosen order of [`similar_item_providers`](Self::similar_item_providers);
+    /// a provider absent from the list sorts last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub similar_item_provider_order: Vec<String>,
 }
 
 /// Trickplay generation options.

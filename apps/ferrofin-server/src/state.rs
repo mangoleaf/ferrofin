@@ -308,6 +308,10 @@ pub async fn build_app_state(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
     ));
+    // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
+    // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
+    // `omdb_api_key`) is set: every call returns nothing without a key.
+    let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -320,6 +324,18 @@ pub async fn build_app_state(
         Arc::new(ferrofin_providers::TvdbSearchProvider::new(Arc::clone(
             &the_tvdb,
         ))),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Series,
+        )),
+        // Box sets identify against TMDB's collections, a separate endpoint.
+        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
@@ -370,7 +386,10 @@ pub async fn build_app_state(
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client)),
+            .with_studios(Arc::clone(&studios_client))
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref()),
     );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
@@ -462,9 +481,6 @@ pub async fn build_app_state(
     );
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
-    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
-        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository)),
-    );
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
         Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
@@ -494,6 +510,29 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // Similar items: the local weighted-overlap scorer always runs; the remote
+    // providers below run only for a library that ticked them in its
+    // "Similarity providers" list, in the admin's configured order.
+    let similar_providers: Vec<Arc<dyn ferrofin_traits::library::RemoteSimilarItemsProvider>> = vec![
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Movie,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Series,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::ListenBrainzSimilarArtistProvider::new(
+            Arc::new(ferrofin_providers::ListenBrainzClient::default()),
+        )),
+    ];
+    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
+        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository))
+            .with_remote_providers(similar_providers, Arc::clone(&virtual_folders))
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("similar")),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -525,11 +564,11 @@ pub async fn build_app_state(
         (!config.fanart_personal_api_key.is_empty())
             .then(|| config.fanart_personal_api_key.clone()),
     )))
-    // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
-    // key is configured (FERROFIN_OMDB_KEY / config.toml `omdb_api_key`).
-    .with_omdb(Arc::new(ferrofin_providers::OmdbClient::new(
-        &config.omdb_api_key,
-    )))
+    // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
+    // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
+    // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
+    // config.toml `omdb_api_key`).
+    .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
     // Resolve MusicBrainz ids for music items in the post-scan enrichment pass
@@ -894,18 +933,22 @@ pub async fn build_app_state(
         ));
 
     // ---- dto (consumes many of the above) ---------------------------------
-    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(FerrofinDtoService::new(
-        db.clone(),
-        server_id.clone(),
-        Arc::clone(&library),
-        Arc::clone(&user_data),
-        Arc::clone(&item_count_service),
-        Arc::clone(&image_processor),
-        Arc::clone(&media_sources),
-        Arc::clone(&chapters),
-        Arc::clone(&trickplay),
-        Arc::clone(&providers),
-    ));
+    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(
+        FerrofinDtoService::new(
+            db.clone(),
+            server_id.clone(),
+            Arc::clone(&library),
+            Arc::clone(&user_data),
+            Arc::clone(&item_count_service),
+            Arc::clone(&image_processor),
+            Arc::clone(&media_sources),
+            Arc::clone(&chapters),
+            Arc::clone(&trickplay),
+        )
+        // The music "Links" row points at the configured MusicBrainz mirror, as
+        // Jellyfin's link providers use the plugin's configured server.
+        .with_musicbrainz_server(&config.musicbrainz_base_url),
+    );
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because

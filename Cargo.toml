@@ -83,6 +83,7 @@ tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Same versions tower-http already links.
 flate2 = "1.1"
+zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
 brotli = "8.0"
 tokio = { version = "1", features = ["full"] }
 notify = "8.2"
@@ -148,6 +149,7 @@ pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898Derive
 sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = "0.15"
