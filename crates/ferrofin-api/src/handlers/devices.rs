@@ -8,9 +8,13 @@
 //! - `POST /Devices/Options` — update a device's custom name.
 //! - `DELETE /Devices` — delete one or more devices, logging out their sessions.
 //!
-//! Every route sits behind `[Authorize(Policy = RequiresElevation)]` upstream;
-//! the [`RequireAuth`] extractor enforces authentication here (the elevation
-//! policy itself is applied at the composition root's auth layer).
+//! Every route sits behind `[Authorize(Policy = RequiresElevation)]` upstream,
+//! and [`RequireAdmin`] enforces that here.
+//!
+//! This file previously said the elevation policy was "applied at the
+//! composition root's auth layer". No such layer existed, so `GET /Devices`
+//! returned every device row — each carrying a plaintext `AccessToken`,
+//! including an administrator's live token — to any authenticated caller.
 
 use axum::extract::{Query, State};
 use axum::routing::get;
@@ -20,7 +24,7 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::devices::DeviceQuery;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -69,7 +73,7 @@ struct DeleteDevicesQuery {
 )]
 async fn get_devices(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Query(query): Query<GetDevicesQuery>,
 ) -> Result<Json<QueryResult<DeviceInfoDto>>, ApiError> {
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
@@ -93,7 +97,7 @@ async fn get_devices(
 )]
 async fn get_device_info(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<DeviceIdQuery>,
 ) -> Result<Json<DeviceInfoDto>, ApiError> {
     let id = require_id(query.id.as_deref())?;
@@ -121,7 +125,7 @@ async fn get_device_info(
 )]
 async fn get_device_options(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<DeviceIdQuery>,
 ) -> Result<Json<DeviceOptionsDto>, ApiError> {
     let id = require_id(query.id.as_deref())?;
@@ -150,7 +154,7 @@ async fn get_device_options(
 )]
 async fn update_device_options(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<DeviceIdQuery>,
     Json(options): Json<DeviceOptionsDto>,
 ) -> Result<axum::http::StatusCode, ApiError> {
@@ -179,7 +183,7 @@ async fn update_device_options(
 )]
 async fn delete_devices(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<DeleteDevicesQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // Comma-delimited id list (Jellyfin's `string[]` query binding).

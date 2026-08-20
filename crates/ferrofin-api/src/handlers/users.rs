@@ -53,7 +53,7 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
@@ -576,7 +576,7 @@ async fn get_user_by_id(
 )]
 async fn delete_user(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     let user = load_user(&state, user_id).await?;
@@ -643,7 +643,7 @@ async fn notify_user_updated(state: &AppState, user_id: Uuid) {
 )]
 async fn create_user_by_name(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Json(body): Json<CreateUserByName>,
 ) -> Result<Json<UserDto>, ApiError> {
     let new_user = state.users.create_user(&body.name).await?;
@@ -726,7 +726,7 @@ async fn update_user(
 )]
 async fn update_user_policy(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
     Json(new_policy): Json<UserPolicy>,
 ) -> Result<StatusCode, ApiError> {
