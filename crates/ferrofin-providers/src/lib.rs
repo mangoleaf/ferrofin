@@ -42,7 +42,7 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use musicbrainz::{AlbumIds, MusicBrainzClient};
-pub use omdb::OmdbClient;
+pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
 pub use studios::StudiosClient;
 pub use tmdb::{
     RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
@@ -64,6 +64,7 @@ pub use local_images::{
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
 pub use provider_manager::{
-    LocalProviderManager, RemoteSearchProvider, TmdbSearchProvider, TvdbSearchProvider,
+    LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbSearchProvider,
+    TvdbSearchProvider,
 };
 pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};

@@ -150,6 +150,70 @@ impl RemoteSearchProvider for TvdbSearchProvider {
     }
 }
 
+/// A [`RemoteSearchProvider`] backed by OMDb — the "Identify" flow's IMDb-keyed
+/// candidates. Port of `OmdbItemProvider.GetSearchResults`; inert (no results)
+/// until an OMDb API key is configured.
+pub struct OmdbSearchProvider {
+    omdb: Arc<crate::omdb::OmdbClient>,
+    kind: crate::omdb::OmdbKind,
+    supported: BaseItemKind,
+}
+
+impl OmdbSearchProvider {
+    /// An OMDb search provider for `kind` (movie, series or episode).
+    #[must_use]
+    pub fn new(omdb: Arc<crate::omdb::OmdbClient>, kind: crate::omdb::OmdbKind) -> Self {
+        let supported = match kind {
+            crate::omdb::OmdbKind::Movie => BaseItemKind::Movie,
+            crate::omdb::OmdbKind::Series => BaseItemKind::Series,
+            crate::omdb::OmdbKind::Episode => BaseItemKind::Episode,
+        };
+        Self {
+            omdb,
+            kind,
+            supported,
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for OmdbSearchProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "The Open Movie Database"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == self.supported
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .omdb
+            .search(self.kind, name, search_info.year)
+            .await
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                production_year: hit.production_year(),
+                image_url: hit.poster.clone(),
+                provider_ids: hit
+                    .imdb_id
+                    .clone()
+                    .map(|id| std::collections::HashMap::from([("Imdb".to_owned(), id)])),
+                name: hit.title,
+                search_provider_name: Some("The Open Movie Database".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
+
 /// A single remote metadata-search fetcher (e.g. a TMDb or MusicBrainz plugin).
 ///
 /// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced

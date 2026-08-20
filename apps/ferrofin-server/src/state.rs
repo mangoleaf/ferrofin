@@ -308,6 +308,10 @@ pub async fn build_app_state(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
     ));
+    // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
+    // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
+    // `omdb_api_key`) is set: every call returns nothing without a key.
+    let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -320,6 +324,14 @@ pub async fn build_app_state(
         Arc::new(ferrofin_providers::TvdbSearchProvider::new(Arc::clone(
             &the_tvdb,
         ))),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Series,
+        )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
@@ -528,11 +540,11 @@ pub async fn build_app_state(
         (!config.fanart_personal_api_key.is_empty())
             .then(|| config.fanart_personal_api_key.clone()),
     )))
-    // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
-    // key is configured (FERROFIN_OMDB_KEY / config.toml `omdb_api_key`).
-    .with_omdb(Arc::new(ferrofin_providers::OmdbClient::new(
-        &config.omdb_api_key,
-    )))
+    // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
+    // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
+    // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
+    // config.toml `omdb_api_key`).
+    .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
     // Resolve MusicBrainz ids for music items in the post-scan enrichment pass

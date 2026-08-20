@@ -72,6 +72,9 @@ struct ArtworkCache {
     /// Item id → the external ids the metadata match yielded, so the image pass
     /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
     item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Item id → OMDb's poster URL, captured during the metadata pass so the
+    /// image pass can use it without a second OMDb request.
+    omdb_poster: std::collections::HashMap<String, String>,
 }
 
 /// What a remote metadata fetch yields for one item: the cast/crew to persist
@@ -203,6 +206,28 @@ impl<'a> FetcherPolicy<'a> {
                 .iter()
                 .any(|f| f.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// The library's preferred metadata language, lowercased. Jellyfin's own
+    /// default is `en`, which is what a library with no saved value gets.
+    fn metadata_language(self) -> String {
+        self.options
+            .and_then(|o| o.preferred_metadata_language.as_deref())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or("en")
+            .to_lowercase()
+    }
+
+    /// The library's metadata country code, lowercased (Jellyfin defaults to
+    /// `US`). OMDb's certificate is only taken for the US.
+    fn country_code(self) -> String {
+        self.options
+            .and_then(|o| o.metadata_country_code.as_deref())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("US")
+            .to_lowercase()
     }
 
     /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order.
@@ -2083,7 +2108,99 @@ impl LibraryScanner {
                 return result;
             }
         }
+        // Nothing upstream matched: OMDb closes the chain, matching its C#
+        // `Order = 2` (behind TMDB and TVDB, ahead of nothing).
+        if omdb_on {
+            return self
+                .fetch_omdb_metadata(entity, &short, cache, policy)
+                .await;
+        }
         RemoteMetadata::default()
+    }
+
+    /// The OMDb fetcher — port of `OmdbItemProvider` and `OmdbEpisodeProvider`.
+    ///
+    /// Movies and series resolve through OMDb's exact-title endpoint (upstream's
+    /// `GetImdbId` fallback when the item carries no IMDb id); an episode is read
+    /// out of its series' season listing, keyed by the series' IMDb id recorded
+    /// earlier in this scan. A row that already has an overview and both ratings
+    /// has nothing left for OMDb to fill, so a re-scan makes no request.
+    ///
+    /// `Rated` and `Genres` are only taken for an English library (OMDb has no
+    /// localization — C# `IsConfiguredForEnglish`), and `Rated` additionally only
+    /// for a US metadata country, both exactly as upstream gates them.
+    async fn fetch_omdb_metadata(
+        &self,
+        entity: &mut BaseItemEntity,
+        short: &str,
+        cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
+    ) -> RemoteMetadata {
+        let Some(omdb) = self.omdb.as_ref().filter(|o| o.is_enabled()) else {
+            return RemoteMetadata::default();
+        };
+        let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
+        if has_overview && entity.community_rating.is_some() && entity.critic_rating.is_some() {
+            return RemoteMetadata::default();
+        }
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        let name = entity.name.as_deref().filter(|n| !n.is_empty());
+        let item = match short {
+            "Movie" | "Series" => {
+                let kind = if short == "Movie" {
+                    ferrofin_providers::OmdbKind::Movie
+                } else {
+                    ferrofin_providers::OmdbKind::Series
+                };
+                match name {
+                    Some(name) => omdb.find_by_title(kind, name, year).await,
+                    None => None,
+                }
+            }
+            "Episode" => {
+                let series_imdb = entity
+                    .series_id
+                    .as_deref()
+                    .and_then(|series| cache.item_provider_ids.get(series))
+                    .and_then(|ids| {
+                        ids.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("Imdb"))
+                            .map(|(_, v)| v.clone())
+                    });
+                match (
+                    series_imdb,
+                    entity
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) {
+                    (Some(series), Some(season), Some(number)) => {
+                        omdb.episode(&series, season, number, None).await
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(item) = item else {
+            return RemoteMetadata::default();
+        };
+        let english = policy.metadata_language() == "en";
+        let us = policy.country_code() == "us";
+        apply_omdb(entity, &item, english, us);
+        if let Some(poster) = item.poster.as_deref().filter(|p| p.starts_with("http")) {
+            cache
+                .omdb_poster
+                .insert(entity.id.clone(), poster.to_owned());
+        }
+        let mut provider_ids = Vec::new();
+        if let Some(id) = item.imdb_id.as_deref().filter(|s| !s.is_empty()) {
+            provider_ids.push(("Imdb".to_owned(), id.to_owned()));
+        }
+        RemoteMetadata {
+            people: omdb_people(&item),
+            provider_ids,
+        }
     }
 
     /// The TMDB half of the remote-metadata pass. `None` means TMDB had no
@@ -2866,6 +2983,12 @@ impl LibraryScanner {
                 {
                     append_fanart(&mut images, fanart.movie_images(&id).await);
                 }
+                // OMDb's poster is the last-resort Primary (C# `Order = 90`,
+                // "after other internet providers, because they're better").
+                // Appending it last means the dedup keeps it only when nothing
+                // above supplied a Primary. The URL was captured during the
+                // metadata pass, so this costs no extra request.
+                append_omdb_poster(&mut images, entity, cache, policy, short);
                 download_images(tmdb, &item_dir, &entity.id, dedup_images_by_type(images)).await
             }
             "Series" => {
@@ -2956,7 +3079,8 @@ impl LibraryScanner {
             return download_images(tmdb, item_dir, &entity.id, images).await;
         }
         // Episode: prefer the TVDB still cached during the metadata pass; else
-        // fall back to the TMDB season-stills cache.
+        // fall back to the TMDB season-stills cache, and to OMDb's poster last
+        // (C# `OmdbImageProvider.Supports` covers Movie, Trailer and Episode).
         let url = policy
             .image_enabled(short, fetcher_names::TVDB)
             .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
@@ -2980,14 +3104,19 @@ impl LibraryScanner {
                     .and_then(|stills| stills.get(&ep_num))
                     .cloned()
             });
-        let Some(url) = url else {
+        let mut images = url
+            .map(|url| {
+                vec![RemoteImage {
+                    image_type: ImageType::Primary,
+                    url,
+                }]
+            })
+            .unwrap_or_default();
+        append_omdb_poster(&mut images, entity, cache, policy, short);
+        if images.is_empty() {
             return Vec::new();
-        };
-        let images = vec![RemoteImage {
-            image_type: ImageType::Primary,
-            url,
-        }];
-        download_images(tmdb, item_dir, &entity.id, images).await
+        }
+        download_images(tmdb, item_dir, &entity.id, dedup_images_by_type(images)).await
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -3986,6 +4115,65 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
 }
 
+/// Applies an OMDb record to the row, filling only what is still empty (a local
+/// NFO, an earlier fetcher, or a prior scan wins), mirroring [`apply_details`].
+///
+/// `english` and `us` are C#'s two localization gates: OMDb serves English data
+/// only, so `Genres` (which upstream prefers over TVDB's) and the certificate
+/// are skipped for a non-English library, and the certificate additionally
+/// requires a US metadata country.
+fn apply_omdb(
+    entity: &mut BaseItemEntity,
+    item: &ferrofin_providers::OmdbItem,
+    english: bool,
+    us: bool,
+) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&item.plot);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = item.community_rating().map(f64::from);
+    }
+    if entity.critic_rating.is_none() {
+        entity.critic_rating = item.rotten_tomatoes().map(f64::from);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = item.production_year().map(i64::from);
+    }
+    if entity.run_time_ticks.is_none() {
+        entity.run_time_ticks = item.run_time_ticks();
+    }
+    if english {
+        if us && entity.official_rating.is_none() {
+            entity.official_rating.clone_from(&item.rated);
+        }
+        merge_multi_value(&mut entity.genres, &item.genres());
+    }
+}
+
+/// Maps OMDb's credited people to persistable rows: the director, the writer,
+/// then each actor. OMDb carries no per-person id or image.
+fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
+    item.people()
+        .into_iter()
+        .map(|(name, kind)| PeopleEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            name,
+            person_type: Some(
+                match kind {
+                    ferrofin_providers::OmdbPersonKind::Director => "Director",
+                    ferrofin_providers::OmdbPersonKind::Writer => "Writer",
+                    ferrofin_providers::OmdbPersonKind::Actor => "Actor",
+                }
+                .to_owned(),
+            ),
+            role: None,
+            primary_image_url: None,
+            provider_id: None,
+        })
+        .collect()
+}
+
 /// The three-letter country code TVDB content ratings are resolved against
 /// (USA fallback is built into [`TvdbClient::series_details`]). Jellyfin uses the
 /// server's metadata country; Ferrofin fixes it to USA for now.
@@ -4184,6 +4372,30 @@ fn append_fanart(images: &mut Vec<RemoteImage>, fanart: Vec<ferrofin_providers::
         image_type: img.image_type,
         url: img.url,
     }));
+}
+
+/// Appends OMDb's poster as a `Primary` candidate, when the library enabled the
+/// OMDb image fetcher and the metadata pass captured a poster URL for the item.
+///
+/// Always appended **last** so [`dedup_images_by_type`] keeps it only when no
+/// better provider supplied a Primary — C# gives `OmdbImageProvider` `Order = 90`
+/// for the same reason.
+fn append_omdb_poster(
+    images: &mut Vec<RemoteImage>,
+    entity: &BaseItemEntity,
+    cache: &ArtworkCache,
+    policy: FetcherPolicy<'_>,
+    short: &str,
+) {
+    if !policy.image_enabled(short, fetcher_names::OMDB) {
+        return;
+    }
+    if let Some(url) = cache.omdb_poster.get(&entity.id) {
+        images.push(RemoteImage {
+            image_type: ImageType::Primary,
+            url: url.clone(),
+        });
+    }
 }
 
 /// Keeps the first image of each type (the primary provider's, then fanart's
@@ -4585,6 +4797,176 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// An OMDb record parsed from a body shaped like the real API's.
+    fn omdb_item(json: &str) -> ferrofin_providers::OmdbItem {
+        serde_json::from_str(json).expect("parse omdb body")
+    }
+
+    // OMDb fills only what is still empty, exactly like the TMDB/NFO appliers.
+    #[test]
+    fn apply_omdb_fills_only_empty_fields() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(
+            r#"{"Plot":"from omdb","Year":"2010","Rated":"PG-13","Runtime":"148 min",
+                "Genre":"Action, Sci-Fi","imdbRating":"8.8",
+                "Ratings":[{"Source":"Rotten Tomatoes","Value":"87%"}]}"#,
+        );
+        let mut e = BaseItemEntity {
+            overview: Some("already set".into()),
+            community_rating: Some(1.0),
+            ..Default::default()
+        };
+        super::apply_omdb(&mut e, &item, true, true);
+        assert_eq!(e.overview.as_deref(), Some("already set")); // not overwritten
+        assert_eq!(e.community_rating, Some(1.0)); // not overwritten
+        assert_eq!(e.critic_rating, Some(87.0)); // filled
+        assert_eq!(e.production_year, Some(2010));
+        assert_eq!(e.official_rating.as_deref(), Some("PG-13"));
+        assert_eq!(e.run_time_ticks, Some(148 * 60 * 10_000_000));
+        assert_eq!(e.genres.as_deref(), Some("Action|Sci-Fi"));
+    }
+
+    // OMDb serves English data only, so C# skips the genres and the certificate
+    // for a library set to any other metadata language.
+    #[test]
+    fn apply_omdb_skips_localized_fields_for_a_non_english_library() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(r#"{"Plot":"plot","Rated":"PG-13","Genre":"Action"}"#);
+        let mut e = BaseItemEntity::default();
+        super::apply_omdb(&mut e, &item, false, true);
+        assert_eq!(e.overview.as_deref(), Some("plot")); // language-neutral
+        assert_eq!(e.official_rating, None);
+        assert_eq!(e.genres, None);
+    }
+
+    // The certificate is a US rating; C# only takes it for a US library.
+    #[test]
+    fn apply_omdb_skips_the_certificate_outside_the_us() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(r#"{"Rated":"PG-13","Genre":"Action"}"#);
+        let mut e = BaseItemEntity::default();
+        super::apply_omdb(&mut e, &item, true, false);
+        assert_eq!(e.official_rating, None);
+        assert_eq!(e.genres.as_deref(), Some("Action")); // genres are not US-gated
+    }
+
+    // Credits land as Director, Writer, then one row per actor.
+    #[test]
+    fn omdb_people_map_to_director_writer_then_actors() {
+        let item = omdb_item(
+            r#"{"Director":"Christopher Nolan","Writer":"Jonathan Nolan",
+                "Actors":"Leonardo DiCaprio, Elliot Page"}"#,
+        );
+        let people = super::omdb_people(&item);
+        let kinds: Vec<_> = people
+            .iter()
+            .map(|p| p.person_type.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(kinds, ["Director", "Writer", "Actor", "Actor"]);
+        assert_eq!(people[3].name, "Elliot Page");
+        assert!(people.iter().all(|p| p.provider_id.is_none()));
+    }
+
+    // A library that saved no TypeOptions gets Jellyfin's own defaults, so the
+    // English/US gates above are open unless the admin changed them.
+    #[test]
+    fn fetcher_policy_defaults_to_english_us() {
+        let policy = super::FetcherPolicy::default();
+        assert_eq!(policy.metadata_language(), "en");
+        assert_eq!(policy.country_code(), "us");
+    }
+
+    #[test]
+    fn fetcher_policy_reads_the_librarys_language_and_country() {
+        let options = ferrofin_model::configuration::LibraryOptions {
+            preferred_metadata_language: Some("DE".to_owned()),
+            metadata_country_code: Some("de".to_owned()),
+            ..Default::default()
+        };
+        let policy = super::FetcherPolicy {
+            options: Some(&options),
+        };
+        assert_eq!(policy.metadata_language(), "de");
+        assert_eq!(policy.country_code(), "de");
+    }
+
+    // OMDb's poster is appended last so the dedup keeps it only as a last
+    // resort, and never at all when the library disabled the OMDb image fetcher.
+    #[test]
+    fn omdb_poster_is_the_last_resort_primary() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let entity = BaseItemEntity {
+            id: "item-1".to_owned(),
+            ..Default::default()
+        };
+        let mut cache = super::ArtworkCache::default();
+        cache
+            .omdb_poster
+            .insert("item-1".to_owned(), "https://omdb.test/p.jpg".to_owned());
+
+        // Nothing else supplied a Primary: OMDb's poster is used.
+        let mut images = Vec::new();
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy::default(),
+            "Movie",
+        );
+        let deduped = super::dedup_images_by_type(images);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].url, "https://omdb.test/p.jpg");
+
+        // A better provider already supplied one: OMDb's is dropped.
+        let mut images = vec![ferrofin_providers::RemoteImage {
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            url: "https://tmdb.test/p.jpg".to_owned(),
+        }];
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy::default(),
+            "Movie",
+        );
+        let deduped = super::dedup_images_by_type(images);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].url, "https://tmdb.test/p.jpg");
+    }
+
+    #[test]
+    fn omdb_poster_is_skipped_when_the_library_disabled_the_fetcher() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let entity = BaseItemEntity {
+            id: "item-1".to_owned(),
+            ..Default::default()
+        };
+        let mut cache = super::ArtworkCache::default();
+        cache
+            .omdb_poster
+            .insert("item-1".to_owned(), "https://omdb.test/p.jpg".to_owned());
+        // A saved TypeOptions listing only TMDB means OMDb's checkbox is off.
+        let options = ferrofin_model::configuration::LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetchers: vec!["TheMovieDb".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy {
+                options: Some(&options),
+            },
+            "Movie",
+        );
+        assert!(images.is_empty());
     }
 
     // The post-scan music pass resolves each album's + artist's MusicBrainz ids
