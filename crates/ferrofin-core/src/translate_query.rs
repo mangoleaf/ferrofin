@@ -1003,9 +1003,42 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
     }
 }
 
+/// Pushes C# `OrderMapper.MapSearchRelevanceOrder` — the match-quality rank a
+/// search puts ahead of every other sort key.
+///
+/// `0` an exact `CleanName`, `1` the term followed by a word break, `2` any
+/// other prefix, `3` a match found anywhere else (including one that only hit
+/// `OriginalTitle`). `substr(…) = ?` is the `StartsWith` translation: it needs
+/// no `LIKE` escaping, so a term carrying `%`/`_` still ranks literally.
+fn push_search_relevance(qb: &mut QueryBuilder<'_, Sqlite>, term: &str) {
+    let clean = get_clean_value(term);
+    let with_space = format!("{clean} ");
+    let clean_len = i64::try_from(clean.chars().count()).unwrap_or(i64::MAX);
+    let space_len = clean_len.saturating_add(1);
+
+    qb.push(r#"CASE WHEN bi."CleanName" = "#)
+        .push_bind(clean.clone())
+        .push(r#" THEN 0 WHEN substr(bi."CleanName", 1, "#)
+        .push_bind(space_len)
+        .push(") = ")
+        .push_bind(with_space)
+        .push(r#" THEN 1 WHEN substr(bi."CleanName", 1, "#)
+        .push_bind(clean_len)
+        .push(") = ")
+        .push_bind(clean)
+        .push(" THEN 2 ELSE 3 END ASC");
+}
+
 /// Appends the `ORDER BY` clause from `filter.order_by`, mapping each
 /// [`ItemSortBy`] to its column (subset of C# `OrderMapper.MapOrderByField`),
 /// with `SortName` as the default / tiebreaker.
+///
+/// A non-blank `filter.search_term` takes the C# `ApplyOrder` search branch:
+/// the relevance rank leads, and `order_by` is evaluated as
+/// `[(SortName, Ascending), ..order_by]` — that leading key being `SortName` is
+/// also what earns C#'s `ThenBy(e.Name)` tiebreaker. Ranking in SQL rather than
+/// after the fact is what makes the `LIMIT` keep the *best* matches instead of
+/// the alphabetically first ones.
 fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
     let ordered: Vec<&(ItemSortBy, SortOrder)> = filter
         .order_by
@@ -1013,7 +1046,28 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
         .filter(|(by, _)| *by != ItemSortBy::Default)
         .collect();
 
+    let search_term = filter
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty());
+
     qb.push(" ORDER BY ");
+
+    if let Some(term) = search_term {
+        push_search_relevance(qb, term);
+        qb.push(r#", bi."SortName" ASC, bi."Name" ASC"#);
+        for (by, order) in ordered {
+            qb.push(", ");
+            push_order_expression(qb, *by, filter);
+            qb.push(match order {
+                SortOrder::Ascending => " ASC",
+                SortOrder::Descending => " DESC",
+            });
+        }
+        return;
+    }
+
     if ordered.is_empty() {
         qb.push(r#"bi."SortName""#);
         return;

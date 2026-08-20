@@ -2295,7 +2295,7 @@ impl LibraryScanner {
             let id = person.id.to_string();
             if let Some(url) = person.image_url {
                 let dir = meta_root.join(&id);
-                let infos = download_images(
+                let mut infos = download_images(
                     tmdb,
                     &dir,
                     &id,
@@ -2305,6 +2305,16 @@ impl LibraryScanner {
                     }],
                 )
                 .await;
+                // Probe the file once, here, exactly as every other image-persisting
+                // path does. Without it a person image is stored 0x0, and because
+                // nothing caches a probed dimension, `DtoService` re-opens and
+                // re-parses that JPEG header on *every* request that asks for
+                // PrimaryImageAspectRatio — a whole page of blocking probes per
+                // request, forever. (Jellyfin gets away with the lazy probe because
+                // it writes the result back onto its in-memory BaseItem; Ferrofin
+                // reloads image rows from the DB each time, so the DB is where the
+                // answer has to live.)
+                self.fill_image_metadata(&mut infos).await;
                 if !infos.is_empty()
                     && let Err(err) = self.persistence.save_item_images(person.id, &infos).await
                 {
@@ -4606,6 +4616,112 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A person's downloaded profile art must be persisted with its real pixel
+    /// dimensions (and blurhash), not the `0x0` placeholder `download_images`
+    /// returns.
+    ///
+    /// Discriminating: the asserted `48x64` comes from the real image processor
+    /// probing the real JPEG on disk, never from a fake — drop the
+    /// `fill_image_metadata` call from `enrich_people` and the row is stored
+    /// `0x0` with no hash and both assertions fail.
+    ///
+    /// It matters on the read path: `DtoService::primary_aspect_ratio` probes
+    /// the file itself whenever the stored dimensions are `0`, and nothing
+    /// memoizes that probe, so a `0x0` row costs an open-and-parse of the JPEG
+    /// header on *every* request for `PrimaryImageAspectRatio` over that person.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_people_stores_probed_dimensions_for_person_art() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_drawing::ImageCrateEncoder;
+        use ferrofin_drawing::ImageProcessor;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, WrittenPerson};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
+
+        let person_id = uuid::Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(person_id),
+                type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+                name: Some("Ada Lovelace".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed person");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let meta_root = tmp.path().join("People");
+        // Pre-place the profile art under the name `download_images` looks for,
+        // so it reuses the on-disk file and the test never needs the network.
+        let art_dir = meta_root.join(person_id.to_string());
+        std::fs::create_dir_all(&art_dir).unwrap();
+        let mut profile = image::RgbImage::new(48, 64);
+        for (x, _y, px) in profile.enumerate_pixels_mut() {
+            *px = if x < 24 {
+                image::Rgb([200, 40, 40])
+            } else {
+                image::Rgb([40, 40, 200])
+            };
+        }
+        profile.save(art_dir.join("primary.jpg")).unwrap();
+
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_image_processor(processor)
+                .with_metadata(
+                    Arc::new(ferrofin_providers::TmdbClient::new()),
+                    meta_root.clone(),
+                );
+
+        let people = FerrofinPeopleRepository::new(db.clone());
+        scanner
+            .enrich_people(
+                &people,
+                vec![WrittenPerson {
+                    id: person_id,
+                    // No biography lookup: that branch is the only one that
+                    // would reach the network.
+                    needs_details: false,
+                    image_url: Some("https://image.tmdb.invalid/ada.jpg".into()),
+                    provider_id: None,
+                }],
+            )
+            .await;
+
+        let images = items.get_image_infos(person_id).await.expect("images");
+        assert_eq!(images.len(), 1, "the person's primary art must be stored");
+        assert_eq!(
+            (images[0].width, images[0].height),
+            (48, 64),
+            "person art must be stored with its probed dimensions, not 0x0"
+        );
+        assert!(
+            images[0]
+                .blur_hash
+                .as_deref()
+                .is_some_and(|h| !h.is_empty()),
+            "person art must carry the blurhash the same probe produces"
+        );
     }
 
     // The post-scan studio pass downloads the artwork-repository thumb for a

@@ -36,6 +36,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt as _;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
@@ -309,9 +310,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
 
     let addr = SocketAddr::new(config.bind_addr, config.port);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind {addr}"))?;
+    let listener = bind_listener(addr).await?;
     tracing::info!(%addr, "ferrofin-server listening");
 
     axum::serve(
@@ -337,6 +336,42 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         "ferrofin-server stopped"
     );
     Ok(())
+}
+
+/// Binds the HTTP listener, with Nagle's algorithm off on every connection it
+/// accepts (see [`disable_nagle`]).
+async fn bind_listener(
+    addr: SocketAddr,
+) -> anyhow::Result<axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>> {
+    Ok(tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind {addr}"))?
+        .tap_io(disable_nagle as fn(&mut tokio::net::TcpStream)))
+}
+
+/// Turns Nagle's algorithm off on every accepted connection (`TCP_NODELAY`).
+///
+/// Kestrel — the server Jellyfin runs on — sets `NoDelay` on accepted sockets by
+/// default; `axum::serve` does not, so without this tap Ferrofin diverges from
+/// Jellyfin by up to a delayed-ACK interval per response.
+///
+/// It matters because of how hyper writes a *streamed* response: the header
+/// block goes out in one write, the body in the next. With Nagle on, the body's
+/// trailing sub-MSS segment is held back until the peer acknowledges the header
+/// segment — and on a reused keep-alive connection the peer has already left TCP
+/// quick-ack mode, so that acknowledgement is the 40 ms delayed-ACK timer. Every
+/// `ServeFile` response (posters and every other image, HLS segments,
+/// subtitles, downloads) therefore paid a ~40 ms stall on a warm connection
+/// while burning under 1 ms of CPU. JSON responses are unaffected — hyper emits
+/// a known-length body in the same vectored write as the headers.
+///
+/// A failure to set the option is logged and ignored: it is an optimisation, not
+/// a correctness requirement, and a connection that cannot take the sockopt must
+/// still be served.
+fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(%error, "failed to set TCP_NODELAY on an accepted connection");
+    }
 }
 
 /// The vendored Jellyfin OpenAPI spec, embedded so the metrics layer can label
@@ -782,5 +817,47 @@ mod tests {
         );
         // Valueless flags and empty segments don't panic.
         assert_eq!(normalize_query_keys("Foo&bar"), "foo&bar");
+    }
+
+    /// The listener `run` binds really clears Nagle on the sockets it serves.
+    ///
+    /// Discriminating: a plain `TcpListener` accepts with `TCP_NODELAY` **off**
+    /// (asserted first, so the test fails loudly if the platform ever changes
+    /// that premise and makes the assertion below vacuous), and `axum::serve`
+    /// adds nothing of its own. Drop the `.tap_io(disable_nagle)` from
+    /// [`bind_listener`] — or stub `disable_nagle` out — and the second
+    /// assertion fails.
+    #[tokio::test]
+    async fn accepted_connections_have_nagle_disabled() {
+        use axum::serve::Listener as _;
+
+        // Premise: a raw accepted socket has Nagle ON.
+        let plain = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let plain_addr = plain.local_addr().expect("addr");
+        let client = tokio::net::TcpStream::connect(plain_addr)
+            .await
+            .expect("connect");
+        let (raw, _) = plain.accept().await.expect("accept");
+        assert!(
+            !raw.nodelay().expect("nodelay"),
+            "a raw accepted socket is expected to have TCP_NODELAY off; if it is on by \
+             default this test can no longer discriminate"
+        );
+        drop((raw, client, plain));
+
+        // The real thing: whatever `run` binds must hand out no-delay sockets.
+        let mut listener = super::bind_listener("127.0.0.1:0".parse().expect("addr"))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (served, _) = listener.accept().await;
+        assert!(
+            served.nodelay().expect("nodelay"),
+            "accepted connections must have TCP_NODELAY set"
+        );
+        drop((served, client));
     }
 }

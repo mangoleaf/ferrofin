@@ -210,6 +210,38 @@ impl ImageCrateEncoder {
         image.resize_exact(width, height, imageops::FilterType::Lanczos3)
     }
 
+    /// The synchronous body of [`get_image_size`](ImageEncoder::get_image_size),
+    /// split out so it can run on the blocking pool via `spawn_blocking`.
+    fn image_size_blocking(path: &str) -> Result<ImageDimensions, ServiceError> {
+        if !Path::new(path).exists() {
+            return Err(ServiceError::not_found(format!(
+                "image file not found: {path}"
+            )));
+        }
+
+        // Zero-byte guard, matching the Skia `FileInfo(...).Length == 0` check.
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() == 0 => return Ok(ImageDimensions::default()),
+            Ok(_) => {}
+            Err(e) => return Err(DrawingError::io(format!("stat {path}"), e).into()),
+        }
+
+        // Probe dimensions from the header only; undecodable → default (0×0).
+        let dims = ImageReader::open(path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.into_dimensions().ok());
+
+        match dims {
+            Some((w, h)) => {
+                let width = i32::try_from(w).unwrap_or(i32::MAX);
+                let height = i32::try_from(h).unwrap_or(i32::MAX);
+                Ok(ImageDimensions::new(width, height))
+            }
+            None => Ok(ImageDimensions::default()),
+        }
+    }
+
     /// The synchronous decode → resize → encode body of
     /// [`encode_image`](ImageEncoder::encode_image), split out so it can run on
     /// the blocking pool via `spawn_blocking` (all CPU-bound, no `.await`).
@@ -304,34 +336,19 @@ impl ImageEncoder for ImageCrateEncoder {
     /// Port of `GetImageSize`. Returns [`ImageDimensions::default`] (`0×0`) for a
     /// zero-byte or undecodable file (Skia's `return default;`), and the header
     /// dimensions otherwise. A missing file is [`ServiceError::NotFound`].
+    ///
+    /// Every step is synchronous filesystem work — two stats plus an open and a
+    /// header read — so it runs on the blocking pool, never inline on the async
+    /// worker. It is not a background-only call: `DtoService` reaches it once per
+    /// item whose stored image dimensions are `0` while building
+    /// `PrimaryImageAspectRatio`, i.e. up to a full page of probes per request,
+    /// and on network-backed media (NFS/SMB) a cold probe parks the calling
+    /// thread for seconds.
     async fn get_image_size(&self, path: &str) -> Result<ImageDimensions, ServiceError> {
-        if !Path::new(path).exists() {
-            return Err(ServiceError::not_found(format!(
-                "image file not found: {path}"
-            )));
-        }
-
-        // Zero-byte guard, matching the Skia `FileInfo(...).Length == 0` check.
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.len() == 0 => return Ok(ImageDimensions::default()),
-            Ok(_) => {}
-            Err(e) => return Err(DrawingError::io(format!("stat {path}"), e).into()),
-        }
-
-        // Probe dimensions from the header only; undecodable → default (0×0).
-        let dims = ImageReader::open(path)
-            .ok()
-            .and_then(|r| r.with_guessed_format().ok())
-            .and_then(|r| r.into_dimensions().ok());
-
-        match dims {
-            Some((w, h)) => {
-                let width = i32::try_from(w).unwrap_or(i32::MAX);
-                let height = i32::try_from(h).unwrap_or(i32::MAX);
-                Ok(ImageDimensions::new(width, height))
-            }
-            None => Ok(ImageDimensions::default()),
-        }
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::image_size_blocking(&path))
+            .await
+            .map_err(|e| ServiceError::backend(format!("image probe task failed: {e}")))?
     }
 
     /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
@@ -1133,5 +1150,64 @@ mod tests {
             ..Default::default()
         };
         assert!(opts.image.is_local_file());
+    }
+
+    /// The dimension probe must be dispatched to the blocking pool, not run
+    /// inline on the async worker.
+    ///
+    /// Discriminating by starvation: the runtime gets exactly one blocking
+    /// thread and that thread is held busy, so a `spawn_blocking` probe is
+    /// *queued* and the timeout elapses — while the previous inline
+    /// `Path::exists` + `std::fs::metadata` + `ImageReader::open` version returns
+    /// in microseconds no matter how starved the pool is, failing the assertion.
+    /// The second half proves the probe still answers correctly once the pool is
+    /// free, so the test cannot pass by simply breaking the probe.
+    ///
+    /// It matters because `DtoService::primary_aspect_ratio` reaches this call
+    /// once per item whose stored image dimensions are `0`; on network-backed
+    /// media a cold probe parks the calling thread for the length of the
+    /// syscall, a whole page of them per request.
+    #[test]
+    fn image_size_probe_goes_through_the_blocking_pool() {
+        // Only bounds the failing direction: an inline probe of a just-written
+        // temp file returns in microseconds, so any value well above the noise
+        // floor works. Nothing waits on this when the code is correct.
+        const STARVED_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "probe.png", 64, 32);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let encoder = ImageCrateEncoder;
+
+            // Occupy the single blocking thread, and wait until it is provably
+            // busy so the probe below cannot win the race for it.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.expect("hog started");
+
+            let starved = tokio::time::timeout(STARVED_WAIT, encoder.get_image_size(&path)).await;
+            assert!(
+                starved.is_err(),
+                "the probe completed with the blocking pool starved, so it ran inline on the \
+                 async worker thread"
+            );
+
+            // Free the pool and confirm the same call still reports real dimensions.
+            release_tx.send(()).expect("release hog");
+            hog.await.expect("hog joined");
+            let dims = encoder.get_image_size(&path).await.expect("probe");
+            assert_eq!((dims.width, dims.height), (64, 32));
+        });
     }
 }

@@ -1,22 +1,26 @@
 //! [`FerrofinSearchManager`] — the concrete [`SearchManager`].
 //!
-//! Port of `Emby.Server.Implementations.Library.SearchManager` (the object-safe
-//! subset). The C# manager fans a term out across registered search providers,
-//! item names, people, genres, studios, and artists, then ranks the union. The
-//! provider *registry* is dropped (registration is a composition-root concern);
-//! what remains is the item-backed search: translate the [`SearchQuery`] into an
-//! [`InternalItemsQuery`] with a name-contains predicate, run it through the
-//! injected [`ItemRepository`], and map the rows to [`SearchHint`]s.
+//! Port of `Emby.Server.Implementations.Library.SearchEngine` (10.11.8). The C#
+//! engine does **no** ranking of its own: it folds the `include*` category
+//! toggles into one `IncludeItemTypes`/`ExcludeItemTypes` pair, hands the term
+//! to the repository as `InternalItemsQuery.SearchTerm`, and lets
+//! `BaseItemRepository.ApplyOrder` rank by match quality *inside the SQL* — so
+//! the query's `LIMIT` keeps the best matches. This port does the same: the
+//! category folding lives here, the relevance `ORDER BY` lives in
+//! [`translate_query`](crate::translate_query), and paging is applied to the
+//! ranked window afterwards exactly as `SearchEngine.GetSearchHints` does.
 //!
-//! Relevance ([`SearchResult::score`]) uses the same tiering the C# code applies:
-//! an exact (case-insensitive) name match outranks a prefix match, which outranks
-//! a substring match. Fuzzy provider scoring is out of scope for this seam.
+//! [`SearchManager::get_search_results`] has no 10.11.8 analogue (it is a
+//! Ferrofin-side convenience returning ids + a coarse score); it keeps the
+//! exact/prefix/substring tiering below.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
+use ferrofin_model::dto::SortOrder;
+use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::search::{SearchHint, SearchQuery};
 use uuid::Uuid;
@@ -57,41 +61,92 @@ impl FerrofinSearchManager {
 
     /// Translates a [`SearchQuery`] into the item query that backs it.
     ///
-    /// The C# search fans out one query per enabled category (media, people,
-    /// genres, studios, artists) and unions the ranked results. This port issues a
-    /// single name-scoped query: when the caller restricts
-    /// [`SearchQuery::include_item_types`] that restriction is honored; otherwise
-    /// the query matches every kind (the category `include_*` flags then act as an
-    /// *additional* exclusion of the by-name kinds the caller turned off).
+    /// Line-for-line port of `SearchEngine.GetSearchHints`'s query building.
+    /// Each category toggle is a two-sided rule: enabled *and* compatible with
+    /// the caller's `IncludeItemTypes` means the kind is only force-*included*
+    /// when media itself is off (a media search already covers it), while a
+    /// disabled — or incompatible — category force-*excludes* the kind.
+    /// `Year`/`Folder`/`CollectionFolder` are always excluded, and a non-empty
+    /// include set wins outright: C# clears the exclusions and the media types.
+    ///
+    /// Note what is *not* set: no `start_index` (upstream pages the ranked
+    /// window after the query, not with `OFFSET`) and `search_term` rather than
+    /// `name_contains`, because only `search_term` earns the relevance
+    /// `ORDER BY`.
     fn to_item_query(query: &SearchQuery) -> InternalItemsQuery {
+        /// C# `SearchEngine.AddIfMissing`.
+        fn add_if_missing(list: &mut Vec<BaseItemKind>, kind: BaseItemKind) {
+            if !list.contains(&kind) {
+                list.push(kind);
+            }
+        }
+
         let mut exclude = query.exclude_item_types.clone();
-        // A disabled category excludes its by-name kinds from the union.
-        if !query.include_genres {
-            exclude.push(BaseItemKind::Genre);
-            exclude.push(BaseItemKind::MusicGenre);
-        }
-        if !query.include_studios {
-            exclude.push(BaseItemKind::Studio);
-        }
-        if !query.include_artists {
-            exclude.push(BaseItemKind::MusicArtist);
-        }
-        if !query.include_people {
-            exclude.push(BaseItemKind::Person);
+        let mut include = query.include_item_types.clone();
+
+        exclude.push(BaseItemKind::Year);
+        exclude.push(BaseItemKind::Folder);
+
+        // One `category` block per C# `if (query.IncludeX && (…)) … else …`.
+        // `probe` is the kind the C# condition tests for membership; `kinds` is
+        // what the branch then adds — they differ only for genres, where the
+        // test is `Contains(Genre)` but both `Genre` and `MusicGenre` move.
+        let mut category = |enabled: bool, probe: BaseItemKind, kinds: &[BaseItemKind]| {
+            if enabled && (include.is_empty() || include.contains(&probe)) {
+                if !query.include_media {
+                    for kind in kinds {
+                        add_if_missing(&mut include, *kind);
+                    }
+                }
+            } else {
+                for kind in kinds {
+                    add_if_missing(&mut exclude, *kind);
+                }
+            }
+        };
+        category(
+            query.include_genres,
+            BaseItemKind::Genre,
+            &[BaseItemKind::Genre, BaseItemKind::MusicGenre],
+        );
+        category(
+            query.include_people,
+            BaseItemKind::Person,
+            &[BaseItemKind::Person],
+        );
+        category(
+            query.include_studios,
+            BaseItemKind::Studio,
+            &[BaseItemKind::Studio],
+        );
+        category(
+            query.include_artists,
+            BaseItemKind::MusicArtist,
+            &[BaseItemKind::MusicArtist],
+        );
+
+        add_if_missing(&mut exclude, BaseItemKind::CollectionFolder);
+        add_if_missing(&mut exclude, BaseItemKind::Folder);
+
+        let mut media_types = query.media_types.clone();
+        if !include.is_empty() {
+            exclude.clear();
+            media_types.clear();
         }
 
         InternalItemsQuery {
-            name_contains: if query.search_term.is_empty() {
+            search_term: if query.search_term.is_empty() {
                 None
             } else {
                 Some(query.search_term.clone())
             },
-            include_item_types: query.include_item_types.clone(),
+            include_item_types: include,
             exclude_item_types: exclude,
-            media_types: query.media_types.clone(),
+            media_types,
+            include_items_by_name: Some(query.parent_id.is_none()),
             parent_id: query.parent_id.unwrap_or_default(),
-            start_index: query.start_index,
             limit: query.limit,
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             is_movie: query.is_movie,
             is_series: query.is_series,
             is_news: query.is_news,
@@ -130,21 +185,26 @@ fn score(name: &str, term: &str) -> Option<f32> {
     }
 }
 
-/// Maps an item row to a [`SearchHint`] carrying the term that matched, or
-/// [`None`] when the row id is not a stored `Guid`.
+/// Maps an item row to a [`SearchHint`].
 ///
-/// A hint is pure navigation: the client turns `Id`/`ItemId` straight into an
-/// `/Items/{id}` request. Emitting the nil GUID would hand it a hit that 404s,
-/// so an unparseable id drops the hint — the same choice `get_search_results`
-/// below already makes.
-fn to_hint(item: &BaseItemEntity, matched_term: &str) -> Option<SearchHint> {
+/// Port of `SearchController.GetSearchHintResult`, whose emission rules the
+/// wire format depends on: `MatchedTerm` comes from `SearchHintInfo`, which
+/// `SearchEngine` never populates, so it stays null and is dropped from the
+/// JSON; `IsFolder` is only assigned `true` (a non-folder leaves it null);
+/// and `ChannelId` is copied from the item's non-nullable `Guid`, so it is
+/// always present — the all-zero id when the item has no channel.
+fn to_hint(item: &BaseItemEntity) -> Option<SearchHint> {
+    // A hint is pure navigation: the client turns `Id`/`ItemId` straight into an
+    // `/Items/{id}` request, so emitting the nil GUID would hand it a hit that
+    // 404s. An unparseable id drops the hint — the same choice
+    // `get_search_results` below already makes.
     let id = Uuid::parse_str(&item.id).ok()?;
     let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
     Some(SearchHint {
         item_id: id,
         id,
         name: item.name.clone(),
-        matched_term: Some(matched_term.to_owned()),
+        matched_term: None,
         index_number: item.index_number.and_then(|n| i32::try_from(n).ok()),
         production_year: item.production_year.and_then(|y| i32::try_from(y).ok()),
         parent_index_number: item.parent_index_number.and_then(|n| i32::try_from(n).ok()),
@@ -154,7 +214,7 @@ fn to_hint(item: &BaseItemEntity, matched_term: &str) -> Option<SearchHint> {
         backdrop_image_tag: None,
         backdrop_image_item_id: None,
         type_: kind,
-        is_folder: Some(item.is_folder),
+        is_folder: item.is_folder.then_some(true),
         run_time_ticks: item.run_time_ticks,
         media_type: parse_media_type(item.media_type.as_deref()),
         start_date: item.start_date,
@@ -167,7 +227,12 @@ fn to_hint(item: &BaseItemEntity, matched_term: &str) -> Option<SearchHint> {
         artists: split_multi(item.artists.as_deref()),
         song_count: None,
         episode_count: None,
-        channel_id: None,
+        channel_id: Some(
+            item.channel_id
+                .as_deref()
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .unwrap_or_else(Uuid::nil),
+        ),
         channel_name: None,
         primary_image_aspect_ratio: None,
     })
@@ -204,20 +269,22 @@ impl SearchManager for FerrofinSearchManager {
         &self,
         query: &SearchQuery,
     ) -> Result<QueryResult<SearchHint>, ServiceError> {
+        // The repository already returned the rows in relevance order, capped at
+        // `limit`. C# `SearchEngine.GetSearchHints` counts *that* window (its
+        // `TotalRecordCount` is the size of the ranked page, not of the whole
+        // match set) and only then applies `StartIndex`/`Limit` to it.
         let items = self.matching_items(query).await?;
-        let mut scored: Vec<(f32, SearchHint)> = items
-            .iter()
-            .filter_map(|item| {
-                let name = item.name.as_deref().unwrap_or_default();
-                let s = score(name, &query.search_term)?;
-                Some((s, to_hint(item, &query.search_term)?))
-            })
-            .collect();
-        // Highest score first; ties keep query order (stable sort).
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut hints: Vec<SearchHint> = items.iter().filter_map(to_hint).collect();
+        let total = i32::try_from(hints.len()).unwrap_or(i32::MAX);
 
-        let total = i32::try_from(scored.len()).unwrap_or(i32::MAX);
-        let hints: Vec<SearchHint> = scored.into_iter().map(|(_, h)| h).collect();
+        if let Some(start) = query.start_index {
+            let start = usize::try_from(start).unwrap_or(0).min(hints.len());
+            hints.drain(..start);
+        }
+        if let Some(limit) = query.limit {
+            hints.truncate(usize::try_from(limit).unwrap_or(0));
+        }
+
         Ok(QueryResult::new(query.start_index, Some(total), hints))
     }
 
@@ -252,8 +319,36 @@ mod tests {
     use super::*;
     use crate::item_repository::FerrofinItemRepository;
     use crate::item_type_lookup::ItemTypeLookup;
-    use crate::test_support::{seed_named_item, seed_named_item_raw_id, set_clean_name, test_db};
+    use crate::test_support::{seed_named_item, set_clean_name, test_db};
     use ferrofin_db::Database;
+
+    /// `to_hint` must DROP a row whose stored `Id` is not a `Guid` rather than
+    /// emit one carrying the nil GUID: a hint is pure navigation, so the client
+    /// turns `Id`/`ItemId` straight into an `/Items/00000000-…` request that
+    /// 404s. Upstream cannot reach this state (`Item.Id` is a `Guid`), and no
+    /// Ferrofin writer emits a non-GUID either — the column is plain `TEXT`, so
+    /// this pins the shape, not a reachable bug.
+    ///
+    /// Deliberately exercises `to_hint` directly. Going through
+    /// `get_search_hints` would NOT discriminate: matching moved into SQL on
+    /// `CleanName`, so a hand-seeded row without one is filtered out before it
+    /// ever reaches this function, and the assertion would pass either way.
+    #[test]
+    fn to_hint_drops_a_row_whose_id_is_not_a_guid() {
+        let mut ok = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: Uuid::from_u128(0x201).to_string().to_uppercase(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            name: Some("Stalker".to_owned()),
+            ..Default::default()
+        };
+        assert!(to_hint(&ok).is_some(), "a parseable id yields a hint");
+
+        ok.id = "not-a-guid".to_owned();
+        assert!(
+            to_hint(&ok).is_none(),
+            "an unparseable id must be dropped, never emitted as the nil GUID"
+        );
+    }
 
     fn manager(db: &Database) -> FerrofinSearchManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -291,42 +386,212 @@ mod tests {
         assert_eq!(result.items[0].name.as_deref(), Some("Matrix"));
     }
 
-    /// A `BaseItems` row whose stored `Id` is not a `Guid` must not surface as a
-    /// hint carrying the nil GUID: the client would turn `Id`/`ItemId` straight
-    /// into an `/Items/00000000-…` request that 404s. It is dropped instead —
-    /// and dropped from `TotalRecordCount` too, matching `get_search_results`.
+    /// Seeds one row and gives it the `CleanName` the scanner would have written.
+    async fn seed(db: &Database, id: u128, kind: BaseItemKind, name: &str) {
+        let id = Uuid::from_u128(id);
+        seed_named_item(db, id, kind, name).await;
+        set_clean_name(db, id, name).await;
+    }
+
+    /// The four relevance tiers, seeded in an order that is deliberately the
+    /// *reverse* of the ranked one. Every helper row leaves `SortName` NULL, so
+    /// SQLite's fallback ordering is insertion order — which is what a
+    /// rank-after-the-fact implementation would surface.
+    async fn seed_relevance_tiers(db: &Database) {
+        seed(db, 0x201, BaseItemKind::Movie, "Zebra Action").await; // contains
+        seed(db, 0x202, BaseItemKind::Movie, "Actionable").await; // prefix
+        seed(db, 0x203, BaseItemKind::Movie, "Action Figures").await; // word prefix
+        seed(db, 0x204, BaseItemKind::Movie, "Action").await; // exact
+    }
+
     #[tokio::test]
-    async fn hint_with_a_non_guid_row_id_is_dropped_not_emitted_as_nil() {
+    async fn hints_rank_exact_then_word_prefix_then_prefix_then_contains() {
         let db = test_db().await;
-        let good = Uuid::from_u128(0x201);
-        seed_named_item(&db, good, BaseItemKind::Movie, "Stalker").await;
-        set_clean_name(&db, good, "Stalker").await;
-        // A row the schema permits (`Id` is plain `TEXT`) but no writer emits.
-        seed_named_item_raw_id(&db, "not-a-guid", BaseItemKind::Movie, "Stalker 2").await;
+        seed_relevance_tiers(&db).await;
+        let mgr = manager(&db);
 
-        let query = SearchQuery {
-            search_term: "stalker".to_owned(),
-            ..Default::default()
-        };
-        let result = manager(&db).get_search_hints(&query).await.expect("hints");
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
 
-        assert!(
+        let names: Vec<_> = result
+            .items
+            .iter()
+            .map(|h| h.name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            ["Action", "Action Figures", "Actionable", "Zebra Action"]
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_keeps_the_best_matches_not_the_first_rows() {
+        // The regression this guards: ranking after a `LIMIT` returns whichever
+        // rows the database happened to hand back, so the two best matches here
+        // ("Action", "Action Figures") never reach the client at all.
+        let db = test_db().await;
+        seed_relevance_tiers(&db).await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+
+        let names: Vec<_> = result
+            .items
+            .iter()
+            .map(|h| h.name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["Action", "Action Figures"]);
+        // C# counts the ranked window, so the total tracks the limited page.
+        assert_eq!(result.total_record_count, 2);
+    }
+
+    #[tokio::test]
+    async fn start_index_pages_the_ranked_window() {
+        let db = test_db().await;
+        seed_relevance_tiers(&db).await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                start_index: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+
+        let names: Vec<_> = result
+            .items
+            .iter()
+            .map(|h| h.name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["Action Figures", "Actionable", "Zebra Action"]);
+        // `TotalRecordCount` is counted before `StartIndex` trims the window.
+        assert_eq!(result.total_record_count, 4);
+    }
+
+    #[tokio::test]
+    async fn a_row_the_sql_matched_is_never_dropped_by_a_second_opinion() {
+        // `CleanName` is diacritic-folded, so the row the WHERE clause matched
+        // exactly is one whose raw `Name` does not contain the term at all.
+        // Re-deciding the match on `Name` after the query drops it — and takes
+        // the reported total down with it.
+        let db = test_db().await;
+        seed(&db, 0x205, BaseItemKind::Movie, "Áction").await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].name.as_deref(), Some("Áction"));
+        assert_eq!(result.total_record_count, 1);
+    }
+
+    #[tokio::test]
+    async fn folder_kinds_are_never_hinted() {
+        let db = test_db().await;
+        seed(&db, 0x301, BaseItemKind::Movie, "Action").await;
+        seed(&db, 0x302, BaseItemKind::CollectionFolder, "Action Library").await;
+        seed(&db, 0x303, BaseItemKind::Folder, "Action Folder").await;
+        seed(&db, 0x304, BaseItemKind::Year, "Action Year").await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+
+        let kinds: Vec<_> = result.items.iter().map(|h| h.type_).collect();
+        assert_eq!(kinds, [BaseItemKind::Movie]);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_category_drops_its_by_name_kind() {
+        let db = test_db().await;
+        seed(&db, 0x401, BaseItemKind::Movie, "Action").await;
+        seed(&db, 0x402, BaseItemKind::Genre, "Action").await;
+        let mgr = manager(&db);
+
+        let with_genres = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+        assert_eq!(with_genres.items.len(), 2);
+
+        let without_genres = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                include_genres: false,
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+        let kinds: Vec<_> = without_genres.items.iter().map(|h| h.type_).collect();
+        assert_eq!(kinds, [BaseItemKind::Movie]);
+    }
+
+    #[tokio::test]
+    async fn hint_emission_matches_the_controllers_null_rules() {
+        use crate::test_support::seed_folder_item;
+
+        let db = test_db().await;
+        seed(&db, 0x501, BaseItemKind::Movie, "Action").await;
+        let artist = Uuid::from_u128(0x502);
+        seed_folder_item(&db, artist, BaseItemKind::MusicArtist, "Action", None).await;
+        set_clean_name(&db, artist, "Action").await;
+        let mgr = manager(&db);
+
+        let result = mgr
+            .get_search_hints(&SearchQuery {
+                search_term: "action".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("hints");
+        assert_eq!(result.items.len(), 2);
+
+        for hint in &result.items {
+            // `SearchEngine` never fills `SearchHintInfo.MatchedTerm`, so the
+            // controller writes null and the field leaves the wire entirely.
+            assert_eq!(hint.matched_term, None, "{:?}", hint.type_);
+            // `ChannelId` is a non-nullable Guid upstream: always serialized.
+            assert_eq!(hint.channel_id, Some(Uuid::nil()), "{:?}", hint.type_);
+        }
+
+        let by_kind = |kind: BaseItemKind| {
             result
                 .items
                 .iter()
-                .all(|h| !h.id.is_nil() && !h.item_id.is_nil()),
-            "no hint may carry the nil GUID"
-        );
-        assert_eq!(
-            result.items.len(),
-            1,
-            "only the row with a parseable id is hinted"
-        );
-        assert_eq!(result.items[0].id, good);
-        assert_eq!(
-            result.total_record_count, 1,
-            "the dropped row must not be counted either"
-        );
+                .find(|h| h.type_ == kind)
+                .unwrap_or_else(|| panic!("no {kind:?} hint"))
+        };
+        // `if (item.IsFolder) result.IsFolder = true;` — and nothing else.
+        assert_eq!(by_kind(BaseItemKind::Movie).is_folder, None);
+        assert_eq!(by_kind(BaseItemKind::MusicArtist).is_folder, Some(true));
     }
 
     #[tokio::test]

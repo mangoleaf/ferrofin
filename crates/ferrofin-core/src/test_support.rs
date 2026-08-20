@@ -145,22 +145,6 @@ async fn insert_base_item_raw_id(
     .expect("insert item");
 }
 
-/// Inserts a named `BaseItems` row whose stored `Id` is the given raw string
-/// rather than a `Guid` — the corrupt-row shape the read paths must not project
-/// into a DTO carrying the nil GUID.
-pub async fn seed_named_item_raw_id(db: &Database, raw_id: &str, kind: BaseItemKind, name: &str) {
-    insert_base_item_raw_id(
-        db,
-        raw_id,
-        kind,
-        &ItemRow {
-            name,
-            ..ItemRow::default()
-        },
-    )
-    .await;
-}
-
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
