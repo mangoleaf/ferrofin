@@ -463,6 +463,86 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
     }
 }
 
+/// `None` for an absent or empty string — TMDB returns `""` as often as `null`.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// One `/search/collection` result.
+#[derive(Debug, Deserialize)]
+struct CollectionSearchResponse {
+    #[serde(default)]
+    results: Vec<CollectionSearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionSearchHit {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionResponse {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    images: CollectionImages,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CollectionImages {
+    #[serde(default)]
+    posters: Vec<CollectionImage>,
+    #[serde(default)]
+    backdrops: Vec<CollectionImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionImage {
+    #[serde(default)]
+    file_path: Option<String>,
+}
+
+/// One TMDB collection search candidate (the box-set Identify row).
+#[derive(Debug, Clone)]
+pub struct TmdbCollectionHit {
+    /// The collection's TMDB id.
+    pub tmdb_id: i64,
+    /// The collection's name.
+    pub name: String,
+    /// The collection's overview, when TMDB has one.
+    pub overview: Option<String>,
+    /// The collection poster's absolute URL.
+    pub poster_url: Option<String>,
+}
+
+/// One TMDB collection's details plus its artwork.
+#[derive(Debug, Clone)]
+pub struct TmdbCollection {
+    /// The collection's TMDB id.
+    pub tmdb_id: i64,
+    /// The collection's name.
+    pub name: String,
+    /// The collection's overview.
+    pub overview: Option<String>,
+    /// Poster/backdrop candidates, TMDB's own pick first.
+    pub images: Vec<RemoteImage>,
+}
+
 /// A TMDB artwork client. Cheap to clone (wraps a [`reqwest::Client`]).
 #[derive(Debug, Clone)]
 pub struct TmdbClient {
@@ -655,6 +735,88 @@ impl TmdbClient {
                 .filter_map(|ep| ep.still_url.map(|url| (ep.episode_number, url)))
                 .collect(),
         }
+    }
+
+    /// Searches TMDB's collections by name (`/search/collection`) — port of
+    /// `TmdbClientManager.SearchCollectionAsync`, the box-set half of the
+    /// Identify flow. Empty on no match or any error.
+    pub async fn search_collection(&self, name: &str) -> Vec<TmdbCollectionHit> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/search/collection", self.base_url))
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<CollectionSearchResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .results
+            .into_iter()
+            .map(|hit| TmdbCollectionHit {
+                tmdb_id: hit.id,
+                name: hit.name.unwrap_or_default(),
+                overview: non_empty(hit.overview),
+                poster_url: non_empty(hit.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+            })
+            .collect()
+    }
+
+    /// One collection's details plus its artwork (`/collection/{id}` with
+    /// `append_to_response=images`) — port of
+    /// `TmdbClientManager.GetCollectionAsync`, which backs both
+    /// `TmdbBoxSetProvider` and `TmdbBoxSetImageProvider`.
+    pub async fn collection(&self, tmdb_id: i64) -> Option<TmdbCollection> {
+        let resp = self
+            .http
+            .get(format!("{}/collection/{tmdb_id}", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("append_to_response", "images"),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let parsed: CollectionResponse = resp.json().await.ok()?;
+        // The single `poster_path`/`backdrop_path` come first (they are TMDB's
+        // own pick), then the rest of the `images` lists — same order the C#
+        // `ConvertPostersToRemoteImageInfo`/`ConvertBackdrops…` pair yields.
+        let mut images = Vec::new();
+        let mut push = |path: Option<String>, image_type: ImageType| {
+            if let Some(path) = non_empty(path) {
+                images.push(RemoteImage {
+                    image_type,
+                    url: format!("{IMAGE_BASE}{path}"),
+                });
+            }
+        };
+        push(parsed.poster_path, ImageType::Primary);
+        push(parsed.backdrop_path, ImageType::Backdrop);
+        for poster in parsed.images.posters {
+            push(poster.file_path, ImageType::Primary);
+        }
+        for backdrop in parsed.images.backdrops {
+            push(backdrop.file_path, ImageType::Backdrop);
+        }
+        Some(TmdbCollection {
+            tmdb_id: parsed.id,
+            name: parsed.name.unwrap_or_default(),
+            overview: non_empty(parsed.overview),
+            images,
+        })
     }
 
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"

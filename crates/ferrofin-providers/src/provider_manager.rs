@@ -150,6 +150,58 @@ impl RemoteSearchProvider for TvdbSearchProvider {
     }
 }
 
+/// A [`RemoteSearchProvider`] over TMDB's *collections* — the "Identify" flow
+/// for a box set. Port of `TmdbBoxSetProvider.GetSearchResults`.
+pub struct TmdbBoxSetSearchProvider {
+    tmdb: Arc<TmdbClient>,
+}
+
+impl TmdbBoxSetSearchProvider {
+    /// A TMDB collection search provider.
+    #[must_use]
+    pub fn new(tmdb: Arc<TmdbClient>) -> Self {
+        Self { tmdb }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "TheMovieDb"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == BaseItemKind::BoxSet
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .tmdb
+            .search_collection(name)
+            .await
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                name: Some(hit.name),
+                overview: hit.overview,
+                image_url: hit.poster_url,
+                provider_ids: Some(std::collections::HashMap::from([(
+                    "TmdbCollection".to_owned(),
+                    hit.tmdb_id.to_string(),
+                )])),
+                search_provider_name: Some("TheMovieDb".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
+
 /// A [`RemoteSearchProvider`] backed by OMDb — the "Identify" flow's IMDb-keyed
 /// candidates. Port of `OmdbItemProvider.GetSearchResults`; inert (no results)
 /// until an OMDb API key is configured.
@@ -432,6 +484,50 @@ impl LocalProviderManager {
         tmdb.season_details(hit.tmdb_id, season_number).await
     }
 
+    /// The box-set refresh arm — port of `TmdbBoxSetProvider` +
+    /// `TmdbBoxSetImageProvider`: search TMDB's collections by the box set's
+    /// name, take the top hit, and apply its name/overview and artwork.
+    async fn refresh_box_set(
+        &self,
+        tmdb: &Arc<TmdbClient>,
+        entity: &mut BaseItemEntity,
+        item_id: Uuid,
+        name: &str,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+            return Ok(());
+        };
+        let Some(collection) = tmdb.collection(hit.tmdb_id).await else {
+            return Ok(());
+        };
+        if wants_fetch(options.metadata_refresh_mode) {
+            apply_name_overview(
+                entity,
+                Some(collection.name.as_str()),
+                collection.overview.as_deref(),
+                options.replace_all_metadata,
+            );
+            if let Some(store) = &self.image_store {
+                store.save_items(std::slice::from_ref(entity)).await?;
+            }
+        }
+        if wants_fetch(options.image_refresh_mode) && self.image_store.is_some() {
+            for image_type in [ImageType::Primary, ImageType::Backdrop] {
+                if let Some(image) = collection
+                    .images
+                    .iter()
+                    .find(|i| i.image_type == image_type)
+                {
+                    let _ = self
+                        .save_image_from_url(item_id, &image.url, image_type, None)
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a season's/episode's fetched name/overview (+ Primary artwork URL)
     /// onto the row — the shared second half of the two TV refresh arms. The
     /// metadata pass persists via the item store; the image download is
@@ -534,6 +630,12 @@ enum RefreshTarget {
         /// The season number within the series.
         season_number: i32,
     },
+    /// A box set: search TMDB's *collections* by name, then fetch
+    /// `/collection/{id}` (C# `TmdbBoxSetProvider`).
+    BoxSet {
+        /// The collection title to search for.
+        name: String,
+    },
     /// An episode: like a season, then select the episode within it.
     Episode {
         /// The parent series title driving the TMDB search.
@@ -583,6 +685,13 @@ fn refresh_target_of(
             name,
             year,
         });
+    }
+    if kind == "BoxSet" {
+        return entity
+            .name
+            .clone()
+            .filter(|n| !n.is_empty())
+            .map(|name| RefreshTarget::BoxSet { name });
     }
     if !matches!(kind, "Season" | "Episode") {
         return None;
@@ -787,6 +896,10 @@ impl ProviderManager for LocalProviderManager {
                     }
                 }
             }
+            RefreshTarget::BoxSet { name } => {
+                self.refresh_box_set(tmdb, &mut entity, item_id, &name, options)
+                    .await?;
+            }
             RefreshTarget::Season {
                 series_name,
                 series_year,
@@ -981,6 +1094,30 @@ impl ProviderManager for LocalProviderManager {
         let Some(tmdb) = &self.tmdb else {
             return Ok(Vec::new());
         };
+        // A box set's artwork is its TMDB *collection*'s (C#
+        // `TmdbBoxSetImageProvider`), a different endpoint from a title's.
+        if short_kind(&entity) == "BoxSet" {
+            let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                return Ok(Vec::new());
+            };
+            let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+                return Ok(Vec::new());
+            };
+            let Some(collection) = tmdb.collection(hit.tmdb_id).await else {
+                return Ok(Vec::new());
+            };
+            return Ok(collection
+                .images
+                .into_iter()
+                .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
+                .map(|img| RemoteImageInfo {
+                    provider_name: Some("TheMovieDb".to_owned()),
+                    url: Some(img.url),
+                    type_: img.image_type,
+                    ..RemoteImageInfo::default()
+                })
+                .collect());
+        }
         let Some((kind, name, year)) = title_lookup(&entity) else {
             return Ok(Vec::new());
         };
@@ -2084,8 +2221,109 @@ mod tests {
             Some(super::RefreshTarget::Title { .. }) => "Title",
             Some(super::RefreshTarget::Season { .. }) => "Season",
             Some(super::RefreshTarget::Episode { .. }) => "Episode",
+            Some(super::RefreshTarget::BoxSet { .. }) => "BoxSet",
             None => "None",
         }
+    }
+
+    #[test]
+    fn a_box_set_resolves_to_a_collection_target() {
+        use super::refresh_target_of;
+        match refresh_target_of(&row("Movies.BoxSet", "The Matrix Collection"), None) {
+            Some(super::RefreshTarget::BoxSet { name }) => {
+                assert_eq!(name, "The Matrix Collection");
+            }
+            other => panic!(
+                "expected a BoxSet target, got {}",
+                target_name(other.as_ref())
+            ),
+        }
+        // An unnamed box set has nothing to search for.
+        let mut unnamed = row("Movies.BoxSet", "");
+        unnamed.name = None;
+        assert!(refresh_target_of(&unnamed, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn box_set_remote_images_come_from_the_tmdb_collection() {
+        // "Choose Image" on a box set searches TMDB's collections, then lists
+        // that collection's artwork — TMDB's own pick first.
+        let search = r#"{"results":[{"id":2344,"name":"The Matrix Collection",
+                         "poster_path":"/c.jpg","overview":"Neo."}]}"#;
+        let collection = r#"{"id":2344,"name":"The Matrix Collection","overview":"Neo.",
+            "poster_path":"/pick.jpg","backdrop_path":"/back.jpg",
+            "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/search/collection", search.to_owned()),
+            ("/collection/", collection.to_owned()),
+        ])
+        .await;
+        let item_id = Uuid::new_v4();
+        let mut boxset = row("Movies.BoxSet", "The Matrix Collection");
+        boxset.id = item_id.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, boxset)]),
+            seen: tx,
+        });
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let mgr = LocalProviderManager::default().with_remote_images(tmdb, items);
+
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .expect("images");
+        let urls: Vec<_> = images.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://image.tmdb.org/t/p/original/pick.jpg",
+                "https://image.tmdb.org/t/p/original/back.jpg",
+                "https://image.tmdb.org/t/p/original/alt.jpg",
+            ]
+        );
+        assert_eq!(images[0].type_, ImageType::Primary);
+        assert_eq!(images[1].type_, ImageType::Backdrop);
+
+        // The query's type filter still applies.
+        let posters = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    image_type: Some(ImageType::Backdrop),
+                    ..RemoteImageQuery::default()
+                },
+            )
+            .await
+            .expect("images");
+        assert_eq!(posters.len(), 1);
+        assert_eq!(posters[0].type_, ImageType::Backdrop);
+    }
+
+    #[tokio::test]
+    async fn the_box_set_identify_provider_returns_collection_candidates() {
+        let search = r#"{"results":[{"id":2344,"name":"The Matrix Collection",
+                         "poster_path":"/c.jpg","overview":"Neo."}]}"#;
+        let server =
+            crate::mock_http::MockServer::start(vec![("/search/collection", search.to_owned())])
+                .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = super::TmdbBoxSetSearchProvider::new(tmdb);
+        assert!(provider.supports(BaseItemKind::BoxSet));
+        assert!(!provider.supports(BaseItemKind::Movie));
+        let results = provider
+            .get_search_results(&ItemLookupInfo {
+                name: Some("Matrix".to_owned()),
+                ..ItemLookupInfo::default()
+            })
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix Collection"));
+        assert_eq!(
+            results[0].provider_ids.as_ref().unwrap()["TmdbCollection"],
+            "2344"
+        );
     }
 
     #[test]

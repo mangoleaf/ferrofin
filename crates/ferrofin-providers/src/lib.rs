@@ -45,8 +45,8 @@ pub use musicbrainz::{AlbumIds, MusicBrainzClient};
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
 pub use studios::StudiosClient;
 pub use tmdb::{
-    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
-    TmdbPerson, TmdbSearchHit, TmdbTrailer,
+    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbCollection, TmdbCollectionHit,
+    TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
@@ -64,7 +64,7 @@ pub use local_images::{
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
 pub use provider_manager::{
-    LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbSearchProvider,
-    TvdbSearchProvider,
+    LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbBoxSetSearchProvider,
+    TmdbSearchProvider, TvdbSearchProvider,
 };
 pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};

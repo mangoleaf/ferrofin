@@ -332,6 +332,10 @@ pub async fn build_app_state(
             Arc::clone(&omdb_client),
             ferrofin_providers::OmdbKind::Series,
         )),
+        // Box sets identify against TMDB's collections, a separate endpoint.
+        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
