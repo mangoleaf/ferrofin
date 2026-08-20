@@ -116,6 +116,15 @@ pub struct PhotoItem {
     /// Port of `BaseItem.IsFileProtocol`; gates [`has_changed`](PhotoProvider::has_changed).
     pub is_file_protocol: bool,
 
+    /// Set by [`PhotoProvider::fetch`] when EXIF was read from the file.
+    ///
+    /// Not a Jellyfin field: C# expresses the same thing by only entering the
+    /// assignment block inside its `try`. A caller must not write the
+    /// unconditionally-assigned fields (`overview`, `community_rating`) back
+    /// onto a row when this is `false`, or a file with no readable EXIF would
+    /// clear values it never spoke about.
+    pub exif_was_read: bool,
+
     /// The item's recorded last-modified time. Port of `BaseItem.DateModified`,
     /// compared against the on-disk time in [`has_changed`](PhotoProvider::has_changed).
     pub date_modified: DateTime<Utc>,
@@ -573,8 +582,13 @@ fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
 ///
 /// Every assignment is unconditional (as upstream's is) except the title, which
 /// C# skips for a locked `Name`, and the dimensions, which are only taken when
-/// the tags carry positive ones.
+/// the tags carry positive ones. Unconditional means a photo whose rating or
+/// comment tag was REMOVED has the field cleared on the next refresh — the file
+/// is the only source of truth for a photo, and upstream assigns both straight
+/// from the tag. It runs only when EXIF was actually read, so a file with none
+/// (or one that failed to open) never reaches here and keeps whatever it had.
 fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
+    item.exif_was_read = true;
     item.exif = tags.exif.clone();
     if let Some(width) = tags.width.filter(|w| *w > 0) {
         item.width = width;
@@ -582,12 +596,8 @@ fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     if let Some(height) = tags.height.filter(|h| *h > 0) {
         item.height = height;
     }
-    if tags.rating.is_some() {
-        item.community_rating = tags.rating;
-    }
-    if tags.comment.is_some() {
-        item.overview.clone_from(&tags.comment);
-    }
+    item.community_rating = tags.rating;
+    item.overview.clone_from(&tags.comment);
     if let Some(title) = tags.title.as_deref().filter(|t| !t.trim().is_empty())
         && !item.name_locked
     {

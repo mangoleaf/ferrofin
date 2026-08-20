@@ -26,11 +26,13 @@ use crate::xbmc::xml_reader::XmlCursor;
 /// (`ComicImageProvider._comicBookExtensions`).
 pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
 
-/// The archive extensions this port can actually open. `.cbr` is RAR and
-/// `.cb7` is 7z; neither has a maintained pure-Rust reader worth a dependency
-/// for a cover image, so those two are recognized as comics but yield no
-/// embedded metadata or cover.
-const READABLE_ARCHIVE_EXTENSIONS: [&str; 2] = ["cbz", "cbt"];
+/// The archive extensions this port can actually open — ZIP, and only ZIP.
+///
+/// `.cbr` is RAR, `.cb7` is 7z and `.cbt` is tar; none has a maintained
+/// pure-Rust reader worth a dependency for a cover image, so all three are
+/// recognized as comics (so the file is still a Book) but yield no embedded
+/// metadata or cover.
+const READABLE_ARCHIVE_EXTENSIONS: [&str; 1] = ["cbz"];
 
 /// The largest single archive entry this module will decompress into memory.
 ///

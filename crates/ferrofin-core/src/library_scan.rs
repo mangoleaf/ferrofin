@@ -2247,10 +2247,12 @@ impl LibraryScanner {
                 entity.sort_name = Some(derived_sort_name(entity, &name));
                 entity.name = Some(name);
             }
-            if photo.overview.is_some() {
+            // C# assigns both straight from the tag, so a photo whose comment
+            // or rating was removed has the field cleared. That only holds when
+            // EXIF was actually read — a file with none says nothing about
+            // either field and must not wipe them.
+            if photo.exif_was_read {
                 entity.overview = photo.overview;
-            }
-            if photo.community_rating.is_some() {
                 entity.community_rating = photo.community_rating;
             }
             if let Some(taken) = photo.date_taken {
@@ -5052,7 +5054,13 @@ fn apply_omdb(
         if us && entity.official_rating.is_none() {
             entity.official_rating.clone_from(&item.rated);
         }
-        merge_multi_value(&mut entity.genres, &item.genres());
+        // C# `ParseAdditionalMetadata` clears `item.Genres` and re-adds OMDb's
+        // ("IMDb data is better than TVDB"), so this REPLACES rather than
+        // merges — a union would leave the very list upstream discards.
+        let genres = item.genres();
+        if !genres.is_empty() {
+            entity.genres = Some(genres.join("|"));
+        }
     }
 }
 

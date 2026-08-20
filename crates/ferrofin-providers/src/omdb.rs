@@ -19,6 +19,10 @@
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -38,6 +42,15 @@ pub struct OmdbClient {
     http: reqwest::Client,
     api_key: SecretString,
     base_url: String,
+    /// Season listings already fetched, keyed by `(series id, season)`.
+    ///
+    /// C# `EnsureSeasonInfo` caches the same JSON on disk under
+    /// `{cache}/omdb/{id}_season_{n}.json` for a day. Ferrofin keeps it in
+    /// memory instead — the cache directory is not wired into this client, and
+    /// the request that matters is the one repeated once per EPISODE of the
+    /// same season within a single scan. Same TTL, same effect on a scan; a
+    /// restart re-fetches where Jellyfin would not.
+    seasons: SeasonCache,
 }
 
 impl OmdbClient {
@@ -49,6 +62,7 @@ impl OmdbClient {
             http: reqwest::Client::new(),
             api_key: SecretString::from(api_key.trim()),
             base_url: API_BASE.to_owned(),
+            seasons: Arc::default(),
         }
     }
 
@@ -190,7 +204,22 @@ impl OmdbClient {
             ("season", season_str.as_str()),
             ("detail", "full"),
         ];
-        let listing: OmdbSeason = self.get(&series_id, &params).await?;
+        let key = (series_id.clone(), season);
+        let cached = self.seasons.lock().ok().and_then(|seasons| {
+            seasons
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < SEASON_CACHE_TTL)
+                .map(|(_, listing)| listing.clone())
+        });
+        let listing: OmdbSeason = if let Some(listing) = cached {
+            listing
+        } else {
+            let fetched: OmdbSeason = self.get(&series_id, &params).await?;
+            if let Ok(mut seasons) = self.seasons.lock() {
+                seasons.insert(key, (Instant::now(), fetched.clone()));
+            }
+            fetched
+        };
         let by_id = episode_imdb_id
             .and_then(normalize_imdb_id)
             .and_then(|wanted| {
@@ -340,8 +369,19 @@ pub struct OmdbSearchKey<'a> {
     pub episode: Option<i32>,
 }
 
+/// The season listings a client has already fetched, keyed by
+/// `(series id, season)` and stamped with when they were read.
+///
+/// Shared across clones of the client, so the composition root handing the same
+/// client to several subsystems does not multiply the requests.
+type SeasonCache = Arc<std::sync::Mutex<HashMap<(String, i32), (Instant, OmdbSeason)>>>;
+
+/// How long a cached season listing stays fresh — C# `EnsureSeasonInfo`'s
+/// `TotalDays <= 1`.
+const SEASON_CACHE_TTL: Duration = Duration::from_hours(24);
+
 /// One season listing (`&season=N`) — port of `OmdbProvider.SeasonRootObject`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct OmdbSeason {
     #[serde(rename = "Episodes", default)]
     episodes: Vec<OmdbItem>,
@@ -726,6 +766,27 @@ mod tests {
         let client = OmdbClient::new("key").with_base_url(&server.base_url);
         let ep = client.episode("tt0903747", 1, 2, None).await.expect("ep");
         assert_eq!(ep.title.as_deref(), Some("Cat's in the Bag..."));
+    }
+
+    #[tokio::test]
+    async fn a_season_listing_is_fetched_once_for_the_whole_season() {
+        // C# `EnsureSeasonInfo` caches the listing for a day. Without a cache
+        // a scan issues one full season request PER EPISODE — the skip gate
+        // upstream of it cannot help, because `episode()` sends no
+        // `tomatoes=true` and so never fills the critic rating the gate wants.
+        let client = {
+            let server = MockServer::start(vec![("/", season_body())]).await;
+            let client = OmdbClient::new("key").with_base_url(&server.base_url);
+            let first = client.episode("tt0903747", 1, 1, None).await.expect("ep");
+            assert_eq!(first.title.as_deref(), Some("Pilot"));
+            client
+            // …and the server goes away here.
+        };
+        // A second episode of the same season must resolve without a request.
+        let second = client.episode("tt0903747", 1, 2, None).await.expect("ep");
+        assert_eq!(second.title.as_deref(), Some("Cat's in the Bag..."));
+        // A DIFFERENT season is a different key, so it has nothing to serve.
+        assert!(client.episode("tt0903747", 2, 1, None).await.is_none());
     }
 
     #[tokio::test]
