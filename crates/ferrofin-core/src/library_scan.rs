@@ -2239,6 +2239,10 @@ impl LibraryScanner {
                 entity.community_rating = photo.community_rating;
             }
             if let Some(taken) = photo.date_taken {
+                // C# sets all three from DateTaken. `DateCreated` is what the
+                // client sorts "Date Added" by, so a scanned photo album orders
+                // by when the shots were taken, not when the files were copied.
+                entity.date_created = Some(taken);
                 entity.premiere_date = Some(taken);
                 entity.production_year = photo.production_year.map(i64::from);
             }
@@ -2292,15 +2296,15 @@ impl LibraryScanner {
                 }
             }
             "Episode" => {
+                // C# `FetchEpisodeData` matches the season listing on the
+                // EPISODE's own IMDb id first and only falls back to the
+                // episode number — a season whose numbering disagrees with
+                // OMDb's resolves correctly only when that id is supplied.
+                let own_imdb = imdb_id_of(cache.item_provider_ids.get(&entity.id));
                 let series_imdb = entity
                     .series_id
                     .as_deref()
-                    .and_then(|series| cache.item_provider_ids.get(series))
-                    .and_then(|ids| {
-                        ids.iter()
-                            .find(|(k, _)| k.eq_ignore_ascii_case("Imdb"))
-                            .map(|(_, v)| v.clone())
-                    });
+                    .and_then(|series| imdb_id_of(cache.item_provider_ids.get(series)));
                 match (
                     series_imdb,
                     entity
@@ -2309,7 +2313,8 @@ impl LibraryScanner {
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
                 ) {
                     (Some(series), Some(season), Some(number)) => {
-                        omdb.episode(&series, season, number, None).await
+                        omdb.episode(&series, season, number, own_imdb.as_deref())
+                            .await
                     }
                     _ => None,
                 }
@@ -3908,7 +3913,11 @@ impl LibraryScanner {
         let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
             return (Vec::new(), Vec::new());
         };
-        let people = match ferrofin_providers::read_book_metadata(&path) {
+        let read = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || ferrofin_providers::read_book_metadata(&path)).await
+        };
+        let people = match read.ok().flatten() {
             Some(book) => {
                 apply_book(entity, &book);
                 book_people(&book)
@@ -3936,7 +3945,12 @@ impl LibraryScanner {
                 blur_hash: None,
             }];
         }
-        let Some((name, bytes)) = ferrofin_providers::read_book_cover(path) else {
+        // Inflating a comic archive can run to hundreds of megabytes; that is
+        // blocking work and must not sit on an async worker thread.
+        let owned = path.to_owned();
+        let cover =
+            tokio::task::spawn_blocking(move || ferrofin_providers::read_book_cover(&owned)).await;
+        let Some((name, bytes)) = cover.ok().flatten() else {
             return Vec::new();
         };
         let extension = Path::new(&name)
@@ -3996,7 +4010,9 @@ impl LibraryScanner {
         // is the collection folder itself and never an album, so its loose
         // photos hang off it directly.
         let (photo_parent, ancestors) = if !photos.is_empty() && dir != root {
-            let name = file_stem(dir);
+            // A directory name is not a filename: `file_stem` would truncate
+            // "Trip 2024. Iceland" at the dot.
+            let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
             match self.base_item(BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
                 Some((album_id, album)) => {
                     let mut ancestors = vec![cf];
@@ -4942,6 +4958,13 @@ async fn apply_release_details(
 /// upstream default rather than inventing a different one.
 const OMDB_CAST_AND_CREW: bool = false;
 
+/// The IMDb id among a scanned row's provider-id pairs, if it recorded one.
+fn imdb_id_of(ids: Option<&Vec<(String, String)>>) -> Option<String> {
+    ids?.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Imdb"))
+        .map(|(_, v)| v.clone())
+}
+
 /// Applies an OMDb record to the row, filling only what is still empty (a local
 /// NFO, an earlier fetcher, or a prior scan wins), mirroring [`apply_details`].
 ///
@@ -4967,9 +4990,9 @@ fn apply_omdb(
     if entity.production_year.is_none() {
         entity.production_year = item.production_year().map(i64::from);
     }
-    if entity.run_time_ticks.is_none() {
-        entity.run_time_ticks = item.run_time_ticks();
-    }
+    // Deliberately NOT `Runtime`: C# `OmdbProvider` deserializes it but never
+    // assigns it. The media file's probed duration is authoritative, and OMDb's
+    // rounded minutes would otherwise become a Series' runtime out of nowhere.
     if english {
         if us && entity.official_rating.is_none() {
             entity.official_rating.clone_from(&item.rated);
@@ -5923,7 +5946,8 @@ mod tests {
         assert_eq!(e.critic_rating, Some(87.0)); // filled
         assert_eq!(e.production_year, Some(2010));
         assert_eq!(e.official_rating.as_deref(), Some("PG-13"));
-        assert_eq!(e.run_time_ticks, Some(148 * 60 * 10_000_000));
+        // OMDb's `Runtime` is never mapped, matching upstream.
+        assert_eq!(e.run_time_ticks, None);
         assert_eq!(e.genres.as_deref(), Some("Action|Sci-Fi"));
     }
 

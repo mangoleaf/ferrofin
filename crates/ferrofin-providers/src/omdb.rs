@@ -19,6 +19,7 @@
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -261,6 +262,9 @@ pub struct OmdbSearchHit {
     /// `Poster` — an absolute image URL.
     #[serde(rename = "Poster", default, deserialize_with = "na_option")]
     pub poster: Option<String>,
+    /// `Released` — a full release date, e.g. `"16 Jul 2010"`.
+    #[serde(rename = "Released", default, deserialize_with = "na_option")]
+    pub released: Option<String>,
 }
 
 impl OmdbSearchHit {
@@ -269,6 +273,22 @@ impl OmdbSearchHit {
     pub fn production_year(&self) -> Option<i32> {
         self.year.as_deref()?.trim().get(..4)?.parse().ok()
     }
+
+    /// `Released` parsed as a date — the search hit's `PremiereDate`.
+    #[must_use]
+    pub fn premiere_date(&self) -> Option<DateTime<Utc>> {
+        parse_release_date(self.released.as_deref()?)
+    }
+}
+
+/// Parses OMDb's `Released` field — `"16 Jul 2010"`, the one form the API
+/// emits, with ISO accepted too since `DateTime.TryParse` takes it.
+fn parse_release_date(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    let date = NaiveDate::parse_from_str(value, "%d %b %Y")
+        .or_else(|_| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+        .ok()?;
+    Some(Utc.from_utc_datetime(&date.into()))
 }
 
 /// One season listing (`&season=N`) — port of `OmdbProvider.SeasonRootObject`.
@@ -294,9 +314,6 @@ pub struct OmdbItem {
     /// `Rated` — the certificate (`PG-13`, `TV-MA`, …).
     #[serde(rename = "Rated", default, deserialize_with = "na_option")]
     pub rated: Option<String>,
-    /// `Runtime` — e.g. `"148 min"`.
-    #[serde(rename = "Runtime", default, deserialize_with = "na_option")]
-    pub runtime: Option<String>,
     /// `Genre` — comma-separated.
     #[serde(rename = "Genre", default, deserialize_with = "na_option")]
     pub genre: Option<String>,
@@ -373,20 +390,6 @@ impl OmdbItem {
     pub fn production_year(&self) -> Option<i32> {
         let year = self.year.as_deref()?.trim();
         year.get(..4)?.parse::<i32>().ok()
-    }
-
-    /// `Runtime` as ticks (100 ns units), from OMDb's `"N min"` form.
-    #[must_use]
-    pub fn run_time_ticks(&self) -> Option<i64> {
-        let minutes: i64 = self
-            .runtime
-            .as_deref()?
-            .trim()
-            .trim_end_matches("min")
-            .trim()
-            .parse()
-            .ok()?;
-        (minutes > 0).then(|| minutes * 60 * 10_000_000)
     }
 
     /// The genre list, split and trimmed (C# `AddGenre` per entry).
@@ -566,7 +569,6 @@ mod tests {
         assert_eq!(item.title.as_deref(), Some("Inception"));
         assert_eq!(item.production_year(), Some(2010));
         assert_eq!(item.rated.as_deref(), Some("PG-13"));
-        assert_eq!(item.run_time_ticks(), Some(148 * 60 * 10_000_000));
         assert_eq!(item.genres(), ["Action", "Adventure", "Sci-Fi"]);
         assert_eq!(item.community_rating(), Some(8.8));
         assert_eq!(item.original_language().as_deref(), Some("English"));
@@ -590,7 +592,6 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(item.plot, None);
-        assert_eq!(item.run_time_ticks(), None);
         assert!(item.genres().is_empty());
         assert_eq!(item.community_rating(), None);
         assert_eq!(item.website, None);
@@ -716,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn search_lists_identify_candidates() {
         let body = r#"{"Search":[
-            {"Title":"Inception","Year":"2010","imdbID":"tt1375666","Poster":"https://example.test/p.jpg"},
+            {"Title":"Inception","Year":"2010","imdbID":"tt1375666","Poster":"https://example.test/p.jpg","Released":"16 Jul 2010"},
             {"Title":"Inception: The Cobol Job","Year":"2010","imdbID":"tt5295894","Poster":"N/A"}
         ],"totalResults":"2","Response":"True"}"#;
         let server = MockServer::start(vec![("/", body.to_owned())]).await;
@@ -726,6 +727,15 @@ mod tests {
         assert_eq!(hits[0].imdb_id.as_deref(), Some("tt1375666"));
         assert_eq!(hits[0].production_year(), Some(2010));
         assert_eq!(hits[1].poster, None, "N/A posters do not become a URL");
+        // `Released` becomes the candidate's PremiereDate, as C#
+        // `ResultToMetadataResult` sets it.
+        assert_eq!(
+            hits[0].premiere_date(),
+            chrono::NaiveDate::from_ymd_opt(2010, 7, 16)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc())
+        );
+        assert_eq!(hits[1].premiere_date(), None, "an absent Released is None");
     }
 
     #[tokio::test]

@@ -257,6 +257,7 @@ impl RemoteSearchProvider for OmdbSearchProvider {
             .into_iter()
             .map(|hit| RemoteSearchResult {
                 production_year: hit.production_year(),
+                premiere_date: hit.premiere_date(),
                 image_url: hit.poster.clone(),
                 provider_ids: hit
                     .imdb_id
@@ -274,10 +275,10 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 ///
 /// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced
 /// to the object-safe surface the manager needs: a display name, the item kinds
-/// it serves, and the search itself. The concrete network fetchers are
-/// **deferred** (feature-gated, need API keys); this trait is the seam a host
-/// registers them against when they land, and the one the dedup/merge port in
-/// [`LocalProviderManager::remote_search`] drives.
+/// it serves, and the search itself. The concrete network fetchers (TMDB, TVDB,
+/// OMDb, MusicBrainz) implement it in this crate and are registered by the
+/// server's composition root; the dedup/merge port in
+/// [`LocalProviderManager::remote_search`] drives them all.
 #[async_trait]
 pub trait RemoteSearchProvider: Send + Sync {
     /// The provider's display name, stamped onto every result it returns.

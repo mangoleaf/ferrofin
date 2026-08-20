@@ -157,6 +157,52 @@ fn kind_of(entity: &BaseItemEntity) -> BaseItemKind {
     crate::item_type_lookup::kind_from_type_name(&entity.type_).unwrap_or(BaseItemKind::Folder)
 }
 
+/// The ids and presentation keys already spoken for, seeded with the item the
+/// request is about.
+///
+/// C# keeps `excludeIds` AND `excludeKeys` (a `PresentationUniqueKey` set,
+/// case-insensitive) and admits a result only when it is new to BOTH — that is
+/// what stops a 4K and a 1080p row for the same film both showing up as
+/// "similar".
+struct Seen {
+    ids: std::collections::HashSet<Uuid>,
+    keys: std::collections::HashSet<String>,
+}
+
+impl Seen {
+    /// The exclusion set for a request about `item_id`, whose own presentation
+    /// key is `key`.
+    fn new(item_id: Uuid, key: Option<&str>) -> Self {
+        Self {
+            ids: std::collections::HashSet::from([item_id]),
+            keys: key.map(presentation_key).into_iter().collect(),
+        }
+    }
+
+    /// Whether `entity` is new to both sets, claiming it when it is.
+    fn claim(&mut self, id: Uuid, entity: &BaseItemEntity) -> bool {
+        // Both `Add`s run in C# before the `&&`, so a rejected-on-id row still
+        // burns its key. Matching that keeps the two implementations' output
+        // identical on a duplicate-heavy library.
+        let new_id = self.ids.insert(id);
+        let new_key = entity
+            .presentation_unique_key
+            .as_deref()
+            .is_none_or(|key| self.keys.insert(presentation_key(key)));
+        new_id && new_key
+    }
+
+    /// The ids to hand a provider as `ExcludeItemIds`.
+    fn ids(&self) -> Vec<Uuid> {
+        self.ids.iter().copied().collect()
+    }
+}
+
+/// A presentation key normalized for the case-insensitive comparison C# uses.
+fn presentation_key(key: &str) -> String {
+    key.to_lowercase()
+}
+
 /// Which providers serve one seed, and where the local scorer sits among them.
 struct SimilarityPlan {
     /// The enabled remote providers, in the library's configured order.
@@ -355,7 +401,7 @@ impl FerrofinSimilarItemsManager {
         exclude_artist_ids: &[Uuid],
         wanted: i32,
         provider_order: usize,
-        taken: &mut std::collections::HashSet<Uuid>,
+        claimed: &mut Seen,
         scored: &mut Vec<(BaseItemEntity, f32)>,
     ) -> Result<(), ServiceError> {
         let remaining = wanted - i32::try_from(scored.len()).unwrap_or(0);
@@ -365,7 +411,7 @@ impl FerrofinSimilarItemsManager {
         // C# hands the local provider `ExcludeItemIds`, so its `Limit` yields
         // that many *new* rows. Filtering in Rust instead would let each
         // duplicate burn a slot and under-fill the requested limit.
-        let mut exclude: Vec<Uuid> = taken.iter().copied().collect();
+        let mut exclude: Vec<Uuid> = claimed.ids();
         exclude.extend_from_slice(exclude_artist_ids);
         let by_overlap = self
             .repo
@@ -373,7 +419,7 @@ impl FerrofinSimilarItemsManager {
             .await?;
         for (position, entity) in by_overlap.into_iter().enumerate() {
             if let Ok(id) = Uuid::parse_str(&entity.id)
-                && taken.insert(id)
+                && claimed.claim(id, &entity)
             {
                 scored.push((entity, calculate_score(None, provider_order, position)));
             }
@@ -440,7 +486,7 @@ impl FerrofinSimilarItemsManager {
         references: &[SimilarItemReference],
         provider_order: usize,
         kind: BaseItemKind,
-        taken: &mut std::collections::HashSet<Uuid>,
+        claimed: &mut Seen,
     ) -> Vec<(BaseItemEntity, f32)> {
         // Best reference per (provider, id): higher score wins, and at equal
         // score the earlier position does.
@@ -506,7 +552,7 @@ impl FerrofinSimilarItemsManager {
                 let Some(&(score, position)) = best.get(&key) else {
                     continue;
                 };
-                if taken.contains(&item_id) {
+                if claimed.ids.contains(&item_id) {
                     continue;
                 }
                 let Ok(Some(entity)) = self.items.retrieve_item(item_id).await else {
@@ -515,9 +561,11 @@ impl FerrofinSimilarItemsManager {
                 if kind_of(&entity) != kind {
                     continue;
                 }
-                // Only mark it consumed once it is actually kept, so a row
-                // rejected here stays available to a later provider.
-                taken.insert(item_id);
+                // Only consumed once it is actually kept, so a row rejected on
+                // kind stays available to a later provider.
+                if !claimed.claim(item_id, &entity) {
+                    continue;
+                }
                 out.push((entity, calculate_score(score, provider_order, position)));
             }
         }
@@ -634,7 +682,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             self.repo.provider_ids(item_id).await.unwrap_or_default()
         };
 
-        let mut taken: std::collections::HashSet<Uuid> = std::collections::HashSet::from([item_id]);
+        let mut claimed = Seen::new(item_id, seed.presentation_unique_key.as_deref());
         let mut scored: Vec<(BaseItemEntity, f32)> = Vec::new();
         let mut ran_local = false;
         let wanted_len = usize::try_from(wanted.max(0)).unwrap_or(0);
@@ -649,7 +697,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                     exclude_artist_ids,
                     wanted,
                     index,
-                    &mut taken,
+                    &mut claimed,
                     &mut scored,
                 )
                 .await?;
@@ -663,7 +711,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             let query = SimilarItemsQuery {
                 user_id,
                 limit: Some(wanted - i32::try_from(scored.len()).unwrap_or(0)),
-                exclude_item_ids: taken.iter().copied().collect(),
+                exclude_item_ids: claimed.ids(),
                 exclude_artist_ids: exclude_artist_ids.to_vec(),
             };
             let references = self
@@ -673,7 +721,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 continue;
             }
             scored.extend(
-                self.resolve_remote_references(&references, order, kind, &mut taken)
+                self.resolve_remote_references(&references, order, kind, &mut claimed)
                     .await,
             );
         }
@@ -687,7 +735,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 exclude_artist_ids,
                 wanted,
                 remote_count,
-                &mut taken,
+                &mut claimed,
                 &mut scored,
             )
             .await?;
@@ -914,7 +962,21 @@ mod tests {
         genres: &str,
         library: Option<Uuid>,
     ) {
+        seed_movie_keyed(db, id, name, genres, library, None).await;
+    }
+
+    /// `seed_movie_in`, plus the `PresentationUniqueKey` two rows for the same
+    /// film share.
+    async fn seed_movie_keyed(
+        db: &Database,
+        id: Uuid,
+        name: &str,
+        genres: &str,
+        library: Option<Uuid>,
+        presentation_unique_key: Option<&str>,
+    ) {
         let movie = ferrofin_db::entities::base_items::BaseItemEntity {
+            presentation_unique_key: presentation_unique_key.map(str::to_owned),
             // The DB GUID form, as every writer in the crate uses — a display
             // form here only agrees with the rest of the schema for ids that
             // happen to contain no hex letters.
@@ -1202,6 +1264,32 @@ mod tests {
             names,
             ["Solaris"],
             "the remote provider was ranked first, so its match wins the single slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_rows_for_the_same_film_are_returned_once() {
+        // C# admits a result only when it is new to BOTH `excludeIds` and
+        // `excludeKeys`. A 4K and a 1080p copy of the same film share a
+        // PresentationUniqueKey, so only one of them may appear.
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x9ab_cf1);
+        let hd = Uuid::from_u128(0x9ab_cf2);
+        let uhd = Uuid::from_u128(0x9ab_cf3);
+        seed_movie_in(&db, seed, "Alien", "SciFi", None).await;
+        seed_movie_keyed(&db, hd, "Aliens", "SciFi", None, Some("aliens-1986")).await;
+        seed_movie_keyed(&db, uhd, "Aliens", "SciFi", None, Some("ALIENS-1986")).await;
+        let names: Vec<_> = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(10))
+            .await
+            .expect("similar")
+            .iter()
+            .filter_map(|r| r.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["Aliens"],
+            "the duplicate row must be dropped, case-insensitively"
         );
     }
 

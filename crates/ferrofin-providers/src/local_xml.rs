@@ -12,13 +12,18 @@
 //! # Not yet reachable from the server
 //!
 //! Both C# savers write to `Path.Combine(item.Path, …)`, and both parsers run
-//! against an item resolved from a folder on disk. Ferrofin creates a `BoxSet`
-//! or `Playlist` as a **pathless** DB row (`collection_manager`'s
-//! `insert_named_item` writes no `Path`), and the scanner resolves no
-//! collection/playlist folders — so today there is no on-disk file for either
-//! side to touch, and nothing in the server calls into this module. Membership
-//! lives in `BaseItems."Data"`, which is Jellyfin's own DB source of truth and
-//! is what makes the drop-in round trip work.
+//! against an item resolved from a folder on disk. Jellyfin gives a box set
+//! such a folder — `{DataPath}/collections/{Name} [boxset]/collection.xml` —
+//! so an **adopted** Jellyfin database does carry those paths and those files.
+//! Ferrofin, however, creates a `BoxSet` or `Playlist` as a **pathless** DB row
+//! (`collection_manager`'s `insert_named_item` writes no `Path`) and its
+//! scanner resolves no collection/playlist folders, so nothing in the server
+//! calls into this module today.
+//!
+//! Nothing is lost by that: membership lives in `BaseItems."Data"`, which is
+//! Jellyfin's own DB source of truth and is what the drop-in round trip
+//! actually exercises — an adopted collection reads back correctly from the
+//! row whether or not its `collection.xml` was parsed.
 //!
 //! This module is the complete, tested reader/writer pair, ready for the day
 //! Ferrofin materializes folder-backed containers. It is deliberately NOT

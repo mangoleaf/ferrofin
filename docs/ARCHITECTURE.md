@@ -48,7 +48,7 @@ injects them into the API's `AppState`.
 | `ferrofin-mediaencoding` | MediaBrowser.MediaEncoding | ffmpeg/ffprobe: probing, transcode arg-building (pure), the live transcode runtime behind a `Transcoder` seam trait |
 | `ferrofin-hls` | Jellyfin.MediaEncoding.Hls | HLS playlist generation + stream manager |
 | `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate |
-| `ferrofin-providers` | MediaBrowser.Providers + Xbmc/LocalMetadata | local NFO always on; remote providers (TMDB/TVDB/MusicBrainz/…) feature-gated |
+| `ferrofin-providers` | MediaBrowser.Providers + Xbmc/LocalMetadata | local NFO always on; remote providers (TMDB/TVDB/OMDb/MusicBrainz/fanart) compiled in, gated by the per-library fetcher checkboxes |
 | `ferrofin-livetv` | Jellyfin.LiveTv | M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | (new — Tier 1a of the plugin design) | compiled-in extensions behind an `Extension` trait; see `docs/PLUGINS_UPSTREAM.md` |
 | `ferrofin-wasm` | (new — Tier 1b of the plugin design) | sandboxed runtime-installed WASM plugin host (wasmtime + the `ferrofin:plugin` WIT world); see `docs/EXTENSIONS.md` |
