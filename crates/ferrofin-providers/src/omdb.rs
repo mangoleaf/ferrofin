@@ -352,7 +352,7 @@ impl OmdbItem {
     pub fn rotten_tomatoes(&self) -> Option<f32> {
         self.ratings
             .iter()
-            .find(|r| r.source == ROTTEN_TOMATOES)
+            .find(|r| r.source.eq_ignore_ascii_case(ROTTEN_TOMATOES))
             .and_then(|r| parse_percent(&r.value))
     }
 

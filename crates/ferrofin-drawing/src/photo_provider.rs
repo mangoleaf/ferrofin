@@ -378,7 +378,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             }
             // The Windows XP* tags are BYTE arrays holding UTF-16LE.
             exif::Value::Byte(bytes) => utf16le(bytes),
-            exif::Value::Undefined(bytes, _) => String::from_utf8_lossy(bytes).into_owned(),
+            exif::Value::Undefined(bytes, _) => undefined_text(tag, bytes)?,
             _ => return None,
         };
         let value = value.trim_end_matches('\0').trim();
@@ -421,6 +421,54 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
         width: integer(Tag::PixelXDimension),
         height: integer(Tag::PixelYDimension),
     }
+}
+
+/// Decodes an UNDEFINED-typed text field.
+///
+/// EXIF `UserComment` (0x9286) is UNDEFINED with a mandatory 8-byte character
+/// code prefix — `ASCII`, `UNICODE`, `JIS` or eight zeros for "undefined",
+/// each NUL-padded to 8 bytes. `kamadak-exif` hands the prefix through
+/// untouched, so it has to be stripped here or it lands in the overview.
+fn undefined_text(tag: exif::Tag, bytes: &[u8]) -> Option<String> {
+    if tag != exif::Tag::UserComment {
+        return Some(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let (code, text) = bytes.split_at_checked(USER_COMMENT_PREFIX_LEN)?;
+    match code {
+        b"ASCII\0\0\0" => Some(String::from_utf8_lossy(text).into_owned()),
+        // UTF-16 with no BOM is big-endian per the spec, but writers disagree;
+        // a BOM wins when present.
+        b"UNICODE\0" => Some(utf16_with_bom(text)),
+        // JIS and the all-zero "undefined" code carry no encoding this can
+        // decode faithfully, so they are dropped rather than mangled.
+        _ => None,
+    }
+}
+
+/// The fixed character-code prefix length of an EXIF `UserComment`.
+const USER_COMMENT_PREFIX_LEN: usize = 8;
+
+/// Decodes UTF-16 text, honouring a leading byte-order mark and defaulting to
+/// big-endian as the EXIF spec specifies.
+fn utf16_with_bom(bytes: &[u8]) -> String {
+    let (bytes, little_endian) = match bytes {
+        [0xff, 0xfe, rest @ ..] => (rest, true),
+        // A big-endian BOM and no BOM at all decode the same way: EXIF
+        // specifies big-endian as the default.
+        [0xfe, 0xff, rest @ ..] | rest => (rest, false),
+    };
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// Decodes a UTF-16LE byte run, as the Windows `XP*` TIFF tags store text.

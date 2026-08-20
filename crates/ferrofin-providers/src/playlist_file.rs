@@ -134,10 +134,17 @@ fn unescape(value: &str) -> String {
 /// Serializes `paths` as the playlist format `path`'s extension implies —
 /// the write side C# calls `SavePlaylistFile`.
 ///
-/// Paths are written verbatim (absolute), which every player accepts and which
-/// keeps the file valid wherever it is moved inside the library.
+/// Entries are written **relative to the playlist's own directory**, as
+/// `PlaylistManager.NormalizeItemPath` does: that is what survives the whole
+/// library being moved, and it is what the reader resolves.
 #[must_use]
 pub fn write_playlist_file(path: &str, paths: &[String]) -> String {
+    let dir = Path::new(path).parent().map(Path::to_path_buf);
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|entry| relative_to(dir.as_deref(), entry))
+        .collect();
+    let paths = &paths;
     match extension_of(path).as_deref() {
         Some("pls") => {
             let mut out = String::from("[playlist]\n");
@@ -176,6 +183,18 @@ fn escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// `entry` expressed relative to `dir` when it lies underneath it, else
+/// unchanged — the write-side twin of [`make_absolute`].
+fn relative_to(dir: Option<&Path>, entry: &str) -> String {
+    let (Some(dir), path) = (dir, Path::new(entry)) else {
+        return entry.to_owned();
+    };
+    path.strip_prefix(dir).map_or_else(
+        |_| entry.to_owned(),
+        |rest| rest.to_string_lossy().into_owned(),
+    )
 }
 
 /// Resolves `entry` against the playlist's directory — port of
@@ -306,6 +325,11 @@ mod tests {
     fn the_pls_writer_emits_the_entry_count() {
         let written = write_playlist_file("/m/l.pls", &["/m/a.flac".to_owned()]);
         assert!(written.contains("NumberOfEntries=1"));
-        assert!(written.contains("File1=/m/a.flac"));
+        // Relative to the playlist's own directory, as
+        // `PlaylistManager.NormalizeItemPath` writes it.
+        assert!(written.contains("File1=a.flac"), "{written}");
+        // A path outside that directory stays absolute.
+        let outside = write_playlist_file("/m/l.pls", &["/other/b.flac".to_owned()]);
+        assert!(outside.contains("File1=/other/b.flac"), "{outside}");
     }
 }

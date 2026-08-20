@@ -560,7 +560,6 @@ fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     // `properties="cover-image"` (the EPUB 3 way), then id `cover-image`,
     // then id `cover`, and only then `<meta name="cover" content="…"/>`.
     let href = epub_manifest_href_by_property(&opf, "cover-image")
-        .or_else(|| epub_manifest_href(&opf, "cover-image"))
         .or_else(|| epub_manifest_href(&opf, "cover"))
         .or_else(|| epub_cover_id(&opf).and_then(|id| epub_manifest_href(&opf, &id)))?;
     // Manifest hrefs are relative to the OPF's own directory.
@@ -612,6 +611,9 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
             && cursor
                 .get_attribute("properties")
                 .is_some_and(|v| v.split_whitespace().any(|p| p == property))
+            && cursor
+                .get_attribute("media-type")
+                .is_some_and(is_image_media_type)
             && let Some(href) = cursor.get_attribute("href")
         {
             let href = href.trim().to_owned();
@@ -624,6 +626,11 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
     None
 }
 
+/// Whether a manifest `media-type` names an image — C# `IsValidImage`.
+fn is_image_media_type(media_type: &str) -> bool {
+    media_type.trim().to_ascii_lowercase().starts_with("image/")
+}
+
 /// The `href` of the manifest item with `id`.
 fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
     let Ok(mut cursor) = XmlCursor::new(opf) else {
@@ -633,6 +640,10 @@ fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
         if cursor.is_element()
             && cursor.name().eq_ignore_ascii_case("item")
             && cursor.get_attribute("id").is_some_and(|v| v == id)
+            // C# probes `//opf:item[@id='cover' and @media-type='image/*']`:
+            // the common EPUB 2 `id="cover"` points at an XHTML wrapper page,
+            // and attaching that as the cover would store markup as an image.
+            && cursor.get_attribute("media-type").is_some_and(is_image_media_type)
             && let Some(href) = cursor.get_attribute("href")
         {
             let href = href.trim().to_owned();
@@ -1151,7 +1162,12 @@ mod tests {
                             <dc:title>Dune</dc:title>
                             <meta name="cover" content="cover-image"/>
                           </metadata>
-                          <manifest><item id="cover-image" href="cover.jpg"/></manifest>
+                          <manifest>
+                            <item id="cover-page" href="cover.xhtml"
+                                  media-type="application/xhtml+xml"/>
+                            <item id="cover-image" href="cover.jpg"
+                                  media-type="image/jpeg"/>
+                          </manifest>
                         </package>"#,
                 ),
                 ("OEBPS/cover.jpg", b"cover bytes"),

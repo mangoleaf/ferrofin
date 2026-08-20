@@ -1937,7 +1937,18 @@ impl LibraryScanner {
             return Vec::new();
         };
         let config = NfoConfiguration::default();
-        let ext_ids = xbmc::StaticExternalIds::new(["Imdb", "Tmdb", "Tvdb"]);
+        // The id tags a document may carry are per-kind: C# builds
+        // `_validProviderIds` from `GetExternalIdInfos(item)`. A fixed
+        // video-only list silently discards an `album.nfo`'s
+        // `<musicbrainzalbumid>` and an `artist.nfo`'s `<musicbrainzartistid>`.
+        let ext_ids = xbmc::StaticExternalIds::new(
+            ferrofin_providers::external_id_infos(
+                crate::item_type_lookup::kind_from_type_name(&entity.type_)
+                    .unwrap_or(BaseItemKind::Folder),
+            )
+            .into_iter()
+            .filter_map(|info| info.key),
+        );
         let ds = NoDirectoryService;
         let mut result = xbmc::new_result(kind);
         let parsed = match kind {
@@ -4524,6 +4535,14 @@ fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetada
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&book.original_title);
     }
+    // C# `BookMetadataService.MergeData` fills SeriesName when the target's is
+    // empty. The resolver writes `Some("")` for the folder shape, so an
+    // `is_none()` guard would never fire.
+    if entity.series_name.as_deref().unwrap_or_default().is_empty()
+        && let Some(series) = book.series_name.as_deref().filter(|s| !s.is_empty())
+    {
+        entity.series_name = Some(series.to_owned());
+    }
     if entity.overview.is_none() {
         entity.overview.clone_from(&book.overview);
     }
@@ -5412,6 +5431,12 @@ fn image_item_kind(type_: &str) -> ImageItemKind {
         "MusicArtist" => ImageItemKind::MusicArtist,
         "AudioBook" => ImageItemKind::AudioBook,
         "Audio" => ImageItemKind::Audio,
+        // A photo takes NO local image of its own (C# `LocalImageProvider`
+        // returns false for `item is Photo`) — without this, one shared
+        // `thumb.jpg` in an album folder attaches to every photo in it. An
+        // album uses the music filename table, as upstream routes it.
+        "Photo" => ImageItemKind::Photo,
+        "PhotoAlbum" => ImageItemKind::PhotoAlbum,
         _ => ImageItemKind::Generic,
     }
 }
