@@ -1883,6 +1883,8 @@ impl LibraryScanner {
             "Series" => NfoItemKind::Series,
             "Season" => NfoItemKind::Season,
             "Episode" => NfoItemKind::Episode,
+            "MusicAlbum" => NfoItemKind::MusicAlbum,
+            "MusicArtist" => NfoItemKind::MusicArtist,
             _ => return Vec::new(),
         };
         let Some(path) = entity.path.as_deref() else {
@@ -1916,6 +1918,9 @@ impl LibraryScanner {
             }
             NfoItemKind::Episode => {
                 xbmc::fetch_episode(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist => {
+                xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
             _ => return Vec::new(),
         };
@@ -4279,6 +4284,10 @@ fn nfo_candidates(
     match kind {
         NfoItemKind::Series => vec![p.join("tvshow.nfo")],
         NfoItemKind::Season => vec![p.join("season.nfo")],
+        // C# `AlbumNfoProvider`/`ArtistNfoProvider.GetXmlFile`: a fixed
+        // filename inside the album/artist folder.
+        NfoItemKind::MusicAlbum => vec![p.join("album.nfo")],
+        NfoItemKind::MusicArtist => vec![p.join("artist.nfo")],
         NfoItemKind::Movie if is_folder => vec![p.join("movie.nfo")],
         NfoItemKind::Movie => {
             let mut c = vec![p.with_extension("nfo")];

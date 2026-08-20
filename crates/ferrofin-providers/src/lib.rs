@@ -67,4 +67,6 @@ pub use provider_manager::{
     LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbBoxSetSearchProvider,
     TmdbSearchProvider, TvdbSearchProvider,
 };
-pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};
+pub use xbmc::saver::{
+    NfoAlbum, NfoTrack, save_album, save_artist, save_episode, save_movie, save_season, save_series,
+};
