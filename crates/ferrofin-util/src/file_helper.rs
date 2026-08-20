@@ -68,9 +68,15 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
 
-        // Running as root ignores the mode bits, so only assert when the probe
-        // is meaningful for this uid.
-        if let Err(err) = ensure_writable_dir(&dir) {
+        // Running as root ignores the mode bits. Establish whether the mode is
+        // meaningful for this uid FIRST, then require the error — asserting
+        // only inside an `if let Err` would pass just as happily against a
+        // probe that never checks anything.
+        let writable_anyway = std::fs::File::create(dir.join("root-can-write")).is_ok();
+        if writable_anyway {
+            let _ = std::fs::remove_file(dir.join("root-can-write"));
+        } else {
+            let err = ensure_writable_dir(&dir).expect_err("a read-only directory must be refused");
             assert_eq!(
                 err.kind(),
                 io::ErrorKind::PermissionDenied,

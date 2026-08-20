@@ -381,8 +381,12 @@ impl AudioNormalizationTask {
         album_id: &str,
         track_paths: &[String],
     ) -> Result<Option<f64>, ServiceError> {
-        let temp_dir = Path::new(&self.paths.cache_path()).join("temp");
-        std::fs::create_dir_all(&temp_dir).map_err(|e| ServiceError::backend(e.to_string()))?;
+        // Same scratch directory the frame extractor uses, named once on the
+        // paths trait so the two cannot drift apart.
+        let temp_dir = std::path::PathBuf::from(self.paths.temp_path());
+        ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
+            ServiceError::backend(format!("temp directory `{}`: {e}", temp_dir.display()))
+        })?;
         let concat = temp_dir.join(format!("{album_id}.concat"));
         // ffmpeg concat-list quoting: single quotes with '\'' escapes.
         let lines: Vec<String> = track_paths
@@ -723,6 +727,20 @@ impl ScheduledTask for ChapterImagesTask {
                     .collect()
             })
             .unwrap_or_default();
+
+        // A blocklist this large is almost always the fingerprint of a past
+        // systemic failure (an unwritable temp directory failing every
+        // extraction), not that many unreadable files. Nothing here can tell
+        // the two apart — the history records only path+mtime — so say how many
+        // videos are being skipped and let the operator judge. Silence is what
+        // let ~2950 wrongly-blocklisted videos look like a working task.
+        if !failed.is_empty() {
+            tracing::info!(
+                skipped = failed.len(),
+                path = %fail_history_path.display(),
+                "skipping videos recorded as previously failed; delete this file to retry them"
+            );
+        }
 
         let total = videos.len().max(1);
         let mut history_write_failed = false;
