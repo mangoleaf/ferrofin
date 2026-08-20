@@ -539,16 +539,7 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
     pages.sort();
     let first = pages.into_iter().next()?;
     let mut entry = archive.by_name(&first).ok()?;
-    if entry.size() > MAX_ARCHIVE_ENTRY_BYTES {
-        tracing::warn!(
-            entry = entry.name(),
-            size = entry.size(),
-            "comic cover page is implausibly large; skipping"
-        );
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
-    entry.read_to_end(&mut bytes).ok()?;
+    let bytes = read_capped(&mut entry)?;
     Some((first, bytes))
 }
 
@@ -672,20 +663,52 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
             .is_some_and(|e| e.name().to_lowercase() == wanted_lower)
     })?;
     let mut entry = archive.by_index(index).ok()?;
-    // A comic page or an OPF is kilobytes; refuse anything that claims to
-    // decompress to more than this rather than reading it into memory. C#
-    // catches the resulting exception; an unbounded read here would abort the
-    // process on OOM instead.
-    if entry.size() > MAX_ARCHIVE_ENTRY_BYTES {
+    read_capped(&mut entry)
+}
+
+/// Reads one archive entry, refusing anything that inflates past
+/// [`MAX_ARCHIVE_ENTRY_BYTES`].
+///
+/// A comic page or an OPF is kilobytes. The cap is enforced on the BYTES READ,
+/// not on `ZipFile.size()`: that header field is attacker-controlled, so a
+/// zip bomb declaring a small size would sail past a header check and then
+/// inflate unbounded into memory. C# catches the resulting exception; an
+/// unbounded read here would abort the process on OOM instead.
+fn read_capped(entry: &mut zip::read::ZipFile<'_, impl std::io::Read>) -> Option<Vec<u8>> {
+    read_capped_to(entry, MAX_ARCHIVE_ENTRY_BYTES)
+}
+
+/// [`read_capped`] with an explicit cap, so the read-side enforcement can be
+/// exercised without a 128 MiB fixture.
+fn read_capped_to(
+    entry: &mut zip::read::ZipFile<'_, impl std::io::Read>,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    let name = entry.name().to_owned();
+    // The declared size is still worth honouring as a capacity hint and as a
+    // cheap early-out, but only ever as a hint.
+    if entry.size() > cap {
         tracing::warn!(
-            entry = entry.name(),
+            entry = name,
             size = entry.size(),
             "archive entry is implausibly large; skipping"
         );
         return None;
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or_default());
-    entry.read_to_end(&mut bytes).ok()?;
+    let hint = usize::try_from(entry.size().min(cap)).unwrap_or_default();
+    let mut bytes = Vec::with_capacity(hint);
+    // One byte past the cap is enough to tell "at the limit" from "over it".
+    entry
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > cap {
+        tracing::warn!(
+            entry = name,
+            "archive entry inflated past the cap; skipping"
+        );
+        return None;
+    }
     Some(bytes)
 }
 
@@ -1076,6 +1099,31 @@ mod tests {
         }
         writer.finish().expect("finish archive");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn an_entry_that_inflates_past_the_cap_is_refused() {
+        // The cap must bind on the BYTES READ, not on `ZipFile::size()` — that
+        // header field is attacker-controlled, so a zip bomb declaring a tiny
+        // size would sail past a header-only check and inflate unbounded.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(&dir, "bomb.cbz", &[("page.jpg", &[b'A'; 4096])], None);
+        let read = |cap: u64| {
+            let file = std::fs::File::open(&path).expect("open");
+            let mut archive =
+                zip::ZipArchive::new(std::io::BufReader::new(file)).expect("read archive");
+            let mut entry = archive.by_name("page.jpg").expect("entry");
+            super::read_capped_to(&mut entry, cap).map(|b| b.len())
+        };
+        // An honest header well over the cap: refused before any read.
+        assert_eq!(read(16), None);
+        assert_eq!(read(8192), Some(4096));
+        assert_eq!(
+            read(4095),
+            None,
+            "content one byte past the cap must be refused"
+        );
+        assert_eq!(read(4096), Some(4096), "content exactly at the cap is fine");
     }
 
     #[test]

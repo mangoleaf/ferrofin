@@ -1045,8 +1045,8 @@ impl LibraryScanner {
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
             // `tvshow.nfo` / `<episode>.nfo` and yields the credited cast/crew.
-            let mut people = if locked {
-                Vec::new()
+            let (mut people, nfo_ids) = if locked {
+                (Vec::new(), Vec::new())
             } else {
                 self.fetch_local_nfo(&mut entity, policy).await
             };
@@ -1057,7 +1057,7 @@ impl LibraryScanner {
             let remote = if locked {
                 RemoteMetadata::default()
             } else {
-                self.fetch_remote_metadata(&mut entity, &mut art_cache, policy)
+                self.fetch_remote_metadata(&mut entity, &mut art_cache, policy, &nfo_ids)
                     .await
             };
             // Photos and books carry their metadata inside the file, not on any
@@ -1075,10 +1075,11 @@ impl LibraryScanner {
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
             // supplement whatever the built-in chain left unfilled; the
             // helper merges their (filtered) ids with the built-ins'.
+            let built_in_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
             let all_provider_ids = self
                 .apply_dynamic_metadata(
                     &mut entity,
-                    &remote.provider_ids,
+                    &built_in_ids,
                     tag_provider_ids,
                     locked,
                     policy,
@@ -1904,12 +1905,12 @@ impl LibraryScanner {
         &self,
         entity: &mut BaseItemEntity,
         policy: FetcherPolicy<'_>,
-    ) -> Vec<PeopleEntity> {
+    ) -> (Vec<PeopleEntity>, Vec<(String, String)>) {
         use ferrofin_providers::xbmc::{
             self, base_parser::NoDirectoryService, config::NfoConfiguration, item::NfoItemKind,
         };
         if !policy.local_reader_enabled(fetcher_names::NFO) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let kind = match short {
@@ -1919,10 +1920,10 @@ impl LibraryScanner {
             "Episode" => NfoItemKind::Episode,
             "MusicAlbum" => NfoItemKind::MusicAlbum,
             "MusicArtist" => NfoItemKind::MusicArtist,
-            _ => return Vec::new(),
+            _ => return (Vec::new(), Vec::new()),
         };
         let Some(path) = entity.path.as_deref() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut xml = None;
         let mut nfo_path = String::new();
@@ -1934,7 +1935,7 @@ impl LibraryScanner {
             }
         }
         let Some(xml) = xml else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let config = NfoConfiguration::default();
         // The id tags a document may carry are per-kind: C# builds
@@ -1967,18 +1968,31 @@ impl LibraryScanner {
             NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist => {
                 xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
-            _ => return Vec::new(),
+            _ => return (Vec::new(), Vec::new()),
         };
         if parsed.is_err() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         apply_nfo(entity, &result.item);
-        result
-            .people
-            .unwrap_or_default()
-            .into_iter()
-            .map(person_to_entity)
-            .collect()
+        // The `<imdbid>`/`<tmdbid>`/`<musicbrainzalbumid>` the sidecar declares
+        // are the ids the USER pinned. They are what the remote fetchers should
+        // resolve by — C#'s local provider populates `item.ProviderIds` before
+        // any remote provider runs — and they must be persisted, or a re-scan
+        // searches by title again and the pin is silently ignored.
+        let ids = result
+            .item
+            .provider_ids
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()));
+        (
+            result
+                .people
+                .unwrap_or_default()
+                .into_iter()
+                .map(person_to_entity)
+                .collect(),
+            ids.filter(|(_, v)| !v.trim().is_empty()).collect(),
+        )
     }
 
     /// Enriches a movie/series row from TMDB (overview, tagline, genres, studios,
@@ -2119,6 +2133,7 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
+        known_ids: &[(String, String)],
     ) -> RemoteMetadata {
         let short = entity
             .type_
@@ -2151,7 +2166,7 @@ impl LibraryScanner {
             // Each fetcher's checkbox gates only itself: unchecking TheMovieDb
             // must not silently disable OMDb as well.
             return if omdb_on {
-                self.fetch_omdb_metadata(entity, &short, cache, policy)
+                self.fetch_omdb_metadata(entity, &short, cache, policy, known_ids)
                     .await
             } else {
                 RemoteMetadata::default()
@@ -2172,7 +2187,7 @@ impl LibraryScanner {
         // `Order = 2` (behind TMDB and TVDB, ahead of nothing).
         if omdb_on {
             return self
-                .fetch_omdb_metadata(entity, &short, cache, policy)
+                .fetch_omdb_metadata(entity, &short, cache, policy, known_ids)
                 .await;
         }
         RemoteMetadata::default()
@@ -2273,6 +2288,7 @@ impl LibraryScanner {
         short: &str,
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
+        known_ids: &[(String, String)],
     ) -> RemoteMetadata {
         let Some(omdb) = self.omdb.as_ref().filter(|o| o.is_enabled()) else {
             return RemoteMetadata::default();
@@ -2283,6 +2299,9 @@ impl LibraryScanner {
         }
         let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         let name = entity.name.as_deref().filter(|n| !n.is_empty());
+        // The id this item already carries — from its NFO sidecar, or from the
+        // fetcher that ran before OMDb in this same pass.
+        let own_imdb = imdb_id_in(known_ids);
         let item = match short {
             "Movie" | "Series" => {
                 let kind = if short == "Movie" {
@@ -2290,9 +2309,13 @@ impl LibraryScanner {
                 } else {
                     ferrofin_providers::OmdbKind::Series
                 };
-                match name {
-                    Some(name) => omdb.find_by_title(kind, name, year).await,
-                    None => None,
+                // C# `OmdbItemProvider.GetResult` reads `info.GetProviderId(Imdb)`
+                // first and only searches by title when there is none: a user who
+                // pinned an id in an NFO must not be re-matched by fuzzy title.
+                match (own_imdb.as_deref(), name) {
+                    (Some(imdb), _) => omdb.item(imdb).await,
+                    (None, Some(name)) => omdb.find_by_title(kind, name, year).await,
+                    (None, None) => None,
                 }
             }
             "Episode" => {
@@ -2300,7 +2323,6 @@ impl LibraryScanner {
                 // EPISODE's own IMDb id first and only falls back to the
                 // episode number — a season whose numbering disagrees with
                 // OMDb's resolves correctly only when that id is supplied.
-                let own_imdb = imdb_id_of(cache.item_provider_ids.get(&entity.id));
                 let series_imdb = entity
                     .series_id
                     .as_deref()
@@ -4554,9 +4576,12 @@ fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetada
     // C# `BookMetadataService.MergeData` fills SeriesName when the target's is
     // empty. The resolver writes `Some("")` for the folder shape, so an
     // `is_none()` guard would never fire.
-    if entity.series_name.as_deref().unwrap_or_default().is_empty()
-        && let Some(series) = book.series_name.as_deref().filter(|s| !s.is_empty())
-    {
+    // C# `BookMetadataService.MergeData` assigns SeriesName when `replaceData`
+    // OR the target is empty, and a default scan passes `replaceData: true`
+    // (`MetadataService.cs` `shouldReplace`). So the embedded value WINS over
+    // the resolver's parent-folder guess — which `push_book` always sets, and
+    // which an empty-only guard would therefore never let through.
+    if let Some(series) = book.series_name.as_deref().filter(|s| !s.is_empty()) {
         entity.series_name = Some(series.to_owned());
     }
     if entity.overview.is_none() {
@@ -4958,9 +4983,31 @@ async fn apply_release_details(
 /// upstream default rather than inventing a different one.
 const OMDB_CAST_AND_CREW: bool = false;
 
+/// `local` followed by the entries of `remote` whose key `local` does not
+/// already hold.
+///
+/// NFO ids lead: `save_provider_id` is INSERT OR REPLACE, so a user's pinned
+/// id must not be overwritten by one a remote search guessed for the same key.
+fn merge_provider_ids(
+    mut local: Vec<(String, String)>,
+    remote: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    for (key, value) in remote {
+        if !local.iter().any(|(k, _)| k.eq_ignore_ascii_case(&key)) {
+            local.push((key, value));
+        }
+    }
+    local
+}
+
 /// The IMDb id among a scanned row's provider-id pairs, if it recorded one.
 fn imdb_id_of(ids: Option<&Vec<(String, String)>>) -> Option<String> {
-    ids?.iter()
+    imdb_id_in(ids?)
+}
+
+/// The IMDb id among a list of provider-id pairs.
+fn imdb_id_in(ids: &[(String, String)]) -> Option<String> {
+    ids.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("Imdb"))
         .map(|(_, v)| v.clone())
 }
@@ -8609,6 +8656,7 @@ mod tests {
             r#"<?xml version="1.0"?>
 <movie><title>The Matrix</title><year>1999</year><plot>Neo wakes up.</plot>
 <genre>Action</genre><genre>SciFi</genre><studio>Warner</studio>
+<uniqueid type="imdb">tt0133093</uniqueid>
 <actor><name>Keanu Reeves</name><role>Neo</role><type>Actor</type></actor>
 <director>Lana Wachowski</director></movie>"#,
         )
@@ -8642,8 +8690,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (overview, _year, _rating, genres, studios, _ids) =
+        let (overview, _year, _rating, genres, studios, ids) =
             movie_detail_row(&db, "The Matrix").await;
+        // The id the USER pinned in the sidecar must be persisted: it is what
+        // every later fetch resolves by, and dropping it makes each re-scan
+        // fall back to a fuzzy title search.
+        assert_eq!(ids.as_deref(), Some("Imdb=tt0133093"));
         assert_eq!(genres.as_deref(), Some("Action|SciFi"));
         assert_eq!(studios.as_deref(), Some("Warner"));
         assert_eq!(overview.as_deref(), Some("Neo wakes up."));

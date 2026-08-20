@@ -122,9 +122,10 @@ fn push(out: &mut Vec<ExternalUrl>, name: &str, url: String) {
 
 /// The "Links" row for an item — a port of every `IExternalUrlProvider`.
 ///
-/// The order matches the C# DI registration order (IMDb, TMDB, Zap2It,
-/// MusicBrainz, TheAudioDb, books), so a client rendering them in sequence
-/// matches Jellyfin.
+/// Ordered by provider name: `ProviderManager`'s constructor does
+/// `externalUrlProviders.OrderBy(i => i.Name)`, discarding DI registration
+/// order, so a client rendering them in sequence matches Jellyfin only if the
+/// same sort is applied here.
 #[must_use]
 pub fn external_urls(item: &ExternalIdItem<'_>) -> Vec<ExternalUrl> {
     let mut out = Vec::new();
@@ -141,6 +142,8 @@ pub fn external_urls(item: &ExternalIdItem<'_>) -> Vec<ExternalUrl> {
     musicbrainz_urls(item, &mut out);
     audiodb_urls(item, &mut out);
     book_urls(item, &mut out);
+    // Stable, so several links from one provider keep their emitted order.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -492,11 +495,16 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
 /// id input fields.
 #[must_use]
 pub fn external_id_infos(kind: BaseItemKind) -> Vec<ExternalIdInfo> {
-    EXTERNAL_IDS
+    let mut out: Vec<ExternalIdInfo> = EXTERNAL_IDS
         .iter()
         .filter(|d| d.kinds.contains(&kind))
         .map(|d| ExternalIdInfo::new(d.name.to_owned(), d.key.to_owned(), d.media_type))
-        .collect()
+        .collect();
+    // `ProviderManager` stores `externalIds.OrderBy(i => i.ProviderName)`, so
+    // the Identify dialog's field order is alphabetical, not registration
+    // order.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 #[cfg(test)]
@@ -633,13 +641,15 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (
-                    "MusicBrainz Album Artist".into(),
-                    "https://musicbrainz.org/artist/artist-1".into()
-                ),
+                // Alphabetical, as `ProviderManager` orders the providers —
+                // NOT the DI registration order.
                 (
                     "MusicBrainz Album".into(),
                     "https://musicbrainz.org/release/release-1".into()
+                ),
+                (
+                    "MusicBrainz Album Artist".into(),
+                    "https://musicbrainz.org/artist/artist-1".into()
                 ),
                 (
                     "MusicBrainz Release Group".into(),

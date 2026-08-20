@@ -91,11 +91,13 @@ pub fn parse_container_xml(xml: &str) -> Option<LocalContainerXml> {
                 cursor.read();
             }
             "CollectionItem" | "PlaylistItem" => {
+                // `read_subtree` already advances the parent past the subtree
+                // it consumed; a `skip()` on top of it would step over the
+                // NEXT entry, dropping every second child.
                 let mut sub = cursor.read_subtree();
                 if let Some(child) = read_linked_child(&mut sub) {
                     out.children.push(child);
                 }
-                cursor.skip();
             }
             _ => {
                 let name = cursor.name().to_owned();
@@ -235,6 +237,27 @@ mod tests {
             parsed.children[0].path.as_deref(),
             Some("/media/The Matrix.mkv")
         );
+    }
+
+    #[test]
+    fn a_compact_document_keeps_every_member() {
+        // No whitespace between entries. `read_subtree` already advances the
+        // parent cursor, so an extra `skip()` here silently dropped every
+        // second child — invisible to any test whose XML is indented.
+        let parsed = parse_container_xml(
+            "<Item><CollectionItems>\
+             <CollectionItem><Path>/a.mkv</Path></CollectionItem>\
+             <CollectionItem><Path>/b.mkv</Path></CollectionItem>\
+             <CollectionItem><Path>/c.mkv</Path></CollectionItem>\
+             </CollectionItems></Item>",
+        )
+        .expect("parse");
+        let paths: Vec<_> = parsed
+            .children
+            .iter()
+            .filter_map(|c| c.path.as_deref())
+            .collect();
+        assert_eq!(paths, ["/a.mkv", "/b.mkv", "/c.mkv"]);
     }
 
     #[test]
