@@ -2,13 +2,13 @@
 //!
 //! See <http://kodi.wiki/view/Advancedsettings.xml#video>.
 
-use fancy_regex::Regex;
+use crate::common::GuardedRegex;
 
 use crate::video::CleanDateTimeResult;
 
 /// Attempts to clean the name, extracting a trailing year.
 #[must_use]
-pub fn clean(name: &str, clean_date_time_regexes: &[Regex]) -> CleanDateTimeResult {
+pub fn clean(name: &str, clean_date_time_regexes: &[GuardedRegex]) -> CleanDateTimeResult {
     let mut result = CleanDateTimeResult::new(name, None);
     if name.is_empty() {
         return result;
@@ -23,7 +23,7 @@ pub fn clean(name: &str, clean_date_time_regexes: &[Regex]) -> CleanDateTimeResu
     result
 }
 
-fn try_clean(name: &str, expression: &Regex, result: &mut CleanDateTimeResult) -> bool {
+fn try_clean(name: &str, expression: &GuardedRegex, result: &mut CleanDateTimeResult) -> bool {
     let Some(captures) = expression.captures(name).ok().flatten() else {
         return false;
     };

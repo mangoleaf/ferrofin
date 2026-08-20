@@ -449,3 +449,68 @@ fn fs_directory_service_reads_real_temp_dir() {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+// `FsDirectoryService` memoizes each listing for the lifetime of the instance,
+// exactly like the upstream `DirectoryService._cache`. Without the memo the
+// episode provider pays two full `readdir` sweeps of the same folder per
+// episode (`files(parent)` then `directories(parent)`), which is O(items ×
+// entries) syscalls across a scan.
+//
+// The memo is proved by deleting the directory between the two calls: a cached
+// service still answers from the first listing, an uncached one returns empty.
+#[test]
+fn fs_directory_service_memoizes_each_listing() {
+    let base = std::env::temp_dir().join(format!("ferrofin-dsc-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("create temp dir");
+    std::fs::write(base.join("a.png"), b"x").expect("write a");
+    std::fs::create_dir_all(base.join("metadata")).expect("create subdir");
+    let path = base.to_string_lossy().into_owned();
+
+    let service = FsDirectoryService::new();
+    let first = service.file_system_entries(&path);
+    assert_eq!(first.len(), 2, "temp dir holds a.png + metadata/");
+
+    // Both derived views must be served from the one memoized listing.
+    assert_eq!(service.files(&path).len(), 1);
+    assert_eq!(service.directories(&path).len(), 1);
+
+    std::fs::remove_dir_all(&base).ok();
+
+    let cached = service.file_system_entries(&path);
+    assert_eq!(cached, first, "second listing must come from the memo");
+    assert_eq!(service.files(&path).len(), 1);
+    assert_eq!(service.directories(&path).len(), 1);
+
+    // A fresh service re-reads: the memo is instance-scoped, never global.
+    assert!(
+        FsDirectoryService::new()
+            .file_system_entries(&path)
+            .is_empty(),
+        "the memo must not outlive the instance"
+    );
+}
+
+// A directory that does not exist memoizes as an empty listing (the upstream
+// `DirectoryNotFoundException → []` branch), and creating it later does not
+// retroactively populate that instance.
+#[test]
+fn fs_directory_service_memoizes_missing_directories() {
+    let base = std::env::temp_dir().join(format!("ferrofin-dsm-{}", uuid::Uuid::new_v4()));
+    let path = base.to_string_lossy().into_owned();
+
+    let service = FsDirectoryService::new();
+    assert!(service.file_system_entries(&path).is_empty());
+
+    std::fs::create_dir_all(&base).expect("create temp dir");
+    std::fs::write(base.join("a.png"), b"x").expect("write a");
+    assert!(
+        service.file_system_entries(&path).is_empty(),
+        "a missing directory memoizes as empty"
+    );
+    assert_eq!(
+        FsDirectoryService::new().file_system_entries(&path).len(),
+        1
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}

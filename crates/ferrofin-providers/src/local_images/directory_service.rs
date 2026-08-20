@@ -8,7 +8,9 @@
 //! seam: production uses [`FsDirectoryService`] (real `std::fs`), and the unit
 //! tests drive an in-memory / temp-dir fake.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use crate::container_types::FileSystemMetadata;
 
@@ -113,22 +115,35 @@ pub trait DirectoryService {
 /// A [`DirectoryService`] backed by the real filesystem via `std::fs`.
 ///
 /// Port of the concrete `DirectoryService` / `ManagedFileSystem` pairing: it
-/// simply reads directories off disk. This is the only place real filesystem
-/// I/O happens, so the parity/coverage numbers exercise [`DirectoryService`]'s
-/// default logic through an in-memory fake instead.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FsDirectoryService;
-
-impl FsDirectoryService {
-    /// Creates a filesystem-backed directory service.
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
+/// reads directories off disk and **memoizes each listing for the lifetime of
+/// the instance**, exactly like the upstream `DirectoryService._cache`
+/// (`ConcurrentDictionary<string, FileSystemMetadata[]>`). The memo is the
+/// reason that class exists: the image providers ask the same folder for its
+/// files and then for its subdirectories, so a cache-less service pays two
+/// `readdir` sweeps — plus a `stat` per entry each time — for every item in a
+/// folder. A missing directory memoizes as an empty listing, matching the
+/// upstream `DirectoryNotFoundException → []` branch.
+///
+/// Lifetime is the instance, so callers scope freshness by scoping the service:
+/// upstream constructs one per refresh operation, and so does Ferrofin's
+/// scanner (one per item). This is the only place real filesystem I/O happens,
+/// so the parity/coverage numbers exercise [`DirectoryService`]'s default logic
+/// through an in-memory fake instead.
+#[derive(Debug, Default)]
+pub struct FsDirectoryService {
+    /// Memoized `path → entries`, mirroring the upstream `_cache`.
+    cache: Mutex<HashMap<String, Arc<[FileSystemMetadata]>>>,
 }
 
-impl DirectoryService for FsDirectoryService {
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
+impl FsDirectoryService {
+    /// Creates a filesystem-backed directory service with an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads `path` off disk (the uncached listing).
+    fn read_entries(path: &str) -> Vec<FileSystemMetadata> {
         let Ok(read_dir) = std::fs::read_dir(path) else {
             return Vec::new();
         };
@@ -141,6 +156,22 @@ impl DirectoryService for FsDirectoryService {
             let full_path = entry.path();
             out.push(fs_metadata_from(&full_path, &metadata));
         }
+        out
+    }
+}
+
+impl DirectoryService for FsDirectoryService {
+    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
+        // A poisoned lock must not fail a scan: fall back to an uncached read.
+        let Ok(mut cache) = self.cache.lock() else {
+            return Self::read_entries(path);
+        };
+        if let Some(hit) = cache.get(path) {
+            return hit.to_vec();
+        }
+        let entries: Arc<[FileSystemMetadata]> = Self::read_entries(path).into();
+        let out = entries.to_vec();
+        cache.insert(path.to_owned(), entries);
         out
     }
 }

@@ -1,13 +1,13 @@
 //! Port of `Emby.Naming.Video.CleanStringParser`.
 
-use fancy_regex::Regex;
+use crate::common::GuardedRegex;
 
 /// Attempts to extract a clean name using the supplied regular expressions.
 ///
 /// Returns `Some(cleaned)` when at least one expression cleaned the string,
 /// mirroring the C# `TryClean` out-param + bool return.
 #[must_use]
-pub fn try_clean(name: Option<&str>, expressions: &[Regex]) -> Option<String> {
+pub fn try_clean(name: Option<&str>, expressions: &[GuardedRegex]) -> Option<String> {
     let name = name?;
     if name.is_empty() {
         return None;
@@ -26,7 +26,7 @@ pub fn try_clean(name: Option<&str>, expressions: &[Regex]) -> Option<String> {
     if cleaned { Some(current) } else { None }
 }
 
-fn try_clean_one(name: &str, expression: &Regex) -> Option<String> {
+fn try_clean_one(name: &str, expression: &GuardedRegex) -> Option<String> {
     let captures = expression.captures(name).ok().flatten()?;
     let cleaned = captures.name("cleaned")?;
     Some(cleaned.as_str().trim().to_string())

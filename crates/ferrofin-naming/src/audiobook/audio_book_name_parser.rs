@@ -1,7 +1,5 @@
 //! Port of `Emby.Naming.AudioBook.AudioBookNameParser`.
 
-use fancy_regex::Regex;
-
 use crate::audiobook::AudioBookNameParserResult;
 use crate::common::NamingOptions;
 
@@ -22,10 +20,7 @@ impl<'a> AudioBookNameParser<'a> {
     pub fn parse(&self, name: &str) -> AudioBookNameParserResult {
         let mut result = AudioBookNameParserResult::default();
 
-        for expression in &self.options.audio_book_names_expressions {
-            let Ok(regex) = Regex::new(&format!("(?i){expression}")) else {
-                continue;
-            };
+        for regex in &self.options.audio_book_names_regexes {
             let Ok(Some(captures)) = regex.captures(name) else {
                 continue;
             };

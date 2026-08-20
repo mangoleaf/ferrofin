@@ -10,8 +10,15 @@ pub fn parse(path: &str, naming_options: &NamingOptions) -> Format3DResult {
     let mut delimiters = naming_options.video_flag_delimiters.clone();
     delimiters.push(' ');
 
+    // The C# code walks a `ReadOnlySpan<char>`, so the split has to happen on
+    // char (not byte) boundaries. Neither the decode nor the split depends on
+    // the rule being tested — `start` advances by the same amount whatever the
+    // rule is — so both are done once here instead of once per rule.
+    let chars: Vec<char> = path.chars().collect();
+    let tokens = split_tokens(&chars, &delimiters);
+
     for rule in &naming_options.format_3d_rules {
-        let result = parse_rule(path, rule, &delimiters);
+        let result = parse_rule(&tokens, rule);
         if result.is_3d {
             return result;
         }
@@ -20,46 +27,55 @@ pub fn parse(path: &str, naming_options: &NamingOptions) -> Format3DResult {
     Format3DResult::default()
 }
 
-fn parse_rule(path: &str, rule: &Format3DRule, delimiters: &[char]) -> Format3DResult {
-    let mut is_3d = false;
-    let mut format_3d: Option<String> = None;
-
-    // If there's no preceding token we just consider it found.
-    let mut found_prefix = rule.preceding_token.as_deref().is_none_or(str::is_empty);
-
-    // Work over char indices to mirror the C# ReadOnlySpan<char> slicing.
-    let chars: Vec<char> = path.chars().collect();
+/// Splits `chars` the way the C# loop does: on the next delimiter, or — when no
+/// delimiter remains — on the last character (upstream's `Length - 1` fallback,
+/// which deliberately drops that final char).
+fn split_tokens<'a>(chars: &'a [char], delimiters: &[char]) -> Vec<&'a [char]> {
+    let mut tokens = Vec::new();
     let mut start = 0usize;
-
     while start < chars.len() {
         let remaining = &chars[start..];
         let index = remaining
             .iter()
             .position(|c| delimiters.contains(c))
             .unwrap_or(remaining.len() - 1);
-
-        let current_slice: String = remaining[..index].iter().collect();
+        tokens.push(&remaining[..index]);
         start += index + 1;
+    }
+    tokens
+}
 
+fn parse_rule(tokens: &[&[char]], rule: &Format3DRule) -> Format3DResult {
+    // If there's no preceding token we just consider it found.
+    let mut found_prefix = rule.preceding_token.as_deref().is_none_or(str::is_empty);
+
+    for token in tokens {
         if !found_prefix {
             found_prefix = rule
                 .preceding_token
                 .as_deref()
-                .is_some_and(|t| current_slice.eq_ignore_ascii_case(t));
+                .is_some_and(|t| eq_ignore_ascii_case(token, t));
             continue;
         }
 
-        is_3d = found_prefix && current_slice.eq_ignore_ascii_case(&rule.token);
-
-        if is_3d {
-            format_3d = Some(rule.token.clone());
-            break;
+        if eq_ignore_ascii_case(token, &rule.token) {
+            return Format3DResult::new(true, Some(rule.token.clone()));
         }
     }
 
-    if is_3d {
-        Format3DResult::new(true, format_3d)
-    } else {
-        Format3DResult::default()
+    Format3DResult::default()
+}
+
+/// ASCII-case-insensitive equality between a `char` slice and a `str`,
+/// equivalent to collecting the slice into a `String` and calling
+/// [`str::eq_ignore_ascii_case`], but without allocating.
+fn eq_ignore_ascii_case(slice: &[char], text: &str) -> bool {
+    let mut expected = text.chars();
+    for actual in slice {
+        match expected.next() {
+            Some(c) if actual.eq_ignore_ascii_case(&c) => {}
+            _ => return false,
+        }
     }
+    expected.next().is_none()
 }

@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 
-use fancy_regex::Regex;
 use ferrofin_model::entities::ExtraType;
 
-use crate::common::{EpisodeExpression, MediaType};
+use crate::common::{EpisodeExpression, GuardedRegex, MediaType};
 use crate::video::{ExtraRule, ExtraRuleType, FileStackRule, Format3DRule, StubTypeRule};
 
 /// Big collection of naming options driving every parser in the crate.
@@ -65,10 +64,14 @@ pub struct NamingOptions {
     pub multiple_episode_expressions: Vec<EpisodeExpression>,
     /// List of extra rules for videos.
     pub video_extra_rules: Vec<ExtraRule>,
+    /// Compiled audiobook parts regexes.
+    pub audio_book_parts_regexes: Vec<GuardedRegex>,
+    /// Compiled audiobook names regexes.
+    pub audio_book_names_regexes: Vec<GuardedRegex>,
     /// Compiled clean-`DateTime` regexes.
-    pub clean_date_time_regexes: Vec<Regex>,
+    pub clean_date_time_regexes: Vec<GuardedRegex>,
     /// Compiled clean-string regexes.
-    pub clean_string_regexes: Vec<Regex>,
+    pub clean_string_regexes: Vec<GuardedRegex>,
 }
 
 impl Default for NamingOptions {
@@ -233,6 +236,14 @@ impl NamingOptions {
 
         let multiple_episode_expressions = build_multiple_episode_expressions();
 
+        let audio_book_parts_regexes = audio_book_parts_expressions
+            .iter()
+            .map(|e| compile(e))
+            .collect();
+        let audio_book_names_regexes = audio_book_names_expressions
+            .iter()
+            .map(|e| compile(e))
+            .collect();
         let clean_date_time_regexes = clean_date_times.iter().map(|e| compile(e)).collect();
         let clean_string_regexes = clean_strings.iter().map(|e| compile(e)).collect();
 
@@ -260,6 +271,8 @@ impl NamingOptions {
             clean_strings,
             multiple_episode_expressions,
             video_extra_rules,
+            audio_book_parts_regexes,
+            audio_book_names_regexes,
             clean_date_time_regexes,
             clean_string_regexes,
         }
@@ -267,6 +280,16 @@ impl NamingOptions {
 
     /// Recompiles the raw clean-regex strings into compiled regexes.
     pub fn compile(&mut self) {
+        self.audio_book_parts_regexes = self
+            .audio_book_parts_expressions
+            .iter()
+            .map(|e| compile(e))
+            .collect();
+        self.audio_book_names_regexes = self
+            .audio_book_names_expressions
+            .iter()
+            .map(|e| compile(e))
+            .collect();
         self.clean_date_time_regexes = self.clean_date_times.iter().map(|e| compile(e)).collect();
         self.clean_string_regexes = self.clean_strings.iter().map(|e| compile(e)).collect();
     }
@@ -278,8 +301,8 @@ impl NamingOptions {
 ///
 /// Panics if `exp` is not a valid regex. Production strings are vendored and
 /// valid; the empty-string test path is also valid.
-fn compile(exp: &str) -> Regex {
-    Regex::new(&format!("(?i){exp}")).expect("NamingOptions clean regex is valid")
+fn compile(exp: &str) -> GuardedRegex {
+    GuardedRegex::new(&format!("(?i){exp}")).expect("NamingOptions clean regex is valid")
 }
 
 fn str_vec(items: &[&str]) -> Vec<String> {

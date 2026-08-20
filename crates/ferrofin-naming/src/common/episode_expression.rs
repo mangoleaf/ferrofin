@@ -2,18 +2,18 @@
 
 use std::cell::OnceCell;
 
-use fancy_regex::Regex;
+use crate::common::GuardedRegex;
 
 /// Regular expression for parsing TV episodes.
 ///
-/// The C# type lazily compiles the [`Regex`] on first access and resets it when
+/// The C# type lazily compiles the [`GuardedRegex`] on first access and resets it when
 /// [`Self::set_expression`] is called; we mirror that with a [`OnceCell`].
 // Four independent flags, one-for-one with the C# `EpisodeExpression` class.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct EpisodeExpression {
     expression: String,
-    regex: OnceCell<Regex>,
+    regex: OnceCell<GuardedRegex>,
     /// Indicates whether a date is expected in the expression.
     pub is_by_date: bool,
     /// Indicates whether the expression is optimistic.
@@ -53,8 +53,8 @@ impl EpisodeExpression {
         self.regex = OnceCell::new();
     }
 
-    /// Returns the compiled [`Regex`], compiling it (case-insensitively) on
-    /// first access.
+    /// Returns the compiled [`GuardedRegex`], compiling it (case-insensitively)
+    /// on first access.
     ///
     /// # Panics
     ///
@@ -62,9 +62,9 @@ impl EpisodeExpression {
     /// production come from the vendored `NamingOptions` tables and are valid;
     /// tests that construct arbitrary expressions supply valid regexes.
     #[must_use]
-    pub fn regex(&self) -> &Regex {
+    pub fn regex(&self) -> &GuardedRegex {
         self.regex.get_or_init(|| {
-            Regex::new(&format!("(?i){}", self.expression))
+            GuardedRegex::new(&format!("(?i){}", self.expression))
                 .expect("EpisodeExpression pattern is a valid regex")
         })
     }

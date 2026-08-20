@@ -1,7 +1,5 @@
 //! Port of `Emby.Naming.AudioBook.AudioBookFilePathParser`.
 
-use fancy_regex::Regex;
-
 use crate::audiobook::AudioBookFilePathParserResult;
 use crate::common::NamingOptions;
 use crate::path;
@@ -24,10 +22,7 @@ impl<'a> AudioBookFilePathParser<'a> {
         let mut result = AudioBookFilePathParserResult::default();
         let file_name = path::file_name_without_extension(path_str);
 
-        for expression in &self.options.audio_book_parts_expressions {
-            let Ok(regex) = Regex::new(&format!("(?i){expression}")) else {
-                continue;
-            };
+        for regex in &self.options.audio_book_parts_regexes {
             let Ok(Some(captures)) = regex.captures(file_name) else {
                 continue;
             };
