@@ -291,10 +291,19 @@ impl PhotoProvider {
         // The EXIF branch, gated on the extension set (C#: "other extensions
         // might cause taglib to hang"). A file that cannot be read or carries no
         // EXIF simply leaves the fields alone — C# catches and logs.
-        if is_exif_candidate(&path)
-            && let Some(tags) = read_exif(&path)
-        {
-            apply_exif(item, &tags);
+        if is_exif_candidate(&path) {
+            // Opening and parsing the container is synchronous file IO, once
+            // per photo — an album is thousands of them. On a stalled NFS mount
+            // that would block an async worker thread, so it runs on the
+            // blocking pool like the book-archive reads do.
+            let owned = path.clone();
+            let tags = tokio::task::spawn_blocking(move || read_exif(&owned))
+                .await
+                .ok()
+                .flatten();
+            if let Some(tags) = tags {
+                apply_exif(item, &tags);
+            }
         }
 
         if (item.width <= 0 || item.height <= 0)

@@ -242,6 +242,38 @@ impl Database {
         Ok(rows)
     }
 
+    /// Names the `PhotoAlbum` rows among `ids`, keyed by the id in its stored
+    /// (uppercase, hyphenated) GUID form.
+    ///
+    /// A photo's `Album`/`AlbumId` come from its parent album, and a page of
+    /// photos resolves them all in one query rather than one per photo. Rows
+    /// that are not a `PhotoAlbum` — a loose photo's collection folder, say —
+    /// are simply absent from the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "Name" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders})
+                     AND "Type" LIKE '%.PhotoAlbum' AND "Name" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]
     /// when the key is unset.
     ///

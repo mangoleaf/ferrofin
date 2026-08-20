@@ -171,6 +171,27 @@ pub async fn seed_item_with_data(
     .await;
 }
 
+/// Inserts a named `BaseItems` row of the given kind hanging off `parent`.
+pub async fn seed_child_item(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    parent: Uuid,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            parent: Some(parent),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
