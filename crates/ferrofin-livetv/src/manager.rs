@@ -18,9 +18,10 @@ use uuid::Uuid;
 
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::BaseItemDto;
+use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::{
-    ChannelType, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo, LiveTvServiceStatus,
-    RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
+    ChannelType, ItemSortBy, ListingsProviderInfo, LiveTvInfo, LiveTvServiceInfo,
+    LiveTvServiceStatus, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
@@ -42,6 +43,21 @@ const SQLITE_BIND_LIMIT: usize = 999;
 const CHANNEL_NS: Uuid = Uuid::from_u128(0x6c74_7663_6861_6e6e_656c_735f_6e73_3031);
 /// Namespace for deriving stable programme UUIDs (v5) from `channel|start`.
 const PROGRAM_NS: Uuid = Uuid::from_u128(0x6c74_7670_726f_6772_616d_735f_6e73_3031);
+
+/// The columns a guide list read returns, joined to the owning channel for
+/// `ChannelName`. Held apart from the filters so the `WHERE`/`ORDER`/`LIMIT`
+/// builders can be shared with the total-record count.
+const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
+                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
+                      p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
+
+/// [`PROGRAM_SELECT`]'s `FROM`/`JOIN` counting instead of selecting, so the
+/// total-record count runs the identical filter set.
+const PROGRAM_COUNT: &str = r#"SELECT COUNT(*)
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
 
 /// Concrete Live TV manager backed by [`Database`] and a [`SourceFetcher`].
 #[derive(Clone)]
@@ -366,31 +382,37 @@ impl LiveTvManager for FerrofinLiveTvManager {
         query: &InternalItemsQuery,
         _options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        // Optional channel filter drawn from the query's channel ids, in the
-        // canonical stored GUID form so it compares equal to the "ChannelId"
-        // column text.
-        let channel_filter: Vec<String> =
-            query.channel_ids.iter().copied().map(guid_to_db).collect();
-        let rows = sqlx::query(
-            r#"SELECT p."Id",p."ChannelId",p."StartDate",p."EndDate",p."Title",p."EpisodeTitle",
-                      p."Overview",p."Genres",p."ProductionYear",p."OfficialRating",p."IsNew",
-                      p."IsRepeat",p."IsPremiere",c."Name" AS "ChannelName"
-               FROM "FerrofinLiveTvPrograms" p
-               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId"
-               ORDER BY p."StartDate""#,
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        let items: Vec<BaseItemDto> = rows
-            .iter()
-            .filter(|r| {
-                channel_filter.is_empty()
-                    || channel_filter.contains(&r.get::<String, _>("ChannelId"))
-            })
-            .map(|r| self.program_dto(r))
-            .collect();
-        Ok(QueryResult::from_items(items))
+        // Every filter is pushed into SQL. It used to read the whole guide
+        // (`SELECT … ORDER BY StartDate` with no WHERE and no LIMIT) and filter
+        // channels in Rust, so a client asking for two hours of thirty channels
+        // was served the entire week for every channel — tens of megabytes of
+        // JSON per request, and `Limit` had no effect at all.
+        let now = Utc::now();
+        let start_index = query.start_index.unwrap_or(0);
+
+        let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
+        push_program_filters(&mut qb, query, now);
+        push_program_order(&mut qb, &query.order_by);
+        push_program_paging(&mut qb, query.limit, start_index);
+        let rows = qb.build().fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let items: Vec<BaseItemDto> = rows.iter().map(|r| self.program_dto(r)).collect();
+
+        // Same rule as the item repository: the count is only bought when
+        // paging actually truncated the result.
+        let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
+        {
+            let mut cb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
+            push_program_filters(&mut cb, query, now);
+            let count: i64 = cb
+                .build_query_scalar()
+                .fetch_one(self.db.pool())
+                .await
+                .map_err(db_err)?;
+            i32::try_from(count).unwrap_or(i32::MAX)
+        } else {
+            i32::try_from(items.len()).unwrap_or(i32::MAX) + start_index
+        };
+        Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 
     async fn get_program(
@@ -738,6 +760,162 @@ impl FerrofinLiveTvManager {
     }
 }
 
+/// Emits `WHERE` for the first predicate of a query and `AND` for each one
+/// after it.
+fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
+    qb.push(if *first { " WHERE " } else { " AND " });
+    *first = false;
+}
+
+/// Pushes the `WHERE` clause of a program query onto `qb`.
+///
+/// Port of the program-relevant arms of C#
+/// `BaseItemRepository.TranslateQuery`: the channel scope, the start/end date
+/// window (with `HasAired` *overriding* the end-date bounds exactly as upstream
+/// does), the airing flag, the exact-name scope `librarySeriesId` sets, and the
+/// genre scope.
+///
+/// Filters whose backing data the guide cache does not hold are deliberately
+/// not faked: `IsMovie`/`IsSeries`/`IsNews`/`IsKids`/`IsSports` need the
+/// per-listing-provider category classification Jellyfin stores as columns on
+/// the program item, `GenreIds` needs genre identity rows, and `SeriesTimerId`
+/// needs the timer↔program link. They stay unapplied until the schema carries
+/// them.
+fn push_program_filters(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    query: &InternalItemsQuery,
+    now: DateTime<Utc>,
+) {
+    let mut first = true;
+    let now_db = datetime_to_db(now);
+
+    if !query.channel_ids.is_empty() {
+        push_separator(qb, &mut first);
+        qb.push(r#"p."ChannelId" IN ("#);
+        let mut list = qb.separated(",");
+        for id in &query.channel_ids {
+            list.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+    }
+
+    // C# `HasAired` *replaces* the end-date bound rather than intersecting it.
+    let (mut min_end, mut max_end) = (query.min_end_date, query.max_end_date);
+    match query.has_aired {
+        Some(true) => max_end = Some(now),
+        Some(false) => min_end = Some(now),
+        None => {}
+    }
+    for (column, op, bound) in [
+        (r#"p."StartDate""#, " >= ", query.min_start_date),
+        (r#"p."StartDate""#, " <= ", query.max_start_date),
+        (r#"p."EndDate""#, " >= ", min_end),
+        (r#"p."EndDate""#, " <= ", max_end),
+    ] {
+        if let Some(bound) = bound {
+            push_separator(qb, &mut first);
+            qb.push(column).push(op).push_bind(datetime_to_db(bound));
+        }
+    }
+
+    if let Some(is_airing) = query.is_airing {
+        push_separator(qb, &mut first);
+        if is_airing {
+            qb.push(r#"(p."StartDate" <= "#)
+                .push_bind(now_db.clone())
+                .push(r#" AND p."EndDate" >= "#)
+                .push_bind(now_db)
+                .push(")");
+        } else {
+            // Accepted divergence: upstream writes `StartDate > now && EndDate
+            // < now`, a contradiction that can never match a programme, so
+            // `isAiring=false` upstream returns nothing at all. Ferrofin reads
+            // it as the negation that was plainly meant.
+            qb.push(r#"(p."StartDate" > "#)
+                .push_bind(now_db.clone())
+                .push(r#" OR p."EndDate" < "#)
+                .push_bind(now_db)
+                .push(")");
+        }
+    }
+
+    if let Some(name) = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        // Upstream compares against the item's CleanName; the guide cache has
+        // no cleaned column, so this is a case-insensitive title match.
+        push_separator(qb, &mut first);
+        qb.push(r#"LOWER(p."Title") = "#)
+            .push_bind(name.to_lowercase());
+    }
+
+    if !query.genres.is_empty() {
+        // `Genres` holds the XMLTV `<category>` list as a JSON array; upstream
+        // matches any one of the requested genres.
+        push_separator(qb, &mut first);
+        qb.push(r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE LOWER("value") IN ("#);
+        let mut list = qb.separated(",");
+        for genre in &query.genres {
+            list.push_bind(genre.to_lowercase());
+        }
+        qb.push("))");
+    }
+}
+
+/// The guide column a sort key reads, or `None` when the guide cache holds
+/// nothing to sort by (those keys are skipped rather than faked).
+fn program_sort_column(sort: ItemSortBy) -> Option<&'static str> {
+    match sort {
+        ItemSortBy::Default | ItemSortBy::StartDate => Some(r#"p."StartDate""#),
+        ItemSortBy::Name | ItemSortBy::SortName => Some(r#"p."Title""#),
+        ItemSortBy::OfficialRating => Some(r#"p."OfficialRating""#),
+        ItemSortBy::ProductionYear => Some(r#"p."ProductionYear""#),
+        ItemSortBy::Random => Some("RANDOM()"),
+        _ => None,
+    }
+}
+
+/// Pushes the `ORDER BY` clause, falling back to start-date ascending — the
+/// order C# `LiveTvManager.GetPrograms` relies on ("order by start date to take
+/// advantage of a specialized index"). The id tiebreaker makes paging stable
+/// across requests.
+fn push_program_order(qb: &mut QueryBuilder<'_, Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
+    let mut wrote = false;
+    for (column, order) in order_by {
+        let Some(sql) = program_sort_column(*column) else {
+            continue;
+        };
+        qb.push(if wrote { ", " } else { " ORDER BY " })
+            .push(sql)
+            .push(if *order == SortOrder::Descending {
+                " DESC"
+            } else {
+                " ASC"
+            });
+        wrote = true;
+    }
+    if !wrote {
+        qb.push(r#" ORDER BY p."StartDate" ASC"#);
+    }
+    qb.push(r#", p."Id""#);
+}
+
+/// Pushes `LIMIT`/`OFFSET` for the requested page.
+fn push_program_paging(qb: &mut QueryBuilder<'_, Sqlite>, limit: Option<i32>, start_index: i32) {
+    if let Some(limit) = limit {
+        qb.push(" LIMIT ").push_bind(i64::from(limit.max(0)));
+    } else if start_index > 0 {
+        // SQLite has no bare OFFSET: -1 is its "no limit" sentinel.
+        qb.push(" LIMIT -1");
+    }
+    if start_index > 0 {
+        qb.push(" OFFSET ").push_bind(i64::from(start_index));
+    }
+}
+
 /// Ensures a DTO id field is set, generating a fresh UUID when absent, and
 /// returns it.
 fn ensure_id(id: &mut Option<String>) -> String {
@@ -796,6 +974,9 @@ mod tests {
     use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
     use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
     use ferrofin_traits::stubs::LiveTvManager;
+
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
 
     use super::{FerrofinLiveTvManager, SourceFetcher, parse_dt};
 
@@ -1050,6 +1231,209 @@ mod tests {
             .await
             .expect("progs");
         assert_eq!(programs.total_record_count, 5000);
+    }
+
+    /// Builds a two-channel guide whose airings sit at fixed offsets from *now*,
+    /// so the airing/has-aired filters can be asserted without freezing the
+    /// clock. Offsets are in minutes relative to the current instant.
+    fn relative_guide() -> String {
+        use std::fmt::Write as _;
+        let now = chrono::Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        for (channel, from, to, title, genre) in [
+            ("one.tv", -180, -120, "Aired", "News"),
+            ("one.tv", -30, 30, "Now Playing", "Drama"),
+            ("one.tv", 120, 180, "Later", "Comedy"),
+            ("two.tv", -10, 50, "Two Now", "News"),
+        ] {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"{channel}\">\
+                 <title>{title}</title><category>{genre}</category></programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        xml
+    }
+
+    /// A manager whose guide holds [`relative_guide`] over the two [`M3U`]
+    /// channels.
+    async fn manager_with_relative_guide() -> FerrofinLiveTvManager {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), relative_guide());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+        mgr.save_listing_provider(ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            ..ListingsProviderInfo::default()
+        })
+        .await
+        .expect("provider");
+        mgr.refresh_guide().await.expect("refresh");
+        mgr
+    }
+
+    /// The programme titles a query returns, in the order it returned them.
+    async fn titles(mgr: &FerrofinLiveTvManager, query: &InternalItemsQuery) -> Vec<String> {
+        mgr.get_programs(query, &DtoOptions::default())
+            .await
+            .expect("programs")
+            .items
+            .into_iter()
+            .filter_map(|item| item.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn program_query_orders_by_start_date_and_scopes_to_channels() {
+        let mgr = manager_with_relative_guide().await;
+        assert_eq!(
+            titles(&mgr, &InternalItemsQuery::default()).await,
+            ["Aired", "Now Playing", "Two Now", "Later"],
+            "the default order is start-date ascending"
+        );
+
+        let two = mgr
+            .get_channels(&DtoOptions::default())
+            .await
+            .expect("channels")
+            .items
+            .into_iter()
+            .find(|c| c.name.as_deref() == Some("Channel Two"))
+            .expect("channel two")
+            .id;
+        let query = InternalItemsQuery {
+            channel_ids: vec![two],
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &query).await, ["Two Now"]);
+    }
+
+    #[tokio::test]
+    async fn program_query_applies_the_airing_window() {
+        let mgr = manager_with_relative_guide().await;
+        let now = chrono::Utc::now();
+
+        let airing = InternalItemsQuery {
+            is_airing: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &airing).await, ["Now Playing", "Two Now"]);
+
+        // Accepted divergence: upstream's `isAiring=false` predicate is a
+        // contradiction that matches nothing; Ferrofin reads it as "not on now".
+        let not_airing = InternalItemsQuery {
+            is_airing: Some(false),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &not_airing).await, ["Aired", "Later"]);
+
+        // HasAired replaces the end-date bound: everything that has finished.
+        let aired = InternalItemsQuery {
+            has_aired: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &aired).await, ["Aired"]);
+
+        // An explicit window keeps only the airings wholly inside it.
+        let window = InternalItemsQuery {
+            min_start_date: Some(now),
+            max_end_date: Some(now + chrono::Duration::hours(4)),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &window).await, ["Later"]);
+    }
+
+    #[tokio::test]
+    async fn program_query_pages_and_counts() {
+        let mgr = manager_with_relative_guide().await;
+
+        let limited = InternalItemsQuery {
+            limit: Some(2),
+            ..InternalItemsQuery::default()
+        };
+        let page = mgr
+            .get_programs(&limited, &DtoOptions::default())
+            .await
+            .expect("page");
+        assert_eq!(page.items.len(), 2, "Limit truncates the page");
+        assert_eq!(
+            page.total_record_count, 4,
+            "the total still counts every match"
+        );
+
+        let offset = InternalItemsQuery {
+            start_index: Some(2),
+            limit: Some(1),
+            ..InternalItemsQuery::default()
+        };
+        let page = mgr
+            .get_programs(&offset, &DtoOptions::default())
+            .await
+            .expect("page2");
+        assert_eq!(page.start_index, 2);
+        assert_eq!(page.total_record_count, 4);
+        assert_eq!(
+            page.items.first().and_then(|i| i.name.clone()).as_deref(),
+            Some("Two Now"),
+            "StartIndex skips into the start-date order"
+        );
+
+        // No paging: the count is the item count, not a second query.
+        let all = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("all");
+        assert_eq!(all.total_record_count, 4);
+        assert_eq!(all.start_index, 0);
+    }
+
+    #[tokio::test]
+    async fn program_query_sorts_filters_by_genre_and_by_name() {
+        let mgr = manager_with_relative_guide().await;
+
+        let descending = InternalItemsQuery {
+            order_by: vec![(ItemSortBy::StartDate, SortOrder::Descending)],
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            titles(&mgr, &descending).await,
+            ["Later", "Two Now", "Now Playing", "Aired"]
+        );
+
+        let by_title = InternalItemsQuery {
+            order_by: vec![(ItemSortBy::Name, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            titles(&mgr, &by_title).await,
+            ["Aired", "Later", "Now Playing", "Two Now"]
+        );
+
+        // Genres come from the XMLTV <category> list and match case-insensitively.
+        let news = InternalItemsQuery {
+            genres: vec!["news".to_owned()],
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &news).await, ["Aired", "Two Now"]);
+
+        // The exact-name scope `librarySeriesId` sets.
+        let named = InternalItemsQuery {
+            name: Some("two now".to_owned()),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(titles(&mgr, &named).await, ["Two Now"]);
     }
 
     #[tokio::test]
