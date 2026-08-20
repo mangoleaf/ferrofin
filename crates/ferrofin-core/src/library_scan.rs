@@ -2192,13 +2192,13 @@ impl LibraryScanner {
         let tmdb_on = policy.metadata_enabled(&short, fetcher_names::TMDB);
         let tvdb_first = policy.metadata_rank(&short, fetcher_names::TVDB)
             <= policy.metadata_rank(&short, fetcher_names::TMDB);
-        if tvdb_on && (tvdb_first || !tmdb_on) {
-            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
-            // A TVDB hit (series cached, or episode text applied) is authoritative;
-            // only fall through to TMDB for a series TVDB could not resolve.
-            if short == "Episode" || cache.series_tvdb.contains_key(&entity.id) {
-                return result;
-            }
+        if tvdb_on
+            && (tvdb_first || !tmdb_on)
+            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+        {
+            // A TVDB hit is authoritative. A miss falls through to TMDB — for
+            // an episode as well as a series.
+            return result;
         }
         if !tmdb_on {
             return RemoteMetadata::default();
@@ -2215,11 +2215,12 @@ impl LibraryScanner {
         // Episode branch at all, so the gap was unreachable; now an episode
         // TMDB has nothing for would otherwise never reach the fetcher the
         // library ranked second.
-        if tvdb_on && matches!(short.as_str(), "Series" | "Episode") && !tvdb_first {
-            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
-            if short == "Episode" || cache.series_tvdb.contains_key(&entity.id) {
-                return result;
-            }
+        if tvdb_on
+            && matches!(short.as_str(), "Series" | "Episode")
+            && !tvdb_first
+            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+        {
+            return result;
         }
         RemoteMetadata::default()
     }
@@ -2497,29 +2498,30 @@ impl LibraryScanner {
     /// (its `tvdb_id` lets episodes resolve, its artwork feeds the image pass).
     /// For an **episode** it resolves the episode by (season, number) against the
     /// cached series id and applies its name/overview/air date. Returns the cast
-    /// to persist. Best-effort — a miss returns no people and leaves the row for
-    /// the TMDB fallback.
+    /// to persist.
+    ///
+    /// `None` is a MISS — TVDB is unwired, could not resolve the title, or has
+    /// nothing for this episode — and the caller falls through to the next
+    /// fetcher. A series miss was previously detectable from
+    /// `cache.series_tvdb`, but an episode miss had no such signal, so the
+    /// caller returned unconditionally for episodes: with no saved
+    /// `TypeOptions` both fetcher ranks are `usize::MAX`, making `tvdb_first`
+    /// true by default, so a library on default ordering never offered TMDB the
+    /// episodes TVDB could not resolve (alternate numbering, specials, very new
+    /// episodes). Both kinds now report a miss the same way.
     async fn fetch_tvdb_metadata(
         &self,
         entity: &mut BaseItemEntity,
         short: &str,
         cache: &mut ArtworkCache,
-    ) -> RemoteMetadata {
-        let Some(tvdb) = &self.tvdb else {
-            return RemoteMetadata::default();
-        };
+    ) -> Option<RemoteMetadata> {
+        let tvdb = self.tvdb.as_ref()?;
         match short {
             "Series" => {
-                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                    return RemoteMetadata::default();
-                };
+                let name = entity.name.as_deref().filter(|n| !n.is_empty())?;
                 let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-                let Some(hit) = pick_series_hit(tvdb.search(name, year).await, year) else {
-                    return RemoteMetadata::default();
-                };
-                let Some(details) = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await else {
-                    return RemoteMetadata::default();
-                };
+                let hit = pick_series_hit(tvdb.search(name, year).await, year)?;
+                let details = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await?;
                 apply_tvdb_series(entity, &details);
                 let people = tvdb_people(&details.people);
                 // Persist the Tvdb id + the cross-provider ids TVDB carries (Imdb
@@ -2532,11 +2534,11 @@ impl LibraryScanner {
                     provider_ids.push(("Tmdb".to_owned(), tmdb.to_owned()));
                 }
                 cache.series_tvdb.insert(entity.id.clone(), details);
-                RemoteMetadata {
+                Some(RemoteMetadata {
                     people,
                     provider_ids,
                     people_fetched: true,
-                }
+                })
             }
             "Episode" => {
                 let (Some(series_id), Some(season), Some(number)) = (
@@ -2546,23 +2548,18 @@ impl LibraryScanner {
                         .and_then(|n| i32::try_from(n).ok()),
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
                 ) else {
-                    return RemoteMetadata::default();
+                    return None;
                 };
                 // The parent series must have matched TVDB earlier this scan.
-                let Some(tvdb_id) = cache.series_tvdb.get(&series_id).map(|d| d.tvdb_id) else {
-                    return RemoteMetadata::default();
-                };
-                let Some(ep) = tvdb
+                let tvdb_id = cache.series_tvdb.get(&series_id).map(|d| d.tvdb_id)?;
+                let ep = tvdb
                     .episode_by_number(
                         tvdb_id,
                         ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
                         season,
                         number,
                     )
-                    .await
-                else {
-                    return RemoteMetadata::default();
-                };
+                    .await?;
                 apply_tvdb_episode(entity, &ep);
                 if let Some(url) = &ep.image_url {
                     cache
@@ -2575,17 +2572,21 @@ impl LibraryScanner {
                 // crew), so prefer those; TVDB's episode credits (guest cast +
                 // director/writers) are the fallback when the series has no
                 // TMDB id or TMDB has nothing for the episode.
-                match self
-                    .episode_people(series_tmdb_id_of(cache, &series_id), season, number, &ep)
-                    .await
-                {
-                    Some(people) => RemoteMetadata::just_people(people),
-                    // Nothing authoritative about this episode's cast — leave
-                    // whatever is stored alone rather than clearing it.
-                    None => RemoteMetadata::default(),
-                }
+                // A hit either way: the episode's text was applied above. Only
+                // the CAST may be unknown, which `people_fetched: false` says.
+                Some(
+                    match self
+                        .episode_people(series_tmdb_id_of(cache, &series_id), season, number, &ep)
+                        .await
+                    {
+                        Some(people) => RemoteMetadata::just_people(people),
+                        // Nothing authoritative about this episode's cast —
+                        // leave whatever is stored alone rather than clearing it.
+                        None => RemoteMetadata::default(),
+                    },
+                )
             }
-            _ => RemoteMetadata::default(),
+            _ => None,
         }
     }
 
@@ -6402,10 +6403,13 @@ mod tests {
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
             ..Default::default()
         };
-        let result = scanner
-            .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
-            .await;
-        assert!(result.people.is_empty() && result.provider_ids.is_empty());
+        // A miss, not an empty hit: the caller must be able to fall through.
+        assert!(
+            scanner
+                .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
+                .await
+                .is_none()
+        );
         assert!(cache.series_tvdb.is_empty());
 
         // Episode whose series isn't in the TVDB cache → skipped (no network).
@@ -6416,10 +6420,44 @@ mod tests {
             index_number: Some(1),
             ..Default::default()
         };
+        assert!(
+            scanner
+                .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
+                .await
+                .is_none()
+        );
+    }
+
+    // With no saved TypeOptions both fetcher ranks are `usize::MAX`, so
+    // `tvdb_first` is true and TVDB runs first. An episode TVDB cannot resolve
+    // — alternate numbering, a special, something aired yesterday — must still
+    // reach TMDB. It did not: the caller returned unconditionally for episodes,
+    // because a series miss was detectable from the cache and an episode miss
+    // was not.
+    #[tokio::test]
+    async fn an_episode_tvdb_misses_still_reaches_tmdb() {
+        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        // TVDB is wired and ranked first (default policy), but knows nothing:
+        // its client points at no server, so every lookup misses.
+        let scanner = scanner.with_tvdb(Arc::new(ferrofin_providers::TvdbClient::new()));
+
         let result = scanner
-            .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
+            .fetch_remote_metadata(
+                &mut episode,
+                &mut cache,
+                super::FetcherPolicy::default(),
+                None,
+            )
             .await;
-        assert!(result.people.is_empty());
+
+        assert_eq!(
+            episode.name.as_deref(),
+            Some("Winter Is Coming"),
+            "TMDB must get the episode TVDB could not resolve"
+        );
+        assert!(result.people_fetched);
     }
 
     // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.
