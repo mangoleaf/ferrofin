@@ -1,9 +1,9 @@
 //! Port of `AttachmentExtractor`.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::MediaEncodingError;
+use crate::keyed_locks::KeyedLocks;
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::MediaStreamType;
@@ -110,7 +110,7 @@ where
     io: Arc<I>,
     /// Per-output-folder locks (port of `AsyncKeyedLocker<string>`), serializing
     /// extraction so two callers never race on the same cache folder.
-    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    locks: KeyedLocks,
 }
 
 impl<E, R, I> AttachmentExtractorImpl<E, R, I>
@@ -125,14 +125,13 @@ where
             media_encoder,
             resolver,
             io,
-            locks: Mutex::new(HashMap::new()),
+            locks: KeyedLocks::new(),
         }
     }
 
     /// Returns the keyed lock for `key`, creating it on first use.
     fn lock_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
-        let mut locks = self.locks.lock().expect("attachment locks poisoned");
-        Arc::clone(locks.entry(key.to_owned()).or_default())
+        self.locks.get(key)
     }
 
     /// Whether the source has any video or audio stream (drives the dummy

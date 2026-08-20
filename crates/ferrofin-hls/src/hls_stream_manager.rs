@@ -35,6 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ferrofin_mediaencoding::keyed_locks::KeyedLocks;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
 use ferrofin_mediaencoding::transcoding::{FsFileCleaner, SessionReporter};
@@ -169,16 +170,19 @@ where
     /// seek requests for the same output could each spawn an ffmpeg writing the
     /// same `{stem}{n}.ts` files — a torn, corrupt segment. Port of Jellyfin's
     /// per-playlist `TranscodingLock`.
-    segment_locks:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Keyed by the playlist's output path, which carries a per-play-session
+    /// id, so the key space grows with every playback — hence [`KeyedLocks`],
+    /// which forgets a key once nobody holds it.
+    segment_locks: Arc<KeyedLocks>,
     /// Per-playlist count of consecutive transcode (re)starts that died without
     /// producing their requested segment, plus the last failure time — the
     /// restart circuit breaker's state. Cleared the moment a started job
     /// delivers a segment.
     ///
-    /// ponytail: entries for permanently-failing playlists linger like
-    /// `segment_locks` entries do; add eviction only if either map ever
-    /// measurably matters.
+    /// Keyed by the same per-session playlist path, so a record whose cooldown
+    /// has long expired can never influence a decision again and is swept on the
+    /// next write — otherwise every playback that ever failed would be
+    /// remembered for the life of the process.
     restart_failures:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
 }
@@ -210,7 +214,7 @@ where
             manager,
             generator,
             paths,
-            segment_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            segment_locks: Arc::new(KeyedLocks::new()),
             restart_failures: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
@@ -237,6 +241,10 @@ where
             .restart_failures
             .lock()
             .expect("restart failures poisoned");
+        // A record older than the cooldown can no longer open the breaker, so it
+        // is dead weight; sweeping here keeps the map to the playlists actually
+        // failing rather than every playlist that ever failed.
+        map.retain(|k, (_, last)| k == key || last.elapsed() < RESTART_FAILURE_COOLDOWN);
         let entry = map
             .entry(key.to_owned())
             .or_insert((0, std::time::Instant::now()));
@@ -281,8 +289,7 @@ where
     /// find/evict/start critical section so concurrent seeks serialise instead of
     /// racing two ffmpegs onto the same segment files.
     fn playlist_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.segment_locks.lock().expect("segment locks poisoned");
-        Arc::clone(locks.entry(key.to_owned()).or_default())
+        self.segment_locks.get(key)
     }
 
     /// Builds a variant/main playlist string for `request` from a plan.
@@ -1200,6 +1207,66 @@ mod tests {
         assert_eq!(spawns.requests.lock().unwrap().len(), spawned + 1);
         let _ = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
         assert_eq!(spawns.requests.lock().unwrap().len(), spawned + 1);
+    }
+
+    #[test]
+    fn restart_failure_records_do_not_accumulate_across_playback_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+        // Each playback session has its own output path, so every failing
+        // stream mints a fresh key. Rewinding each record past the cooldown is
+        // what a real long-lived server sees: sessions that failed hours ago.
+        for i in 0..500 {
+            let key = format!("/cache/session-{i}/out.m3u8");
+            mgr.record_restart_failure(&key);
+            mgr.force_cooldown_elapsed(&key);
+        }
+        let live = mgr.restart_failures.lock().unwrap().len();
+        assert_eq!(
+            live, 1,
+            "records past their cooldown can no longer open the breaker and must \
+             not be retained; found {live} of 500"
+        );
+    }
+
+    #[test]
+    fn a_playlist_still_failing_keeps_its_record_while_others_are_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+        // Trip the breaker for one playlist, then churn unrelated stale keys
+        // past it. The sweep must not disarm a breaker that is still live.
+        for _ in 0..RESTART_FAILURE_LIMIT {
+            mgr.record_restart_failure("/cache/hot/out.m3u8");
+        }
+        assert!(mgr.restart_breaker_open("/cache/hot/out.m3u8"));
+        for i in 0..50 {
+            let key = format!("/cache/cold-{i}/out.m3u8");
+            mgr.record_restart_failure(&key);
+            mgr.force_cooldown_elapsed(&key);
+        }
+        assert!(
+            mgr.restart_breaker_open("/cache/hot/out.m3u8"),
+            "sweeping stale records must not reset a live breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn segment_locks_do_not_accumulate_across_playback_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+        // Each lock handle is dropped at the end of the iteration, exactly as a
+        // completed segment request releases it.
+        for i in 0..500 {
+            let _lock = mgr.playlist_lock(&format!("/cache/session-{i}/out.m3u8"));
+        }
+        assert_eq!(
+            mgr.segment_locks.len(),
+            1,
+            "a per-session playlist lock must be forgotten once nobody holds it"
+        );
     }
 
     #[tokio::test]

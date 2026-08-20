@@ -9,6 +9,16 @@
 
 // glibc malloc arena contention convoyed 64 threads (32 tokio + 32 sqlx-sqlite)
 // into 2200% kernel-mode CPU at moderate request rates; jemalloc eliminates it.
+//
+// The dependency enables jemalloc's `background_threads` feature, and that is a
+// memory fix rather than a speed one. jemalloc purges decayed dirty pages
+// *opportunistically, on allocator calls*: with no background thread, a server
+// that goes quiet after a burst never runs the purge, so anonymous memory stays
+// at whatever the burst peaked at for the rest of the process's life. Measured
+// over an identical 20,000-request burst followed by 90 s idle, anonymous
+// memory fell by 0.2-0.7 MiB (0.1-0.2%) without the background thread and by
+// 69-309 MiB (31-88%) with it. That ratchet is why a long-lived server's peak
+// RSS drifts far above its working set. Runtime `MALLOC_CONF` still overrides.
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

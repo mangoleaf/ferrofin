@@ -13,6 +13,7 @@ pub mod configuration;
 pub mod encoder;
 pub mod encoding_helper;
 pub mod error;
+pub mod keyed_locks;
 pub mod probing;
 pub mod subtitles;
 pub mod transcoding;

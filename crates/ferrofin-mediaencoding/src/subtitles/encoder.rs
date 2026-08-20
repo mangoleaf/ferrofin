@@ -13,15 +13,14 @@
 //! - `AsyncKeyedLock` around `ConvertSubtitles` determinism is preserved via the
 //!   same keyed-lock helper.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
-use tokio::sync::Mutex as AsyncMutex;
+
+use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Subtitle, TimeCode};
 use super::parser::{SubtitleEditParser, SubtitleParser};
@@ -132,26 +131,6 @@ pub trait SubtitleIo: Send + Sync {
     /// request) instead of hitting the cache.
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
-    }
-}
-
-/// A set of keyed async mutexes, replacing the C# `AsyncKeyedLocker<string>`.
-///
-/// Guarantees that operations sharing a key (an output cache path, or a
-/// conversion stream key) never run concurrently, preserving the determinism the
-/// `SubtitleEncoder` relies on.
-#[derive(Default)]
-struct KeyedLocks {
-    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-}
-
-impl KeyedLocks {
-    /// Returns the mutex for `key`, creating it on first use.
-    fn get(&self, key: &str) -> Arc<AsyncMutex<()>> {
-        let mut map = self.locks.lock().expect("keyed-lock map is not poisoned");
-        map.entry(key.to_owned())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
     }
 }
 
