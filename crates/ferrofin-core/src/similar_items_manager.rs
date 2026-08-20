@@ -352,11 +352,17 @@ impl FerrofinSimilarItemsManager {
                 reference.provider_name.to_lowercase(),
                 reference.provider_id.to_lowercase(),
             );
+            // C#'s `match.Score > existing.Score` is a *lifted* float comparison:
+            // it is false whenever either side is null, so an unscored reference
+            // never displaces a scored one and vice versa. `Option`'s own
+            // ordering ranks `Some` above `None`, which would diverge — hence
+            // the explicit both-present check.
             let better = match best.get(&key) {
                 None => true,
-                Some((score, at)) => {
-                    reference.score > *score || (reference.score == *score && position < *at)
-                }
+                Some((score, at)) => match (reference.score, *score) {
+                    (Some(new), Some(old)) if new > old => true,
+                    _ => reference.score == *score && position < *at,
+                },
             };
             if better {
                 best.insert(key, (reference.score, position));
@@ -534,12 +540,13 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             );
         }
 
-        // Highest score first; ties break on the id so a page is stable.
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.id.cmp(&b.0.id))
-        });
+        // Highest score first. The sort is deliberately left STABLE with no
+        // tie-break: the score formula clamps to 1.0, so a provider's first few
+        // results all tie, and their insertion order is the provider's own
+        // ranking. C# relies on the same stability (`OrderByDescending` is a
+        // stable sort in .NET) — adding a tie-break here would scramble the
+        // most relevant results.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(usize::try_from(wanted.max(0)).unwrap_or(0));
         Ok(scored.into_iter().map(|(entity, _)| entity).collect())
     }
