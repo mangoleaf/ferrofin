@@ -1400,6 +1400,7 @@ mod tests {
         FerrofinSyncPlayManager,
         Arc<RecordingBus>,
         ferrofin_db::Database,
+        Arc<dyn LibraryManager>,
     ) {
         let db = crate::test_support::test_db().await;
         let bus = Arc::new(RecordingBus::default());
@@ -1426,8 +1427,8 @@ mod tests {
         let users: Arc<dyn UserManager> =
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
         let mgr = FerrofinSyncPlayManager::new(Arc::clone(&bus) as Arc<dyn SessionMessageBus>)
-            .with_library_access(users, library);
-        (mgr, bus, db)
+            .with_library_access(users, Arc::clone(&library));
+        (mgr, bus, db, library)
     }
 
     /// A session for a user that exists in the DB.
@@ -1469,10 +1470,15 @@ mod tests {
     /// Removes an item from the library out from under a live group — the
     /// reachable way a queued item stops resolving (the queue gate keeps an
     /// unresolvable item from being enqueued in the first place).
-    async fn delete_item(db: &ferrofin_db::Database, id: Uuid) {
-        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(ferrofin_db::store::guid_to_db(id))
-            .execute(db.writer())
+    async fn delete_item(library: &dyn LibraryManager, id: Uuid) {
+        library
+            .delete_item(
+                id,
+                &ferrofin_traits::options::DeleteOptions {
+                    delete_file_location: false,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("delete item");
     }
@@ -1493,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_queue_item_that_stops_resolving_hides_the_group() {
-        let (m, _bus, db) = access_mgr().await;
+        let (m, _bus, db, library) = access_mgr().await;
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
@@ -1504,7 +1510,7 @@ mod tests {
         set_queue(&m, &owner, vec![movie]).await;
         assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
 
-        delete_item(&db, movie).await;
+        delete_item(library.as_ref(), movie).await;
         assert!(
             m.list_groups(&other).await.unwrap().is_empty(),
             "a group playing what the user cannot see is not listed"
@@ -1517,14 +1523,14 @@ mod tests {
 
     #[tokio::test]
     async fn joining_a_group_whose_queue_is_inaccessible_is_denied() {
-        let (m, bus, db) = access_mgr().await;
+        let (m, bus, db, library) = access_mgr().await;
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
         let movie = seed_movie(&db, "Movie").await;
 
         let info = m.new_group(&owner, "movie night").await.unwrap();
         set_queue(&m, &owner, vec![movie]).await;
-        delete_item(&db, movie).await;
+        delete_item(library.as_ref(), movie).await;
 
         m.join_group(&other, info.group_id).await.unwrap();
         assert_eq!(
@@ -1545,7 +1551,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_visible_queue_can_be_listed_and_joined() {
-        let (m, bus, db) = access_mgr().await;
+        let (m, bus, db, _library) = access_mgr().await;
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
 
@@ -1572,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_queue_change_a_member_cannot_see_is_refused() {
-        let (m, bus, db) = access_mgr().await;
+        let (m, bus, db, _library) = access_mgr().await;
         let owner = db_session(&db, "s1", "alice").await;
         let other = db_session(&db, "s2", "bob").await;
 

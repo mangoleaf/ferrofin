@@ -99,10 +99,18 @@ def main():
         check("  PlayableMediaTypes populated", bool(t.get("PlayableMediaTypes")), str(t.get("PlayableMediaTypes")))
 
     # ---- pick a real item to cast -----------------------------------------
+    # A Movie, specifically: casting a lone Episode legitimately expands to the
+    # rest of its series when the user auto-plays next episodes, which would make
+    # the "carries exactly the cast item" check ambiguous.
     status, items = http(
-        "GET", f"/Items?UserId={controller['user_id']}&Recursive=true&Limit=1&IncludeItemTypes=Movie,Episode,Audio",
+        "GET", f"/Items?UserId={controller['user_id']}&Recursive=true&Limit=1&IncludeItemTypes=Movie",
         token=controller["token"], **controller["ident"],
     )
+    if status != 200 or not (items or {}).get("Items"):
+        status, items = http(
+            "GET", f"/Items?UserId={controller['user_id']}&Recursive=true&Limit=1&IncludeItemTypes=Audio",
+            token=controller["token"], **controller["ident"],
+        )
     item_id = None
     folder_id = None
     real_item = True
@@ -208,6 +216,36 @@ def main():
     msg = ws_t.wait("GeneralCommand")
     check("DisplayContent (browse-to) reaches target", msg is not None, f"http {status}, got {ws_t.types()}")
 
+    # ---- the return path: what the target plays shows up on the controller --
+    # Without this a cast "works" but the remote-control UI stays blank.
+    if real_item:
+        http("POST", "/Sessions/Playing", token=target["token"],
+             body={"ItemId": item_id, "PositionTicks": 0, "IsPaused": False,
+                   "PlayMethod": "DirectPlay"},
+             **target["ident"])
+        http("POST", "/Sessions/Playing/Progress", token=target["token"],
+             body={"ItemId": item_id, "PositionTicks": 900000000, "IsPaused": True,
+                   "PlayMethod": "DirectPlay"},
+             **target["ident"])
+        status, sessions = http(
+            "GET", f"/Sessions?ControllableByUserId={controller['user_id']}",
+            token=controller["token"], **controller["ident"],
+        )
+        seen = next((s for s in (sessions or []) if s.get("Id") == target["session_id"]), None)
+        now_playing = (seen or {}).get("NowPlayingItem") or {}
+        play_state = (seen or {}).get("PlayState") or {}
+        check("the target's NowPlayingItem is visible to the controller",
+              str(now_playing.get("Id", "")).replace("-", "").lower()
+              == item_id.replace("-", "").lower(),
+              f"http {status}, got {now_playing.get('Id')}")
+        check("the target's PlayState (position + paused) is visible to the controller",
+              play_state.get("PositionTicks") == 900000000 and play_state.get("IsPaused") is True,
+              str(play_state))
+        http("POST", "/Sessions/Playing/Stopped", token=target["token"],
+             body={"ItemId": item_id, "PositionTicks": 900000000}, **target["ident"])
+    else:
+        skip("NowPlayingItem / PlayState round-trip", "server has no library item")
+
     # ---- SyncPlay ----------------------------------------------------------
     print("\n--- SyncPlay ---")
     ws_c.drain(); ws_t.drain()
@@ -267,11 +305,106 @@ def main():
         check("a non-owner member can seek the group",
               ((seek or {}).get("Data") or {}).get("Command") in ("Seek", "Pause"),
               f"http {status}, got {ws_c.types()}")
+
+        # ---- the queue-editing and per-member verbs ------------------------
+        # Each must be accepted and reach the other member, so the whole
+        # /SyncPlay surface is push-verified rather than status-verified.
+        def playlist_item_ids():
+            """The group's current queue, as server-assigned PlaylistItemIds."""
+            ws_c.drain()
+            http("POST", "/SyncPlay/Ping", token=controller["token"],
+                 body={"Ping": 1}, **controller["ident"])
+            st, g = http("GET", f"/SyncPlay/{group_id}", token=controller["token"],
+                         **controller["ident"])
+            return st, g
+
+        ws_c.drain(); ws_t.drain()
+        status, _ = http("POST", "/SyncPlay/Queue", token=controller["token"],
+                         body={"ItemIds": [item_id], "Mode": "Queue"}, **controller["ident"])
+        pq = ws_t.wait("SyncPlayGroupUpdate",
+                       predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
+        queued = ((pq or {}).get("Data") or {}).get("Data") or {}
+        playlist = queued.get("Playlist") or []
+        check("Queue appends to the group queue and pushes the new PlayQueue",
+              status == 204 and len(playlist) >= 2, f"http {status}, playlist={len(playlist)}")
+
+        ids = [p.get("PlaylistItemId") for p in playlist]
+        if len(ids) >= 2:
+            for name, uri, body, want_len in (
+                ("SetPlaylistItem", "/SyncPlay/SetPlaylistItem", {"PlaylistItemId": ids[1]}, None),
+                ("MovePlaylistItem", "/SyncPlay/MovePlaylistItem",
+                 {"PlaylistItemId": ids[1], "NewIndex": 0}, None),
+                ("RemoveFromPlaylist", "/SyncPlay/RemoveFromPlaylist",
+                 {"PlaylistItemIds": [ids[0]]}, len(ids) - 1),
+            ):
+                ws_c.drain(); ws_t.drain()
+                status, _ = http("POST", uri, token=controller["token"], body=body,
+                                 **controller["ident"])
+                got = ws_t.wait("SyncPlayGroupUpdate",
+                                predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
+                detail = f"http {status}, got {ws_t.types()}"
+                if want_len is None:
+                    check(f"{name} pushes an updated PlayQueue", status == 204 and got is not None,
+                          detail)
+                else:
+                    now = (((got or {}).get("Data") or {}).get("Data") or {}).get("Playlist") or []
+                    check(f"{name} pushes an updated PlayQueue",
+                          status == 204 and len(now) == want_len,
+                          f"{detail}, playlist={len(now)}")
+        else:
+            skip("SetPlaylistItem / MovePlaylistItem / RemoveFromPlaylist",
+                 "queue too short to edit")
+
+        # Next/Previous only move (and so only broadcast) on a queue with
+        # somewhere to go — re-seed a two-entry queue before exercising them.
+        ws_c.drain(); ws_t.drain()
+        http("POST", "/SyncPlay/SetNewQueue", token=controller["token"],
+             body={"PlayingQueue": [item_id, item_id], "PlayingItemPosition": 0,
+                   "StartPositionTicks": 0},
+             **controller["ident"])
+        pq = ws_t.wait("SyncPlayGroupUpdate",
+                       predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
+        ids = [p.get("PlaylistItemId")
+               for p in ((((pq or {}).get("Data") or {}).get("Data") or {}).get("Playlist") or [])]
+
+        for name, uri, body in (
+            # C# guards these on the *current* item, so a stale client cannot
+            # skip twice; NextItem moves 0→1, PreviousItem moves back.
+            ("NextItem", "/SyncPlay/NextItem", {"PlaylistItemId": ids[0] if ids else None}),
+            ("PreviousItem", "/SyncPlay/PreviousItem", {"PlaylistItemId": ids[1] if len(ids) > 1 else None}),
+            ("SetRepeatMode", "/SyncPlay/SetRepeatMode", {"Mode": "RepeatAll"}),
+            ("SetShuffleMode", "/SyncPlay/SetShuffleMode", {"Mode": "Shuffle"}),
+        ):
+            ws_c.drain(); ws_t.drain()
+            status, _ = http("POST", uri, token=controller["token"], body=body,
+                             **controller["ident"])
+            time.sleep(0.4)
+            check(f"{name} is accepted and reaches the other member",
+                  status == 204 and bool(ws_t.types()), f"http {status}, got {ws_t.types()}")
+
+        # Per-member verbs mutate the caller's own member state; they are
+        # accepted and must not disturb the group (C# handles them per session).
+        for name, uri, body in (
+            ("Buffering", "/SyncPlay/Buffering",
+             {"When": "2026-01-01T00:00:00Z", "PositionTicks": 0, "IsPlaying": False,
+              "PlaylistItemId": ids[0] if ids else str(uuid.uuid4())}),
+            ("Ready", "/SyncPlay/Ready",
+             {"When": "2026-01-01T00:00:00Z", "PositionTicks": 0, "IsPlaying": False,
+              "PlaylistItemId": ids[0] if ids else str(uuid.uuid4())}),
+            ("SetIgnoreWait", "/SyncPlay/SetIgnoreWait", {"IgnoreWait": True}),
+            ("Ping", "/SyncPlay/Ping", {"Ping": 42}),
+        ):
+            status, _ = http("POST", uri, token=target["token"], body=body, **target["ident"])
+            check(f"{name} is accepted from a member", status == 204, f"http {status}")
+
+        st, _ = playlist_item_ids()
+        check("the group survives the whole verb sweep", st == 200, f"GET /SyncPlay/{{id}} -> {st}")
     else:
         skip("SyncPlay queue + transport verbs",
              "server has no library item; a queue of unresolvable ids is refused by design")
 
     # A queue nobody can resolve must be refused outright, with no broadcast.
+    time.sleep(0.5)  # let the previous step's pushes land before draining
     ws_c.drain(); ws_t.drain()
     status, _ = http("POST", "/SyncPlay/SetNewQueue", token=controller["token"],
                      body={"PlayingQueue": [str(uuid.uuid4())], "PlayingItemPosition": 0,

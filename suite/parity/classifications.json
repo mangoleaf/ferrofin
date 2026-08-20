@@ -60,15 +60,15 @@
     },
     "GET /Plugins": {
       "category": "expected-extension",
-      "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) — the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests)."
+      "classification": "expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) \u2014 the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests)."
     },
     "GET /Packages": {
       "category": "instance",
-      "classification": "instance: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted); manifest fetch is size-capped + timed out. Catalog content is repository-config-specific — harness instances configure none — so nothing to diff. Verified 2026-08-14 by unit + server HTTP tests."
+      "classification": "instance: aggregates the enabled repositories' manifests (PackageInfo[]) plus synthesized compiled-in entries; repositoryName/Url stamped from the repository actually fetched (manifest claims are untrusted); manifest fetch is size-capped + timed out. Catalog content is repository-config-specific \u2014 harness instances configure none \u2014 so nothing to diff. Verified 2026-08-14 by unit + server HTTP tests."
     },
     "GET /Repositories": {
       "category": "instance",
-      "classification": "instance: returns the admin-configured package repositories — instance-local state (harness instances configure none), nothing to diff. Verified 2026-08-14 by unit + handler tests."
+      "classification": "instance: returns the admin-configured package repositories \u2014 instance-local state (harness instances configure none), nothing to diff. Verified 2026-08-14 by unit + handler tests."
     },
     "GET /web/ConfigurationPages": {
       "category": "expected-extension",
@@ -132,7 +132,7 @@
     },
     "GET /System/Configuration": {
       "category": "instance",
-      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug."
+      "classification": "instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds \u2014 setup state, not a bug."
     },
     "GET /LiveTv/TunerHosts/Types": {
       "category": "deferred",
@@ -148,7 +148,7 @@
     },
     "DELETE /Playlists/{playlistId}/Users/{userId}": {
       "category": "instance",
-      "classification": "instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect."
+      "classification": "instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side \u2014 not a defect."
     },
     "DELETE /Audio/{itemId}/Lyrics": {
       "category": "deferred-remote-or-feature-gated",
@@ -172,51 +172,51 @@
     },
     "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/main.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/master.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Audio/{itemId}/master.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/stream": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Audio/{itemId}/stream": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/stream.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Audio/{itemId}/stream.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Audio/{itemId}/universal": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Audio/{itemId}/universal": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Channels/{channelId}/Features": {
       "category": "requires-livetv-tuner",
@@ -236,7 +236,7 @@
     },
     "GET /Episode/{id}/IntroSkipperSegments": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "POST /FileTransformation/RegisterTransformation": {
       "category": "expected-extension",
@@ -320,11 +320,11 @@
     },
     "GET /Items/{itemId}/Download": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "GET /Items/{itemId}/File": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "POST /Items/{itemId}/RemoteImages/Download": {
       "category": "deferred-remote-or-feature-gated",
@@ -332,7 +332,7 @@
     },
     "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
       "category": "expected-extension",
@@ -384,11 +384,11 @@
     },
     "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "POST /LiveTv/Programs": {
       "category": "requires-livetv-tuner",
@@ -456,31 +456,31 @@
     },
     "GET /MediaSegmentsApi": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "POST /MediaSegmentsApi/{itemId}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "DELETE /MediaSegmentsApi/{segmentId}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "POST /Packages/Installed/{name}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: repository install of WASM plugins is real (2026-08-14: ABI gate → HTTPS-per-hop download → streamed size cap → sha256/md5 verify → component+identity validation → guid-squat refusal → atomic stage → restart-required; admin-only; end-to-end server test). Divergence vs Jellyfin: the install is SYNCHRONOUS — none of the PackageInstalling/Completed/Failed/Cancelled WebSocket messages are emitted (no dashboard progress; a slow repo holds the POST open), and the plugin appears in /Plugins only after the activating restart. Async install + Package* push is the recorded follow-up (WebSocket-push backlog)."
+      "classification": "accepted-divergence: repository install of WASM plugins is real (2026-08-14: ABI gate \u2192 HTTPS-per-hop download \u2192 streamed size cap \u2192 sha256/md5 verify \u2192 component+identity validation \u2192 guid-squat refusal \u2192 atomic stage \u2192 restart-required; admin-only; end-to-end server test). Divergence vs Jellyfin: the install is SYNCHRONOUS \u2014 none of the PackageInstalling/Completed/Failed/Cancelled WebSocket messages are emitted (no dashboard progress; a slow repo holds the POST open), and the plugin appears in /Plugins only after the activating restart. Async install + Package* push is the recorded follow-up (WebSocket-push backlog)."
     },
     "DELETE /Packages/Installing/{packageId}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: always 404 — installs are synchronous, so no tracked installation exists to cancel (Jellyfin tracks async installs). Admin-only."
+      "classification": "accepted-divergence: always 404 \u2014 installs are synchronous, so no tracked installation exists to cancel (Jellyfin tracks async installs). Admin-only."
     },
     "GET /Packages/{name}": {
       "category": "instance",
-      "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog — catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests."
+      "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog \u2014 catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests."
     },
     "GET /Playback/BitrateTest": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "DELETE /Plugins/{pluginId}": {
       "category": "accepted-divergence",
@@ -492,7 +492,7 @@
     },
     "POST /Plugins/{pluginId}/Configuration": {
       "category": "instance",
-      "classification": "instance: no shared plugin id across the two servers, so no config write to diff. Real write (JSON-validated, persisted; admin-only — a WASM plugin's config is guest input); verified 2026-08-14 by unit + handler tests incl. 403."
+      "classification": "instance: no shared plugin id across the two servers, so no config write to diff. Real write (JSON-validated, persisted; admin-only \u2014 a WASM plugin's config is guest input); verified 2026-08-14 by unit + handler tests incl. 403."
     },
     "POST /Plugins/{pluginId}/Manifest": {
       "category": "instance",
@@ -520,11 +520,11 @@
     },
     "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "POST /Repositories": {
       "category": "instance",
-      "classification": "instance: replaces the configured package repositories (admin-only, RequiresElevation port) — instance-local state, nothing to diff. Verified 2026-08-14 by unit + handler tests incl. 403 for non-admin."
+      "classification": "instance: replaces the configured package repositories (admin-only, RequiresElevation port) \u2014 instance-local state, nothing to diff. Verified 2026-08-14 by unit + handler tests incl. 403 for non-admin."
     },
     "POST /SkipButtonCss/InjectCss": {
       "category": "expected-extension",
@@ -535,164 +535,164 @@
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
     "POST /SyncPlay/Buffering": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Join": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Leave": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/MovePlaylistItem": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/New": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/NextItem": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Pause": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Ping": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/PreviousItem": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Queue": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Ready": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/RemoveFromPlaylist": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Seek": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/SetIgnoreWait": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/SetNewQueue": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/SetPlaylistItem": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/SetRepeatMode": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/SetShuffleMode": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Stop": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "POST /SyncPlay/Unpause": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "GET /SyncPlay/{id}": {
-      "category": "requires-syncplay-group",
-      "classification": "requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration)."
+      "category": "verified-by-push-probe",
+      "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
     "GET /System/Logs/Log": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "DELETE /Videos/{itemId}/Subtitles/{index}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/live.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/main.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/master.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Videos/{itemId}/master.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/stream": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Videos/{itemId}/stream": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/stream.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "HEAD /Videos/{itemId}/stream.{container}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
     },
     "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
       "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output — not a JSON body to diff."
+      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "GET /web/ConfigurationPage": {
       "category": "expected-extension",
@@ -780,7 +780,7 @@
     },
     "GET /Items/Root": {
       "category": "deferred",
-      "classification": "deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200)."
+      "classification": "deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope \u2014 see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200)."
     },
     "GET /Years/{year}": {
       "category": "expected-extension",
@@ -824,15 +824,15 @@
     },
     "GET /Studios/{name}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404."
+      "classification": "accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect \u2192 J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 \u2014 a GET with no filesystem write. Verified live 2026-08-11: existing\u2192200, absent\u2192404."
     },
     "GET /Genres/{genreName}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Ferrofin 404 vs Jellyfin auto-created 200. Shape verified."
+      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre\u2192200 BaseItemDto (both servers), absent\u2192Ferrofin 404 vs Jellyfin auto-created 200. Shape verified."
     },
     "GET /Persons/{name}": {
       "category": "accepted-divergence",
-      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified."
+      "classification": "accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person\u2192200 BaseItemDto, absent\u2192404 (both servers 404 in the harness run). Shape verified."
     },
     "GET /Genres": {
       "category": "verified",
@@ -848,11 +848,11 @@
     },
     "GET /LiveTv/Timers/Defaults": {
       "category": "verified",
-      "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/…), 200 + schema conformant."
+      "classification": "verified 2026-08-11: SeriesTimerInfoDto defaults (ChannelId/Days/padding flags/\u2026), 200 + schema conformant."
     },
     "GET /DisplayPreferences/{displayPreferencesId}": {
       "category": "verified",
-      "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses."
+      "classification": "verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) \u2014 the by-client resolution Jellyfin uses."
     }
   }
 }

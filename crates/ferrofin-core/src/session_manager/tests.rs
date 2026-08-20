@@ -19,8 +19,10 @@ use uuid::Uuid;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::net::WebSocketConnection;
 use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::persistence::ItemPersistenceService;
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -152,19 +154,25 @@ impl WebSocketConnection for FakeConnection {
     }
 }
 
+/// The real library manager over `db` — shared by the session manager under
+/// test and the fixtures that write through it.
+fn library_manager(db: &Database) -> Arc<FerrofinLibraryManager> {
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ItemTypeLookup::new());
+    Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ))
+}
+
 /// Builds a session manager wired over `db` with the real sibling managers.
 fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
     let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
         config: default_server_configuration(),
     });
-    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-        Arc::new(ItemTypeLookup::new());
-    let library = Arc::new(FerrofinLibraryManager::new(
-        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
-        Arc::new(FerrofinItemCountService::new(db.clone())),
-        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-        Arc::new(FerrofinPeopleRepository::new(db.clone())),
-    ));
+    let library = library_manager(db);
     Arc::new(FerrofinSessionManager::new(
         Arc::new(FerrofinUserManager::new(db.clone())),
         Arc::new(FerrofinDeviceManager::new(db.clone())),
@@ -1229,12 +1237,12 @@ fn pushed_item_ids(data: &serde_json::Value) -> Vec<Uuid> {
 /// Records `child` as a descendant of `parent` — the row the recursive
 /// (`AncestorIds`) child query joins through.
 async fn seed_ancestor(db: &Database, child: Uuid, parent: Uuid) {
-    sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
-        .bind(guid_to_db(child))
-        .bind(guid_to_db(parent))
-        .execute(db.writer())
+    // Through the production writer, so the fixture cannot drift from how the
+    // scanner actually registers a descendant.
+    FerrofinItemPersistenceService::new(db.clone())
+        .set_ancestors(child, &[parent])
         .await
-        .expect("insert ancestor");
+        .expect("set ancestors");
 }
 
 /// Grants the playback permission `GetPlayAccess` gates every cast on.
@@ -1619,18 +1627,13 @@ async fn casting_one_episode_queues_the_rest_of_the_series() {
     let db = test_db().await;
     let (mgr, bus) = cast_manager(&db);
     let user_id = Uuid::new_v4();
-    let seeded = seed_named_user(&db, user_id, "alice").await;
-    allow_playback(&db, &seeded).await;
-    sqlx::query(r#"UPDATE "Users" SET "EnableNextEpisodeAutoPlay" = 1 WHERE "Id" = ?1"#)
-        .bind(guid_to_db(user_id))
-        .execute(db.writer())
-        .await
-        .unwrap();
-    let user = sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
-        .bind(guid_to_db(user_id))
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+    let mut user = seed_named_user(&db, user_id, "alice").await;
+    allow_playback(&db, &user).await;
+    // Through the real user writer, so the fixture exercises the same column
+    // mapping production does.
+    user.enable_next_episode_auto_play = true;
+    let users = FerrofinUserManager::new(db.clone());
+    users.update_user(&user).await.expect("update user");
 
     let series = Uuid::new_v4();
     crate::test_support::seed_folder_item(
@@ -1641,6 +1644,7 @@ async fn casting_one_episode_queues_the_rest_of_the_series() {
         None,
     )
     .await;
+    let library = library_manager(&db);
     let mut episodes = Vec::new();
     for n in 0..3 {
         let id = Uuid::new_v4();
@@ -1651,12 +1655,16 @@ async fn casting_one_episode_queues_the_rest_of_the_series() {
             &format!("Ep {n}"),
         )
         .await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?1 WHERE "Id" = ?2"#)
-            .bind(guid_to_db(series))
-            .bind(guid_to_db(id))
-            .execute(db.writer())
+        let mut row = library
+            .get_item_by_id(id)
             .await
-            .unwrap();
+            .expect("load episode")
+            .expect("episode present");
+        row.series_id = Some(guid_to_db(series));
+        library
+            .update_items(std::slice::from_ref(&row), Some(series))
+            .await
+            .expect("set series id");
         seed_ancestor(&db, id, series).await;
         episodes.push(id);
     }
