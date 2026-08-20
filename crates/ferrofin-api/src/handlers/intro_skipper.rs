@@ -818,14 +818,29 @@ struct TransformationRegistration {
 /// consults. The .NET-specific callback forms (assembly reflection, named
 /// pipes) cannot exist in a Rust process; a registration carrying only those is
 /// still `200` (upstream always is) but logged, since it can never fire.
+///
+/// **Elevation is required**, as upstream requires it
+/// (`[Authorize(Policy = Policies.RequiresElevation)]` on
+/// `FileTransformationController.RegisterTransformation`). This port previously
+/// took a bare [`RequireAuth`], which was both a divergence from upstream and
+/// the reachable end of an unbounded registry: a registration is keyed by an id
+/// **and** a pattern the caller supplies, nothing sweeps it, and each accepted
+/// one retains the caller's strings for the life of the process — measured at
+/// +157 MB of RssAnon over 150 requests carrying 1 MB of strings each. The
+/// registry is capped independently in `ferrofin-extensions`; this gate is what
+/// keeps a guest profile or a stolen playback token away from it at all, and it
+/// belongs here for the same reason `plugins::require_admin` does — registering
+/// a callback that rewrites the JavaScript served to every browser is staging
+/// code, not editing metadata.
 async fn register_transformation(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Json(payload): Json<TransformationRegistration>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
+    require_elevation(&state, &auth).await?;
     let Some(service) = state.file_transformations.as_ref() else {
         tracing::warn!("file-transformation registration dropped: pipeline not wired");
-        return StatusCode::OK;
+        return Ok(StatusCode::OK);
     };
     if payload.transformation_endpoint.is_empty() {
         tracing::warn!(
@@ -836,7 +851,7 @@ async fn register_transformation(
             "file-transformation registration has no HTTP endpoint; \
              .NET assembly/pipe callbacks are unsupported in Ferrofin"
         );
-        return StatusCode::OK;
+        return Ok(StatusCode::OK);
     }
     service
         .add_endpoint_transformation(
@@ -845,7 +860,27 @@ async fn register_transformation(
             &payload.transformation_endpoint,
         )
         .await;
-    StatusCode::OK
+    Ok(StatusCode::OK)
+}
+
+/// Upstream's `Policies.RequiresElevation`: an API key, or a user whose policy
+/// grants `IsAdministrator`. Mirrors `plugins::require_admin`, which gates the
+/// other "stage code for later execution" surface.
+async fn require_elevation(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
+    if auth.is_api_key {
+        return Ok(());
+    }
+    if let Some(user) = &auth.user
+        && super::users::is_administrator(state, user).await?
+    {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(
+        "administrator access required".to_owned(),
+    ))
 }
 
 /// Registers the Intro Skipper extension's routes onto `router`.

@@ -1,0 +1,31 @@
+-- Index MediaStreamInfos by (ItemId, StreamType) — Ferrofin-own, FerrofinIX_ namespace.
+--
+-- The DTO builder's `HasSubtitles` probe
+--   SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
+--    WHERE "StreamType" = ?1 AND "ItemId" IN (<the page's video ids>)
+-- was written on the assumption that `(ItemId, StreamIndex)` — the table's
+-- primary key — would serve it. It does not: `EXPLAIN QUERY PLAN` on the bench
+-- library picks `IX_MediaStreamInfos_StreamType (StreamType=?)` instead, which
+-- SCANS every subtitle stream row in the library (4,169 of 9,368 here) and
+-- tests `ItemId IN (…)` per row, then builds a temp b-tree for the DISTINCT.
+-- The cost therefore scales with library size, not page size, and it fires on
+-- every list page that carries videos.
+--
+-- Leading with ItemId turns it into one seek per page id, with StreamType and
+-- the projected ItemId both inside the index, so the probe is index-only and
+-- the DISTINCT falls out of the scan order — no temp b-tree.
+--
+-- Measured on the bench library (9,862 items / 9,368 streams), alternating legs
+-- in-process: the 50-id probe 710 µs -> 33 µs (21x), row set identical (the
+-- caller collects into a HashSet, so the changed row ORDER is unobservable).
+-- End-to-end over real HTTP, two long-lived servers driven in an order-flipped
+-- A,B cycle at 30 req/s: items_sortname p50 3.8 ms -> 2.65 ms (B won 12/12
+-- cycles) and items_datesort 6.8 ms -> 4.15 ms (9/10). A negative control on
+-- /Persons — which never touches MediaStreamInfos — showed no separation,
+-- confirming the rig was not biased.
+--
+-- Write cost: one extra b-tree insert per stream row, i.e. per probed media
+-- file. Streams are written once per scan/probe of an item, never on a read
+-- path, and the index carries two short columns.
+CREATE INDEX IF NOT EXISTS "FerrofinIX_MediaStreamInfos_ItemId_StreamType"
+    ON "MediaStreamInfos" ("ItemId", "StreamType");

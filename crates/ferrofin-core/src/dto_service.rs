@@ -1281,11 +1281,17 @@ impl FerrofinDtoService {
             dto.album = item.album.clone();
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // A track's parent is its album row — jellyfin-web's now-playing
-            // bar and track lists link back through AlbumId.
-            dto.album_id = item
-                .parent_id
-                .as_deref()
-                .and_then(|p| Uuid::parse_str(p).ok());
+            // bar and track lists link back through AlbumId. Upstream reads
+            // `Audio.AlbumEntity`, i.e. `FindParent<MusicAlbum>()`, so the id is
+            // only emitted when the parent really IS an album: an `AudioBook`
+            // hangs off its books library, and pointing AlbumId at a collection
+            // folder sends the client somewhere that is not an album.
+            if kind == BaseItemKind::Audio {
+                dto.album_id = item
+                    .parent_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok());
+            }
         }
 
         // Artists / album-artists — only the kinds that implement C#
@@ -1379,6 +1385,14 @@ impl FerrofinDtoService {
                 .series_id
                 .as_deref()
                 .and_then(|s| Uuid::parse_str(s).ok());
+        }
+
+        // Book extras — port of `DtoService.SetBookProperties`, which projects
+        // the one `IHasSeries` field a book carries (the book series its
+        // filename or containing folder names). Upstream has no equivalent for
+        // `AudioBook`, so neither do we.
+        if kind == BaseItemKind::Book {
+            dto.series_name = item.series_name.clone();
         }
 
         // Series air-time.
@@ -4540,5 +4554,57 @@ mod tests {
         let batch_sources = batch[0].media_sources.as_ref().expect("batch sources");
         assert_eq!(batch_sources.len(), 2);
         assert_eq!(batch_sources[1].path.as_deref(), Some("/media/alt.mkv"));
+    }
+
+    // The two book kinds project the fields Jellyfin's DtoService gives them —
+    // and, just as importantly, not the ones it withholds. An audiobook is an
+    // `Audio` but hangs off its books library, so the `AlbumEntity` lookup
+    // (`FindParent<MusicAlbum>`) finds nothing and no AlbumId is emitted;
+    // pointing it at the collection folder would send jellyfin-web's
+    // now-playing bar to a page that is not an album.
+    #[tokio::test]
+    async fn book_kinds_project_the_fields_jellyfin_gives_them() {
+        let db = test_db().await;
+        let library = Uuid::new_v4();
+        let album = Uuid::new_v4();
+        let (book_id, audiobook_id, track_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, book_id, BaseItemKind::Book, "A Study in Scarlet").await;
+        seed_named_item(&db, audiobook_id, BaseItemKind::AudioBook, "The Hobbit").await;
+        seed_named_item(&db, track_id, BaseItemKind::Audio, "In the Flesh").await;
+
+        let mut book = fetch_item(&db, book_id).await;
+        book.series_name = Some("Sherlock Holmes".to_owned());
+        let mut audiobook = fetch_item(&db, audiobook_id).await;
+        audiobook.parent_id = Some(guid_to_db(library));
+        audiobook.series_name = Some("Sprawl".to_owned());
+        let mut track = fetch_item(&db, track_id).await;
+        track.parent_id = Some(guid_to_db(album));
+
+        let svc = service(db);
+        let dto = async |item| {
+            svc.get_base_item_dto(item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap()
+        };
+
+        // `SetBookProperties` projects a book's series…
+        let book_dto = dto(&book).await;
+        assert_eq!(book_dto.series_name.as_deref(), Some("Sherlock Holmes"));
+        // …and a Book is not `IHasMediaSources`, so IsFolder stays absent.
+        assert_eq!(book_dto.is_folder, None);
+
+        let audiobook_dto = dto(&audiobook).await;
+        assert_eq!(
+            audiobook_dto.album_id, None,
+            "an audiobook's parent is its library, not a MusicAlbum"
+        );
+        assert_eq!(audiobook_dto.is_folder, Some(false));
+        assert_eq!(
+            audiobook_dto.series_name, None,
+            "upstream has no SetAudioBookProperties"
+        );
+
+        // A real track still links back to its album row.
+        assert_eq!(dto(&track).await.album_id, Some(album));
     }
 }

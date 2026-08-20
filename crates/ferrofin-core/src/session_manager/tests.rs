@@ -1124,3 +1124,85 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
         "the recreated session inherits the device's reported capabilities"
     );
 }
+
+/// `MaxActiveSessions` is a check-then-act: the count is read from the live
+/// session pool, but the session it is counting for is only inserted several
+/// awaits later (device row, `upsert_session`). Without the admission gate every
+/// login in a concurrent burst reads the same pre-burst count and all of them
+/// are admitted — a user capped at one session gets as many as the burst is
+/// wide (measured over real HTTP: 23 of 24 accepted, where the sequential
+/// control accepts exactly 1).
+///
+/// Each login uses a DISTINCT device id, so every admitted login is its own
+/// session; a shared device id would collapse them into one and hide the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_logins_cannot_exceed_max_active_sessions() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "capped").await;
+    // Cap the account through the same API an admin uses, then allow the
+    // devices (`update_policy` does not touch `EnableAllDevices`).
+    let users: Arc<dyn ferrofin_traits::library::UserManager> =
+        Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+    users
+        .update_policy(
+            user_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let logins = 16;
+    let gate = Arc::new(tokio::sync::Barrier::new(logins));
+    let mut tasks = Vec::new();
+    for i in 0..logins {
+        let mgr = Arc::clone(&mgr);
+        let gate = Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            let request = AuthenticationRequest {
+                user_id: Some(user_id),
+                app: Some("Web".to_owned()),
+                app_version: Some("1.0".to_owned()),
+                device_id: Some(format!("dev-{i}")),
+                device_name: Some("Chrome".to_owned()),
+                ..AuthenticationRequest::default()
+            };
+            gate.wait().await;
+            mgr.authenticate_direct(&request).await
+        }));
+    }
+
+    let mut admitted = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => admitted += 1,
+            Err(ServiceError::Unauthorized(msg)) => {
+                assert!(msg.contains("maximum number of sessions"), "{msg}");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    assert_eq!(
+        admitted, 1,
+        "MaxActiveSessions = 1 must admit exactly one login, not {admitted}"
+    );
+    let live = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(live, 1, "and exactly one session may be live afterwards");
+}

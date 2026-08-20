@@ -26,6 +26,31 @@ use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 
 use crate::db_error::{db_err, media_stream_type_disc};
 
+/// The DTO builder's `HasSubtitles` probe: the subset of `ids` that carry at
+/// least one subtitle stream. `?1` is the stream-type discriminant, `?2..` the
+/// item ids.
+///
+/// The table's primary key is `(ItemId, StreamIndex)`, so this *looks* like a
+/// per-id seek — but it is not one off the PK. `StreamType = ?1` is an equality
+/// on the leading column of `IX_MediaStreamInfos_StreamType`, and SQLite scores
+/// that cheaper than the `IN` list: the plan it picks unaided SCANS every
+/// subtitle stream row in the library, tests `ItemId IN (…)` per row, and
+/// builds a temp b-tree for the `DISTINCT` — a cost that grows with library
+/// size, on a statement that fires on every list page carrying videos.
+/// `FerrofinIX_MediaStreamInfos_ItemId_StreamType` (migration 0016) gives the
+/// planner a leading-`ItemId` alternative that also covers the projection, and
+/// `subtitle_probe_uses_the_item_id_index` pins that it stays chosen.
+fn subtitle_probe_sql(ids: usize) -> String {
+    let ph = (2..=ids + 1)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
+                   WHERE "StreamType" = ?1 AND "ItemId" IN ({ph})"#
+    )
+}
+
 /// The concrete media-stream repository.
 #[derive(Clone)]
 pub struct FerrofinMediaStreamRepository {
@@ -125,18 +150,12 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         item_ids: &[Uuid],
     ) -> Result<Vec<Uuid>, ServiceError> {
         // Ids-only page query for the DTO builder's `HasSubtitles` — no stream
-        // rows materialize, and `(ItemId, StreamIndex)` is the table's PK so
-        // each id resolves off the index.
+        // rows materialize. See [`subtitle_probe_sql`] for why the index it
+        // resolves off is `FerrofinIX_MediaStreamInfos_ItemId_StreamType` and
+        // not the table's primary key.
         let mut with_subs = Vec::new();
         for chunk in item_ids.chunks(500) {
-            let ph = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                r#"SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
-                   WHERE "StreamType" = ?1 AND "ItemId" IN ({ph})"#,
-            );
+            let sql = subtitle_probe_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(&sql)
                 .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)));
             for id in chunk {
@@ -354,5 +373,39 @@ mod tests {
             .await
             .expect("langs");
         assert_eq!(sub_langs, vec!["und".to_owned()]);
+    }
+
+    /// The `HasSubtitles` probe must seek by `ItemId`, never scan the library's
+    /// subtitle streams by `StreamType`. Without
+    /// `FerrofinIX_MediaStreamInfos_ItemId_StreamType` SQLite picks
+    /// `IX_MediaStreamInfos_StreamType` and walks every subtitle row (4,169 of
+    /// 9,368 on the bench library) plus a temp b-tree for the `DISTINCT`:
+    /// 710 µs vs 33 µs for a 50-id page, on a statement that fires on every
+    /// list page carrying videos. Pinned here against the real migrated schema.
+    #[tokio::test]
+    async fn subtitle_probe_uses_the_item_id_index() {
+        let db = test_db().await;
+        let sql = super::subtitle_probe_sql(50);
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        for _ in 0..51 {
+            query = query.bind("x");
+        }
+        let plan: Vec<String> = query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect();
+
+        assert!(
+            plan.iter().any(|s| s.contains("ItemId=?")),
+            "subtitle probe must seek by ItemId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.contains("TEMP B-TREE")),
+            "subtitle probe must not sort for DISTINCT, got: {plan:?}"
+        );
     }
 }

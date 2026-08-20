@@ -98,6 +98,76 @@ struct Registration {
     kind: TransformKind,
 }
 
+/// Hard cap on the number of live registrations — a runaway bound, not a
+/// working-set tuner.
+///
+/// The registry has the lifetime of the process and nothing sweeps it: an
+/// entry survives until its owner calls `remove_transformation`, which no
+/// caller of `POST /FileTransformation/RegisterTransformation` is obliged to
+/// do. Registrations are keyed by an id **and** a pattern the caller supplies,
+/// so varying either defeats the idempotence check and appends a fresh entry
+/// per request. Real deployments register a handful (one per plugin that
+/// patches a web file); this cap is orders of magnitude above that and exists
+/// only so a caller in a loop cannot grow the process without limit.
+///
+/// FLAGGED as a candidate setting — plausible range 32…4096, default 256.
+const MAX_REGISTRATIONS: usize = 256;
+
+/// Hard cap on one registration's pattern length.
+///
+/// A pattern is matched (and regex-compiled) against every served `/web` path,
+/// so an over-long one is both retained forever and re-scanned per request.
+/// Web-root-relative paths and the regexes that match them are tens of bytes;
+/// 1 KiB is an abuse guard, not a limit anyone reaches.
+///
+/// FLAGGED as a candidate setting — plausible range 256…8192, default 1024.
+const MAX_PATTERN_LEN: usize = 1024;
+
+/// Hard cap on one registration's callback endpoint length. Endpoints are URLs;
+/// 2 KiB is the conventional practical URL ceiling.
+///
+/// FLAGGED as a candidate setting — plausible range 256…8192, default 2048.
+const MAX_ENDPOINT_LEN: usize = 2048;
+
+/// Whether a registration may be admitted, given the registry's current
+/// contents. Refusals are logged and dropped (the upstream controller always
+/// answers `Ok()`, so refusing must not change the HTTP status).
+///
+/// The length checks come first so an over-long string is never stored, and
+/// the count check ignores re-registrations of an existing `(id, pattern)` —
+/// those replace nothing and add nothing, and are handled by the callers'
+/// idempotence check.
+fn admits(regs: &[Registration], id: Uuid, pattern: &str, endpoint_len: usize) -> bool {
+    if pattern.len() > MAX_PATTERN_LEN {
+        tracing::warn!(
+            %id,
+            len = pattern.len(),
+            max = MAX_PATTERN_LEN,
+            "file-transformation registration refused: pattern too long"
+        );
+        return false;
+    }
+    if endpoint_len > MAX_ENDPOINT_LEN {
+        tracing::warn!(
+            %id,
+            len = endpoint_len,
+            max = MAX_ENDPOINT_LEN,
+            "file-transformation registration refused: endpoint too long"
+        );
+        return false;
+    }
+    if regs.len() >= MAX_REGISTRATIONS {
+        tracing::warn!(
+            %id,
+            pattern,
+            max = MAX_REGISTRATIONS,
+            "file-transformation registration refused: registry is full"
+        );
+        return false;
+    }
+    true
+}
+
 /// How a registered transformation is invoked.
 enum TransformKind {
     /// An in-process transformer (a compiled-in extension's callback).
@@ -329,6 +399,9 @@ impl FileTransformationService for WebFileTransformationService {
         if regs.iter().any(|r| r.id == id && r.pattern == pattern) {
             return;
         }
+        if !admits(&regs, id, &pattern, 0) {
+            return;
+        }
         tracing::info!(%id, pattern, "registered file transformation");
         regs.push(Registration {
             id,
@@ -344,6 +417,9 @@ impl FileTransformationService for WebFileTransformationService {
             .write()
             .expect("registrations lock poisoned");
         if regs.iter().any(|r| r.id == id && r.pattern == pattern) {
+            return;
+        }
+        if !admits(&regs, id, &pattern, endpoint.len()) {
             return;
         }
         tracing::info!(%id, pattern, endpoint, "registered endpoint file transformation");
@@ -730,5 +806,105 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(v["DebugLoggingState"], "Disabled");
         assert!(v["Transformations"].as_array().expect("array").is_empty());
+    }
+
+    /// The registry's length in a test (the field is private to this module).
+    fn len_of(svc: &WebFileTransformationService) -> usize {
+        svc.registrations.read().expect("lock").len()
+    }
+
+    /// The registry is process-lifetime state with no sweeper, and both halves
+    /// of its idempotence key come from the caller — so an unbounded registry
+    /// grows by one permanent entry per request. Measured before this cap
+    /// existed: 150 `POST /FileTransformation/RegisterTransformation` calls
+    /// carrying 1 MB of strings each raised the server's RssAnon by 157 MB,
+    /// linearly and with no plateau.
+    #[tokio::test]
+    async fn registry_stops_growing_at_the_cap() {
+        let svc = service_with("{}", true);
+        for i in 0..(MAX_REGISTRATIONS + 50) {
+            svc.add_endpoint_transformation(
+                Uuid::from_u128(i as u128),
+                &format!("pattern-{i}"),
+                "http://127.0.0.1:1/cb",
+            )
+            .await;
+        }
+        assert_eq!(
+            len_of(&svc),
+            MAX_REGISTRATIONS,
+            "an unbounded registry would hold every registration"
+        );
+    }
+
+    /// The same cap must hold for in-process registrations, so a compiled-in
+    /// extension registering in a loop cannot outgrow it either.
+    #[tokio::test]
+    async fn builtin_registrations_share_the_cap() {
+        let svc = service_with("{}", true);
+        let plugins: Arc<dyn PluginManager> = Arc::new(FakePlugins {
+            ft_config: b"{}".to_vec(),
+            is_config: b"{}".to_vec(),
+            enabled: true,
+        });
+        for i in 0..(MAX_REGISTRATIONS + 10) {
+            svc.add_transformation(
+                Uuid::from_u128(i as u128),
+                &format!("builtin-{i}"),
+                Arc::new(SkipButtonTransformer::new(Arc::clone(&plugins))),
+            )
+            .await;
+        }
+        assert_eq!(len_of(&svc), MAX_REGISTRATIONS);
+    }
+
+    /// A single registration can carry megabytes of caller-supplied string and
+    /// keep them for the life of the process, so the strings are capped too —
+    /// an over-long one is refused outright rather than stored truncated.
+    #[tokio::test]
+    async fn over_long_pattern_and_endpoint_are_refused() {
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(
+            Uuid::from_u128(1),
+            &"p".repeat(MAX_PATTERN_LEN + 1),
+            "http://127.0.0.1:1/cb",
+        )
+        .await;
+        assert_eq!(len_of(&svc), 0, "an over-long pattern must not be stored");
+
+        svc.add_endpoint_transformation(
+            Uuid::from_u128(2),
+            "ok-pattern",
+            &"e".repeat(MAX_ENDPOINT_LEN + 1),
+        )
+        .await;
+        assert_eq!(len_of(&svc), 0, "an over-long endpoint must not be stored");
+
+        // A registration inside both limits still lands.
+        svc.add_endpoint_transformation(Uuid::from_u128(3), "ok-pattern", "http://127.0.0.1:1/cb")
+            .await;
+        assert_eq!(len_of(&svc), 1);
+    }
+
+    /// Refusing at the cap must not evict what is already registered: the
+    /// Intro Skipper's compiled-in patch has to keep working while a noisy
+    /// caller is being refused.
+    #[tokio::test]
+    async fn a_full_registry_still_serves_its_existing_registrations() {
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(0), "keep.me.js", "http://127.0.0.1:1/cb")
+            .await;
+        for i in 1..(MAX_REGISTRATIONS + 20) {
+            svc.add_endpoint_transformation(
+                Uuid::from_u128(i as u128),
+                &format!("noise-{i}"),
+                "http://127.0.0.1:1/cb",
+            )
+            .await;
+        }
+        assert!(
+            svc.needs_transformation("keep.me.js").await,
+            "the first registration must survive the flood"
+        );
     }
 }
