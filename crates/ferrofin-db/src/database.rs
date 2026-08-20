@@ -68,11 +68,13 @@ impl Database {
         // SQLITE_BUSY failures for every in-flight request (a real
         // mid-playback black-screen). The maintenance task now also skips the
         // vacuum during playback; the long timeout is the second seatbelt.
+        configure_sqlite_for_concurrency();
         let read_options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(30))
+            .pragma("mmap_size", "1073741824")
             .foreign_keys(true);
         let write_options = read_options
             .clone()
@@ -572,6 +574,44 @@ fn quota_cores(quota: i64, period: i64) -> Option<u32> {
         return None;
     }
     u32::try_from((quota + period - 1) / period).ok() // ceil; i64 div_ceil is unstable
+}
+
+/// Turns off SQLite's global memory-statistics bookkeeping, once per process.
+///
+/// SQLite's default build wraps every `sqlite3Malloc`/`sqlite3_free` in a global
+/// mutex purely to keep `sqlite3_memory_used()` accurate. Nothing here reads
+/// those counters, but every connection pays the mutex — and since each sqlx
+/// SQLite connection is its own OS thread, the reader pool contends on ONE lock
+/// for every allocation the query engine makes.
+///
+/// Profiling a 100-item list endpoint at 400 req/s found 82 of 85 mutex-blocked
+/// stacks sitting in `sqlite3_free`/`sqlite3Malloc`. That contention is what
+/// capped effective parallelism at ~1-2 on a 32-core box and produced the
+/// capacity cliff where latency went from 5 ms to ~9 s between 200 and 400
+/// req/s. It is also why a SMALLER reader pool measured faster: fewer threads,
+/// less contention on the same global lock.
+///
+/// Must run before the first connection is opened — `sqlite3_config` fails once
+/// SQLite has initialized, which is why this is a process-wide `Once` on the
+/// connect path rather than per-pool setup. A failure is not fatal: it means
+/// SQLite was already initialized and we keep the default behaviour.
+fn configure_sqlite_for_concurrency() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `sqlite3_config` is only unsafe because it must not race with
+        // an initialized library or a live connection. The `Once` plus its
+        // placement before the first pool open give that ordering.
+        let rc = unsafe {
+            libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MEMSTATUS, 0_i32)
+        };
+        if rc != libsqlite3_sys::SQLITE_OK {
+            tracing::debug!(
+                rc,
+                "sqlite3_config(MEMSTATUS, 0) declined — SQLite was already \
+                 initialized; keeping default allocator bookkeeping"
+            );
+        }
+    });
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 ferrofin-model.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
+libsqlite3-sys.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true

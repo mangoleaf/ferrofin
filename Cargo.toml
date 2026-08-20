@@ -85,6 +85,10 @@ notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"] }
+# Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
+# cargo unifies them to ONE linked copy — a second copy would mean a second,
+# unconfigured SQLite. Used only to call sqlite3_config() before any connection.
+libsqlite3-sys = "0.30.1"
 
 # ── serde / errors ─────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }

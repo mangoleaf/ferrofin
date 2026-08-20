@@ -1,5 +1,9 @@
 # Capacity-cliff investigation — 2026-08-19
 
+> **RESOLVED.** Root cause was SQLite's global allocator mutex. See "The answer"
+> at the bottom; the analysis above is kept because the eliminations are what
+> made the cause findable.
+
 Measured with the fast loop (`./serve.sh` + `./hit.sh`), profiling binary over a
 copy of the benchv2 database (9,862 items / 7,505 people), native, not Docker.
 
@@ -95,3 +99,60 @@ answer directly. Without them, `samply` refuses and `eu-stack` returns
 Everything the full suite reported earlier in the day is suspect — the stray
 busy-loops overlapped much of it, including runs reported as clean passes. Only
 the *shapes* above, re-measured after killing them, should be trusted.
+
+
+---
+
+# The answer
+
+Profiling (`eu-stack` sampling, once `ptrace_scope` was lowered) found **132 of 828
+stacks blocked on a mutex**, and every caller was SQLite internals:
+`sqlite3Malloc` 49, `sqlite3_free` 29, `pcache1Fetch` 25, `pcache1Unpin` 23.
+
+Two global locks, fixed in two steps:
+
+1. **Shared page cache.** `PRAGMA mmap_size = 1 GiB` serves pages from an mmap
+   instead of `pcache1`. Re-profiling showed pcache contention drop from 54
+   samples to 3, and 400/s went 8,954 ms → 4,712 ms.
+
+2. **Global allocator mutex.** SQLite's default build wraps every
+   malloc/free in a global mutex solely to keep `sqlite3_memory_used()`
+   accurate — statistics nothing here reads. `sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0)`
+   removes it. After step 1 this was 82 of 85 remaining blocked stacks.
+
+## Result
+
+`items_mixed` (100-item page), p50:
+
+| rate | before | after |
+|---|---|---|
+| 200/s | 5.0 ms | 2.9 ms |
+| 400/s | **8,954 ms** | **2.8 ms** |
+| 1000/s | — | 2.8 ms |
+| 3000/s | — | 3.5 ms, 100% ok |
+
+The cliff is gone: flat to 3000/s where capacity was ~220/s. The endpoints this
+investigation started from, at their calibrated rates, all 100% ok:
+`persons` @608/s 2.6 ms (was 8,521 ms), `nextup` @1849/s 2.3 ms (was 10,190 ms),
+`items_resume` @464/s 0.2 ms, `music_genres` @728/s 0.8 ms.
+
+## The pool finding above was an artifact — disregard it
+
+This document previously reported `pool=4` beating `pool=32` by 1.6x and
+suggested re-deriving the default. That was the contention showing through:
+fewer SQLite threads meant less pressure on the one global lock. With the lock
+gone, measured again:
+
+| pool | 400/s | 1500/s |
+|---|---|---|
+| 4 | 2.6 ms | 521.9 ms |
+| 32 | 2.7 ms | 2.8 ms |
+
+`pool = cores` is optimal, exactly as the earlier pool-sweep concluded. The
+default was right and was correctly left alone.
+
+## Harness gap
+
+`playlist_items` and `shows_seasons` cannot be driven by `hit.sh` yet —
+`benchlib.pick_items` does not populate `playlistId`/`seriesId`. Server-side
+they go through the same path as the endpoints above, but they are unverified.
