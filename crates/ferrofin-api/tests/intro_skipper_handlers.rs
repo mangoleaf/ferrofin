@@ -183,8 +183,8 @@ impl ServerConfigurationManager for MemConfig {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(FakePaths)
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(ServerConfiguration::default())
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ServerConfiguration::default()))
     }
     async fn update_configuration(
         &self,

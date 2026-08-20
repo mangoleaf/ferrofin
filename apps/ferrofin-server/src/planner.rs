@@ -1571,8 +1571,11 @@ mod tests {
         }
         async fn configuration(
             &self,
-        ) -> Result<ferrofin_model::configuration::ServerConfiguration, ServiceError> {
-            Ok(ferrofin_model::configuration::ServerConfiguration::default())
+        ) -> Result<std::sync::Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
+        {
+            Ok(std::sync::Arc::new(
+                ferrofin_model::configuration::ServerConfiguration::default(),
+            ))
         }
         async fn update_configuration(
             &self,

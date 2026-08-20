@@ -1539,8 +1539,8 @@ mod bus_fallback_tests {
         fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
             unreachable!("not used by broadcast")
         }
-        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-            Ok(default_server_configuration())
+        async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(default_server_configuration()))
         }
         async fn update_configuration(
             &self,
@@ -1852,8 +1852,8 @@ mod broadcast_lock_tests {
         fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
             unreachable!("not used in these tests")
         }
-        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-            Ok(default_server_configuration())
+        async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(default_server_configuration()))
         }
         async fn update_configuration(
             &self,

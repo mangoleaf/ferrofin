@@ -141,7 +141,8 @@ impl FerrofinServerApplicationHost {
             .configuration_manager
             .configuration()
             .await?
-            .server_name;
+            .server_name
+            .clone();
         let published = if name.trim().is_empty() {
             None
         } else {

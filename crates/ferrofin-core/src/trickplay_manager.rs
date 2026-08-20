@@ -151,7 +151,7 @@ impl FerrofinTrickplayManager {
     /// Reads the current [`TrickplayOptions`], clamping a too-small interval to
     /// [`MIN_INTERVAL_MS`] (mirroring the C# guard).
     async fn trickplay_options(&self) -> Result<TrickplayOptions, ServiceError> {
-        let mut options = self.config.configuration().await?.trickplay_options;
+        let mut options = self.config.configuration().await?.trickplay_options.clone();
         if options.interval < MIN_INTERVAL_MS {
             tracing::warn!(
                 interval = options.interval,
@@ -980,11 +980,11 @@ mod tests {
             unreachable!("not used in these tests")
         }
 
-        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-            Ok(ServerConfiguration {
+        async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(ServerConfiguration {
                 trickplay_options: self.options.clone(),
                 ..ServerConfiguration::default()
-            })
+            }))
         }
 
         async fn update_configuration(

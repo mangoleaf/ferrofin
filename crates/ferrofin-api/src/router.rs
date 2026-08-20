@@ -88,16 +88,62 @@ pub fn create_router(state: AppState) -> Router {
     .layer(CorsLayer::permissive())
 }
 
+/// Whether an OTLP endpoint is configured, i.e. whether a span exporter will
+/// ever read this process's `otel.name` fields.
+///
+/// Same variable, same emptiness rule as the bootstrap's `build_tracer_provider`
+/// — that is what decides whether the `tracing-opentelemetry` layer exists at
+/// all. Split from the environment read so the rule itself is testable.
+fn otlp_configured_from(endpoint: Option<&str>) -> bool {
+    endpoint.is_some_and(|e| !e.trim().is_empty())
+}
+
+/// Cached [`otlp_configured_from`] over the real environment.
+///
+/// The bootstrap reads `OTEL_EXPORTER_OTLP_ENDPOINT` once at startup and never
+/// re-reads it, so caching here cannot drift from the installed layer stack.
+fn otlp_export_configured() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        otlp_configured_from(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref())
+    })
+}
+
 /// Builds the per-request span, named by the matched route template so
 /// `tracing-opentelemetry` groups spans by endpoint (via `otel.name`).
 fn make_request_span(req: &Request) -> Span {
+    build_request_span(req, otlp_export_configured())
+}
+
+/// [`make_request_span`] with the OTLP decision passed in, so both branches are
+/// reachable from a test without touching the process environment.
+///
+/// `otel.name` exists **only** for the OTLP exporter: nothing else reads it, and
+/// the route template it carries is already on the span as `http.route`. With
+/// export off there is no `tracing-opentelemetry` layer to consume it, so the
+/// `otlp == false` callsite drops the field — and with it the per-request
+/// `format!` that builds its value. That is TRACING.md rule 2 ("no
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` ⇒ no overhead beyond the existing fmt
+/// subscriber") applied to the one place still paying for export on every
+/// request. The span name and every other field are identical in both branches.
+fn build_request_span(req: &Request, otlp: bool) -> Span {
     let route = req
         .extensions()
         .get::<MatchedPath>()
         .map_or("unmatched", MatchedPath::as_str);
+    if otlp {
+        return tracing::info_span!(
+            "http_request",
+            otel.name = %format!("{} {route}", req.method()),
+            http.request.method = %req.method(),
+            http.route = route,
+            url.path = %req.uri().path(),
+            http.response.status_code = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+        );
+    }
     tracing::info_span!(
         "http_request",
-        otel.name = %format!("{} {route}", req.method()),
         http.request.method = %req.method(),
         http.route = route,
         url.path = %req.uri().path(),
@@ -343,6 +389,100 @@ mod tests {
         // here. Also assert we actually registered the full table.
         let _ = create_router(fake_state());
         assert!(axum_routes().len() >= 400);
+    }
+
+    #[test]
+    fn otlp_configured_only_for_a_non_blank_endpoint() {
+        use super::otlp_configured_from;
+        assert!(!otlp_configured_from(None));
+        assert!(!otlp_configured_from(Some("")));
+        assert!(!otlp_configured_from(Some("   ")));
+        assert!(otlp_configured_from(Some("http://alloy:4317")));
+    }
+
+    /// Records the field names + rendered values of every span the subscriber sees.
+    #[derive(Clone, Default)]
+    struct FieldSpy(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldSpy {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push((field.name().to_owned(), format!("{value:?}")));
+                }
+            }
+            attrs.record(&mut Visit(&mut self.0.lock().expect("spy lock")));
+        }
+    }
+
+    /// Builds a request span under a field-capturing subscriber and returns the
+    /// `(field, value)` pairs the span was created with.
+    fn span_fields(otlp: bool) -> Vec<(String, String)> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spy = FieldSpy::default();
+        let subscriber = tracing_subscriber::registry().with(spy.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            // No `MatchedPath` extension outside a real route match, so the
+            // route template renders as the `"unmatched"` fallback — which is
+            // itself the branch worth pinning (an unrouted request must still
+            // produce a well-formed span, not panic or leak the raw URL).
+            let req = Request::builder()
+                .uri("/Items?limit=1")
+                .body(Body::empty())
+                .unwrap();
+            let _span = super::build_request_span(&req, otlp);
+        });
+        spy.0.lock().expect("spy lock").clone()
+    }
+
+    #[test]
+    fn request_span_carries_otel_name_only_when_export_is_configured() {
+        // `otel.name` is the exporter's span name and nothing else reads it, so
+        // it — and the `format!` behind it — is paid for only with OTLP on.
+        let with_otlp = span_fields(true);
+        assert!(
+            with_otlp
+                .iter()
+                .any(|(k, v)| k == "otel.name" && v == "GET unmatched"),
+            "otel.name = \"<METHOD> <route template>\": {with_otlp:?}"
+        );
+
+        let without = span_fields(false);
+        assert!(
+            !without.iter().any(|(k, _)| k == "otel.name"),
+            "no exporter ⇒ no otel.name: {without:?}"
+        );
+    }
+
+    #[test]
+    fn request_span_fields_are_otherwise_identical_in_both_branches() {
+        // Everything a log reader or the dashboard sees must be unchanged by the
+        // OTLP gate — only `otel.name` may differ.
+        let with_otlp: Vec<_> = span_fields(true)
+            .into_iter()
+            .filter(|(k, _)| k != "otel.name")
+            .collect();
+        let without = span_fields(false);
+        assert_eq!(with_otlp, without);
+        // And the fields the fmt sink actually renders are all present.
+        assert_eq!(
+            without,
+            vec![
+                ("http.request.method".to_owned(), "GET".to_owned()),
+                ("http.route".to_owned(), "\"unmatched\"".to_owned()),
+                ("url.path".to_owned(), "/Items".to_owned()),
+            ]
+        );
     }
 
     #[test]

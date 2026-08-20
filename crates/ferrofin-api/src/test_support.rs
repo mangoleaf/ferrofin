@@ -1012,11 +1012,11 @@ impl ServerConfigurationManager for FakeConfig {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(FakePaths)
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
         // Default config has `is_startup_wizard_completed = false`, so the
         // `FirstTimeSetupOrAuth` extractor takes its anonymous first-time-setup
         // path in tests (matching a fresh install).
-        Ok(ServerConfiguration::default())
+        Ok(Arc::new(ServerConfiguration::default()))
     }
     async fn update_configuration(
         &self,

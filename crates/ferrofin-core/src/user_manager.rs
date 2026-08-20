@@ -214,7 +214,7 @@ impl FerrofinUserManager {
         let Ok(configured) = config.configuration().await else {
             return stored;
         };
-        let apps = configured.cast_receiver_applications;
+        let apps = &configured.cast_receiver_applications;
         let stored = stored.filter(|s| !s.is_empty());
         stored
             .filter(|id| apps.iter().any(|app| app.id == *id))

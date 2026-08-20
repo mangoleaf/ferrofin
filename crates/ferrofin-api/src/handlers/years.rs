@@ -66,8 +66,11 @@ async fn get_years(
     if let Some(parent) = query.parent_id {
         ancestor_ids.push(parent);
     }
+    // The user row moves into the query and is borrowed back out for the DTO
+    // projection below — `resolve_user` already cloned it off the auth context,
+    // and a second full copy of every string on it buys nothing.
     let internal = ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(user),
         start_index: query.start_index,
         limit: query.limit,
         recursive: query.recursive.unwrap_or(true),
@@ -76,7 +79,7 @@ async fn get_years(
     };
     let result = state.library.get_years(&internal).await?;
     let options = DtoOptions::with_all_fields(false);
-    let projected = project_item_rows(&state, result, &options, Some(&user)).await?;
+    let projected = project_item_rows(&state, result, &options, internal.user.as_ref()).await?;
     Ok(Json(projected))
 }
 

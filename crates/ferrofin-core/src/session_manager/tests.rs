@@ -48,8 +48,8 @@ impl ServerConfigurationManager for FixedConfig {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         unreachable!("not used in these tests")
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(self.config.clone())
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(self.config.clone()))
     }
     async fn update_configuration(
         &self,

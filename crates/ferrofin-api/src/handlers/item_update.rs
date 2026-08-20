@@ -366,7 +366,7 @@ async fn update_item_content_type(
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let folder = containing_folder_path(item.path.as_deref());
 
-    let mut configuration = state.config.configuration().await?;
+    let mut configuration = (*state.config.configuration().await?).clone();
     configuration.content_types.retain(|pair| {
         pair.name
             .as_deref()

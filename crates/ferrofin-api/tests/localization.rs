@@ -180,11 +180,11 @@ impl ServerConfigurationManager for StubConfig {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(self.paths.clone())
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(ServerConfiguration {
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ServerConfiguration {
             server_name: "Ferrofin".to_owned(),
             ..Default::default()
-        })
+        }))
     }
     async fn update_configuration(
         &self,

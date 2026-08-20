@@ -299,7 +299,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             cache_path: Some(self.paths.cache_path()),
             log_path: Some(self.paths.log_directory_path()),
             transcoding_temp_path: Some(transcode),
-            cast_receiver_applications: Some(cfg.cast_receiver_applications),
+            cast_receiver_applications: Some(cfg.cast_receiver_applications.clone()),
             operating_system: Some(host_operating_system().to_owned()),
             ..Default::default()
         })

@@ -338,6 +338,10 @@ impl DtoService for OkDto {
 struct StubLibrary {
     /// The last query passed to [`LibraryManager::get_genres`].
     last_genre_query: Mutex<Option<InternalItemsQuery>>,
+    /// When set, [`LibraryManager::get_genres`] also returns a row whose stored
+    /// `Id` is not a Guid (a corrupt/adopted row) — the case the handler must
+    /// drop rather than publish as the nil GUID.
+    malformed_genre_id: bool,
 }
 
 #[async_trait]
@@ -360,14 +364,20 @@ impl LibraryManager for StubLibrary {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
         *self.last_genre_query.lock().expect("genre query lock") = Some(query.clone());
-        Ok(QueryResult::new(
-            Some(0),
-            Some(1),
-            vec![ItemWithCounts {
-                item: item_entity(Uuid::from_u128(0x21), "Action"),
+        let mut items = vec![ItemWithCounts {
+            item: item_entity(Uuid::from_u128(0x21), "Action"),
+            counts: ferrofin_model::dto::ItemCounts::default(),
+        }];
+        if self.malformed_genre_id {
+            let mut item = item_entity(Uuid::from_u128(0x23), "Corrupt");
+            "not-a-guid".clone_into(&mut item.id);
+            items.push(ItemWithCounts {
+                item,
                 counts: ferrofin_model::dto::ItemCounts::default(),
-            }],
-        ))
+            });
+        }
+        let total = i32::try_from(items.len()).expect("small");
+        Ok(QueryResult::new(Some(0), Some(total), items))
     }
     async fn get_music_genres(
         &self,
@@ -697,6 +707,33 @@ async fn items_filters2_returns_genre_facets() {
         .map(String::as_str)
         .collect();
     assert_eq!(keys, vec!["Genres", "Tags"]);
+}
+
+#[tokio::test]
+async fn items_filters2_drops_a_genre_whose_stored_id_is_not_a_guid() {
+    // `Id` is what the client sends back as `genreIds=…`. Upstream reads a Guid
+    // column and can only emit real ids; Ferrofin stores the id as text, so a row
+    // that will not parse is dropped rather than published as the nil GUID — a
+    // facet chip that resolves to nothing is worse than no chip.
+    let library = Arc::new(StubLibrary {
+        malformed_genre_id: true,
+        ..StubLibrary::default()
+    });
+    let (status, body) = get_with(library, "/Items/Filters2?includeItemTypes=Movie").await;
+    assert_eq!(status, StatusCode::OK);
+    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+    assert_eq!(
+        filters.genres,
+        vec![NameGuidPair {
+            name: Some("Action".to_owned()),
+            id: Uuid::from_u128(0x21),
+        }],
+        "only the well-formed facet is published"
+    );
+    assert!(
+        !filters.genres.iter().any(|pair| pair.id.is_nil()),
+        "no nil-GUID facet reaches the client"
+    );
 }
 
 #[tokio::test]

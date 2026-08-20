@@ -146,13 +146,11 @@ async fn get_grouping_options(
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()
         .map(|folder| SpecialViewOptionDto {
-            name: folder.name.clone(),
             // C#'s `Id.ToString("N")` — a dashless guid. Fall back to the raw id
-            // when it is not a parseable guid.
-            id: Some(
-                Uuid::parse_str(&folder.id)
-                    .map_or_else(|_| folder.id.clone(), |g| g.simple().to_string()),
-            ),
+            // when it is not a parseable guid. Read the id first so the name can
+            // move out of the owned row instead of being copied.
+            id: Some(Uuid::parse_str(&folder.id).map_or(folder.id, |g| g.simple().to_string())),
+            name: folder.name,
         })
         .collect();
     options.sort_by(|a, b| a.name.cmp(&b.name));

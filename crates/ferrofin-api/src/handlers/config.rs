@@ -65,7 +65,9 @@ async fn get_configuration(
     State(state): State<AppState>,
     _auth: RequireAuth,
 ) -> Result<Json<ServerConfiguration>, ApiError> {
-    Ok(Json(state.config.configuration().await?))
+    // The seam hands out a shared handle; this endpoint owns its response body,
+    // so it is one of the few callers that deep-clones the document.
+    Ok(Json((*state.config.configuration().await?).clone()))
 }
 
 /// `POST /System/Configuration` — replace the server configuration.

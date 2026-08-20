@@ -665,10 +665,11 @@ mod tests {
         }
         async fn configuration(
             &self,
-        ) -> Result<ferrofin_model::configuration::ServerConfiguration, ServiceError> {
+        ) -> Result<std::sync::Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
+        {
             let mut c = crate::configuration_manager::default_server_configuration();
             c.display_specials_within_seasons = self.include_specials;
-            Ok(c)
+            Ok(std::sync::Arc::new(c))
         }
         async fn update_configuration(
             &self,

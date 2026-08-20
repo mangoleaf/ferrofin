@@ -674,6 +674,25 @@ async fn scan_status(
     }))
 }
 
+/// Projects a season's episode rows into the visualization list.
+///
+/// A row whose stored `Id` is not a Guid is **dropped** rather than listed under
+/// the nil GUID: `Id` is the key the visualization page sends straight back to
+/// fetch that episode's segments, and the nil one resolves to nothing. Upstream
+/// reads a `Guid` column here and can only ever emit real ids.
+fn episode_visualizations(episodes: Vec<BaseItemEntity>) -> Vec<EpisodeVisualization> {
+    episodes
+        .into_iter()
+        .filter_map(|e| {
+            let id = Uuid::parse_str(&e.id).ok()?;
+            Some(EpisodeVisualization {
+                id,
+                name: e.name.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 /// `GET /Intros/Show/{SeriesId}/{SeasonId}` — the episodes of a season.
 async fn get_season_episodes(
     State(state): State<AppState>,
@@ -686,14 +705,7 @@ async fn get_season_episodes(
             "season {season_id} has no episodes"
         )));
     }
-    let out = episodes
-        .into_iter()
-        .map(|e| EpisodeVisualization {
-            id: Uuid::parse_str(&e.id).unwrap_or_default(),
-            name: e.name.unwrap_or_default(),
-        })
-        .collect();
-    Ok(Json(out))
+    Ok(Json(episode_visualizations(episodes)))
 }
 
 /// `DELETE /Intros/Show/{SeriesId}/{SeasonId}` — erase the season's Intro
@@ -887,10 +899,48 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMPORT_STRING, find_skip_duration_span, inject_import, mode_to_segment_type, secs_to_ticks,
-        segment_type_mode_name, ticks_to_secs, update_duration_value,
+        IMPORT_STRING, episode_visualizations, find_skip_duration_span, inject_import,
+        mode_to_segment_type, secs_to_ticks, segment_type_mode_name, ticks_to_secs,
+        update_duration_value,
     };
+    use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::media_segments::MediaSegmentType;
+    use uuid::Uuid;
+
+    #[test]
+    fn episode_visualizations_drop_rows_whose_id_is_not_a_guid() {
+        let good = Uuid::from_u128(0x5EA5);
+        let episodes = vec![
+            BaseItemEntity {
+                id: good.to_string(),
+                name: Some("S01E01".to_owned()),
+                ..BaseItemEntity::default()
+            },
+            BaseItemEntity {
+                id: "not-a-guid".to_owned(),
+                name: Some("S01E02".to_owned()),
+                ..BaseItemEntity::default()
+            },
+        ];
+        let out = episode_visualizations(episodes);
+        // The malformed row is skipped, not published as the nil GUID — an id the
+        // page would send back to a segments lookup that can never match.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, good);
+        assert_eq!(out[0].name, "S01E01");
+        assert!(!out.iter().any(|e| e.id.is_nil()));
+    }
+
+    #[test]
+    fn episode_visualizations_default_a_missing_name_to_empty() {
+        let out = episode_visualizations(vec![BaseItemEntity {
+            id: Uuid::from_u128(1).to_string(),
+            name: None,
+            ..BaseItemEntity::default()
+        }]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "");
+    }
 
     #[test]
     fn mode_round_trips_through_segment_type() {

@@ -993,8 +993,8 @@ mod tests {
         fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
             Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
         }
-        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-            Ok(self.configuration.clone())
+        async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.configuration.clone()))
         }
         async fn update_configuration(
             &self,

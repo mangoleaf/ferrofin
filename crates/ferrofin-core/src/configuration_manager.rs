@@ -26,44 +26,31 @@
 //! construction the manager loads `system.json` if present, otherwise falls
 //! back to [`default_server_configuration`] and writes it out.
 //!
-//! ## What the `Arc` indirection buys today, and what it does not
+//! ## What the `Arc` indirection buys
 //!
 //! `ServerConfiguration` is a large struct with dozens of heap-owned fields
 //! (`String`s, `Vec`s, the per-type `MetadataOptions` table), so handing out a
-//! *clone* of it is dozens of allocations. Storing it behind an `Arc` delivers
-//! two things right now:
+//! *clone* of it is dozens of allocations. Storing it behind an `Arc` — and
+//! handing that `Arc` out through the trait seam — delivers three things:
 //!
 //! - Writers build a fresh `ServerConfiguration`, wrap it in a new `Arc`, and
 //!   swap the pointer, so the write section is a single pointer store and an
 //!   in-flight reader keeps a consistent (never torn) view of the document it
 //!   started with while the next read observes the new one.
-//! - The deep clone that [`snapshot`](FerrofinServerConfigurationManager::snapshot)
-//!   performs now happens *after* the read lock is released (it clones the
-//!   handle under the lock and the document outside it), so a slow reader no
-//!   longer widens the window in which a writer is blocked.
+//! - [`ServerConfigurationManager::configuration`] — the seam every
+//!   per-request reader goes through, including the API auth extractor
+//!   (`ferrofin-api`'s `auth.rs`) and `AuthorizationContext`, both of which hold
+//!   this manager only as `Arc<dyn ServerConfigurationManager>` — returns
+//!   [`snapshot_shared`](FerrofinServerConfigurationManager::snapshot_shared),
+//!   so an authenticated request now pays a refcount bump instead of a deep
+//!   copy of the whole document.
+//! - The callers that genuinely *edit* the configuration (the startup wizard,
+//!   `/System/Configuration`, the metadata-options editor) clone the document
+//!   explicitly — the cost stays, but only on the write paths that need it.
 //!
-//! It does **not** yet make per-request configuration reads cheap, and nothing
-//! in this module should be read as claiming otherwise. The readers that would
-//! benefit most — the API auth extractor (`ferrofin-api`'s `auth.rs`) and
-//! `AuthorizationContext` — hold the manager as
-//! `Arc<dyn ServerConfigurationManager>` and can therefore only call
-//! [`ServerConfigurationManager::configuration`], which is declared to return an
-//! *owned* `ServerConfiguration`. Every one of those reads still deep-clones the
-//! whole document, exactly as it did before the `Arc` landed, and
-//! [`snapshot_shared`](FerrofinServerConfigurationManager::snapshot_shared)
-//! currently has no caller outside this module.
-//!
-//! Unlocking the hot path is a **pending, one-line change to a file this module
-//! does not own** — `crates/ferrofin-traits/src/configuration.rs`: declare
-//!
-//! ```text
-//! async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError>;
-//! ```
-//!
-//! (still object-safe), return `self.snapshot_shared()` from the impl below,
-//! and adjust the handful of call sites that mutate the returned value to clone
-//! it explicitly. Until that lands, treat the `Arc` storage as groundwork, not
-//! as a delivered per-request win.
+//! [`snapshot`](FerrofinServerConfigurationManager::snapshot) still exists for
+//! in-crate callers that want an owned, mutable copy; in-crate readers that only
+//! need a field should prefer `snapshot_shared`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -309,14 +296,10 @@ impl FerrofinServerConfigurationManager {
     /// swaps in a *new* `Arc`, so an existing handle keeps observing the
     /// document it was taken from and the next call observes the new one.
     ///
-    /// **Callers today: this module only** —
-    /// [`snapshot`](Self::snapshot) and `validate_metadata_path`. The
-    /// per-request readers (the API auth extractor, `AuthorizationContext`) see
-    /// this manager as `Arc<dyn ServerConfigurationManager>`, so they can only
-    /// reach [`ServerConfigurationManager::configuration`], which returns an
-    /// owned document and therefore still deep-clones on every request. This
-    /// method is groundwork for the pending trait-signature change described in
-    /// the module docs; it is not, on its own, a per-request saving.
+    /// This is what [`ServerConfigurationManager::configuration`] returns, so
+    /// it is the path every per-request reader takes — including the ones that
+    /// see this manager only as `Arc<dyn ServerConfigurationManager>` (the API
+    /// auth extractor and `AuthorizationContext`).
     ///
     /// # Panics
     ///
@@ -334,13 +317,13 @@ impl FerrofinServerConfigurationManager {
 
     /// A snapshot clone of the current configuration.
     ///
-    /// This deep-copies the whole document. It is nonetheless the path *every*
-    /// trait-seam read takes — including every per-request one — because
-    /// [`ServerConfigurationManager::configuration`] is declared to hand out an
-    /// owned value; see the module docs. The one thing the `Arc` changes here is
-    /// that the copy is made after the read lock has been dropped rather than
-    /// while holding it. In-crate callers that only need to read a field should
-    /// prefer [`snapshot_shared`](Self::snapshot_shared).
+    /// This deep-copies the whole document, so it is for callers that need an
+    /// owned, *mutable* configuration to edit and hand back to
+    /// [`ServerConfigurationManager::update_configuration`]. The copy is made
+    /// after the read lock has been dropped rather than while holding it.
+    /// Callers that only need to read a field should use
+    /// [`snapshot_shared`](Self::snapshot_shared), which is also what the trait
+    /// seam hands out.
     ///
     /// # Panics
     ///
@@ -389,8 +372,8 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
     }
 
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(self.snapshot())
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(self.snapshot_shared())
     }
 
     async fn update_configuration(
@@ -574,11 +557,15 @@ mod tests {
         // The owned snapshot is value-identical to the shared one (parity: the
         // trait seam must keep emitting exactly what it emitted before).
         assert_eq!(mgr.snapshot(), *before);
-        assert_eq!(
-            mgr.configuration().await.expect("configuration"),
-            *before,
-            "the trait accessor must observe the same document"
+        // The trait seam must hand out the *shared* handle, not a deep copy:
+        // this is the per-request read path, so pointer identity is the
+        // invariant, not just value equality.
+        let via_trait = mgr.configuration().await.expect("configuration");
+        assert!(
+            Arc::ptr_eq(&before, &via_trait),
+            "the trait accessor must share the document, not deep-clone it"
         );
+        assert_eq!(*via_trait, *before);
 
         // Mutate a spread of heap-owned and scalar fields.
         let mut cfg = mgr.snapshot();
@@ -603,7 +590,7 @@ mod tests {
         for observed in [
             (*after).clone(),
             mgr.snapshot(),
-            mgr.configuration().await.expect("configuration"),
+            (*mgr.configuration().await.expect("configuration")).clone(),
         ] {
             assert_eq!(observed.server_name, "Swapped");
             assert_eq!(observed.sort_remove_words, vec!["das", "der"]);
@@ -613,8 +600,13 @@ mod tests {
             assert_eq!(observed, cfg, "the read must equal the written document");
         }
 
-        // And the swapped-in document is itself shared, not re-cloned per read.
+        // And the swapped-in document is itself shared, not re-cloned per read —
+        // through the trait seam as well as the in-crate handle.
         assert!(Arc::ptr_eq(&after, &mgr.snapshot_shared()));
+        assert!(Arc::ptr_eq(
+            &after,
+            &mgr.configuration().await.expect("configuration")
+        ));
     }
 
     /// `validate_metadata_path` reads the live document, so an unchanged path is

@@ -80,7 +80,7 @@ struct StartupUserDto {
     tag = "ferrofin"
 )]
 async fn complete_wizard(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
-    let mut config = state.config.configuration().await?;
+    let mut config = (*state.config.configuration().await?).clone();
     config.is_startup_wizard_completed = true;
     state.config.update_configuration(&config).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -100,10 +100,10 @@ async fn get_startup_configuration(
 ) -> Result<Json<StartupConfigurationDto>, ApiError> {
     let config = state.config.configuration().await?;
     Ok(Json(StartupConfigurationDto {
-        server_name: Some(config.server_name),
-        ui_culture: Some(config.ui_culture),
-        metadata_country_code: Some(config.metadata_country_code),
-        preferred_metadata_language: Some(config.preferred_metadata_language),
+        server_name: Some(config.server_name.clone()),
+        ui_culture: Some(config.ui_culture.clone()),
+        metadata_country_code: Some(config.metadata_country_code.clone()),
+        preferred_metadata_language: Some(config.preferred_metadata_language.clone()),
     }))
 }
 
@@ -121,7 +121,7 @@ async fn update_initial_configuration(
     State(state): State<AppState>,
     Json(body): Json<StartupConfigurationDto>,
 ) -> Result<StatusCode, ApiError> {
-    let mut config = state.config.configuration().await?;
+    let mut config = (*state.config.configuration().await?).clone();
     config.server_name = body.server_name.unwrap_or_default();
     config.ui_culture = body.ui_culture.unwrap_or_default();
     config.metadata_country_code = body.metadata_country_code.unwrap_or_default();

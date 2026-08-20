@@ -47,7 +47,18 @@ pub trait ServerConfigurationManager: Send + Sync {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths>;
 
     /// The current, strongly-typed server configuration.
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError>;
+    ///
+    /// Returned as a shared `Arc` rather than an owned value: `ServerConfiguration`
+    /// is a large document (dozens of `String`s/`Vec`s plus the per-item-type
+    /// metadata-options table) and this accessor sits on the per-request auth
+    /// path, so handing out an owned copy cost a deep clone on every
+    /// authenticated request. Readers observe fields through the handle; the
+    /// (rare) caller that needs to *edit* the document clones it explicitly and
+    /// passes the result to
+    /// [`update_configuration`](Self::update_configuration). The handle is a
+    /// point-in-time snapshot — a concurrent update swaps in a new `Arc`, so an
+    /// existing handle keeps observing the document it was taken from.
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError>;
 
     /// Persists a replacement server configuration.
     async fn update_configuration(

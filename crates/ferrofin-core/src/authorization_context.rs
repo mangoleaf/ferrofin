@@ -627,9 +627,9 @@ mod tests {
             unreachable!("not used by the authorization context")
         }
 
-        async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
+        async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.config.clone())
+            Ok(Arc::new(self.config.clone()))
         }
 
         async fn update_configuration(

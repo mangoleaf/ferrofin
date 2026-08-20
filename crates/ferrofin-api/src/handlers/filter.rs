@@ -219,9 +219,18 @@ async fn get_query_filters(
     filters.genres = genre_result
         .items
         .into_iter()
-        .map(|iwc| NameGuidPair {
-            name: iwc.item.name.clone(),
-            id: Uuid::parse_str(&iwc.item.id).unwrap_or_else(|_| Uuid::nil()),
+        .filter_map(|iwc| {
+            // Upstream's facet is `(item.Name, item.Id)` off a `Guid` column, so
+            // it can only ever emit a real id. Ferrofin stores the id as text, so
+            // a row that is not a Guid is **dropped** rather than published as
+            // the nil GUID: `Id` is what the client sends back as `genreIds=…`,
+            // and a nil one selects nothing, so emitting it would only add a
+            // facet chip that silently returns an empty library.
+            let id = Uuid::parse_str(&iwc.item.id).ok()?;
+            Some(NameGuidPair {
+                name: iwc.item.name,
+                id,
+            })
         })
         .collect();
 

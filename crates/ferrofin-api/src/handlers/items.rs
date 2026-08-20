@@ -262,8 +262,11 @@ async fn get_items(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
+    // The user row moves into the query and is borrowed back out for the DTO
+    // projection below — `resolve_user` already cloned it off the auth context,
+    // and a second full copy of every string on it buys nothing.
     let mut internal = InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(user),
         start_index: query.start_index,
         limit: query.limit,
         recursive: query.recursive.unwrap_or(false),
@@ -336,7 +339,7 @@ async fn get_items(
     };
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, Some(&user), None, true)
+        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(
         Some(result.start_index),
@@ -603,8 +606,11 @@ async fn get_resume_items(
     use ferrofin_model::live_tv::ItemSortBy;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    // The user row moves into the query and is borrowed back out for the DTO
+    // projection below — `resolve_user` already cloned it off the auth context,
+    // and a second full copy of every string on it buys nothing.
     let mut internal = InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(user),
         start_index: query.start_index,
         limit: query.limit,
         recursive: true,
@@ -628,7 +634,7 @@ async fn get_resume_items(
     let options = DtoOptions::with_all_fields(false);
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, Some(&user), None, true)
+        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(
         Some(result.start_index),

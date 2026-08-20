@@ -247,8 +247,8 @@ impl ServerConfigurationManager for MemConfig {
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(ferrofin_api::test_support::FakePaths)
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(self.config.lock().unwrap().clone())
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(self.config.lock().unwrap().clone()))
     }
     async fn update_configuration(
         &self,

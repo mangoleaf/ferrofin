@@ -41,17 +41,17 @@ pub(crate) fn request_context(
     query: Option<&str>,
     remote: Option<String>,
 ) -> RequestContext {
-    let headers = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
-        })
-        .collect();
+    // Sized up front: `filter_map` reports a zero lower bound, so `collect` would
+    // otherwise regrow this vector several times for every request that arrives.
+    let mut copied = Vec::with_capacity(headers.len());
+    copied.extend(headers.iter().filter_map(|(name, value)| {
+        value
+            .to_str()
+            .ok()
+            .map(|v| (name.as_str().to_owned(), v.to_owned()))
+    }));
     RequestContext {
-        headers,
+        headers: copied,
         query_string: query.map(ToOwned::to_owned),
         remote_endpoint: remote,
     }

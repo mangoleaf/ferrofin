@@ -669,6 +669,42 @@ fn grouping_parent(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> 
     Uuid::parse_str(id_str).ok().filter(|u| !u.is_nil())
 }
 
+/// Buckets the latest rows by [`grouping_parent`], preserving first-seen order.
+///
+/// Ungroupable rows (movies, and episodes/audio with no parent) each get their
+/// own single-item bucket keyed by their own id, so they can never merge with
+/// one another.
+///
+/// The key map points at a **slot** in the result rather than owning a second
+/// copy of the key: the key string moves into the map once and is never cloned,
+/// and the result vector is itself the first-seen ordering. Both are per-row on
+/// the `/Items/Latest` home row.
+fn group_by_parent(
+    items: Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
+) -> Vec<(
+    Option<Uuid>,
+    Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
+)> {
+    use std::collections::HashMap;
+    let mut slot_of: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(
+        Option<Uuid>,
+        Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
+    )> = Vec::new();
+    for item in items {
+        let (key, parent) = match grouping_parent(&item) {
+            Some(pid) => (pid.to_string(), Some(pid)),
+            None => (item.id.clone(), None),
+        };
+        let slot = *slot_of.entry(key).or_insert_with(|| {
+            groups.push((parent, Vec::new()));
+            groups.len() - 1
+        });
+        groups[slot].1.push(item);
+    }
+    groups
+}
+
 /// Groups the latest items by their grouping parent, preserving first-seen order.
 /// A group of ≥2 items collapses to its (resolved) parent with a child count;
 /// everything else is emitted as-is with a zero count.
@@ -682,33 +718,9 @@ async fn group_latest(
     ),
     ApiError,
 > {
-    use std::collections::HashMap;
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<
-        String,
-        (
-            Option<Uuid>,
-            Vec<ferrofin_db::entities::base_items::BaseItemEntity>,
-        ),
-    > = HashMap::new();
-    for item in items {
-        let (key, parent) = match grouping_parent(&item) {
-            Some(pid) => (pid.to_string(), Some(pid)),
-            None => (item.id.clone(), None),
-        };
-        groups
-            .entry(key.clone())
-            .or_insert_with(|| {
-                order.push(key.clone());
-                (parent, Vec::new())
-            })
-            .1
-            .push(item);
-    }
     let mut entities = Vec::new();
     let mut counts = Vec::new();
-    for key in order {
-        let (parent, mut group) = groups.remove(&key).expect("group present");
+    for (parent, mut group) in group_by_parent(items) {
         if group.len() > 1
             && let Some(pid) = parent
             && let Some(parent_item) = state.library.get_item_by_id(pid).await?
@@ -730,10 +742,10 @@ async fn group_latest(
 /// segment against the serde name of the kind (Jellyfin's `BaseItemKind` names).
 fn type_name_matches(stored: &str, kind: ferrofin_model::data::BaseItemKind) -> bool {
     let short = stored.rsplit('.').next().unwrap_or(stored);
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(std::string::ToString::to_string))
-        .is_some_and(|name| name == short)
+    // Compare against the serialized name in place. This runs once per (row ×
+    // requested kind) on `/Items/Latest`, so the old `to_value(…) → to_string()`
+    // pair bought two heap allocations per comparison for a borrowed `&str`.
+    matches!(serde_json::to_value(kind), Ok(serde_json::Value::String(name)) if name == short)
 }
 
 /// `GET /Items/{itemId}/CriticReviews` — critic reviews for an item.
@@ -905,7 +917,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::{grouping_parent, type_name_matches};
+    use super::{group_by_parent, grouping_parent, type_name_matches};
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
@@ -917,6 +929,66 @@ mod tests {
             parent_id: parent_id.map(str::to_owned),
             ..BaseItemEntity::default()
         }
+    }
+
+    /// An item with an id, so grouping can key ungroupable rows by their own id.
+    fn identified(id: Uuid, type_: &str, series_id: Option<&str>) -> BaseItemEntity {
+        BaseItemEntity {
+            id: id.to_string(),
+            type_: type_.to_owned(),
+            series_id: series_id.map(str::to_owned),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    const EPISODE: &str = "MediaBrowser.Controller.Entities.TV.Episode";
+    const MOVIE: &str = "MediaBrowser.Controller.Entities.Movies.Movie";
+
+    #[test]
+    fn group_by_parent_buckets_by_series_in_first_seen_order() {
+        let series_a = Uuid::from_u128(0xA);
+        let series_b = Uuid::from_u128(0xB);
+        let (e1, e2, e3) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let movie = Uuid::from_u128(9);
+        // Interleaved so a "collapse only adjacent runs" implementation fails.
+        let groups = group_by_parent(vec![
+            identified(e1, EPISODE, Some(&series_a.to_string())),
+            identified(movie, MOVIE, None),
+            identified(e2, EPISODE, Some(&series_b.to_string())),
+            identified(e3, EPISODE, Some(&series_a.to_string())),
+        ]);
+        // Order is first-seen: series A, the movie, then series B.
+        let shape: Vec<(Option<Uuid>, Vec<String>)> = groups
+            .into_iter()
+            .map(|(parent, items)| (parent, items.into_iter().map(|i| i.id).collect()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Some(series_a), vec![e1.to_string(), e3.to_string()]),
+                (None, vec![movie.to_string()]),
+                (Some(series_b), vec![e2.to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_parent_keeps_ungroupable_rows_apart() {
+        // Two parentless movies must never share a bucket (they are keyed by
+        // their own ids), or the handler would collapse them into one row.
+        let (a, b) = (Uuid::from_u128(4), Uuid::from_u128(5));
+        let groups = group_by_parent(vec![identified(a, MOVIE, None), identified(b, MOVIE, None)]);
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups
+                .iter()
+                .all(|(parent, items)| parent.is_none() && items.len() == 1)
+        );
+    }
+
+    #[test]
+    fn group_by_parent_of_nothing_is_nothing() {
+        assert!(group_by_parent(Vec::new()).is_empty());
     }
 
     #[test]

@@ -274,11 +274,11 @@ impl ServerConfigurationManager for StubConfig {
     fn application_paths(&self) -> StdArc<dyn ServerApplicationPaths> {
         unimplemented!()
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(ServerConfiguration {
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ServerConfiguration {
             allow_client_log_upload: self.allow_upload,
             ..Default::default()
-        })
+        }))
     }
     async fn update_configuration(
         &self,

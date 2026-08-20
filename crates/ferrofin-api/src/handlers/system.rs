@@ -25,21 +25,7 @@ use crate::state::AppState;
 /// query), mirroring the auth middleware's construction so the system manager
 /// sees the same request view.
 fn context_from_parts(parts: &Parts) -> RequestContext {
-    let headers = parts
-        .headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
-        })
-        .collect();
-    RequestContext {
-        headers,
-        query_string: parts.uri.query().map(ToOwned::to_owned),
-        remote_endpoint: None,
-    }
+    crate::auth::request_context(&parts.headers, parts.uri.query(), None)
 }
 
 /// `GET /System/Info` — the full system information for an authenticated client.

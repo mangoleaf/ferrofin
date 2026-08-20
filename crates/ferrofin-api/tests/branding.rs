@@ -177,8 +177,8 @@ impl ServerConfigurationManager for StubConfig {
             data: self.data_path.clone(),
         })
     }
-    async fn configuration(&self) -> Result<ServerConfiguration, ServiceError> {
-        Ok(ServerConfiguration::default())
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ServerConfiguration::default()))
     }
     async fn update_configuration(&self, _c: &ServerConfiguration) -> Result<(), ServiceError> {
         Ok(())
