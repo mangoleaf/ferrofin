@@ -788,3 +788,171 @@ async fn report_session_ended_removes_the_session() {
         .unwrap();
     assert!(sessions.is_empty());
 }
+
+/// A [`UserDataManager`](ferrofin_traits::library::UserDataManager) decorator
+/// that counts the DTO reads the push path makes, delegating the rest to the
+/// real manager.
+struct CountingUserData {
+    inner: Arc<dyn ferrofin_traits::library::UserDataManager>,
+    dto_reads: std::sync::atomic::AtomicUsize,
+    play_state_writes: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingUserData {
+    fn new(inner: Arc<dyn ferrofin_traits::library::UserDataManager>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            dto_reads: std::sync::atomic::AtomicUsize::new(0),
+            play_state_writes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    fn dto_reads(&self) -> usize {
+        self.dto_reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn play_state_writes(&self) -> usize {
+        self.play_state_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::library::UserDataManager for CountingUserData {
+    async fn save_user_data(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &ferrofin_model::dto::UpdateUserItemDataDto,
+    ) -> Result<(), ServiceError> {
+        self.inner.save_user_data(user_id, item_id, user_data).await
+    }
+    async fn get_user_data_dto(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<ferrofin_model::dto::UserItemDataDto>, ServiceError> {
+        self.dto_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get_user_data_dto(item_id, user_id).await
+    }
+    async fn get_user_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>, ServiceError>
+    {
+        self.inner.get_user_data_batch(item_ids, user_id).await
+    }
+    async fn update_play_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+    ) -> Result<bool, ServiceError> {
+        self.play_state_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .update_play_state(user_id, item_id, reported_position_ticks)
+            .await
+    }
+    async fn mark_played(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ferrofin_model::dto::UserItemDataDto, ServiceError> {
+        self.inner.mark_played(user_id, item_id, date_played).await
+    }
+    async fn mark_unplayed(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<ferrofin_model::dto::UserItemDataDto, ServiceError> {
+        self.inner.mark_unplayed(user_id, item_id).await
+    }
+    async fn reset_playback_stream_selections(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        self.inner
+            .reset_playback_stream_selections(user_id, item_id)
+            .await
+    }
+}
+
+/// Builds a session manager whose user-data manager is the counting decorator.
+fn manager_counting(
+    db: &Database,
+    user_data: Arc<CountingUserData>,
+) -> Arc<FerrofinSessionManager> {
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ItemTypeLookup::new());
+    let library = Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ));
+    Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        user_data,
+        library,
+        Arc::new(UnusedDtoService),
+        Arc::new(FerrofinEventManager::new()),
+        db.clone(),
+        "server-1".to_owned(),
+    ))
+}
+
+// A progress report still persists play state when the user has no session that
+// could receive the `UserDataChanged` push — but it must not pay the extra
+// `UserData` read to build a message nobody can receive. Playstate progress is
+// the hottest write in the server, so that read is per-report waste.
+#[tokio::test]
+async fn progress_without_a_listening_session_skips_the_push_read() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let counting =
+        CountingUserData::new(Arc::new(FerrofinUserDataManager::new(db.clone(), config)));
+    let mgr = manager_counting(&db, counting.clone());
+
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "solo").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-solo", "TV", "e", &user)
+        .await
+        .unwrap();
+    let info = PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id,
+        position_ticks: Some(1000),
+        ..PlaybackProgressInfo::default()
+    };
+
+    // No WebSocket, no bus sink: the push would reach nobody.
+    mgr.on_playback_progress(&info, false).await.unwrap();
+    assert_eq!(counting.play_state_writes(), 1, "the write still happens");
+    assert_eq!(counting.dto_reads(), 0, "no push means no read for it");
+
+    // Attach a socket to that same session: the push is deliverable again and
+    // the read is paid for exactly one message.
+    let conn = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        session.id.as_deref().unwrap(),
+        conn.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    mgr.on_playback_progress(&info, false).await.unwrap();
+    assert_eq!(counting.play_state_writes(), 2);
+    assert_eq!(counting.dto_reads(), 1);
+    assert_eq!(conn.sent_count(), 1);
+}

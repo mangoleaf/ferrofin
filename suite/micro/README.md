@@ -52,6 +52,44 @@ read files (images, streaming) will misreport; do not use this harness for those
                                  # ctrl-c serve.sh -> opens the Firefox Profiler UI
 ```
 
+## Write rows
+
+`hit.sh` drives **any** method, with or without a JSON body. A non-GET row (or any row
+with a `body`) is sent through a vegeta *targets file* — vegeta reads a body only from an
+`@file` line in that form — with `Content-Type: application/json` attached; GET rows keep
+the original one-line target. The expected status comes from the row's `ok` field, and a
+window that returns something else prints `<-- expected 204, also saw {...}` so a write
+that silently 200s or 400s can't masquerade as a measurement.
+
+```sh
+./hit.sh list                      # every drivable row, with its method
+./hit.sh playstate_progress 600    # POST + body, 204 expected
+```
+
+Rows come from `suite/perf/endpoints.py` (the gate's table) **plus** `./write_endpoints.py`,
+a fast-loop-only table of extra write rows — playstate start/stop/ping, favourite/played/
+rating, playlist add/move, display preferences. They live here rather than in
+`endpoints.py` because that file is what `perf-gate.sh` measures and what
+`suite/perf-baseline.json` must carry. Every row there is state-preserving under
+repetition, so a 10s window leaves the database where it found it. A name collision with
+the gate's table is a hard error.
+
+Write rows need the ids `benchlib.enrich_context` resolves (`writeItemId`, `playlistId`,
+…); `hit.sh` calls it on demand the first time a row asks for one and extends the cached
+context.
+
+## Running two servers at once
+
+`FF_MICRO_PORT` now selects the pid/log files too (`/tmp/ff-micro-<port>.pid`), so a
+second agent measuring a second binary cannot stop yours. `FF_MICRO_CTX` picks the fixture
+cache — use a private one per server, since the playlist fixture only exists in the
+database that server was pointed at:
+
+```sh
+FF_MICRO_PORT=18331 FF_MICRO_DATA=/tmp/my-db ./serve.sh start
+FF_MICRO_PORT=18331 FF_MICRO_CTX=/tmp/my-ctx.json ./hit.sh playstate_progress 600
+```
+
 ## What this harness cannot measure (and will report as a failure)
 
 These are gaps in the harness, not server bugs. Check here before chasing a 0% row.
@@ -60,11 +98,8 @@ These are gaps in the harness, not server bugs. Check here before chasing a 0% r
   image/streaming routes return 404 because `/tmp/ffdb2` holds only the database. The
   media, metadata and image directories are deliberately not copied (they are ~1.3 GB and
   irrelevant to query/DTO work). Use the real suite for those.
-- **POST endpoints needing a body** — `playstate_progress` returns 415: `hit.sh` sends the
-  method and URL but no JSON body or content-type. Anything in the registry with a
-  request body needs a body added here before it means anything.
-- **Endpoints needing fixtures `pick_items` does not supply** — `playlist_items` and
-  `shows_seasons` need `playlistId` / `seriesId`, which `benchlib.pick_items` does not
-  populate; `hit.sh` fails loudly rather than measuring the wrong thing.
+- **Endpoints needing fixtures the server cannot supply** — a row whose path or body names
+  a `{…}` field neither `pick_items` nor `enrich_context` resolves fails loudly rather
+  than measuring the wrong thing.
 
 A row reading `0.0%` ok for one of the above means "not exercised", not "broken".

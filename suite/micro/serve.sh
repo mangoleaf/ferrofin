@@ -12,8 +12,14 @@ cd "$(dirname "$0")"
 DATA=${FF_MICRO_DATA:-/tmp/ff-fast}
 PORT=${FF_MICRO_PORT:-18299}
 BIN=../../target/profiling/ferrofin-server
-PIDFILE=/tmp/ff-micro.pid
-LOG=/tmp/ff-micro.log
+# Per-PORT pid/log files: two people (or two agents) measuring at once each get
+# their own server, and `stop` can never kill the other one. The default port
+# keeps the original paths so an already-running default server still stops.
+if [ "$PORT" = 18299 ]; then
+  PIDFILE=/tmp/ff-micro.pid; LOG=/tmp/ff-micro.log
+else
+  PIDFILE=/tmp/ff-micro-$PORT.pid; LOG=/tmp/ff-micro-$PORT.log
+fi
 
 # The bench fixture's admin. Same values the suite's .env uses, because the
 # database being served was scanned by the suite and already holds this user.

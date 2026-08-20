@@ -509,6 +509,30 @@ impl FerrofinSessionManager {
         Ok(())
     }
 
+    /// Whether any of `user_id`'s sessions could actually receive a pushed
+    /// message: an open WebSocket connection on the session, or a sink
+    /// registered on the session bus for its id (the `/socket` handler's path).
+    /// Exactly the two delivery routes [`Self::broadcast`] uses, so a `false`
+    /// here means the broadcast would reach nobody.
+    async fn has_listener_for_user(&self, user_id: Uuid) -> bool {
+        let bus_candidates: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            let mut ids = Vec::new();
+            for session in sessions.values().filter(|s| s.contains_user(user_id)) {
+                if session.connections.iter().any(|c| c.is_open()) {
+                    return true;
+                }
+                ids.push(session.id.clone());
+            }
+            ids
+        };
+        self.bus.as_ref().is_some_and(|bus| {
+            bus_candidates
+                .iter()
+                .any(|id| bus.is_connected(id.as_str()))
+        })
+    }
+
     /// Pushes the user's refreshed play-state for `item_id` to every session
     /// belonging to that user (`UserDataChanged`), so their other signed-in
     /// devices update resume position / played flags live instead of showing
@@ -516,6 +540,15 @@ impl FerrofinSessionManager {
     /// `UserDataChangedNotifier` (which fires on every user-data save).
     /// Best-effort: a delivery failure must not fail the playback report.
     async fn push_user_data_changed(&self, user_id: Uuid, item_id: Uuid) {
+        // Building the payload costs a `UserData` read, and every play-state
+        // report triggers one. When the user has no session that could receive
+        // the push — no open WebSocket and no registered bus sink — `broadcast`
+        // would drop it, so skip the read instead of paying for a message
+        // nobody is listening for. (A session with either delivery path still
+        // gets the push, unchanged.)
+        if !self.has_listener_for_user(user_id).await {
+            return;
+        }
         let Ok(Some(dto)) = self
             .user_data_manager
             .get_user_data_dto(item_id, user_id)
