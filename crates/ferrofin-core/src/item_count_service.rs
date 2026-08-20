@@ -150,20 +150,7 @@ impl FerrofinItemCountService {
 
         let mut by_name: HashMap<String, HashMap<String, i32>> = HashMap::new();
         for chunk in distinct_names.chunks(500) {
-            let mut sql = format!(
-                r#"SELECT p."Name", bi."Type", COUNT(DISTINCT bi."Id")
-                   FROM "BaseItems" bi
-                   JOIN "PeopleBaseItemMap" pm ON pm."ItemId" = bi."Id"
-                   JOIN "Peoples" p ON p."Id" = pm."PeopleId"
-                   WHERE p."Name" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            if !type_names.is_empty() {
-                sql.push_str(r#" AND bi."Type" IN ("#);
-                sql.push_str(&placeholders(type_names.len()));
-                sql.push(')');
-            }
-            sql.push_str(r#" GROUP BY p."Name", bi."Type""#);
+            let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
             for name in chunk {
@@ -317,19 +304,7 @@ impl ItemCountService for FerrofinItemCountService {
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
         for chunk in distinct_cleans.chunks(500) {
-            let mut sql = format!(
-                r#"SELECT iv."CleanValue", bi."Type", COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
-                   JOIN "ItemValuesMap" ivm ON ivm."ItemId" = bi."Id"
-                   JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-                   WHERE iv."CleanValue" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            if !type_names.is_empty() {
-                sql.push_str(r#" AND bi."Type" IN ("#);
-                sql.push_str(&placeholders(type_names.len()));
-                sql.push(')');
-            }
-            sql.push_str(r#" GROUP BY iv."CleanValue", bi."Type""#);
+            let sql = item_value_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
             for clean in chunk {
@@ -583,6 +558,62 @@ fn counts_from_type_map(by_type: &HashMap<String, i32>) -> ItemCounts {
         book_count: get(BaseItemKind::Book),
         item_count: by_type.values().sum(),
     }
+}
+
+/// The per-name credited-item count aggregate: `names` bound person names and,
+/// when `types` is non-zero, that many stored `Type` names to restrict to.
+///
+/// The `CROSS JOIN`s pin the join order. SQLite reads `CROSS JOIN` as "do not
+/// reorder"; the join semantics are exactly those of the inner joins it
+/// replaces, so the rows are unchanged. Left to itself the planner drives from
+/// `BaseItems` by `Type` — walking every movie/episode/series in the library and
+/// only then filtering on the person name (12.9 ms on a 9.8k-item library).
+/// Seeded from `Peoples` it seeks `IX_Peoples_Name`, then
+/// `IX_PeopleBaseItemMap_PeopleId`, then the `BaseItems` id index, touching only
+/// the credits of the names actually asked for (0.3 ms on the same library).
+fn people_name_counts_sql(names: usize, types: usize) -> String {
+    let mut sql = format!(
+        r#"SELECT p."Name", bi."Type", COUNT(DISTINCT bi."Id")
+           FROM "Peoples" p
+           CROSS JOIN "PeopleBaseItemMap" pm ON pm."PeopleId" = p."Id"
+           CROSS JOIN "BaseItems" bi ON bi."Id" = pm."ItemId"
+           WHERE p."Name" IN ({})"#,
+        placeholders(names)
+    );
+    if types > 0 {
+        sql.push_str(r#" AND bi."Type" IN ("#);
+        sql.push_str(&placeholders(types));
+        sql.push(')');
+    }
+    sql.push_str(r#" GROUP BY p."Name", bi."Type""#);
+    sql
+}
+
+/// The per-clean-value count aggregate for the generic by-name kinds
+/// (genre/studio/year/artist): `cleans` bound clean values and, when `types` is
+/// non-zero, that many stored `Type` names to restrict to.
+///
+/// Same join-order pin as [`people_name_counts_sql`], for the same reason:
+/// driven from `BaseItems` the planner walks every item of every counted type
+/// before the clean-value filter can reject anything, where seeding from
+/// `ItemValues` — one row per genre/studio/year name — seeks straight to the
+/// values asked for.
+fn item_value_counts_sql(cleans: usize, types: usize) -> String {
+    let mut sql = format!(
+        r#"SELECT iv."CleanValue", bi."Type", COUNT(DISTINCT bi."Id")
+           FROM "ItemValues" iv
+           CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+           CROSS JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
+           WHERE iv."CleanValue" IN ({})"#,
+        placeholders(cleans)
+    );
+    if types > 0 {
+        sql.push_str(r#" AND bi."Type" IN ("#);
+        sql.push_str(&placeholders(types));
+        sql.push(')');
+    }
+    sql.push_str(r#" GROUP BY iv."CleanValue", bi."Type""#);
+    sql
 }
 
 /// Builds a `?, ?, …` placeholder list of length `n`.
@@ -1233,5 +1264,59 @@ mod tests {
         assert_eq!(counts.movie_count, 2, "both movie credits counted");
         assert_eq!(counts.series_count, 1);
         assert_eq!(counts.item_count, 3);
+    }
+
+    /// `EXPLAIN QUERY PLAN` for one statement, as the `detail` column of each
+    /// step in outer-to-inner order.
+    async fn query_plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        for _ in 0..binds {
+            query = query.bind("x");
+        }
+        query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect()
+    }
+
+    /// Both by-name count aggregates must start from the *name* side. Left to
+    /// itself SQLite drives them from `BaseItems` by `Type` — a walk of every
+    /// item of every counted kind, 12.9 ms per call on a 9.8k-item library —
+    /// so the join order is pinned with `CROSS JOIN`. This asserts the pin
+    /// still holds against the real migrated schema: the outermost loop is the
+    /// name table, and `BaseItems` is reached by id, not by `Type`.
+    #[tokio::test]
+    async fn by_name_count_aggregates_seek_from_the_name_side() {
+        let db = test_db().await;
+
+        let people = people_name_counts_sql(3, 2);
+        let plan = query_plan(&db, &people, 5).await;
+        let outer = plan.first().expect("a plan step");
+        assert!(
+            outer.contains("Peoples") && outer.contains("IX_Peoples_Name"),
+            "person counts must seek Peoples by Name first, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+            "person counts must reach BaseItems by id, got: {plan:?}"
+        );
+
+        let values = item_value_counts_sql(3, 2);
+        let plan = query_plan(&db, &values, 5).await;
+        let outer = plan.first().expect("a plan step");
+        assert!(
+            outer.starts_with("SCAN iv ") || outer.starts_with("SEARCH iv ") || outer == "SCAN iv",
+            "value counts must start at ItemValues, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+            "value counts must reach BaseItems by id, got: {plan:?}"
+        );
     }
 }
