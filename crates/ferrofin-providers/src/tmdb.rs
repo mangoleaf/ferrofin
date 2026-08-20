@@ -152,6 +152,8 @@ pub struct SeasonDetails {
 /// One episode's metadata within a [`SeasonDetails`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EpisodeDetails {
+    /// The episode's own TMDB id, for the `Tmdb` provider id on its row.
+    pub tmdb_id: Option<i64>,
     /// The episode number within the season.
     pub episode_number: i32,
     /// The episode title, if any.
@@ -426,6 +428,8 @@ struct SeasonResponse {
 #[derive(Debug, Deserialize)]
 struct SeasonEpisode {
     #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
     episode_number: i32,
     #[serde(default)]
     name: Option<String>,
@@ -452,6 +456,7 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
             .episodes
             .into_iter()
             .map(|ep| EpisodeDetails {
+                tmdb_id: ep.id,
                 episode_number: ep.episode_number,
                 name: non_empty(ep.name),
                 overview: non_empty(ep.overview),
