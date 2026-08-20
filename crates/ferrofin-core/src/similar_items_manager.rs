@@ -530,7 +530,12 @@ impl FerrofinSimilarItemsManager {
             }
         }
 
-        let mut out = Vec::new();
+        // C# collects into `resolvedByKey`, a presentation-key-keyed map that
+        // keeps the HIGHEST-scoring row per key, and only writes the winners
+        // into the exclude sets once the whole batch is resolved. Claiming as
+        // rows arrive instead would let an arbitrary DB row order decide which
+        // copy of a film represents it.
+        let mut resolved: Vec<(String, Uuid, BaseItemEntity, f32)> = Vec::new();
         for (provider_key, values) in by_provider {
             let rows = match self
                 .repo
@@ -561,13 +566,29 @@ impl FerrofinSimilarItemsManager {
                 if kind_of(&entity) != kind {
                     continue;
                 }
-                // Only consumed once it is actually kept, so a row rejected on
-                // kind stays available to a later provider.
-                if !claimed.claim(item_id, &entity) {
+                // C# `GetPresentationUniqueKey()` falls back to the item id, so
+                // a keyless row is its own bucket rather than colliding with
+                // every other keyless row.
+                let key = entity
+                    .presentation_unique_key
+                    .as_deref()
+                    .map_or_else(|| item_id.to_string(), presentation_key);
+                if claimed.keys.contains(&key) {
                     continue;
                 }
-                out.push((entity, calculate_score(score, provider_order, position)));
+                let score = calculate_score(score, provider_order, position);
+                match resolved.iter_mut().find(|(seen, ..)| *seen == key) {
+                    Some(entry) if entry.3 < score => *entry = (key, item_id, entity, score),
+                    Some(_) => {}
+                    None => resolved.push((key, item_id, entity, score)),
+                }
             }
+        }
+        let mut out = Vec::with_capacity(resolved.len());
+        for (key, item_id, entity, score) in resolved {
+            claimed.ids.insert(item_id);
+            claimed.keys.insert(key);
+            out.push((entity, score));
         }
         out
     }
@@ -1265,6 +1286,75 @@ mod tests {
             ["Solaris"],
             "the remote provider was ranked first, so its match wins the single slot"
         );
+    }
+
+    #[tokio::test]
+    async fn the_best_scoring_copy_represents_a_remote_match() {
+        // C# `ResolveRemoteReferences` buckets the batch by PresentationUniqueKey
+        // and keeps the HIGHEST-scoring row per bucket, writing the winners into
+        // the exclude sets only once the whole batch is resolved. Keeping
+        // whichever row the DB happened to return first would make the answer
+        // depend on row order.
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_da1);
+        let seed = Uuid::from_u128(0x9ab_da2);
+        let hd = Uuid::from_u128(0x9ab_da3);
+        let uhd = Uuid::from_u128(0x9ab_da4);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        seed_movie_keyed(&db, hd, "Aliens HD", "Drama", Some(library), Some("aliens")).await;
+        seed_movie_keyed(
+            &db,
+            uhd,
+            "Aliens UHD",
+            "Drama",
+            Some(library),
+            Some("aliens"),
+        )
+        .await;
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .save_provider_id(hd, "Tmdb", "679-hd")
+            .await
+            .expect("save hd id");
+        persistence
+            .save_provider_id(uhd, "Tmdb", "679-uhd")
+            .await
+            .expect("save uhd id");
+
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![
+                    // The lower-scoring copy is listed FIRST, so first-wins and
+                    // best-wins give different answers.
+                    SimilarItemReference {
+                        provider_name: "Tmdb".to_owned(),
+                        provider_id: "679-hd".to_owned(),
+                        score: Some(0.2),
+                    },
+                    SimilarItemReference {
+                        provider_name: "Tmdb".to_owned(),
+                        provider_id: "679-uhd".to_owned(),
+                        score: Some(0.9),
+                    },
+                ],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec!["TheMovieDb".to_owned()],
+            }),
+        );
+        let names: Vec<_> = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(10))
+            .await
+            .expect("similar")
+            .iter()
+            .filter_map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["Aliens UHD"], "the higher-scoring copy must win");
     }
 
     #[tokio::test]
