@@ -2240,17 +2240,37 @@ impl LibraryScanner {
             .and_then(|d| episode_in_season(d, number))?
             .clone();
         apply_tmdb_episode(entity, &ep);
-        Some(RemoteMetadata::default())
+        let series_tmdb_id = cache.series_tmdb.get(&series_id).copied();
+        let people = self
+            .tmdb_episode_people(series_tmdb_id, season, number)
+            .await;
+        Some(RemoteMetadata::just_people(people))
+    }
+
+    /// The people TMDB credits on ONE episode — the regulars credited in *that*
+    /// episode in billing order, then its guest stars, then its crew.
+    ///
+    /// Port of `TmdbEpisodeProvider`'s credits handling. The series' full
+    /// regular cast is deliberately NOT merged in: doing that made every
+    /// episode page show the series list verbatim, burying the guest stars and
+    /// the director the page exists to show.
+    async fn tmdb_episode_people(
+        &self,
+        series_tmdb_id: Option<i64>,
+        season: i32,
+        number: i32,
+    ) -> Vec<PeopleEntity> {
+        let (Some(tmdb), Some(series_id)) = (&self.tmdb, series_tmdb_id) else {
+            return Vec::new();
+        };
+        tmdb_people(&tmdb.episode_credits(series_id, season, number).await)
     }
 
     /// The people credited on ONE episode: TMDB's per-episode credits when the
     /// series carries a TMDB id, else TVDB's episode credits.
     ///
-    /// Port of `TmdbEpisodeProvider`: an episode's Cast & Crew is that
-    /// episode's own credits — the regulars credited in it, its guest stars,
-    /// then its crew. The series' full regular cast is deliberately NOT merged
-    /// in: doing that made every episode page show the series list verbatim,
-    /// burying the guest stars and director the page exists to show.
+    /// TVDB's episode credits are the fallback when the series has no TMDB id
+    /// or TMDB has nothing for the episode.
     async fn episode_people(
         &self,
         series_tmdb_id: Option<i64>,
@@ -2258,13 +2278,13 @@ impl LibraryScanner {
         number: i32,
         ep: &ferrofin_providers::TvdbEpisodeDetails,
     ) -> Vec<PeopleEntity> {
-        if let (Some(tmdb), Some(series_id)) = (&self.tmdb, series_tmdb_id) {
-            let credits = tmdb.episode_credits(series_id, season, number).await;
-            if !credits.is_empty() {
-                return tmdb_people(&credits);
-            }
+        let credits = self
+            .tmdb_episode_people(series_tmdb_id, season, number)
+            .await;
+        if credits.is_empty() {
+            return tvdb_people(&ep.people);
         }
-        tvdb_people(&ep.people)
+        credits
     }
 
     /// The TheTVDB metadata pass — the TV authority. For a **series** it searches
@@ -5456,7 +5476,10 @@ mod tests {
                 let mut buf = [0u8; 2048];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let (status, payload) = if req.contains("/season/") {
+                // `/credits` first: its path contains `/season/` too.
+                let (status, payload) = if req.contains("/credits") {
+                    ("200 OK", CREDITS_JSON)
+                } else if req.contains("/season/") {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     ("200 OK", body)
                 } else {
@@ -5471,6 +5494,22 @@ mod tests {
         });
         (format!("http://{addr}"), hits)
     }
+
+    /// One episode's credits: two billed regulars, a guest star, a director,
+    /// and a job Jellyfin does not map to a person type.
+    const CREDITS_JSON: &str = r#"{
+        "cast": [
+            {"id": 1, "name": "Sean Bean", "character": "Ned Stark"},
+            {"id": 2, "name": "Maisie Williams", "character": "Arya Stark"}
+        ],
+        "guest_stars": [
+            {"id": 3, "name": "Jason Momoa", "character": "Khal Drogo"}
+        ],
+        "crew": [
+            {"id": 4, "name": "Tim Van Patten", "job": "Director"},
+            {"id": 5, "name": "A Gaffer", "job": "Gaffer"}
+        ]
+    }"#;
 
     const SEASON_JSON: &str = r#"{
         "name": "Season 1",
@@ -5541,6 +5580,51 @@ mod tests {
             episode.sort_name.as_deref(),
             Some("001 - 0001 - Winter Is Coming")
         );
+    }
+
+    // The episode page exists to show who was in THAT episode. Its credits are
+    // the regulars billed in it, then its guest stars, then its crew — never
+    // the series' regular cast, which is what every episode page listed before
+    // ca2f22c and again after 659b62e gated the only branch that fetched them.
+    #[tokio::test]
+    async fn tmdb_episode_credits_are_the_episodes_own() {
+        let (base, _hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let result = scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache)
+            .await
+            .expect("applied");
+
+        let names: Vec<&str> = result.people.iter().map(|p| p.name.as_str()).collect();
+        // Billing order, then the guest star, then the crew. The unmapped
+        // "Gaffer" job is dropped, as upstream drops it.
+        assert_eq!(
+            names,
+            vec![
+                "Sean Bean",
+                "Maisie Williams",
+                "Jason Momoa",
+                "Tim Van Patten"
+            ]
+        );
+        assert_eq!(result.people[0].person_type.as_deref(), Some("Actor"));
+        assert_eq!(result.people[0].role.as_deref(), Some("Ned Stark"));
+        assert_eq!(result.people[2].person_type.as_deref(), Some("GuestStar"));
+        assert_eq!(result.people[3].person_type.as_deref(), Some("Director"));
+    }
+
+    // A series with no TMDB id yields no credits rather than reaching for the
+    // network with a missing id.
+    #[tokio::test]
+    async fn tmdb_episode_people_need_a_series_id() {
+        let (base, _hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        assert!(scanner.tmdb_episode_people(None, 1, 1).await.is_empty());
+        assert_eq!(scanner.tmdb_episode_people(Some(1399), 1, 1).await.len(), 4);
     }
 
     // An NFO <title> outranks the provider: `apply_nfo` ran first and moved the
