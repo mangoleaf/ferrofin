@@ -38,6 +38,32 @@ pub enum SyncPlayUserAccessType {
     None = 2,
 }
 
+impl SyncPlayUserAccessType {
+    /// Maps a stored `Users.SyncPlayAccess` discriminant to its variant,
+    /// treating an unknown value as the permissive default (as C# does when
+    /// casting an out-of-range `int` back to the enum).
+    #[must_use]
+    pub fn from_stored(value: i32) -> Self {
+        match value {
+            1 => Self::JoinGroups,
+            2 => Self::None,
+            _ => Self::CreateAndJoinGroups,
+        }
+    }
+
+    /// Whether this level permits joining an existing group.
+    #[must_use]
+    pub fn can_join_groups(self) -> bool {
+        matches!(self, Self::CreateAndJoinGroups | Self::JoinGroups)
+    }
+
+    /// Whether this level permits creating a group.
+    #[must_use]
+    pub fn can_create_groups(self) -> bool {
+        matches!(self, Self::CreateAndJoinGroups)
+    }
+}
+
 /// The day of the week, or a group of days, an access schedule applies to
 /// (mirrors `Jellyfin.Data.Enums.DynamicDayOfWeek`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
@@ -273,4 +299,32 @@ pub struct UserPolicy {
     /// Gets or sets a value indicating what `SyncPlay` features the user can
     /// access.
     pub sync_play_access: SyncPlayUserAccessType,
+}
+
+#[cfg(test)]
+mod sync_play_access_tests {
+    use super::SyncPlayUserAccessType as Access;
+
+    #[test]
+    fn stored_discriminants_map_to_their_variants() {
+        assert_eq!(Access::from_stored(0), Access::CreateAndJoinGroups);
+        assert_eq!(Access::from_stored(1), Access::JoinGroups);
+        assert_eq!(Access::from_stored(2), Access::None);
+        // Out of range falls back to the permissive default, as a C# int-to-enum
+        // cast does.
+        assert_eq!(Access::from_stored(99), Access::CreateAndJoinGroups);
+        assert_eq!(Access::from_stored(-1), Access::CreateAndJoinGroups);
+    }
+
+    #[test]
+    fn create_implies_join_but_not_the_reverse() {
+        assert!(Access::CreateAndJoinGroups.can_create_groups());
+        assert!(Access::CreateAndJoinGroups.can_join_groups());
+
+        assert!(!Access::JoinGroups.can_create_groups());
+        assert!(Access::JoinGroups.can_join_groups());
+
+        assert!(!Access::None.can_create_groups());
+        assert!(!Access::None.can_join_groups());
+    }
 }

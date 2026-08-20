@@ -1250,7 +1250,7 @@ async fn build_user_policy(
         enabled_devices,
         enabled_folders,
         enable_content_deletion_from_folders: content_deletion_folders,
-        sync_play_access: sync_play_from_i32(user.sync_play_access),
+        sync_play_access: SyncPlayUserAccessType::from_stored(user.sync_play_access),
         blocked_channels: Some(blocked_channels),
         blocked_media_folders: Some(blocked_media_folders),
         block_unrated_items,
@@ -1314,15 +1314,6 @@ fn subtitle_mode_from_i32(value: i32) -> SubtitlePlaybackMode {
         3 => SubtitlePlaybackMode::None,
         4 => SubtitlePlaybackMode::Smart,
         _ => SubtitlePlaybackMode::Default,
-    }
-}
-
-/// Maps a stored `SyncPlayAccess` discriminant to its enum.
-fn sync_play_from_i32(value: i32) -> SyncPlayUserAccessType {
-    match value {
-        1 => SyncPlayUserAccessType::JoinGroups,
-        2 => SyncPlayUserAccessType::None,
-        _ => SyncPlayUserAccessType::CreateAndJoinGroups,
     }
 }
 

@@ -263,10 +263,25 @@ def main():
     check("Leave -> UserLeft to remaining member", user_left is not None, f"got {ws_c.types()}")
 
     # ---- SyncPlay access policy -------------------------------------------
+    # `IsInGroup` is a per-*user* check (C# `ISyncPlayManager.IsUserActive`), and
+    # both probe sessions are the same user — so the controller has to leave too
+    # before the user counts as out of every group.
     print("\n--- SyncPlay access policy ---")
+    http("POST", "/SyncPlay/Leave", token=controller["token"], **controller["ident"])
     status, _ = http("POST", "/SyncPlay/Pause", token=target["token"], **target["ident"])
     check("playback verb from a non-member is rejected (Jellyfin: 403)", status == 403,
-          f"status {status} (Ferrofin returns 204 + a NotInGroup push)")
+          f"status {status}")
+    status, _ = http("POST", "/SyncPlay/Leave", token=target["token"], **target["ident"])
+    check("Leave from a non-member is rejected (Jellyfin: 403)", status == 403, f"status {status}")
+
+    # Creating a group is allowed again once the policy permits it, and the
+    # group verbs unlock with membership.
+    status, group = http("POST", "/SyncPlay/New", token=controller["token"],
+                         body={"GroupName": "policy-check"}, **controller["ident"])
+    check("New is allowed for a CreateAndJoinGroups user", status == 200, f"status {status}")
+    status, _ = http("POST", "/SyncPlay/Pause", token=controller["token"], **controller["ident"])
+    check("playback verb is allowed once in a group", status == 204, f"status {status}")
+    http("POST", "/SyncPlay/Leave", token=controller["token"], **controller["ident"])
 
     ws_c.close(); ws_t.close()
 

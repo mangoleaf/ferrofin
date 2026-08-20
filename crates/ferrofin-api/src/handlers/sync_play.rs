@@ -6,6 +6,10 @@
 //! live group state and pushes `SyncPlayCommand`/`SyncPlayGroupUpdate` messages
 //! to member sockets via the session message bus.
 //!
+//! Every route is gated by the user's `SyncPlayAccess` policy first — the C#
+//! `[Authorize(Policy = Policies.SyncPlay*)]` attributes, which land here as
+//! [`require_access`] because Ferrofin has no attribute-driven policy layer.
+//!
 //! The manager is wired at the composition root
 //! ([`AppState::with_sync_play`](crate::state::AppState::with_sync_play)); until
 //! then these routes return `501`.
@@ -23,12 +27,14 @@ use ferrofin_model::sync_play::{
     RemoveFromPlaylistRequestDto, SeekRequestDto, SetPlaylistItemRequestDto,
     SetRepeatModeRequestDto, SetShuffleModeRequestDto,
 };
+use ferrofin_model::users::SyncPlayUserAccessType;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
 
@@ -55,6 +61,51 @@ async fn sync_play_session(
     })
 }
 
+/// The SyncPlay authorization requirement a route carries — port of
+/// `Jellyfin.Api.Auth.SyncPlayAccessPolicy.SyncPlayAccessRequirementType`.
+///
+/// Jellyfin also puts `SyncPlayHasAccess` on the controller class, ANDed with
+/// each route's own requirement. It is not evaluated separately here because
+/// every one of the three below already implies it: `HasAccess` holds when the
+/// user may create *or* join groups, or is already in one — which is exactly
+/// what `CreateGroup` / `JoinGroup` / `IsInGroup` each establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The shared `Group` postfix is upstream's naming (`SyncPlayAccessRequirementType`),
+// kept so the table below reads against the C# it ports.
+#[allow(clippy::enum_variant_names)]
+enum SyncPlayAccess {
+    /// `POST /SyncPlay/New` — the user's policy must allow creating groups.
+    CreateGroup,
+    /// `Join` / `List` / `{id}` — the policy must allow joining groups.
+    JoinGroup,
+    /// `Leave` + the 17 playback verbs — the user must already be in a group.
+    IsInGroup,
+}
+
+/// Enforces one [`SyncPlayAccess`] requirement for the caller, `403` otherwise
+/// (C# `SyncPlayAccessHandler`, whose failed requirement is a `ForbidResult`).
+async fn require_access(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    required: SyncPlayAccess,
+) -> Result<(), ApiError> {
+    let mgr = manager(state)?;
+    let user = resolve_user(state, auth, None).await?;
+    let access = SyncPlayUserAccessType::from_stored(user.sync_play_access);
+    let permitted = match required {
+        SyncPlayAccess::CreateGroup => access.can_create_groups(),
+        SyncPlayAccess::JoinGroup => access.can_join_groups(),
+        SyncPlayAccess::IsInGroup => mgr.is_user_active(user_uuid(&user)?).await?,
+    };
+    if permitted {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "User does not have access to SyncPlay.".to_owned(),
+        ))
+    }
+}
+
 /// Applies a playback [`PlaybackRequest`] to the caller's group and returns
 /// `204` — the shared body of the 17 playback endpoints.
 async fn dispatch(
@@ -62,6 +113,7 @@ async fn dispatch(
     auth: &AuthorizationInfo,
     request: PlaybackRequest,
 ) -> Result<StatusCode, ApiError> {
+    require_access(state, auth, SyncPlayAccess::IsInGroup).await?;
     let mgr = manager(state)?;
     let session = sync_play_session(state, auth).await?;
     mgr.handle_request(&session, request).await?;
@@ -76,6 +128,7 @@ async fn new_group(
     State(state): State<AppState>,
     Json(body): Json<NewGroupRequestDto>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
+    require_access(&state, &auth, SyncPlayAccess::CreateGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     Ok(Json(mgr.new_group(&session, &body.group_name).await?))
@@ -87,6 +140,7 @@ async fn join_group(
     State(state): State<AppState>,
     Json(body): Json<JoinGroupRequestDto>,
 ) -> Result<StatusCode, ApiError> {
+    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     mgr.join_group(&session, body.group_id).await?;
@@ -98,6 +152,7 @@ async fn leave_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
+    require_access(&state, &auth, SyncPlayAccess::IsInGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     mgr.leave_group(&session).await?;
@@ -109,6 +164,7 @@ async fn list_groups(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<GroupInfoDto>>, ApiError> {
+    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     Ok(Json(mgr.list_groups(&session).await?))
@@ -120,6 +176,7 @@ async fn get_group(
     State(state): State<AppState>,
     Path(group_id): Path<Uuid>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
+    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
     Ok(Json(mgr.get_group(&session, group_id).await?))
