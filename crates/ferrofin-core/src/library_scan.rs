@@ -3723,10 +3723,11 @@ impl LibraryScanner {
         // neither directory rule applies to it and its loose files each become
         // their own row. (Upstream reaches the root through the multi-item
         // resolver instead, which for a root holding exactly ONE audio file
-        // names that audiobook after the LIBRARY folder. Naming a book after
-        // the library it sits in is an upstream wart, not behaviour worth
-        // reproducing; the file stem is used here. Every other root shape
-        // matches upstream exactly.)
+        // names that audiobook after the LIBRARY folder and dates it from that
+        // folder's name too. Naming a book after the library it sits in is an
+        // upstream wart, not behaviour worth reproducing; the file stem and no
+        // year are used here. Every other root shape matches upstream exactly.
+        // Recorded as an accepted divergence in `docs/FEATURES.md`.)
         if dir != root {
             if let Some(book) = single_book_file(&entries) {
                 self.push_book(&book, folder_name(dir), cf, out);
@@ -3742,7 +3743,7 @@ impl LibraryScanner {
                 self.plan_books(&entry.path, root, cf, naming, out);
             } else if is_book_file(&entry.path) {
                 self.push_book(&entry.path, None, cf, out);
-            } else if is_audio_file(&entry.path, naming) {
+            } else if is_audio_file(&entry.path, naming) && !is_cue_sheet(&entry.path) {
                 self.push_audio_book(&entry.path, None, None, cf, out);
             }
         }
@@ -3752,12 +3753,14 @@ impl LibraryScanner {
     ///
     /// `folder` is the directory name when the containing directory *is* the
     /// book (`BookResolver.GetBook`): the name is parsed from it and a missing
-    /// series stays empty. Otherwise the file's own stem is parsed and the
-    /// containing directory name stands in for a missing series
-    /// (`BookResolver.Resolve`).
+    /// series becomes the empty string, which is what upstream stores and — via
+    /// `WhenWritingNull` — what it serializes. Omitting the key instead would be
+    /// a `SeriesName` body diff on the common `Dracula/dracula.epub` shape.
+    /// Otherwise the file's own stem is parsed and the containing directory name
+    /// stands in for a missing series (`BookResolver.Resolve`).
     fn push_book(&self, path: &str, folder: Option<String>, cf: Uuid, out: &mut Vec<Planned>) {
         let (parsed_from, series_fallback) = match folder {
-            Some(name) => (name, None),
+            Some(name) => (name, Some(String::new())),
             None => (file_stem(path), parent_folder_name(path)),
         };
         let parsed = book_file_name_parser::parse(Some(&parsed_from));
@@ -3828,6 +3831,23 @@ const BOOK_EXTENSIONS: &[&str] = &[
 /// `TimeSpan.TicksPerSecond`, so a book is nominally one second long and
 /// position-ticks resume has a non-zero denominator to work against.
 const BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
+
+/// Whether `path` is a `.cue` sheet.
+///
+/// A cue sheet counts as audio by extension (it is in `AudioFileExtensions`),
+/// but upstream `AudioResolver.Resolve` bails on it explicitly before building
+/// any item: a cue sheet *describes* a rip, it is not one, so resolving it puts
+/// a phantom row in the library next to the file it indexes.
+///
+/// Only the per-file arm needs this. `single_audio_book` passes every file to
+/// `AudioBookListResolver` exactly as `ResolveMultipleAudio` does, and a
+/// `book.m4b` + `book.cue` pair fails the single-audiobook guard there on both
+/// sides, falling through to this arm.
+fn is_cue_sheet(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+}
 
 /// Whether `path` is one of the [`BOOK_EXTENSIONS`] documents.
 fn is_book_file(path: &str) -> bool {
@@ -8064,7 +8084,9 @@ mod tests {
             "path is the document: {:?}",
             books[1].path
         );
-        assert_eq!(books[1].series_name, None);
+        // Upstream's `GetBook` sets `SeriesName = result.SeriesName ?? ""`, and
+        // serializes the empty string rather than omitting the key.
+        assert_eq!(books[1].series_name.as_deref(), Some(""));
 
         // `.CBZ` matched case-insensitively, and the comic `vNN cNN` pattern
         // reached ParentIndexNumber/IndexNumber through the row.
@@ -8116,6 +8138,18 @@ mod tests {
         let neuromancer = media.join("Neuromancer");
         touch(&neuromancer, "Neuromancer Part 1.mp3");
         touch(&neuromancer, "Neuromancer Part 2.mp3");
+        // The same book in two containers and no part numbers: the list
+        // resolver keeps one and files the other as an ALTERNATE VERSION, which
+        // is the third of `ResolveMultipleAudio`'s guards and the only one the
+        // shapes above never reach. Both files fall through to a row each.
+        let foundation = media.join("Foundation");
+        touch(&foundation, "Foundation.mp3");
+        touch(&foundation, "Foundation.m4b");
+        // A cue sheet counts as audio by extension but is never an item — it
+        // describes the rip beside it (`AudioResolver.Resolve` bails on .cue).
+        let dracula = media.join("Dracula");
+        touch(&dracula, "dracula.m4b");
+        touch(&dracula, "dracula.cue");
 
         let (db, cf) = scan_one(CollectionTypeOptions::books, "Books", &media).await;
         let audiobooks = scanned_by_kind(&db, BaseItemKind::AudioBook).await;
@@ -8129,12 +8163,17 @@ mod tests {
                 // The extras guard rejected the folder, so both files stand
                 // alone under their own stems.
                 Some("Dune"),
+                // The alternate-version guard rejected this folder, likewise.
+                Some("Foundation"),
+                Some("Foundation"),
                 Some("Neuromancer Part 1"),
                 Some("Neuromancer Part 2"),
                 // The RAW folder name, year and all: `FindAudioBook` overrides
                 // the parsed name with `Path.GetFileName(ContainingFolderPath)`
                 // while keeping the parsed year on ProductionYear.
                 Some("The Hobbit (1937)"),
+                // The .cue beside it produced no row of its own.
+                Some("dracula"),
                 Some("interview-with-the-author"),
             ],
         );

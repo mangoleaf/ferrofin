@@ -69,8 +69,8 @@ Wired and working, with a documented limitation or lighter verification:
   .cbz .epub .mobi .pdf`) to `Book` and audio files to `AudioBook`, and serves them through
   `/Items/{id}/File` + `/Items/{id}/Download`, which is what jellyfin-web's epub/comic/pdf
   readers fetch. Verified against Ferrofin over real HTTP and in unit tests, but **not
-  diffed against a live Jellyfin server** — treat it as the least-verified entry here. Four
-  things to know:
+  diffed against a live Jellyfin server** — treat it as the least-verified entry here.
+  Notable behaviours and divergences:
   - **Accepted divergence (ahead of the contract):** name / series / index / year come from
     `Emby.Naming.Book.BookFileNameParser`, which is on upstream `master` and **not** in the
     pinned 10.11.8 contract. Against 10.11.8 a book is named from its bare filename; Ferrofin
@@ -83,6 +83,11 @@ Wired and working, with a documented limitation or lighter verification:
     `Folder` item and parents the books under it; Ferrofin parents every book directly to the
     collection folder, exactly as the movie scan does. This scanner materializes no
     intermediate `Folder` rows.
+  - **Naming divergence at the library root:** a books library whose *root* holds exactly one
+    audio file is named after the **library folder** by Jellyfin (and dated from it) — an
+    artefact of the root going through the multi-item resolver. Ferrofin names it from the
+    file, with no year. Naming a book after the library it sits in is an upstream wart, not
+    behaviour worth reproducing; every other shape matches upstream exactly.
   - No book metadata provider: upstream core has none either (no book NFO parser, no remote
     book provider — that is the third-party Bookshelf plugin), so metadata is filename +
     local images.
