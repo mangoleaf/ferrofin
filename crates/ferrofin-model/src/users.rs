@@ -39,15 +39,19 @@ pub enum SyncPlayUserAccessType {
 }
 
 impl SyncPlayUserAccessType {
-    /// Maps a stored `Users.SyncPlayAccess` discriminant to its variant,
-    /// treating an unknown value as the permissive default (as C# does when
-    /// casting an out-of-range `int` back to the enum).
+    /// Maps a stored `Users.SyncPlayAccess` discriminant to its variant.
+    ///
+    /// An unknown value denies. C# casts the raw `int` straight back to the
+    /// enum, which then matches *neither* `CreateAndJoinGroups` nor
+    /// `JoinGroups` in `SyncPlayAccessHandler` — so upstream refuses too. The
+    /// column has no CHECK constraint, so a hand-edited or future-version row
+    /// must not silently grant full access.
     #[must_use]
     pub fn from_stored(value: i32) -> Self {
         match value {
+            0 => Self::CreateAndJoinGroups,
             1 => Self::JoinGroups,
-            2 => Self::None,
-            _ => Self::CreateAndJoinGroups,
+            _ => Self::None,
         }
     }
 
@@ -310,10 +314,12 @@ mod sync_play_access_tests {
         assert_eq!(Access::from_stored(0), Access::CreateAndJoinGroups);
         assert_eq!(Access::from_stored(1), Access::JoinGroups);
         assert_eq!(Access::from_stored(2), Access::None);
-        // Out of range falls back to the permissive default, as a C# int-to-enum
-        // cast does.
-        assert_eq!(Access::from_stored(99), Access::CreateAndJoinGroups);
-        assert_eq!(Access::from_stored(-1), Access::CreateAndJoinGroups);
+        // Out of range denies: the value backs an authorization check, and an
+        // out-of-range C# cast matches no permitted variant either.
+        assert_eq!(Access::from_stored(99), Access::None);
+        assert_eq!(Access::from_stored(-1), Access::None);
+        assert!(!Access::from_stored(99).can_join_groups());
+        assert!(!Access::from_stored(99).can_create_groups());
     }
 
     #[test]

@@ -17,12 +17,17 @@ import struct
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-BASE = os.environ.get("FERROFIN_BASE", "http://127.0.0.1:8096")
-_HOST, _PORT = BASE.split("//", 1)[1].split(":")
-PORT = int(_PORT)
-HOST = _HOST
+BASE = os.environ.get("FERROFIN_BASE", "http://127.0.0.1:8096").rstrip("/")
+_PARSED = urllib.parse.urlparse(BASE)
+if _PARSED.scheme not in ("http", ""):
+    # create_connection speaks plain TCP; an https base would fail the
+    # handshake with a confusing error rather than an honest one.
+    raise SystemExit(f"FERROFIN_BASE must be http:// (got {BASE!r}) — TLS is not supported")
+HOST = _PARSED.hostname or "127.0.0.1"
+PORT = _PARSED.port or 80
 
 
 def auth_header(token=None, client="Probe", device="Probe", device_id="probe", version="1"):
@@ -82,6 +87,10 @@ class WS:
         self.msgs = []
         self.closed = False
         self.lock = threading.Lock()
+        # The pump thread answers pings while the main thread sends — two
+        # concurrent sendall()s would interleave header/mask/payload and desync
+        # the stream, which surfaces later as an unrelated probe failure.
+        self.write_lock = threading.Lock()
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _read(self, n):
@@ -133,7 +142,8 @@ class WS:
             header += bytes([0x80 | 126]) + struct.pack(">H", n)
         else:
             header += bytes([0x80 | 127]) + struct.pack(">Q", n)
-        self.sock.sendall(header + mask + masked)
+        with self.write_lock:
+            self.sock.sendall(header + mask + masked)
 
     def send_json(self, obj):
         self._frame(json.dumps(obj).encode())

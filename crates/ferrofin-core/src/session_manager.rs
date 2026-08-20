@@ -667,6 +667,73 @@ impl FerrofinSessionManager {
         id: Uuid,
         user: Option<&UserEntity>,
     ) -> Result<Vec<Uuid>, ServiceError> {
+        let mut out = Vec::new();
+        for member in self.flatten_linked_containers(id, user).await? {
+            out.extend(self.expand_one_for_playback(member, user).await?);
+        }
+        Ok(out)
+    }
+
+    /// Replaces a box set / playlist with the items it links to, in order,
+    /// repeating for a nested one.
+    ///
+    /// Their membership is manual `FerrofinLinkedChildren` edges, **not** the
+    /// physical `AncestorIds` closure the recursive child query walks — so the
+    /// folder expansion below cannot see it and a box set would resolve to an
+    /// empty queue. Anything else passes straight through.
+    async fn flatten_linked_containers(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        /// A box set inside a box set is legal; a cycle is not, but the depth
+        /// cap makes one terminate anyway.
+        const MAX_NESTING: usize = 4;
+
+        let mut frontier = vec![id];
+        for _ in 0..MAX_NESTING {
+            let mut next = Vec::with_capacity(frontier.len());
+            let mut expanded = false;
+            for current in frontier {
+                let Some(item) = self.library_manager.get_item_by_id(current).await? else {
+                    // Reported once, by the expansion step below.
+                    next.push(current);
+                    continue;
+                };
+                let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+                if !matches!(kind, Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)) {
+                    next.push(current);
+                    continue;
+                }
+                expanded = true;
+                // The non-recursive parent query is the one that merges manual
+                // linked children (see `translate_query`).
+                next.extend(
+                    self.library_manager
+                        .get_item_ids(&InternalItemsQuery {
+                            parent_id: current,
+                            is_virtual_item: Some(false),
+                            user: user.cloned(),
+                            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                            ..InternalItemsQuery::default()
+                        })
+                        .await?,
+                );
+            }
+            frontier = next;
+            if !expanded {
+                break;
+            }
+        }
+        Ok(frontier)
+    }
+
+    /// The playable ids behind one already-flattened item.
+    async fn expand_one_for_playback(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<Uuid>, ServiceError> {
         let Some(item) = self.library_manager.get_item_by_id(id).await? else {
             error!(item_id = %id, "nonexistent item id passed to play translation");
             return Ok(Vec::new());

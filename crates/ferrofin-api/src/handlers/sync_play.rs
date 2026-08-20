@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::{resolve_user, user_uuid};
+use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
 
@@ -90,7 +90,14 @@ async fn require_access(
     required: SyncPlayAccess,
 ) -> Result<(), ApiError> {
     let mgr = manager(state)?;
-    let user = resolve_user(state, auth, None).await?;
+    // An API-key caller has no user row. Upstream evaluates the policy against
+    // `GetUserId()` and refuses, so this is a `403` — not the `400` that
+    // `resolve_user` reports for a user-less request.
+    let Some(user) = resolve_user_opt(state, auth, None).await? else {
+        return Err(ApiError::Forbidden(
+            "SyncPlay requires a signed-in user.".to_owned(),
+        ));
+    };
     let access = SyncPlayUserAccessType::from_stored(user.sync_play_access);
     let permitted = match required {
         SyncPlayAccess::CreateGroup => access.can_create_groups(),

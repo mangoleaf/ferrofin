@@ -19,8 +19,20 @@ command -v ffmpeg >/dev/null || { echo "ffmpeg required to generate the fixture"
 
 if [ ! -f "$ROOT/movies/Probe Movie (2020)/Probe Movie (2020).mkv" ]; then
   echo "generating fixture in $ROOT"
-  rm -rf "$ROOT"
+  # Never recursively delete the root: a caller who points
+  # FERROFIN_PROBE_MEDIA at a real media directory (a natural thing to try)
+  # would lose it. Only the two subtrees this script creates are cleared, and
+  # only when they look like ours.
+  for sub in movies tv; do
+    if [ -d "$ROOT/$sub" ] && [ ! -e "$ROOT/$sub/.ferrofin-probe-fixture" ]; then
+      echo "refusing to touch $ROOT/$sub — not a probe fixture directory" >&2
+      echo "set FERROFIN_PROBE_MEDIA to an empty or probe-owned path" >&2
+      exit 1
+    fi
+    rm -rf "${ROOT:?}/$sub"
+  done
   mkdir -p "$ROOT/movies/Probe Movie (2020)" "$ROOT/tv/Probe Show/Season 01"
+  touch "$ROOT/movies/.ferrofin-probe-fixture" "$ROOT/tv/.ferrofin-probe-fixture"
   master="$ROOT/.master.mkv"
   ffmpeg -y -loglevel error \
     -f lavfi -i testsrc=duration=1:size=320x240:rate=5 \

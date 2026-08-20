@@ -683,24 +683,42 @@ impl FerrofinSyncPlayManager {
     /// `IsVisibleStandalone` are not checked here either — this tightens by
     /// itself when they land in `translate_query`.
     async fn has_access_to_queue(&self, user_id: Uuid, items: &[Uuid]) -> bool {
-        let Some(access) = self.access.as_ref() else {
-            return true;
-        };
-        if items.is_empty() {
-            return true;
+        match self.visible_subset(user_id, items).await {
+            None => true,
+            Some(visible) => items.iter().all(|id| visible.contains(id)),
+        }
+    }
+
+    /// Which of `ids` the user may see, in **one** query for the whole set.
+    ///
+    /// `None` means no access seam is wired, i.e. everything is visible. An
+    /// unresolvable user or a failed query yields an empty set, so a non-empty
+    /// request denies (fail closed) while an empty one still passes.
+    ///
+    /// Batching matters: `list_groups` checks every group, and a per-group
+    /// user-fetch-plus-query made that route cost `2N+1` statements — measured
+    /// at 41 queries and p50 6ms for 50 groups before this was hoisted.
+    async fn visible_subset(
+        &self,
+        user_id: Uuid,
+        ids: &[Uuid],
+    ) -> Option<std::collections::HashSet<Uuid>> {
+        let access = self.access.as_ref()?;
+        if ids.is_empty() {
+            return Some(std::collections::HashSet::new());
         }
         let Ok(Some(user)) = access.users.get_user_by_id(user_id).await else {
-            return false;
+            return Some(std::collections::HashSet::new());
         };
         let query = InternalItemsQuery {
-            item_ids: items.to_vec(),
+            item_ids: ids.to_vec(),
             user: Some(user),
             ..InternalItemsQuery::default()
         };
         let Ok(visible) = access.library.get_item_ids(&query).await else {
-            return false;
+            return Some(std::collections::HashSet::new());
         };
-        items.iter().all(|id| visible.contains(id))
+        Some(visible.into_iter().collect())
     }
 
     /// Whether every member of the group may see `items` (C#
@@ -788,13 +806,13 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         // The joiner must be able to see what the group is already playing (C#
         // `JoinGroup` -> `HasAccessToPlayQueue`). Read the queue under the lock,
         // then check without holding it.
-        let queue = self
+        let checked_queue = self
             .lock()
             .groups
             .get(&group_id)
             .map(|g| g.queue.item_ids());
-        if let Some(queue) = queue
-            && !self.has_access_to_queue(session.user_id, &queue).await
+        if let Some(queue) = &checked_queue
+            && !self.has_access_to_queue(session.user_id, queue).await
         {
             let env = render_update(GroupUpdate::LibraryAccessDenied(
                 LibraryAccessDeniedUpdate {
@@ -817,6 +835,29 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     .unwrap_or(json!({})),
                 );
                 drop(reg);
+                self.bus.send(&session.session_id, env);
+                return Ok(());
+            }
+            // The access check above ran off-lock; if the queue moved on since,
+            // it was never checked against what the group is playing now.
+            // Refusing here (rather than joining) keeps the gate closed.
+            if reg
+                .groups
+                .get(&group_id)
+                .is_some_and(|g| Some(g.queue.item_ids()) != checked_queue)
+            {
+                drop(reg);
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    %group_id,
+                    "sync-play join refused: the queue changed during the access check"
+                );
+                let env = render_update(GroupUpdate::LibraryAccessDenied(
+                    LibraryAccessDeniedUpdate {
+                        group_id,
+                        data: String::new(),
+                    },
+                ));
                 self.bus.send(&session.session_id, env);
                 return Ok(());
             }
@@ -891,13 +932,27 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 .collect()
         };
         candidates.sort_by_key(|(info, _)| info.group_id);
-        let mut groups = Vec::with_capacity(candidates.len());
-        for (info, queue) in candidates {
-            if self.has_access_to_queue(session.user_id, &queue).await {
-                groups.push(info);
-            }
-        }
-        Ok(groups)
+        // One query for the union of every group's queue, not one per group —
+        // this route is polled by SyncPlay clients, so a per-group round trip
+        // is a latency cliff as the server fills with groups.
+        let union: Vec<Uuid> = {
+            let mut seen = std::collections::HashSet::new();
+            candidates
+                .iter()
+                .flat_map(|(_, queue)| queue.iter().copied())
+                .filter(|id| seen.insert(*id))
+                .collect()
+        };
+        let visible = self.visible_subset(session.user_id, &union).await;
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, queue)| {
+                visible
+                    .as_ref()
+                    .is_none_or(|set| queue.iter().all(|id| set.contains(id)))
+            })
+            .map(|(info, _)| info)
+            .collect())
     }
 
     async fn get_group(
@@ -936,6 +991,11 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
             PlaybackRequest::Queue { item_ids, .. } => item_ids,
             _ => &[],
         };
+        // The set of members the access check below was made against. The check
+        // itself hits the database, so it cannot run under the registry lock;
+        // the mutation re-verifies this snapshot while holding that lock, which
+        // is what stops a member who joined in between from being skipped.
+        let mut checked_members: Option<Vec<Uuid>> = None;
         if !incoming.is_empty() {
             let members = {
                 let reg = self.lock();
@@ -946,8 +1006,17 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     .unwrap_or_default()
             };
             if !members.is_empty() && !self.all_members_have_access(&members, incoming).await {
+                // Upstream logs and returns to the previous state without
+                // broadcasting (`WaitingGroupState.HandleRequest` on a failed
+                // `SetPlayQueue`), so the refusal is only visible in the log.
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    items = incoming.len(),
+                    "sync-play queue change refused: a member cannot access the items"
+                );
                 return Ok(());
             }
+            checked_members = Some(members);
         }
         let plan = {
             let mut reg = self.lock();
@@ -965,6 +1034,19 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 return Ok(());
             };
             let group = reg.groups.get_mut(&group_id).expect("mapped group present");
+            // Closes the window between the off-lock access check and this
+            // mutation: if the membership changed, the items were not checked
+            // against whoever is in the group *now*, so refuse rather than
+            // apply a queue nobody vouched for.
+            if let Some(checked) = &checked_members
+                && group.member_user_ids() != *checked
+            {
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    "sync-play queue change refused: membership changed during the access check"
+                );
+                return Ok(());
+            }
             // Member-scoped requests mutate the requesting member, not the group.
             match &request {
                 PlaybackRequest::Ping { ping } => {

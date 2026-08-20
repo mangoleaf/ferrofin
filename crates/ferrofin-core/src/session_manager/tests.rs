@@ -1245,6 +1245,22 @@ async fn seed_ancestor(db: &Database, child: Uuid, parent: Uuid) {
         .expect("set ancestors");
 }
 
+/// Sets an item's `SortName` through the production writer — the fixture insert
+/// leaves it NULL, which makes a `SortName` ordering assertion meaningless.
+async fn set_sort_name(db: &Database, id: Uuid, sort_name: &str) {
+    let library = library_manager(db);
+    let mut row = library
+        .get_item_by_id(id)
+        .await
+        .expect("load item")
+        .expect("item present");
+    row.sort_name = Some(sort_name.to_owned());
+    library
+        .update_items(std::slice::from_ref(&row), None)
+        .await
+        .expect("set sort name");
+}
+
 /// Grants the playback permission `GetPlayAccess` gates every cast on.
 async fn allow_playback(db: &Database, user: &UserEntity) {
     set_permission(
@@ -1314,6 +1330,116 @@ async fn casting_a_folder_expands_to_its_playable_children() {
         pushed_item_ids(&only_pushed_data(&received)),
         vec![ep_a, ep_b],
         "the series expands to its real episodes in SortName order, minus the virtual one"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_box_set_expands_to_its_linked_members() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // A box set's membership is a manual LinkedChildren edge, NOT the physical
+    // `AncestorIds` closure the recursive folder query walks — so expanding it
+    // the folder way yields nothing and the cast silently plays an empty queue.
+    let boxset = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        boxset,
+        ferrofin_model::data::BaseItemKind::BoxSet,
+        "Trilogy",
+        None,
+    )
+    .await;
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    let mut members = Vec::new();
+    for name in ["A Part", "B Part"] {
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            &db,
+            id,
+            ferrofin_model::data::BaseItemKind::Movie,
+            name,
+        )
+        .await;
+        set_sort_name(&db, id, name).await;
+        links
+            .upsert_linked_child(boxset, id, 0)
+            .await
+            .expect("link");
+        members.push(id);
+    }
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![boxset]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        members,
+        "the box set expands to its linked members, in SortName order"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_playlist_expands_through_a_nested_box_set() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let playlist = Uuid::new_v4();
+    let boxset = Uuid::new_v4();
+    for (id, kind, name) in [
+        (
+            playlist,
+            ferrofin_model::data::BaseItemKind::Playlist,
+            "Mix",
+        ),
+        (
+            boxset,
+            ferrofin_model::data::BaseItemKind::BoxSet,
+            "Trilogy",
+        ),
+    ] {
+        crate::test_support::seed_folder_item(&db, id, kind, name, None).await;
+    }
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    links
+        .upsert_linked_child(playlist, boxset, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(boxset, movie, 0)
+        .await
+        .expect("link");
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![playlist]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![movie],
+        "nesting is flattened, not left as a container id the client cannot play"
     );
 }
 
