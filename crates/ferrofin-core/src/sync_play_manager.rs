@@ -32,11 +32,13 @@ use uuid::Uuid;
 use ferrofin_model::sync_play::{
     GroupDoesNotExistUpdate, GroupInfoDto, GroupJoinedUpdate, GroupLeftUpdate, GroupQueueMode,
     GroupRepeatMode, GroupShuffleMode, GroupStateType, GroupStateUpdate, GroupUpdate,
-    NotInGroupUpdate, PlayQueueGroupUpdate, PlayQueueUpdate, PlayQueueUpdateReason,
-    PlaybackRequestType, SendCommand, SendCommandType, StateUpdate, SyncPlayQueueItem,
-    UserJoinedUpdate, UserLeftUpdate,
+    LibraryAccessDeniedUpdate, NotInGroupUpdate, PlayQueueGroupUpdate, PlayQueueUpdate,
+    PlayQueueUpdateReason, PlaybackRequestType, SendCommand, SendCommandType, StateUpdate,
+    SyncPlayQueueItem, UserJoinedUpdate, UserLeftUpdate,
 };
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::{LibraryManager, UserManager};
+use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::session_bus::SessionMessageBus;
 use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 
@@ -89,6 +91,9 @@ impl Outbound {
 #[derive(Debug, Clone)]
 struct GroupMember {
     session_id: String,
+    /// The signed-in user behind the session — the grain the library-access
+    /// checks and the `active_users` counter work at.
+    user_id: Uuid,
     user_name: String,
     ping_ms: i64,
     is_buffering: bool,
@@ -116,6 +121,11 @@ impl PlayQueue {
             })
             .collect();
         self.playing_index = position.clamp(0, self.max_index());
+    }
+
+    /// The queue's item ids, for the library-access checks.
+    fn item_ids(&self) -> Vec<Uuid> {
+        self.items.iter().map(|i| i.item_id).collect()
     }
 
     fn max_index(&self) -> i32 {
@@ -275,6 +285,14 @@ impl Group {
         self.members.iter().map(|m| m.ping_ms).max().unwrap_or(0)
     }
 
+    /// The distinct user ids behind the group's member sessions.
+    fn member_user_ids(&self) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = self.members.iter().map(|m| m.user_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     fn member_mut(&mut self, session_id: &str) -> Option<&mut GroupMember> {
         self.members.iter_mut().find(|m| m.session_id == session_id)
     }
@@ -283,6 +301,7 @@ impl Group {
         if self.member_mut(&session.session_id).is_none() {
             self.members.push(GroupMember {
                 session_id: session.session_id.clone(),
+                user_id: session.user_id,
                 user_name: session.user_name.clone(),
                 ping_ms: DEFAULT_PING_MS,
                 is_buffering: false,
@@ -603,10 +622,21 @@ struct Registry {
     active_users: HashMap<Uuid, u32>,
 }
 
+/// The user + library seams a group needs to answer "may this user see the
+/// items in that play queue?" (the C# `Group`'s `_userManager`/`_libraryManager`).
+struct LibraryAccess {
+    users: Arc<dyn UserManager>,
+    library: Arc<dyn LibraryManager>,
+}
+
 /// The real SyncPlay manager: a group registry plus a socket message bus.
 pub struct FerrofinSyncPlayManager {
     registry: Mutex<Registry>,
     bus: Arc<dyn SessionMessageBus>,
+    /// When wired, group visibility and queue changes are gated on every
+    /// affected member's access to the queued items. Absent (unit tests), every
+    /// queue is treated as accessible.
+    access: Option<LibraryAccess>,
 }
 
 impl std::fmt::Debug for FerrofinSyncPlayManager {
@@ -623,7 +653,65 @@ impl FerrofinSyncPlayManager {
         Self {
             registry: Mutex::new(Registry::default()),
             bus,
+            access: None,
         }
+    }
+
+    /// Wires the user + library seams (composition root only), enabling the
+    /// library-access rules C# `Group` applies: a group whose queue a user
+    /// cannot see is hidden from `List`/`{id}` and refuses their `Join`, and a
+    /// queue change is rejected unless every member can see the new items.
+    #[must_use]
+    pub fn with_library_access(
+        mut self,
+        users: Arc<dyn UserManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        self.access = Some(LibraryAccess { users, library });
+        self
+    }
+
+    /// Whether `user_id` may see every item in `items` — port of C#
+    /// `Group.HasAccessToQueue`, which rejects an item that does not resolve or
+    /// is not `IsVisibleStandalone` for the user. An empty queue is accessible.
+    ///
+    /// ponytail: routed through the repository's user-scoped query rather than a
+    /// second, SyncPlay-only visibility rule, so it enforces exactly what the
+    /// rest of the API enforces. Today that means "the item exists and the query
+    /// returns it for this user"; Ferrofin's query pipeline does not yet apply
+    /// parental-rating or enabled-folder predicates, so those parts of
+    /// `IsVisibleStandalone` are not checked here either — this tightens by
+    /// itself when they land in `translate_query`.
+    async fn has_access_to_queue(&self, user_id: Uuid, items: &[Uuid]) -> bool {
+        let Some(access) = self.access.as_ref() else {
+            return true;
+        };
+        if items.is_empty() {
+            return true;
+        }
+        let Ok(Some(user)) = access.users.get_user_by_id(user_id).await else {
+            return false;
+        };
+        let query = InternalItemsQuery {
+            item_ids: items.to_vec(),
+            user: Some(user),
+            ..InternalItemsQuery::default()
+        };
+        let Ok(visible) = access.library.get_item_ids(&query).await else {
+            return false;
+        };
+        items.iter().all(|id| visible.contains(id))
+    }
+
+    /// Whether every member of the group may see `items` (C#
+    /// `Group.AllUsersHaveAccessToQueue`), used to gate queue changes.
+    async fn all_members_have_access(&self, members: &[Uuid], items: &[Uuid]) -> bool {
+        for user_id in members {
+            if !self.has_access_to_queue(*user_id, items).await {
+                return false;
+            }
+        }
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
@@ -697,6 +785,26 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         let joined_env;
         let user_joined_env;
         let others: Vec<String>;
+        // The joiner must be able to see what the group is already playing (C#
+        // `JoinGroup` -> `HasAccessToPlayQueue`). Read the queue under the lock,
+        // then check without holding it.
+        let queue = self
+            .lock()
+            .groups
+            .get(&group_id)
+            .map(|g| g.queue.item_ids());
+        if let Some(queue) = queue
+            && !self.has_access_to_queue(session.user_id, &queue).await
+        {
+            let env = render_update(GroupUpdate::LibraryAccessDenied(
+                LibraryAccessDeniedUpdate {
+                    group_id,
+                    data: String::new(),
+                },
+            ));
+            self.bus.send(&session.session_id, env);
+            return Ok(());
+        }
         {
             let mut reg = self.lock();
             if !reg.groups.contains_key(&group_id) {
@@ -771,24 +879,47 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
 
     async fn list_groups(
         &self,
-        _session: &SyncPlaySession,
+        session: &SyncPlaySession,
     ) -> Result<Vec<GroupInfoDto>, ServiceError> {
-        let reg = self.lock();
-        let mut groups: Vec<GroupInfoDto> = reg.groups.values().map(Group::info).collect();
-        groups.sort_by_key(|g| g.group_id);
+        // A group is only listed when the caller could actually join it — C#
+        // `ListGroups` filters on `HasAccessToPlayQueue`.
+        let mut candidates: Vec<(GroupInfoDto, Vec<Uuid>)> = {
+            let reg = self.lock();
+            reg.groups
+                .values()
+                .map(|g| (g.info(), g.queue.item_ids()))
+                .collect()
+        };
+        candidates.sort_by_key(|(info, _)| info.group_id);
+        let mut groups = Vec::with_capacity(candidates.len());
+        for (info, queue) in candidates {
+            if self.has_access_to_queue(session.user_id, &queue).await {
+                groups.push(info);
+            }
+        }
         Ok(groups)
     }
 
     async fn get_group(
         &self,
-        _session: &SyncPlaySession,
+        session: &SyncPlaySession,
         group_id: Uuid,
     ) -> Result<GroupInfoDto, ServiceError> {
-        self.lock()
-            .groups
-            .get(&group_id)
-            .map(Group::info)
-            .ok_or_else(|| ServiceError::not_found(format!("sync-play group {group_id}")))
+        let found = {
+            let reg = self.lock();
+            reg.groups
+                .get(&group_id)
+                .map(|g| (g.info(), g.queue.item_ids()))
+        };
+        let not_found = || ServiceError::not_found(format!("sync-play group {group_id}"));
+        let (info, queue) = found.ok_or_else(not_found)?;
+        // An inaccessible group is indistinguishable from a missing one, as it is
+        // upstream (the id simply does not match any group the user may see).
+        if self.has_access_to_queue(session.user_id, &queue).await {
+            Ok(info)
+        } else {
+            Err(not_found())
+        }
     }
 
     async fn handle_request(
@@ -797,6 +928,27 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
         request: PlaybackRequest,
     ) -> Result<(), ServiceError> {
         let now = Utc::now();
+        // A request that puts new items in the queue is refused unless *every*
+        // member can see them (C# `SetPlayQueue`/`Queue` ->
+        // `AllUsersHaveAccessToQueue`, which return false and broadcast nothing).
+        let incoming: &[Uuid] = match &request {
+            PlaybackRequest::Play { playing_queue, .. } => playing_queue,
+            PlaybackRequest::Queue { item_ids, .. } => item_ids,
+            _ => &[],
+        };
+        if !incoming.is_empty() {
+            let members = {
+                let reg = self.lock();
+                reg.session_to_group
+                    .get(&session.session_id)
+                    .and_then(|id| reg.groups.get(id))
+                    .map(Group::member_user_ids)
+                    .unwrap_or_default()
+            };
+            if !members.is_empty() && !self.all_members_have_access(&members, incoming).await {
+                return Ok(());
+            }
+        }
         let plan = {
             let mut reg = self.lock();
             let Some(&group_id) = reg.session_to_group.get(&session.session_id) else {
@@ -1238,5 +1390,219 @@ mod tests {
         // The first group is now empty and dropped.
         assert!(m.get_group(&a, first.group_id).await.is_err());
         assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
+    }
+
+    // ── library access (C# `Group.HasAccessToPlayQueue`) ───────────────────
+
+    /// A manager wired to a real DB-backed library + user manager, so the
+    /// access checks run against the same query path the rest of the API uses.
+    async fn access_mgr() -> (
+        FerrofinSyncPlayManager,
+        Arc<RecordingBus>,
+        ferrofin_db::Database,
+    ) {
+        let db = crate::test_support::test_db().await;
+        let bus = Arc::new(RecordingBus::default());
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let library: Arc<dyn LibraryManager> =
+            Arc::new(crate::library_manager::FerrofinLibraryManager::new(
+                Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                    db.clone(),
+                    lookup,
+                )),
+                Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                    db.clone(),
+                )),
+                Arc::new(
+                    crate::item_persistence_service::FerrofinItemPersistenceService::new(
+                        db.clone(),
+                    ),
+                ),
+                Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                    db.clone(),
+                )),
+            ));
+        let users: Arc<dyn UserManager> =
+            Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+        let mgr = FerrofinSyncPlayManager::new(Arc::clone(&bus) as Arc<dyn SessionMessageBus>)
+            .with_library_access(users, library);
+        (mgr, bus, db)
+    }
+
+    /// A session for a user that exists in the DB.
+    async fn db_session(db: &ferrofin_db::Database, id: &str, name: &str) -> SyncPlaySession {
+        let user_id = Uuid::new_v4();
+        crate::test_support::seed_named_user(db, user_id, name).await;
+        SyncPlaySession {
+            session_id: id.into(),
+            user_id,
+            user_name: name.into(),
+        }
+    }
+
+    /// The `Type` of every group update pushed to `session_id`.
+    fn update_types(bus: &RecordingBus, session_id: &str) -> Vec<String> {
+        bus.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sid, _)| sid == session_id)
+            .filter_map(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter_map(|v| v["Data"]["Type"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Seeds a movie and returns its id.
+    async fn seed_movie(db: &ferrofin_db::Database, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            db,
+            id,
+            ferrofin_model::data::BaseItemKind::Movie,
+            name,
+        )
+        .await;
+        id
+    }
+
+    /// Removes an item from the library out from under a live group — the
+    /// reachable way a queued item stops resolving (the queue gate keeps an
+    /// unresolvable item from being enqueued in the first place).
+    async fn delete_item(db: &ferrofin_db::Database, id: Uuid) {
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("delete item");
+    }
+
+    /// Puts `items` on the group's queue via the owner.
+    async fn set_queue(m: &FerrofinSyncPlayManager, owner: &SyncPlaySession, items: Vec<Uuid>) {
+        m.handle_request(
+            owner,
+            PlaybackRequest::Play {
+                playing_queue: items,
+                playing_item_position: 0,
+                start_position_ticks: 0,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_queue_item_that_stops_resolving_hides_the_group() {
+        let (m, _bus, db) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+
+        let info = m.new_group(&owner, "movie night").await.unwrap();
+        // An empty queue is accessible to everyone, so the group is visible.
+        assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
+        set_queue(&m, &owner, vec![movie]).await;
+        assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
+
+        delete_item(&db, movie).await;
+        assert!(
+            m.list_groups(&other).await.unwrap().is_empty(),
+            "a group playing what the user cannot see is not listed"
+        );
+        assert!(
+            m.get_group(&other, info.group_id).await.is_err(),
+            "and is indistinguishable from a missing group"
+        );
+    }
+
+    #[tokio::test]
+    async fn joining_a_group_whose_queue_is_inaccessible_is_denied() {
+        let (m, bus, db) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+        let movie = seed_movie(&db, "Movie").await;
+
+        let info = m.new_group(&owner, "movie night").await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+        delete_item(&db, movie).await;
+
+        m.join_group(&other, info.group_id).await.unwrap();
+        assert_eq!(
+            update_types(&bus, "s2"),
+            vec!["LibraryAccessDenied".to_owned()],
+            "the joiner is told why"
+        );
+        assert!(
+            !m.is_user_active(other.user_id).await.unwrap(),
+            "and is not added to the group"
+        );
+        assert!(
+            m.is_user_active(owner.user_id).await.unwrap(),
+            "while the existing member stays in it"
+        );
+        let _ = info;
+    }
+
+    #[tokio::test]
+    async fn a_visible_queue_can_be_listed_and_joined() {
+        let (m, bus, db) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+
+        let movie = seed_movie(&db, "Movie").await;
+
+        let info = m.new_group(&owner, "movie night").await.unwrap();
+        set_queue(&m, &owner, vec![movie]).await;
+
+        assert_eq!(m.list_groups(&other).await.unwrap().len(), 1);
+        m.join_group(&other, info.group_id).await.unwrap();
+        assert!(
+            !update_types(&bus, "s2").contains(&"LibraryAccessDenied".to_owned()),
+            "a resolvable queue is not denied"
+        );
+        assert_eq!(
+            m.get_group(&owner, info.group_id)
+                .await
+                .unwrap()
+                .participants
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_change_a_member_cannot_see_is_refused() {
+        let (m, bus, db) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let other = db_session(&db, "s2", "bob").await;
+
+        let info = m.new_group(&owner, "movie night").await.unwrap();
+        m.join_group(&other, info.group_id).await.unwrap();
+        bus.sent.lock().unwrap().clear();
+
+        // A queue of items nobody can resolve is rejected outright — no state
+        // change and, as upstream, no broadcast at all.
+        m.handle_request(&owner, play(2)).await.unwrap();
+        assert!(
+            bus.sent.lock().unwrap().is_empty(),
+            "a refused queue change broadcasts nothing"
+        );
+        assert_eq!(
+            m.get_group(&owner, info.group_id).await.unwrap().state,
+            GroupStateType::Idle,
+            "and leaves the group in its previous state"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_the_library_seam_every_queue_is_accessible() {
+        // The unit-test wiring (no library) must stay permissive, so the rest of
+        // the suite exercises group mechanics without a database.
+        let (m, _bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g").await.unwrap();
+        m.handle_request(&a, play(2)).await.unwrap();
+        assert_eq!(m.list_groups(&a).await.unwrap().len(), 1);
+        assert!(m.get_group(&a, info.group_id).await.is_ok());
     }
 }

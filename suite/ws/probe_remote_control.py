@@ -26,10 +26,19 @@ PASS = os.environ.get("FERROFIN_PASS", "")
 RESULTS = []
 
 
+SKIPPED = []
+
+
 def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""))
     return ok
+
+
+def skip(name, why):
+    """Records a check that could not run — never counted as a pass."""
+    SKIPPED.append(name)
+    print(f"SKIP  {name}  — {why}")
 
 
 def login(device_id, client="Probe", device="Probe"):
@@ -223,37 +232,55 @@ def main():
     user_joined = ws_c.wait("SyncPlayGroupUpdate", predicate=lambda m: (m.get("Data") or {}).get("Type") == "UserJoined")
     check("existing member receives UserJoined push", user_joined is not None, f"got {ws_c.types()}")
 
+    # A queue change is refused unless every member can see the items, so these
+    # need a real library item — an idle group ignores the transport verbs.
+    if real_item:
+        ws_c.drain(); ws_t.drain()
+        status, _ = http("POST", "/SyncPlay/SetNewQueue", token=controller["token"],
+                         body={"PlayingQueue": [item_id], "PlayingItemPosition": 0, "StartPositionTicks": 0},
+                         **controller["ident"])
+        pq_c = ws_c.wait("SyncPlayGroupUpdate", predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
+        pq_t = ws_t.wait("SyncPlayGroupUpdate", predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
+        check("SetNewQueue -> PlayQueue push to both members", pq_c is not None and pq_t is not None,
+              f"http {status}, controller={pq_c is not None} target={pq_t is not None}")
+        cmd_t = ws_t.wait("SyncPlayCommand")
+        data = (cmd_t or {}).get("Data") or {}
+        check("SetNewQueue -> Unpause SyncPlayCommand with a future When",
+              data.get("Command") == "Unpause" and data.get("When"), str(data)[:200])
+
+        for verb, expect in (("Pause", "Pause"), ("Unpause", "Unpause"), ("Stop", "Stop")):
+            ws_c.drain(); ws_t.drain()
+            status, _ = http("POST", f"/SyncPlay/{verb}", token=controller["token"], **controller["ident"])
+            got_c = ws_c.wait("SyncPlayCommand")
+            got_t = ws_t.wait("SyncPlayCommand")
+            cc = ((got_c or {}).get("Data") or {}).get("Command")
+            ct = ((got_t or {}).get("Data") or {}).get("Command")
+            check(f"SyncPlay {verb} broadcasts to every member", cc == expect and ct == expect,
+                  f"http {status}, controller={cc} target={ct}")
+
+        ws_c.drain(); ws_t.drain()
+        http("POST", "/SyncPlay/Unpause", token=controller["token"], **controller["ident"])
+        ws_c.drain(); ws_t.drain()
+        status, _ = http("POST", "/SyncPlay/Seek", token=target["token"],
+                         body={"PositionTicks": 600000000}, **target["ident"])
+        seek = ws_c.wait("SyncPlayCommand")
+        check("a non-owner member can seek the group",
+              ((seek or {}).get("Data") or {}).get("Command") in ("Seek", "Pause"),
+              f"http {status}, got {ws_c.types()}")
+    else:
+        skip("SyncPlay queue + transport verbs",
+             "server has no library item; a queue of unresolvable ids is refused by design")
+
+    # A queue nobody can resolve must be refused outright, with no broadcast.
     ws_c.drain(); ws_t.drain()
     status, _ = http("POST", "/SyncPlay/SetNewQueue", token=controller["token"],
-                     body={"PlayingQueue": [item_id], "PlayingItemPosition": 0, "StartPositionTicks": 0},
+                     body={"PlayingQueue": [str(uuid.uuid4())], "PlayingItemPosition": 0,
+                           "StartPositionTicks": 0},
                      **controller["ident"])
-    pq_c = ws_c.wait("SyncPlayGroupUpdate", predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
-    pq_t = ws_t.wait("SyncPlayGroupUpdate", predicate=lambda m: (m.get("Data") or {}).get("Type") == "PlayQueue")
-    check("SetNewQueue -> PlayQueue push to both members", pq_c is not None and pq_t is not None,
-          f"http {status}, controller={pq_c is not None} target={pq_t is not None}")
-    cmd_t = ws_t.wait("SyncPlayCommand")
-    data = (cmd_t or {}).get("Data") or {}
-    check("SetNewQueue -> Unpause SyncPlayCommand with a future When",
-          data.get("Command") == "Unpause" and data.get("When"), str(data)[:200])
-
-    for verb, expect in (("Pause", "Pause"), ("Unpause", "Unpause"), ("Stop", "Stop")):
-        ws_c.drain(); ws_t.drain()
-        status, _ = http("POST", f"/SyncPlay/{verb}", token=controller["token"], **controller["ident"])
-        got_c = ws_c.wait("SyncPlayCommand")
-        got_t = ws_t.wait("SyncPlayCommand")
-        cc = ((got_c or {}).get("Data") or {}).get("Command")
-        ct = ((got_t or {}).get("Data") or {}).get("Command")
-        check(f"SyncPlay {verb} broadcasts to every member", cc == expect and ct == expect,
-              f"http {status}, controller={cc} target={ct}")
-
-    ws_c.drain(); ws_t.drain()
-    http("POST", "/SyncPlay/Unpause", token=controller["token"], **controller["ident"])
-    ws_c.drain(); ws_t.drain()
-    status, _ = http("POST", "/SyncPlay/Seek", token=target["token"],
-                     body={"PositionTicks": 600000000}, **target["ident"])
-    seek = ws_c.wait("SyncPlayCommand")
-    check("a non-owner member can seek the group",
-          ((seek or {}).get("Data") or {}).get("Command") in ("Seek", "Pause"), f"http {status}, got {ws_c.types()}")
+    time.sleep(0.5)
+    check("a queue of items no member can see is refused silently",
+          status == 204 and not ws_c.types() and not ws_t.types(),
+          f"http {status}, controller={ws_c.types()} target={ws_t.types()}")
 
     ws_c.drain(); ws_t.drain()
     status, _ = http("POST", "/SyncPlay/Leave", token=target["token"], **target["ident"])
@@ -286,7 +313,10 @@ def main():
     ws_c.close(); ws_t.close()
 
     failed = [n for n, ok, _ in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
+    print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed"
+          + (f", {len(SKIPPED)} skipped" if SKIPPED else ""))
+    for name in SKIPPED:
+        print(f"  skipped: {name}")
     if failed:
         print("failed:")
         for n in failed:
