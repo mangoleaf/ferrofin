@@ -14,6 +14,35 @@ real socket until this.
   driving every remote-control and SyncPlay verb and asserting on what the
   **receiving socket** actually got.
 
+## Profiling these paths
+
+The perf gate's sentinels are all read endpoints, so nothing here is in the
+benchmark. These drive the same paths directly:
+
+- `count_queries.py` — SQL statements per request, read from the server's
+  `sqlx::query=debug` log. **The sharpest instrument for this code**: these
+  paths are database-bound, so an N+1 shows up as a count that scales with
+  group or member count. This is what caught `/SyncPlay/List` costing `2N+1`.
+- `profile_load.py` — per-operation p50/p95 as a function of group count.
+- `rss_plateau.py` — RSS per round under sustained load, to answer "does this
+  leak" straight from `/proc`.
+
+```bash
+cargo build --profile profiling -p ferrofin-server   # release speed + symbols
+RUST_LOG='info,sqlx::query=debug' ./target/profiling/ferrofin-server ... &
+FERROFIN_BASE=... FERROFIN_LOG=<logfile> python3 suite/ws/count_queries.py
+```
+
+Tooling notes for this host, so the next person doesn't re-derive them:
+
+- **samply does not work here** — it needs a `perf_event_mlock_kb` above 516
+  and fails with `mmap failed`. Raising it needs root.
+- **heaptrack cannot wrap the server** — in LD_PRELOAD mode it hangs during
+  library-watcher startup, and runtime attach (documented unstable) traced the
+  wrapper shell rather than the server. It *does* work on the test binary:
+  `heaptrack target/debug/deps/ferrofin_core-<hash> sync_play_manager`, which
+  is enough for allocation attribution of the manager code.
+
 ## Running
 
 ```bash
