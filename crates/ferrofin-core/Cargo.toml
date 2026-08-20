@@ -14,6 +14,7 @@ ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
+ferrofin-util.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true

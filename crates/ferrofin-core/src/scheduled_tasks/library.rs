@@ -688,6 +688,33 @@ impl ScheduledTask for ChapterImagesTask {
         // Failure history: videos whose extraction failed before are skipped
         // until their file changes (the key embeds the mtime).
         let fail_history_path = Path::new(&self.paths.cache_path()).join("chapter-failures.txt");
+
+        // Pre-flight the two directories the run writes to. An unwritable temp
+        // directory fails EVERY extraction, and without this the run would
+        // record every video in the library as permanently failed — which is
+        // exactly what happened: a server whose cache volume had a root-owned
+        // `temp/` blocklisted ~3000 videos, then could not even rewrite the
+        // blocklist. A misconfigured server must fail the task, loudly and
+        // once, and leave the history untouched.
+        for dir in [
+            std::path::PathBuf::from(self.paths.temp_path()),
+            fail_history_path
+                .parent()
+                .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf),
+        ] {
+            if let Err(e) = ferrofin_util::file_helper::ensure_writable_dir(&dir) {
+                tracing::error!(
+                    directory = %dir.display(),
+                    error = %e,
+                    "chapter image extraction cannot write to a directory it needs; \
+                     no images can be produced until this is fixed"
+                );
+                return Err(ServiceError::backend(format!(
+                    "chapter image extraction needs a writable `{}`: {e}",
+                    dir.display()
+                )));
+            }
+        }
         let mut failed: Vec<String> = std::fs::read_to_string(&fail_history_path)
             .map(|text| {
                 text.split('|')
@@ -698,6 +725,7 @@ impl ScheduledTask for ChapterImagesTask {
             .unwrap_or_default();
 
         let total = videos.len().max(1);
+        let mut history_write_failed = false;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -730,11 +758,18 @@ impl ScheduledTask for ChapterImagesTask {
             // failure history so it is skipped until its file changes.
             if !matches!(outcome, Ok(true)) {
                 failed.push(history_key);
-                if let Some(parent) = fail_history_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&fail_history_path, failed.join("|")) {
-                    tracing::warn!(error = %e, "failed to write chapter failure history");
+                if let Err(e) = std::fs::write(&fail_history_path, failed.join("|"))
+                    && !history_write_failed
+                {
+                    // Once per run: the cause is the file, not the video, so a
+                    // per-item warning is one line per video in the library.
+                    history_write_failed = true;
+                    tracing::warn!(
+                        path = %fail_history_path.display(),
+                        error = %e,
+                        "cannot write the chapter failure history; failures will be retried \
+                         on every run until this is fixed"
+                    );
                 }
             }
         }
@@ -2295,6 +2330,53 @@ mod tests {
             std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
                 .expect("history written");
         assert!(history.contains("film.mkv"));
+        drop(media);
+    }
+
+    // The failure mode that cost a real library every chapter image: the
+    // extraction temp directory was owned by another user, so ffmpeg produced
+    // nothing for every chapter of every video, and the run recorded ~3000
+    // videos as permanently failed. A directory the run cannot write is a
+    // server misconfiguration — fail the task and leave the history alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_temp_directory_fails_the_run_without_blocklisting_anything() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (media, _movie, chapters, task) = chapter_task_fixture(false).await;
+        let temp = std::path::PathBuf::from(task.paths.temp_path());
+        std::fs::create_dir_all(&temp).expect("create temp");
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let outcome = task.execute(&TaskProgress::default()).await;
+
+        // Running as root ignores the mode bits; only assert when the probe is
+        // meaningful for this uid.
+        if std::fs::File::create(temp.join("probe")).is_err() {
+            let err = outcome.expect_err("an unwritable temp directory must fail the task");
+            assert!(
+                err.to_string().contains("temp"),
+                "the error must name the directory: {err}"
+            );
+            assert!(
+                chapters
+                    .chapters
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .all(|c| c.image_path.is_none())
+            );
+            assert!(
+                !media
+                    .path()
+                    .join("cache")
+                    .join("chapter-failures.txt")
+                    .exists(),
+                "a misconfigured server must not blocklist the library"
+            );
+        }
+
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).expect("restore");
         drop(media);
     }
 }
