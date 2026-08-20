@@ -135,16 +135,6 @@ pub struct SeriesMatch {
     pub images: Vec<RemoteImage>,
 }
 
-/// One season's artwork from `/tv/{id}/season/{n}`: the season poster plus every
-/// episode's still, keyed by episode number.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SeasonImages {
-    /// The season poster URL, if any.
-    pub poster: Option<String>,
-    /// `episode_number` → still image URL.
-    pub episode_stills: std::collections::HashMap<i32, String>,
-}
-
 /// One season's metadata + artwork from `/tv/{id}/season/{n}`: the season's
 /// name/overview/poster and every episode's metadata, in a single request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -580,7 +570,8 @@ impl TmdbClient {
     /// Matches a TV series by name/year and returns its TMDB id + poster/backdrop.
     ///
     /// Unlike [`images_for`](Self::images_for) this keeps the id so seasons and
-    /// episodes of the same series can be fetched with [`season_images`]. `None`
+    /// episodes of the same series can be fetched with
+    /// [`season_details`](Self::season_details). `None`
     /// on no match or any network/parse error.
     pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
         let mut req = self
@@ -638,23 +629,6 @@ impl TmdbClient {
         }
         let parsed = resp.json::<SeasonResponse>().await.ok()?;
         Some(season_details_from(parsed))
-    }
-
-    /// Fetches one season's artwork (`/tv/{id}/season/{n}`): the season poster and
-    /// every episode's still. A projection of [`season_details`](Self::season_details)
-    /// (same request); empty on any failure.
-    pub async fn season_images(&self, tmdb_id: i64, season_number: i32) -> SeasonImages {
-        let Some(details) = self.season_details(tmdb_id, season_number).await else {
-            return SeasonImages::default();
-        };
-        SeasonImages {
-            poster: details.poster,
-            episode_stills: details
-                .episodes
-                .into_iter()
-                .filter_map(|ep| ep.still_url.map(|url| (ep.episode_number, url)))
-                .collect(),
-        }
     }
 
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"
@@ -1155,18 +1129,5 @@ mod tests {
         assert_eq!(ep2.name, None);
         assert_eq!(ep2.overview, None);
         assert_eq!(ep2.still_url, None);
-
-        // The `SeasonImages` projection keeps the poster + stills-by-number shape.
-        let images = SeasonImages {
-            poster: details.poster.clone(),
-            episode_stills: details
-                .episodes
-                .iter()
-                .filter_map(|ep| ep.still_url.clone().map(|url| (ep.episode_number, url)))
-                .collect(),
-        };
-        assert_eq!(images.poster, details.poster);
-        assert_eq!(images.episode_stills.len(), 1);
-        assert!(images.episode_stills.contains_key(&1));
     }
 }

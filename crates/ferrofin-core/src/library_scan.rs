@@ -60,8 +60,14 @@ use crate::media_source_manager::stream_dto_to_entity;
 struct ArtworkCache {
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
-    /// (series item id, season number) → {episode number → still image URL}.
-    season_stills: std::collections::HashMap<(String, i32), std::collections::HashMap<i32, String>>,
+    /// (series item id, season number) → the season's TMDB details, fetched
+    /// once per scan. `/tv/{id}/season/{n}` carries the season poster, every
+    /// episode's still URL, AND every episode's name/overview, so the metadata
+    /// pass and the image pass share this one response instead of each paying
+    /// for it. `None` records a season TMDB could not resolve, so a miss is
+    /// not re-requested once per episode.
+    season_details:
+        std::collections::HashMap<(String, i32), Option<ferrofin_providers::tmdb::SeasonDetails>>,
     /// Series item id → the matched TVDB series details (when TVDB, the TV
     /// authority, resolved the series). Its `tvdb_id` lets episodes resolve, and
     /// its artwork is reused by the image pass instead of re-fetching.
@@ -92,6 +98,14 @@ impl RemoteMetadata {
             provider_ids: Vec::new(),
         }
     }
+}
+
+/// One episode's entry in a cached season response, by episode number.
+fn episode_in_season(
+    details: &ferrofin_providers::tmdb::SeasonDetails,
+    number: i32,
+) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
+    details.episodes.iter().find(|e| e.episode_number == number)
 }
 
 /// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
@@ -2072,7 +2086,10 @@ impl LibraryScanner {
             return RemoteMetadata::default();
         }
         let omdb_on = policy.metadata_enabled(&short, fetcher_names::OMDB);
-        if let Some(result) = self.fetch_tmdb_metadata(entity, &short, omdb_on).await {
+        if let Some(result) = self
+            .fetch_tmdb_metadata(entity, &short, omdb_on, cache)
+            .await
+        {
             return result;
         }
         // The library ranked TMDB above TVDB and TMDB missed the series:
@@ -2096,13 +2113,23 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         short: &str,
         omdb_on: bool,
+        cache: &mut ArtworkCache,
     ) -> Option<RemoteMetadata> {
         let tmdb = self.tmdb.as_ref()?;
+        // TMDB is Jellyfin's default episode provider, and on a library
+        // migrated from Jellyfin it is usually the ONLY metadata fetcher saved
+        // for `Episode` (stock Jellyfin never lists TheTVDB). Its episode half
+        // reads the season response rather than `/movie|tv/{id}`, so it
+        // branches before the `TmdbKind` split below.
+        if short == "Episode" {
+            return self.fetch_tmdb_episode(entity, cache).await;
+        }
         let kind = match short {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
             _ => return None,
         };
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         // Fetch when the row still lacks core metadata OR still lacks a Rotten
         // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
         // for titles scanned before OMDb was configured. A fully-enriched title is
@@ -2120,17 +2147,33 @@ impl LibraryScanner {
         let wants_trailers =
             crate::item_data::read_remote_trailers(entity.data.as_deref()).is_empty();
         if has_overview && !wants_rating && !wants_trailers {
+            // A series that needs no metadata of its own STILL has to publish
+            // its TMDB id: every season and episode beneath it resolves through
+            // `cache.series_tmdb`. Returning here without it is why an
+            // already-enriched series would leave its whole episode tree with no
+            // provider at all — silently, and only on re-scans.
+            if matches!(kind, TmdbKind::Series)
+                && !cache.series_tmdb.contains_key(&entity.id)
+                && let Some(name) = entity.name.clone().filter(|n| !n.is_empty())
+                && let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next()
+            {
+                cache.series_tmdb.insert(entity.id.clone(), hit.tmdb_id);
+            }
             return Some(RemoteMetadata::default());
         }
         let name = entity.name.clone().filter(|n| !n.is_empty())?;
         let name = name.as_str();
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         let tmdb_id = tmdb
             .search(kind, name, year)
             .await
             .into_iter()
             .next()
             .map(|h| h.tmdb_id)?;
+        // Same reason as the short-circuit above: the seasons/episodes below
+        // this series key off the cached id.
+        if matches!(kind, TmdbKind::Series) {
+            cache.series_tmdb.insert(entity.id.clone(), tmdb_id);
+        }
         let details = tmdb.details(kind, tmdb_id).await?;
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
@@ -2153,6 +2196,51 @@ impl LibraryScanner {
             people: tmdb_people(&details.people),
             provider_ids,
         })
+    }
+
+    /// The TMDB **episode** metadata pass — port of `TmdbEpisodeProvider`.
+    ///
+    /// An episode's title and synopsis come from its entry in the series'
+    /// cached `/tv/{id}/season/{n}` response (see
+    /// [`season_details_cached`](Self::season_details_cached)), so a whole
+    /// season's episodes cost one request between them — the same request the
+    /// image pass already makes for the season poster and episode stills.
+    ///
+    /// `None` means TMDB had nothing for this episode (the caller may fall back
+    /// to another fetcher); `Some(default)` means the row needed no fetch.
+    async fn fetch_tmdb_episode(
+        &self,
+        entity: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Option<RemoteMetadata> {
+        let (Some(series_id), Some(season), Some(number)) = (
+            entity.series_id.clone(),
+            entity
+                .parent_index_number
+                .and_then(|n| i32::try_from(n).ok()),
+            entity.index_number.and_then(|n| i32::try_from(n).ok()),
+        ) else {
+            return None;
+        };
+        // Re-scan gate: an episode that already carries a real title (not the
+        // resolver's file-stem placeholder) and a synopsis needs nothing from
+        // TMDB, so a re-scan makes no request for it at all.
+        //
+        // Accepted edge: an episode whose title and overview came from an NFO
+        // is skipped even if its stored credits are stale. The corrective pass
+        // over a library that never had episode metadata still reaches every
+        // episode, because such a row has neither.
+        let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
+        if !name_is_file_stem_placeholder(entity) && has_overview {
+            return Some(RemoteMetadata::default());
+        }
+        let ep = self
+            .season_details_cached(cache, &series_id, season)
+            .await
+            .and_then(|d| episode_in_season(d, number))?
+            .clone();
+        apply_tmdb_episode(entity, &ep);
+        Some(RemoteMetadata::default())
     }
 
     /// The people credited on ONE episode: TMDB's per-episode credits when the
@@ -2911,11 +2999,43 @@ impl LibraryScanner {
         }
     }
 
+    /// The `/tv/{id}/season/{n}` response for one season, fetched at most once
+    /// per scan.
+    ///
+    /// That single response carries the season poster, every episode's still
+    /// URL, and every episode's name/overview — so the metadata pass (episode
+    /// titles and synopses) and the image pass (season poster, episode stills)
+    /// both come through here rather than each paying for the request. A
+    /// resolved miss is cached as `None` so a season TMDB does not have is not
+    /// re-requested once per episode.
+    ///
+    /// `None` when TMDB is unwired, the series never matched TMDB, or the
+    /// request failed. A series with no cached TMDB id is NOT recorded as a
+    /// miss: nothing was asked, and the id may still arrive.
+    async fn season_details_cached<'a>(
+        &self,
+        cache: &'a mut ArtworkCache,
+        series_id: &str,
+        season: i32,
+    ) -> Option<&'a ferrofin_providers::tmdb::SeasonDetails> {
+        let key = (series_id.to_owned(), season);
+        if !cache.season_details.contains_key(&key) {
+            let tmdb = self.tmdb.as_ref()?;
+            // No series match yet → no request to make, and no miss to record.
+            let &tmdb_id = cache.series_tmdb.get(series_id)?;
+            let details = tmdb.season_details(tmdb_id, season).await;
+            cache.season_details.insert(key.clone(), details);
+        }
+        cache.season_details.get(&key)?.as_ref()
+    }
+
     /// The season-poster / episode-still image pass, split out of
-    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** fetches
-    /// its poster + every episode still from TMDB in one request (caching the
-    /// stills); an **episode** downloads the still cached earlier this scan
-    /// (TVDB's, else TMDB's season-stills map).
+    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** takes
+    /// its poster from the cached `/tv/{id}/season/{n}` response; an
+    /// **episode** downloads the still cached earlier this scan (TVDB's, else
+    /// that same season response). Both go through
+    /// [`season_details_cached`](Self::season_details_cached), so the season
+    /// request is made at most once per scan no matter which pass asks first.
     async fn fetch_tv_still_images(
         &self,
         entity: &BaseItemEntity,
@@ -2926,26 +3046,21 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
         if short == "Season" {
-            // Season posters (and the episode-still cache) are TMDB's.
+            // Season posters are TMDB's.
             if !policy.image_enabled(short, fetcher_names::TMDB) {
                 return Vec::new();
             }
             let (Some(series_id), Some(season_num)) = (
-                entity.series_id.as_deref(),
+                entity.series_id.clone(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) else {
                 return Vec::new();
             };
-            let Some(&tmdb_id) = cache.series_tmdb.get(series_id) else {
-                return Vec::new(); // series didn't match TMDB
-            };
-            // One request yields the season poster + every episode still.
-            let season = tmdb.season_images(tmdb_id, season_num).await;
-            cache
-                .season_stills
-                .insert((series_id.to_owned(), season_num), season.episode_stills);
-            let images = season
-                .poster
+            let poster = self
+                .season_details_cached(cache, &series_id, season_num)
+                .await
+                .and_then(|d| d.poster.clone());
+            let images = poster
                 .map(|url| {
                     vec![RemoteImage {
                         image_type: ImageType::Primary,
@@ -2956,30 +3071,31 @@ impl LibraryScanner {
             return download_images(tmdb, item_dir, &entity.id, images).await;
         }
         // Episode: prefer the TVDB still cached during the metadata pass; else
-        // fall back to the TMDB season-stills cache.
-        let url = policy
+        // fall back to this episode's entry in the cached season response.
+        let tvdb_still = policy
             .image_enabled(short, fetcher_names::TVDB)
             .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
-            .flatten()
-            .or_else(|| {
-                if !policy.image_enabled(short, fetcher_names::TMDB) {
-                    return None;
-                }
-                let (Some(series_id), Some(season_num), Some(ep_num)) = (
-                    entity.series_id.as_deref(),
+            .flatten();
+        let url = match tvdb_still {
+            Some(url) => Some(url),
+            None if policy.image_enabled(short, fetcher_names::TMDB) => {
+                match (
+                    entity.series_id.clone(),
                     entity
                         .parent_index_number
                         .and_then(|n| i32::try_from(n).ok()),
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
-                ) else {
-                    return None;
-                };
-                cache
-                    .season_stills
-                    .get(&(series_id.to_owned(), season_num))
-                    .and_then(|stills| stills.get(&ep_num))
-                    .cloned()
-            });
+                ) {
+                    (Some(series_id), Some(season_num), Some(ep_num)) => self
+                        .season_details_cached(cache, &series_id, season_num)
+                        .await
+                        .and_then(|d| episode_in_season(d, ep_num))
+                        .and_then(|ep| ep.still_url.clone()),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
         let Some(url) = url else {
             return Vec::new();
         };
@@ -4015,6 +4131,40 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
 }
 
+/// Whether the row's name is still the resolver's file-stem placeholder rather
+/// than a real title.
+///
+/// A provider title outranks the placeholder (upstream
+/// `MetadataService.MergeBaseItemData` runs with `replaceData=true` on a
+/// standard scan, so the provider replaces the stem the resolver stamped), but
+/// an NFO `<title>` still wins: `apply_nfo` ran first and changed the name away
+/// from the stem, which is exactly what this detects.
+///
+/// Shared by every episode provider so the two cannot disagree about what a
+/// placeholder is — a disagreement would show up as one provider silently
+/// refusing to title an episode.
+fn name_is_file_stem_placeholder(entity: &BaseItemEntity) -> bool {
+    match (entity.name.as_deref(), entity.path.as_deref()) {
+        (None | Some(""), _) => true,
+        (Some(name), Some(path)) => name == file_stem(path),
+        _ => false,
+    }
+}
+
+/// Applies a provider's episode title to the row, replacing the resolver's
+/// file-stem placeholder. The derived sort name follows the new title, as
+/// `apply_nfo` does. A blank title, or a row already carrying a real title,
+/// is left alone.
+fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
+    if !name_is_file_stem_placeholder(entity) {
+        return;
+    }
+    if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(derived_sort_name(entity, title));
+    }
+}
+
 /// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
 /// everything except the title, where the provider outranks the resolver's
 /// filename placeholder).
@@ -4022,30 +4172,26 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbE
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
-    // The episode's own title is authoritative over the resolver's
-    // filename-derived placeholder (upstream MetadataService.MergeBaseItemData
-    // runs with replaceData=true on a standard scan, so the provider title
-    // replaces the stem the resolver stamped). An NFO `<title>` still wins:
-    // `apply_nfo` ran first and changed the name away from the stem, which is
-    // exactly what the placeholder check detects. The derived sort name follows
-    // the new title, as `apply_nfo` does.
-    let name_is_placeholder = match (entity.name.as_deref(), entity.path.as_deref()) {
-        (Some(name), Some(path)) => name == file_stem(path),
-        (None | Some(""), _) => true,
-        _ => false,
-    };
-    if name_is_placeholder
-        && let Some(title) = d.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
-    {
-        entity.name = Some(title.to_owned());
-        entity.sort_name = Some(derived_sort_name(entity, title));
-    }
+    apply_episode_title(entity, d.name.as_deref());
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = d.aired.as_deref().and_then(parse_ymd);
     }
+}
+
+/// Applies a matched TMDB **episode** entry from the season response to the row
+/// — the same fill-if-empty overview and placeholder-replacing title as
+/// [`apply_tvdb_episode`].
+///
+/// TMDB's season response carries no air date per episode, so `premiere_date`
+/// and `production_year` are left to whatever the NFO or another fetcher set.
+fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb::EpisodeDetails) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&d.overview);
+    }
+    apply_episode_title(entity, d.name.as_deref());
 }
 
 /// Applies embedded audio-tag metadata to a music row (fill-if-empty, so an NFO
@@ -5283,6 +5429,225 @@ mod tests {
         // Nor does a series without a TMDB id reach for TMDB.
         let people = scanner.episode_people(None, 1, 1, &ep).await;
         assert_eq!(people.len(), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // TMDB episode provider
+    // ---------------------------------------------------------------------
+
+    /// A minimal TMDB stand-in serving `/tv/{id}/season/{n}`, counting every
+    /// request it receives. Returns `(base_url, hit_counter)`.
+    ///
+    /// The counter is the point: the season response carries the episode text
+    /// AND the artwork, so both scan passes must share one request per season.
+    /// A regression that re-fetches per episode still produces correct data —
+    /// only the count catches it.
+    fn spawn_tmdb_season_server(
+        body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, payload) = if req.contains("/season/") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ("200 OK", body)
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    const SEASON_JSON: &str = r#"{
+        "name": "Season 1",
+        "overview": "The first season.",
+        "poster_path": "/poster.jpg",
+        "episodes": [
+            {"episode_number": 1, "name": "Winter Is Coming",
+             "overview": "Ned is summoned south.", "still_path": "/e1.jpg"},
+            {"episode_number": 2, "name": "The Kingsroad",
+             "overview": "The party rides north.", "still_path": "/e2.jpg"}
+        ]
+    }"#;
+
+    /// Builds a scanner wired to a fake TMDB, plus the episode row the scan
+    /// would have planned (name = the file stem, no overview).
+    async fn tmdb_episode_fixture(
+        base_url: &str,
+        tmp: &std::path::Path,
+    ) -> (
+        LibraryScanner,
+        super::ArtworkCache,
+        ferrofin_db::entities::base_items::BaseItemEntity,
+    ) {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(base_url));
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata(tmdb, tmp.join("metadata"));
+
+        let mut cache = super::ArtworkCache::default();
+        cache.series_tmdb.insert("SERIES".to_owned(), 1399);
+
+        let episode = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+            name: Some("GoT.S01E01.1080p.Bluray".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
+            series_id: Some("SERIES".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        (scanner, cache, episode)
+    }
+
+    // The regression this whole change exists for: on a library migrated from
+    // Jellyfin, TheMovieDb is the only metadata fetcher saved for `Episode`, so
+    // TMDB must title the episode itself. Before the fix TMDB had no Episode
+    // branch at all and every episode kept its filename forever.
+    #[tokio::test]
+    async fn tmdb_episode_title_replaces_the_filename_placeholder() {
+        let (base, _hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let result = scanner.fetch_tmdb_episode(&mut episode, &mut cache).await;
+        assert!(result.is_some());
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+        // An episode sorts by position, never alphabetically by the new title,
+        // or the client's play queue scrambles.
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("001 - 0001 - Winter Is Coming")
+        );
+    }
+
+    // An NFO <title> outranks the provider: `apply_nfo` ran first and moved the
+    // name off the file stem, which is exactly what the placeholder check reads.
+    // The overview is still filled, because it was empty.
+    #[tokio::test]
+    async fn tmdb_episode_keeps_an_nfo_title_but_fills_the_overview() {
+        let (base, _hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = Some("A Title From The NFO".into());
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache)
+            .await
+            .expect("applied");
+        assert_eq!(episode.name.as_deref(), Some("A Title From The NFO"));
+        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+    }
+
+    // `/tv/{id}/season/{n}` carries the episode text AND the season poster AND
+    // every episode still. One request must serve the whole season across both
+    // the metadata and the image pass — otherwise a 10k-episode library pays
+    // 10k requests for data it already had.
+    #[tokio::test]
+    async fn season_details_are_fetched_once_per_season() {
+        let (base, hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut ep1) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let mut ep2 = ep1.clone();
+        ep2.name = Some("GoT.S01E02.1080p.Bluray".into());
+        ep2.path = Some("/tv/GoT/Season 1/GoT.S01E02.1080p.Bluray.mkv".into());
+        ep2.index_number = Some(2);
+
+        scanner.fetch_tmdb_episode(&mut ep1, &mut cache).await;
+        scanner.fetch_tmdb_episode(&mut ep2, &mut cache).await;
+        // The image pass asks for the same season.
+        let poster = scanner
+            .season_details_cached(&mut cache, "SERIES", 1)
+            .await
+            .and_then(|d| d.poster.clone());
+
+        assert_eq!(ep1.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(ep2.name.as_deref(), Some("The Kingsroad"));
+        assert!(poster.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Re-scan gate: a row that already has a real title and a synopsis needs
+    // nothing, and must not spend a request to learn that.
+    #[tokio::test]
+    async fn tmdb_episode_with_title_and_overview_makes_no_request() {
+        let (base, hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = Some("Winter Is Coming".into());
+        episode.overview = Some("Ned is summoned south.".into());
+
+        let result = scanner.fetch_tmdb_episode(&mut episode, &mut cache).await;
+        assert!(result.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // A season TMDB has nothing for is recorded as a miss, so a 24-episode
+    // season costs one failed request rather than 24.
+    #[tokio::test]
+    async fn a_season_miss_is_cached_and_not_re_requested() {
+        // Every request 404s: the server only answers `/season/` paths, and the
+        // client treats a non-2xx as a miss.
+        let (base, hits) = spawn_tmdb_season_server("{}");
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.series_tmdb.insert("SERIES".to_owned(), 1399);
+
+        // An empty body parses into a season with no episodes — a resolved
+        // response. Ask twice for a season number the cache has not seen.
+        assert!(
+            scanner
+                .season_details_cached(&mut cache, "SERIES", 7)
+                .await
+                .is_some_and(|d| d.episodes.is_empty())
+        );
+        scanner.season_details_cached(&mut cache, "SERIES", 7).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // A series with no cached TMDB id makes NO request and records NO miss —
+    // the id may still arrive (the series row is scanned before its episodes,
+    // but a gated-off Series fetcher leaves the cache empty).
+    #[tokio::test]
+    async fn an_unmatched_series_asks_tmdb_nothing() {
+        let (base, hits) = spawn_tmdb_season_server(SEASON_JSON);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.series_tmdb.clear();
+
+        assert!(
+            scanner
+                .fetch_tmdb_episode(&mut episode, &mut cache)
+                .await
+                .is_none()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(cache.season_details.is_empty());
+        // Untouched: the row keeps its placeholder for a later fetcher.
+        assert_eq!(episode.name.as_deref(), Some("GoT.S01E01.1080p.Bluray"));
     }
 
     // fetch_tvdb_metadata short-circuits (no network) when it can't act: a series

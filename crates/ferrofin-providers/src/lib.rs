@@ -41,8 +41,8 @@ pub use musicbrainz::{AlbumIds, MusicBrainzClient};
 pub use omdb::OmdbClient;
 pub use studios::StudiosClient;
 pub use tmdb::{
-    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
-    TmdbPerson, TmdbSearchHit, TmdbTrailer,
+    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage,
+    TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
