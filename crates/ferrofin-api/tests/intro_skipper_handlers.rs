@@ -258,6 +258,17 @@ impl PluginManager for MemPlugins {
 
 /// Builds an authenticated `AppState` with the four working fakes wired in.
 fn build_app(segments: Arc<MemSegments>, tasks: Arc<MemTasks>, config: Arc<MemConfig>) -> AppState {
+    build_app_as(segments, tasks, config, Arc::new(AuthedAuthService))
+}
+
+/// [`build_app`] with the authentication seam chosen by the caller, so the
+/// elevation-gated route can be driven as a plain user *and* as an API key.
+fn build_app_as(
+    segments: Arc<MemSegments>,
+    tasks: Arc<MemTasks>,
+    config: Arc<MemConfig>,
+    auth: Arc<dyn ferrofin_traits::net::AuthService>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -274,7 +285,7 @@ fn build_app(segments: Arc<MemSegments>, tasks: Arc<MemTasks>, config: Arc<MemCo
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AuthedAuthService),
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -489,8 +500,49 @@ async fn no_op_success_routes() {
         let (status, _) = send(app.clone(), method, uri, body).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
     }
+}
+
+/// `POST /FileTransformation/RegisterTransformation` registers a callback that
+/// rewrites the JavaScript served to every browser, and each accepted
+/// registration is retained for the life of the process in a registry nothing
+/// sweeps. Upstream gates it with `Policies.RequiresElevation`; this port took a
+/// bare `RequireAuth`, which let any authenticated account grow that registry —
+/// measured at +157 MB of RssAnon over 150 requests carrying 1 MB of strings
+/// each, linearly and with no plateau.
+#[tokio::test]
+async fn register_transformation_requires_an_administrator() {
+    let seg = Arc::new(MemSegments::default());
+    let tasks = Arc::new(MemTasks {
+        running: false,
+        started: Mutex::new(Vec::new()),
+    });
+    let config = Arc::new(MemConfig::default());
+
+    // A plain authenticated user (no admin policy, not an API key) is refused.
+    let user_app = build_app_as(
+        seg.clone(),
+        tasks.clone(),
+        config.clone(),
+        Arc::new(AuthedAuthService),
+    );
     let (status, _) = send(
-        app,
+        user_app,
+        "POST",
+        "/FileTransformation/RegisterTransformation",
+        "{}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An elevated caller still reaches the handler and gets upstream's `Ok()`.
+    let admin_app = build_app_as(
+        seg,
+        tasks,
+        config,
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    );
+    let (status, _) = send(
+        admin_app,
         "POST",
         "/FileTransformation/RegisterTransformation",
         "{}",
