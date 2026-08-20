@@ -43,11 +43,43 @@ use crate::resolvers::FileSystemWatcher;
 struct PendingChanges {
     /// Changed paths accumulated in the current settle window.
     paths: HashSet<String>,
-    /// When the current window lapses (last report + delay).
+    /// When the current window lapses (last report + delay, clamped by
+    /// [`Self::hard_deadline`]).
     deadline: Instant,
+    /// The ceiling on [`Self::deadline`] for the current batch: the first
+    /// report of the batch plus [`MAX_SETTLE_WINDOWS`] delays. Without it the
+    /// window is re-armed by every report and a source that never goes quiet
+    /// (a download directory, a recording being written) defers the scan
+    /// forever while `paths` grows without bound.
+    hard_deadline: Instant,
     /// Whether a debounce worker task is alive and will dispatch.
     worker_running: bool,
 }
+
+/// How many settle delays a batch may be deferred before it is dispatched
+/// regardless of continuing reports.
+///
+/// This is the bound on the accumulator: `paths` can hold at most one entry per
+/// distinct path reported within `LibraryMonitorDelay × MAX_SETTLE_WINDOWS`,
+/// rather than one per path reported since the server started. It is also what
+/// makes a continuously-written library root scan at all — with a purely
+/// sliding window it never does.
+///
+/// FLAGGED as a candidate setting — plausible range 2…60, default 10 (10 min at
+/// the default 60 s `LibraryMonitorDelay`).
+const MAX_SETTLE_WINDOWS: u32 = 10;
+
+/// Hard cap on accumulated paths: reaching it dispatches the batch immediately
+/// instead of waiting the window out.
+///
+/// Paths are **dispatched**, never dropped — a dropped path is a change the
+/// library never learns about. So this bounds how large one batch gets, not how
+/// much work is done. Sized so the accumulator stays well under 10 MB even for
+/// long paths, while sitting far above any plausible real import batch.
+///
+/// FLAGGED as a candidate setting — plausible range 1_000…200_000, default
+/// 20_000.
+const MAX_PENDING_PATHS: usize = 20_000;
 
 /// The narrow slice of the library manager the monitor needs: queue a rescan.
 ///
@@ -128,6 +160,11 @@ pub struct FerrofinLibraryMonitor {
     /// Debounce accumulator shared with the worker task. `std::sync::Mutex`:
     /// the guard never spans an `.await`.
     pending: Arc<Mutex<PendingChanges>>,
+    /// Wakes the debounce worker out of its sleep when a report *lowers* the
+    /// deadline (the size cap firing). Raising the deadline needs no wake — the
+    /// worker re-reads it and sleeps again — but lowering one it is already
+    /// sleeping past would otherwise not take effect until the old deadline.
+    flush: Arc<tokio::sync::Notify>,
     /// A fixed settle delay, taking precedence over the configured one.
     fixed_debounce: Option<Duration>,
     /// Where the live `LibraryMonitorDelay` setting is read from. `None` (and
@@ -158,8 +195,10 @@ impl FerrofinLibraryMonitor {
             pending: Arc::new(Mutex::new(PendingChanges {
                 paths: HashSet::new(),
                 deadline: Instant::now(),
+                hard_deadline: Instant::now(),
                 worker_running: false,
             })),
+            flush: Arc::new(tokio::sync::Notify::new()),
             fixed_debounce: None,
             config: None,
         }
@@ -217,7 +256,13 @@ impl FerrofinLibraryMonitor {
                 .lock()
                 .expect("pending set not poisoned")
                 .deadline;
-            tokio::time::sleep_until(deadline).await;
+            // Racing the sleep against `flush` is what lets the size cap take
+            // effect while the worker is already asleep past that point. A
+            // spurious wake simply re-reads the deadline and sleeps again.
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = self.flush.notified() => {}
+            }
             let paths = {
                 let mut pending = self.pending.lock().expect("pending set not poisoned");
                 // A report during the sleep pushed the deadline out — keep waiting.
@@ -329,14 +374,34 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         }
         // Accumulate the path and (re)arm the settle window; the single worker
         // task dispatches once the window lapses with no further reports.
-        let spawn_worker = {
+        //
+        // The re-arm is clamped two ways, because a purely sliding window is
+        // unbounded in both time and memory: a source that keeps reporting
+        // holds the batch open forever, so the scan never runs and `paths`
+        // grows for the life of the process (measured: 60,000 reported paths
+        // held 27 MB resident, released only once the reports stopped). The
+        // clamps dispatch the batch — they never drop a path.
+        let (spawn_worker, wake_worker) = {
             let mut pending = self.pending.lock().expect("pending set not poisoned");
+            let now = Instant::now();
+            if pending.paths.is_empty() {
+                pending.hard_deadline = now + delay * MAX_SETTLE_WINDOWS;
+            }
             pending.paths.insert(path.to_owned());
-            pending.deadline = Instant::now() + delay;
-            !std::mem::replace(&mut pending.worker_running, true)
+            let previous = pending.deadline;
+            pending.deadline = std::cmp::min(now + delay, pending.hard_deadline);
+            if pending.paths.len() >= MAX_PENDING_PATHS {
+                pending.deadline = now;
+            }
+            let spawn = !std::mem::replace(&mut pending.worker_running, true);
+            // Only a *lowered* deadline needs a wake; a raised one is picked up
+            // when the worker's current sleep ends.
+            (spawn, !spawn && pending.deadline < previous)
         };
         if spawn_worker {
             tokio::spawn(self.clone().debounce_worker());
+        } else if wake_worker {
+            self.flush.notify_one();
         }
         Ok(())
     }
@@ -594,6 +659,121 @@ mod tests {
         // …but does fire once 60s pass with no further changes (t=90).
         tokio::time::sleep(Duration::from_secs(20)).await;
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A source that never goes quiet used to hold the batch open forever: the
+    /// settle window was re-armed by every report with no ceiling, so the scan
+    /// never ran and the accumulator grew for the life of the process
+    /// (measured over HTTP: 60,000 reported paths held 27 MB resident, freed
+    /// only once the reports stopped). The hard deadline dispatches the batch
+    /// after `MAX_SETTLE_WINDOWS` delays regardless.
+    #[tokio::test(start_paused = true)]
+    async fn unending_reports_still_dispatch_at_the_hard_deadline() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        // A report every 30s — half the settle delay, so a purely sliding
+        // window is re-armed before it ever lapses.
+        for i in 0..(MAX_SETTLE_WINDOWS * 2) {
+            monitor
+                .report_file_system_changed(&format!("/media/movies/m{i}.mkv"))
+                .await
+                .expect("report");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        // The loop ran for MAX_SETTLE_WINDOWS * 2 delays without ever leaving a
+        // full window quiet, so a purely sliding window would still be holding
+        // the batch here. One extra tick lets the woken worker finish its
+        // dispatch (the hard deadline and the loop's last sleep land together).
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            library.scans.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "a never-quiet source must still get scanned"
+        );
+    }
+
+    /// The size cap must fire when the worker is ALREADY ASLEEP on the settle
+    /// deadline — which is the production shape, and the one the sibling test
+    /// below cannot reach.
+    ///
+    /// That test floods in a tight loop, so the worker never gets scheduled to
+    /// begin its 60s sleep and simply reads the lowered deadline on its first
+    /// pass; the wake-up is never exercised and deleting `flush.notify_one()`
+    /// leaves it green. In production reports trickle in from inotify or one
+    /// HTTP request at a time, the worker *is* parked on `now + 60s` when the
+    /// capping path lands, and the notify is the only thing that dispatches it.
+    /// Sleeping first is what forces the worker to park.
+    #[tokio::test(start_paused = true)]
+    async fn the_size_cap_wakes_a_worker_already_parked_on_the_settle_deadline() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+
+        monitor
+            .report_file_system_changed("/media/movies/first.mkv")
+            .await
+            .expect("report");
+        // Let the worker actually reach its sleep on the 60s deadline.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for i in 1..MAX_PENDING_PATHS {
+            monitor
+                .report_file_system_changed(&format!("/media/movies/m{i}.mkv"))
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let batches = library.batches.lock().unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the cap must wake the parked worker; without the notify the batch \
+             waits out the full settle window and nothing is dispatched"
+        );
+        assert_eq!(batches[0].len(), MAX_PENDING_PATHS);
+    }
+
+    /// The hard deadline bounds the batch in time; the size cap bounds it in
+    /// paths, for a burst that arrives faster than the window. Paths are
+    /// dispatched, never dropped — so the batch must carry every reported path.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_past_the_size_cap_dispatches_without_dropping_paths() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        for i in 0..MAX_PENDING_PATHS {
+            monitor
+                .report_file_system_changed(&format!("/media/movies/m{i}.mkv"))
+                .await
+                .expect("report");
+        }
+        // Reaching the cap dispatches promptly. Without it nothing would have
+        // been queued yet — the settle window still has 60s to run.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let batches = library.batches.lock().unwrap();
+            assert_eq!(batches.len(), 1, "the cap must force a dispatch mid-burst");
+            assert_eq!(batches[0].len(), MAX_PENDING_PATHS);
+        }
+        // The tail starts a fresh batch, dispatched by its own settle window.
+        for i in MAX_PENDING_PATHS..(MAX_PENDING_PATHS + 5) {
+            monitor
+                .report_file_system_changed(&format!("/media/movies/m{i}.mkv"))
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let batches = library.batches.lock().unwrap();
+        let dispatched: usize = batches.iter().map(Vec::len).sum();
+        assert_eq!(
+            dispatched,
+            MAX_PENDING_PATHS + 5,
+            "the cap dispatches paths early, it never drops them"
+        );
     }
 
     #[tokio::test]

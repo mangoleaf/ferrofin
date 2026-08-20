@@ -53,7 +53,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/trickplay_manager.rs", 7),
     ("crates/ferrofin-core/src/tv_series_manager.rs", 2),
     ("crates/ferrofin-core/src/user_entity_ext.rs", 11),
-    ("crates/ferrofin-core/src/user_manager.rs", 28),
+    ("crates/ferrofin-core/src/user_manager.rs", 27),
     ("crates/ferrofin-core/src/virtual_folder_manager.rs", 4),
     ("crates/ferrofin-livetv/src/manager.rs", 22),
 ];

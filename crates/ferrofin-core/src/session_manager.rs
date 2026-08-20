@@ -198,6 +198,18 @@ pub struct FerrofinSessionManager {
     /// The pool of active sessions keyed by session key (`app + deviceId`),
     /// matching the C# `_activeConnections` keying.
     sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
+    /// Serializes the `MaxActiveSessions` admission decision with the session
+    /// creation that satisfies it.
+    ///
+    /// The count is read from [`Self::sessions`] but the session that makes the
+    /// count go up is only inserted several `await`s later (token mint, device
+    /// row, `upsert_session`). Without this gate every login in a concurrent
+    /// burst observes the *pre-burst* count and is admitted, so a user capped at
+    /// one session ends up with as many as the burst was wide — measured live at
+    /// 23 of 24. Taken **only** when the user actually has a limit, so the
+    /// default (`0` = unlimited, what every user has unless an admin says
+    /// otherwise) still logs in with no added serialization.
+    session_limit_gate: Arc<Mutex<()>>,
     /// The session message bus the HTTP WebSocket handler registers client
     /// sinks on. A bus-registered socket counts as a live controller (it drives
     /// `SupportsRemoteControl`) and is the delivery path for remote-control
@@ -250,6 +262,7 @@ impl FerrofinSessionManager {
             db,
             server_id: server_id.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_limit_gate: Arc::new(Mutex::new(())),
             media_sources: None,
             music_manager: None,
             bus: None,
@@ -1693,6 +1706,41 @@ impl SessionManager for FerrofinSessionManager {
 }
 
 impl FerrofinSessionManager {
+    /// Admits one more session for `user` under their `MaxActiveSessions`
+    /// policy, returning the guard the caller must hold until that session
+    /// actually exists.
+    ///
+    /// The decision and the session creation that satisfies it are ONE
+    /// operation: the count here reads the live session pool, but the session
+    /// being counted for is not inserted until `upsert_session`, several awaits
+    /// later. Holding `session_limit_gate` across that span is what makes
+    /// "count, then take the slot" atomic — without it every login in a
+    /// concurrent burst reads the same pre-burst count and all of them are
+    /// admitted (measured over real HTTP: 23 of 24 for a cap of 1).
+    ///
+    /// A user with no limit (`0`, the default) takes no gate at all, so the
+    /// ordinary login path is not serialized.
+    async fn admit_session(
+        &self,
+        user: &UserEntity,
+        user_uuid: Uuid,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>, ServiceError> {
+        if user.max_active_sessions < 1 {
+            return Ok(None);
+        }
+        let gate = self.session_limit_gate.lock().await;
+        let active = {
+            let sessions = self.sessions.lock().await;
+            sessions.values().filter(|s| s.user_id == user_uuid).count()
+        };
+        if i64::try_from(active).unwrap_or(i64::MAX) >= user.max_active_sessions {
+            return Err(ServiceError::unauthorized(
+                "user is at their maximum number of sessions",
+            ));
+        }
+        Ok(Some(gate))
+    }
+
     /// Shared authenticate path (C# `AuthenticateNewSessionInternal`).
     async fn authenticate_internal(
         &self,
@@ -1738,19 +1786,10 @@ impl FerrofinSessionManager {
             ));
         }
 
-        // Enforce the per-user max active sessions (C# check).
+        // Enforce the per-user max active sessions (C# check). The returned
+        // guard is bound for the rest of the call — see `admit_session`.
         let user_uuid = parse_user_id(&user.id)?;
-        if user.max_active_sessions >= 1 {
-            let active = {
-                let sessions = self.sessions.lock().await;
-                sessions.values().filter(|s| s.user_id == user_uuid).count()
-            };
-            if i64::try_from(active).unwrap_or(i64::MAX) >= user.max_active_sessions {
-                return Err(ServiceError::unauthorized(
-                    "user is at their maximum number of sessions",
-                ));
-            }
-        }
+        let _limit_gate = self.admit_session(&user, user_uuid).await?;
 
         // Mint a fresh access token: log out existing device rows for this
         // user/device, then create a new device (C# `GetAuthorizationToken`).
