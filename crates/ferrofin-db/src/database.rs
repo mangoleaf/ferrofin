@@ -134,6 +134,10 @@ impl Database {
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the pool cannot be
     /// opened.
     pub async fn connect_in_memory() -> Result<Self> {
+        // Same process-wide setup as the file-backed path: without it this
+        // pool's connection would have no `ferrofin_random()` and every
+        // random-ordered query would fail with "no such function".
+        configure_sqlite_for_concurrency();
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -598,7 +602,8 @@ fn quota_cores(quota: i64, period: i64) -> Option<u32> {
 /// `suite/micro/FINDINGS.md`.
 const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
 
-/// Turns off SQLite's global memory-statistics bookkeeping, once per process.
+/// One-time process-wide SQLite setup: drops the global allocator mutex and
+/// registers Ferrofin's connection-local `RANDOM()` replacement.
 ///
 /// SQLite's default build wraps every `sqlite3Malloc`/`sqlite3_free` in a global
 /// mutex purely to keep `sqlite3_memory_used()` accurate. Nothing here reads
@@ -612,6 +617,11 @@ const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
 /// capacity cliff where latency went from 5 ms to ~9 s between 200 and 400
 /// req/s. It is also why a SMALLER reader pool measured faster: fewer threads,
 /// less contention on the same global lock.
+///
+/// The second step registers [`sqlite_random`](crate::sqlite_random)'s
+/// `ferrofin_random()` for every connection opened afterwards — the same story
+/// one lock further on: SQLite's `RANDOM()` serializes every row of a random
+/// sort on the global PRNG mutex.
 ///
 /// Must run before the first connection is opened — `sqlite3_config` fails once
 /// SQLite has initialized, which is why this is a process-wide `Once` on the
@@ -633,6 +643,10 @@ fn configure_sqlite_for_concurrency() {
                  initialized; keeping default allocator bookkeeping"
             );
         }
+        // Strictly after the `sqlite3_config` above: registering an
+        // auto-extension initializes SQLite, and `sqlite3_config` is refused
+        // once that has happened.
+        crate::sqlite_random::register_random_function();
     });
 }
 

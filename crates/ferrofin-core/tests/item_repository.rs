@@ -14,6 +14,8 @@ use ferrofin_core::{
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::dto::SortOrder;
+use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemTypeLookup as _,
@@ -213,6 +215,70 @@ async fn name_and_ordering_translate() {
     let hit = repository.get_item_list(&by_name).await.expect("list");
     assert_eq!(hit.len(), 1);
     assert_eq!(hit[0].name.as_deref(), Some("Memento"));
+}
+
+/// `ItemSortBy::Random` has to reach the database as a per-row draw.
+///
+/// Two failure modes this pins, both of which pass every other test in this
+/// file: the random expression is a function Ferrofin registers itself, so a
+/// pool it never reached fails the query outright; and a single evaluation
+/// hoisted out of the row loop would return the same page, in the same order,
+/// on every call while still looking like a working endpoint.
+#[tokio::test]
+async fn random_order_draws_a_fresh_page_each_call() {
+    use std::collections::HashSet;
+
+    const LIBRARY: u128 = 40;
+    const PAGE: usize = 5;
+    const CALLS: usize = 20;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    for i in 0..LIBRARY {
+        persist
+            .save_items(&[item(
+                Uuid::from_u128(0x9000 + i),
+                BaseItemKind::Movie,
+                &format!("Movie {i:02}"),
+            )])
+            .await
+            .expect("save");
+    }
+
+    let query = InternalItemsQuery {
+        order_by: vec![(ItemSortBy::Random, SortOrder::Descending)],
+        limit: Some(i32::try_from(PAGE).expect("page fits")),
+        ..Default::default()
+    };
+    let mut pages: Vec<Vec<String>> = Vec::with_capacity(CALLS);
+    for _ in 0..CALLS {
+        let rows = repository
+            .get_item_list(&query)
+            .await
+            .expect("random-ordered page");
+        assert_eq!(rows.len(), PAGE);
+        pages.push(rows.iter().map(|r| r.id.clone()).collect());
+    }
+
+    // C(40,5) orderings: two calls agreeing by luck is a ~1-in-10^7 event, so
+    // repeats mean the draw is not being made per call.
+    let distinct: HashSet<&Vec<String>> = pages.iter().collect();
+    assert!(
+        distinct.len() >= CALLS - 1,
+        "random pages repeat: {} distinct of {CALLS}",
+        distinct.len()
+    );
+
+    // ...and the draw must range over the whole library, not a fixed corner of
+    // it. Each item is missed with probability (1 - 5/40)^20 ~= 0.07, so ~37 of
+    // 40 show up; 30 leaves a wide margin.
+    let seen: HashSet<&String> = pages.iter().flatten().collect();
+    assert!(
+        seen.len() >= 30,
+        "random draw confined to {} of {LIBRARY} items",
+        seen.len()
+    );
 }
 
 #[tokio::test]

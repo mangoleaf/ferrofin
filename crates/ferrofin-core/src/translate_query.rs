@@ -1046,8 +1046,8 @@ fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuer
 /// Covers the scalar-column cases of `OrderMapper.MapOrderByField`; the
 /// user-data-correlated cases (`DatePlayed`, `PlayCount`, …) and the
 /// `ItemValues`-correlated cases (`Artist`, `Studio`) fall back to `SortName`,
-/// since they need joins the library manager owns. `Random` uses SQLite
-/// `RANDOM()`.
+/// since they need joins the library manager owns. `Random` uses Ferrofin's
+/// connection-local `ferrofin_random()`.
 /// Pushes the ORDER BY expression for one [`ItemSortBy`] key. The user-data
 /// keys (`DatePlayed`, `PlayCount`, played/favorite state) are correlated
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
@@ -1099,7 +1099,12 @@ fn push_order_expression(
 
 fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
     match by {
-        ItemSortBy::Random => "RANDOM()",
+        // Not SQLite's `RANDOM()`: that draws from one process-wide PRNG behind
+        // a global mutex, taken once per scanned row, which is what capped
+        // random-ordered endpoints (`/Items/Suggestions`) at ~450 req/s before
+        // collapsing the whole server into kernel lock-wait. Same uniform
+        // per-row draw, from thread-local state — see `ferrofin_db::sqlite_random`.
+        ItemSortBy::Random => ferrofin_db::sqlite_random::RANDOM_SQL_EXPR,
         ItemSortBy::Runtime => r#"bi."RunTimeTicks""#,
         ItemSortBy::DateCreated => r#"bi."DateCreated""#,
         ItemSortBy::DateLastContentAdded => r#"bi."DateLastMediaAdded""#,

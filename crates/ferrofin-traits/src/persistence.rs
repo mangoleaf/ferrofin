@@ -511,6 +511,23 @@ pub trait ItemPersistenceService: Send + Sync {
 
 fn _assert_object_safe_item_persistence_service(_: &dyn ItemPersistenceService) {}
 
+/// One by-name row for [`ItemCountService::get_item_counts_for_name_items`],
+/// carrying the name columns the count queries key on.
+///
+/// Both names are `Option` so a `NULL` column stays distinguishable from an
+/// empty string, exactly as the row reads out of `BaseItems`.
+#[derive(Debug, Clone, Copy)]
+pub struct NameItemRow<'a> {
+    /// The by-name item's id.
+    pub id: Uuid,
+    /// The row's `Name` — the key a `Person`'s credits are counted by
+    /// (upstream matches `m.People.Name == item.Name`).
+    pub name: Option<&'a str>,
+    /// The row's `CleanName` — the key every other by-name kind counts by,
+    /// through `ItemValues`.
+    pub clean_name: Option<&'a str>,
+}
+
 /// Counts items and played descendants.
 ///
 /// Port of `IItemCountService`. The C# value tuples become [`PlayedAndTotal`];
@@ -536,21 +553,26 @@ pub trait ItemCountService: Send + Sync {
     ) -> Result<ItemCounts, ServiceError>;
 
     /// Batch form of [`Self::get_item_counts_for_name_item`] for a page of
-    /// by-name items of the same `kind`: one entry per id (missing rows count
-    /// as zeros). The default loops the per-item form; the concrete service
-    /// overrides it with a grouped query.
+    /// by-name items of the same `kind`: one entry per row (a row without the
+    /// name column its kind counts by reports zeros). The default loops the
+    /// per-item form; the concrete service overrides it with a grouped query.
+    ///
+    /// Takes whole [`NameItemRow`]s rather than ids because the caller is
+    /// projecting those very rows: passing the name columns along saves the
+    /// service a `SELECT "Id","Name"` / `SELECT "Id","CleanName"` round trip
+    /// that re-reads what the caller already holds.
     async fn get_item_counts_for_name_items(
         &self,
         kind: BaseItemKind,
-        ids: &[Uuid],
+        rows: &[NameItemRow<'_>],
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
-        let mut out = HashMap::with_capacity(ids.len());
-        for &id in ids {
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
             out.insert(
-                id,
-                self.get_item_counts_for_name_item(kind, id, related_item_kinds, access_filter)
+                row.id,
+                self.get_item_counts_for_name_item(kind, row.id, related_item_kinds, access_filter)
                     .await?,
             );
         }

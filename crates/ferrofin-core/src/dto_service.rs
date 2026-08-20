@@ -70,7 +70,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager};
 use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
-use ferrofin_traits::persistence::ItemCountService;
+use ferrofin_traits::persistence::{ItemCountService, NameItemRow};
 use ferrofin_traits::providers::ProviderManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 
@@ -1356,20 +1356,26 @@ impl FerrofinDtoService {
         items: &[BaseItemEntity],
         user: Option<&UserEntity>,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
-        let mut by_kind: HashMap<BaseItemKind, Vec<Uuid>> = HashMap::new();
+        // The rows carry their own `Name`/`CleanName`, so the count service
+        // keys off those instead of re-selecting them for the page.
+        let mut by_kind: HashMap<BaseItemKind, Vec<NameItemRow<'_>>> = HashMap::new();
         for item in items {
             let kind = row_kind(item);
             if related_item_kinds(kind).is_some() {
-                by_kind.entry(kind).or_default().push(row_id(item));
+                by_kind.entry(kind).or_default().push(NameItemRow {
+                    id: row_id(item),
+                    name: item.name.as_deref(),
+                    clean_name: item.clean_name.as_deref(),
+                });
             }
         }
         let access_filter = access_filter_for(user);
         let mut out = HashMap::new();
-        for (kind, ids) in by_kind {
+        for (kind, rows) in by_kind {
             let related = related_item_kinds(kind).unwrap_or(&[]);
             out.extend(
                 self.item_counts
-                    .get_item_counts_for_name_items(kind, &ids, related, &access_filter)
+                    .get_item_counts_for_name_items(kind, &rows, related, &access_filter)
                     .await?,
             );
         }
@@ -1663,17 +1669,13 @@ impl FerrofinDtoService {
         user: Option<&UserEntity>,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
-        // Images and user-data are independent; run them concurrently.
         let want_images =
             options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
         let want_user_data = user.is_some() && options.enable_user_data;
-        let images_fut = async {
-            if want_images {
-                self.load_images_batch(&ids).await
-            } else {
-                Ok(HashMap::new())
-            }
-        };
+        // User-data and the page's credits are independent; run them concurrently.
+        // Images wait for the credits, because the cast's by-name Person rows
+        // want images too and both id sets go in ONE `BaseItemImageInfos` read
+        // (this used to be two, and a random page is mostly people).
         let user_data_fut = async {
             if want_user_data && let Some(u) = user {
                 let user_id = Uuid::parse_str(&u.id).unwrap_or_else(|_| Uuid::nil());
@@ -1682,7 +1684,14 @@ impl FerrofinDtoService {
                 Ok(HashMap::new())
             }
         };
-        let (images, user_data) = tokio::try_join!(images_fut, user_data_fut)?;
+        let people_fut = async {
+            if options.contains_field(ItemFields::People) {
+                self.library.get_people_batch(&ids).await
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let (user_data, people) = tokio::try_join!(user_data_fut, people_fut)?;
         // Merged alternate versions (rows pointing at a page item via
         // `PrimaryVersionId`), so each item's extra selectable sources build
         // without a per-item query; their streams join the stream batch below.
@@ -1696,9 +1705,9 @@ impl FerrofinDtoService {
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
-        let media_streams = if options.contains_field(ItemFields::MediaStreams)
-            || options.contains_field(ItemFields::MediaSources)
-        {
+        let want_streams = options.contains_field(ItemFields::MediaStreams)
+            || options.contains_field(ItemFields::MediaSources);
+        let media_streams = if want_streams {
             let stream_ids: Vec<Uuid> = ids
                 .iter()
                 .copied()
@@ -1719,72 +1728,88 @@ impl FerrofinDtoService {
         } else {
             HashMap::new()
         };
-        // People for the page, then every credited person's images in one further
-        // query — attach_people otherwise runs get_people + load_images per item.
-        let (people, person_images, person_ids_by_name) =
-            if options.contains_field(ItemFields::People) {
-                let people = self.library.get_people_batch(&ids).await?;
-                // Resolve each distinct credit NAME to its by-name Person item
-                // (C# AttachPeople: `People[].Id` is the per-name item id, the
-                // one favorites are written against — never the per-credit
-                // `Peoples` row id, which fragments a person across types).
-                // One lowercase per distinct spelling, not one per credit per
-                // item: `slot_by_name` maps every RAW spelling seen to the slot
-                // of the case-insensitively-deduped name it resolves through, so
-                // the projection can look the id up by the stored string.
-                let mut names: Vec<String> = Vec::new();
-                let mut slot_by_lower: HashMap<String, usize> = HashMap::new();
-                let mut slot_by_name: HashMap<String, usize> = HashMap::new();
-                for person in people.values().flatten() {
-                    if slot_by_name.contains_key(person.name.as_str()) {
-                        continue;
-                    }
-                    let slot = *slot_by_lower
-                        .entry(person.name.to_lowercase())
-                        .or_insert_with(|| {
-                            names.push(person.name.clone());
-                            names.len() - 1
-                        });
-                    slot_by_name.insert(person.name.clone(), slot);
+        // Every credited person resolved to its by-name Person item, and the
+        // ids whose images the projection will want.
+        let (person_image_ids, person_ids_by_name) = if options.contains_field(ItemFields::People) {
+            // Resolve each distinct credit NAME to its by-name Person item
+            // (C# AttachPeople: `People[].Id` is the per-name item id, the
+            // one favorites are written against — never the per-credit
+            // `Peoples` row id, which fragments a person across types).
+            // One lowercase per distinct spelling, not one per credit per
+            // item: `slot_by_name` maps every RAW spelling seen to the slot
+            // of the case-insensitively-deduped name it resolves through, so
+            // the projection can look the id up by the stored string.
+            let mut names: Vec<String> = Vec::new();
+            let mut slot_by_lower: HashMap<String, usize> = HashMap::new();
+            let mut slot_by_name: HashMap<String, usize> = HashMap::new();
+            for person in people.values().flatten() {
+                if slot_by_name.contains_key(person.name.as_str()) {
+                    continue;
                 }
-                let resolved = self
-                    .library
-                    .get_named_items(ferrofin_model::data::BaseItemKind::Person, &names)
-                    .await
-                    .unwrap_or_default();
-                let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
-                let mut person_ids: Vec<Uuid> = Vec::new();
-                for (slot, row) in resolved.into_iter().enumerate() {
-                    if let Some(row) = row
-                        && let Ok(id) = Uuid::parse_str(&row.id)
-                        && let Some(entry) = id_by_slot.get_mut(slot)
-                    {
-                        *entry = Some(id);
-                        person_ids.push(id);
-                    }
+                let slot = *slot_by_lower
+                    .entry(person.name.to_lowercase())
+                    .or_insert_with(|| {
+                        names.push(person.name.clone());
+                        names.len() - 1
+                    });
+                slot_by_name.insert(person.name.clone(), slot);
+            }
+            let resolved = self
+                .library
+                .get_named_items(ferrofin_model::data::BaseItemKind::Person, &names)
+                .await
+                .unwrap_or_default();
+            let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
+            let mut person_ids: Vec<Uuid> = Vec::new();
+            for (slot, row) in resolved.into_iter().enumerate() {
+                if let Some(row) = row
+                    && let Ok(id) = Uuid::parse_str(&row.id)
+                    && let Some(entry) = id_by_slot.get_mut(slot)
+                {
+                    *entry = Some(id);
+                    person_ids.push(id);
                 }
-                let by_name: HashMap<String, Uuid> = slot_by_name
-                    .into_iter()
-                    .filter_map(|(name, slot)| {
-                        id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
-                    })
-                    .collect();
-                // Pre-unification rows keyed images on the credit id; keep
-                // loading those too so old databases still render cast art.
-                person_ids.extend(
-                    people
-                        .values()
-                        .flatten()
-                        .filter_map(|p| Uuid::parse_str(&p.id).ok()),
-                );
-                let images = self
-                    .load_images_batch(&person_ids)
-                    .await
-                    .unwrap_or_default();
-                (people, images, by_name)
-            } else {
-                (HashMap::new(), HashMap::new(), HashMap::new())
-            };
+            }
+            let by_name: HashMap<String, Uuid> = slot_by_name
+                .into_iter()
+                .filter_map(|(name, slot)| {
+                    id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
+                })
+                .collect();
+            // Pre-unification rows keyed images on the credit id; keep
+            // loading those too so old databases still render cast art.
+            person_ids.extend(
+                people
+                    .values()
+                    .flatten()
+                    .filter_map(|p| Uuid::parse_str(&p.id).ok()),
+            );
+            (person_ids, by_name)
+        } else {
+            (Vec::new(), HashMap::new())
+        };
+
+        // The one image read: the page's own rows (when images are wanted) plus
+        // every credited person's row. `person_images` keeps its own copy of the
+        // cast entries because a page item drains its own entry as it projects.
+        let mut image_ids: Vec<Uuid> = if want_images { ids.clone() } else { Vec::new() };
+        image_ids.extend(person_image_ids.iter().copied());
+        let fetched_images = if image_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.load_images_batch(&image_ids).await?
+        };
+        let person_images: HashMap<Uuid, Vec<ItemImageInfo>> = person_image_ids
+            .iter()
+            .filter_map(|id| fetched_images.get(id).map(|rows| (*id, rows.clone())))
+            .collect();
+        // With images switched off the page keeps none — only the cast art the
+        // People field asked for, exactly as when these were two reads.
+        let images = if want_images {
+            fetched_images
+        } else {
+            HashMap::new()
+        };
         // Studio/genre/artist ids for every name on the page in one query. Collect
         // exactly what the attach steps resolve: studios/genres only when their
         // field is requested, artists/album-artists only for the kinds that carry
@@ -1885,16 +1910,34 @@ impl FerrofinDtoService {
             }
             _ => HashMap::new(),
         };
-        // Subtitle presence for the page's videos in one ids-only query — C#
-        // emits `HasSubtitles` on every video DTO regardless of `ItemFields`.
+        // Subtitle presence for the page's videos — C# emits `HasSubtitles` on
+        // every video DTO regardless of `ItemFields`.
         let video_ids: Vec<Uuid> = items
             .iter()
             .filter(|i| kinds::is_video(row_kind(i)))
             .map(row_id)
             .collect();
-        let has_subtitles = if video_ids.is_empty() {
+        let has_subtitles: std::collections::HashSet<Uuid> = if video_ids.is_empty() {
             std::collections::HashSet::new()
+        } else if want_streams {
+            // The page's streams are already in hand (they cover every page id,
+            // videos included), so the answer is a scan of what was read rather
+            // than a second round trip — that ids-only query was the costliest
+            // statement on the /Items/Suggestions page after the page query
+            // itself (0.47 ms of a 3.8 ms request).
+            video_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    media_streams.get(id).is_some_and(|streams| {
+                        streams.iter().any(|s| {
+                            s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle
+                        })
+                    })
+                })
+                .collect()
         } else {
+            // No stream fields requested, so nothing was bulk-loaded to read.
             self.media_sources
                 .get_item_ids_with_subtitles(&video_ids)
                 .await?
@@ -2594,8 +2637,17 @@ mod tests {
     }
 
     /// A [`MediaSourceManager`] fake — canned streams and one alternate version.
+    ///
+    /// `get_item_ids_with_subtitles` deliberately reports EVERY id as subtitled
+    /// while the stream batch is per-id: a projection that answered
+    /// `HasSubtitles` from that query instead of from the streams it already
+    /// read would mark `without_subtitles` items subtitled, and the tests below
+    /// would catch it.
     #[derive(Default)]
-    struct FakeSources;
+    struct FakeSources {
+        /// Ids whose canned stream list carries no subtitle stream.
+        without_subtitles: std::collections::HashSet<Uuid>,
+    }
 
     #[async_trait]
     impl MediaSourceManager for FakeSources {
@@ -2625,15 +2677,21 @@ mod tests {
             Ok(item_ids
                 .iter()
                 .map(|id| {
-                    (
-                        *id,
-                        vec![MediaStream {
-                            index: 0,
-                            stream_type: ferrofin_model::entities::MediaStreamType::Video,
-                            codec: Some("h264".to_owned()),
+                    let mut streams = vec![MediaStream {
+                        index: 0,
+                        stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                        codec: Some("h264".to_owned()),
+                        ..MediaStream::default()
+                    }];
+                    if !self.without_subtitles.contains(id) {
+                        streams.push(MediaStream {
+                            index: 1,
+                            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
+                            codec: Some("subrip".to_owned()),
                             ..MediaStream::default()
-                        }],
-                    )
+                        });
+                    }
+                    (*id, streams)
                 })
                 .collect())
         }
@@ -2958,7 +3016,7 @@ mod tests {
             Arc::new(FakeUserData),
             Arc::new(FakeCounts),
             Arc::new(FakeImages),
-            Arc::new(FakeSources),
+            Arc::new(FakeSources::default()),
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
             Arc::new(FakeProviders),
@@ -2974,7 +3032,7 @@ mod tests {
             Arc::new(FakeUserData),
             Arc::new(FakeCounts),
             Arc::new(FakeImages),
-            Arc::new(FakeSources),
+            Arc::new(FakeSources::default()),
             Arc::new(ChaptersWithImages),
             Arc::new(FakeTrickplay),
             Arc::new(FakeProviders),
@@ -2983,6 +3041,23 @@ mod tests {
 
     fn service(db: Database) -> FerrofinDtoService {
         service_with(db, Arc::new(FakeLibrary::default()))
+    }
+
+    /// [`service`] with a media-source fake whose canned streams the caller
+    /// controls.
+    fn service_with_sources(db: Database, sources: FakeSources) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts),
+            Arc::new(FakeImages),
+            Arc::new(sources),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+            Arc::new(FakeProviders),
+        )
     }
 
     // Clients gate the chapter-thumbnail request on `ImageTag`; without it the
@@ -3151,6 +3226,70 @@ mod tests {
         // the fake), not just the file-level fact.
         assert_eq!(dto.can_delete, Some(true));
         assert_eq!(dto.can_download, Some(false));
+    }
+
+    /// `HasSubtitles` is read out of the page's already-prefetched streams, not
+    /// bought with a second ids-only query — that query was the second-costliest
+    /// statement on `/Items/Suggestions`.
+    ///
+    /// The fake's `get_item_ids_with_subtitles` reports EVERY id as subtitled,
+    /// so a projection that still asked it would mark `bare` subtitled too. The
+    /// per-item answer must therefore come from the streams themselves.
+    #[tokio::test]
+    async fn has_subtitles_reads_the_prefetched_streams_not_a_second_query() {
+        let db = test_db().await;
+        let subbed = Uuid::from_u128(0x5B01);
+        let bare = Uuid::from_u128(0x5B02);
+        seed_named_item(&db, subbed, BaseItemKind::Movie, "Subbed").await;
+        seed_named_item(&db, bare, BaseItemKind::Movie, "Bare").await;
+        let items = vec![fetch_item(&db, subbed).await, fetch_item(&db, bare).await];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                without_subtitles: std::iter::once(bare).collect(),
+            },
+        );
+
+        let dtos = svc
+            .get_base_item_dtos(&items, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(dtos[0].has_subtitles, Some(true), "subtitle stream present");
+        assert_eq!(
+            dtos[1].has_subtitles, None,
+            "no subtitle stream on the page"
+        );
+    }
+
+    /// With no stream-bearing field requested nothing is prefetched to read, so
+    /// the ids-only query is still the answer — dropping it outright would nil
+    /// `HasSubtitles` for every caller asking for a lean DTO.
+    #[tokio::test]
+    async fn has_subtitles_falls_back_to_the_query_when_streams_are_not_prefetched() {
+        let db = test_db().await;
+        let bare = Uuid::from_u128(0x5B03);
+        seed_named_item(&db, bare, BaseItemKind::Movie, "Bare").await;
+        let items = vec![fetch_item(&db, bare).await];
+        let svc = service_with_sources(
+            db,
+            FakeSources {
+                without_subtitles: std::iter::once(bare).collect(),
+            },
+        );
+
+        // No MediaStreams/MediaSources field → no stream batch was loaded.
+        let lean = DtoOptions::with_all_fields(false);
+        let dtos = svc
+            .get_base_item_dtos(&items, &lean, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dtos[0].has_subtitles,
+            Some(true),
+            "the ids-only query still answers when nothing was prefetched"
+        );
     }
 
     #[tokio::test]
@@ -3951,6 +4090,63 @@ mod tests {
         assert_eq!(people.len(), 2);
         assert_eq!(people[0].id, person, "first spelling");
         assert_eq!(people[1].id, person, "second spelling");
+    }
+
+    /// The page's own images and the cast's images come out of ONE
+    /// `BaseItemImageInfos` read, and each side must still land on its own DTO.
+    ///
+    /// The two used to be separate queries; merging them is only safe if the
+    /// page rows keep their images (they are drained per item as it projects)
+    /// AND the by-name `Person` rows keep theirs (they are read by name, and a
+    /// person may also be sitting on the page).
+    #[tokio::test]
+    async fn page_and_cast_images_both_survive_the_single_image_read() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xC_1234);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_images(
+            &db,
+            movie,
+            &[image_info(ImageType::Primary, "/m.jpg", None)],
+        )
+        .await;
+        let person = Uuid::from_u128(0xC_5678);
+        seed_named_item(&db, person, BaseItemKind::Person, "Leonardo DiCaprio").await;
+        seed_images(
+            &db,
+            person,
+            &[image_info(ImageType::Primary, "/p.jpg", None)],
+        )
+        .await;
+        let person_row = fetch_item(&db, person).await;
+        let item = fetch_item(&db, movie).await;
+
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: "Leonardo DiCaprio".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: vec![person_row],
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            dto.image_tags
+                .as_ref()
+                .is_some_and(|tags| tags.contains_key(&ImageType::Primary)),
+            "the page item keeps its own image"
+        );
+        let people = dto.people.as_ref().expect("people");
+        assert!(
+            people[0].primary_image_tag.is_some(),
+            "the credited person keeps its cast art"
+        );
     }
 
     /// Credit spellings whose *stored* form differs from every "tidy" convention

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemCountService, PlayedAndTotal};
+use ferrofin_traits::persistence::{ItemCountService, NameItemRow, PlayedAndTotal};
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
@@ -110,27 +110,17 @@ impl FerrofinItemCountService {
     /// CleanName/ItemValues count path returns zero for them.
     async fn people_name_counts(
         &self,
-        ids: &[Uuid],
+        rows: &[NameItemRow<'_>],
         related_item_kinds: &[BaseItemKind],
         mut out: HashMap<Uuid, ItemCounts>,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
-        // Resolve each person row's Name.
-        let mut name_by_id: Vec<(Uuid, String)> = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
-            let sql = format!(
-                r#"SELECT "Id","Name" FROM "BaseItems" WHERE "Id" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            for (row_id, name) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                if let (Ok(uuid), Some(name)) = (Uuid::parse_str(&row_id), name) {
-                    name_by_id.push((uuid, name));
-                }
-            }
-        }
+        // Each row's Name comes from the caller's already-projected row — the
+        // page was read out of `BaseItems` to build the DTOs, so re-selecting
+        // `Id`/`Name` here would be a round trip for data in hand.
+        let name_by_id: Vec<(Uuid, &str)> = rows
+            .iter()
+            .filter_map(|row| row.name.map(|name| (row.id, name)))
+            .collect();
         if name_by_id.is_empty() {
             return Ok(out);
         }
@@ -143,7 +133,7 @@ impl FerrofinItemCountService {
         // through to sqlx as `&str`, so no name is ever copied on this path.
         let distinct_names: Vec<&str> = name_by_id
             .iter()
-            .map(|(_, n)| n.as_str())
+            .map(|(_, n)| *n)
             .collect::<HashSet<&str>>()
             .into_iter()
             .collect();
@@ -168,7 +158,7 @@ impl FerrofinItemCountService {
         }
 
         for (id, name) in name_by_id {
-            if let Some(by_type) = by_name.get(&name) {
+            if let Some(by_type) = by_name.get(name) {
                 out.insert(id, counts_from_type_map(by_type));
             }
         }
@@ -223,11 +213,28 @@ impl ItemCountService for FerrofinItemCountService {
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<ItemCounts, ServiceError> {
-        // A single by-name item is a batch of one.
+        // A single by-name item is a batch of one; the caller passed only an
+        // id, so this form is the one place that still reads the name columns.
+        let names: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                r#"SELECT "Name", "CleanName" FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let Some((name, clean_name)) = names else {
+            return Ok(ItemCounts::default());
+        };
+        let row = NameItemRow {
+            id,
+            name: name.as_deref(),
+            clean_name: clean_name.as_deref(),
+        };
         Ok(self
             .get_item_counts_for_name_items(
                 kind,
-                std::slice::from_ref(&id),
+                std::slice::from_ref(&row),
                 related_item_kinds,
                 access_filter,
             )
@@ -239,15 +246,17 @@ impl ItemCountService for FerrofinItemCountService {
     async fn get_item_counts_for_name_items(
         &self,
         kind: BaseItemKind,
-        ids: &[Uuid],
+        rows: &[NameItemRow<'_>],
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
-        // Every id reports counts (zeros when the row or its CleanName is
-        // missing), matching the per-item form's defaults.
-        let mut out: HashMap<Uuid, ItemCounts> =
-            ids.iter().map(|&id| (id, ItemCounts::default())).collect();
-        if ids.is_empty() {
+        // Every row reports counts (zeros when its CleanName is missing),
+        // matching the per-item form's defaults.
+        let mut out: HashMap<Uuid, ItemCounts> = rows
+            .iter()
+            .map(|row| (row.id, ItemCounts::default()))
+            .collect();
+        if rows.is_empty() {
             return Ok(out);
         }
 
@@ -256,26 +265,15 @@ impl ItemCountService for FerrofinItemCountService {
         // C# `ItemCountService` Person branch (`m.People.Name == item.Name`). The
         // CleanName/ItemValues path below would count zero for a Person.
         if kind == BaseItemKind::Person {
-            return self.people_name_counts(ids, related_item_kinds, out).await;
+            return self.people_name_counts(rows, related_item_kinds, out).await;
         }
 
-        // Resolve every by-name row's CleanName in one query per chunk.
-        let mut clean_by_id: Vec<(Uuid, String)> = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
-            let sql = format!(
-                r#"SELECT "Id", "CleanName" FROM "BaseItems" WHERE "Id" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            let mut query = sqlx::query_as::<_, (String, Option<String>)>(&sql);
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            for (row_id, clean) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                if let (Ok(uuid), Some(clean)) = (Uuid::parse_str(&row_id), clean) {
-                    clean_by_id.push((uuid, clean));
-                }
-            }
-        }
+        // Each row's CleanName rides along on the row the caller is already
+        // projecting, so this path reads `ItemValues` and nothing else.
+        let clean_by_id: Vec<(Uuid, &str)> = rows
+            .iter()
+            .filter_map(|row| row.clean_name.map(|clean| (row.id, clean)))
+            .collect();
         if clean_by_id.is_empty() {
             return Ok(out);
         }
@@ -298,7 +296,7 @@ impl ItemCountService for FerrofinItemCountService {
         // to sqlx as `&str`, so no clean value is copied on this path.
         let distinct_cleans: Vec<&str> = clean_by_id
             .iter()
-            .map(|(_, c)| c.as_str())
+            .map(|(_, c)| *c)
             .collect::<HashSet<&str>>()
             .into_iter()
             .collect();
@@ -322,7 +320,7 @@ impl ItemCountService for FerrofinItemCountService {
         }
 
         for (id, clean) in clean_by_id {
-            if let Some(by_type) = by_clean.get(&clean) {
+            if let Some(by_type) = by_clean.get(clean) {
                 out.insert(id, counts_from_type_map(by_type));
             }
         }
@@ -635,13 +633,36 @@ fn placeholders(n: usize) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{
-        seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, set_clean_name,
-        test_db,
+        fetch_item, seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data,
+        set_clean_name, test_db,
     };
     use ferrofin_db::Database;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
 
     fn svc(db: &Database) -> FerrofinItemCountService {
         FerrofinItemCountService::new(db.clone())
+    }
+
+    /// Reads the stored rows for `ids`, the way the DTO projection already has
+    /// them in hand when it asks for counts.
+    async fn stored_rows(db: &Database, ids: &[Uuid]) -> Vec<BaseItemEntity> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(fetch_item(db, *id).await);
+        }
+        out
+    }
+
+    /// The count-service view of those rows — `Name`/`CleanName` exactly as
+    /// stored, never a test-side guess at what the cleaner produced.
+    fn name_rows(rows: &[BaseItemEntity]) -> Vec<NameItemRow<'_>> {
+        rows.iter()
+            .map(|row| NameItemRow {
+                id: Uuid::parse_str(&row.id).expect("row id"),
+                name: row.name.as_deref(),
+                clean_name: row.clean_name.as_deref(),
+            })
+            .collect()
     }
 
     /// Seeds a folder with a played and an unplayed child, wiring the AncestorIds
@@ -936,10 +957,11 @@ mod tests {
         seed_named_item(&db, s1, BaseItemKind::Series, "S1").await;
         seed_item_genre(&db, s1, "Comedy").await;
 
+        let stored = stored_rows(&db, &[drama, comedy, no_clean]).await;
         let batch = service
             .get_item_counts_for_name_items(
                 BaseItemKind::Genre,
-                &[drama, comedy, no_clean],
+                &name_rows(&stored),
                 &[BaseItemKind::Movie, BaseItemKind::Series],
                 &InternalItemsQuery::default(),
             )
@@ -1024,10 +1046,12 @@ mod tests {
         seed_item_genre(&db, comedy_series, "Comedy").await;
 
         let ids: Vec<Uuid> = dupes.iter().map(|(id, _)| *id).chain([other]).collect();
+        let stored = stored_rows(&db, &ids).await;
+        let rows = name_rows(&stored);
         let counts = service
             .get_item_counts_for_name_items(
                 BaseItemKind::Genre,
-                &ids,
+                &rows,
                 &[BaseItemKind::Movie, BaseItemKind::Series],
                 &InternalItemsQuery::default(),
             )
@@ -1046,7 +1070,7 @@ mod tests {
         let unrestricted = service
             .get_item_counts_for_name_items(
                 BaseItemKind::Genre,
-                &ids,
+                &rows,
                 &[],
                 &InternalItemsQuery::default(),
             )
@@ -1054,6 +1078,110 @@ mod tests {
             .expect("unrestricted counts");
         assert_eq!(unrestricted[&dupes[0].0].movie_count, 1);
         assert_eq!(unrestricted[&other].series_count, 1);
+    }
+
+    /// The batch counts key off the names the CALLER supplies, never a re-read
+    /// of the rows — the caller is projecting those rows already, and the
+    /// re-read was a round trip per page on every by-name list endpoint.
+    ///
+    /// Proven by supplying rows whose name columns are absent while the stored
+    /// rows have perfectly good ones: a service that went back to `BaseItems`
+    /// would find the names and report non-zero counts.
+    #[tokio::test]
+    async fn name_counts_key_off_the_supplied_rows_not_a_re_read() {
+        let db = test_db().await;
+        let service = svc(&db);
+
+        let drama = Uuid::from_u128(0xEE01);
+        seed_named_item(&db, drama, BaseItemKind::Genre, "Drama").await;
+        set_clean_name(&db, drama, "Drama").await;
+        let movie = Uuid::from_u128(0xEE11);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_item_genre(&db, movie, "Drama").await;
+
+        let person = Uuid::from_u128(0xEE02);
+        seed_named_item(&db, person, BaseItemKind::Person, "Ada Lovelace").await;
+        let people_id = Uuid::from_u128(0xEE03);
+        sqlx::query(r#"INSERT INTO "Peoples" ("Id","Name","PersonType") VALUES (?1,?2,?3)"#)
+            .bind(guid_to_db(people_id))
+            .bind("Ada Lovelace")
+            .bind("Actor")
+            .execute(db.writer())
+            .await
+            .expect("seed people");
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+               VALUES (?1,?2,?3,0,0)"#,
+        )
+        .bind(guid_to_db(movie))
+        .bind(guid_to_db(people_id))
+        .bind("Role")
+        .execute(db.writer())
+        .await
+        .expect("seed people map");
+
+        // The stored rows do carry the names…
+        let stored = stored_rows(&db, &[drama]).await;
+        let counted = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &name_rows(&stored),
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("genre counts");
+        assert_eq!(counted[&drama].movie_count, 1);
+
+        // …but a row handed over without them must report zeros, for both the
+        // ItemValues branch and the Peoples branch.
+        let blank_genre = NameItemRow {
+            id: drama,
+            name: None,
+            clean_name: None,
+        };
+        let blind = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                std::slice::from_ref(&blank_genre),
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("genre counts without a name");
+        assert_eq!(
+            blind[&drama].movie_count, 0,
+            "the service re-read the row instead of using what it was given"
+        );
+
+        let blank_person = NameItemRow {
+            id: person,
+            name: None,
+            clean_name: None,
+        };
+        let blind_person = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Person,
+                std::slice::from_ref(&blank_person),
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("person counts without a name");
+        assert_eq!(blind_person[&person].movie_count, 0);
+
+        // The per-item form takes only an id, so it still reads the row itself
+        // and must keep counting.
+        let single = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Person,
+                person,
+                &[BaseItemKind::Movie],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("single person counts");
+        assert_eq!(single.movie_count, 1);
     }
 
     /// The Person branch dedupes on the raw `Name`, so two Person rows sharing a
@@ -1127,10 +1255,11 @@ mod tests {
             seed_named_item(&db, id, BaseItemKind::Person, raw_name).await;
         }
 
+        let stored = stored_rows(&db, &[p1, p2]).await;
         let counts = service
             .get_item_counts_for_name_items(
                 BaseItemKind::Person,
-                &[p1, p2],
+                &name_rows(&stored),
                 &[BaseItemKind::Movie, BaseItemKind::Series],
                 &InternalItemsQuery::default(),
             )
@@ -1144,10 +1273,10 @@ mod tests {
         }
     }
 
-    /// The by-name count path chunks its `IN` lists at 500. Seeding 501 distinct
-    /// by-name rows crosses that boundary in both the CleanName-resolution query
-    /// (`ids.chunks`) and the count query (`distinct_cleans.chunks`); an
-    /// off-by-one in either silently drops the tail's counts.
+    /// The by-name count path chunks its `IN` list at 500. Seeding 501 distinct
+    /// by-name rows crosses that boundary in the count query
+    /// (`distinct_cleans.chunks`); an off-by-one there silently drops the
+    /// tail's counts.
     #[tokio::test]
     async fn name_item_counts_span_the_chunk_boundary() {
         /// One past the 500-item `IN`-chunk size used by the by-name count path.
@@ -1169,10 +1298,11 @@ mod tests {
             seed_item_genre(&db, movie, &name).await;
         }
 
+        let stored = stored_rows(&db, &genre_ids).await;
         let counts = service
             .get_item_counts_for_name_items(
                 BaseItemKind::Genre,
-                &genre_ids,
+                &name_rows(&stored),
                 &[BaseItemKind::Movie],
                 &InternalItemsQuery::default(),
             )
