@@ -1021,11 +1021,7 @@ impl LibraryScanner {
         let mut probes = self.probe_pipeline(&planned);
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
-            // Bounded progress cadence (RULES_LOGGING volume rule); `0` disables it.
-            if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every)
-            {
-                tracing::info!(scanned, total = planned.len(), "library scan progress");
-            }
+            self.log_scan_progress(scanned, planned.len());
             if self.events.is_some() && !self.persistence.item_exists(item.id).await.unwrap_or(true)
             {
                 items_added.push(item);
@@ -1062,9 +1058,14 @@ impl LibraryScanner {
                 self.fetch_remote_metadata(&mut entity, &mut art_cache, policy)
                     .await
             };
-            // Photos carry their metadata inside the file, not on any remote
-            // provider; the Primary image this sets is the photo itself.
-            let photo_images = self.enrich_photo(&mut entity, locked).await;
+            // Photos and books carry their metadata inside the file, not on any
+            // remote provider. A photo's Primary image is the file itself; a
+            // book's is the cover extracted from its archive.
+            let (embedded_people, embedded_images) =
+                self.enrich_from_file(&mut entity, locked).await;
+            if people.is_empty() {
+                people = embedded_people;
+            }
             if people.is_empty() {
                 people = remote.people;
             }
@@ -1111,9 +1112,7 @@ impl LibraryScanner {
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
             }
-            if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
-                repo.save_chapters(item.id, &chapters).await?;
-            }
+            self.save_chapters(item.id, &chapters).await?;
             // Artwork — locked items skip the rewrite entirely: their image
             // rows are user-owned.
             if !locked {
@@ -1121,7 +1120,7 @@ impl LibraryScanner {
                     entity: &entity,
                     streams: &streams,
                     policy,
-                    photo_images,
+                    embedded_images,
                 };
                 self.persist_artwork(item.id, art, &mut art_cache).await;
             }
@@ -2724,15 +2723,16 @@ impl LibraryScanner {
             entity,
             streams,
             policy,
-            photo_images,
+            embedded_images,
         } = art;
         // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
-        // before any discovery runs), so it needs none of the chain below.
-        if !photo_images.is_empty() {
-            let mut images = photo_images;
+        // before any discovery runs), and a book's cover comes out of its own
+        // archive — neither needs the discovery chain below.
+        if !embedded_images.is_empty() {
+            let mut images = embedded_images;
             self.fill_image_metadata(&mut images).await;
             if let Err(err) = self.persistence.save_item_images(item_id, &images).await {
-                tracing::warn!(%err, item = %item_id, "failed to persist photo artwork");
+                tracing::warn!(%err, item = %item_id, "failed to persist embedded artwork");
             }
             return;
         }
@@ -3255,7 +3255,11 @@ impl LibraryScanner {
                             self.plan_photos(location, cf, cf, &naming, &mut out);
                         }
                     }
-                    // books / boxsets / … aren't scanned in v1.
+                    Some(CollectionTypeOptions::books) => {
+                        self.plan_books(location, cf, cf, &mut out);
+                    }
+                    // boxsets aren't scanned — a box set is created through the
+                    // collections API, not resolved from disk.
                     Some(_) => {}
                 }
             }
@@ -3763,6 +3767,148 @@ impl LibraryScanner {
         self.plan_music_album(dir, cf, naming, out);
     }
 
+    /// Resolves the books under `dir` — port of `BookResolver`.
+    ///
+    /// Every recognized book/comic file becomes a `Book`, named from its
+    /// filename (the naming layer strips the volume/chapter/year markers), and
+    /// directories are walked. `AudioBook` folders are resolved by the audio
+    /// path, not here.
+    fn plan_books(&self, dir: &str, cf: Uuid, parent: Uuid, out: &mut Vec<Planned>) {
+        for entry in self.file_system.get_file_system_entries(dir) {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_books(&entry.path, cf, parent, out);
+                continue;
+            }
+            if !is_book_file(&entry.path) {
+                continue;
+            }
+            let stem = file_stem(&entry.path);
+            let parsed = ferrofin_naming::book::book_file_name_parser::parse(Some(&stem));
+            let name = parsed.name.clone().unwrap_or_else(|| stem.clone());
+            let Some((id, mut entity)) =
+                self.base_item(BaseItemKind::Book, cf, parent, name, &entry.path, false)
+            else {
+                continue;
+            };
+            entity.media_type = Some("Book".to_owned());
+            entity.production_year = parsed.year.map(i64::from);
+            entity.index_number = parsed.index.map(i64::from);
+            entity.parent_index_number = parsed.parent_index.map(i64::from);
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            });
+        }
+    }
+
+    /// Persists an item's probed chapter markers, when there are any and a
+    /// chapter repository is wired.
+    async fn save_chapters(
+        &self,
+        item_id: Uuid,
+        chapters: &[ferrofin_db::entities::base_items::ChapterEntity],
+    ) -> Result<(), ServiceError> {
+        if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
+            repo.save_chapters(item_id, chapters).await?;
+        }
+        Ok(())
+    }
+
+    /// Emits the bounded per-item progress line (RULES_LOGGING volume rule);
+    /// a `progress_every` of `0` disables it.
+    fn log_scan_progress(&self, scanned: usize, total: usize) {
+        if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every) {
+            tracing::info!(scanned, total, "library scan progress");
+        }
+    }
+
+    /// The embedded-metadata passes for the kinds whose metadata lives inside
+    /// the file rather than on a remote provider: photos (EXIF) and books
+    /// (`ComicInfo`/`ComicBookInfo`/OPF). Returns the credits and the image
+    /// extracted from the file, for the artwork pass.
+    async fn enrich_from_file(
+        &self,
+        entity: &mut BaseItemEntity,
+        locked: bool,
+    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>) {
+        let mut images = self.enrich_photo(entity, locked).await;
+        let (people, book_images) = self.enrich_book(entity, locked).await;
+        images.extend(book_images);
+        (people, images)
+    }
+
+    /// The book embedded-metadata pass — port of `ComicProvider`,
+    /// `ComicBookInfoProvider`, `EpubProvider` and `OpfProvider`, plus the two
+    /// cover extractors.
+    ///
+    /// Fills only what the row still lacks, like every other local reader, and
+    /// returns the cast (writer/penciller/…) plus the cover image to persist.
+    async fn enrich_book(
+        &self,
+        entity: &mut BaseItemEntity,
+        locked: bool,
+    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>) {
+        if !entity.type_.ends_with(".Book") || locked {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let people = match ferrofin_providers::read_book_metadata(&path) {
+            Some(book) => {
+                apply_book(entity, &book);
+                book_people(&book)
+            }
+            None => Vec::new(),
+        };
+        (people, self.extract_book_cover(entity, &path).await)
+    }
+
+    /// Writes a book's embedded cover into its metadata art directory and
+    /// returns the image row — the shape `download_images` produces for a
+    /// remote fetch, so the artwork pass treats both the same.
+    async fn extract_book_cover(&self, entity: &BaseItemEntity, path: &str) -> Vec<ItemImageInfo> {
+        let Some(meta_root) = &self.metadata_dir else {
+            return Vec::new();
+        };
+        let item_dir = meta_root.join(&entity.id);
+        if let Some(existing) = existing_art_file(&item_dir, "primary") {
+            return vec![ItemImageInfo {
+                path: existing.to_string_lossy().into_owned(),
+                image_type: ImageType::Primary,
+                date_modified: file_date_modified(&existing),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }];
+        }
+        let Some((name, bytes)) = ferrofin_providers::read_book_cover(path) else {
+            return Vec::new();
+        };
+        let extension = Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_ascii_lowercase();
+        if tokio::fs::create_dir_all(&item_dir).await.is_err() {
+            return Vec::new();
+        }
+        let out = item_dir.join(format!("primary.{extension}"));
+        if let Err(err) = tokio::fs::write(&out, &bytes).await {
+            tracing::warn!(%err, item = %entity.id, "failed to write book cover");
+            return Vec::new();
+        }
+        vec![ItemImageInfo {
+            path: out.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: file_date_modified(&out),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }]
+    }
+
     /// Resolves the photos under `dir` — port of `PhotoResolver` and
     /// `PhotoAlbumResolver`.
     ///
@@ -4074,8 +4220,9 @@ struct ArtworkPass<'a> {
     streams: &'a [MediaStreamInfoEntity],
     /// The owning library's image-fetcher gate.
     policy: FetcherPolicy<'a>,
-    /// A photo's own file as its Primary image, when the row is a photo.
-    photo_images: Vec<ItemImageInfo>,
+    /// The image embedded in the item's own file — a photo (the file itself)
+    /// or a book cover — when the row has one.
+    embedded_images: Vec<ItemImageInfo>,
 }
 
 /// The fetcher policy of the library an item belongs to — every `Planned` item
@@ -4090,6 +4237,68 @@ fn policy_for<'a>(
         .and_then(|id| policies.get(id))
         .copied()
         .unwrap_or_default()
+}
+
+/// The file extensions a book library resolves — port of `BookResolver`'s
+/// supported set (the comic archives plus the e-book formats).
+const BOOK_EXTENSIONS: [&str; 8] = ["azw", "azw3", "epub", "mobi", "pdf", "cbz", "cbr", "cb7"];
+
+/// Whether `path` is a book file.
+fn is_book_file(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| BOOK_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
+/// Applies a book's embedded metadata to the row, filling only what is still
+/// empty (mirrors [`apply_details`]).
+fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetadata) {
+    if let Some(name) = book
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        entity.name = Some(name.to_owned());
+        entity.sort_name = Some(derived_sort_name(entity, name));
+    }
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&book.original_title);
+    }
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&book.overview);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = book.production_year.map(i64::from);
+    }
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = book.premiere_date;
+    }
+    if entity.index_number.is_none() {
+        entity.index_number = book.index_number.map(i64::from);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = book.community_rating;
+    }
+    merge_multi_value(&mut entity.genres, &book.genres);
+    merge_multi_value(&mut entity.studios, &book.studios);
+    merge_multi_value(&mut entity.tags, &book.tags);
+}
+
+/// Maps a book's credits to persistable rows. Comic and OPF sources carry no
+/// per-person id or image.
+fn book_people(book: &ferrofin_providers::BookMetadata) -> Vec<PeopleEntity> {
+    book.people
+        .iter()
+        .map(|(name, kind)| PeopleEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            name: name.clone(),
+            person_type: Some(kind.clone()),
+            role: None,
+            primary_image_url: None,
+            provider_id: None,
+        })
+        .collect()
 }
 
 /// Filename prefixes that mark an image as *artwork*, never a photo. Port of
@@ -5224,6 +5433,73 @@ mod tests {
             crate::item_data::read_data_string(&parsed, "Software").as_deref(),
             Some("Darktable")
         );
+    }
+
+    // BookResolver's extension set, matched case-insensitively.
+    #[test]
+    fn book_files_are_recognized_by_extension() {
+        for book in [
+            "Dune.epub",
+            "Dune.EPUB",
+            "batman.cbz",
+            "manual.pdf",
+            "x.azw3",
+        ] {
+            assert!(super::is_book_file(&format!("/b/{book}")), "{book}");
+        }
+        for other in ["cover.jpg", "notes.txt", "movie.mkv", "no-extension"] {
+            assert!(!super::is_book_file(&format!("/b/{other}")), "{other}");
+        }
+    }
+
+    // Embedded book metadata fills only what the row still lacks, but the title
+    // is authoritative (as it is for NFO).
+    #[test]
+    fn apply_book_fills_empty_fields_and_takes_the_title() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let book = ferrofin_providers::BookMetadata {
+            name: Some("The Killing Joke".into()),
+            overview: Some("One bad day.".into()),
+            production_year: Some(1988),
+            genres: vec!["Superhero".into()],
+            studios: vec!["DC Comics".into()],
+            tags: vec!["classic".into()],
+            index_number: Some(1),
+            ..Default::default()
+        };
+        let mut entity = BaseItemEntity {
+            name: Some("batman - the killing joke".into()),
+            overview: Some("from a sidecar".into()),
+            ..Default::default()
+        };
+        super::apply_book(&mut entity, &book);
+        assert_eq!(entity.name.as_deref(), Some("The Killing Joke"));
+        assert_eq!(entity.overview.as_deref(), Some("from a sidecar")); // kept
+        assert_eq!(entity.production_year, Some(1988));
+        assert_eq!(entity.genres.as_deref(), Some("Superhero"));
+        assert_eq!(entity.studios.as_deref(), Some("DC Comics"));
+        assert_eq!(entity.tags.as_deref(), Some("classic"));
+        assert_eq!(entity.index_number, Some(1));
+        assert!(
+            entity.sort_name.is_some(),
+            "the sort name follows the title"
+        );
+    }
+
+    #[test]
+    fn book_credits_become_people_rows() {
+        let book = ferrofin_providers::BookMetadata {
+            people: vec![
+                ("Alan Moore".to_owned(), "Author".to_owned()),
+                ("Brian Bolland".to_owned(), "Penciller".to_owned()),
+            ],
+            ..Default::default()
+        };
+        let people = super::book_people(&book);
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].name, "Alan Moore");
+        assert_eq!(people[0].person_type.as_deref(), Some("Author"));
+        assert!(people[1].provider_id.is_none());
     }
 
     /// An OMDb record parsed from a body shaped like the real API's.

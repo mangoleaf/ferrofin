@@ -9,6 +9,7 @@
 //! it does anything.
 
 pub mod audiodb;
+pub mod books;
 pub mod container_types;
 pub mod error;
 pub mod external_ids;
@@ -32,6 +33,7 @@ pub mod tmdb;
 pub mod tvdb;
 pub mod xbmc;
 
+pub use books::{BookMetadata, read_book_cover, read_book_metadata};
 pub use error::ProvidersError;
 pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
 
