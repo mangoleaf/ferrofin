@@ -148,7 +148,12 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
         };
         let target_duration = target_source.ceil();
 
-        let mut builder = String::with_capacity(128);
+        // Two lines per segment, each carrying the endpoint prefix and the
+        // verbatim request query. A 2.5-hour film is ~3k segments / ~0.5 MB, so
+        // a 128-byte start meant ~12 grow-and-copy rounds over a
+        // half-megabyte buffer; size it from what we are about to write.
+        let per_segment = 64 + request.endpoint_prefix.len() + request.query_string.len();
+        let mut builder = String::with_capacity(256 + segments.len() * per_segment);
         builder.push_str("#EXTM3U\n");
         builder.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
         builder.push_str("#EXT-X-VERSION:");
@@ -180,7 +185,7 @@ impl<C: EncodingOptionsProvider> DynamicHlsPlaylistGenerator<C> {
             #[allow(clippy::cast_precision_loss)]
             let length_ticks = convert_to_i64(length * TICKS_PER_SECOND as f64);
             builder.push_str("#EXTINF:");
-            builder.push_str(&format_six_decimals(*length));
+            push_six_decimals(&mut builder, *length);
             builder.push_str(", nodesc\n");
             builder.push_str(&request.endpoint_prefix);
             let _ = write!(builder, "{index}");
@@ -362,11 +367,14 @@ fn convert_to_i64(value: f64) -> i64 {
     value.round_ties_even() as i64
 }
 
-/// Renders a length with `"0.000000"` (six fixed decimals, invariant culture).
+/// Appends a length rendered as `"0.000000"` (six fixed decimals, invariant
+/// culture) to `out`.
 ///
 /// Mirrors C# `length.ToString("0.000000", CultureInfo.InvariantCulture)`.
-fn format_six_decimals(value: f64) -> String {
-    format!("{value:.6}")
+/// Written straight into the playlist buffer rather than through a temporary
+/// `String`, which was one heap allocation per segment (~3k on a long film).
+fn push_six_decimals(out: &mut String, value: f64) {
+    let _ = write!(out, "{value:.6}");
 }
 
 /// Renders a `Math.Ceiling` result the way C# `StringBuilder.Append(double)`
@@ -550,8 +558,17 @@ mod tests {
 
     #[test]
     fn format_helpers_render_like_dotnet() {
-        assert_eq!(format_six_decimals(10.427), "10.427000");
-        assert_eq!(format_six_decimals(2.0), "2.000000");
+        let six = |v: f64| {
+            let mut s = String::new();
+            push_six_decimals(&mut s, v);
+            s
+        };
+        assert_eq!(six(10.427), "10.427000");
+        assert_eq!(six(2.0), "2.000000");
+        // Appends rather than replaces — the playlist builder relies on it.
+        let mut s = "#EXTINF:".to_owned();
+        push_six_decimals(&mut s, 1.5);
+        assert_eq!(s, "#EXTINF:1.500000");
         assert_eq!(format_double_ceiling(10.0), "10");
         assert_eq!(format_double_ceiling(3.0), "3");
     }

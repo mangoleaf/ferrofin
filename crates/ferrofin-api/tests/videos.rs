@@ -675,6 +675,23 @@ async fn video_stream_range_request_is_206_with_content_range() {
     assert_eq!(&bytes[..], b"2345");
 }
 
+#[tokio::test]
+async fn video_stream_missing_file_is_404() {
+    // The media source resolves (the DB has a path) but the file is gone —
+    // a stale NFS handle, a moved file, an unmounted share. That must be a 404,
+    // and the fs-level cause is logged on that branch (the diagnostic used to
+    // run as an unconditional pre-`stat` on every segment/Range request).
+    let mut path = std::env::temp_dir();
+    path.push(format!("ferrofin-absent-{}-movie.mkv", Uuid::new_v4()));
+    let path = path.to_string_lossy().into_owned();
+    let router = create_router(state(&path, no_subtitles()).app);
+    let response = router
+        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 // ---- Version-group management ----------------------------------------------
 
 #[tokio::test]

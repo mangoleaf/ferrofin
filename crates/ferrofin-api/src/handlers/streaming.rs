@@ -42,15 +42,24 @@ pub(crate) async fn stream_path(state: &AppState, item_id: Uuid) -> Result<Strin
 /// `Range`/`HEAD`/`206 Partial Content`/`404` handling; its infallible response is
 /// mapped into an axum body. A resolution/IO failure surfaces as `404`.
 pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Response, ApiError> {
-    // A path the database resolved but the filesystem rejects otherwise
-    // surfaces as a bare 404 indistinguishable from a missing route — name the
-    // fs-level cause (stale NFS handle, permissions, moved file) in the log.
-    if let Err(e) = tokio::fs::metadata(path).await {
-        tracing::warn!(path, error = %e, "direct-stream file is not accessible");
-    }
     let response = ServeFile::new(path)
         .oneshot(request)
         .await
         .map_err(|e| ApiError::NotFound(e.to_string()))?;
+    // A path the database resolved but the filesystem rejects otherwise
+    // surfaces as a bare 404 indistinguishable from a missing route — name the
+    // fs-level cause (stale NFS handle, permissions, moved file) in the log.
+    // Only on the 404 branch: this helper serves every HLS segment and every
+    // Range request of a direct play, and an unconditional pre-`stat` doubled
+    // the metadata syscalls on that path (two round trips per request on
+    // network storage) to produce a diagnostic that never fired. A 206/416 is
+    // about the Range header, not the file, so it is not interesting here.
+    if response.status() == axum::http::StatusCode::NOT_FOUND {
+        let reason = tokio::fs::metadata(path)
+            .await
+            .err()
+            .map_or_else(|| "unreadable".to_owned(), |e| e.to_string());
+        tracing::warn!(path, error = reason, "direct-stream file is not accessible");
+    }
     Ok(response.map(Body::new))
 }

@@ -510,13 +510,18 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         };
 
         let options = self.encoding_options().await;
-        let segment_length_secs = if options.encoding_thread_count >= 0 {
-            request
-                .segment_length
-                .unwrap_or(DEFAULT_SEGMENT_LENGTH_SECS)
-        } else {
-            DEFAULT_SEGMENT_LENGTH_SECS
-        };
+        // `StreamState.SegmentLength`: an explicit `SegmentLength` from the
+        // client wins outright, otherwise the 3s default. The request value was
+        // previously gated on `encoding_thread_count >= 0` — an unrelated knob
+        // that defaults to -1 (auto), so a client's negotiated `SegmentLength`
+        // (device profiles emit it, `StreamInfo::to_url` forwards it) was
+        // silently dropped on every default install: a 6s-segment profile got
+        // 3s segments, doubling both the playlist and the number of segment
+        // requests a client makes over a film.
+        let segment_length_secs = request
+            .segment_length
+            .filter(|&secs| secs > 0)
+            .unwrap_or(DEFAULT_SEGMENT_LENGTH_SECS);
         let segment_container = request
             .segment_container
             .clone()
@@ -2079,6 +2084,38 @@ mod tests {
         assert!(plan.is_remuxing_video);
         assert!(plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]));
         assert!(plan.arguments.windows(2).any(|w| w == ["-c:a", "copy"]));
+    }
+
+    #[tokio::test]
+    async fn plan_honors_the_requested_segment_length() {
+        // `StreamState.SegmentLength`: an explicit request value wins. This was
+        // gated on `encoding_thread_count >= 0`, which defaults to -1 — so the
+        // negotiated length was dropped on every default install and a 6s
+        // profile silently got 3s segments (double the playlist, double the
+        // segment requests). `plan()` here reads the default EncodingOptions.
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_length = Some(6);
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        assert_eq!(plan.segment_length_ms, 6000);
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-hls_time", "6"]),
+            "{:?}",
+            plan.arguments
+        );
+
+        // Absent → the 3s default.
+        let plan = p.plan(&request("abc"), false, Some(0)).await.unwrap();
+        assert_eq!(plan.segment_length_ms, 3000);
+
+        // A degenerate 0 would make the playlist generator divide by zero
+        // (`HlsError::InvalidOperation` → 500); it falls back to the default
+        // instead. Deliberate divergence: upstream takes the 0 verbatim.
+        let mut req = request("abc");
+        req.segment_length = Some(0);
+        let plan = p.plan(&req, false, Some(0)).await.unwrap();
+        assert_eq!(plan.segment_length_ms, 3000);
     }
 
     #[tokio::test]

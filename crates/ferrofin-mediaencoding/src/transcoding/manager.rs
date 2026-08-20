@@ -671,6 +671,59 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         })
     }
 
+    /// Milliseconds since the job registered for `path`/`job_type` last saw
+    /// activity — the value [`Self::reap_idle_jobs`] compares against the job's
+    /// ping timeout. `None` when no such job is registered.
+    ///
+    /// Lets a caller (and the tests around the serve paths) verify that a
+    /// keep-alive actually landed on the job it was meant for.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn millis_since_activity(&self, path: &str, job_type: TranscodingJobType) -> Option<u128> {
+        let jobs = self.jobs.lock().expect("jobs lock poisoned");
+        jobs.iter()
+            .find(|j| j.handle.job_type == job_type && j.handle.path.eq_ignore_ascii_case(path))
+            .map(|j| j.last_activity.elapsed().as_millis())
+    }
+
+    /// Marks a consumer active on the job that *owns* `file_path` — the job
+    /// whose playlist stem prefixes the file's (`{stem}.m3u8` itself, or one of
+    /// its `{stem}{n}{ext}` segments).
+    ///
+    /// Port of `HlsSegmentController.GetFileResult`, which resolves the owning
+    /// playlist for a served transcode-cache file and calls
+    /// `OnTranscodeBeginRequest` on it. Upstream finds it by scanning the
+    /// transcode directory; the registry already knows every live job's
+    /// playlist path, so this is the same answer without the directory read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn begin_request_guard_for_file(
+        &self,
+        file_path: &Path,
+        job_type: TranscodingJobType,
+    ) -> Option<TranscodeRequestGuard<'_, S, C>> {
+        let stem = file_path.file_stem()?.to_string_lossy().into_owned();
+        let owner = {
+            let jobs = self.jobs.lock().expect("jobs lock poisoned");
+            jobs.iter()
+                .filter(|j| j.handle.job_type == job_type)
+                .find(|j| {
+                    Path::new(&j.handle.path).file_stem().is_some_and(|s| {
+                        stem.to_ascii_lowercase()
+                            .starts_with(&s.to_string_lossy().to_ascii_lowercase())
+                    })
+                })
+                .map(|j| j.handle.path.clone())
+        }?;
+        self.begin_request_guard(&owner, job_type)
+    }
+
     /// Synchronous end-request: decrements the job's active-consumer count and
     /// refreshes its activity stamp (the idle countdown starts *now*).
     fn end_request_sync(&self, handle: &TranscodingJobHandle) {
@@ -748,16 +801,60 @@ fn segment_file_extension(segment_container: Option<&str>) -> String {
     }
 }
 
+/// How many trailing bytes of an ffmpeg stderr log [`stderr_log_tail`] reads.
+///
+/// Comfortably more than the four lines it keeps (ffmpeg's longest lines are a
+/// couple of hundred bytes), and small enough that a multi-megabyte log from a
+/// long-running job costs one 16 kB read instead of a full slurp.
+///
+/// ponytail: tuning knob — a candidate server setting if an operator ever wants
+/// a longer diagnostic tail.
+const STDERR_TAIL_BYTES: u64 = 16 * 1024;
+
+/// Reads at most the last `max_bytes` of `path` as lossy UTF-8, dropping the
+/// first (possibly partial) line when the file was longer than that. Empty on
+/// any I/O error.
+fn read_tail(path: &Path, max_bytes: u64) -> String {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let truncated = len > max_bytes;
+    if truncated && file.seek(SeekFrom::Start(len - max_bytes)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::with_capacity(usize::try_from(len.min(max_bytes)).unwrap_or(0));
+    if file.take(max_bytes).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        // The window opened mid-line; that fragment is not a whole log line.
+        text.find('\n')
+            .map_or(String::new(), |i| text[i + 1..].to_owned())
+    } else {
+        text
+    }
+}
+
 /// The last few lines of ffmpeg's stderr log, formatted for appending to the
 /// exit-code error (empty when the log is absent or empty).
 ///
 /// A failed transcode's bare exit code says nothing; stderr names the cause
-/// (unreadable input, bad arguments). The log is small at start-failure — the
-/// process died before producing output.
+/// (unreadable input, bad arguments).
+///
+/// Only the last [`STDERR_TAIL_BYTES`] are read. The log is small when a
+/// transcode fails to *start*, but this is also called when a long-running job
+/// dies mid-stream (`wait_for_segment` / `wait_for_file`), and ffmpeg's stderr
+/// grows at roughly 0.4 kB per wall-clock second of encoding (measured): a
+/// two-hour job leaves a multi-megabyte log. Reading it whole would put that
+/// much blocking I/O — and, via the returned string, that much log line and
+/// HTTP error body — on every failed segment request, exactly when a source is
+/// killing ffmpeg repeatedly.
 fn stderr_log_tail(log_path: &Path) -> String {
-    let Ok(contents) = std::fs::read_to_string(log_path) else {
-        return String::new();
-    };
+    let contents = read_tail(log_path, STDERR_TAIL_BYTES);
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines
         .iter()
@@ -1517,6 +1614,105 @@ mod start_ffmpeg_tests {
         assert_eq!(
             stderr_log_tail(&log),
             "; stderr tail: two | three | four | five: Stale file handle"
+        );
+    }
+
+    #[test]
+    fn stderr_log_tail_reads_only_the_end_of_a_huge_log() {
+        use super::{STDERR_TAIL_BYTES, read_tail, stderr_log_tail};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("big.log");
+
+        // A long-running job's log: megabytes of ffmpeg progress lines. Only
+        // the last window is read, and the tail still names the real cause.
+        let mut body = String::new();
+        while u64::try_from(body.len()).unwrap() < 20 * STDERR_TAIL_BYTES {
+            body.push_str("frame= 1234 fps= 30 q=28.0 size=  4096kB time=00:12:34.56\n");
+        }
+        body.push_str("boom: Input/output error\n");
+        std::fs::write(&log, &body).expect("write");
+        assert!(
+            u64::try_from(body.len()).unwrap() > 10 * STDERR_TAIL_BYTES,
+            "fixture must be far larger than the read window"
+        );
+
+        let window = read_tail(&log, STDERR_TAIL_BYTES);
+        assert!(
+            u64::try_from(window.len()).unwrap() <= STDERR_TAIL_BYTES,
+            "read {} bytes, window is {STDERR_TAIL_BYTES}",
+            window.len()
+        );
+        // The partial first line of the window is dropped, so every retained
+        // line is a whole one.
+        assert!(window.starts_with("frame="), "{:?}", &window[..40]);
+
+        let tail = stderr_log_tail(&log);
+        assert!(tail.ends_with("boom: Input/output error"), "{tail}");
+
+        // ffmpeg writes its progress updates carriage-return separated, so a
+        // long run can leave a single line that is itself megabytes long.
+        // Slurping the file would put that whole line into the error string,
+        // the warn! log and the HTTP 500 body; the bounded read cannot.
+        let mut crlog = String::new();
+        crlog.push_str(&"x".repeat(usize::try_from(4 * STDERR_TAIL_BYTES).unwrap()));
+        crlog.push_str("\nfirst\nsecond\nboom: Input/output error\n");
+        std::fs::write(&log, &crlog).expect("write");
+        let tail = stderr_log_tail(&log);
+        assert!(tail.ends_with("boom: Input/output error"), "{tail}");
+        assert!(
+            tail.len() < 1024,
+            "tail must stay small even beside a megabyte-long line: {} bytes",
+            tail.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_request_guard_for_file_finds_the_owning_playlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("a1b2c3.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["a1b2c30.ts".to_owned()],
+            extra_files: vec!["a1b2c3.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+
+        // Expire the idle window, then serve one of the job's segments through
+        // the legacy route's helper: the keep-alive must restamp activity so
+        // the reaper leaves the job alone.
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = -1;
+        }
+        let guard =
+            m.begin_request_guard_for_file(&out_dir.join("a1b2c37.ts"), TranscodingJobType::Hls);
+        assert!(guard.is_some(), "segment must resolve to its playlist job");
+        drop(guard);
+        {
+            let mut jobs = m.jobs.lock().unwrap();
+            jobs[0].ping_timeout_ms = 60_000;
+        }
+        assert!(m.reap_idle_jobs().await.is_empty());
+        assert_eq!(m.active_job_count(), 1);
+
+        // The playlist file itself resolves to the same job...
+        assert!(
+            m.begin_request_guard_for_file(&playlist, TranscodingJobType::Hls)
+                .is_some()
+        );
+        // ...an unrelated stem does not, and neither does the wrong job type.
+        assert!(
+            m.begin_request_guard_for_file(&out_dir.join("deadbeef0.ts"), TranscodingJobType::Hls)
+                .is_none()
+        );
+        assert!(
+            m.begin_request_guard_for_file(&playlist, TranscodingJobType::Progressive)
+                .is_none()
         );
     }
 }

@@ -317,6 +317,30 @@ where
             .map_err(ServiceError::from)
     }
 
+    /// Serves `segment_path` if it is already on disk, marking the owning
+    /// playlist's transcode as actively consumed (the `OnTranscodeBeginRequest`
+    /// keep-alive) so the idle reaper leaves it alone. `None` when the segment
+    /// is not there yet.
+    ///
+    /// Both existence checks in [`Self::resolve_dynamic_segment`] — the
+    /// pre-lock fast path and the post-lock re-check — go through here, so
+    /// neither can serve a client without restamping the job.
+    fn serve_if_present(
+        &self,
+        playlist_key: &str,
+        segment_path: &Path,
+        ext: &str,
+    ) -> Option<ServedFile> {
+        if !segment_path.exists() {
+            return None;
+        }
+        // The guard's drop restarts the idle countdown from now.
+        let _guard = self
+            .manager
+            .begin_request_guard(playlist_key, TranscodingJobType::Hls);
+        Some(served(segment_path, ext))
+    }
+
     /// Starts (or reuses) the transcode for `request` and resolves segment
     /// `segment_id` on disk. Port of `GetDynamicSegment`.
     async fn resolve_dynamic_segment(
@@ -346,11 +370,8 @@ where
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if segment_path.exists() {
-            let _guard = self
-                .manager
-                .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
-            return Ok(served(&segment_path, &ext));
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, &ext) {
+            return Ok(file);
         }
 
         // Serialise the find/evict/start decision per playlist so two concurrent
@@ -359,9 +380,13 @@ where
         let _guard = lock.lock().await;
 
         // Another request may have produced the segment while we waited for the
-        // lock — re-check before doing any work.
-        if segment_path.exists() {
-            return Ok(served(&segment_path, &ext));
+        // lock — re-check before doing any work. Through the same helper: this
+        // branch serves a real client just like the fast path above, and when
+        // it open-coded the check without the keep-alive it left
+        // `last_activity` stale and the idle reaper free to kill a job that was
+        // actively being consumed.
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, &ext) {
+            return Ok(file);
         }
 
         // A transcode may already be running for this playlist. Only ONE ffmpeg
@@ -495,8 +520,19 @@ where
         // cancelled spawn can orphan an unregistered ffmpeg, and the next
         // segment request then starts a second writer onto the same segment
         // files — torn, unparsable fragments (the fragParsingError regression).
+        //
+        // Only the `-ss`/`-start_number` arguments differ with the start
+        // segment — the output id, playlist path and container do not — so the
+        // segment-0 plan above already answers everything up to here, and a
+        // non-resuming client (`start == 0`) needs no second plan at all. That
+        // second plan is a full media-source resolution (3 DB round trips) plus
+        // an arg rebuild, paid on every fMP4 playback start.
         let start = resume_segment_index(request.start_time_ticks, plan.segment_length_ms);
-        let plan = self.planner.plan(request, is_audio, Some(start)).await?;
+        let plan = if start == 0 {
+            plan
+        } else {
+            self.planner.plan(request, is_audio, Some(start)).await?
+        };
         let playlist_key = plan.playlist_path.to_string_lossy().into_owned();
         let lock = self.playlist_lock(&playlist_key);
         let _guard = lock.lock().await;
@@ -680,7 +716,18 @@ where
             return Err(ServiceError::invalid_input("invalid segment"));
         }
         // Refresh the owning job's keep-alive timer (OnTranscodeBeginRequest on
-        // the playlist that owns this file).
+        // the playlist that owns this file). This comment used to stand alone
+        // over code that never made the call: a client driving playback through
+        // the legacy `hls` routes never touched `last_activity`, so unless it
+        // also sent playback-progress pings the idle reaper killed its ffmpeg
+        // 60s in — mid-playback. Upstream `HlsSegmentController.GetFileResult`
+        // does exactly this for the legacy video-segment and playlist routes.
+        // The legacy *audio* route serves without it upstream; sharing the
+        // refresh here is a deliberate, response-invisible superset (it can
+        // only stop a reap of a job a client is actively consuming).
+        let _rg = self
+            .manager
+            .begin_request_guard_for_file(&path, TranscodingJobType::Hls);
         let ext = path
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
@@ -1165,6 +1212,41 @@ mod tests {
         assert!(served.path.ends_with("out0.ts"));
     }
 
+    #[tokio::test]
+    async fn serving_an_existing_segment_keeps_the_job_alive() {
+        // Serving a segment straight off disk is an active consumer: it must
+        // restamp the owning job, or the idle reaper kills the ffmpeg out from
+        // under a client that is streaming along happily.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let before = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job registered");
+        assert!(before >= 50, "idle clock should have advanced: {before}ms");
+
+        // Segment 0 is on disk now, so this re-serves it off the fast path.
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+
+        let after = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job still registered");
+        assert!(
+            after < before,
+            "serving an on-disk segment must restamp the job: {before}ms -> {after}ms"
+        );
+    }
+
     #[test]
     fn resume_segment_index_maps_offset_to_segment() {
         // 6s segments (6000 ms). 60s resume → segment 10.
@@ -1207,6 +1289,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn init_segment_without_a_resume_offset_plans_once() {
+        // Only `-ss`/`-start_number` vary with the start segment, so a
+        // non-resuming init serve (`start == 0`) must not re-plan: the second
+        // plan is a full media-source resolution (3 DB round trips) plus an arg
+        // rebuild, and it produced a byte-identical plan.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.mp4".to_owned()],
+            extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, recorded) = manager_with(tmp.path(), script, "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+        let served = mgr.dynamic_segment(&init_req, -1, false).await.unwrap();
+        assert!(served.path.ends_with("out-1.mp4"));
+        let calls = recorded.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[(false, Some(0))],
+            "one plan for a non-resuming init serve"
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_transcode_file_serves_inside_dir() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("abc0.ts"), b"seg").unwrap();
@@ -1214,6 +1324,47 @@ mod tests {
         let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
         assert!(served.path.ends_with("abc0.ts"));
         assert_eq!(served.content_type, "video/mp2t");
+    }
+
+    /// Upstream `HlsSegmentController.GetFileResult` refreshes the owning
+    /// transcode's keep-alive on every legacy segment/playlist serve. Ferrofin
+    /// carried the comment but not the call: a client driving playback through
+    /// the legacy `hls` routes never restamped `last_activity`, so the idle
+    /// reaper killed its ffmpeg 60s in — mid-playback — unless the client also
+    /// happened to send playback-progress pings.
+    #[tokio::test]
+    async fn legacy_serve_refreshes_the_owning_jobs_keep_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        // Start a real (fake-backed) job so the registry has one to keep alive.
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+
+        // Let the idle clock run, then serve one of that job's segments the way
+        // the legacy route does.
+        std::fs::write(tmp.path().join("out7.ts"), b"seg").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let before = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job registered");
+        assert!(before >= 50, "idle clock should have advanced: {before}ms");
+
+        mgr.resolve_transcode_file("out7.ts", false).await.unwrap();
+
+        let after = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job still registered");
+        assert!(
+            after < before,
+            "legacy serve must restamp the owning job: {before}ms -> {after}ms"
+        );
     }
 
     #[tokio::test]
