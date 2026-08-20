@@ -481,9 +481,6 @@ pub async fn build_app_state(
     );
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
-    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
-        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository)),
-    );
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
         Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
@@ -513,6 +510,29 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // Similar items: the local weighted-overlap scorer always runs; the remote
+    // providers below run only for a library that ticked them in its
+    // "Similarity providers" list, in the admin's configured order.
+    let similar_providers: Vec<Arc<dyn ferrofin_traits::library::RemoteSimilarItemsProvider>> = vec![
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Movie,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Series,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::ListenBrainzSimilarArtistProvider::new(
+            Arc::new(ferrofin_providers::ListenBrainzClient::default()),
+        )),
+    ];
+    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
+        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository))
+            .with_remote_providers(similar_providers, Arc::clone(&virtual_folders))
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("similar")),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),

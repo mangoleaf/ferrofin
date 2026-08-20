@@ -468,6 +468,21 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
+/// One page of `/movie|tv/{id}/similar`.
+#[derive(Debug, Deserialize)]
+struct SimilarResponse {
+    #[serde(default)]
+    results: Vec<SimilarHit>,
+    #[serde(default)]
+    total_pages: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimilarHit {
+    #[serde(default)]
+    id: i64,
+}
+
 /// One `/search/collection` result.
 #[derive(Debug, Deserialize)]
 struct CollectionSearchResponse {
@@ -861,6 +876,42 @@ impl TmdbClient {
                 overview: hit.overview.filter(|o| !o.is_empty()),
             })
             .collect()
+    }
+
+    /// One page of TMDB's "similar titles" for a movie or series
+    /// (`/movie|tv/{id}/similar`) — port of
+    /// `TmdbClientManager.GetMovieSimilarPageAsync`/its TV twin.
+    ///
+    /// Returns the page's TMDB ids and the reported total page count, so the
+    /// caller can walk the pages the way the C# provider does. Empty on any
+    /// error.
+    pub async fn similar_page(&self, kind: TmdbKind, tmdb_id: i64, page: i32) -> (Vec<i64>, i32) {
+        let path = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Series => "tv",
+        };
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("page", &page.max(1).to_string()),
+            ])
+            .send()
+            .await
+        else {
+            return (Vec::new(), 0);
+        };
+        if !resp.status().is_success() {
+            return (Vec::new(), 0);
+        }
+        let Ok(parsed) = resp.json::<SimilarResponse>().await else {
+            return (Vec::new(), 0);
+        };
+        (
+            parsed.results.into_iter().map(|hit| hit.id).collect(),
+            parsed.total_pages,
+        )
     }
 
     /// Lists **all** poster (Primary) + backdrop images TMDB has for a title (the

@@ -14,6 +14,7 @@ pub mod error;
 pub mod external_ids;
 pub mod fanart;
 pub mod library_options;
+pub mod listenbrainz;
 pub mod local_images;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
@@ -25,6 +26,7 @@ pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod provider_manager;
+pub mod similarity;
 pub mod studios;
 pub mod tmdb;
 pub mod tvdb;
@@ -41,8 +43,12 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
+pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{AlbumIds, MusicBrainzClient};
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
+pub use similarity::{
+    ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
+};
 pub use studios::StudiosClient;
 pub use tmdb::{
     RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbCollection, TmdbCollectionHit,

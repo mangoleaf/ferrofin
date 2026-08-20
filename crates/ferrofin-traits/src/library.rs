@@ -1245,6 +1245,79 @@ pub trait VirtualFolderManager: Send + Sync {
 
 fn _assert_object_safe_virtual_folder_manager(_: &dyn VirtualFolderManager) {}
 
+/// A reference to a similar item by external provider id, as a remote
+/// similarity provider returns it — port of
+/// `MediaBrowser.Controller.Library.SimilarItemReference`.
+///
+/// A remote provider knows nothing about the local library; the manager resolves
+/// each reference to a library item by looking the id up in `BaseItemProviders`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarItemReference {
+    /// The provider-id key the value is stored under (`Tmdb`,
+    /// `MusicBrainzArtist`, …).
+    pub provider_name: String,
+    /// The provider-id value.
+    pub provider_id: String,
+    /// The provider's own similarity score, `0.0`–`1.0`. `None` lets the
+    /// manager derive one from the reference's position in the result list.
+    pub score: Option<f32>,
+}
+
+/// The query options a similarity provider is handed — port of
+/// `MediaBrowser.Controller.Library.SimilarItemsQuery`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SimilarItemsQuery {
+    /// The requesting user, when the request is user-scoped.
+    pub user_id: Option<Uuid>,
+    /// How many results are still wanted.
+    pub limit: Option<i32>,
+    /// Item ids already accounted for, which must not be returned again.
+    pub exclude_item_ids: Vec<Uuid>,
+    /// Artist ids to exclude (an artist's own catalog).
+    pub exclude_artist_ids: Vec<Uuid>,
+}
+
+/// A similarity provider backed by an external service — port of
+/// `IRemoteSimilarItemsProvider`.
+///
+/// Local similarity is not a trait: Ferrofin has exactly one local scorer (the
+/// weighted genre/tag/people overlap query, upstream's six identically-named
+/// `"Local Genre/Tag"` providers collapsed into one), so it stays inline in the
+/// manager rather than behind a one-implementation seam.
+#[async_trait]
+pub trait RemoteSimilarItemsProvider: Send + Sync {
+    /// The provider's display name — the string a library's
+    /// `TypeOptions.SimilarItemProviders` lists to enable it.
+    fn name(&self) -> &str;
+
+    /// Whether this provider serves `item_kind`.
+    fn supports(&self, item_kind: BaseItemKind) -> bool;
+
+    /// How long the manager may reuse this provider's results from disk.
+    /// `None` disables caching for it.
+    fn cache_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The similar-item references for `seed`.
+    ///
+    /// `seed_provider_ids` are the seed's external ids (`BaseItemProviders`),
+    /// resolved by the manager: a remote provider is keyed by one of them and
+    /// has no repository of its own. C# reads them off the item, which carries
+    /// its `ProviderIds` dictionary in memory.
+    ///
+    /// Best-effort: a provider that fails returns an empty list rather than an
+    /// error, matching the C# manager's per-provider `catch`.
+    async fn get_similar_items(
+        &self,
+        seed: &BaseItemEntity,
+        seed_provider_ids: &std::collections::HashMap<String, String>,
+        query: &SimilarItemsQuery,
+    ) -> Vec<SimilarItemReference>;
+}
+
+fn _assert_object_safe_remote_similar_items_provider(_: &dyn RemoteSimilarItemsProvider) {}
+
 /// Finds items similar to a seed and builds recommendation categories.
 ///
 /// Port of `ISimilarItemsManager`. The generic `GetSimilarItemsProviders<T>` and
