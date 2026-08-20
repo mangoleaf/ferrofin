@@ -1634,6 +1634,7 @@ impl LibraryScanner {
                     .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
                     .await;
             }
+            apply_release_details(&mut updated, mb, resolved.release_id.as_deref()).await;
 
             self.enrich_album_artwork(
                 album_uuid,
@@ -1743,6 +1744,30 @@ impl LibraryScanner {
             let mut updated = artist.clone();
             let mut changed = false;
             let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
+            // MusicBrainz's own artist fields (C# `MusicBrainzArtistProvider`
+            // writes more than the id): the life span, whose end is what the
+            // artist NFO saver emits as `<disbanded>`.
+            if mb_enabled
+                && (updated.premiere_date.is_none() || updated.end_date.is_none())
+                && let Some(details) = mb.artist_details(&id).await
+            {
+                if updated.premiere_date.is_none()
+                    && let Some(begin) = details
+                        .premiere_date
+                        .and_then(ferrofin_providers::PartialDate::to_utc)
+                {
+                    updated.premiere_date = Some(begin);
+                    changed = true;
+                }
+                if updated.end_date.is_none()
+                    && let Some(end) = details
+                        .end_date
+                        .and_then(ferrofin_providers::PartialDate::to_utc)
+                {
+                    updated.end_date = Some(end);
+                    changed = true;
+                }
+            }
             if policy.metadata_enabled("MusicArtist", fetcher_names::AUDIODB)
                 && let Some(adb) = &self.audiodb
                 && let Some(a) = adb.artist(&id).await
@@ -4618,6 +4643,35 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
         .collect();
     if let Some(data) = crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers) {
         entity.data = Some(data);
+    }
+}
+
+/// Fills an album's release date and year from MusicBrainz — C#
+/// `MusicBrainzAlbumProvider` writes more onto a `MusicAlbum` than its ids, and
+/// for a tagless album this is the only year there is. A row that already has a
+/// date makes no request.
+async fn apply_release_details(
+    album: &mut BaseItemEntity,
+    mb: &ferrofin_providers::MusicBrainzClient,
+    release_id: Option<&str>,
+) {
+    if album.premiere_date.is_some() {
+        return;
+    }
+    let Some(release) = release_id else {
+        return;
+    };
+    let Some(details) = mb.release_details(release).await else {
+        return;
+    };
+    if let Some(date) = details
+        .premiere_date
+        .and_then(ferrofin_providers::PartialDate::to_utc)
+    {
+        album.premiere_date = Some(date);
+    }
+    if album.production_year.is_none() {
+        album.production_year = details.production_year.map(i64::from);
     }
 }
 

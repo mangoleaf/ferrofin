@@ -17,6 +17,7 @@ pub mod fanart;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
+pub mod local_xml;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
@@ -26,6 +27,7 @@ pub mod musicbrainz;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
+pub mod playlist_file;
 pub mod provider_manager;
 pub mod similarity;
 pub mod studios;
@@ -36,6 +38,11 @@ pub mod xbmc;
 pub use books::{BookMetadata, read_book_cover, read_book_metadata};
 pub use error::ProvidersError;
 pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
+pub use local_xml::{
+    LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
+    save_playlist_xml,
+};
+pub use playlist_file::{is_playlist_file, read_playlist_file, write_playlist_file};
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};
@@ -46,7 +53,7 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
-pub use musicbrainz::{AlbumIds, MusicBrainzClient};
+pub use musicbrainz::{AlbumIds, ArtistDetails, MusicBrainzClient, PartialDate, ReleaseDetails};
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
 pub use similarity::{
     ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
