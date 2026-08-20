@@ -38,6 +38,7 @@ async fn boot() -> (WiredApp, Database, tempfile::TempDir) {
         ffprobe: "ffprobe".into(),
         filters: Vec::new(),
         encoders: Vec::new(),
+        chromaprint_muxer: false,
     };
     let (tx, _rx) = tokio::sync::oneshot::channel();
     let wired = build_app_state(&db, &config, &ffmpeg, tx).await.unwrap();

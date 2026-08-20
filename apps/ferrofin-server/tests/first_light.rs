@@ -190,6 +190,7 @@ async fn boot() -> Harness {
         ffprobe: std::path::PathBuf::from("ffprobe"),
         filters: Vec::new(),
         encoders: Vec::new(),
+        chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
     let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)

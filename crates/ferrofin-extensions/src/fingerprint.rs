@@ -51,8 +51,25 @@ impl ChromaprintFingerprinter {
     /// reports unavailable.
     #[must_use]
     pub fn discover(ffmpeg: &str) -> Option<Self> {
-        let ffmpeg_chromaprint = ffmpeg_has_chromaprint(ffmpeg);
-        let fpcalc = discover_fpcalc();
+        Self::with_ffmpeg_chromaprint(ffmpeg, ffmpeg_has_chromaprint(ffmpeg))
+    }
+
+    /// [`Self::discover`] for a caller that ALREADY knows whether this ffmpeg
+    /// has the `chromaprint` muxer.
+    ///
+    /// The composition root probes `ffmpeg -muxers` during encoder discovery
+    /// anyway; re-deriving it here meant a second blocking `ffmpeg` spawn on
+    /// the startup critical path (34 ms of an 88 ms cold start, measured).
+    /// Backend selection is otherwise identical to [`Self::discover`].
+    #[must_use]
+    pub fn with_ffmpeg_chromaprint(ffmpeg: &str, ffmpeg_chromaprint: bool) -> Option<Self> {
+        // `fpcalc` is only consulted when the (preferred) ffmpeg muxer is
+        // absent, so the common case spawns nothing at all.
+        let fpcalc = if ffmpeg_chromaprint {
+            None
+        } else {
+            discover_fpcalc()
+        };
         (ffmpeg_chromaprint || fpcalc.is_some()).then(|| Self {
             fpcalc,
             ffmpeg: ffmpeg.to_owned(),
@@ -322,6 +339,26 @@ mod tests {
     fn discover_fpcalc_reports_presence_not_a_path() {
         // Either outcome is valid (fpcalc is optional); it must never invent one.
         assert!(discover_fpcalc().is_none_or(|p| p == "fpcalc"));
+    }
+
+    #[test]
+    fn pre_probed_muxer_picks_ffmpeg_without_re_probing() {
+        // The composition root passes the `-muxers` answer it already has, so
+        // this path must NOT depend on the named ffmpeg existing — that second
+        // spawn is exactly what it removes from the startup critical path.
+        let fp = ChromaprintFingerprinter::with_ffmpeg_chromaprint("ferrofin-no-such-ffmpeg", true)
+            .expect("a reported chromaprint muxer is a usable backend");
+        assert_eq!(fp.backend(), "ffmpeg -f chromaprint");
+    }
+
+    #[test]
+    fn pre_probed_absent_muxer_matches_discovery() {
+        // Told the muxer is absent, selection must land wherever `discover`
+        // lands on this host — fpcalc if present, no fingerprinter otherwise.
+        let fp =
+            ChromaprintFingerprinter::with_ffmpeg_chromaprint("ferrofin-no-such-ffmpeg", false);
+        assert_eq!(fp.is_some(), discover_fpcalc().is_some());
+        assert!(fp.is_none_or(|f| f.backend() == "fpcalc"));
     }
 
     #[test]

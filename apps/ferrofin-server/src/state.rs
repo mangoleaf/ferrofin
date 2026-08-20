@@ -741,8 +741,12 @@ pub async fn build_app_state(
     // `chromaprint` muxer, else `fpcalc`; otherwise it loads but reports
     // unavailable at run time.
     let fingerprinter: Option<Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>> =
-        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::discover(
+        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_ffmpeg_chromaprint(
             &ffmpeg.ffmpeg.to_string_lossy(),
+            // Already probed by `discover_ffmpeg`, concurrently with the other
+            // capability reads — re-probing here spawned `ffmpeg -muxers` a
+            // second time, synchronously, on the startup critical path.
+            ffmpeg.chromaprint_muxer,
         )
         .map(|fp| {
             tracing::debug!(backend = fp.backend(), "intro skipper: fingerprint backend");
@@ -1356,6 +1360,7 @@ mod tests {
             ffprobe: PathBuf::from("ffprobe"),
             filters: Vec::new(),
             encoders: Vec::new(),
+            chromaprint_muxer: false,
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
 

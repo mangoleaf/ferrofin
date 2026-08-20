@@ -71,6 +71,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         ffprobe: std::path::PathBuf::from("ffprobe"),
         filters: Vec::new(),
         encoders: Vec::new(),
+        chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
     let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
@@ -380,6 +381,7 @@ async fn repository_install_stages_plugin_and_flags_restart() {
         ffprobe: std::path::PathBuf::from("ffprobe"),
         filters: Vec::new(),
         encoders: Vec::new(),
+        chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
     let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)

@@ -665,6 +665,7 @@ mod tests {
             ffprobe: "ffprobe".into(),
             filters: Vec::new(),
             encoders: Vec::new(),
+            chromaprint_muxer: false,
         };
         let (_hls, _attachments, _subtitles) = build_media_encoding(
             media_sources,

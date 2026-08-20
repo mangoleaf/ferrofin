@@ -97,16 +97,50 @@ fn log_startup_banner(config: &Config) {
 /// Waits for the first shutdown trigger and reports why, for the shutdown log.
 ///
 /// `"api"` — an API-initiated shutdown/restart (`POST /System/Shutdown|Restart`
-/// fires `shutdown_tx`); `"signal"` — ctrl-c / SIGINT. Before this the process
-/// hard-killed on ctrl-c (no drain, no log/trace flush); now both drain cleanly.
+/// fires `shutdown_tx`); `"sigint"` — ctrl-c; `"sigterm"` — `docker stop`,
+/// `systemctl stop`, a Kubernetes pod eviction. Before this the process
+/// hard-killed on ctrl-c (no drain, no log/trace flush); now all three drain
+/// cleanly.
+///
+/// SIGTERM matters more than SIGINT in production and was previously unhandled.
+/// A container's server process is **PID 1**, and the kernel does not apply
+/// default signal dispositions to PID 1 — an unhandled SIGTERM is *ignored*, so
+/// `docker stop`/`docker compose stop -t N` sat out its whole grace period and
+/// then SIGKILLed (observed: the benchmark's cold-leg containers all exited
+/// `137`, and each restart cost the full 60 s grace). Every Kubernetes rolling
+/// update hit the same path. Handling it turns that into a real drain.
 async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> &'static str {
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            tracing::warn!(error = %e, "SIGTERM listener could not be installed");
+            None
+        }
+    };
+    // `None` (install failed) must never resolve, or the select would treat it
+    // as an immediate shutdown; a never-ready future is the neutral element.
+    #[cfg(unix)]
+    let terminate = async move {
+        match sigterm.as_mut() {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
     tokio::select! {
         _ = shutdown_rx => "api",
+        () = terminate => "sigterm",
         result = tokio::signal::ctrl_c() => {
             if let Err(e) = result {
                 tracing::warn!(error = %e, "ctrl-c listener failed");
             }
-            "signal"
+            "sigint"
         }
     }
 }
@@ -154,7 +188,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     log_startup_banner(&config);
 
-    let db = open_database(&config).await?;
+    // Opening/migrating the database and probing ffmpeg share no state, and
+    // both are dominated by waiting (SQLite I/O; five `ffmpeg`/`ffprobe`
+    // spawns). Run them CONCURRENTLY — measured, this hides the whole database
+    // open behind the encoder probe on a populated library. Neither is skipped
+    // or reordered relative to what depends on it: `build_app_state` below
+    // still needs both.
+    let (db, ffmpeg) = tokio::join!(open_database(&config), discover_ffmpeg(&config, None));
+    let db = db?;
 
     // ffmpeg is required for playback but not for the server to boot: warn and
     // continue so the API comes up even on a host without ffmpeg installed.
@@ -162,7 +203,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // no persisted fallback is supplied here. When discovery fails, wire the
     // encoder with bare `ffmpeg`/`ffprobe` names so playback 500s (rather than
     // failing to boot) until a working ffmpeg is configured.
-    let ffmpeg = match discover_ffmpeg(&config, None).await {
+    let ffmpeg = match ffmpeg {
         Ok(paths) => {
             tracing::info!(
                 ffmpeg = %paths.ffmpeg.display(),
@@ -184,6 +225,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 ffprobe: "ffprobe".into(),
                 filters: Vec::new(),
                 encoders: Vec::new(),
+                chromaprint_muxer: false,
             }
         }
     };

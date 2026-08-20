@@ -101,23 +101,18 @@ impl Database {
         //     be set OFF on this connection BEFORE `MIGRATOR.run` opens its
         //     per-migration transactions (SQLite's own recommended table-
         //     rebuild procedure). A `foreign_key_check` afterwards surfaces any
-        //     integrity violation the rebuild introduced.
+        //     integrity violation the rebuild introduced — see
+        //     [`foreign_key_check`] for why it runs only on a boot that
+        //     actually applied something.
         if let Some(path) = &file_path {
             use sqlx::ConnectOptions;
             let mut conn = write_options.clone().foreign_keys(false).connect().await?;
             adopt_jellyfin_database(&mut conn, path).await?;
             backup_before_rebuild(&mut conn, path).await?;
+            let before = applied_migration_count(&mut conn).await?;
             MIGRATOR.run(&mut conn).await?;
-            let violations = sqlx::query("PRAGMA foreign_key_check")
-                .fetch_all(&mut conn)
-                .await?
-                .len();
-            if violations > 0 {
-                tracing::error!(
-                    violations,
-                    "foreign-key violations after migration — database integrity is compromised"
-                );
-                return Err(crate::DbError::MigrationIntegrity { violations });
+            if applied_migration_count(&mut conn).await? != before {
+                foreign_key_check(&mut conn).await?;
             }
             sqlx::Connection::close(conn).await?;
         }
@@ -505,6 +500,55 @@ async fn backup_before_rebuild(
     Ok(())
 }
 
+/// How many migrations `_sqlx_migrations` records as applied (`0` when the
+/// table does not exist yet — a fresh or Jellyfin-native database).
+///
+/// Used to tell "this boot applied something" from "this boot was a no-op
+/// history check", which is what gates the post-migration
+/// [`foreign_key_check`].
+async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
+    let has_history: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if has_history.is_none() {
+        return Ok(0);
+    }
+    Ok(
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "_sqlx_migrations""#)
+            .fetch_one(&mut *conn)
+            .await?,
+    )
+}
+
+/// Runs `PRAGMA foreign_key_check` and fails the open when it reports rows.
+///
+/// This is the seatbelt on the `foreign_keys = OFF` migration connection: a
+/// table-rebuild migration drops a parent table, and with enforcement off a
+/// mistake there leaves dangling child rows instead of erroring. The scan is
+/// **O(rows × foreign keys)** — ~20 ms on a 10k-item library, and it grows with
+/// the library — so it runs only on a boot that actually applied a migration.
+/// That is not a weakened guarantee: a boot whose `MIGRATOR.run` was a no-op
+/// changed no schema and can have introduced no violation, and the boot that
+/// *did* apply the migration already ran this check and refused to open if it
+/// failed. Every migration is therefore still verified, exactly once, on the
+/// boot that applies it.
+async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *conn)
+        .await?
+        .len();
+    if violations > 0 {
+        tracing::error!(
+            violations,
+            "foreign-key violations after migration — database integrity is compromised"
+        );
+        return Err(crate::DbError::MigrationIntegrity { violations });
+    }
+    Ok(())
+}
+
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
 /// affinity mask (`available_parallelism`) and the cgroup CFS quota.
 ///
@@ -652,6 +696,71 @@ fn configure_sqlite_for_concurrency() {
 
 #[cfg(test)]
 mod tests {
+
+    /// The gate on the post-migration `foreign_key_check`.
+    ///
+    /// The check is skipped on a boot whose `MIGRATOR.run` applied nothing —
+    /// that boot changed no schema, so it can have introduced no violation, and
+    /// the boot that DID apply the migration already checked. The whole
+    /// argument rests on this counter telling "applied something" from "history
+    /// check only", so it is pinned here: `0` before any migration exists (the
+    /// table itself is absent — this must not error), the full chain length
+    /// after, and unchanged across a re-open. If it ever reported a constant,
+    /// the check would silently stop running on the boots that need it.
+    #[tokio::test]
+    async fn applied_migration_count_tracks_the_chain_and_is_stable_on_reopen() {
+        use sqlx::ConnectOptions as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("count.db");
+        let url = format!("sqlite://{}", path.display());
+
+        let mut fresh = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("connect");
+        assert_eq!(
+            super::applied_migration_count(&mut fresh)
+                .await
+                .expect("count on a database with no history table"),
+            0,
+            "a database with no _sqlx_migrations must count 0, not error"
+        );
+        sqlx::Connection::close(fresh).await.expect("close");
+
+        let db = Database::connect(&url).await.expect("connect");
+        drop(db);
+
+        let mut migrated = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .connect()
+            .await
+            .expect("reconnect");
+        let after = super::applied_migration_count(&mut migrated)
+            .await
+            .expect("count after migrating");
+        let expected = i64::try_from(MIGRATOR.iter().count()).expect("chain length fits i64");
+        assert_eq!(
+            after, expected,
+            "every bundled migration must be recorded — this is what makes \
+             'nothing was applied' distinguishable from 'the chain just ran'"
+        );
+
+        // The second open is the no-op path the skip exists for: the count must
+        // come back identical, so `before == after` and the scan is skipped.
+        let db = Database::connect(&url).await.expect("reconnect handle");
+        drop(db);
+        assert_eq!(
+            super::applied_migration_count(&mut migrated)
+                .await
+                .expect("count after a no-op open"),
+            after,
+            "a no-op open must leave the count untouched"
+        );
+        sqlx::Connection::close(migrated).await.expect("close");
+    }
 
     /// The `mmap_size` ceiling must survive database growth without being
     /// re-applied, because nothing re-applies it: it is set once when a pooled
