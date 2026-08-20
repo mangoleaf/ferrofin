@@ -32,12 +32,16 @@ use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
 use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
-use crate::user_entity_ext::{has_permission, preference_contains};
+use crate::device_repository::DeviceRepository;
+use crate::user_entity_ext::{get_preference, has_permission};
 
 /// The concrete device manager.
 #[derive(Clone)]
 pub struct FerrofinDeviceManager {
     db: Database,
+    /// The batched reads behind the device listing (see
+    /// [`crate::device_repository`]).
+    repo: DeviceRepository,
     /// Transient per-device reported capabilities (device id → capabilities),
     /// mirroring the C# `_capabilitiesMap` `ConcurrentDictionary`.
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
@@ -59,6 +63,7 @@ impl FerrofinDeviceManager {
     #[must_use]
     pub fn new(db: Database) -> Self {
         Self {
+            repo: DeviceRepository::new(db.clone()),
             db,
             capabilities: Arc::new(RwLock::new(HashMap::new())),
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
@@ -123,13 +128,21 @@ impl FerrofinDeviceManager {
         device: &DeviceEntity,
         options: Option<&DeviceOptionsEntity>,
     ) -> Result<DeviceInfo, ServiceError> {
+        let names = self.repo.usernames_for(&[device.user_id.as_str()]).await?;
+        self.device_info_with_name(device, options, names.get(&device.user_id).cloned())
+    }
+
+    /// The pure half of [`Self::to_device_info`]: merges an already-resolved
+    /// owner name with the device row, its options, and the reported
+    /// capabilities. A `None` name is the missing-`Users`-row case and is the
+    /// documented `404` (C# `ToDeviceInfo` dereferences the user).
+    fn device_info_with_name(
+        &self,
+        device: &DeviceEntity,
+        options: Option<&DeviceOptionsEntity>,
+        last_user_name: Option<String>,
+    ) -> Result<DeviceInfo, ServiceError> {
         let caps = self.capabilities_for(&device.device_id);
-        let last_user_name: Option<String> =
-            sqlx::query_scalar(r#"SELECT "Username" FROM "Users" WHERE "Id" = ?1 LIMIT 1"#)
-                .bind(&device.user_id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
         let last_user_name = last_user_name.ok_or_else(|| {
             ServiceError::not_found(format!("User with UserId {} not found", device.user_id))
         })?;
@@ -198,6 +211,89 @@ impl FerrofinDeviceManager {
 
         Ok(QueryResult::new(query.start_index, Some(count), page))
     }
+
+    /// Resolves the **user-scoped** half of
+    /// [`DeviceManager::can_access_device`] once, so a listing pays for it once
+    /// instead of once per device. Neither permission nor the `EnabledDevices`
+    /// list depends on the device being tested.
+    async fn resolve_access(
+        &self,
+        user: Option<&UserEntity>,
+    ) -> Result<DeviceAccess, ServiceError> {
+        let Some(user) = user else {
+            return Ok(DeviceAccess::Unfiltered);
+        };
+        let pool = self.db.pool();
+        if has_permission(pool, &user.id, PermissionKind::EnableAllDevices).await?
+            || has_permission(pool, &user.id, PermissionKind::IsAdministrator).await?
+        {
+            return Ok(DeviceAccess::All);
+        }
+        Ok(DeviceAccess::Enabled(
+            get_preference(pool, &user.id, PreferenceKind::EnabledDevices).await?,
+        ))
+    }
+
+    /// Applies a resolved [`DeviceAccess`] to one device id — the per-device
+    /// half of `can_access_device`, with every query hoisted out of it.
+    ///
+    /// The membership test matches `preference_contains` (ASCII
+    /// case-insensitive), and the empty-id rejection stays per device so a
+    /// listing still fails the way the per-device call failed.
+    fn access_allows(&self, access: &DeviceAccess, device_id: &str) -> Result<bool, ServiceError> {
+        if matches!(access, DeviceAccess::Unfiltered) {
+            return Ok(true);
+        }
+        if device_id.is_empty() {
+            return Err(ServiceError::invalid_input("deviceId must not be empty"));
+        }
+        match access {
+            DeviceAccess::Unfiltered | DeviceAccess::All => Ok(true),
+            DeviceAccess::Enabled(enabled) => Ok(enabled
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(device_id))
+                // Devices that don't advertise a persistent identifier are
+                // always usable (C# `!GetCapabilities(id).SupportsPersistentIdentifier`).
+                || !self.capabilities_for(device_id).supports_persistent_identifier),
+        }
+    }
+
+    /// Batch-resolves the `DeviceOptions` row and owner name for `devices`, then
+    /// assembles them in order. Two queries total, whatever the device count.
+    async fn device_infos_for(
+        &self,
+        devices: &[&DeviceEntity],
+    ) -> Result<Vec<DeviceInfo>, ServiceError> {
+        let device_ids: Vec<&str> = devices.iter().map(|d| d.device_id.as_str()).collect();
+        let options = self.repo.options_for(&device_ids).await?;
+
+        let mut user_ids: Vec<&str> = devices.iter().map(|d| d.user_id.as_str()).collect();
+        user_ids.sort_unstable();
+        user_ids.dedup();
+        let names = self.repo.usernames_for(&user_ids).await?;
+
+        let mut infos = Vec::with_capacity(devices.len());
+        for device in devices {
+            infos.push(self.device_info_with_name(
+                device,
+                options.get(&device.device_id),
+                names.get(&device.user_id).cloned(),
+            )?);
+        }
+        Ok(infos)
+    }
+}
+
+/// The user-scoped half of the per-device access check, resolved once per
+/// listing (see [`FerrofinDeviceManager::resolve_access`]).
+enum DeviceAccess {
+    /// No user was named, so no check runs at all — every device is visible and
+    /// even an empty device id is not rejected.
+    Unfiltered,
+    /// `EnableAllDevices` or `IsAdministrator`: every device is visible.
+    All,
+    /// Neither permission — the user's `EnabledDevices` list, tested in memory.
+    Enabled(Vec<String>),
 }
 
 /// Maps recorded [`ClientCapabilities`] to their wire DTO (C#
@@ -301,11 +397,8 @@ impl DeviceManager for FerrofinDeviceManager {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
         let devices = self.query_devices(query).await?;
-        let mut infos = Vec::with_capacity(devices.items.len());
-        for device in &devices.items {
-            let options = self.options_row(&device.device_id).await?;
-            infos.push(self.to_device_info(device, options.as_ref()).await?);
-        }
+        let rows: Vec<&DeviceEntity> = devices.items.iter().collect();
+        let infos = self.device_infos_for(&rows).await?;
         Ok(QueryResult::new(
             Some(devices.start_index),
             Some(devices.total_record_count),
@@ -318,12 +411,7 @@ impl DeviceManager for FerrofinDeviceManager {
         user_id: Option<Uuid>,
     ) -> Result<QueryResult<DeviceInfoDto>, ServiceError> {
         // All devices, most recently active first (C# ordering).
-        let devices: Vec<DeviceEntity> = sqlx::query_as::<_, DeviceEntity>(
-            r#"SELECT * FROM "Devices" ORDER BY "DateLastActivity" DESC, "DeviceId""#,
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let devices = self.repo.all_by_last_activity().await?;
 
         let user = match user_id {
             Some(id) => {
@@ -339,21 +427,33 @@ impl DeviceManager for FerrofinDeviceManager {
             None => None,
         };
 
-        let mut dtos = Vec::new();
+        // `can_access_device` is user-scoped apart from the device id, so
+        // resolve it once and test each device in memory. The scan stops at the
+        // first device the check rejects outright (an empty id), keeping the
+        // original per-device ordering of errors: any missing-user `404` among
+        // the devices *before* it still surfaces first.
+        let access = self.resolve_access(user.as_ref()).await?;
+        let mut visible: Vec<&DeviceEntity> = Vec::new();
+        let mut rejected = None;
         for device in &devices {
-            let denied = match &user {
-                Some(user) => !self.can_access_device(user, &device.device_id).await?,
-                None => false,
-            };
-            if denied {
-                continue;
+            match self.access_allows(&access, &device.device_id) {
+                Ok(true) => visible.push(device),
+                Ok(false) => {}
+                Err(err) => {
+                    rejected = Some(err);
+                    break;
+                }
             }
-            let options = self.options_row(&device.device_id).await?;
-            let info = self.to_device_info(device, options.as_ref()).await?;
-            dtos.push(Self::to_device_info_dto(info));
         }
 
-        Ok(QueryResult::from_items(dtos))
+        let infos = self.device_infos_for(&visible).await?;
+        if let Some(err) = rejected {
+            return Err(err);
+        }
+
+        Ok(QueryResult::from_items(
+            infos.into_iter().map(Self::to_device_info_dto).collect(),
+        ))
     }
 
     async fn delete_device(&self, device: &DeviceEntity) -> Result<(), ServiceError> {
@@ -403,22 +503,10 @@ impl DeviceManager for FerrofinDeviceManager {
             return Err(ServiceError::invalid_input("deviceId must not be empty"));
         }
 
-        let pool = self.db.pool();
-        if has_permission(pool, &user.id, PermissionKind::EnableAllDevices).await?
-            || has_permission(pool, &user.id, PermissionKind::IsAdministrator).await?
-        {
-            return Ok(true);
-        }
-
-        if preference_contains(pool, &user.id, PreferenceKind::EnabledDevices, device_id).await? {
-            return Ok(true);
-        }
-
-        // Devices that don't advertise a persistent identifier are always usable
-        // (C# `!GetCapabilities(deviceId).SupportsPersistentIdentifier`).
-        Ok(!self
-            .capabilities_for(device_id)
-            .supports_persistent_identifier)
+        // One device, so the "resolve once" split costs the same queries it
+        // always did — but the rule lives in exactly one place.
+        let access = self.resolve_access(Some(user)).await?;
+        self.access_allows(&access, device_id)
     }
 
     async fn update_device_options(
@@ -464,7 +552,7 @@ impl DeviceManager for FerrofinDeviceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{seed_user, test_db};
+    use crate::test_support::{seed_named_user, seed_user, test_db};
     use chrono::Utc;
 
     /// Builds a device row for `user` with the given reported device id/token.
@@ -612,5 +700,215 @@ mod tests {
             mgr.can_access_device(&user, "").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// Registers a device for `user` with an explicit last-activity stamp, so a
+    /// test can pin the listing order.
+    async fn device_at(
+        mgr: &FerrofinDeviceManager,
+        user: Uuid,
+        device_id: &str,
+        activity: chrono::DateTime<Utc>,
+    ) {
+        let mut row = device_row(user, device_id, &format!("tok-{device_id}"));
+        row.date_last_activity = activity;
+        mgr.create_device(&row).await.expect("create");
+    }
+
+    /// The device ids of a listing, in the order it returned them.
+    fn ids(result: &QueryResult<DeviceInfoDto>) -> Vec<String> {
+        result
+            .items
+            .iter()
+            .map(|d| d.id.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// The access check is now resolved once per listing instead of once per
+    /// device; this pins every branch of it as `GET /Devices` observes it —
+    /// the `EnabledDevices` membership test, the no-persistent-identifier
+    /// fallback, and the `EnableAllDevices` override — plus the
+    /// `DateLastActivity DESC` ordering the hoist must not disturb.
+    #[tokio::test]
+    async fn devices_for_user_filters_and_orders_like_the_per_device_check() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(10);
+        let user = seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db.clone());
+
+        let now = Utc::now();
+        device_at(&mgr, uid, "dev-new", now).await;
+        device_at(&mgr, uid, "dev-mid", now - chrono::Duration::hours(1)).await;
+        device_at(&mgr, uid, "dev-old", now - chrono::Duration::hours(2)).await;
+
+        // Every device advertises a persistent identifier by default, so with
+        // no permissions and an empty enabled list nothing is visible.
+        assert!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")).is_empty(),
+            "default capabilities gate every device"
+        );
+
+        // Only the explicitly enabled device becomes visible.
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            PreferenceKind::EnabledDevices,
+            &["dev-mid".to_owned()],
+        )
+        .await
+        .expect("enable");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dev-mid"]
+        );
+
+        // A device that does not advertise a persistent identifier is visible
+        // regardless, and sorts ahead of the enabled one by activity.
+        mgr.save_capabilities(
+            "dev-new",
+            &ClientCapabilities {
+                supports_persistent_identifier: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dev-new", "dev-mid"]
+        );
+
+        // `EnableAllDevices` opens all three, still newest-activity first.
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnableAllDevices,
+            true,
+        )
+        .await
+        .expect("grant");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dev-new", "dev-mid", "dev-old"]
+        );
+    }
+
+    /// `IsAdministrator` is the second permission the hoisted check consults;
+    /// without it the admin-only branch would silently stop opening devices.
+    #[tokio::test]
+    async fn administrator_sees_every_device() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(11);
+        let user = seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db.clone());
+
+        let now = Utc::now();
+        device_at(&mgr, uid, "dev-a", now).await;
+        device_at(&mgr, uid, "dev-b", now - chrono::Duration::hours(1)).await;
+
+        assert!(ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")).is_empty());
+
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("grant");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dev-a", "dev-b"]
+        );
+    }
+
+    /// Equal activity stamps fall back to `DeviceId`, and no user id means no
+    /// access check at all — both observable in the listing.
+    #[tokio::test]
+    async fn equal_activity_tiebreaks_by_device_id_and_no_user_skips_the_check() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(12);
+        seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db);
+
+        let now = Utc::now();
+        device_at(&mgr, uid, "dev-b", now).await;
+        device_at(&mgr, uid, "dev-a", now).await;
+
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(None).await.expect("list")),
+            vec!["dev-a", "dev-b"]
+        );
+    }
+
+    /// The per-device `DeviceOptions` and `Users` reads became one batched read
+    /// each; this pins that every device still gets *its own* custom name and
+    /// *its own* owner name (a mis-keyed batch map would cross them over).
+    #[tokio::test]
+    async fn batched_options_and_owner_names_stay_paired_to_their_device() {
+        let db = test_db().await;
+        let owner_a = Uuid::from_u128(13);
+        let owner_b = Uuid::from_u128(14);
+        let user_a = seed_named_user(&db, owner_a, "ay").await;
+        seed_named_user(&db, owner_b, "bee").await;
+
+        let mgr = FerrofinDeviceManager::new(db.clone());
+        let now = Utc::now();
+        device_at(&mgr, owner_a, "dev-a", now).await;
+        device_at(&mgr, owner_b, "dev-b", now - chrono::Duration::hours(1)).await;
+        mgr.update_device_options("dev-b", Some("Living Room"))
+            .await
+            .expect("options");
+
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user_a.id,
+            PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("grant");
+
+        let listed = mgr.get_devices_for_user(Some(owner_a)).await.expect("list");
+        assert_eq!(ids(&listed), vec!["dev-a", "dev-b"]);
+        assert_eq!(listed.items[0].last_user_name.as_deref(), Some("ay"));
+        assert_eq!(listed.items[0].custom_name, None);
+        assert_eq!(listed.items[1].last_user_name.as_deref(), Some("bee"));
+        assert_eq!(listed.items[1].custom_name.as_deref(), Some("Living Room"));
+
+        // The un-filtered listing path (`GET /Devices/Info` bulk form) batches
+        // the same two reads and must agree.
+        let infos = mgr
+            .get_device_infos(&DeviceQuery::default())
+            .await
+            .expect("infos");
+        let by_id: HashMap<_, _> = infos
+            .items
+            .iter()
+            .map(|i| (i.id.clone().unwrap_or_default(), i))
+            .collect();
+        assert_eq!(by_id["dev-a"].last_user_name.as_deref(), Some("ay"));
+        assert_eq!(by_id["dev-b"].last_user_name.as_deref(), Some("bee"));
+        assert_eq!(by_id["dev-b"].custom_name.as_deref(), Some("Living Room"));
+    }
+
+    /// A device whose owning `Users` row is missing is a `404`, not a silently
+    /// dropped row — the contract the batched name lookup had to preserve.
+    #[tokio::test]
+    async fn missing_owner_row_is_still_not_found() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(15);
+        seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db);
+        let row = device_row(uid, "dev-a", "tok-a");
+
+        assert!(matches!(
+            mgr.device_info_with_name(&row, None, None),
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(
+            mgr.device_info_with_name(&row, None, Some("u".to_owned()))
+                .is_ok()
+        );
     }
 }

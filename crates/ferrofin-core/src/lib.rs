@@ -162,6 +162,7 @@ pub mod collection_manager;
 pub mod configuration_manager;
 pub mod db_error;
 pub mod device_manager;
+mod device_repository;
 pub mod display_preferences_manager;
 pub mod dto_service;
 pub mod event_manager;

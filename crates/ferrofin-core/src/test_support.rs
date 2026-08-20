@@ -307,7 +307,16 @@ pub async fn seed_provider_id(db: &Database, item_id: Uuid, provider: &str, valu
 }
 
 /// Inserts a minimal `Users` row and returns a [`UserEntity`] carrying its id.
+///
+/// `Username` is unique, so seeding a second user in one database needs
+/// [`seed_named_user`].
 pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
+    seed_named_user(db, id, "u").await
+}
+
+/// [`seed_user`] with an explicit `Username`, for tests that need to tell two
+/// users apart by name.
+pub async fn seed_named_user(db: &Database, id: Uuid, username: &str) -> UserEntity {
     sqlx::query(
         r#"INSERT INTO "Users"
            ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
@@ -318,9 +327,10 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'u')"#,
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2)"#,
     )
     .bind(guid_to_db(id))
+    .bind(username)
     .execute(db.writer())
     .await
     .expect("insert user");
