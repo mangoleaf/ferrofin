@@ -125,6 +125,20 @@ struct Registration {
     /// Per-trigger-index last fire time, so a daily/weekly trigger fires once
     /// per scheduled occurrence and an interval trigger keeps its cadence.
     trigger_fires: HashMap<usize, DateTime<Utc>>,
+    /// When this task's trigger set was last reconfigured via
+    /// [`FerrofinTaskManager::set_triggers`], `None` while it still runs its
+    /// defaults.
+    ///
+    /// Load-bearing for daily/weekly triggers: `set_triggers` clears
+    /// [`trigger_fires`](Self::trigger_fires), so without this the scheduler
+    /// forgets that today's occurrence already ran and re-fires it on the next
+    /// sweep — saving the schedule of "Extract Chapter Images" at 20:00 kicked
+    /// off its 4-hour ffmpeg pass 30 seconds later. Upstream's
+    /// `DailyTrigger.Start` always arms the *next* occurrence, never a past
+    /// one; this timestamp is that floor. Interval triggers deliberately keep
+    /// using the scheduler start (upstream's `IntervalTrigger.Start` does
+    /// re-arm a due interval shortly after a reload).
+    triggers_since: Option<DateTime<Utc>>,
 }
 
 impl Registration {
@@ -256,6 +270,7 @@ impl FerrofinTaskManager {
             abort: None,
             started_at: None,
             trigger_fires: HashMap::new(),
+            triggers_since: None,
         };
         lock(&self.tasks).insert(key, registration);
     }
@@ -543,6 +558,10 @@ impl FerrofinTaskManager {
                 .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
             reg.triggers_override = Some(triggers.to_vec());
             reg.trigger_fires.clear();
+            // The new trigger set only ever arms *future* occurrences; without
+            // this floor the cleared fire history makes an already-run daily
+            // occurrence look due again on the next sweep.
+            reg.triggers_since = Some(Utc::now());
         }
         lock(&self.stored_overrides).insert(key.to_owned(), triggers.to_vec());
         self.persist_overrides();
@@ -608,9 +627,17 @@ impl FerrofinTaskManager {
                     continue;
                 }
                 let last_run_end = reg.last_result.as_ref().map(|r| r.end_time_utc);
+                let triggers_since = reg.triggers_since;
                 for (idx, trigger) in triggers.iter().enumerate() {
                     let last_fire = reg.trigger_fires.get(&idx).copied();
-                    if trigger_due(trigger, now, last_fire, last_run_end, scheduler_start) {
+                    if trigger_due(
+                        trigger,
+                        now,
+                        last_fire,
+                        last_run_end,
+                        scheduler_start,
+                        triggers_since,
+                    ) {
                         reg.trigger_fires.insert(idx, now);
                         due.push(key.clone());
                         break;
@@ -658,12 +685,20 @@ fn weekday_of(day: DayOfWeek) -> chrono::Weekday {
 ///   fire, the task's last run end, or scheduler start (so a fresh boot waits a
 ///   full interval rather than firing everything at once).
 /// - `StartupTrigger`: handled at scheduler start, never due in a sweep.
+///
+/// `triggers_since` is when the task's trigger set was last reconfigured (see
+/// [`Registration::triggers_since`]); a daily/weekly occurrence older than that
+/// belongs to the previous configuration and never fires, matching upstream's
+/// `DailyTrigger.Start`, which always arms the next future occurrence. Interval
+/// triggers ignore it — upstream's `IntervalTrigger.Start` re-arms a due
+/// interval shortly after a reload rather than restarting the cadence.
 fn trigger_due(
     trigger: &TaskTriggerInfo,
     now: DateTime<Utc>,
     last_fire: Option<DateTime<Utc>>,
     last_run_end: Option<DateTime<Utc>>,
     scheduler_start: DateTime<Utc>,
+    triggers_since: Option<DateTime<Utc>>,
 ) -> bool {
     match trigger.type_ {
         TaskTriggerInfoType::StartupTrigger => false,
@@ -706,12 +741,13 @@ fn trigger_due(
                 return false;
             };
             let scheduled = scheduled_local.with_timezone(&Utc);
-            // An occurrence that predates scheduler start never fires: booting
-            // at noon must not immediately run every daily-at-3am task (the C#
-            // DailyTrigger schedules the *next* occurrence at startup).
-            now >= scheduled
-                && scheduled >= scheduler_start
-                && last_fire.is_none_or(|f| f < scheduled)
+            // An occurrence that predates scheduler start — or the moment the
+            // trigger set was last saved — never fires: booting at noon must
+            // not immediately run every daily-at-3am task, and saving the
+            // schedule at 20:00 must not re-run this morning's occurrence (the
+            // C# DailyTrigger schedules the *next* occurrence in both cases).
+            let floor = triggers_since.map_or(scheduler_start, |since| since.max(scheduler_start));
+            now >= scheduled && scheduled >= floor && last_fire.is_none_or(|f| f < scheduled)
         }
     }
 }
@@ -1241,24 +1277,31 @@ mod tests {
 
         // Not due 30 minutes after scheduler start.
         let now = start + chrono::Duration::minutes(30);
-        assert!(!trigger_due(&trigger, now, None, None, start));
+        assert!(!trigger_due(&trigger, now, None, None, start, None));
 
         // Due one hour after scheduler start.
         let now = start + chrono::Duration::hours(1);
-        assert!(trigger_due(&trigger, now, None, None, start));
+        assert!(trigger_due(&trigger, now, None, None, start, None));
 
         // A recent run end pushes the next fire out.
         let run_end = start + chrono::Duration::minutes(45);
-        assert!(!trigger_due(&trigger, now, None, Some(run_end), start));
+        assert!(!trigger_due(
+            &trigger,
+            now,
+            None,
+            Some(run_end),
+            start,
+            None
+        ));
         let now = run_end + chrono::Duration::hours(1);
-        assert!(trigger_due(&trigger, now, None, Some(run_end), start));
+        assert!(trigger_due(&trigger, now, None, Some(run_end), start, None));
 
         // Missing/zero interval never fires.
         let no_interval = TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,
             ..TaskTriggerInfo::default()
         };
-        assert!(!trigger_due(&no_interval, now, None, None, start));
+        assert!(!trigger_due(&no_interval, now, None, None, start, None));
     }
 
     #[test]
@@ -1284,16 +1327,24 @@ mod tests {
             scheduled - chrono::Duration::minutes(5),
             None,
             None,
-            start
+            start,
+            None
         ));
         // After 03:00 local, never fired — due.
         let now = scheduled + chrono::Duration::minutes(5);
-        assert!(trigger_due(&trigger, now, None, None, start));
+        assert!(trigger_due(&trigger, now, None, None, start, None));
         // Already fired for this occurrence — not due again.
-        assert!(!trigger_due(&trigger, now, Some(now), None, start));
+        assert!(!trigger_due(&trigger, now, Some(now), None, start, None));
         // Next day, same wall time — due again.
         let tomorrow = now + chrono::Duration::days(1);
-        assert!(trigger_due(&trigger, tomorrow, Some(now), None, start));
+        assert!(trigger_due(
+            &trigger,
+            tomorrow,
+            Some(now),
+            None,
+            start,
+            None
+        ));
         // An occurrence that predates scheduler start never fires: a boot at
         // noon must not immediately run a daily-at-3am task.
         let late_start = scheduled + chrono::Duration::hours(9);
@@ -1302,7 +1353,73 @@ mod tests {
             late_start + chrono::Duration::minutes(5),
             None,
             None,
-            late_start
+            late_start,
+            None
+        ));
+    }
+
+    #[test]
+    fn saving_triggers_does_not_re_fire_todays_daily_occurrence() {
+        use chrono::{Local, TimeZone as _};
+
+        // Daily at 02:00 local; the server booted yesterday, so scheduler start
+        // predates today's occurrence and the task already ran at 02:00.
+        let scheduled = Local
+            .with_ymd_and_hms(2026, 7, 1, 2, 0, 0)
+            .single()
+            .expect("ts")
+            .with_timezone(&Utc);
+        let start = scheduled - chrono::Duration::days(1);
+        let trigger = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::DailyTrigger,
+            time_of_day_ticks: Some(2 * 3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        // 20:00 the same evening — an admin saves this task's schedule, which
+        // clears the fire history (`last_fire` is gone) and stamps
+        // `triggers_since`.
+        let saved_at = scheduled + chrono::Duration::hours(18);
+        let now = saved_at + chrono::Duration::seconds(30);
+
+        // Without the save floor the cleared history makes this morning's
+        // occurrence look due again — the bug this guards.
+        assert!(
+            trigger_due(&trigger, now, None, None, start, None),
+            "precondition: a cleared fire history alone makes the past occurrence due"
+        );
+        // With it, today's occurrence stays spent.
+        assert!(!trigger_due(
+            &trigger,
+            now,
+            None,
+            None,
+            start,
+            Some(saved_at)
+        ));
+        // Tomorrow's occurrence still fires.
+        let tomorrow = scheduled + chrono::Duration::days(1) + chrono::Duration::minutes(5);
+        assert!(trigger_due(
+            &trigger,
+            tomorrow,
+            None,
+            None,
+            start,
+            Some(saved_at)
+        ));
+        // An interval trigger is unaffected by the save (upstream's
+        // `IntervalTrigger.Start` re-arms a due interval after a reload).
+        let interval = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(3600 * TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        assert!(trigger_due(
+            &interval,
+            now,
+            None,
+            None,
+            start,
+            Some(saved_at)
         ));
     }
 
@@ -1327,20 +1444,20 @@ mod tests {
             day_of_week: Some(DayOfWeek::Wednesday),
             ..TaskTriggerInfo::default()
         };
-        assert!(trigger_due(&wednesday, now, None, None, start));
+        assert!(trigger_due(&wednesday, now, None, None, start, None));
 
         let thursday = TaskTriggerInfo {
             day_of_week: Some(DayOfWeek::Thursday),
             ..wednesday
         };
-        assert!(!trigger_due(&thursday, now, None, None, start));
+        assert!(!trigger_due(&thursday, now, None, None, start, None));
 
         // Weekly without a day never fires.
         let dayless = TaskTriggerInfo {
             day_of_week: None,
             ..wednesday
         };
-        assert!(!trigger_due(&dayless, now, None, None, start));
+        assert!(!trigger_due(&dayless, now, None, None, start, None));
     }
 
     #[tokio::test]
