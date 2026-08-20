@@ -44,6 +44,24 @@ pub struct FerrofinDeviceManager {
     repo: DeviceRepository,
     /// Transient per-device reported capabilities (device id → capabilities),
     /// mirroring the C# `_capabilitiesMap` `ConcurrentDictionary`.
+    ///
+    /// Entries are **never removed**, including by `delete_device` —
+    /// deliberately, matching upstream (C# `DeleteDevice` drops the device from
+    /// `_devices`, never from `_capabilitiesMap`), because two behaviours still
+    /// read this map after the `Devices` row is gone:
+    /// - [`Self::access_allows`] lets a restricted user reach a device that
+    ///   reported `SupportsPersistentIdentifier: false`. Forgetting the entry
+    ///   falls back to the default (`true`, as C# `new ClientCapabilities()`)
+    ///   and turns that allow into a deny — deleting one device row would
+    ///   silently lock a user out of a device they could use before.
+    /// - a session created for that device id inherits these capabilities (C#
+    ///   `OnSessionStarted`), which is what keeps a client remote-controllable
+    ///   across a session that ended, before it re-posts
+    ///   `/Sessions/Capabilities/Full`.
+    ///
+    /// Growth is bounded by the number of device ids that ever authenticated —
+    /// the same population as the persisted `Devices` table, at a few hundred
+    /// bytes each — so this is not a leak that outruns the database.
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
     /// The shared token-resolution cache — cleared on every device mutation so
     /// a deleted/rewritten token can never be served from cache (revocation is
@@ -457,6 +475,9 @@ impl DeviceManager for FerrofinDeviceManager {
     }
 
     async fn delete_device(&self, device: &DeviceEntity) -> Result<(), ServiceError> {
+        // The `capabilities` entry for `device.device_id` deliberately survives
+        // (C# `DeleteDevice` drops only `_devices`) — see the field's docs: it
+        // still gates `can_access_device` for restricted users.
         sqlx::query(r#"DELETE FROM "Devices" WHERE "Id" = ?1"#)
             .bind(device.id)
             .execute(self.db.writer())
@@ -935,6 +956,58 @@ mod tests {
         assert!(
             mgr.device_info_with_name(&row, None, Some("u".to_owned()))
                 .is_ok()
+        );
+    }
+
+    /// Deleting a device must NOT forget its reported capabilities. They are not
+    /// bookkeeping: they decide whether a restricted user may use that device id
+    /// (a device that reports no persistent identifier is freely usable, while
+    /// the *default* capabilities gate it), and they seed the capabilities of
+    /// any session later created for the id. Evicting the entry with the row
+    /// would flip a working device into "access denied" for exactly the users an
+    /// admin never touched — upstream keeps it for the same reason.
+    #[tokio::test]
+    async fn deleting_a_device_keeps_its_capabilities() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(7);
+        let user = seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db);
+
+        // A device with no persistent identifier: usable by a user with no
+        // device permissions at all.
+        mgr.save_capabilities(
+            "dev-transient",
+            &ClientCapabilities {
+                supports_persistent_identifier: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("save");
+        let device = mgr
+            .create_device(&device_row(uid, "dev-transient", "tok-7"))
+            .await
+            .expect("create");
+        assert!(
+            mgr.can_access_device(&user, "dev-transient")
+                .await
+                .expect("access")
+        );
+
+        mgr.delete_device(&device).await.expect("delete");
+
+        assert!(
+            !mgr.get_capabilities(Some("dev-transient"))
+                .await
+                .expect("get")
+                .supports_persistent_identifier,
+            "the reported capabilities outlive the device row"
+        );
+        assert!(
+            mgr.can_access_device(&user, "dev-transient")
+                .await
+                .expect("access"),
+            "deleting the row must not turn an allowed device into a denied one"
         );
     }
 }

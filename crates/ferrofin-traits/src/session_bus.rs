@@ -43,8 +43,13 @@ pub trait SessionMessageBus: Send + Sync {
     fn register(&self, session_id: String, sink: MessageSink) -> SinkToken;
 
     /// Removes the registration `token` identifies (called when its socket
-    /// closes). A token that is no longer registered is a no-op.
-    fn unregister(&self, session_id: &str, token: SinkToken);
+    /// closes) and reports whether the session still has a live socket
+    /// afterwards. A token that is no longer registered is a no-op.
+    ///
+    /// The return value is what lets the caller end a session only when its
+    /// **last** socket goes, as `WebSocketController.OnConnectionClosed` does:
+    /// `false` means that was the last one.
+    fn unregister(&self, session_id: &str, token: SinkToken) -> bool;
 
     /// Delivers `message` to the session if it is connected, returning whether a
     /// sink existed to receive it.

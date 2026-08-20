@@ -31,6 +31,14 @@
 //! - **Idle/inactive timers and `IAsyncDisposable`** are dropped — no real
 //!   scheduler in this crate (that is Wave 8 / scheduled tasks). Automatic
 //!   progress is tracked as a flag on the in-memory session.
+//! - **The session pool is evicted exactly where upstream evicts it**, never on
+//!   a timer: [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and
+//!   the C# `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync`
+//!   path the API layer's `/socket` handler calls when a session's last socket
+//!   closes) and [`SessionManager::logout`]. A client that only ever speaks
+//!   HTTP therefore keeps its entry until the server restarts — same as
+//!   upstream, where `/Sessions` filters the stale ones by `activeWithinSeconds`
+//!   rather than reaping them.
 //! - **Exceptions → `Result<_, ServiceError>`**: `SecurityException` /
 //!   `AuthenticationException` → [`ServiceError::Unauthorized`]; a missing
 //!   session / user → [`ServiceError::NotFound`]; bad arguments →
@@ -62,7 +70,7 @@ use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::EventManager;
-use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager};
+use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager, UserManager};
 use ferrofin_traits::net::WebSocketConnection;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use ferrofin_traits::session_bus::SessionMessageBus;
@@ -188,6 +196,11 @@ pub struct FerrofinSessionManager {
     /// `SupportsRemoteControl`) and is the delivery path for remote-control
     /// pushes when no [`WebSocketConnection`] is attached directly.
     bus: Option<Arc<dyn SessionMessageBus>>,
+    /// The media-source manager, when wired — the owner of the open-live-stream
+    /// table. `OnPlaybackStopped` closes the reported live stream through it
+    /// (C# `CloseLiveStreamIfNeededAsync`); without it that close is a no-op and
+    /// an abandoned live stream stays open until the client asks explicitly.
+    media_sources: Option<Arc<dyn MediaSourceManager>>,
 }
 
 impl std::fmt::Debug for FerrofinSessionManager {
@@ -226,6 +239,7 @@ impl FerrofinSessionManager {
             db,
             server_id: server_id.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            media_sources: None,
             bus: None,
         }
     }
@@ -235,6 +249,16 @@ impl FerrofinSessionManager {
     #[must_use]
     pub fn with_session_bus(mut self, bus: Arc<dyn SessionMessageBus>) -> Self {
         self.bus = Some(bus);
+        self
+    }
+
+    /// Wires the media-source manager (composition root only), so a
+    /// playback-stopped report closes the live stream it names — the C#
+    /// `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync` path. Without it
+    /// live streams are only ever closed by an explicit `/LiveStreams/Close`.
+    #[must_use]
+    pub fn with_media_sources(mut self, media_sources: Arc<dyn MediaSourceManager>) -> Self {
+        self.media_sources = Some(media_sources);
         self
     }
 
@@ -346,6 +370,18 @@ impl FerrofinSessionManager {
             .await?
             .and_then(|o| o.custom_name);
 
+        // A newly created session inherits the device's last reported
+        // capabilities (C# `OnSessionStarted` -> `ReportCapabilities(info, caps,
+        // saveCapabilities: false)`). That is what makes the device manager's
+        // never-evicted capabilities map load-bearing: a session recreated after
+        // its socket closed still advertises `SupportsRemoteControl`, so the
+        // client does not vanish from the cast menu until it re-posts
+        // `/Sessions/Capabilities/Full`.
+        let device_capabilities = self
+            .device_manager
+            .get_capabilities(Some(device_id))
+            .await?;
+
         let mut sessions = self.sessions.lock().await;
         let is_new = !sessions.contains_key(&key);
         let session = sessions.entry(key.clone()).or_insert_with(|| {
@@ -379,7 +415,7 @@ impl FerrofinSessionManager {
                 now_playing_is_paused: false,
                 now_viewing_item_id: None,
                 additional_users: Vec::new(),
-                capabilities: ClientCapabilities::default(),
+                capabilities: device_capabilities,
                 transcoding_info: None,
                 is_playing: false,
                 connections: Vec::new(),
@@ -783,6 +819,14 @@ impl SessionManager for FerrofinSessionManager {
                     .await?;
                 self.push_user_data_changed(user_id, info.item_id).await;
             }
+        }
+
+        // C# `OnPlaybackStopped`: the live stream the client was playing is
+        // closed here, not only by an explicit `/LiveStreams/Close`. A client that
+        // stops playback and never calls Close otherwise leaks its open stream.
+        if let Some(live_stream_id) = info.live_stream_id.as_deref() {
+            self.close_live_stream_if_needed(live_stream_id, session_id)
+                .await?;
         }
 
         let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
@@ -1270,12 +1314,26 @@ impl SessionManager for FerrofinSessionManager {
 
     async fn close_live_stream_if_needed(
         &self,
-        _live_stream_id: &str,
+        live_stream_id: &str,
         _session_or_play_session_id: &str,
     ) -> Result<(), ServiceError> {
-        // Live-stream reference-counting needs the injected `IMediaSourceManager`
-        // (not part of this unit). Deferred: with no live streams opened here,
-        // there is nothing to close. See the module docs.
+        // C# keeps a `_activeLiveStreamSessions` map so a live stream shared by
+        // several sessions is closed only by the last one; when a live stream has
+        // no mapping it closes outright. Ferrofin mints a fresh live-stream id per
+        // `OpenLiveStream`, so no two sessions ever name the same id and the
+        // no-mapping branch is the only reachable one — the refcount map (itself
+        // unbounded) buys nothing here.
+        if live_stream_id.is_empty() {
+            return Ok(());
+        }
+        let Some(media_sources) = self.media_sources.as_ref() else {
+            return Ok(());
+        };
+        // C# logs and swallows: a failed close must not fail the client's
+        // playback-stopped report.
+        if let Err(err) = media_sources.close_live_stream(live_stream_id).await {
+            error!(%live_stream_id, %err, "error closing live stream");
+        }
         Ok(())
     }
 
@@ -1840,7 +1898,13 @@ mod bus_fallback_tests {
         ) -> ferrofin_traits::session_bus::SinkToken {
             0
         }
-        fn unregister(&self, _session_id: &str, _token: ferrofin_traits::session_bus::SinkToken) {}
+        fn unregister(
+            &self,
+            _session_id: &str,
+            _token: ferrofin_traits::session_bus::SinkToken,
+        ) -> bool {
+            false
+        }
         fn send(&self, _session_id: &str, _message: String) -> bool {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

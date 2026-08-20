@@ -956,3 +956,171 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
     assert_eq!(counting.dto_reads(), 1);
     assert_eq!(conn.sent_count(), 1);
 }
+
+/// A media-source manager that records every `close_live_stream` id. Only the
+/// live-stream half of the trait is reachable from the session manager.
+struct RecordingMediaSources {
+    closed: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
+    async fn get_media_streams(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn get_media_attachments(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn get_playback_media_sources(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+        _allow_media_probe: bool,
+        _enable_path_substitution: bool,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn get_static_media_sources(
+        &self,
+        _item_id: Uuid,
+        _enable_path_substitution: bool,
+        _user_id: Option<Uuid>,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn open_live_stream(
+        &self,
+        _request: &ferrofin_model::media_info::LiveStreamRequest,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn get_live_stream(
+        &self,
+        _id: &str,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+    async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
+        self.closed
+            .lock()
+            .expect("closed mutex")
+            .push(id.to_owned());
+        Ok(())
+    }
+    async fn refresh_media_streams(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unreachable!("not reached from the session manager")
+    }
+}
+
+/// A stopped playback closes the live stream it names (C# `OnPlaybackStopped` →
+/// `CloseLiveStreamIfNeededAsync`). Without it the media source manager's
+/// open-stream table only ever shrinks on an explicit `/LiveStreams/Close`, so a
+/// client that stops playing and goes away leaks its `MediaSourceInfo` forever.
+#[tokio::test]
+async fn stopping_playback_closes_the_reported_live_stream() {
+    use ferrofin_model::session::PlaybackStopInfo;
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = Arc::new(
+        Arc::try_unwrap(manager(&db))
+            .expect("sole owner")
+            .with_media_sources(
+                Arc::clone(&sources) as Arc<dyn ferrofin_traits::library::MediaSourceManager>
+            ),
+    );
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-live", "TV", "e", &user)
+        .await
+        .unwrap();
+
+    // No live stream named: nothing to close.
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert!(
+        sources.closed.lock().expect("closed mutex").is_empty(),
+        "a report without a live stream id closes nothing"
+    );
+
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-42".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-42".to_owned()],
+        "the reported live stream is closed exactly once"
+    );
+}
+
+/// A session recreated after its previous one ended (the socket closed, or an
+/// explicit logout) inherits the device's last reported capabilities — C#
+/// `OnSessionStarted` → `ReportCapabilities(info, _deviceManager.GetCapabilities
+/// (deviceId), saveCapabilities: false)`. This is what makes ending a session on
+/// socket close safe: the client stays remote-controllable without having to
+/// re-post `/Sessions/Capabilities/Full`, and it is why the device manager's
+/// capabilities map is never evicted.
+#[tokio::test]
+async fn a_recreated_session_inherits_the_devices_capabilities() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let dto = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    let session_id = dto.id.clone().unwrap();
+    assert!(
+        !dto.supports_media_control,
+        "nothing reported yet, so the first session starts with defaults"
+    );
+
+    mgr.report_capabilities(
+        &session_id,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // The socket closed: the session leaves the pool (C# `CloseIfNeededAsync`).
+    mgr.report_session_ended(&session_id).await.unwrap();
+    assert!(
+        mgr.get_sessions(Uuid::nil(), None, None, None, true)
+            .await
+            .unwrap()
+            .is_empty(),
+        "ending the session removes it from the pool"
+    );
+
+    // The client's next request recreates it — same id, capabilities intact.
+    let again = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .await
+        .unwrap();
+    assert_eq!(again.id.as_deref(), Some(session_id.as_str()));
+    assert!(
+        again.supports_media_control,
+        "the recreated session inherits the device's reported capabilities"
+    );
+}

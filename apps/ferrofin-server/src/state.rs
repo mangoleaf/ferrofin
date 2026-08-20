@@ -925,7 +925,10 @@ pub async fn build_app_state(
             db.clone(),
             server_id.clone(),
         )
-        .with_session_bus(Arc::clone(&session_bus)),
+        .with_session_bus(Arc::clone(&session_bus))
+        // So a playback-stopped report closes the live stream it names (C#
+        // `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync`).
+        .with_media_sources(Arc::clone(&media_sources)),
     );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -1288,6 +1291,37 @@ pub async fn build_app_state(
     let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> = Arc::new(
         ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus)),
     );
+    // A session that ended (its last socket closed, or it logged out) leaves its
+    // SyncPlay group — port of `SyncPlayManager.OnSessionEnded`. Without it the
+    // group keeps a participant that can never receive another command, and the
+    // registry's session→group map keeps an entry nothing will ever remove.
+    {
+        let sync_play = Arc::clone(&sync_play);
+        event_bus.subscribe(
+            "SessionEnded",
+            Arc::new(move |payload: &str| {
+                let Ok(session) =
+                    serde_json::from_str::<ferrofin_model::dto::SessionInfoDto>(payload)
+                else {
+                    return Ok(());
+                };
+                let Some(session_id) = session.id.filter(|id| !id.is_empty()) else {
+                    return Ok(());
+                };
+                let member = ferrofin_traits::stubs::SyncPlaySession {
+                    session_id,
+                    user_id: session.user_id,
+                    user_name: session.user_name.unwrap_or_default(),
+                };
+                let sync_play = Arc::clone(&sync_play);
+                tokio::spawn(async move {
+                    // Not a member of any group: a successful no-op.
+                    let _ = sync_play.leave_group(&member).await;
+                });
+                Ok(())
+            }),
+        );
+    }
     // ---- File Transformation pipeline --------------------------------------
     // The registry the static `/web` mount consults per request. The Intro
     // Skipper's skip-button patch for `main.jellyfin.bundle.js` is its

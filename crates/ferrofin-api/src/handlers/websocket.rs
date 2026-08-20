@@ -16,6 +16,13 @@
 //! (`GET /Sessions?ControllableByUserId=…` → `SupportsRemoteControl`). The sink
 //! is unregistered when the socket closes. An anonymous socket still holds open (keep-alive only), so a client
 //! that opens the socket before authenticating is never dropped.
+//!
+//! Closing the socket also **ends the session** when no other socket took its
+//! place -- the port of `WebSocketController.OnConnectionClosed` ->
+//! `SessionManager.CloseIfNeededAsync`, which is how upstream keeps
+//! `_activeConnections` from accumulating one entry per client that ever
+//! connected. Without it a closed browser tab stays in `GET /Sessions` forever
+//! and its `SessionEnded` activity entry is never written.
 
 use std::time::Duration;
 
@@ -319,6 +326,37 @@ fn register_sink(
     Some((c.session_id.clone(), std::sync::Arc::clone(bus), token))
 }
 
+/// Drops this socket's sink and, when it was the session's **last** socket, ends
+/// the session — the port of `WebSocketController.OnConnectionClosed` →
+/// `ISessionManager.CloseIfNeededAsync`.
+///
+/// `unregister` reports whether a registration survives: a socket that notices
+/// its own death only after the client reconnected finds the reconnect's sink
+/// still there, and must leave that live session alone. Otherwise the session
+/// ends, which drops it from the session pool (upstream `_activeConnections`,
+/// which is why a closed browser tab stops appearing in `GET /Sessions`) and
+/// emits `SessionEnded`. Returns whether the session was ended.
+async fn end_session_if_last_socket<F, Fut>(
+    bus: &dyn ferrofin_traits::session_bus::SessionMessageBus,
+    session_id: &str,
+    token: u64,
+    end_session: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ferrofin_traits::error::ServiceError>>,
+{
+    if bus.unregister(session_id, token) {
+        return false;
+    }
+    if let Err(err) = end_session().await {
+        // The session may already be gone (an explicit `/Sessions/Logout` races
+        // the socket close). Nothing to report to anyone — the socket is closed.
+        tracing::debug!(session_id, %err, "session already ended");
+    }
+    true
+}
+
 /// Holds a WebSocket open: register the caller's push sink (if authenticated),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
@@ -429,9 +467,10 @@ async fn handle_socket(
     }
 
     if let Some((sid, bus, token)) = registration {
-        // Scoped to *this* socket's registration: a second tab of the same
-        // client shares the session id, and its sink must survive our close.
-        bus.unregister(&sid, token);
+        end_session_if_last_socket(bus.as_ref(), &sid, token, || {
+            state.sessions.report_session_ended(&sid)
+        })
+        .await;
     }
     drop(tx);
     tracing::info!(
@@ -763,5 +802,84 @@ mod tests {
             "MessageId is a UUID: {id}"
         );
         assert_eq!(id.len(), 36, "hyphenated form (8-4-4-4-12)");
+    }
+
+    /// A bus whose `unregister` answers a canned "a sink still remains", and
+    /// records what it was asked to remove.
+    struct FakeBus {
+        still_connected: bool,
+        removed: std::sync::Mutex<Vec<(String, ferrofin_traits::session_bus::SinkToken)>>,
+    }
+
+    impl ferrofin_traits::session_bus::SessionMessageBus for FakeBus {
+        fn register(
+            &self,
+            _session_id: String,
+            _sink: ferrofin_traits::session_bus::MessageSink,
+        ) -> ferrofin_traits::session_bus::SinkToken {
+            0
+        }
+        fn unregister(
+            &self,
+            session_id: &str,
+            token: ferrofin_traits::session_bus::SinkToken,
+        ) -> bool {
+            self.removed
+                .lock()
+                .expect("fake bus mutex")
+                .push((session_id.to_owned(), token));
+            self.still_connected
+        }
+        fn send(&self, _session_id: &str, _message: String) -> bool {
+            false
+        }
+        fn is_connected(&self, _session_id: &str) -> bool {
+            self.still_connected
+        }
+    }
+
+    #[tokio::test]
+    async fn last_socket_close_ends_the_session() {
+        let bus = FakeBus {
+            still_connected: false,
+            removed: std::sync::Mutex::new(Vec::new()),
+        };
+        let ended = std::sync::Mutex::new(Vec::new());
+        let did_end = super::end_session_if_last_socket(&bus, "sess-1", 7, || async {
+            ended.lock().expect("ended mutex").push("sess-1");
+            Ok(())
+        })
+        .await;
+
+        assert!(did_end, "no socket remained, so the session must end");
+        assert_eq!(*ended.lock().expect("ended mutex"), vec!["sess-1"]);
+        assert_eq!(
+            *bus.removed.lock().expect("fake bus mutex"),
+            vec![("sess-1".to_owned(), 7)],
+            "the closing socket removes its own registration by token"
+        );
+    }
+
+    /// The C# guard `if (!session.SessionControllers.Any(i => i.IsSessionActive))`:
+    /// a stale socket closing after the client reconnected must not end the
+    /// session out from under the live one.
+    #[tokio::test]
+    async fn a_reconnect_keeps_the_session_alive() {
+        let bus = FakeBus {
+            still_connected: true,
+            removed: std::sync::Mutex::new(Vec::new()),
+        };
+        let ended = std::sync::Mutex::new(Vec::new());
+        let did_end = super::end_session_if_last_socket(&bus, "sess-1", 7, || async {
+            ended.lock().expect("ended mutex").push("sess-1");
+            Ok(())
+        })
+        .await;
+
+        assert!(!did_end, "a reconnected socket still holds the session");
+        assert!(
+            ended.lock().expect("ended mutex").is_empty(),
+            "the live session must not be ended"
+        );
     }
 }

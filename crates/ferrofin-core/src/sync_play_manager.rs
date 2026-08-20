@@ -941,7 +941,13 @@ mod tests {
         ) -> ferrofin_traits::session_bus::SinkToken {
             0
         }
-        fn unregister(&self, _session_id: &str, _token: ferrofin_traits::session_bus::SinkToken) {}
+        fn unregister(
+            &self,
+            _session_id: &str,
+            _token: ferrofin_traits::session_bus::SinkToken,
+        ) -> bool {
+            false
+        }
         fn send(&self, session_id: &str, message: String) -> bool {
             self.sent.lock().unwrap().push((session_id.into(), message));
             true

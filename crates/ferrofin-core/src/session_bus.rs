@@ -63,16 +63,18 @@ impl SessionMessageBus for FerrofinSessionMessageBus {
         token
     }
 
-    fn unregister(&self, session_id: &str, token: SinkToken) {
+    fn unregister(&self, session_id: &str, token: SinkToken) -> bool {
         let mut guard = self.sinks.lock().expect("session bus mutex poisoned");
         let Some(sinks) = guard.get_mut(session_id) else {
-            return;
+            return false;
         };
         sinks.retain(|(t, _)| *t != token);
         if sinks.is_empty() {
             // Keep `is_connected` honest: an empty vector is not a connection.
             guard.remove(session_id);
+            return false;
         }
+        true
     }
 
     fn send(&self, session_id: &str, message: String) -> bool {
@@ -162,6 +164,31 @@ mod tests {
         assert!(bus.send("s", "x".into()));
         assert_eq!(first.load(Ordering::SeqCst), 0, "closed socket never fires");
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    /// The `bool` is what lets a caller end the session only when the *last*
+    /// socket goes. A dropped socket often notices its own death well after the
+    /// client reconnected (TCP timeout >> reconnect), so the stale unregister
+    /// must report "still connected" and leave the session alive.
+    #[test]
+    fn unregister_reports_whether_a_socket_remains() {
+        let bus = FerrofinSessionMessageBus::new();
+        let (live, sink_live) = counting_sink();
+        let stale = bus.register("s".into(), Box::new(|_| {}));
+        let current = bus.register("s".into(), sink_live);
+
+        assert!(
+            bus.unregister("s", stale),
+            "the reconnected socket is still registered"
+        );
+        assert!(bus.send("s", "x".into()));
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+
+        assert!(
+            !bus.unregister("s", current),
+            "that was the last socket — the session has no connection left"
+        );
+        assert!(!bus.is_connected("s"));
     }
 
     #[test]
