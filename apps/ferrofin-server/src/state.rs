@@ -555,6 +555,11 @@ pub async fn build_app_state(
     if let Some(every) = config.scan_progress_every {
         scanner = scanner.with_progress_every(every as usize);
     }
+    // How many ffprobe processes the scan keeps in flight (bootstrap knob);
+    // `None`/zero keeps the crate default.
+    if let Some(concurrency) = config.scan_probe_concurrency.filter(|c| *c > 0) {
+        scanner = scanner.with_probe_concurrency(concurrency as usize);
+    }
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
     // clients over the WebSocket so open views refresh after a scan.

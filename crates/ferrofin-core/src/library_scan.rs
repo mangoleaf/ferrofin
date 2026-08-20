@@ -318,6 +318,186 @@ fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
     })
 }
 
+/// Cap on how many ffprobe processes the scan keeps in flight by default.
+///
+/// The probe is ~95% of scan wall time (measured: 74 s of a 78 s, 2 100-item
+/// scan) and is a pure per-file read, so probing one file at a time leaves
+/// every core but one idle. This ceiling is deliberately modest rather than
+/// core-count-wide: the win is close to linear on a local SSD, but a library on
+/// a spinning disk or a network mount turns a wide window into seek thrash, and
+/// a scan must never starve playback. Operators who know their storage raise it
+/// with `FERROFIN_SCAN_PROBE_CONCURRENCY` / `scan_probe_concurrency`.
+pub const DEFAULT_SCAN_PROBE_CONCURRENCY: usize = 4;
+
+/// The effective default probe window: [`DEFAULT_SCAN_PROBE_CONCURRENCY`],
+/// never more than the visible cores (a single-core NAS gains nothing from
+/// four concurrent probes but pays for all four).
+fn default_probe_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(DEFAULT_SCAN_PROBE_CONCURRENCY)
+}
+
+/// The ffprobe request for a leaf media item, or `None` when the row must not
+/// be probed at all: a folder, a non-media row, or a row with no path.
+///
+/// This is the *deciding* half of the probe — exactly the eligibility test the
+/// inline probe applied — split out so the whole plan can be classified up
+/// front, before any ffprobe runs.
+fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
+    let is_audio = entity.media_type.as_deref() == Some("Audio");
+    let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
+    if entity.is_folder || !is_media {
+        return None;
+    }
+    Some(MediaInfoRequest {
+        media_source: MediaSourceInfo {
+            path: Some(entity.path.clone()?),
+            ..Default::default()
+        },
+        // Extract embedded chapter markers so they show on the playback
+        // timeline (matching Jellyfin's `-show_chapters`).
+        extract_chapters: true,
+        media_is_audio: is_audio,
+    })
+}
+
+/// Runs `request` on the encoder as a detached task, so the caller can keep
+/// several probes in flight while it works through the scan in order.
+///
+/// A probe failure is logged and reported as `None` — exactly what the
+/// inline probe did — so one unreadable file never aborts a scan.
+fn spawn_probe(
+    encoder: Arc<dyn MediaEncoder>,
+    request: MediaInfoRequest,
+) -> tokio::task::JoinHandle<Option<MediaInfo>> {
+    tokio::task::spawn(async move {
+        match encoder.get_media_info_full(&request).await {
+            Ok(probed) => Some(probed),
+            Err(e) => {
+                let path = request.media_source.path.as_deref();
+                tracing::warn!(error = %e, ?path, "media probe failed; item left unprobed");
+                None
+            }
+        }
+    })
+}
+
+/// The look-ahead probe pipeline: tracks which planned rows probe, keeps a
+/// bounded set of ffprobe tasks in flight, and hands each planned item its
+/// result **in plan order**.
+///
+/// Order is the whole point. The scan body still runs one item at a time, in
+/// exactly the sequence [`LibraryScanner::plan`] produced, writing exactly the
+/// same rows; only the ffprobe wait is moved off that critical path.
+struct ProbePipeline<'a> {
+    /// The encoder seam, cloned into each spawned probe. `None` disables the
+    /// pipeline entirely (no probe wired — the unit-test and no-ffmpeg case).
+    encoder: Option<Arc<dyn MediaEncoder>>,
+    /// The plan the scan is walking, borrowed so a request can be rebuilt at
+    /// dispatch time from the row itself.
+    planned: &'a [Planned],
+    /// Per planned item: `Some(is_audio)` when the row is probe-eligible,
+    /// `None` when it is a folder / non-media / path-less row that never
+    /// probes. Deliberately one byte per item rather than a parked
+    /// [`MediaInfoRequest`] — a request carries a whole `MediaSourceInfo`
+    /// (504 bytes plus its path), so parking one per item would hold ~50 MB
+    /// across a 100 000-item scan; this vector holds 100 KB.
+    eligible: Vec<Option<bool>>,
+    /// The next planned index that has not been dispatched yet.
+    next: usize,
+    /// In-flight probes, in dispatch (= plan) order, tagged with their index.
+    inflight: std::collections::VecDeque<(usize, tokio::task::JoinHandle<Option<MediaInfo>>)>,
+    /// How many probes to keep in flight.
+    window: usize,
+}
+
+impl<'a> ProbePipeline<'a> {
+    /// Builds the pipeline over `planned` and primes `window` probes.
+    fn new(encoder: Option<Arc<dyn MediaEncoder>>, planned: &'a [Planned], window: usize) -> Self {
+        let eligible = if encoder.is_some() {
+            planned
+                .iter()
+                .map(|p| probe_request(&p.entity).map(|r| r.media_is_audio))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut this = Self {
+            encoder,
+            planned,
+            eligible,
+            next: 0,
+            inflight: std::collections::VecDeque::new(),
+            window: window.max(1),
+        };
+        for _ in 0..this.window {
+            this.dispatch_next();
+        }
+        this
+    }
+
+    /// Dispatches the next probe-eligible planned item, skipping the folders
+    /// and non-media rows that never probe.
+    fn dispatch_next(&mut self) {
+        let Some(encoder) = &self.encoder else { return };
+        while self.next < self.eligible.len() {
+            let index = self.next;
+            self.next += 1;
+            if self.eligible[index].is_some()
+                && let Some(request) = probe_request(&self.planned[index].entity)
+            {
+                self.inflight
+                    .push_back((index, spawn_probe(Arc::clone(encoder), request)));
+                return;
+            }
+        }
+    }
+
+    /// Awaits the probe for planned item `index` and reports whether that item
+    /// was probed as audio (which selects the embedded-tag branch of
+    /// [`LibraryScanner::apply_probe`]), then refills the window so the
+    /// following files are already being probed while the caller persists this
+    /// one. The result is `None` when the item was not probe-eligible (the
+    /// queue head belongs to a later index) or its probe failed.
+    async fn take(&mut self, index: usize) -> (Option<MediaInfo>, bool) {
+        let is_audio = self.eligible.get(index).copied().flatten().unwrap_or(false);
+        if self.inflight.front().is_none_or(|(i, _)| *i != index) {
+            return (None, is_audio);
+        }
+        let Some((_, handle)) = self.inflight.pop_front() else {
+            return (None, is_audio);
+        };
+        let probed = match handle.await {
+            Ok(probed) => probed,
+            Err(err) => {
+                tracing::warn!(%err, "probe task failed; item left unprobed");
+                None
+            }
+        };
+        // Refill only once this probe is done, so `window` is the exact number
+        // of ffprobe processes that can ever run at the same time — dispatching
+        // before the await would make it `window + 1`, and an operator who set
+        // the knob to 1 to protect a fragile mount would still get two.
+        self.dispatch_next();
+        (probed, is_audio)
+    }
+
+    /// Cancels every probe still in flight — a scan that ended (or failed)
+    /// must not leave ffprobe processes running behind it.
+    fn abort(&mut self) {
+        for (_, handle) in self.inflight.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for ProbePipeline<'_> {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 /// One item the plan pass resolved, ready to persist.
 struct Planned {
     /// The item id (also `entity.id`, kept typed for `set_ancestors`).
@@ -391,6 +571,11 @@ pub struct LibraryScanner {
     media_encoder: Option<Arc<dyn MediaEncoder>>,
     /// Where probed streams are stored (paired with `media_encoder`).
     media_streams: Option<Arc<dyn MediaStreamRepository>>,
+    /// How many ffprobe processes the scan keeps in flight
+    /// ([`DEFAULT_SCAN_PROBE_CONCURRENCY`]). The probe dominates scan wall
+    /// time and is a pure per-file read, so the scan runs this many files
+    /// ahead of the (still strictly ordered) persistence loop.
+    probe_concurrency: usize,
     /// Optional TMDB client for fetching remote artwork (posters/backdrops) for
     /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
     tmdb: Option<Arc<TmdbClient>>,
@@ -471,6 +656,7 @@ impl LibraryScanner {
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             media_encoder: None,
             media_streams: None,
+            probe_concurrency: default_probe_concurrency(),
             tmdb: None,
             omdb: None,
             tvdb: None,
@@ -488,6 +674,21 @@ impl LibraryScanner {
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
         }
+    }
+
+    /// Overrides how many ffprobe processes the scan keeps in flight
+    /// (`0` is clamped to 1 — the old strictly-serial behaviour).
+    ///
+    /// Wired from the `FERROFIN_SCAN_PROBE_CONCURRENCY` bootstrap knob; unit
+    /// tests keep [`DEFAULT_SCAN_PROBE_CONCURRENCY`]. Raising it trades
+    /// concurrent ffmpeg processes (and their I/O) for scan throughput: on a
+    /// local disk it scales close to linearly with cores, but on a spinning
+    /// disk or a network mount a wide window turns sequential reads into seek
+    /// thrash, which is why the default is deliberately modest.
+    #[must_use]
+    pub fn with_probe_concurrency(mut self, concurrency: usize) -> Self {
+        self.probe_concurrency = concurrency.max(1);
+        self
     }
 
     /// Sets the per-database id-derivation mode. Called once by the
@@ -789,6 +990,10 @@ impl LibraryScanner {
         // never runs for that library's items, and the saved order picks
         // the authority when fetchers compete.
         let fetcher_policies = fetcher_policies(folders);
+        // ffprobe dominates scan wall time and touches nothing but the file it
+        // reads, so it runs `probe_concurrency` files ahead of this loop. The
+        // loop itself is unchanged: same plan order, same rows, same writes.
+        let mut probes = self.probe_pipeline(&planned);
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
             // Bounded progress cadence (RULES_LOGGING volume rule); `0` disables it.
@@ -815,7 +1020,9 @@ impl LibraryScanner {
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
-            let (streams, chapters, tag_provider_ids) = self.probe(&mut entity).await;
+            let (media_info, is_audio) = probes.take(scanned).await;
+            let (streams, chapters, tag_provider_ids) =
+                Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
             // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
@@ -897,6 +1104,7 @@ impl LibraryScanner {
                 self.publish_refresh_progress(cf, pct).await;
             }
         }
+        probes.abort();
         // Drop rows whose files vanished since the last scan, so deleted media
         // stops being listed and served. Best-effort — a failure must not fail
         // the whole scan.
@@ -1557,49 +1765,34 @@ impl LibraryScanner {
         }
     }
 
-    /// Best-effort ffprobe of a leaf media item: enriches `entity` with the probed
-    /// `run_time_ticks`/`size` and returns its media streams (ready to persist).
+    /// Opens the look-ahead ffprobe pipeline over an already-planned item set.
+    fn probe_pipeline<'a>(&self, planned: &'a [Planned]) -> ProbePipeline<'a> {
+        ProbePipeline::new(self.media_encoder.clone(), planned, self.probe_concurrency)
+    }
+
+    /// Folds a completed probe onto the item row — the probed
+    /// `run_time_ticks`/`size` plus, for audio, the embedded tags — and returns
+    /// the media-stream, chapter and provider-id rows to persist.
     ///
-    /// Returns an empty vec — leaving the item unprobed but still browsable — when
-    /// no encoder is wired, the item is a folder or non-media, it has no path, or
-    /// the probe fails (missing ffmpeg, unreadable file). Probe failures are
-    /// swallowed so one bad file never aborts a whole library scan.
-    async fn probe(
-        &self,
+    /// The *mutating* half of the probe, split from
+    /// [`probe_request`](Self::probe_request) so the ffprobe call itself can run
+    /// ahead of the scan loop ([`spawn_probe`]) while the row updates stay
+    /// strictly in scan order. `probed` is `None` when the item was not
+    /// probe-eligible or ffprobe failed (missing ffmpeg, unreadable file) —
+    /// both leave the row exactly as the plan built it, still browsable, so one
+    /// bad file never aborts a whole library scan.
+    fn apply_probe(
         entity: &mut BaseItemEntity,
+        probed: Option<&MediaInfo>,
+        media_is_audio: bool,
     ) -> (
         Vec<MediaStreamInfoEntity>,
         Vec<ChapterEntity>,
         Vec<(String, String)>,
     ) {
         let empty = (Vec::new(), Vec::new(), Vec::new());
-        let Some(encoder) = &self.media_encoder else {
+        let Some(probed) = probed else {
             return empty;
-        };
-        let is_audio = entity.media_type.as_deref() == Some("Audio");
-        let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
-        if entity.is_folder || !is_media {
-            return empty;
-        }
-        let Some(path) = entity.path.clone() else {
-            return empty;
-        };
-        let request = MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                path: Some(path),
-                ..Default::default()
-            },
-            // Extract embedded chapter markers so they show on the playback
-            // timeline (matching Jellyfin's `-show_chapters`).
-            extract_chapters: true,
-            media_is_audio: is_audio,
-        };
-        let probed = match encoder.get_media_info_full(&request).await {
-            Ok(probed) => probed,
-            Err(e) => {
-                tracing::warn!(error = %e, path = ?entity.path, "media probe failed; item left unprobed");
-                return empty;
-            }
         };
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
@@ -1607,8 +1800,8 @@ impl LibraryScanner {
         // Embedded audio tags (album/artists/track/disc/year/genres + the
         // MusicBrainz ids) — the port of `AudioFileProber`. Fill-if-empty so an
         // NFO/prior scan wins; the ids are returned for persistence.
-        let provider_ids = if is_audio {
-            apply_audio_metadata(entity, &probed)
+        let provider_ids = if media_is_audio {
+            apply_audio_metadata(entity, probed)
         } else {
             Vec::new()
         };
@@ -5298,6 +5491,275 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(video_codec.as_deref(), Some("h264"));
+    }
+
+    /// A probe that answers with a duration derived from the file it was given
+    /// and records how many probes were in flight at once.
+    ///
+    /// Both halves are load-bearing: the per-path duration is what catches a
+    /// pipelined result being handed to the wrong item, and the high-water mark
+    /// is what catches the pipeline silently degrading to serial.
+    struct TracingProbe {
+        /// Probes currently running.
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        /// The most probes ever running at the same time.
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        /// When set, a probe blocks until this many probes are inside it at
+        /// once. That makes the overlap assertion deterministic instead of a
+        /// race against the scheduler: on a serial pipeline the rendezvous can
+        /// never complete, the probe falls out on [`RENDEZVOUS_TIMEOUT`], and
+        /// the peak stays at 1.
+        rendezvous: Option<Arc<tokio::sync::Barrier>>,
+        /// Set once a rendezvous has completed. One is all the assertion needs,
+        /// and retiring it keeps a genuinely serial pipeline to a single
+        /// timeout instead of one per probe.
+        met: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// How long the rendezvous probe waits for its peers before giving up. Only
+    /// reached when the pipeline failed to overlap — the assertion then fails
+    /// on the peak, rather than hanging the test.
+    const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// How many probes must meet inside the fake for the wide-window test.
+    /// Below the window under test (8) and well below the file count, so a
+    /// working pipeline always reaches it.
+    const RENDEZVOUS_WIDTH: usize = 4;
+
+    impl TracingProbe {
+        /// The duration a file at `path` probes as: `<n> * 1_000_000` ticks for
+        /// `... <n>.mkv`, so every fixture file has a distinct, checkable value.
+        fn ticks_for(path: &str) -> i64 {
+            let stem = path.rsplit('/').next().unwrap_or_default();
+            let digits: String = stem.chars().filter(char::is_ascii_digit).collect();
+            digits.parse::<i64>().unwrap_or(0) * 1_000_000
+        }
+    }
+
+    #[async_trait]
+    impl MediaEncoder for TracingProbe {
+        fn encoder_path(&self) -> String {
+            "ffmpeg".to_owned()
+        }
+        fn probe_path(&self) -> String {
+            "ffprobe".to_owned()
+        }
+        async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn get_media_info(
+            &self,
+            request: &MediaInfoRequest,
+        ) -> Result<MediaSourceInfo, ServiceError> {
+            use std::sync::atomic::Ordering;
+            let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(live, Ordering::SeqCst);
+            if let Some(barrier) = &self.rendezvous
+                && !self.met.load(Ordering::SeqCst)
+            {
+                let met = tokio::time::timeout(RENDEZVOUS_TIMEOUT, barrier.wait())
+                    .await
+                    .is_ok();
+                self.met.store(met, Ordering::SeqCst);
+            }
+            tokio::task::yield_now().await;
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            let path = request.media_source.path.clone().unwrap_or_default();
+            Ok(MediaSourceInfo {
+                run_time_ticks: Some(Self::ticks_for(&path)),
+                path: Some(path),
+                ..Default::default()
+            })
+        }
+        async fn extract_audio_image(
+            &self,
+            _path: &str,
+            _image_stream_index: Option<i32>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        async fn extract_video_image(
+            &self,
+            _input_file: &str,
+            _container: &str,
+            _media_source: &MediaSourceInfo,
+            _video_stream: &MediaStream,
+            _threed_format: Option<ferrofin_model::entities::Video3DFormat>,
+            _offset_ticks: Option<i64>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
+            input_file.to_owned()
+        }
+        fn get_time_parameter(&self, _ticks: i64) -> String {
+            String::new()
+        }
+        async fn convert_image(&self, _i: &str, _o: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// Builds a movies+tv library over `tmp`, scans it with `concurrency`
+    /// probes in flight, and returns the tracing probe's peak concurrency plus
+    /// the persistence handle to read rows back through.
+    async fn scan_with_probe_concurrency(
+        tmp: &std::path::Path,
+        movies: usize,
+        concurrency: usize,
+        rendezvous: Option<usize>,
+    ) -> (
+        usize,
+        Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        Vec<(ferrofin_model::data::BaseItemKind, String)>,
+    ) {
+        let media = tmp.join("movies");
+        let tv = tmp.join("tv").join("Series 01").join("Season 01");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::create_dir_all(&tv).unwrap();
+        let mut expected: Vec<(ferrofin_model::data::BaseItemKind, String)> = Vec::new();
+        for i in 1..=movies {
+            let path = media.join(format!("Movie {i:03}.mkv"));
+            std::fs::write(&path, b"").unwrap();
+            expected.push((
+                ferrofin_model::data::BaseItemKind::Movie,
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+        // Episodes under a Series/Season folder pair: the folder rows are NOT
+        // probe-eligible, so they are exactly what a pipeline that failed to
+        // skip non-media items would misalign on.
+        for e in 1..=movies {
+            let path = tv.join(format!("Series 01 S01E{e:03}.mkv"));
+            std::fs::write(&path, b"").unwrap();
+            expected.push((
+                ferrofin_model::data::BaseItemKind::Episode,
+                path.to_string_lossy().into_owned(),
+            ));
+        }
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        for (name, kind, path) in [
+            ("Movies", CollectionTypeOptions::movies, media),
+            ("Shows", CollectionTypeOptions::tvshows, tmp.join("tv")),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(kind),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: path.to_string_lossy().into_owned(),
+                    }],
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = Arc::new(TracingProbe {
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+            rendezvous: rendezvous.map(|n| Arc::new(tokio::sync::Barrier::new(n))),
+            met: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let scanner = LibraryScanner::new(
+            Arc::clone(&vf),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_probe_concurrency(concurrency)
+        .with_probe(
+            probe,
+            Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+            Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+                db.clone(),
+            )),
+        );
+        scanner.scan_all().await.unwrap();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+            crate::item_repository::FerrofinItemRepository::new(db, lookup),
+        );
+        (
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            items,
+            expected,
+        )
+    }
+
+    // The probe runs ahead of the persistence loop, so the one thing that can
+    // silently break is a result landing on the WRONG item. Every file probes
+    // as a duration derived from its own name, so a single misaligned handoff
+    // (or a mis-skipped folder row) shows up as a wrong RunTimeTicks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipelined_probe_results_stay_with_their_own_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, items, expected) = scan_with_probe_concurrency(tmp.path(), 12, 8, None).await;
+        for (kind, path) in &expected {
+            let id = crate::item_type_lookup::derive_item_id(*kind, path).expect("derivable id");
+            let row = items
+                .retrieve_item(id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{path} was not scanned"));
+            assert_eq!(
+                row.run_time_ticks,
+                Some(TracingProbe::ticks_for(path)),
+                "{path} got another item's probe result"
+            );
+        }
+    }
+
+    // ...and the pipeline must actually overlap probes: a window of 8 keeps
+    // more than one ffprobe in flight, while a window of 1 is exactly the old
+    // strictly-serial scan. Without this, a regression to `window = 1` would
+    // still pass every correctness test in this file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_window_bounds_how_many_probes_overlap() {
+        let wide = tempfile::tempdir().unwrap();
+        let (peak_wide, _, _) =
+            scan_with_probe_concurrency(wide.path(), 12, 8, Some(RENDEZVOUS_WIDTH)).await;
+        assert!(
+            peak_wide >= RENDEZVOUS_WIDTH,
+            "a window of 8 must run {RENDEZVOUS_WIDTH} probes at once; peak was {peak_wide}"
+        );
+        assert!(
+            peak_wide <= 8,
+            "the window must bound in-flight probes; peak was {peak_wide}"
+        );
+
+        let serial = tempfile::tempdir().unwrap();
+        let (peak_serial, _, _) = scan_with_probe_concurrency(serial.path(), 12, 1, None).await;
+        assert_eq!(
+            peak_serial, 1,
+            "a window of 1 must stay strictly serial (the pre-pipeline behaviour)"
+        );
+    }
+
+    // `0` is not a legal window — it would deadlock the scan on an empty
+    // pipeline — so the builder clamps it to the serial case.
+    #[tokio::test]
+    async fn probe_concurrency_zero_clamps_to_serial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_probe_concurrency(0);
+        assert_eq!(scanner.probe_concurrency, 1);
     }
 
     /// Reads back the scanned movies' `(Name, SortName, ProductionYear)` rows,

@@ -122,6 +122,7 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     metrics_sample_interval: Option<u32>,
     scan_progress_every: Option<u32>,
+    scan_probe_concurrency: Option<u32>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
@@ -277,6 +278,17 @@ pub struct Config {
     /// `config.toml`, else the default. A logging knob only — mistuning it changes
     /// log density, never scan correctness.
     pub scan_progress_every: Option<u32>,
+
+    /// How many ffprobe processes a library scan keeps in flight. The probe is
+    /// ~95% of scan wall time and is a pure per-file read, so probing one file
+    /// at a time leaves every core but one idle. `None`/zero =
+    /// [`ferrofin_core::library_scan::DEFAULT_SCAN_PROBE_CONCURRENCY`]. Raise
+    /// it on a local SSD (it scales close to linearly with cores); leave it low
+    /// on a spinning disk or a network mount, where a wide window turns
+    /// sequential reads into seek thrash. Resolved
+    /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
+    /// `config.toml` > default.
+    pub scan_probe_concurrency: Option<u32>,
 
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
@@ -527,6 +539,8 @@ impl Config {
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
+            scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
+                .or(file.scan_probe_concurrency),
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
             wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
@@ -624,6 +638,7 @@ impl Config {
             enable_metrics: None,
             metrics_sample_interval: None,
             scan_progress_every: None,
+            scan_probe_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,

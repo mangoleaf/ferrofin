@@ -58,6 +58,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_LIBRARY_ROOTS` | none | Library root paths to seed on a fresh install. |
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
+| `FERROFIN_SCAN_PROBE_CONCURRENCY` | `4` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
 
 ## Observability
 
@@ -104,6 +105,11 @@ Not runtime config, listed for completeness:
 
 - `FERROFIN_REFRESH_PLUGIN_ASSETS=1` — re-fetch vendored extension settings pages during
   `cargo build -p ferrofin-extensions`.
+- `FERROFIN_SCAN_BENCH=1` — run the opt-in library-scan measurement harness
+  (`apps/ferrofin-server/tests/scan_bench.rs`); reports items/second for a generated
+  fixture library. `FERROFIN_SCAN_BENCH_{MOVIES,SERIES,EPISODES}` size it,
+  `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
+  `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
 - `FERROFIN_FFMPEG_TESTS=1` — run the env-gated real-ffmpeg integration tests.
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
   wasm32-wasip2 target) and run the end-to-end WASM plugin tests.
