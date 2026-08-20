@@ -669,8 +669,11 @@ impl FerrofinSessionManager {
         user: Option<&UserEntity>,
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut out = Vec::new();
-        for member in self.flatten_linked_containers(id, user).await? {
-            out.extend(self.expand_one_for_playback(&member, user).await?);
+        for (member_id, member) in self.flatten_linked_containers(id, user).await? {
+            out.extend(
+                self.expand_one_for_playback(member_id, &member, user)
+                    .await?,
+            );
         }
         Ok(out)
     }
@@ -682,8 +685,11 @@ impl FerrofinSessionManager {
     /// physical `AncestorIds` closure the recursive child query walks — so the
     /// folder expansion below cannot see it and a box set would resolve to an
     /// empty queue. Anything else passes straight through.
-    /// Carries the loaded rows, not ids: the caller needs each item's kind and
-    /// `IsFolder` next, so re-fetching them there would double every read.
+    /// Carries `(id, row)` pairs, not ids: the caller needs each item's kind and
+    /// `IsFolder` next, so re-fetching them there would double every read — and
+    /// pairing the id it was *looked up by* means no step ever has to re-parse
+    /// `BaseItems.Id` back out of the row (see the `expect`-free contract note
+    /// on the child loop).
     ///
     /// Members come back in `SortName` order, not playlist link order, which
     /// *is* upstream's behaviour and was checked rather than assumed:
@@ -697,7 +703,7 @@ impl FerrofinSessionManager {
         &self,
         id: Uuid,
         user: Option<&UserEntity>,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<Vec<(Uuid, BaseItemEntity)>, ServiceError> {
         /// A box set inside a box set is legal; a cycle is not, but the depth
         /// cap makes one terminate anyway.
         const MAX_NESTING: usize = 4;
@@ -711,38 +717,52 @@ impl FerrofinSessionManager {
         // accumulating recursive children into a keyed map.
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
         seen.insert(id);
-        let mut frontier = vec![root];
+        let mut frontier = vec![(id, root)];
         for _ in 0..MAX_NESTING {
-            if !frontier.iter().any(Self::is_linked_container) {
+            if !frontier
+                .iter()
+                .any(|(_, item)| Self::is_linked_container(item))
+            {
                 break;
             }
             let mut next = Vec::with_capacity(frontier.len());
-            for item in frontier {
+            for (item_id, item) in frontier {
                 if !Self::is_linked_container(&item) {
-                    next.push(item);
+                    next.push((item_id, item));
                     continue;
                 }
-                let parent_id = Uuid::parse_str(&item.id).unwrap_or_default();
+                // One query for the whole container: `get_item_list` takes the
+                // same query as `get_item_ids` but returns the rows, so the
+                // members do not each cost a second single-row read.
+                //
                 // The non-recursive parent query is the one that merges manual
                 // linked children (see `translate_query`).
-                let child_ids = self
+                let children = self
                     .library_manager
-                    .get_item_ids(&InternalItemsQuery {
-                        parent_id,
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: item_id,
                         is_virtual_item: Some(false),
                         user: user.cloned(),
                         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
                         ..InternalItemsQuery::default()
                     })
                     .await?;
-                for child_id in child_ids {
+                for child in children {
+                    // Never degrade an unparseable id to the nil GUID (see
+                    // `fc01259`): a nil `parent_id` does not scope to nothing,
+                    // it makes `translate_query` drop the parent predicate
+                    // altogether — which would cast the entire library.
+                    let Ok(child_id) = Uuid::parse_str(&child.id) else {
+                        error!(
+                            raw_id = %child.id,
+                            "skipping a play-translation child whose stored id is not a guid"
+                        );
+                        continue;
+                    };
                     // A member reachable twice (linked directly *and* through a
                     // nested container) belongs in the queue once.
-                    if !seen.insert(child_id) {
-                        continue;
-                    }
-                    if let Some(child) = self.library_manager.get_item_by_id(child_id).await? {
-                        next.push(child);
+                    if seen.insert(child_id) {
+                        next.push((child_id, child));
                     }
                 }
             }
@@ -761,12 +781,15 @@ impl FerrofinSessionManager {
     }
 
     /// The playable ids behind one already-flattened, already-loaded item.
+    ///
+    /// `id` is the id the row was looked up by, so this never re-derives it
+    /// from `BaseItems.Id` and cannot degrade it (`fc01259`).
     async fn expand_one_for_playback(
         &self,
+        id: Uuid,
         item: &BaseItemEntity,
         user: Option<&UserEntity>,
     ) -> Result<Vec<Uuid>, ServiceError> {
-        let id = Uuid::parse_str(&item.id).unwrap_or_default();
         let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
 
         // The persisted `IsFolder` column is authoritative for a specific row;

@@ -1507,6 +1507,70 @@ async fn a_member_reachable_twice_is_queued_once() {
 }
 
 #[tokio::test]
+async fn a_container_member_with_an_unparseable_id_is_skipped_not_nil() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // Degrading the unparseable id to the nil GUID would be far worse than a
+    // bad entry: `translate_query` skips the parent predicate entirely when
+    // `parent_id` is nil, so the "container" would expand to the whole library.
+    let boxset = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        boxset,
+        ferrofin_model::data::BaseItemKind::BoxSet,
+        "Trilogy",
+        None,
+    )
+    .await;
+    let good = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        good,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+    {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(boxset, good, 0)
+            .await
+            .expect("link");
+    }
+    crate::test_support::seed_child_with_raw_id(
+        &db,
+        "not-a-guid",
+        ferrofin_model::data::BaseItemKind::Movie,
+        boxset,
+    )
+    .await;
+    // An unrelated item that must NOT appear: its presence would mean the
+    // parent scope was dropped.
+    let elsewhere = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        elsewhere,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Unrelated",
+    )
+    .await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![boxset]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![good],
+        "the corrupt row is dropped and the scope holds — no nil GUID, no library-wide queue"
+    );
+}
+
+#[tokio::test]
 async fn casting_a_plain_item_passes_through_unexpanded() {
     let db = test_db().await;
     let (mgr, bus) = cast_manager(&db);
