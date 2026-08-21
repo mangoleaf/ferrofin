@@ -17,7 +17,7 @@ use ferrofin_model::system::{LogFile, PublicSystemInfo, SystemInfo};
 use ferrofin_model::system_info_dtos::SystemStorageDto;
 use ferrofin_traits::net::RequestContext;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -80,7 +80,7 @@ async fn get_public_system_info(
 )]
 async fn get_system_storage(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
 ) -> Result<Json<SystemStorageDto>, ApiError> {
     let info = state.system.get_system_storage_info().await?;
     Ok(Json(SystemStorageDto::from_system_storage_info(info)))
@@ -127,7 +127,7 @@ async fn restart_application(
 )]
 async fn shutdown_application(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
     state.system.shutdown().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -146,7 +146,7 @@ async fn shutdown_application(
 )]
 async fn get_server_logs(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
 ) -> Result<Json<Vec<LogFile>>, ApiError> {
     let dir = state.config.application_paths().log_directory_path();
     let files = state.file_system.get_files(&dir, &[".txt", ".log"]);
@@ -193,7 +193,7 @@ struct LogFileQuery {
 )]
 async fn get_log_file(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Query(query): Query<LogFileQuery>,
 ) -> Result<Response, ApiError> {
     let name = query

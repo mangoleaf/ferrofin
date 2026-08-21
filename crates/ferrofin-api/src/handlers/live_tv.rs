@@ -40,7 +40,7 @@ use ferrofin_model::live_tv::{
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
@@ -696,7 +696,7 @@ async fn query_programs(
 /// guide so its channels populate immediately; returns the stored host.
 async fn add_tuner_host(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Json(info): Json<TunerHostInfo>,
 ) -> Result<Json<TunerHostInfo>, ApiError> {
     let m = live_tv(&state)?;
@@ -710,7 +710,7 @@ async fn add_tuner_host(
 /// Port of `LiveTvController.DeleteTunerHost`.
 async fn delete_tuner_host(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(q): Query<IdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.delete_tuner_host(&q.id).await?;
@@ -724,7 +724,7 @@ async fn delete_tuner_host(
 /// are not used by the XMLTV backend.
 async fn add_listing_provider(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Json(info): Json<ListingsProviderInfo>,
 ) -> Result<Json<ListingsProviderInfo>, ApiError> {
     let m = live_tv(&state)?;
@@ -738,7 +738,7 @@ async fn add_listing_provider(
 /// Port of `LiveTvController.DeleteListingProvider`.
 async fn delete_listing_provider(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(q): Query<IdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.delete_listing_provider(&q.id).await?;
@@ -751,7 +751,7 @@ async fn delete_listing_provider(
 /// successful no-op.
 async fn reset_tuner(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(tuner_id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     live_tv(&state)?.reset_tuner(&tuner_id).await?;
@@ -839,7 +839,7 @@ async fn get_recording_group(
 /// configured). Returned as a JSON array so the dashboard's SD setup page parses
 /// it instead of erroring.
 async fn get_schedules_direct_countries(
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!([]))
 }
@@ -908,7 +908,7 @@ struct SetChannelMappingDto {
 /// provider id is unknown.
 async fn set_channel_mapping(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Json(dto): Json<SetChannelMappingDto>,
 ) -> Result<Json<TunerChannelMapping>, ApiError> {
     let manager = live_tv(&state)?;
@@ -1117,7 +1117,7 @@ async fn cancel_series_timer(
 
 /// `GET /LiveTv/ChannelMappingOptions` — channel-mapping options.
 async fn get_channel_mapping_options(
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Json<ChannelMappingOptionsDto> {
     Json(ChannelMappingOptionsDto::default())
 }
@@ -1145,7 +1145,7 @@ async fn get_tuner_host_types(RequireAuth(_auth): RequireAuth) -> Json<Vec<NameI
 }
 
 /// `GET /LiveTv/Tuners/Discover` — auto-discovered tuner devices (none → empty).
-async fn discover_tuners(RequireAuth(_auth): RequireAuth) -> Json<Vec<TunerHostInfo>> {
+async fn discover_tuners(RequireAdmin(_auth): RequireAdmin) -> Json<Vec<TunerHostInfo>> {
     Json(Vec::new())
 }
 
@@ -1238,6 +1238,15 @@ mod tests {
         RequireAuth(AuthorizationInfo::default())
     }
 
+    /// The elevated caller for the tuner/listing-provider routes, which are
+    /// `RequiresElevation` upstream. Constructing the extractor directly
+    /// bypasses the policy check by design — these tests exercise the handler
+    /// body, and the gate itself is pinned end to end in
+    /// `apps/ferrofin-server/tests/elevation.rs`.
+    fn admin_auth() -> RequireAdmin {
+        RequireAdmin(AuthorizationInfo::default())
+    }
+
     #[tokio::test]
     async fn info_is_disabled_when_no_manager() {
         let info = get_live_tv_info(State(fake_state()), auth())
@@ -1300,9 +1309,13 @@ mod tests {
     #[tokio::test]
     async fn mutations_501_when_no_manager() {
         let state = fake_state();
-        let err = add_tuner_host(State(state.clone()), auth(), Json(TunerHostInfo::default()))
-            .await
-            .unwrap_err();
+        let err = add_tuner_host(
+            State(state.clone()),
+            admin_auth(),
+            Json(TunerHostInfo::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
         let err = get_channel(State(state), auth(), Path(Uuid::nil()))
             .await
@@ -1314,11 +1327,11 @@ mod tests {
     async fn defaults_and_lists() {
         let _ = get_guide_info(auth()).await;
         let _ = get_default_timer(auth()).await;
-        let _ = get_channel_mapping_options(auth()).await;
+        let _ = get_channel_mapping_options(admin_auth()).await;
         let _ = get_default_listing_provider(auth()).await;
         assert!(get_lineups(auth()).await.0.is_empty());
         assert_eq!(get_tuner_host_types(auth()).await.0.len(), 1);
-        assert!(discover_tuners(auth()).await.0.is_empty());
+        assert!(discover_tuners(admin_auth()).await.0.is_empty());
         let state = fake_state();
         assert!(
             get_recordings(State(state.clone()), auth())
@@ -1376,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn schedules_direct_countries_is_empty() {
         assert_eq!(
-            get_schedules_direct_countries(auth()).await.0,
+            get_schedules_direct_countries(admin_auth()).await.0,
             serde_json::json!([])
         );
     }
@@ -1410,7 +1423,7 @@ mod tests {
         assert_eq!(rec.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
         let map = set_channel_mapping(
             State(state),
-            auth(),
+            admin_auth(),
             Json(SetChannelMappingDto {
                 provider_id: "p".into(),
                 tuner_channel_id: "t".into(),
@@ -1620,7 +1633,7 @@ mod tests {
         let state = fake_state().with_live_tv(fake.clone());
         let mapping = set_channel_mapping(
             State(state),
-            auth(),
+            admin_auth(),
             Json(SetChannelMappingDto {
                 provider_id: "prov1".into(),
                 tuner_channel_id: "10".into(),
@@ -1645,7 +1658,7 @@ mod tests {
         let state = fake_state().with_live_tv(fake);
         let err = set_channel_mapping(
             State(state),
-            auth(),
+            admin_auth(),
             Json(SetChannelMappingDto {
                 provider_id: "missing".into(),
                 tuner_channel_id: "1".into(),

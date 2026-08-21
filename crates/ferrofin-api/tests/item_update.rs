@@ -161,6 +161,11 @@ fn base_item_entity(id: Uuid) -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
+/// Every route this file covers — `POST /Items/{itemId}`, `ContentType`,
+/// `MetadataEditor`, `Refresh`, `ExternalIdInfos` — is `RequiresElevation` upstream,
+/// so this stub authenticates as an API key — which satisfies the policy
+/// without a user/policy lookup, exactly as C# does. The gate itself is pinned
+/// end to end in `apps/ferrofin-server/tests/elevation.rs`.
 struct OkAuth;
 
 #[async_trait]
@@ -171,6 +176,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -185,6 +191,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })

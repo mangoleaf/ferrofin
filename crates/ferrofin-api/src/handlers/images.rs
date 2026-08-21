@@ -52,7 +52,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::image_upload::{
     decode_base64, image_extension_from_content_type, image_mime_from_content_type,
@@ -973,7 +973,7 @@ async fn save_item_image(
 )]
 async fn set_item_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     headers: axum::http::HeaderMap,
     body: String,
@@ -1006,7 +1006,7 @@ async fn set_item_image(
 )]
 async fn set_item_image_by_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
@@ -1048,7 +1048,7 @@ async fn set_item_image_by_index(
 )]
 async fn delete_item_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -1081,7 +1081,7 @@ async fn delete_item_image(
 )]
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -1127,7 +1127,7 @@ pub(crate) struct UpdateImageIndexQuery {
 )]
 async fn update_item_image_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {

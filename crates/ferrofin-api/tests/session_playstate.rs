@@ -105,7 +105,19 @@ fn data_dto(item_id: Uuid, played: bool) -> UserItemDataDto {
 
 /// An [`AuthService`]/[`AuthorizationContext`] authenticating as [`USER_ID`],
 /// carrying a token + client/device fields (so session-id resolution runs).
-struct OkAuth;
+/// `elevated` authenticates as an API key. Off by default: `GET /Auth/Providers` and `GET /Auth/PasswordResetProviders` are,
+/// but most routes in this file are not, and over-gating them would break
+/// ordinary clients.
+struct OkAuth {
+    elevated: bool,
+}
+
+fn authed_info_as(elevated: bool) -> AuthorizationInfo {
+    AuthorizationInfo {
+        is_api_key: elevated,
+        ..authed_info()
+    }
+}
 
 fn authed_info() -> AuthorizationInfo {
     AuthorizationInfo {
@@ -123,7 +135,7 @@ fn authed_info() -> AuthorizationInfo {
 #[async_trait]
 impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info())
+        Ok(authed_info_as(self.elevated))
     }
 }
 
@@ -133,7 +145,7 @@ impl AuthorizationContext for OkAuth {
         &self,
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info())
+        Ok(authed_info_as(self.elevated))
     }
 }
 
@@ -795,6 +807,20 @@ impl HlsStreamManager for RecordingHls {
 
 /// Builds an [`AppState`] with the recording session + user-data fakes.
 fn state(sessions: Arc<RecordingSessions>, user_data: Arc<RecordingUserData>) -> AppState {
+    state_as(sessions, user_data, false)
+}
+
+/// `state` for a caller satisfying `RequiresElevation` — `GET /Auth/Providers`
+/// and `GET /Auth/PasswordResetProviders` are admin-only upstream.
+fn elevated_state(sessions: Arc<RecordingSessions>, user_data: Arc<RecordingUserData>) -> AppState {
+    state_as(sessions, user_data, true)
+}
+
+fn state_as(
+    sessions: Arc<RecordingSessions>,
+    user_data: Arc<RecordingUserData>,
+    elevated: bool,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary),
         Arc::new(OkUsers),
@@ -810,8 +836,8 @@ fn state(sessions: Arc<RecordingSessions>, user_data: Arc<RecordingUserData>) ->
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(OkAuth { elevated }),
+        Arc::new(OkAuth { elevated }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1607,7 +1633,7 @@ async fn logout_uses_caller_token() {
 #[tokio::test]
 async fn auth_providers_are_listed() {
     let (sessions, user_data) = recording();
-    let app = state(sessions, user_data);
+    let app = elevated_state(sessions, user_data);
     let (status, body) = send(app.clone(), "GET", "/Auth/Providers", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let providers: Vec<NameIdPair> = serde_json::from_slice(&body).expect("providers");

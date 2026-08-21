@@ -49,7 +49,7 @@ use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResul
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
 
-use crate::auth::{FirstTimeSetupOrAuth, RequireAuth};
+use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
@@ -325,7 +325,7 @@ async fn get_file(
 )]
 async fn refresh_library(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<axum::http::StatusCode, ApiError> {
     state.library.queue_library_scan().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -355,7 +355,7 @@ struct MediaFoldersQuery {
 )]
 async fn get_physical_paths(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<Vec<String>>, ApiError> {
     Ok(Json(state.virtual_folders.get_physical_paths().await?))
 }
@@ -454,7 +454,7 @@ async fn get_available_options(
 )]
 async fn get_media_folders(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, None).await?;

@@ -78,7 +78,13 @@ fn user() -> UserEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
+/// `elevated` authenticates as an API key, satisfying `RequiresElevation` on
+/// the admin-only video routes (`MergeVersions`, `AlternateSources`, subtitle
+/// delete). Off by default so the playback routes keep proving they work for an
+/// ordinary user — over-gating those would break streaming for everyone.
+struct OkAuth {
+    elevated: bool,
+}
 
 #[async_trait]
 impl AuthService for OkAuth {
@@ -88,6 +94,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user()),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -102,6 +109,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user()),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -485,9 +493,22 @@ struct Harness {
     bulk: Arc<Mutex<Vec<&'static str>>>,
 }
 
+/// The ordinary-user harness.
+fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
+    state_with(path, subtitles, false)
+}
+
+/// The elevated harness, for the video routes that are `RequiresElevation`
+/// upstream: `POST /Videos/MergeVersions`,
+/// `DELETE /Videos/{itemId}/AlternateSources`, and
+/// `DELETE /Videos/{itemId}/Subtitles/{index}`.
+fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
+    state_with(path, subtitles, true)
+}
+
 /// Builds a [`Harness`] serving `path` for streams and using `subtitles` for the
 /// subtitle routes.
-fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
+fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -> Harness {
     let merged = Arc::new(Mutex::new(Vec::new()));
     let removed = Arc::new(Mutex::new(Vec::new()));
     let bulk = Arc::new(Mutex::new(Vec::new()));
@@ -512,8 +533,8 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(ferrofin_api::test_support::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(OkAuth { elevated }),
+        Arc::new(OkAuth { elevated }),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -697,7 +718,7 @@ async fn video_stream_missing_file_is_404() {
 #[tokio::test]
 async fn merge_versions_requires_two_ids() {
     let (_dir, path) = temp_media();
-    let h = state(&path, no_subtitles());
+    let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
     let resp = router
@@ -714,7 +735,7 @@ async fn merge_versions_requires_two_ids() {
 #[tokio::test]
 async fn merge_versions_merges_two_ids() {
     let (_dir, path) = temp_media();
-    let h = state(&path, no_subtitles());
+    let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
     let other = Uuid::from_u128(0x00A1_0002);
@@ -733,7 +754,7 @@ async fn merge_versions_merges_two_ids() {
 #[tokio::test]
 async fn delete_alternate_sources_ok() {
     let (_dir, path) = temp_media();
-    let h = state(&path, no_subtitles());
+    let h = elevated_state(&path, no_subtitles());
     let removed = h.removed.clone();
     let router = create_router(h.app);
     let resp = router
@@ -831,7 +852,7 @@ async fn additional_parts_missing_item_is_404() {
 async fn subtitle_delete_records_and_204() {
     let (_dir, path) = temp_media();
     let deleted = Arc::new(Mutex::new(Vec::new()));
-    let app = state(
+    let app = elevated_state(
         &path,
         Arc::new(CannedSubtitles {
             deleted: deleted.clone(),
@@ -853,7 +874,7 @@ async fn subtitle_delete_records_and_204() {
 #[tokio::test]
 async fn subtitle_delete_missing_item_404() {
     let (_dir, path) = temp_media();
-    let app = state(
+    let app = elevated_state(
         &path,
         Arc::new(CannedSubtitles {
             deleted: Arc::new(Mutex::new(Vec::new())),

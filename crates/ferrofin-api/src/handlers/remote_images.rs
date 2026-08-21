@@ -23,7 +23,7 @@ use ferrofin_model::providers::{
 use ferrofin_traits::providers::ItemUpdateType;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -169,7 +169,7 @@ struct DownloadQuery {
 )]
 async fn download_remote_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<DownloadQuery>,
 ) -> Result<StatusCode, ApiError> {

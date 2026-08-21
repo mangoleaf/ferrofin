@@ -31,6 +31,7 @@ use ferrofin_model::branding::BrandingOptionsDto;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::handlers::image_upload::{decode_base64, image_extension_from_content_type};
 use crate::state::AppState;
@@ -170,6 +171,7 @@ async fn get_splashscreen(
 )]
 async fn upload_splashscreen(
     State(state): State<AppState>,
+    _auth: RequireAdmin,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -206,7 +208,10 @@ async fn upload_splashscreen(
     responses((status = 204, description = "Splashscreen deleted")),
     tag = "ferrofin"
 )]
-async fn delete_splashscreen(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
+async fn delete_splashscreen(
+    State(state): State<AppState>,
+    _auth: RequireAdmin,
+) -> Result<StatusCode, ApiError> {
     let mut branding = state.config.get_branding().await?;
     if let Some(loc) = branding.splashscreen_location.clone()
         && !loc.trim().is_empty()

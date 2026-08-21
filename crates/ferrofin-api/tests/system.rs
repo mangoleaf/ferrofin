@@ -77,7 +77,16 @@ fn user() -> UserEntity {
 }
 
 /// An auth stub that authenticates as [`USER_ID`].
-struct OkAuth;
+/// `elevated` authenticates as an API key, satisfying `RequiresElevation` on
+/// `Info/Storage`, `Logs`, `Logs/Log` and `Shutdown`. Off by default so
+/// `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
+///
+/// `Restart` is deliberately NOT gated: upstream guards it with
+/// `LocalAccessOrRequiresElevation`, a different policy Ferrofin does not
+/// implement yet.
+struct OkAuth {
+    elevated: bool,
+}
 
 #[async_trait]
 impl AuthService for OkAuth {
@@ -88,6 +97,7 @@ impl AuthService for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             user: Some(user()),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
         })
@@ -103,6 +113,7 @@ impl AuthorizationContext for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             user: Some(user()),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
         })
@@ -318,10 +329,21 @@ impl SystemManager for StubSystem {
     }
 }
 
+/// The ordinary-user state.
+fn full_state() -> AppState {
+    full_state_with(false)
+}
+
+/// The elevated state, for `Info/Storage`, `Logs`, `Logs/Log`, `Shutdown` and
+/// the dashboard configuration pages.
+fn elevated_full_state() -> AppState {
+    full_state_with(true)
+}
+
 /// Builds an [`AppState`] whose system/filesystem/config/activity managers are
 /// stubs and the rest are panic fakes.
-fn full_state() -> AppState {
-    let auth = Arc::new(OkAuth);
+fn full_state_with(elevated: bool) -> AppState {
+    let auth = Arc::new(OkAuth { elevated });
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -358,9 +380,15 @@ fn full_state() -> AppState {
     )
 }
 
-/// Builds an [`AppState`] whose activity manager is `activity`; others are stubs.
+/// Activity-log state for an elevated caller — `/System/ActivityLog/Entries` is
+/// `RequiresElevation` upstream.
 fn state_with_activity(activity: Arc<StubActivity>) -> AppState {
-    let auth = Arc::new(OkAuth);
+    state_with_activity_elevated(activity, true)
+}
+
+/// Builds an [`AppState`] whose activity manager is `activity`; others are stubs.
+fn state_with_activity_elevated(activity: Arc<StubActivity>, elevated: bool) -> AppState {
+    let auth = Arc::new(OkAuth { elevated });
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -471,7 +499,7 @@ async fn system_ping_returns_name() {
 
 #[tokio::test]
 async fn system_storage_projects_dto() {
-    let (status, body) = get(full_state(), "/System/Info/Storage").await;
+    let (status, body) = get(elevated_full_state(), "/System/Info/Storage").await;
     assert_eq!(status, StatusCode::OK);
     let v = json(&body);
     assert_eq!(v["ProgramDataFolder"]["FreeSpace"], 100);
@@ -480,17 +508,18 @@ async fn system_storage_projects_dto() {
 
 #[tokio::test]
 async fn system_logs_list_and_fetch() {
-    let (status, body) = get(full_state(), "/System/Logs").await;
+    let (status, body) = get(elevated_full_state(), "/System/Logs").await;
     assert_eq!(status, StatusCode::OK);
     let v = json(&body);
     assert_eq!(v[0]["Name"], "ferrofin.log");
     assert_eq!(v[0]["Size"], 42);
 
-    let (fetch_status, fetch_body) = get(full_state(), "/System/Logs/Log?name=ferrofin.log").await;
+    let (fetch_status, fetch_body) =
+        get(elevated_full_state(), "/System/Logs/Log?name=ferrofin.log").await;
     assert_eq!(fetch_status, StatusCode::OK);
     assert_eq!(String::from_utf8(fetch_body).unwrap(), "log body");
 
-    let (missing_status, _) = get(full_state(), "/System/Logs/Log?name=absent.log").await;
+    let (missing_status, _) = get(elevated_full_state(), "/System/Logs/Log?name=absent.log").await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
 }
 
@@ -505,10 +534,17 @@ async fn system_endpoint_defaults_to_non_local() {
 
 #[tokio::test]
 async fn system_restart_and_shutdown_no_content() {
-    let (r, _) = send(full_state(), "POST", "/System/Restart", Body::empty(), None).await;
+    let (r, _) = send(
+        elevated_full_state(),
+        "POST",
+        "/System/Restart",
+        Body::empty(),
+        None,
+    )
+    .await;
     assert_eq!(r, StatusCode::NO_CONTENT);
     let (s, _) = send(
-        full_state(),
+        elevated_full_state(),
         "POST",
         "/System/Shutdown",
         Body::empty(),
@@ -538,7 +574,7 @@ async fn activity_log_binds_query_and_returns_entries() {
 
 #[tokio::test]
 async fn dashboard_pages_empty_and_page_not_found() {
-    let (pages, pb) = get(full_state(), "/web/ConfigurationPages").await;
+    let (pages, pb) = get(elevated_full_state(), "/web/ConfigurationPages").await;
     assert_eq!(pages, StatusCode::OK);
     assert!(json(&pb).as_array().unwrap().is_empty());
 

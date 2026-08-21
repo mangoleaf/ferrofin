@@ -196,7 +196,15 @@ fn empty_item() -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
+///
+/// `elevated` authenticates as an API key instead, which satisfies the
+/// `RequiresElevation` policy on the image *write* routes (upload, delete,
+/// reorder) without a user/policy lookup. It is deliberately NOT the default:
+/// the read routes must keep proving they work for an ordinary user, since
+/// over-gating them would break every client's thumbnail grid.
+struct OkAuth {
+    elevated: bool,
+}
 
 #[async_trait]
 impl AuthService for OkAuth {
@@ -206,6 +214,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -220,6 +229,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -700,6 +710,8 @@ struct Stubs {
     library: Arc<StubLibrary>,
     users: Arc<StubUsers>,
     providers: Arc<StubProviders>,
+    /// Whether the caller satisfies `RequiresElevation` (see [`OkAuth`]).
+    elevated: bool,
 }
 
 /// Builds the image stubs, serving `image_path` for item/by-name images and
@@ -719,6 +731,16 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             saved: Arc::new(Mutex::new(Vec::new())),
             deleted: Arc::new(Mutex::new(Vec::new())),
         }),
+        elevated: false,
+    }
+}
+
+/// [`stubs`] for the image *write* routes, which are `RequiresElevation`
+/// upstream (`ImageController`'s POST/DELETE actions).
+fn elevated_stubs(image_path: String, profile_path: String) -> Stubs {
+    Stubs {
+        elevated: true,
+        ..stubs(image_path, profile_path)
     }
 }
 
@@ -739,8 +761,12 @@ fn state(s: &Stubs) -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(ferrofin_api::test_support::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(OkAuth {
+            elevated: s.elevated,
+        }),
+        Arc::new(OkAuth {
+            elevated: s.elevated,
+        }),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -1111,7 +1137,7 @@ async fn remote_image_providers_returns_list() {
 
 #[tokio::test]
 async fn download_remote_image_is_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1124,7 +1150,7 @@ async fn download_remote_image_is_204() {
 
 #[tokio::test]
 async fn download_remote_image_missing_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1139,7 +1165,7 @@ async fn download_remote_image_missing_type_is_400() {
 
 #[tokio::test]
 async fn set_item_image_saves_and_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     // "hi" base64-encoded.
     let (status, _) = send(
         &s,
@@ -1155,7 +1181,7 @@ async fn set_item_image_saves_and_returns_204() {
 
 #[tokio::test]
 async fn set_item_image_by_index_saves() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1169,7 +1195,7 @@ async fn set_item_image_by_index_saves() {
 
 #[tokio::test]
 async fn set_item_image_bad_content_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1183,7 +1209,7 @@ async fn set_item_image_bad_content_type_is_400() {
 
 #[tokio::test]
 async fn set_item_image_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1196,7 +1222,7 @@ async fn set_item_image_missing_item_is_404() {
 
 #[tokio::test]
 async fn delete_item_image_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1213,7 +1239,7 @@ async fn delete_item_image_returns_204() {
 
 #[tokio::test]
 async fn delete_item_image_by_index_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1230,7 +1256,7 @@ async fn delete_item_image_by_index_returns_204() {
 
 #[tokio::test]
 async fn delete_item_image_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1245,7 +1271,7 @@ async fn delete_item_image_missing_item_is_404() {
 
 #[tokio::test]
 async fn update_item_image_index_swaps_and_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1262,7 +1288,7 @@ async fn update_item_image_index_swaps_and_returns_204() {
 
 #[tokio::test]
 async fn update_item_image_index_non_multiple_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1276,7 +1302,7 @@ async fn update_item_image_index_non_multiple_type_is_400() {
 
 #[tokio::test]
 async fn update_item_image_index_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",

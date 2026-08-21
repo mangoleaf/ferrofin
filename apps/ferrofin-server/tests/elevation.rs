@@ -251,6 +251,116 @@ async fn an_ordinary_account_cannot_reach_the_elevated_surface() {
     assert_eq!(status, StatusCode::FORBIDDEN, "only an admin deletes users");
 }
 
+/// The rest of the elevated surface. None of these escalate on their own, but
+/// they disclose server internals — API keys, log contents, filesystem layout,
+/// the plugin catalog — to any account that asks, and two of them take the
+/// server down or rewrite its library.
+#[tokio::test]
+async fn an_ordinary_account_cannot_reach_the_elevated_reads_and_writes() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
+    let (status, _) = call_as(
+        &router,
+        "POST",
+        "/Users/New",
+        Some(&admin_token),
+        "elev-admin",
+        Some(serde_json::json!({ "Name": USER_NAME, "Password": USER_PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let user_token = login(&router, USER_NAME, USER_PASSWORD, "elev-user").await;
+
+    for uri in [
+        "/System/Configuration/MetadataOptions/Default",
+        "/System/Logs",
+        "/System/Info/Storage",
+        "/Auth/Keys",
+        "/Auth/Providers",
+        "/ScheduledTasks",
+        "/System/ActivityLog/Entries",
+        "/Library/PhysicalPaths",
+        "/Library/MediaFolders",
+        "/Packages",
+        "/Repositories",
+        "/LiveTv/ChannelMappingOptions",
+        "/LiveTv/Tuners/Discover",
+        "/web/ConfigurationPages",
+    ] {
+        let (status, _) = call_as(&router, "GET", uri, Some(&user_token), "elev-user", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "GET {uri}");
+    }
+
+    // Elevated writes, including the two that take the server down or rewrite
+    // its configuration.
+    for (method, uri) in [
+        ("POST", "/System/Shutdown"),
+        ("POST", "/Library/Refresh"),
+        ("POST", "/Items/RemoteSearch/Person"),
+        // POST/DELETE only — a GET here is a 405, not an authz answer.
+        ("POST", "/LiveTv/TunerHosts"),
+        ("POST", "/LiveTv/ListingProviders"),
+    ] {
+        let (status, _) = call_as(
+            &router,
+            method,
+            uri,
+            Some(&user_token),
+            "elev-user",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+/// The routes an ordinary account MUST keep — the over-gating guard.
+///
+/// Gating too widely is as much a bug as gating too little: these are what a
+/// client calls to browse and play, and upstream leaves every one of them on
+/// plain `[Authorize]`.
+#[tokio::test]
+async fn an_ordinary_account_keeps_the_routes_it_needs() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
+    let (status, _) = call_as(
+        &router,
+        "POST",
+        "/Users/New",
+        Some(&admin_token),
+        "elev-admin",
+        Some(serde_json::json!({ "Name": "viewer", "Password": "viewer-pw" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = login(&router, "viewer", "viewer-pw", "elev-viewer").await;
+
+    for uri in [
+        "/Users/Me",
+        "/Items",
+        // Reading server configuration is plain `[Authorize]` upstream —
+        // `ConfigurationController` gates only the POSTs and
+        // `MetadataOptions/Default`. Debatable of Jellyfin, but it is parity,
+        // and gating it here would break the web client's settings screens.
+        "/System/Configuration",
+        "/System/Configuration/branding",
+        "/UserViews",
+        "/Sessions",
+        "/DisplayPreferences/usersettings?userId=me&client=emby",
+        "/System/Info/Public",
+        "/Localization/Options",
+    ] {
+        let (status, _) = call_as(&router, "GET", uri, Some(&token), "elev-viewer", None).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GET {uri} must stay reachable by an ordinary account"
+        );
+    }
+}
+
 /// The gate must not be so wide that it locks the administrator out — a test
 /// that only asserted `403` would pass with every route permanently denied.
 #[tokio::test]

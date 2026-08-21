@@ -28,7 +28,7 @@ use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_uuids;
@@ -144,7 +144,7 @@ struct MergeVersionsQuery {
 )]
 async fn merge_versions(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<MergeVersionsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(Some(&query.ids))?;
@@ -176,7 +176,7 @@ async fn merge_versions(
 )]
 async fn delete_alternate_sources(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     state.library.remove_alternate_sources(item_id).await?;

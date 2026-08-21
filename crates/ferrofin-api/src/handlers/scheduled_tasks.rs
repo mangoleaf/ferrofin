@@ -25,7 +25,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -62,7 +62,7 @@ struct GetTasksQuery {
 )]
 async fn get_tasks(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<GetTasksQuery>,
 ) -> Result<Json<Vec<TaskInfo>>, ApiError> {
     let tasks = state.tasks.get_tasks().await?;
@@ -92,7 +92,7 @@ async fn get_tasks(
 )]
 async fn get_task(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(task_id): Path<String>,
 ) -> Result<Json<TaskInfo>, ApiError> {
     let task = state
@@ -122,7 +122,7 @@ async fn get_task(
 )]
 async fn start_task(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(task_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     // Mirror the C# 404-before-run: report a missing task as `404` rather than
@@ -152,7 +152,7 @@ async fn start_task(
 )]
 async fn stop_task(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(task_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.tasks.cancel_task(&task_id).await?;
@@ -177,7 +177,7 @@ async fn stop_task(
 )]
 async fn update_task_triggers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(task_id): Path<String>,
     Json(triggers): Json<Vec<TaskTriggerInfo>>,
 ) -> Result<StatusCode, ApiError> {

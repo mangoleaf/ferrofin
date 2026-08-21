@@ -17,7 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::plugins::ConfigurationPageInfo;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -43,7 +43,7 @@ struct ConfigurationPagesQuery {
 )]
 async fn get_configuration_pages(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Query(query): Query<ConfigurationPagesQuery>,
 ) -> Result<Json<Vec<ConfigurationPageInfo>>, ApiError> {
     let mut pages = state.plugins.get_configuration_pages().await?;

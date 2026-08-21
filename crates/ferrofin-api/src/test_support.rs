@@ -2116,6 +2116,47 @@ pub fn authed_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> A
     .with_virtual_folders(vf)
 }
 
+/// Like [`authed_state_with_virtual_folders`] but authenticated as an API key,
+/// for `GET /Library/PhysicalPaths` and the other elevated library routes.
+#[must_use]
+pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(ApiKeyAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+    .with_virtual_folders(vf)
+}
+
 /// Builds an authenticating [`AppState`] with the given plugin manager injected,
 /// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
 ///
@@ -2283,6 +2324,50 @@ pub fn authed_state_with_library_and_monitor(
     .with_library_monitor(monitor)
 }
 
+/// Like [`authed_state_with_library_and_monitor`] but authenticated as an API
+/// key, for `POST /Library/Refresh`.
+#[must_use]
+pub fn elevated_state_with_library_and_monitor(
+    library: Arc<dyn LibraryManager>,
+    monitor: Arc<dyn LibraryMonitor>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(ApiKeyAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+    .with_library_monitor(monitor)
+}
+
 /// Builds an [`AppState`] whose library manager is `library` and whose provider
 /// manager is `providers`, with always-authenticating auth.
 ///
@@ -2312,6 +2397,50 @@ pub fn authed_state_with_library_and_providers(
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
         Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+}
+
+/// Like [`authed_state_with_library_and_providers`] but authenticated as an
+/// **API key**, which satisfies `RequiresElevation` — for the library and
+/// item-lookup routes that are admin-only upstream.
+#[must_use]
+pub fn elevated_state_with_library_and_providers(
+    library: Arc<dyn LibraryManager>,
+    providers: Arc<dyn ProviderManager>,
+) -> AppState {
+    AppState::new(
+        library,
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        providers,
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(ApiKeyAuthService),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),

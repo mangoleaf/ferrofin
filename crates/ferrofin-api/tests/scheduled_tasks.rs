@@ -31,12 +31,17 @@ use ferrofin_traits::tasks::TaskManager;
 
 /// An auth pair that authenticates every request (no user detail needed — the
 /// scheduled-task handlers only require *some* valid credential).
+/// Every `ScheduledTasksController` route is `RequiresElevation` upstream,
+/// so this stub authenticates as an API key — which satisfies the policy
+/// without a user/policy lookup, exactly as C# does. The gate itself is pinned
+/// end to end in `apps/ferrofin-server/tests/elevation.rs`.
 struct OkAuth;
 
 #[async_trait]
 impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
+            is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -50,6 +55,7 @@ impl AuthorizationContext for OkAuth {
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
+            is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })

@@ -37,7 +37,7 @@ use ferrofin_model::subtitles::FontFile;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
@@ -90,7 +90,7 @@ async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
 )]
 async fn delete_subtitle(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, index)): Path<(Uuid, i32)>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id).await?;
