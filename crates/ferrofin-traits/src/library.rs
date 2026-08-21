@@ -108,6 +108,16 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Whether an item with `id` exists.
+    ///
+    /// Semantically `get_item_by_id(id).is_some()` — which is the default — but
+    /// the concrete manager answers it with an existence probe rather than
+    /// decoding the whole row, so the "item must exist" `404` gate on the image
+    /// routes does not pay for a full `BaseItems` read it then discards.
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+        Ok(self.get_item_by_id(id).await?.is_some())
+    }
+
     /// Gets the image rows attached to an item.
     ///
     /// Port of the `BaseItem.ImageInfos` accessor the image controllers read

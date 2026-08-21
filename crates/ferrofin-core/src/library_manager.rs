@@ -43,6 +43,12 @@ use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
 };
 
+/// The placeholder item row seeded by the initial migration, which every real
+/// item query excludes (the `Uuid` form of
+/// [`PLACEHOLDER_ID`](crate::translate_query::PLACEHOLDER_ID),
+/// `00000000-0000-0000-0000-000000000001`).
+const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
+
 /// The concrete library manager.
 ///
 /// Holds cheaply-cloneable `Arc<dyn _>` handles to the four persistence traits it
@@ -171,6 +177,18 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+        // Exactly `get_item_by_id(id).is_some()`, minus the row decode:
+        // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
+        // excludes the seeded placeholder row, so both are "not an item" here
+        // too. `ItemRepository::item_exists` answers the rest with a
+        // `SELECT 1` existence probe instead of a ~70-column read.
+        if id.is_nil() || id == PLACEHOLDER_ITEM_ID {
+            return Ok(false);
+        }
+        self.items.item_exists(id).await
     }
 
     async fn get_ancestors(
@@ -945,6 +963,30 @@ mod tests {
                 .expect("nil")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn item_exists_agrees_with_get_item_by_id() {
+        // The image routes gate their 404 on `item_exists`, so it must answer
+        // exactly what `get_item_by_id(..).is_some()` answers — including for
+        // the two ids that are "not an item": the nil id and the placeholder
+        // row the initial migration seeds.
+        let db = test_db().await;
+        let id = Uuid::from_u128(11);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Stalker").await;
+        let mgr = manager(&db);
+
+        for probe in [
+            id,
+            Uuid::from_u128(0xABBA),
+            Uuid::nil(),
+            PLACEHOLDER_ITEM_ID,
+        ] {
+            let by_row = mgr.get_item_by_id(probe).await.expect("row").is_some();
+            let by_probe = mgr.item_exists(probe).await.expect("exists");
+            assert_eq!(by_probe, by_row, "disagreement on {probe}");
+        }
+        assert!(mgr.item_exists(id).await.expect("exists"));
     }
 
     #[tokio::test]
