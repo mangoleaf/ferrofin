@@ -22,6 +22,28 @@ No `OTEL_EXPORTER_OTLP_ENDPOINT` ⇒ no provider, no overhead beyond the existin
 fmt subscriber. Export must never gate or alter server behaviour; exporter init
 failure logs a `warn!` and the server runs on (same posture as metrics init).
 
+"No overhead" is enforced at the request span's callsite, not just at the
+provider: fields that exist **only** for the exporter (`otel.name`,
+`http.response.status_code`) are absent from the `otlp == false` branch of
+`build_request_span`, so the work that fills them is a no-op with export off.
+That is worth doing because the fmt sinks materialise a span's fields eagerly —
+and a `Span::record` onto a span that already carries fields makes the JSON sink
+re-parse and re-serialize its whole formatted field string.
+
+Measured directly, optimized build, production sink stack (JSON stdout layer +
+plain-text file layer), 200k iterations x 5, median-of-5, as the delta between a
+span carrying the `Empty` status field plus its `record` and the same span
+without the field:
+
+| sinks | with field | without | delta |
+|---|---|---|---|
+| JSON + text | 1.198 µs | 0.606 µs | **0.592 µs** |
+| text only | 0.328 µs | 0.250 µs | 0.078 µs |
+
+Against a ~80 µs/request budget that is well under 1% — small, but it is pure
+waste when nothing exports, and it scales with the number of exporter-only
+fields. A new exporter-only field belongs in the `otlp` branch alone.
+
 ## 3. Sampling is the storage knob
 
 `ParentBased(TraceIdRatioBased(ratio))`, `ratio` from `OTEL_TRACES_SAMPLER_ARG`

@@ -41,7 +41,9 @@ async fn boot() -> (WiredApp, Database, tempfile::TempDir) {
         chromaprint_muxer: false,
     };
     let (tx, _rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, tx).await.unwrap();
+    let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
+        .await
+        .unwrap();
     (wired, db, tmp)
 }
 

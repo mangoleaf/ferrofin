@@ -165,7 +165,12 @@ fn item_entity(id: Uuid, name: &str, kind: BaseItemKind) -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
+/// `elevated` authenticates as an API key. Off by default: `GET /Library/MediaFolders` is `RequiresElevation` upstream,
+/// but most routes in this file are not, and over-gating them would break
+/// ordinary clients.
+struct OkAuth {
+    elevated: bool,
+}
 
 #[async_trait]
 impl AuthService for OkAuth {
@@ -175,6 +180,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -189,6 +195,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -588,7 +595,7 @@ impl DtoService for OkDto {
 }
 
 /// Builds an [`AppState`] wired with the user-library stubs.
-fn state() -> AppState {
+fn state_as(elevated: bool) -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
         Arc::new(OkUsers),
@@ -604,8 +611,8 @@ fn state() -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(OkAuth { elevated }),
+        Arc::new(OkAuth { elevated }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -627,7 +634,16 @@ fn state() -> AppState {
 
 /// Drives one request through the router and returns (status, body bytes).
 async fn send(method: &str, uri: &str, body: Body) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state());
+    send_as(method, uri, body, false).await
+}
+
+/// [`send`] for a caller satisfying `RequiresElevation`.
+async fn send_elevated(method: &str, uri: &str, body: Body) -> (StatusCode, Vec<u8>) {
+    send_as(method, uri, body, true).await
+}
+
+async fn send_as(method: &str, uri: &str, body: Body, elevated: bool) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state_as(elevated));
     let response = router
         .oneshot(
             Request::builder()
@@ -823,7 +839,8 @@ async fn grouping_options_returns_name_sorted_views() {
 
 #[tokio::test]
 async fn media_folders_returns_collection_folders() {
-    let (status, body) = send("GET", "/Library/MediaFolders", Body::empty()).await;
+    // `GET /Library/MediaFolders` is `RequiresElevation` upstream.
+    let (status, body) = send_elevated("GET", "/Library/MediaFolders", Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
     assert_eq!(result.items.len(), 2);

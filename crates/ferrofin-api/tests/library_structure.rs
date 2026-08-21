@@ -19,7 +19,8 @@ use axum::http::{Request, StatusCode, header};
 use ferrofin_api::AppState;
 use ferrofin_api::create_router;
 use ferrofin_api::test_support::{
-    FakeVirtualFolders, authed_state_with_virtual_folders, fake_state,
+    FakeVirtualFolders, authed_state_with_virtual_folders, elevated_state_with_virtual_folders,
+    fake_state,
 };
 use tower::ServiceExt;
 
@@ -458,7 +459,9 @@ async fn update_library_options_by_name_and_missing_is_404() {
 
 #[tokio::test]
 async fn physical_paths_unions_locations() {
-    let (state, vf) = working_state();
+    // `GET /Library/PhysicalPaths` is `RequiresElevation` upstream.
+    let vf = Arc::new(FakeVirtualFolders::working());
+    let state = elevated_state_with_virtual_folders(vf.clone());
     let mut options = ferrofin_model::configuration::LibraryOptions::default();
     options
         .path_infos

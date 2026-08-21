@@ -46,7 +46,7 @@ use ferrofin_traits::providers::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -67,7 +67,7 @@ use crate::state::AppState;
 )]
 async fn get_external_id_infos(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
     if state.library.get_item_by_id(item_id).await?.is_none() {
@@ -108,9 +108,13 @@ async fn run_remote_search(
 
 /// Generates a `POST /Items/RemoteSearch/{route}` handler for one lookup type.
 macro_rules! remote_search_handler {
+    // `$auth` is the extractor guarding the generated route. Upstream gates
+    // ONLY `RemoteSearch/Person` with `RequiresElevation` and leaves the other
+    // nine remote searches on plain `[Authorize]` — asymmetric, but it is what
+    // `ItemLookupController` does at v10.11.8, so it is what we do.
     (
         $(#[$meta:meta])*
-        fn $fn_name:ident($info:ty, $kind:expr, $route:literal)
+        fn $fn_name:ident($info:ty, $kind:expr, $route:literal, $auth:ty)
     ) => {
         $(#[$meta])*
         #[utoipa::path(
@@ -124,7 +128,7 @@ macro_rules! remote_search_handler {
         )]
         async fn $fn_name(
             State(state): State<AppState>,
-            RequireAuth(_auth): RequireAuth,
+            _auth: $auth,
             Json(query): Json<RemoteSearchQuery<$info>>,
         ) -> Result<Json<Vec<RemoteSearchResult>>, ApiError> {
             let request = to_request(query, $kind, |info| info.base);
@@ -135,39 +139,39 @@ macro_rules! remote_search_handler {
 
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Movie` — port of `GetMovieRemoteSearchResults`.
-    fn movie_remote_search(MovieInfo, BaseItemKind::Movie, "Movie")
+    fn movie_remote_search(MovieInfo, BaseItemKind::Movie, "Movie", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Trailer` — port of `GetTrailerRemoteSearchResults`.
-    fn trailer_remote_search(TrailerInfo, BaseItemKind::Trailer, "Trailer")
+    fn trailer_remote_search(TrailerInfo, BaseItemKind::Trailer, "Trailer", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/MusicVideo` — port of `GetMusicVideoRemoteSearchResults`.
-    fn music_video_remote_search(MusicVideoInfo, BaseItemKind::MusicVideo, "MusicVideo")
+    fn music_video_remote_search(MusicVideoInfo, BaseItemKind::MusicVideo, "MusicVideo", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Series` — port of `GetSeriesRemoteSearchResults`.
-    fn series_remote_search(SeriesInfo, BaseItemKind::Series, "Series")
+    fn series_remote_search(SeriesInfo, BaseItemKind::Series, "Series", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/BoxSet` — port of `GetBoxSetRemoteSearchResults`.
-    fn box_set_remote_search(BoxSetInfo, BaseItemKind::BoxSet, "BoxSet")
+    fn box_set_remote_search(BoxSetInfo, BaseItemKind::BoxSet, "BoxSet", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/MusicArtist` — port of `GetMusicArtistRemoteSearchResults`.
-    fn music_artist_remote_search(ArtistInfo, BaseItemKind::MusicArtist, "MusicArtist")
+    fn music_artist_remote_search(ArtistInfo, BaseItemKind::MusicArtist, "MusicArtist", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/MusicAlbum` — port of `GetMusicAlbumRemoteSearchResults`.
-    fn music_album_remote_search(AlbumInfo, BaseItemKind::MusicAlbum, "MusicAlbum")
+    fn music_album_remote_search(AlbumInfo, BaseItemKind::MusicAlbum, "MusicAlbum", RequireAuth)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Person` — port of `GetPersonRemoteSearchResults`.
-    fn person_remote_search(PersonLookupInfo, BaseItemKind::Person, "Person")
+    fn person_remote_search(PersonLookupInfo, BaseItemKind::Person, "Person", RequireAdmin)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Book` — port of `GetBookRemoteSearchResults`.
-    fn book_remote_search(BookInfo, BaseItemKind::Book, "Book")
+    fn book_remote_search(BookInfo, BaseItemKind::Book, "Book", RequireAuth)
 }
 
 /// Query string of `POST /Items/RemoteSearch/Apply/{itemId}`.
@@ -205,7 +209,7 @@ fn default_true() -> bool {
 )]
 async fn apply_search_criteria(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
     Json(_search_result): Json<RemoteSearchResult>,

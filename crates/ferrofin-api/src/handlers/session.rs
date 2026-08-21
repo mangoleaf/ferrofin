@@ -33,7 +33,7 @@ use ferrofin_model::session::{
 };
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::{current_session, current_session_id};
@@ -542,7 +542,7 @@ async fn report_session_ended(
 )]
 async fn get_auth_providers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<Vec<NameIdPair>>, ApiError> {
     let providers = state.users.get_authentication_providers().await?;
     Ok(Json(providers))
@@ -559,7 +559,7 @@ async fn get_auth_providers(
 )]
 async fn get_password_reset_providers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<Vec<NameIdPair>>, ApiError> {
     let providers = state.users.get_password_reset_providers().await?;
     Ok(Json(providers))

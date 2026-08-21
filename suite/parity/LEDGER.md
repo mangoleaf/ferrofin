@@ -249,7 +249,7 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `POST /Backup/Restore` — not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run.
 - ⚠️ `GET /Channels/{channelId}/Features` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `GET /Channels/{channelId}/Items` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
-- ⚠️ `GET /DisplayPreferences/{displayPreferencesId}` — verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses.
+- ⚠️ `GET /DisplayPreferences/{displayPreferencesId}` — verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses.
 - ⚠️ `GET /Environment/DirectoryContents` — not-testable-this-way: lists the server host's filesystem, which differs per container instance.
 - ⚠️ `GET /Environment/Drives` — instance: per-host filesystem drives.
 - ⚠️ `GET /Environment/ParentPath` — not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific.
@@ -258,13 +258,13 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `GET /Episode/{id}/IntroSkipperSegments` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `POST /FileTransformation/RegisterTransformation` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
 - ⚠️ `GET /Genres` — verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result.
-- ⚠️ `GET /Genres/{genreName}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Hermit 404 vs Jellyfin auto-created 200. Shape verified.
-- ⚠️ `GET /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
-- ⚠️ `HEAD /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
-- ⚠️ `GET /Genres/{name}/Images/{imageType}/{imageIndex}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
-- ⚠️ `HEAD /Genres/{name}/Images/{imageType}/{imageIndex}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
+- ⚠️ `GET /Genres/{genreName}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Ferrofin 404 vs Jellyfin auto-created 200. Shape verified.
+- ⚠️ `GET /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
+- ⚠️ `HEAD /Genres/{name}/Images/{imageType}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
+- ⚠️ `GET /Genres/{name}/Images/{imageType}/{imageIndex}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
+- ⚠️ `HEAD /Genres/{name}/Images/{imageType}/{imageIndex}` — deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported.
 - ⚠️ `GET /IntroSkipper` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
-- ⚠️ `GET /IntroSkipper/SupportBundle` — expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.
+- ⚠️ `GET /IntroSkipper/SupportBundle` — expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design.
 - ⚠️ `POST /Intros/AnalyzerActions/UpdateSeason` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
 - ⚠️ `GET /Intros/AnalyzerActions/{SeasonId}` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
 - ⚠️ `POST /Intros/EraseTimestamps` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
@@ -284,7 +284,7 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `POST /Items/RemoteSearch/Person` — deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).
 - ⚠️ `POST /Items/RemoteSearch/Series` — deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).
 - ⚠️ `POST /Items/RemoteSearch/Trailer` — deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness).
-- ⚠️ `GET /Items/Root` — deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200).
+- ⚠️ `GET /Items/Root` — deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200).
 - ⚠️ `GET /Items/Suggestions` — instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior).
 - ⚠️ `GET /Items/{itemId}` — instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred).
 - ⚠️ `GET /Items/{itemId}/Ancestors` — instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope).
@@ -323,7 +323,7 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `DELETE /LiveTv/ListingProviders` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `POST /LiveTv/ListingProviders` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `GET /LiveTv/ListingProviders/Lineups` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
-- ⚠️ `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` — deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision.
+- ⚠️ `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` — deferred: Jellyfin proxies json.schedulesdirect.org; Ferrofin has no Schedules Direct DVR provider (returns empty). Subsystem decision.
 - ⚠️ `GET /LiveTv/LiveRecordings/{recordingId}/stream` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `POST /LiveTv/Programs` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
@@ -342,15 +342,15 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `POST /LiveTv/Timers/{timerId}` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `DELETE /LiveTv/TunerHosts` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `POST /LiveTv/TunerHosts` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
-- ⚠️ `GET /LiveTv/TunerHosts/Types` — deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported.
+- ⚠️ `GET /LiveTv/TunerHosts/Types` — deferred: Ferrofin implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported.
 - ⚠️ `POST /LiveTv/Tuners/{tunerId}/Reset` — requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for.
 - ⚠️ `GET /MediaSegmentsApi` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `POST /MediaSegmentsApi/{itemId}` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `DELETE /MediaSegmentsApi/{segmentId}` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
-- ⚠️ `POST /MergeVersions/MergeEpisodes` — expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
-- ⚠️ `POST /MergeVersions/MergeMovies` — expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
-- ⚠️ `POST /MergeVersions/SplitEpisodes` — expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
-- ⚠️ `POST /MergeVersions/SplitMovies` — expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
+- ⚠️ `POST /MergeVersions/MergeEpisodes` — expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
+- ⚠️ `POST /MergeVersions/MergeMovies` — expected-extension: Ferrofin ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
+- ⚠️ `POST /MergeVersions/SplitEpisodes` — expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
+- ⚠️ `POST /MergeVersions/SplitMovies` — expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design.
 - ⚠️ `GET /Movies/{itemId}/Similar` — deferred: same weighted similarity scorer as Items/{id}/Similar.
 - ⚠️ `GET /MusicGenres` — verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres).
 - ⚠️ `GET /MusicGenres/InstantMix` — not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre).
@@ -361,8 +361,8 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `GET /Packages/{name}` — instance: resolves a package by name/assemblyGuid from the aggregated repository catalog — catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests.
 - ⚠️ `GET /Persons/{name}` — accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing person→200 BaseItemDto, absent→404 (both servers 404 in the harness run). Shape verified.
 - ⚠️ `GET /Playback/BitrateTest` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
-- ⚠️ `GET /Playlists/{itemId}/InstantMix` — expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.
-- ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect.
+- ⚠️ `GET /Playlists/{itemId}/InstantMix` — expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset.
+- ⚠️ `DELETE /Playlists/{playlistId}/Users/{userId}` — instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect.
 - ⚠️ `GET /Plugins` — expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) — the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests).
 - ⚠️ `DELETE /Plugins/{pluginId}` — accepted-divergence: real uninstall for a staged WASM plugin (file + config + enabled override removed, restart-required); a compiled-in extension honestly rejects with 400 where Jellyfin can uninstall any plugin. Admin-only.
 - ⚠️ `GET /Plugins/{pluginId}/Configuration` — instance: the two servers share no plugin id (Ferrofin ships compiled-in extensions + WASM plugins; stock Jellyfin ships neither), so there is no config to fetch on both sides. Real read (stored values overlaid on defaults, C# partial-deserialize semantics); verified 2026-08-14 by unit + handler tests.
@@ -385,37 +385,37 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `POST /Startup/Configuration` — not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done.
 - ⚠️ `POST /Startup/RemoteAccess` — not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server.
 - ⚠️ `POST /Startup/User` — not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server.
-- ⚠️ `GET /Studios/{name}` — accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404.
-- ⚠️ `POST /SyncPlay/Buffering` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Join` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Leave` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/MovePlaylistItem` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/New` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/NextItem` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Pause` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Ping` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/PreviousItem` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Queue` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Ready` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/RemoveFromPlaylist` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Seek` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/SetIgnoreWait` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/SetNewQueue` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/SetPlaylistItem` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/SetRepeatMode` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/SetShuffleMode` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Stop` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `POST /SyncPlay/Unpause` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
-- ⚠️ `GET /SyncPlay/{id}` — requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration).
+- ⚠️ `GET /Studios/{name}` — accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404.
+- ⚠️ `POST /SyncPlay/Buffering` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Join` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Leave` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/MovePlaylistItem` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/New` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/NextItem` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Pause` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Ping` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/PreviousItem` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Queue` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Ready` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/RemoveFromPlaylist` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Seek` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/SetIgnoreWait` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/SetNewQueue` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/SetPlaylistItem` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/SetRepeatMode` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/SetShuffleMode` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Stop` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `POST /SyncPlay/Unpause` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
+- ⚠️ `GET /SyncPlay/{id}` — verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py).
 - ⚠️ `GET /System/ActivityLog/Entries` — instance: activity-log entries differ per instance/run.
-- ⚠️ `GET /System/Configuration` — instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug.
+- ⚠️ `GET /System/Configuration` — instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug.
 - ⚠️ `GET /System/Info/Storage` — instance: per-host disk paths and free/used space.
 - ⚠️ `GET /System/Logs` — instance: log-file set differs per instance/run.
 - ⚠️ `GET /System/Logs/Log` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
-- ⚠️ `GET /System/Ping` — instance: returns the server name string (hermit vs the Jellyfin instance name).
+- ⚠️ `GET /System/Ping` — instance: returns the server name string (ferrofin vs the Jellyfin instance name).
 - ⚠️ `POST /System/Restart` — not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff.
 - ⚠️ `POST /System/Shutdown` — not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff.
-- ⚠️ `GET /Trailers` — instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap.
+- ⚠️ `GET /Trailers` — instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap.
 - ⚠️ `GET /Trailers/{itemId}/Similar` — deferred: weighted similarity scorer not ported.
 - ⚠️ `GET /UserViews` — instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir.
 - ⚠️ `POST /Users/ForgotPassword` — not-testable-this-way: password-reset initiation returns a PIN challenge whose PinFile path is host-instance-specific and whose completion requires reading that file off the server host.
@@ -438,10 +438,10 @@ _Extensions must not dilute or flatter core's coverage number — each owner's d
 - ⚠️ `GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}` — not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies).
 - ⚠️ `GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}` — not-testable-this-way: binary/subtitle file output — not a JSON body to diff.
-- ⚠️ `GET /Years` — expected-extension: Hermit does not materialize Year items (documented out-of-scope).
-- ⚠️ `GET /Years/{year}` — expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200).
+- ⚠️ `GET /Years` — expected-extension: Ferrofin does not materialize Year items (documented out-of-scope).
+- ⚠️ `GET /Years/{year}` — expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200).
 - ⚠️ `GET /web/ConfigurationPage` — expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises.
-- ⚠️ `GET /web/ConfigurationPages` — expected-extension: plugin configuration pages come from external plugins Hermit doesn't host.
+- ⚠️ `GET /web/ConfigurationPages` — expected-extension: plugin configuration pages come from external plugins Ferrofin doesn't host.
 
 ## Full ledger
 
@@ -505,7 +505,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Devices/Info` | registered | REAL | ✅ | · | ✅ | ok |
 | `GET /Devices/Options` | registered | REAL | ✅ | · | ✅ | ok |
 | `POST /Devices/Options` | registered | REAL | · | · | ✅ | ok |
-| `GET /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ⚠️ | verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Hermit returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses. |
+| `GET /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ⚠️ | verified 2026-08-11: the auto-flag was a harness artifact (literal unresolved {displayPreferencesId}); with a real client key (e.g. usersettings?client=emby) Ferrofin returns 200 DisplayPreferencesDto (Id/Client/SortBy/CustomPrefs) — the by-client resolution Jellyfin uses. |
 | `POST /DisplayPreferences/{displayPreferencesId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Environment/DefaultDirectoryBrowser` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /Environment/DirectoryContents` | registered | REAL | ✅ | · | · | not-testable-this-way: lists the server host's filesystem, which differs per container instance. |
@@ -520,14 +520,14 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /FallbackFont/Fonts/{name}` | registered | REAL | ✅ | · | ✅ |  |
 | `POST /FileTransformation/RegisterTransformation` | registered | REAL | · | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
 | `GET /Genres` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: QueryResult<BaseItemDto> (Items array + TotalRecordCount + StartIndex), status+schema conformant; empty-library returns the well-formed empty result. |
-| `GET /Genres/{genreName}` | registered | REAL | ✅ | ✅ | ⚠️ | accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Hermit 404 vs Jellyfin auto-created 200. Shape verified. |
-| `GET /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
-| `HEAD /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
-| `GET /Genres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
-| `HEAD /Genres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Hermit has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
+| `GET /Genres/{genreName}` | registered | REAL | ✅ | ✅ | ⚠️ | accepted-divergence: same no-lazy-create-on-GET family as /Studios/{name}. Existing genre→200 BaseItemDto (both servers), absent→Ferrofin 404 vs Jellyfin auto-created 200. Shape verified. |
+| `GET /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
+| `HEAD /Genres/{name}/Images/{imageType}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
+| `GET /Genres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
+| `HEAD /Genres/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ⚠️ | · | ⚠️ | deferred: Jellyfin dynamically generates a genre image by compositing the genre's child-item posters into a collage (DynamicImageProvider); Ferrofin has no dynamic image-collage generator, so it returns 404 (H=404 vs J=200 600x600). Not ported. |
 | `GET /GetUtcTime` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /IntroSkipper` | registered | REAL | ⚠️ | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
-| `GET /IntroSkipper/SupportBundle` | registered | REAL | ⚠️ | ⚠️ | · | expected-extension: IntroSkipper is a compiled-in Hermit plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design. |
+| `GET /IntroSkipper/SupportBundle` | registered | REAL | ⚠️ | ⚠️ | · | expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (H=200 vs J=404). By design. |
 | `POST /Intros/AnalyzerActions/UpdateSeason` | registered | REAL | · | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
 | `GET /Intros/AnalyzerActions/{SeasonId}` | registered | REAL | ⚠️ | ✅ | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
 | `POST /Intros/EraseTimestamps` | registered | REAL | · | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
@@ -552,11 +552,11 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /Items/RemoteSearch/Person` | registered | REAL | · | · | · | deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness). |
 | `POST /Items/RemoteSearch/Series` | registered | REAL | · | · | · | deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness). |
 | `POST /Items/RemoteSearch/Trailer` | registered | REAL | · | · | · | deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness). |
-| `GET /Items/Root` | registered | REAL | ⚠️ | · | · | deferred: Hermit deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200). |
+| `GET /Items/Root` | registered | REAL | ⚠️ | · | · | deferred: Ferrofin deliberately omits the synthetic root/aggregate folder tree (documented out-of-scope — see the Items/{id}/Ancestors classification), so there is no user root folder item to return (H=404 vs J=200). |
 | `GET /Items/Suggestions` | registered | REAL | ✅ | ✅ | ⚠️ | instance/methodology: Jellyfin orders suggestions by Random, so the set is non-deterministic across independent scans (matches Jellyfin's behavior). |
 | `DELETE /Items/{itemId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Items/{itemId}` | registered | REAL | ✅ | ✅ | ⚠️ | instance/probe-noise: residual diffs are MediaStream probe values (BitRate/IsAVC/Level/RealFrameRate) that vary per independent probe, plus Localized* (needs localization on read-back, deferred). |
-| `POST /Items/{itemId}` | registered | REAL | · | · | ✅ | instance/methodology: the metadata edit persists correctly on Hermit (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Hermit defect. |
+| `POST /Items/{itemId}` | registered | REAL | · | · | ✅ | instance/methodology: the metadata edit persists correctly on Ferrofin (read-back reflects it); Jellyfin's read-back didn't reflect the synthetic tag-edit body (oracle/body difference), so this is not a Ferrofin defect. |
 | `GET /Items/{itemId}/Ancestors` | registered | REAL | ✅ | ✅ | ⚠️ | instance: ancestor set differs only by /config-vs-/data path-derived ids + the deliberately-omitted synthetic root/aggregate folder tree (documented out-of-scope). |
 | `POST /Items/{itemId}/ContentType` | registered | REAL | · | · | ✅ | ok |
 | `GET /Items/{itemId}/CriticReviews` | registered | REAL | ✅ | ✅ | ✅ |  |
@@ -622,7 +622,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /LiveTv/ListingProviders` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `GET /LiveTv/ListingProviders/Default` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /LiveTv/ListingProviders/Lineups` | registered | REAL | ⚠️ | ✅ | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
-| `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` | registered | REAL | ✅ | ⚠️ | ⚠️ | deferred: Jellyfin proxies json.schedulesdirect.org; Hermit has no Schedules Direct DVR provider (returns empty). Subsystem decision. |
+| `GET /LiveTv/ListingProviders/SchedulesDirect/Countries` | registered | REAL | ✅ | ⚠️ | ⚠️ | deferred: Jellyfin proxies json.schedulesdirect.org; Ferrofin has no Schedules Direct DVR provider (returns empty). Subsystem decision. |
 | `GET /LiveTv/LiveRecordings/{recordingId}/stream` | registered | REAL | · | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}` | registered | REAL | · | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `GET /LiveTv/Programs` | registered | REAL | ✅ | ✅ | ✅ |  |
@@ -649,7 +649,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /LiveTv/Timers/{timerId}` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `DELETE /LiveTv/TunerHosts` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
 | `POST /LiveTv/TunerHosts` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
-| `GET /LiveTv/TunerHosts/Types` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: Hermit implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported. |
+| `GET /LiveTv/TunerHosts/Types` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: Ferrofin implements only the M3U tuner-host type and correctly advertises only that; HDHomeRun/etc. tuner hosts are unported. |
 | `GET /LiveTv/Tuners/Discover` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `GET /LiveTv/Tuners/Discvover` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /LiveTv/Tuners/{tunerId}/Reset` | registered | REAL | · | · | · | requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for. |
@@ -661,11 +661,11 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /MediaSegmentsApi` | registered | REAL | ⚠️ | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `POST /MediaSegmentsApi/{itemId}` | registered | REAL | · | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `DELETE /MediaSegmentsApi/{segmentId}` | registered | REAL | · | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
-| `POST /MergeVersions/MergeEpisodes` | registered | REAL | · | · | ⚠️ | expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
-| `POST /MergeVersions/MergeMovies` | registered | REAL | · | · | ⚠️ | expected-extension: Hermit ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
-| `POST /MergeVersions/SplitEpisodes` | registered | REAL | · | · | ⚠️ | expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
-| `POST /MergeVersions/SplitMovies` | registered | REAL | · | · | ⚠️ | expected-extension: Hermit ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
-| `GET /Movies/Recommendations` | registered | REAL | ✅ | ✅ | ✅ | deferred: Hermit seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data. |
+| `POST /MergeVersions/MergeEpisodes` | registered | REAL | · | · | ⚠️ | expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
+| `POST /MergeVersions/MergeMovies` | registered | REAL | · | · | ⚠️ | expected-extension: Ferrofin ships the MergeVersions controller (danieladov 'Merge Versions' plugin surface) compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
+| `POST /MergeVersions/SplitEpisodes` | registered | REAL | · | · | ⚠️ | expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
+| `POST /MergeVersions/SplitMovies` | registered | REAL | · | · | ⚠️ | expected-extension: Ferrofin ships the MergeVersions controller compiled-in; stock Jellyfin 10.11.8 lacks it (H=2xx vs J=404). By design. |
+| `GET /Movies/Recommendations` | registered | REAL | ✅ | ✅ | ✅ | deferred: Ferrofin seeds recommendations off DateCreated recency, not user behavior (played/favorites/people). Real gap but L-effort and only observable on a fixture with user data. |
 | `GET /Movies/{itemId}/Similar` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: same weighted similarity scorer as Items/{id}/Similar. |
 | `GET /MusicGenres` | registered | REAL | ✅ | ✅ | ⚠️ | verified 2026-08-11: QueryResult<BaseItemDto>, status+schema conformant (same by-name list shape as /Genres). |
 | `GET /MusicGenres/InstantMix` | registered | REAL | ✅ | · | · | not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre). |
@@ -690,7 +690,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /PlayingItems/{itemId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /PlayingItems/{itemId}/Progress` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists` | registered | REAL | · | · | ✅ | ok |
-| `GET /Playlists/{itemId}/InstantMix` | registered | REAL | ⚠️ | ✅ | · | expected-extension: Hermit generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset. |
+| `GET /Playlists/{itemId}/InstantMix` | registered | REAL | ⚠️ | ✅ | · | expected-extension: Ferrofin generates an instant mix for a playlist (H=200); stock Jellyfin returns 404 (playlists are not an instant-mix source). A harmless superset. |
 | `GET /Playlists/{playlistId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists/{playlistId}` | registered | REAL | · | · | ✅ | ok |
 | `DELETE /Playlists/{playlistId}/Items` | registered | REAL | · | · | ✅ | ok |
@@ -698,7 +698,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `POST /Playlists/{playlistId}/Items` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Playlists/{playlistId}/Users` | registered | REAL | · | · | ✅ | ok |
-| `DELETE /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ⚠️ | instance/methodology: Hermit correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Hermit is the more-correct side — not a defect. |
+| `DELETE /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ⚠️ | instance/methodology: Ferrofin correctly removes the playlist share (H read-back shows it gone); Jellyfin returns 204 but still lists the user (Jellyfin quirk), so Ferrofin is the more-correct side — not a defect. |
 | `GET /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /Playlists/{playlistId}/Users/{userId}` | registered | REAL | · | · | ✅ | ok |
 | `GET /Plugins` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: lists Ferrofin's installed plugins (compiled-in extensions + staged WASM plugins) — the set necessarily differs from any stock Jellyfin instance. Route is real and schema-conformant (server HTTP tests). |
@@ -758,35 +758,35 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Startup/User` | registered | REAL | ✅ | ✅ | ✅ |  |
 | `POST /Startup/User` | registered | REAL | · | · | · | not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server. |
 | `GET /Studios` | registered | REAL | ✅ | ✅ | ✅ | ok |
-| `GET /Studios/{name}` | registered | REAL | ⚠️ | · | ⚠️ | accepted-divergence: Hermit does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Hermit returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404. |
+| `GET /Studios/{name}` | registered | REAL | ⚠️ | · | ⚠️ | accepted-divergence: Ferrofin does not lazily CREATE a by-name item on a GET (Jellyfin's GetItemByName writes a row as a read side-effect → J=200 for an absent studio). Ferrofin returns the item if it exists (200, BaseItemDto) else 404 — a GET with no filesystem write. Verified live 2026-08-11: existing→200, absent→404. |
 | `GET /Studios/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `HEAD /Studios/{name}/Images/{imageType}` | registered | REAL | ✅ | · | ✅ |  |
 | `GET /Studios/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ✅ | · | ✅ |  |
 | `HEAD /Studios/{name}/Images/{imageType}/{imageIndex}` | registered | REAL | ✅ | · | ✅ |  |
-| `POST /SyncPlay/Buffering` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Join` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Leave` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
+| `POST /SyncPlay/Buffering` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Join` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Leave` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
 | `GET /SyncPlay/List` | registered | REAL | ✅ | ✅ | ✅ |  |
-| `POST /SyncPlay/MovePlaylistItem` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/New` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/NextItem` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Pause` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Ping` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/PreviousItem` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Queue` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Ready` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/RemoveFromPlaylist` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Seek` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/SetIgnoreWait` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/SetNewQueue` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/SetPlaylistItem` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/SetRepeatMode` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/SetShuffleMode` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Stop` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `POST /SyncPlay/Unpause` | registered | REAL | · | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
-| `GET /SyncPlay/{id}` | registered | REAL | ✅ | · | · | requires-syncplay-group: requires an active SyncPlay group (multi-client session orchestration). |
+| `POST /SyncPlay/MovePlaylistItem` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/New` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/NextItem` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Pause` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Ping` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/PreviousItem` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Queue` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Ready` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/RemoveFromPlaylist` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Seek` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/SetIgnoreWait` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/SetNewQueue` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/SetPlaylistItem` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/SetRepeatMode` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/SetShuffleMode` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Stop` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `POST /SyncPlay/Unpause` | registered | REAL | · | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
+| `GET /SyncPlay/{id}` | registered | REAL | ✅ | · | · | verified-by-push-probe: the response body carries no signal here — the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py). |
 | `GET /System/ActivityLog/Entries` | registered | REAL | ✅ | ✅ | ⚠️ | instance: activity-log entries differ per instance/run. |
-| `GET /System/Configuration` | registered | REAL | ✅ | ✅ | ⚠️ | instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Hermit auto-seeds — setup state, not a bug. |
+| `GET /System/Configuration` | registered | REAL | ✅ | ✅ | ⚠️ | instance/methodology: real default fields (PluginRepositories/EnableLegacyAuthorization/CacheSize) now match; residual IsStartupWizardCompleted/IsPortAuthorized reflect the harness completing Jellyfin's wizard during setup while Ferrofin auto-seeds — setup state, not a bug. |
 | `POST /System/Configuration` | registered | REAL | · | · | ✅ | ok |
 | `POST /System/Configuration/Branding` | registered | REAL | · | · | ✅ | ok |
 | `GET /System/Configuration/MetadataOptions/Default` | registered | REAL | ✅ | ✅ | ✅ |  |
@@ -798,12 +798,12 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /System/Info/Storage` | registered | REAL | ✅ | ✅ | ⚠️ | instance: per-host disk paths and free/used space. |
 | `GET /System/Logs` | registered | REAL | ✅ | ✅ | ⚠️ | instance: log-file set differs per instance/run. |
 | `GET /System/Logs/Log` | registered | REAL | ✅ | · | · | not-testable-this-way: binary/subtitle file output — not a JSON body to diff. |
-| `GET /System/Ping` | registered | REAL | ✅ | ✅ | ⚠️ | instance: returns the server name string (hermit vs the Jellyfin instance name). |
+| `GET /System/Ping` | registered | REAL | ✅ | ✅ | ⚠️ | instance: returns the server name string (ferrofin vs the Jellyfin instance name). |
 | `POST /System/Ping` | registered | REAL | · | · | ✅ | ok |
 | `POST /System/Restart` | registered | REAL | · | · | · | not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff. |
 | `POST /System/Shutdown` | registered | REAL | · | · | · | not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff. |
 | `GET /Tmdb/ClientConfiguration` | registered | REAL | ✅ | ✅ | ✅ |  |
-| `GET /Trailers` | registered | REAL | ⚠️ | ✅ | · | instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Hermit correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Hermit gap. |
+| `GET /Trailers` | registered | REAL | ⚠️ | ✅ | · | instance: Jellyfin 10.11.8 returns 500 here (its own error with no Trailers provider), while Ferrofin correctly returns 200 with an empty result. Kept correct per policy (do not port Jellyfin bugs); not a Ferrofin gap. |
 | `GET /Trailers/{itemId}/Similar` | registered | REAL | ✅ | ✅ | ⚠️ | deferred: weighted similarity scorer not ported. |
 | `DELETE /UserFavoriteItems/{itemId}` | registered | REAL | · | · | ✅ | ok |
 | `POST /UserFavoriteItems/{itemId}` | registered | REAL | · | · | ✅ | ok |
@@ -857,7 +857,7 @@ _deep/status/schema: ✅ pass · ⚠️ fail · · untested_
 | `GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}` | registered | REAL | ⚠️ | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}` | registered | REAL | ⚠️ | · | · | not-testable-this-way: streaming/HLS/segment output — not a JSON body to diff (Layer-1 status-conformance applies). |
 | `GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}` | registered | REAL | ✅ | · | · | not-testable-this-way: binary/subtitle file output — not a JSON body to diff. |
-| `GET /Years` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: Hermit does not materialize Year items (documented out-of-scope). |
-| `GET /Years/{year}` | registered | REAL | ⚠️ | · | · | expected-extension: Hermit does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200). |
+| `GET /Years` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: Ferrofin does not materialize Year items (documented out-of-scope). |
+| `GET /Years/{year}` | registered | REAL | ⚠️ | · | · | expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200). |
 | `GET /web/ConfigurationPage` | registered | REAL | ✅ | · | · | expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises. |
-| `GET /web/ConfigurationPages` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: plugin configuration pages come from external plugins Hermit doesn't host. |
+| `GET /web/ConfigurationPages` | registered | REAL | ✅ | ✅ | ⚠️ | expected-extension: plugin configuration pages come from external plugins Ferrofin doesn't host. |

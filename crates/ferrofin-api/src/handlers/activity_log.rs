@@ -18,7 +18,7 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::activity::{ActivityLogQuery, ActivityLogSortBy, SortOrder};
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -123,7 +123,7 @@ fn build_order_by(
 )]
 async fn get_log_entries(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Query(query): Query<GetLogEntriesQuery>,
 ) -> Result<Json<QueryResult<ActivityLogEntry>>, ApiError> {
     let order_by = build_order_by(query.sort_by.as_deref(), query.sort_order.as_deref());

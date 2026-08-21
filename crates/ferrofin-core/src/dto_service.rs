@@ -2030,16 +2030,19 @@ impl FerrofinDtoService {
                     });
                 slot_by_name.insert(person.name.clone(), slot);
             }
+            // The id is the ONLY thing this resolution needs, so it asks for the
+            // id — not the row. Materializing a full `BaseItemEntity` per
+            // credited name was the single most expensive statement on an
+            // all-fields page (hundreds of 72-column rows decoded and dropped).
             let resolved = self
                 .library
-                .get_named_items(ferrofin_model::data::BaseItemKind::Person, &names)
+                .get_named_item_ids(ferrofin_model::data::BaseItemKind::Person, &names)
                 .await
                 .unwrap_or_default();
             let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
             let mut person_ids: Vec<Uuid> = Vec::new();
-            for (slot, row) in resolved.into_iter().enumerate() {
-                if let Some(row) = row
-                    && let Ok(id) = Uuid::parse_str(&row.id)
+            for (slot, resolved_id) in resolved.into_iter().enumerate() {
+                if let Some(id) = resolved_id
                     && let Some(entry) = id_by_slot.get_mut(slot)
                 {
                     *entry = Some(id);

@@ -147,6 +147,35 @@ pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Returns the ids of every item whose metadata the user has **locked**
+    /// (`IsLocked = 1`).
+    ///
+    /// The library scan needs each item's lock state, and asking per item cost
+    /// it a full `SELECT *` row hydration for one boolean. Locked items are
+    /// rare — usually none — so the whole answer is one small query, and the
+    /// scan reads it from the returned set instead.
+    async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The stored `Name`/`SortName`/`Overview`/`Path` of every item of `kind`,
+    /// in one query.
+    ///
+    /// The episode metadata providers gate a re-fetch on what a previous scan
+    /// already achieved, which only the stored row knows — `Planned.entity` is
+    /// rebuilt from the filesystem every scan, so its name is always the file
+    /// stem. Asking per item would reinstate exactly the `SELECT *`-per-item
+    /// cost that [`locked_item_ids`](Self::locked_item_ids) was introduced to
+    /// remove, so this is the same shape: one narrow read per scan.
+    ///
+    /// Defaults to empty — a repository that does not implement it simply
+    /// leaves every gate closed, which costs a re-fetch and never wrong data.
+    async fn item_text_rows(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
+        let _ = kind;
+        Ok(Vec::new())
+    }
+
     /// Walks the `ParentId` chain from `item_id` upward in a single query
     /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
     /// the starting item does not exist.
@@ -169,6 +198,29 @@ pub trait ItemRepository: Send + Sync {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Returns `(Id, CleanName)` for every row matching the query, in the same
+    /// order — and under the same predicates, ordering and paging — as
+    /// [`Self::get_item_list`].
+    ///
+    /// The by-name resolvers ([`crate::library::LibraryManager::get_named_item_ids`])
+    /// join a page's names against `CleanName` and then read nothing but the id,
+    /// so materializing a full item row per name is pure waste: on a cast-heavy
+    /// page that is hundreds of 72-column rows decoded and dropped. The default
+    /// delegates to [`Self::get_item_list`], so every implementation keeps
+    /// working; the concrete repository overrides it with a two-column
+    /// projection over the identical query.
+    async fn get_item_id_clean_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        Ok(self
+            .get_item_list(filter)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.clean_name))
+            .collect())
+    }
 
     /// Returns the latest item rows for the given collection type (Latest API).
     async fn get_latest_item_list(

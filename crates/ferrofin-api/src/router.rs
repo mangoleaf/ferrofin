@@ -124,14 +124,27 @@ fn make_request_span(req: &Request) -> Span {
 /// [`make_request_span`] with the OTLP decision passed in, so both branches are
 /// reachable from a test without touching the process environment.
 ///
-/// `otel.name` exists **only** for the OTLP exporter: nothing else reads it, and
-/// the route template it carries is already on the span as `http.route`. With
-/// export off there is no `tracing-opentelemetry` layer to consume it, so the
-/// `otlp == false` callsite drops the field — and with it the per-request
-/// `format!` that builds its value. That is TRACING.md rule 2 ("no
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` ⇒ no overhead beyond the existing fmt
-/// subscriber") applied to the one place still paying for export on every
-/// request. The span name and every other field are identical in both branches.
+/// Two fields exist **only** for the OTLP exporter, so the `otlp == false`
+/// callsite drops both — TRACING.md rule 2 ("no `OTEL_EXPORTER_OTLP_ENDPOINT` ⇒
+/// no overhead beyond the existing fmt subscriber") applied to the places that
+/// still pay for export on every request:
+///
+/// - `otel.name` is the exporter's span name and nothing else reads it (the
+///   route template it carries is already on the span as `http.route`).
+///   Dropping it drops the per-request `format!` that builds its value.
+/// - `http.response.status_code` is the exporter's status attribute, and it is
+///   the only field written *after* the span already carries values. A
+///   [`Span::record`] onto a span that has fields makes the JSON fmt sink
+///   re-parse its whole formatted field string and re-serialize it
+///   (`JsonFields::add_fields`, "far from efficient" by its own comment), on
+///   every response. Without the field on the callsite [`record_status`]
+///   resolves no field and is a no-op, so that work disappears. Nothing reads
+///   the value with export off: spans themselves are never printed
+///   (`FmtSpan::NONE`), and the one log line emitted after it is recorded —
+///   `tower_http`'s failure line for a 5xx — carries the status in its own
+///   `classification` field regardless.
+///
+/// Every field a log reader sees at span creation is identical in both branches.
 fn build_request_span(req: &Request, otlp: bool) -> Span {
     let route = req
         .extensions()
@@ -153,7 +166,6 @@ fn build_request_span(req: &Request, otlp: bool) -> Span {
         http.request.method = %req.method(),
         http.route = route,
         url.path = %req.uri().path(),
-        http.response.status_code = tracing::field::Empty,
         trace_id = tracing::field::Empty,
     )
 }
@@ -172,6 +184,10 @@ fn record_trace_id(_req: &Request, span: &Span) {
 }
 
 /// Records the final HTTP status code onto the request span.
+///
+/// A no-op when the span was built without the `http.response.status_code`
+/// field, i.e. whenever OTLP export is off — see [`build_request_span`] for why
+/// that field is exporter-only and what recording it costs.
 fn record_status(res: &Response, _latency: std::time::Duration, span: &Span) {
     span.record("http.response.status_code", res.status().as_u16());
 }
@@ -488,6 +504,74 @@ mod tests {
                 ("http.route".to_owned(), "\"unmatched\"".to_owned()),
                 ("url.path".to_owned(), "/Items".to_owned()),
             ]
+        );
+    }
+
+    /// Captures the `(field, value)` pairs handed to `Layer::on_record`, i.e.
+    /// exactly the dispatch a `Span::record` makes — or does not make.
+    #[derive(Clone, Default)]
+    struct RecordSpy(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecordSpy {
+        fn on_record(
+            &self,
+            _id: &tracing::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visit<'a>(&'a mut Vec<(String, String)>);
+            impl tracing::field::Visit for Visit<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push((field.name().to_owned(), format!("{value:?}")));
+                }
+            }
+            values.record(&mut Visit(&mut self.0.lock().expect("spy lock")));
+        }
+    }
+
+    /// Runs `record_status` over a freshly built request span and returns what
+    /// reached the subscriber as a field recording.
+    fn status_recordings(otlp: bool) -> Vec<(String, String)> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let spy = RecordSpy::default();
+        let subscriber = tracing_subscriber::registry().with(spy.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let req = Request::builder()
+                .uri("/Items")
+                .body(Body::empty())
+                .unwrap();
+            let span = super::build_request_span(&req, otlp);
+            let res = axum::response::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .unwrap();
+            super::record_status(&res, std::time::Duration::from_millis(1), &span);
+        });
+        spy.0.lock().expect("spy lock").clone()
+    }
+
+    #[test]
+    fn status_code_is_recorded_only_when_export_is_configured() {
+        // With export on, the exporter's status attribute is filled in as before.
+        assert_eq!(
+            status_recordings(true),
+            vec![("http.response.status_code".to_owned(), "500".to_owned())],
+            "OTLP on ⇒ the status still reaches the span"
+        );
+
+        // With export off the field is not on the callsite, so `Span::record`
+        // resolves nothing and never dispatches. That absent dispatch is the
+        // point: a recording onto a span that already carries fields makes the
+        // JSON fmt sink re-parse and re-serialize its whole formatted field
+        // string, on every single response.
+        let without = status_recordings(false);
+        assert!(
+            without.is_empty(),
+            "no exporter ⇒ no per-response field recording: {without:?}"
         );
     }
 

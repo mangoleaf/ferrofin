@@ -111,6 +111,26 @@ async fn insert_base_item(db: &Database, id: Uuid, kind: BaseItemKind, row: &Ite
     insert_base_item_raw_id(db, &guid_to_db(id), kind, row).await;
 }
 
+/// Inserts a child row whose `Id` is **not** a `Guid`, parented to `parent`.
+///
+/// The column is plain `TEXT` with a single writer, so no production path
+/// produces this — but code that reads `BaseItems.Id` back out must not degrade
+/// it to the nil GUID when it fails to parse (see `fc01259`), and that guard
+/// needs a row to exercise.
+pub async fn seed_child_with_raw_id(db: &Database, raw_id: &str, kind: BaseItemKind, parent: Uuid) {
+    insert_base_item_raw_id(
+        db,
+        raw_id,
+        kind,
+        &ItemRow {
+            name: "Corrupt Row",
+            parent: Some(parent),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
 /// [`insert_base_item`] taking the `Id` column value verbatim, so a fixture can
 /// store an id that is *not* a `Guid` (the column is plain `TEXT`, so the shape
 /// exists even though no writer produces it).

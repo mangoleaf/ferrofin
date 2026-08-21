@@ -196,7 +196,15 @@ fn empty_item() -> BaseItemEntity {
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
+///
+/// `elevated` authenticates as an API key instead, which satisfies the
+/// `RequiresElevation` policy on the image *write* routes (upload, delete,
+/// reorder) without a user/policy lookup. It is deliberately NOT the default:
+/// the read routes must keep proving they work for an ordinary user, since
+/// over-gating them would break every client's thumbnail grid.
+struct OkAuth {
+    elevated: bool,
+}
 
 #[async_trait]
 impl AuthService for OkAuth {
@@ -206,6 +214,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -220,6 +229,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
+            is_api_key: self.elevated,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -236,16 +246,35 @@ struct StubLibrary {
     /// Records each `(item_id, image_type, index1, index2)` swap the handler asks
     /// for, so the reorder test can assert the request reached the manager.
     swaps: Mutex<Vec<(Uuid, ImageType, i32, i32)>>,
+    /// Counts every item-existence read the handler performs, by either route
+    /// (`get_item_by_id` or `item_exists`). The served path must make none: the
+    /// image row it found already proves the item exists.
+    item_reads: Mutex<usize>,
+}
+
+impl StubLibrary {
+    /// How many item-existence reads the handlers have made so far.
+    fn item_reads(&self) -> usize {
+        *self.item_reads.lock().expect("lock")
+    }
 }
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        *self.item_reads.lock().expect("lock") += 1;
         Ok(match id {
             _ if id == ITEM_ID => Some(item_entity(ITEM_ID, "Imaged Movie", "Movie")),
             _ if id == GENRE_ID => Some(item_entity(GENRE_ID, "Drama", "Genre")),
             _ => None,
         })
+    }
+
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+        // Counted through the same door as `get_item_by_id`: the assertion is
+        // about *any* item read on the hot path, not about which one.
+        *self.item_reads.lock().expect("lock") += 1;
+        Ok(id == ITEM_ID || id == GENRE_ID)
     }
 
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
@@ -681,6 +710,8 @@ struct Stubs {
     library: Arc<StubLibrary>,
     users: Arc<StubUsers>,
     providers: Arc<StubProviders>,
+    /// Whether the caller satisfies `RequiresElevation` (see [`OkAuth`]).
+    elevated: bool,
 }
 
 /// Builds the image stubs, serving `image_path` for item/by-name images and
@@ -690,6 +721,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         library: Arc::new(StubLibrary {
             image_path,
             swaps: Mutex::new(Vec::new()),
+            item_reads: Mutex::new(0),
         }),
         users: Arc::new(StubUsers {
             profile_path,
@@ -699,6 +731,16 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             saved: Arc::new(Mutex::new(Vec::new())),
             deleted: Arc::new(Mutex::new(Vec::new())),
         }),
+        elevated: false,
+    }
+}
+
+/// [`stubs`] for the image *write* routes, which are `RequiresElevation`
+/// upstream (`ImageController`'s POST/DELETE actions).
+fn elevated_stubs(image_path: String, profile_path: String) -> Stubs {
+    Stubs {
+        elevated: true,
+        ..stubs(image_path, profile_path)
     }
 }
 
@@ -719,8 +761,12 @@ fn state(s: &Stubs) -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(ferrofin_api::test_support::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(OkAuth {
+            elevated: s.elevated,
+        }),
+        Arc::new(OkAuth {
+            elevated: s.elevated,
+        }),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -887,6 +933,110 @@ async fn item_image_wrong_type_is_404() {
 }
 
 #[tokio::test]
+async fn serving_an_item_image_reads_no_item_row() {
+    // The hot path: the image row the handler found already proves the item
+    // exists (`BaseItemImageInfos.ItemId` is a cascading foreign key), so the
+    // served request must not also read `BaseItems`. Restoring the eager
+    // existence check makes this one, not zero.
+    let img = TempImage::new(b"IMAGEBYTES");
+    let s = stubs(img.path(), String::new());
+
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"IMAGEBYTES");
+    assert_eq!(s.library.item_reads(), 0, "served image read an item row");
+
+    // Same for the indexed and fully-parametrized aliases.
+    let (status, _) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Primary/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Primary/0/tag/0/0/0/0/0"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(s.library.item_reads(), 0, "alias route read an item row");
+}
+
+#[tokio::test]
+async fn item_image_404_still_tells_missing_item_from_missing_image() {
+    // The item read moved onto the miss path — it did not disappear. A request
+    // for an item that does not exist still says so, and one for an item that
+    // exists but has no image of that type still names the image.
+    let img = TempImage::new(b"X");
+    let s = stubs(img.path(), String::new());
+
+    let missing = Uuid::from_u128(0xDEAD);
+
+    // All THREE route shapes that pass `ItemResolved::No` must keep the
+    // distinction — the bare route, the indexed alias, and the fully
+    // parametrized alias. Flipping either alias to `ItemResolved::Yes` changes
+    // its missing-item body from "item {id}" to "item {id} has no Primary image
+    // at 0", and with only the bare route asserted the whole suite stayed green.
+    for (label, path) in [
+        ("bare", format!("/Items/{missing}/Images/Primary")),
+        ("indexed", format!("/Items/{missing}/Images/Primary/0")),
+        (
+            "parametrized",
+            // {imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}
+            format!("/Items/{missing}/Images/Primary/0/tag/jpg/100/100/0/0"),
+        ),
+    ] {
+        let before = s.library.item_reads();
+        let (status, body) = send(&s, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}: {path}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains(&format!("item {missing}")) && !text.contains("has no"),
+            "{label}: missing item should 404 as the item, got {text}"
+        );
+        assert_eq!(
+            s.library.item_reads(),
+            before + 1,
+            "{label}: the miss path must read the item exactly once"
+        );
+    }
+
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Logo"), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        text.contains("has no Logo image at 0"),
+        "existing item without that image should 404 as the image, got {text}"
+    );
+}
+
+#[tokio::test]
+async fn by_name_image_miss_does_not_re_read_the_item() {
+    // The by-name routes resolved the item row themselves, so an image miss
+    // must not go back to the database for it — and its 404 still names the
+    // image, not the item.
+    let img = TempImage::new(b"X");
+    let s = stubs(img.path(), String::new());
+
+    let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Logo", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        text.contains("has no Logo image at 0"),
+        "by-name image miss should 404 as the image, got {text}"
+    );
+    assert_eq!(
+        s.library.item_reads(),
+        0,
+        "by-name miss re-read the item row"
+    );
+}
+
+#[tokio::test]
 async fn remote_image_backdrop_is_404_no_local_file() {
     let img = TempImage::new(b"X");
     let s = stubs(img.path(), String::new());
@@ -987,7 +1137,7 @@ async fn remote_image_providers_returns_list() {
 
 #[tokio::test]
 async fn download_remote_image_is_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1000,7 +1150,7 @@ async fn download_remote_image_is_204() {
 
 #[tokio::test]
 async fn download_remote_image_missing_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1015,7 +1165,7 @@ async fn download_remote_image_missing_type_is_400() {
 
 #[tokio::test]
 async fn set_item_image_saves_and_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     // "hi" base64-encoded.
     let (status, _) = send(
         &s,
@@ -1031,7 +1181,7 @@ async fn set_item_image_saves_and_returns_204() {
 
 #[tokio::test]
 async fn set_item_image_by_index_saves() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1045,7 +1195,7 @@ async fn set_item_image_by_index_saves() {
 
 #[tokio::test]
 async fn set_item_image_bad_content_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1059,7 +1209,7 @@ async fn set_item_image_bad_content_type_is_400() {
 
 #[tokio::test]
 async fn set_item_image_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1072,7 +1222,7 @@ async fn set_item_image_missing_item_is_404() {
 
 #[tokio::test]
 async fn delete_item_image_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1089,7 +1239,7 @@ async fn delete_item_image_returns_204() {
 
 #[tokio::test]
 async fn delete_item_image_by_index_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1106,7 +1256,7 @@ async fn delete_item_image_by_index_returns_204() {
 
 #[tokio::test]
 async fn delete_item_image_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "DELETE",
@@ -1121,7 +1271,7 @@ async fn delete_item_image_missing_item_is_404() {
 
 #[tokio::test]
 async fn update_item_image_index_swaps_and_returns_204() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1138,7 +1288,7 @@ async fn update_item_image_index_swaps_and_returns_204() {
 
 #[tokio::test]
 async fn update_item_image_index_non_multiple_type_is_400() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",
@@ -1152,7 +1302,7 @@ async fn update_item_image_index_non_multiple_type_is_400() {
 
 #[tokio::test]
 async fn update_item_image_index_missing_item_is_404() {
-    let s = stubs(String::new(), String::new());
+    let s = elevated_stubs(String::new(), String::new());
     let (status, _) = send(
         &s,
         "POST",

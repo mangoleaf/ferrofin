@@ -113,6 +113,11 @@ impl AuthorizationContext for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             user: Some(user()),
+            // Must agree with `authenticate`: the router's auth layer inserts
+            // THIS value as a request extension and `RequireAuth` prefers it,
+            // so dropping `is_api_key` here silently downgrades every request
+            // to a non-elevated one.
+            is_api_key: self.is_api_key,
             is_authenticated: true,
             ..Default::default()
         })
@@ -382,7 +387,11 @@ async fn call_with_body(
 }
 
 fn ok_auth() -> Arc<OkAuth> {
-    Arc::new(OkAuth { is_api_key: false })
+    // Every `/Auth/Keys` route is `RequiresElevation` upstream and gated with
+    // `RequireAdmin` here; an API key satisfies the policy without a
+    // user/policy lookup. The gate itself is pinned in
+    // `apps/ferrofin-server/tests/elevation.rs`.
+    Arc::new(OkAuth { is_api_key: true })
 }
 // ---- ApiKeys ---------------------------------------------------------------
 

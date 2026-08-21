@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::security::AuthenticationInfo;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -43,7 +43,7 @@ struct CreateKeyQuery {
 )]
 async fn get_keys(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<QueryResult<AuthenticationInfo>>, ApiError> {
     let keys = state.api_keys.get_api_keys().await?;
     Ok(Json(QueryResult::from_items(keys)))
@@ -62,7 +62,7 @@ async fn get_keys(
 )]
 async fn create_key(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<CreateKeyQuery>,
 ) -> Result<StatusCode, ApiError> {
     let app = match query.app.as_deref() {
@@ -86,7 +86,7 @@ async fn create_key(
 )]
 async fn revoke_key(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(key): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.api_keys.delete_api_key(&key).await?;

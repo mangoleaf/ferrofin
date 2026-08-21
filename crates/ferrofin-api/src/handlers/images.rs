@@ -52,7 +52,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::image_upload::{
     decode_base64, image_extension_from_content_type, image_mime_from_content_type,
@@ -335,11 +335,33 @@ fn append_image_cache_headers(
     );
 }
 
+/// Whether the caller has already proved the item exists.
+///
+/// The by-name routes resolve the item row before they get here, so they know;
+/// the `/Items/{itemId}/…` routes do not. It decides which `404` an image miss
+/// produces, and — because the item read only happens on that miss — it is what
+/// keeps the hit path down to a single query.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ItemResolved {
+    /// The caller already loaded the item row.
+    Yes,
+    /// The item is only an id so far; an image miss must tell "no such item"
+    /// apart from "item has no such image".
+    No,
+}
+
 /// Resolves an item's images, selects the requested one, and serves it.
 ///
 /// The shared body of the item and by-name image routes: `item_id` is the
 /// resolved item (real item id or by-name item id), `image_type`/`index` select
 /// the image, and a missing item image is a `404`.
+///
+/// The image rows are read *first* and the item's own existence is only checked
+/// when no image matched. An image row cannot outlive its item — the
+/// `BaseItemImageInfos.ItemId` foreign key cascades and the runtime pools run
+/// with `foreign_keys = ON` — so a matched row already proves the item exists,
+/// and the served path pays one query instead of two. Both `404` messages are
+/// unchanged: the item read still happens, just on the miss.
 async fn serve_item_image(
     state: &AppState,
     item_id: Uuid,
@@ -347,6 +369,7 @@ async fn serve_item_image(
     index: i32,
     query: &ImageQuery,
     request: Request,
+    resolved: ItemResolved,
 ) -> Result<Response, ApiError> {
     // Chapter thumbnails live on the chapter rows, not in the item's image
     // rows (port of `BaseItem.GetImageInfo(ImageType.Chapter, index)`).
@@ -362,12 +385,15 @@ async fn serve_item_image(
     };
     let image = chapter_image
         .as_ref()
-        .or_else(|| select_image(&images, image_type, index))
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "item {item_id} has no {image_type:?} image at {index}"
-            ))
-        })?;
+        .or_else(|| select_image(&images, image_type, index));
+    let Some(image) = image else {
+        if resolved == ItemResolved::No && !state.library.item_exists(item_id).await? {
+            return Err(ApiError::NotFound(format!("item {item_id}")));
+        }
+        return Err(ApiError::NotFound(format!(
+            "item {item_id} has no {image_type:?} image at {index}"
+        )));
+    };
     serve_image_file(state, item_id, image, index, query, request).await
 }
 
@@ -394,14 +420,17 @@ async fn get_item_image(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    // The item must exist (a missing item is a 404).
-    state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let index = query.image_index.unwrap_or(0);
-    serve_item_image(&state, item_id, image_type, index, &query, request).await
+    serve_item_image(
+        &state,
+        item_id,
+        image_type,
+        index,
+        &query,
+        request,
+        ItemResolved::No,
+    )
+    .await
 }
 
 /// `GET`/`HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed variant.
@@ -429,12 +458,16 @@ async fn get_item_image_by_index(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    serve_item_image(&state, item_id, image_type, image_index, &query, request).await
+    serve_item_image(
+        &state,
+        item_id,
+        image_type,
+        image_index,
+        &query,
+        request,
+        ItemResolved::No,
+    )
+    .await
 }
 
 /// `GET`/`HEAD` for the fully-parametrized item-image alias
@@ -472,11 +505,6 @@ async fn get_item_image_parametrized(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // Lift the positional transform segments into a query (empty/`0` segments mean
     // "unset", matching how clients bake a partial transform into the path).
     let query = ImageQuery {
@@ -486,7 +514,16 @@ async fn get_item_image_parametrized(
         tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
         ..ImageQuery::default()
     };
-    serve_item_image(&state, item_id, image_type, image_index, &query, request).await
+    serve_item_image(
+        &state,
+        item_id,
+        image_type,
+        image_index,
+        &query,
+        request,
+        ItemResolved::No,
+    )
+    .await
 }
 
 /// `GET /Items/{itemId}/Images` — the item's image infos.
@@ -638,7 +675,16 @@ async fn serve_named_image(
         .ok_or_else(|| ApiError::NotFound(format!("{kind:?} {name}")))?;
     let item_id = Uuid::parse_str(&item.id)
         .map_err(|e| ApiError::NotFound(format!("bad by-name id: {e}")))?;
-    serve_item_image(state, item_id, image_type, index, query, request).await
+    serve_item_image(
+        state,
+        item_id,
+        image_type,
+        index,
+        query,
+        request,
+        ItemResolved::Yes,
+    )
+    .await
 }
 
 /// Builds a `GET`/`HEAD` handler pair for a by-name image controller of `kind`.
@@ -927,7 +973,7 @@ async fn save_item_image(
 )]
 async fn set_item_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     headers: axum::http::HeaderMap,
     body: String,
@@ -960,7 +1006,7 @@ async fn set_item_image(
 )]
 async fn set_item_image_by_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
@@ -1002,7 +1048,7 @@ async fn set_item_image_by_index(
 )]
 async fn delete_item_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -1035,7 +1081,7 @@ async fn delete_item_image(
 )]
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
@@ -1081,7 +1127,7 @@ pub(crate) struct UpdateImageIndexQuery {
 )]
 async fn update_item_image_index(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {

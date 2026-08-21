@@ -38,7 +38,7 @@ use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::plugins::PluginDescriptor;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -324,7 +324,7 @@ async fn get_plugin_manifest(
 )]
 async fn get_repositories(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<Vec<RepositoryInfo>>, ApiError> {
     Ok(Json(state.plugins.get_repositories().await?))
 }
@@ -339,7 +339,7 @@ async fn get_repositories(
 )]
 async fn set_repositories(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Json(repositories): Json<Vec<RepositoryInfo>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -359,7 +359,7 @@ async fn set_repositories(
 )]
 async fn get_packages(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<Vec<PackageInfo>>, ApiError> {
     Ok(Json(state.plugins.list_packages().await?))
 }
@@ -381,7 +381,7 @@ async fn get_packages(
 )]
 async fn get_package_info(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(name): Path<String>,
     Query(query): Query<PackageInfoQuery>,
 ) -> Result<Json<PackageInfo>, ApiError> {
@@ -447,7 +447,7 @@ struct InstallPackageQuery {
 )]
 async fn install_package(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(name): Path<String>,
     Query(query): Query<InstallPackageQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -482,7 +482,7 @@ async fn install_package(
 )]
 async fn cancel_package_installation(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(auth): RequireAdmin,
     Path(package_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;

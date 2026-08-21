@@ -121,6 +121,47 @@ impl FromRequestParts<AppState> for RequireAuth {
     }
 }
 
+/// Extractor for handlers behind Jellyfin's `RequiresElevation` policy.
+///
+/// Port of `Policies.RequiresElevation`, which upstream declares on 74
+/// controller actions: the caller must be an API key, or a user whose policy
+/// grants `IsAdministrator`. Anything else is `403`.
+///
+/// This exists because several controllers carried a comment saying elevation
+/// was "applied at the composition root's auth layer" — a layer that was never
+/// built. The result was that every elevation-gated route was reachable by any
+/// authenticated account: an ordinary user could `POST /Users/{ownId}/Policy`
+/// with `IsAdministrator: true` and be an administrator in one request, or read
+/// `GET /Devices` and harvest the administrator's plaintext access token. Gate
+/// in the extractor, never in a comment.
+///
+/// An API key is elevated, matching C# — `Policies.RequiresElevation` is
+/// satisfied by the `ApiKey` scheme without a user attached.
+#[derive(Debug, Clone)]
+pub struct RequireAdmin(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireAdmin {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+        if info.is_api_key {
+            return Ok(Self(info));
+        }
+        if let Some(user) = &info.user
+            && crate::handlers::users::is_administrator(state, user).await?
+        {
+            return Ok(Self(info));
+        }
+        Err(ApiError::Forbidden(
+            "administrator access required".to_owned(),
+        ))
+    }
+}
+
 /// Extractor for handlers behind Jellyfin's `FirstTimeSetupOrDefault` policy.
 ///
 /// Port of `FirstTimeSetupHandler`: while the startup wizard is **not** complete

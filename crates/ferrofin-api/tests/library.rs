@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_api::create_router;
-use ferrofin_api::test_support::authed_state_with_library_and_monitor;
+use ferrofin_api::test_support::{
+    authed_state_with_library_and_monitor, elevated_state_with_library_and_monitor,
+};
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::CollectionType;
 use ferrofin_model::dto::ItemCounts;
@@ -315,11 +317,26 @@ fn seeded_items() -> Vec<SeededItem> {
 
 /// Builds the router over the recording doubles, returning the shared monitor.
 fn router_with(items: Vec<SeededItem>) -> (axum::Router, Arc<RecordingMonitor>) {
+    router_with_auth(items, false)
+}
+
+/// `router_with` for a caller satisfying `RequiresElevation` — needed by
+/// `POST /Library/Refresh`, which is admin-only upstream.
+fn elevated_router_with(items: Vec<SeededItem>) -> (axum::Router, Arc<RecordingMonitor>) {
+    router_with_auth(items, true)
+}
+
+fn router_with_auth(
+    items: Vec<SeededItem>,
+    elevated: bool,
+) -> (axum::Router, Arc<RecordingMonitor>) {
     let monitor = Arc::new(RecordingMonitor::default());
-    let state = authed_state_with_library_and_monitor(
-        Arc::new(RecordingLibrary { items }),
-        monitor.clone(),
-    );
+    let library: Arc<RecordingLibrary> = Arc::new(RecordingLibrary { items });
+    let state = if elevated {
+        elevated_state_with_library_and_monitor(library, monitor.clone())
+    } else {
+        authed_state_with_library_and_monitor(library, monitor.clone())
+    };
     (create_router(state), monitor)
 }
 
@@ -462,7 +479,7 @@ async fn refresh_library_returns_204() {
     // Moved from batch14: `POST /Library/Refresh` queues a scan and returns 204.
     // Re-homed onto this file's `router_with`/`post` harness, whose
     // `RecordingLibrary::queue_library_scan` returns `Ok(())`.
-    let (router, _monitor) = router_with(seeded_items());
+    let (router, _monitor) = elevated_router_with(seeded_items());
     let status = post(router, "/Library/Refresh", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }

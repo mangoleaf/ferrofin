@@ -55,23 +55,30 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
-use ferrofin_model::dto::SessionInfoDto;
+use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::dto::{SessionInfoDto, SortOrder};
+use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
-    ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayRequest,
-    PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
+    ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayCommand,
+    PlayRequest, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
     SessionMessageType, SessionUserInfo, TranscodingInfo, UserDataChangeInfo,
 };
+use ferrofin_util::shuffle_extensions::shuffle;
 
 use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::EventManager;
-use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager, UserManager};
+use ferrofin_traits::library::{
+    LibraryManager, MediaSourceManager, MusicManager, UserDataManager, UserManager,
+};
 use ferrofin_traits::net::WebSocketConnection;
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use ferrofin_traits::session_bus::SessionMessageBus;
 
@@ -213,6 +220,10 @@ pub struct FerrofinSessionManager {
     /// (C# `CloseLiveStreamIfNeededAsync`); without it that close is a no-op and
     /// an abandoned live stream stays open until the client asks explicitly.
     media_sources: Option<Arc<dyn MediaSourceManager>>,
+    /// The music manager, when wired — used only by `SendPlayCommand`'s
+    /// `PlayInstantMix` translation (C# `TranslateItemForInstantMix`). Without
+    /// it a cast instant-mix falls back to playing the seed item itself.
+    music_manager: Option<Arc<dyn MusicManager>>,
 }
 
 impl std::fmt::Debug for FerrofinSessionManager {
@@ -253,6 +264,7 @@ impl FerrofinSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_limit_gate: Arc::new(Mutex::new(())),
             media_sources: None,
+            music_manager: None,
             bus: None,
         }
     }
@@ -272,6 +284,16 @@ impl FerrofinSessionManager {
     #[must_use]
     pub fn with_media_sources(mut self, media_sources: Arc<dyn MediaSourceManager>) -> Self {
         self.media_sources = Some(media_sources);
+        self
+    }
+
+    /// Wires the music manager (composition root only), so casting an instant
+    /// mix to a device expands the seed item into the mix — the C#
+    /// `SendPlayCommand` -> `TranslateItemForInstantMix` path. Without it a
+    /// `PlayInstantMix` cast degrades to playing the seed item alone.
+    #[must_use]
+    pub fn with_music_manager(mut self, music_manager: Arc<dyn MusicManager>) -> Self {
+        self.music_manager = Some(music_manager);
         self
     }
 
@@ -643,6 +665,319 @@ impl FerrofinSessionManager {
             .await;
     }
 
+    /// Expands one cast item id into the ids a client can actually play — port
+    /// of C# `TranslateItemForPlayback`.
+    ///
+    /// A folder (series, season, album, box set, playlist, …) becomes its
+    /// recursive non-folder, non-virtual children; an "item by name" (genre,
+    /// studio, person, year, artist) becomes the items tagged with it. Anything
+    /// else is itself. Both expansions sort by `SortName`, matching upstream, so
+    /// the receiving client gets the queue in playing order.
+    ///
+    /// An id that resolves to nothing contributes nothing (C# logs and returns
+    /// an empty array rather than failing the whole command).
+    async fn translate_item_for_playback(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let mut out = Vec::new();
+        for (member_id, member) in self.flatten_linked_containers(id, user).await? {
+            out.extend(
+                self.expand_one_for_playback(member_id, &member, user)
+                    .await?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Replaces a box set / playlist with the items it links to, in order,
+    /// repeating for a nested one.
+    ///
+    /// Their membership is manual `FerrofinLinkedChildren` edges, **not** the
+    /// physical `AncestorIds` closure the recursive child query walks — so the
+    /// folder expansion below cannot see it and a box set would resolve to an
+    /// empty queue. Anything else passes straight through.
+    /// Carries `(id, row)` pairs, not ids: the caller needs each item's kind and
+    /// `IsFolder` next, so re-fetching them there would double every read — and
+    /// pairing the id it was *looked up by* means no step ever has to re-parse
+    /// `BaseItems.Id` back out of the row (see the `expect`-free contract note
+    /// on the child loop).
+    ///
+    /// Members come back in `SortName` order, not playlist link order, which
+    /// *is* upstream's behaviour and was checked rather than assumed:
+    /// `TranslateItemForPlayback` calls `Folder.GetItemList`, which for a
+    /// recursive query goes to `Folder.QueryRecursive` -> the repository with
+    /// the request's `OrderBy`. `Playlist.GetRecursiveChildren` (which would
+    /// preserve link order) is not on that path. So a cast playlist plays
+    /// alphabetically on both servers, even though `/Playlists/{id}/Items`
+    /// serves link order.
+    async fn flatten_linked_containers(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<(Uuid, BaseItemEntity)>, ServiceError> {
+        /// A box set inside a box set is legal; a cycle is not, but the depth
+        /// cap makes one terminate anyway.
+        const MAX_NESTING: usize = 4;
+
+        let Some(root) = self.library_manager.get_item_by_id(id).await? else {
+            error!(item_id = %id, "nonexistent item id passed to play translation");
+            return Ok(Vec::new());
+        };
+        // Ordering matters (this is a play queue), so dedup with a side set
+        // rather than by collecting into one. Upstream dedupes the same way,
+        // accumulating recursive children into a keyed map.
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        seen.insert(id);
+        let mut frontier = vec![(id, root)];
+        for _ in 0..MAX_NESTING {
+            if !frontier
+                .iter()
+                .any(|(_, item)| Self::is_linked_container(item))
+            {
+                break;
+            }
+            let mut next = Vec::with_capacity(frontier.len());
+            for (item_id, item) in frontier {
+                if !Self::is_linked_container(&item) {
+                    next.push((item_id, item));
+                    continue;
+                }
+                // One query for the whole container: `get_item_list` takes the
+                // same query as `get_item_ids` but returns the rows, so the
+                // members do not each cost a second single-row read.
+                //
+                // The non-recursive parent query is the one that merges manual
+                // linked children (see `translate_query`).
+                let children = self
+                    .library_manager
+                    .get_item_list(&InternalItemsQuery {
+                        parent_id: item_id,
+                        is_virtual_item: Some(false),
+                        user: user.cloned(),
+                        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                        ..InternalItemsQuery::default()
+                    })
+                    .await?;
+                for child in children {
+                    // Never degrade an unparseable id to the nil GUID (see
+                    // `fc01259`): a nil `parent_id` does not scope to nothing,
+                    // it makes `translate_query` drop the parent predicate
+                    // altogether — which would cast the entire library.
+                    let Ok(child_id) = Uuid::parse_str(&child.id) else {
+                        error!(
+                            raw_id = %child.id,
+                            "skipping a play-translation child whose stored id is not a guid"
+                        );
+                        continue;
+                    };
+                    // A member reachable twice (linked directly *and* through a
+                    // nested container) belongs in the queue once.
+                    if seen.insert(child_id) {
+                        next.push((child_id, child));
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Ok(frontier)
+    }
+
+    /// Whether this item's members are manual `FerrofinLinkedChildren` edges
+    /// rather than the physical `AncestorIds` closure.
+    fn is_linked_container(item: &BaseItemEntity) -> bool {
+        matches!(
+            crate::item_type_lookup::kind_from_type_name(&item.type_),
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        )
+    }
+
+    /// The playable ids behind one already-flattened, already-loaded item.
+    ///
+    /// `id` is the id the row was looked up by, so this never re-derives it
+    /// from `BaseItems.Id` and cannot degrade it (`fc01259`).
+    async fn expand_one_for_playback(
+        &self,
+        id: Uuid,
+        item: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+
+        // The persisted `IsFolder` column is authoritative for a specific row;
+        // the kind is the class-level default (see `kinds::is_folder`).
+        let by_name = kind.is_some_and(crate::kinds::is_item_by_name);
+        if !item.is_folder && !by_name {
+            return Ok(vec![id]);
+        }
+
+        let mut query = InternalItemsQuery {
+            recursive: true,
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            user: user.cloned(),
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        if by_name {
+            // `IItemByName.GetTaggedItems` — the filter field differs per kind.
+            match kind {
+                Some(BaseItemKind::Genre | BaseItemKind::MusicGenre) => query.genre_ids = vec![id],
+                Some(BaseItemKind::Studio) => query.studio_ids = vec![id],
+                Some(BaseItemKind::Person) => query.person_ids = vec![id],
+                Some(BaseItemKind::MusicArtist) => query.artist_ids = vec![id],
+                Some(BaseItemKind::Year) => {
+                    let Some(year) = item.production_year.and_then(|y| i32::try_from(y).ok())
+                    else {
+                        return Ok(Vec::new());
+                    };
+                    query.years = vec![year];
+                }
+                // Not a by-name kind after all — fall back to the folder path.
+                _ => query.ancestor_ids = vec![id],
+            }
+        } else {
+            query.ancestor_ids = vec![id];
+        }
+        self.library_manager.get_item_ids(&query).await
+    }
+
+    /// Expands a cast instant-mix seed into the mix — port of C#
+    /// `TranslateItemForInstantMix`. Without a wired [`MusicManager`] the seed
+    /// item is played on its own rather than the command failing.
+    async fn translate_item_for_instant_mix(
+        &self,
+        id: Uuid,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let Some(music) = self.music_manager.as_ref() else {
+            error!(item_id = %id, "no music manager wired — instant-mix cast plays the seed item");
+            return Ok(vec![id]);
+        };
+        let mix = music
+            .get_instant_mix_from_item(id, user_id, &DtoOptions::default())
+            .await?;
+        Ok(mix
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect())
+    }
+
+    /// Rewrites a cast [`PlayRequest`] the way C# `SendPlayCommand` does before
+    /// it reaches the wire: expand the item ids, resolve `PlayInstantMix` /
+    /// `PlayShuffle` into a concrete `PlayNow` list, extend a lone episode into
+    /// the rest of its series when the target user auto-plays next episodes,
+    /// and stamp the controlling user.
+    async fn translate_play_request(
+        &self,
+        controlling_session_id: &str,
+        target: &SessionInfo,
+        command: &PlayRequest,
+    ) -> Result<PlayRequest, ServiceError> {
+        let user = if target.user_id.is_nil() {
+            None
+        } else {
+            self.user_manager.get_user_by_id(target.user_id).await?
+        };
+        let user_id = user.as_ref().map(|_| target.user_id);
+
+        let mut translated = command.clone();
+        let mut items: Vec<Uuid> = Vec::new();
+        if command.play_command == PlayCommand::PlayInstantMix {
+            for id in &command.item_ids {
+                items.extend(self.translate_item_for_instant_mix(*id, user_id).await?);
+            }
+            translated.play_command = PlayCommand::PlayNow;
+        } else {
+            for id in &command.item_ids {
+                items.extend(self.translate_item_for_playback(*id, user.as_ref()).await?);
+            }
+        }
+
+        if command.play_command == PlayCommand::PlayShuffle {
+            shuffle(&mut items);
+            translated.play_command = PlayCommand::PlayNow;
+        }
+        translated.item_ids = items;
+
+        // C# `GetPlayAccess` is the `EnableMediaPlayback` permission and nothing
+        // item-specific, so one check covers the whole list.
+        if let Some(user) = user.as_ref()
+            && !translated.item_ids.is_empty()
+            && !has_permission(
+                self.db.pool(),
+                &user.id,
+                PermissionKind::EnableMediaPlayback,
+            )
+            .await?
+        {
+            return Err(ServiceError::invalid_input(format!(
+                "{} is not allowed to play media.",
+                user.username
+            )));
+        }
+
+        if let Some(user) = user.as_ref()
+            && user.enable_next_episode_auto_play
+            && translated.item_ids.len() == 1
+            && let Some(rest) = self.episodes_from(translated.item_ids[0], user).await?
+        {
+            translated.item_ids = rest;
+        }
+
+        if !controlling_session_id.is_empty()
+            && let Ok(controller) = self.get_session_snapshot(controlling_session_id).await
+            && !controller.user_id.is_nil()
+        {
+            translated.controlling_user_id = controller.user_id;
+        }
+        Ok(translated)
+    }
+
+    /// The episodes of `episode_id`'s series from that episode onward, or `None`
+    /// when the id is not an episode with a series (C# `SendPlayCommand`'s
+    /// `EnableNextEpisodeAutoPlay` branch, which skips to the requested episode
+    /// and takes the remainder).
+    async fn episodes_from(
+        &self,
+        episode_id: Uuid,
+        user: &UserEntity,
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        let Some(item) = self.library_manager.get_item_by_id(episode_id).await? else {
+            return Ok(None);
+        };
+        if crate::item_type_lookup::kind_from_type_name(&item.type_) != Some(BaseItemKind::Episode)
+        {
+            return Ok(None);
+        }
+        let Some(series_id) = item
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return Ok(None);
+        };
+        let episodes = self
+            .library_manager
+            .get_item_ids(&InternalItemsQuery {
+                recursive: true,
+                is_folder: Some(false),
+                is_virtual_item: Some(false),
+                user: Some(user.clone()),
+                ancestor_ids: vec![series_id],
+                include_item_types: vec![BaseItemKind::Episode],
+                order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let Some(start) = episodes.iter().position(|id| *id == episode_id) else {
+            return Ok(None);
+        };
+        let rest = episodes[start..].to_vec();
+        Ok((rest.len() > 1).then_some(rest))
+    }
+
     /// Sends a message to one controllable session, enforcing the controller's
     /// permission when a controlling session is named (C# `AssertCanControl`).
     async fn send_to_controllable(
@@ -915,10 +1250,15 @@ impl SessionManager for FerrofinSessionManager {
         session_id: &str,
         command: &PlayRequest,
     ) -> Result<(), ServiceError> {
-        // Instant-mix expansion (C# `TranslateItemForInstantMix`) needs the
-        // injected `IMusicManager`, which is not part of this unit — deferred.
-        // The play request is forwarded verbatim as the pushed payload.
-        let data = serde_json::to_string(command)
+        // C# `SendPlayCommand` rewrites the request before it reaches the wire —
+        // clients receive a concrete `PlayNow`/`PlayNext`/`PlayLast` over
+        // playable ids, never a container id or an unresolved
+        // `PlayShuffle`/`PlayInstantMix`.
+        let target = self.get_session_snapshot(session_id).await?;
+        let translated = self
+            .translate_play_request(controlling_session_id, &target, command)
+            .await?;
+        let data = serde_json::to_string(&translated)
             .map_err(|e| ServiceError::backend(format!("serialize command: {e}")))?;
         self.send_to_controllable(
             controlling_session_id,
@@ -935,7 +1275,16 @@ impl SessionManager for FerrofinSessionManager {
         session_id: &str,
         command: &PlaystateRequest,
     ) -> Result<(), ServiceError> {
-        let data = serde_json::to_string(command)
+        // C# stamps the controlling user (as a dashless "N"-format guid) so the
+        // target can attribute the command.
+        let mut command = command.clone();
+        if !controlling_session_id.is_empty()
+            && let Ok(controller) = self.get_session_snapshot(controlling_session_id).await
+            && !controller.user_id.is_nil()
+        {
+            command.controlling_user_id = Some(controller.user_id.simple().to_string());
+        }
+        let data = serde_json::to_string(&command)
             .map_err(|e| ServiceError::backend(format!("serialize command: {e}")))?;
         self.send_to_controllable(
             controlling_session_id,

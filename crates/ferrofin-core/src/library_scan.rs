@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike as _, Utc};
 use ferrofin_db::entities::base_items::{
     BaseItemEntity, ChapterEntity, MediaStreamInfoEntity, PeopleEntity,
 };
@@ -62,8 +62,14 @@ use crate::media_source_manager::stream_dto_to_entity;
 struct ArtworkCache {
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
-    /// (series item id, season number) → {episode number → still image URL}.
-    season_stills: std::collections::HashMap<(String, i32), std::collections::HashMap<i32, String>>,
+    /// (series item id, season number) → the season's TMDB details, fetched
+    /// once per scan. `/tv/{id}/season/{n}` carries the season poster, every
+    /// episode's still URL, AND every episode's name/overview, so the metadata
+    /// pass and the image pass share this one response instead of each paying
+    /// for it. `None` records a season TMDB could not resolve, so a miss is
+    /// not re-requested once per episode.
+    season_details:
+        std::collections::HashMap<(String, i32), Option<ferrofin_providers::tmdb::SeasonDetails>>,
     /// Series item id → the matched TVDB series details (when TVDB, the TV
     /// authority, resolved the series). Its `tvdb_id` lets episodes resolve, and
     /// its artwork is reused by the image pass instead of re-fetching.
@@ -87,16 +93,107 @@ struct ArtworkCache {
 struct RemoteMetadata {
     people: Vec<PeopleEntity>,
     provider_ids: Vec<(String, String)>,
+    /// Whether a credits fetch actually completed for this item.
+    ///
+    /// `true` makes [`people`](Self::people) authoritative **even when empty**,
+    /// so credits stored by an earlier, wronger scan are cleared. `false` — a
+    /// provider that did not run, was gated off by the library, missed, or
+    /// errored — leaves whatever is stored alone, so a network outage or an
+    /// unticked fetcher never wipes a library's cast.
+    people_fetched: bool,
 }
 
 impl RemoteMetadata {
-    /// People only (no external ids to persist).
+    /// People only (no external ids to persist), from a completed fetch.
     fn just_people(people: Vec<PeopleEntity>) -> Self {
         Self {
             people,
             provider_ids: Vec::new(),
+            people_fetched: true,
         }
     }
+}
+
+/// The handful of stored values a provider's re-scan gate needs, lifted out of
+/// the row so the scan loop does not carry a whole `BaseItemEntity` across
+/// every await in it (that alone puts the scan future over clippy's
+/// `large_futures` ceiling).
+struct StoredText {
+    name: Option<String>,
+    sort_name: Option<String>,
+    overview: Option<String>,
+    /// Whether the stored `name` is a real title rather than the resolver's
+    /// file-stem placeholder. Computed at read time, while the row's path is
+    /// still in hand.
+    titled: bool,
+}
+
+impl StoredText {
+    fn from_row(row: &ferrofin_db::entities::base_items::ItemTextRow) -> Self {
+        Self {
+            name: row.name.clone(),
+            sort_name: row.sort_name.clone(),
+            overview: row.overview.clone(),
+            titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
+        }
+    }
+
+    /// Whether a previous scan already gave this row both a real title and a
+    /// synopsis — the condition for skipping a provider fetch entirely.
+    fn is_complete(&self) -> bool {
+        self.titled && self.overview.as_deref().is_some_and(|o| !o.is_empty())
+    }
+}
+
+/// What a TMDB episode-credits lookup yielded.
+///
+/// The three states must stay distinct all the way to the persistence guard:
+/// credits are saved by REPLACEMENT, so treating a failure — or a lookup that
+/// never ran — as "this episode has no cast" deletes what is stored.
+enum TmdbCredits {
+    /// TMDB answered. The list is authoritative even when empty.
+    Fetched(Vec<PeopleEntity>),
+    /// TMDB was asked and did not answer (network, 429, 5xx, bad JSON).
+    Failed,
+    /// TMDB was never asked: no client wired, or the series has no TMDB id.
+    NotAttempted,
+}
+
+impl TmdbCredits {
+    /// The credits when TMDB answered, else `None`.
+    fn fetched(self) -> Option<Vec<PeopleEntity>> {
+        match self {
+            Self::Fetched(people) => Some(people),
+            Self::Failed | Self::NotAttempted => None,
+        }
+    }
+}
+
+/// A series' TMDB id as resolved so far this scan: the direct TMDB match if
+/// there was one, else the `Tmdb` id TheTVDB carries on a series it matched.
+///
+/// A library can rank TVDB first for `Series` while leaving `Episode` to TMDB,
+/// which resolves the series through TVDB and never populates `series_tmdb`.
+/// Without the fallback every episode under such a series silently gets
+/// nothing. The TVDB arm already reaches for the same id.
+fn series_tmdb_id_of(cache: &ArtworkCache, series_id: &str) -> Option<i64> {
+    cache.series_tmdb.get(series_id).copied().or_else(|| {
+        cache
+            .series_tvdb
+            .get(series_id)?
+            .tmdb_id
+            .as_deref()?
+            .parse()
+            .ok()
+    })
+}
+
+/// One episode's entry in a cached season response, by episode number.
+fn episode_in_season(
+    details: &ferrofin_providers::tmdb::SeasonDetails,
+    number: i32,
+) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
+    details.episodes.iter().find(|e| e.episode_number == number)
 }
 
 /// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
@@ -1009,8 +1106,7 @@ impl LibraryScanner {
         let mut items_added: Vec<&Planned> = Vec::new();
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
-        let mut art_cache = ArtworkCache::default();
-        self.preload_provider_ids(&planned, &mut art_cache).await;
+        let (mut art_cache, locked_items, stored_text) = self.scan_prereads(&planned).await;
         // Per-library fetcher policies, keyed by the collection-folder id
         // every Planned item carries as its first ancestor. This is what
         // makes the dashboard's per-library "Metadata downloaders" and
@@ -1034,22 +1130,68 @@ impl LibraryScanner {
             // when `IsLocked`), and leave its people/images untouched below.
             // The scan-upsert's `IsLocked` guard backstops the metadata
             // columns; file-derived facts (the probe) still update.
-            let locked = self.is_item_locked(item.id).await;
+            let locked = locked_items.contains(&item.id);
             let policy = policy_for(item, &fetcher_policies);
+            // What a previous scan already achieved for this row, from the same
+            // read-once-per-scan batch the lock set uses.
+            let stored = stored_text.get(&item.id);
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
             let (media_info, is_audio) = probes.take(scanned).await;
             let (streams, chapters, tag_provider_ids) =
                 Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
-            let (people, remote_ids, embedded_images) = self
-                .run_metadata_chain(&mut entity, &mut art_cache, policy, locked)
-                .await;
+            // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
+            // metadata reader, which runs before any remote fetch. It fills
+            // genres/studios/tags/overview/ratings/year from `movie.nfo` /
+            // `tvshow.nfo` / `<episode>.nfo`, and yields the credited cast/crew
+            // plus the external ids the file pins.
+            let (mut people, nfo_ids) = if locked {
+                (Vec::new(), Vec::new())
+            } else {
+                self.fetch_local_nfo(&mut entity, policy).await
+            };
+            // Sidecar ids first, then any this row already carries: both are
+            // `info.GetProviderId`, which the fetchers resolve by before they
+            // ever search by title.
+            let known_ids = known_provider_ids(&nfo_ids, &art_cache, &entity.id);
+            // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
+            // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
+            // shows the same detail page Jellyfin does. Best-effort: failures don't
+            // abort, and NFO-provided people take precedence.
+            let remote = if locked {
+                RemoteMetadata::default()
+            } else {
+                // Boxed: the provider chain below this is the deepest branch of
+                // the per-item future, and inlining it puts the whole scan
+                // future over clippy's `large_futures` ceiling — the scan loop
+                // is held across every await in it.
+                Box::pin(self.fetch_remote_metadata(
+                    &mut entity,
+                    &mut art_cache,
+                    policy,
+                    stored,
+                    &known_ids,
+                ))
+                .await
+            };
+            let people_fetched = remote.people_fetched;
+            // Photos and books carry their metadata inside the file, not on any
+            // remote provider. A photo's Primary image is the file itself; a
+            // book's is the cover extracted from its archive.
+            let (embedded_people, embedded_images) =
+                self.enrich_from_file(&mut entity, locked).await;
+            if people.is_empty() {
+                people = embedded_people;
+            }
+            if people.is_empty() {
+                people = remote.people;
+            }
             self.apply_parental_rating_score(&mut entity);
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
             // supplement whatever the built-in chain left unfilled; the
             // helper merges their (filtered) ids with the built-ins'.
-            let built_in_ids = remote_ids;
+            let built_in_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
             let all_provider_ids = self
                 .apply_dynamic_metadata(
                     &mut entity,
@@ -1076,31 +1218,20 @@ impl LibraryScanner {
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
-            if !people.is_empty()
-                && let Some(repo) = &self.people
-            {
-                match repo.update_people(item.id, &people).await {
-                    Ok(written) => self.enrich_people(repo.as_ref(), written).await,
-                    Err(err) => {
-                        tracing::warn!(%err, item = %item.id, "failed to persist cast/crew");
-                    }
-                }
-            }
-            if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
-                repo.save_media_streams(item.id, &streams).await?;
-            }
-            self.save_chapters(item.id, &chapters).await?;
-            // Artwork — locked items skip the rewrite entirely: their image
-            // rows are user-owned.
-            if !locked {
-                let art = ArtworkPass {
-                    entity: &entity,
+            self.persist_people(item.id, people, people_fetched).await;
+            self.persist_item_media(
+                item.id,
+                &entity,
+                ItemMedia {
                     streams: &streams,
-                    policy,
+                    chapters: &chapters,
                     embedded_images,
-                };
-                self.persist_artwork(item.id, art, &mut art_cache).await;
-            }
+                    policy,
+                    locked,
+                },
+                &mut art_cache,
+            )
+            .await?;
             // Per-library refresh % for open dashboards (`RefreshProgress`),
             // at the same bounded cadence as the progress log plus each
             // library's completion.
@@ -1118,6 +1249,34 @@ impl LibraryScanner {
         self.publish_library_changed(&items_added, &removed).await;
         self.post_scan_passes(folders).await;
         Ok(planned.len())
+    }
+
+    /// Writes an item's cast/crew, if there is anything authoritative to write.
+    ///
+    /// A completed credits fetch is authoritative even when it found nobody:
+    /// `update_people` replaces the item's rows, so an empty authoritative
+    /// result is what clears credits an earlier, wronger scan wrote (episodes
+    /// carrying their whole series' cast). A fetch that never ran — locked
+    /// item, gated-off fetcher, network failure, provider miss — leaves the
+    /// stored rows alone.
+    ///
+    /// Note the asymmetry: only REMOTE fetches carry the flag.
+    /// `fetch_local_nfo` returns a bare vec, so an NFO that credits nobody
+    /// cannot clear a stale cast — an NFO-authoritative library keeps the rows
+    /// this behaviour exists to correct.
+    async fn persist_people(&self, item_id: Uuid, people: Vec<PeopleEntity>, fetched: bool) {
+        if people.is_empty() && !fetched {
+            return;
+        }
+        let Some(repo) = &self.people else {
+            return;
+        };
+        match repo.update_people(item_id, &people).await {
+            Ok(written) => self.enrich_people(repo.as_ref(), written).await,
+            Err(err) => {
+                tracing::warn!(%err, item = %item_id, "failed to persist cast/crew");
+            }
+        }
     }
 
     /// Persists the item's external provider ids (the remote match's
@@ -1153,55 +1312,68 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Runs one item through the metadata chain — local NFO, then the remote
-    /// fetchers, then the embedded readers — and returns its credited people,
-    /// the provider ids to persist, and any images the file itself yielded.
+    /// What one scanned item contributes beyond its own row: its streams,
+    /// chapters and artwork.
+    /// Writes a scanned item's streams, chapters and artwork.
     ///
-    /// The order is Jellyfin's: the local reader is authoritative and runs
-    /// first, its ids seed the remote lookups (C# `info.GetProviderId`), and a
-    /// locked item skips every provider.
-    async fn run_metadata_chain(
+    /// Split out of the walk to keep it under the line ceiling; none of this
+    /// holds the provider chain's future, so it does not affect the boxing that
+    /// keeps that future small.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a storage failure from the stream or chapter write. Artwork
+    /// is best-effort and logs its own failures.
+    async fn persist_item_media(
         &self,
-        entity: &mut BaseItemEntity,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        media: ItemMedia<'_>,
         art_cache: &mut ArtworkCache,
-        policy: FetcherPolicy<'_>,
-        locked: bool,
-    ) -> (Vec<PeopleEntity>, Vec<(String, String)>, Vec<ItemImageInfo>) {
-        // Local Kodi/XBMC NFO sidecar first — Jellyfin's default local metadata
-        // reader, which runs before any remote fetch. It fills
-        // genres/studios/tags/overview/ratings/year from `movie.nfo` /
-        // `tvshow.nfo` / `<episode>.nfo` and yields the credited cast/crew.
-        let (mut people, nfo_ids) = if locked {
-            (Vec::new(), Vec::new())
-        } else {
-            self.fetch_local_nfo(entity, policy).await
-        };
-        let known_ids = known_provider_ids(&nfo_ids, art_cache, &entity.id);
-        // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
-        // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
-        // shows the same detail page Jellyfin does. Best-effort: failures don't
-        // abort, and NFO-provided people take precedence.
-        let remote = if locked {
-            RemoteMetadata::default()
-        } else {
-            self.fetch_remote_metadata(entity, art_cache, policy, &known_ids)
-                .await
-        };
-        // Photos and books carry their metadata inside the file, not on any
-        // remote provider. A photo's Primary image is the file itself; a book's
-        // is the cover extracted from its archive.
-        let (embedded_people, embedded_images) = self.enrich_from_file(entity, locked).await;
-        if people.is_empty() {
-            people = embedded_people;
+    ) -> Result<(), ServiceError> {
+        if let (false, Some(repo)) = (media.streams.is_empty(), &self.media_streams) {
+            repo.save_media_streams(item_id, media.streams).await?;
         }
-        if people.is_empty() {
-            people = remote.people;
+        self.save_chapters(item_id, media.chapters).await?;
+        // Artwork — locked items skip the rewrite entirely: their image rows
+        // are user-owned.
+        if !media.locked {
+            let art = ArtworkPass {
+                entity,
+                streams: media.streams,
+                policy: media.policy,
+                embedded_images: media.embedded_images,
+            };
+            self.persist_artwork(item_id, art, art_cache).await;
         }
-        (
-            people,
-            merge_provider_ids(nfo_ids, remote.provider_ids),
-            embedded_images,
-        )
+        Ok(())
+    }
+
+    /// The batches every item in the walk reads from, gathered once up front.
+    ///
+    /// Each of these replaced a per-item query, so they are the difference
+    /// between one read per scan and one per row. They run BEFORE the loop, so
+    /// keeping them out of it also keeps them out of the future the loop holds
+    /// across its awaits.
+    async fn scan_prereads(
+        &self,
+        planned: &[Planned],
+    ) -> (
+        ArtworkCache,
+        std::collections::HashSet<Uuid>,
+        std::collections::HashMap<Uuid, StoredText>,
+    ) {
+        // Carries matched series' TMDB ids + their episode-still URLs across
+        // the scan so seasons/episodes resolve against the same series lookup,
+        // pre-seeded with the external ids previous scans recorded.
+        let mut art_cache = ArtworkCache::default();
+        self.preload_provider_ids(planned, &mut art_cache).await;
+        // One read of the locked-item set for the whole scan, replacing the
+        // per-item row hydration the loop used to pay (see `locked_items`).
+        let locked_items = self.locked_items(planned).await;
+        // Same one-read-per-scan shape, for the episode providers' gate.
+        let stored_text = self.stored_episode_text(planned).await;
+        (art_cache, locked_items, stored_text)
     }
 
     /// Seeds the scan's provider-id cache with the ids previous scans recorded,
@@ -2176,6 +2348,7 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
+        stored: Option<&StoredText>,
         known_ids: &[(String, String)],
     ) -> RemoteMetadata {
         let short = entity
@@ -2196,13 +2369,13 @@ impl LibraryScanner {
         let tmdb_on = policy.metadata_enabled(&short, fetcher_names::TMDB);
         let tvdb_first = policy.metadata_rank(&short, fetcher_names::TVDB)
             <= policy.metadata_rank(&short, fetcher_names::TMDB);
-        if tvdb_on && (tvdb_first || !tmdb_on) {
-            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
-            // A TVDB hit (series cached, or episode text applied) is authoritative;
-            // only fall through to TMDB for a series TVDB could not resolve.
-            if short == "Episode" || cache.series_tvdb.contains_key(&entity.id) {
-                return result;
-            }
+        if tvdb_on
+            && (tvdb_first || !tmdb_on)
+            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+        {
+            // A TVDB hit is authoritative. A miss falls through to TMDB — for
+            // an episode as well as a series.
+            return result;
         }
         let omdb_on = policy.metadata_enabled(&short, fetcher_names::OMDB);
         if !tmdb_on {
@@ -2216,18 +2389,22 @@ impl LibraryScanner {
             };
         }
         if let Some(result) = self
-            .fetch_tmdb_metadata(entity, &short, omdb_on, known_ids)
+            .fetch_tmdb_metadata(entity, &short, omdb_on, cache, stored, known_ids)
             .await
         {
             return result;
         }
-        // The library ranked TMDB above TVDB and TMDB missed the series:
-        // TVDB is the fallback.
-        if tvdb_on && short == "Series" && !tvdb_first {
-            let result = self.fetch_tvdb_metadata(entity, &short, cache).await;
-            if cache.series_tvdb.contains_key(&entity.id) {
-                return result;
-            }
+        // The library ranked TMDB above TVDB and TMDB missed: TVDB is the
+        // fallback. Episodes are included — before this change TMDB had no
+        // Episode branch at all, so the gap was unreachable; now an episode
+        // TMDB has nothing for would otherwise never reach the fetcher the
+        // library ranked second.
+        if tvdb_on
+            && matches!(short.as_str(), "Series" | "Episode")
+            && !tvdb_first
+            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+        {
+            return result;
         }
         // Nothing upstream matched: OMDb closes the chain, matching its C#
         // `Order = 2` (behind TMDB and TVDB, ahead of nothing).
@@ -2414,6 +2591,8 @@ impl LibraryScanner {
         if let Some(id) = item.imdb_id.as_deref().filter(|s| !s.is_empty()) {
             provider_ids.push(("Imdb".to_owned(), id.to_owned()));
         }
+        // A completed OMDb fetch, so its credits are authoritative even when
+        // empty — same rule as the TMDB and TVDB arms.
         RemoteMetadata {
             // C# `ParseAdditionalMetadata` returns before adding the
             // director/writer/actors unless the OMDb plugin's `CastAndCrew`
@@ -2425,6 +2604,7 @@ impl LibraryScanner {
                 Vec::new()
             },
             provider_ids,
+            people_fetched: true,
         }
     }
 
@@ -2438,14 +2618,25 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         short: &str,
         omdb_on: bool,
+        cache: &mut ArtworkCache,
+        stored: Option<&StoredText>,
         known_ids: &[(String, String)],
     ) -> Option<RemoteMetadata> {
         let tmdb = self.tmdb.as_ref()?;
+        // TMDB is Jellyfin's default episode provider, and on a library
+        // migrated from Jellyfin it is usually the ONLY metadata fetcher saved
+        // for `Episode` (stock Jellyfin never lists TheTVDB). Its episode half
+        // reads the season response rather than `/movie|tv/{id}`, so it
+        // branches before the `TmdbKind` split below.
+        if short == "Episode" {
+            return self.fetch_tmdb_episode(entity, cache, stored).await;
+        }
         let kind = match short {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
             _ => return None,
         };
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
         // Fetch when the row still lacks core metadata OR still lacks a Rotten
         // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
         // for titles scanned before OMDb was configured. A fully-enriched title is
@@ -2463,6 +2654,24 @@ impl LibraryScanner {
         let wants_trailers =
             crate::item_data::read_remote_trailers(entity.data.as_deref()).is_empty();
         if has_overview && !wants_rating && !wants_trailers {
+            // A series that needs no metadata of its own STILL has to publish
+            // its TMDB id: every season and episode beneath it resolves through
+            // `cache.series_tmdb`. Returning here without it is why an
+            // already-enriched series would leave its whole episode tree with no
+            // provider at all — silently, and only on re-scans.
+            // ponytail: re-searches by name to recover the id, because there
+            // is no scan-time reader for the `Tmdb` id already persisted to
+            // BaseItemProviders when this series was first matched. One extra
+            // search per already-enriched series per scan, and in principle a
+            // renamed row could resolve to a different id and re-point its
+            // episode tree. Read the stored id back instead if either bites.
+            if matches!(kind, TmdbKind::Series)
+                && !cache.series_tmdb.contains_key(&entity.id)
+                && let Some(name) = entity.name.clone().filter(|n| !n.is_empty())
+                && let Some(hit) = tmdb.search(kind, &name, year).await.into_iter().next()
+            {
+                cache.series_tmdb.insert(entity.id.clone(), hit.tmdb_id);
+            }
             return Some(RemoteMetadata::default());
         }
         // C# `TmdbMovieProvider.GetMetadata` reads `info.GetProviderId(Tmdb)`
@@ -2476,13 +2685,19 @@ impl LibraryScanner {
             id
         } else {
             let name = entity.name.clone().filter(|n| !n.is_empty())?;
-            let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
             tmdb.search(kind, name.as_str(), year)
                 .await
                 .into_iter()
                 .next()
                 .map(|h| h.tmdb_id)?
         };
+        // Same reason as the short-circuit above: the seasons/episodes below
+        // this series key off the cached id. Cached however the id was
+        // resolved — a pinned series id serves its children just as well, and
+        // caching only the searched one would leave them looking it up again.
+        if matches!(kind, TmdbKind::Series) {
+            cache.series_tmdb.insert(entity.id.clone(), tmdb_id);
+        }
         let details = tmdb.details(kind, tmdb_id).await?;
         apply_details(entity, &details);
         // Rotten Tomatoes critic rating via OMDb, keyed by the IMDb id.
@@ -2504,31 +2719,173 @@ impl LibraryScanner {
         Some(RemoteMetadata {
             people: tmdb_people(&details.people),
             provider_ids,
+            people_fetched: true,
         })
+    }
+
+    /// The TMDB **episode** metadata pass — port of `TmdbEpisodeProvider`.
+    ///
+    /// An episode's title and synopsis come from its entry in the series'
+    /// cached `/tv/{id}/season/{n}` response (see
+    /// [`season_details_cached`](Self::season_details_cached)), so a whole
+    /// season's episodes cost one request between them — the same request the
+    /// image pass already makes for the season poster and episode stills.
+    ///
+    /// `None` means TMDB had nothing for this episode (the caller may fall back
+    /// to another fetcher); `Some(default)` means the row needed no fetch.
+    async fn fetch_tmdb_episode(
+        &self,
+        entity: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
+        stored: Option<&StoredText>,
+    ) -> Option<RemoteMetadata> {
+        let (Some(series_id), Some(season), Some(number)) = (
+            entity.series_id.clone(),
+            entity
+                .parent_index_number
+                .and_then(|n| i32::try_from(n).ok()),
+            entity.index_number.and_then(|n| i32::try_from(n).ok()),
+        ) else {
+            return None;
+        };
+        // Re-scan gate. It reads the STORED row, not the planned entity: the
+        // entity is rebuilt from the filesystem every scan, so its name is
+        // always the file stem and its overview always `None`. Gating on it
+        // would never fire — every episode would re-request its credits on
+        // every nightly scan.
+        //
+        // Skipping also has to carry the stored values forward. The scan upsert
+        // writes `excluded` for unlocked rows, so returning here without them
+        // would overwrite a good title with the placeholder — one scan during a
+        // TMDB outage would revert the whole library to filenames.
+        //
+        // An NFO wins either way: `apply_nfo` already ran and moved the name
+        // off the stem, which is what the placeholder check reads.
+        //
+        // ponytail: an episode TMDB has a title but no overview for never
+        // satisfies this gate, so it re-fetches its credits every scan (the
+        // season response itself is cached, so that half is free). Same
+        // unbounded-refetch shape as the trailers backfill above. Store a
+        // "checked" marker if it ever costs real time.
+        if let Some(stored) = stored.filter(|s| s.is_complete()) {
+            if name_is_file_stem_placeholder(entity) {
+                entity.name.clone_from(&stored.name);
+                entity.sort_name.clone_from(&stored.sort_name);
+            }
+            if entity.overview.is_none() {
+                entity.overview.clone_from(&stored.overview);
+            }
+            return Some(RemoteMetadata::default());
+        }
+        let ep = self
+            .season_details_cached(cache, &series_id, season)
+            .await
+            .and_then(|d| episode_in_season(d, number))?
+            .clone();
+        apply_tmdb_episode(entity, &ep);
+        let people = self
+            .tmdb_episode_people(series_tmdb_id_of(cache, &series_id), season, number)
+            .await
+            .fetched();
+        // `None` is a FAILED credits request (network, 429, 5xx, bad JSON), not
+        // an episode with no cast. Reporting it as a completed fetch would let
+        // one rate-limited request during a large scan delete the episode's
+        // stored credits — and the re-scan gate above would then skip that
+        // episode forever, because its title and overview are now set.
+        // Upstream `TmdbEpisodeProvider` sets the episode's own Tmdb id; the
+        // client's Identify and external-links surface on an episode page reads
+        // it.
+        let provider_ids = ep
+            .tmdb_id
+            .map(|id| vec![("Tmdb".to_owned(), id.to_string())])
+            .unwrap_or_default();
+        Some(match people {
+            Some(people) => RemoteMetadata {
+                people,
+                provider_ids,
+                people_fetched: true,
+            },
+            None => RemoteMetadata {
+                people: Vec::new(),
+                provider_ids,
+                people_fetched: false,
+            },
+        })
+    }
+
+    /// The people TMDB credits on ONE episode — the regulars credited in *that*
+    /// episode in billing order, then its guest stars, then its crew.
+    ///
+    /// Port of `TmdbEpisodeProvider`'s credits handling. The series' full
+    /// regular cast is deliberately NOT merged in: doing that made every
+    /// episode page show the series list verbatim, burying the guest stars and
+    /// the director the page exists to show.
+    ///
+    /// `None` means no credits were fetched — TMDB is unwired, the series has
+    /// no TMDB id, or the request failed. `Some(vec![])` means TMDB answered
+    /// and credits nobody. Credits are persisted by replacement, so the caller
+    /// must not conflate the two.
+    async fn tmdb_episode_people(
+        &self,
+        series_tmdb_id: Option<i64>,
+        season: i32,
+        number: i32,
+    ) -> TmdbCredits {
+        let (Some(tmdb), Some(series_id)) = (&self.tmdb, series_tmdb_id) else {
+            return TmdbCredits::NotAttempted;
+        };
+        match tmdb.episode_credits(series_id, season, number).await {
+            Some(credits) => TmdbCredits::Fetched(tmdb_people(&credits)),
+            None => TmdbCredits::Failed,
+        }
     }
 
     /// The people credited on ONE episode: TMDB's per-episode credits when the
     /// series carries a TMDB id, else TVDB's episode credits.
     ///
-    /// Port of `TmdbEpisodeProvider`: an episode's Cast & Crew is that
-    /// episode's own credits — the regulars credited in it, its guest stars,
-    /// then its crew. The series' full regular cast is deliberately NOT merged
-    /// in: doing that made every episode page show the series list verbatim,
-    /// burying the guest stars and director the page exists to show.
+    /// TVDB's episode credits are the fallback when no TMDB credits were
+    /// fetched (no id, or the request failed) and when TMDB credited nobody.
+    /// `tmdb_people` filters nothing, so "TMDB returned an empty list" and
+    /// "the mapping produced nobody" are the same condition — the pre-existing
+    /// behaviour is preserved either way it is spelled.
+    ///
+    /// `None` means nothing authoritative was learned, and only one case
+    /// produces it: TMDB's request **failed** and TVDB's record credits nobody.
+    /// Reporting that as a completed fetch would let one TMDB 429 clear the
+    /// episode's stored cast.
+    ///
+    /// A TMDB fetch that was never *attempted* — no client wired, or the series
+    /// has no TMDB id — is different: TVDB is then the only source, so its
+    /// empty record is authoritative and does clear. Conflating the two would
+    /// leave a TVDB-only server unable to correct a stale cast, which is the
+    /// bug this change exists to fix, on the other provider.
     async fn episode_people(
         &self,
         series_tmdb_id: Option<i64>,
         season: i32,
         number: i32,
         ep: &ferrofin_providers::TvdbEpisodeDetails,
-    ) -> Vec<PeopleEntity> {
-        if let (Some(tmdb), Some(series_id)) = (&self.tmdb, series_tmdb_id) {
-            let credits = tmdb.episode_credits(series_id, season, number).await;
-            if !credits.is_empty() {
-                return tmdb_people(&credits);
-            }
+    ) -> Option<Vec<PeopleEntity>> {
+        let tvdb = || tvdb_people(&ep.people);
+        match self
+            .tmdb_episode_people(series_tmdb_id, season, number)
+            .await
+        {
+            // TMDB answered with credits: they win.
+            TmdbCredits::Fetched(credits) if !credits.is_empty() => Some(credits),
+            // TMDB answered with nobody. Prefer TVDB's record if it has anyone;
+            // otherwise both sources agree, and that is authoritative.
+            TmdbCredits::Fetched(empty) => Some(match tvdb() {
+                fallback if fallback.is_empty() => empty,
+                fallback => fallback,
+            }),
+            // Nothing was asked of TMDB, so TVDB is the only source and its
+            // answer stands even when empty.
+            TmdbCredits::NotAttempted => Some(tvdb()),
+            // TMDB was asked and failed: only a non-empty TVDB record says
+            // anything about this episode.
+            TmdbCredits::Failed => Some(tvdb()).filter(|p| !p.is_empty()),
         }
-        tvdb_people(&ep.people)
     }
 
     /// The TheTVDB metadata pass — the TV authority. For a **series** it searches
@@ -2536,29 +2893,30 @@ impl LibraryScanner {
     /// (its `tvdb_id` lets episodes resolve, its artwork feeds the image pass).
     /// For an **episode** it resolves the episode by (season, number) against the
     /// cached series id and applies its name/overview/air date. Returns the cast
-    /// to persist. Best-effort — a miss returns no people and leaves the row for
-    /// the TMDB fallback.
+    /// to persist.
+    ///
+    /// `None` is a MISS — TVDB is unwired, could not resolve the title, or has
+    /// nothing for this episode — and the caller falls through to the next
+    /// fetcher. A series miss was previously detectable from
+    /// `cache.series_tvdb`, but an episode miss had no such signal, so the
+    /// caller returned unconditionally for episodes: with no saved
+    /// `TypeOptions` both fetcher ranks are `usize::MAX`, making `tvdb_first`
+    /// true by default, so a library on default ordering never offered TMDB the
+    /// episodes TVDB could not resolve (alternate numbering, specials, very new
+    /// episodes). Both kinds now report a miss the same way.
     async fn fetch_tvdb_metadata(
         &self,
         entity: &mut BaseItemEntity,
         short: &str,
         cache: &mut ArtworkCache,
-    ) -> RemoteMetadata {
-        let Some(tvdb) = &self.tvdb else {
-            return RemoteMetadata::default();
-        };
+    ) -> Option<RemoteMetadata> {
+        let tvdb = self.tvdb.as_ref()?;
         match short {
             "Series" => {
-                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                    return RemoteMetadata::default();
-                };
+                let name = entity.name.as_deref().filter(|n| !n.is_empty())?;
                 let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-                let Some(hit) = pick_series_hit(tvdb.search(name, year).await, year) else {
-                    return RemoteMetadata::default();
-                };
-                let Some(details) = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await else {
-                    return RemoteMetadata::default();
-                };
+                let hit = pick_series_hit(tvdb.search(name, year).await, year)?;
+                let details = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await?;
                 apply_tvdb_series(entity, &details);
                 let people = tvdb_people(&details.people);
                 // Persist the Tvdb id + the cross-provider ids TVDB carries (Imdb
@@ -2571,10 +2929,11 @@ impl LibraryScanner {
                     provider_ids.push(("Tmdb".to_owned(), tmdb.to_owned()));
                 }
                 cache.series_tvdb.insert(entity.id.clone(), details);
-                RemoteMetadata {
+                Some(RemoteMetadata {
                     people,
                     provider_ids,
-                }
+                    people_fetched: true,
+                })
             }
             "Episode" => {
                 let (Some(series_id), Some(season), Some(number)) = (
@@ -2584,23 +2943,18 @@ impl LibraryScanner {
                         .and_then(|n| i32::try_from(n).ok()),
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
                 ) else {
-                    return RemoteMetadata::default();
+                    return None;
                 };
                 // The parent series must have matched TVDB earlier this scan.
-                let Some(tvdb_id) = cache.series_tvdb.get(&series_id).map(|d| d.tvdb_id) else {
-                    return RemoteMetadata::default();
-                };
-                let Some(ep) = tvdb
+                let tvdb_id = cache.series_tvdb.get(&series_id).map(|d| d.tvdb_id)?;
+                let ep = tvdb
                     .episode_by_number(
                         tvdb_id,
                         ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
                         season,
                         number,
                     )
-                    .await
-                else {
-                    return RemoteMetadata::default();
-                };
+                    .await?;
                 apply_tvdb_episode(entity, &ep);
                 if let Some(url) = &ep.image_url {
                     cache
@@ -2613,17 +2967,21 @@ impl LibraryScanner {
                 // crew), so prefer those; TVDB's episode credits (guest cast +
                 // director/writers) are the fallback when the series has no
                 // TMDB id or TMDB has nothing for the episode.
-                let series_tmdb_id = cache
-                    .series_tvdb
-                    .get(&series_id)
-                    .and_then(|d| d.tmdb_id.as_deref())
-                    .and_then(|id| id.parse::<i64>().ok());
-                let people = self
-                    .episode_people(series_tmdb_id, season, number, &ep)
-                    .await;
-                RemoteMetadata::just_people(people)
+                // A hit either way: the episode's text was applied above. Only
+                // the CAST may be unknown, which `people_fetched: false` says.
+                Some(
+                    match self
+                        .episode_people(series_tmdb_id_of(cache, &series_id), season, number, &ep)
+                        .await
+                    {
+                        Some(people) => RemoteMetadata::just_people(people),
+                        // Nothing authoritative about this episode's cast —
+                        // leave whatever is stored alone rather than clearing it.
+                        None => RemoteMetadata::default(),
+                    },
+                )
             }
-            _ => RemoteMetadata::default(),
+            _ => None,
         }
     }
 
@@ -3164,18 +3522,82 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
-    /// editor's "lock this item"). Absent repository (unit-test builds) or a
-    /// missing/new row → unlocked.
-    async fn is_item_locked(&self, id: Uuid) -> bool {
+    /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
+    /// editor's "lock this item"), once per scan. Absent repository
+    /// (unit-test builds) or a read failure → nothing is treated as locked.
+    ///
+    /// This used to be a per-item `retrieve_item` — a full `SELECT *`
+    /// hydration of all 72 `BaseItems` columns to read one boolean, paid for
+    /// every planned item on every scan (O(items) queries). Locked items are
+    /// rare (usually none), so the whole answer is one small indexed read and
+    /// the loop looks the id up in the returned set.
+    ///
+    /// The index is what makes that true: `FerrofinIX_BaseItems_IsLocked`
+    /// (migration 0017) is PARTIAL (`WHERE "IsLocked" = 1`), so it holds only
+    /// the locked rows. Without it this is `SCAN BaseItems` — 26-53 ms warm on
+    /// a 100k-item table — which is tolerable amortized over a full scan but
+    /// not on `scan_paths`, the library-monitor path that runs for one or two
+    /// items on every filesystem event.
+    ///
+    /// A lock applied *while* this scan is running is not seen by it, exactly
+    /// as a lock applied one item too late was never seen before. The locked
+    /// item's stored metadata is protected regardless: the scan upsert guards
+    /// every user-owned column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`,
+    /// evaluated against the row's committed value at write time.
+    async fn locked_items(&self, planned: &[Planned]) -> std::collections::HashSet<Uuid> {
+        // Nothing to scan, nothing to look up. `run_scan` is shared with
+        // `scan_paths`, and a noisy directory (`.partial` files, stray
+        // subtitles) produces watcher events that plan zero items — which must
+        // not cost a database read at all.
+        if planned.is_empty() {
+            return std::collections::HashSet::new();
+        }
         let Some(repo) = &self.item_repository else {
-            return false;
+            return std::collections::HashSet::new();
         };
-        repo.retrieve_item(id)
+        match repo.locked_item_ids().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read locked items; treating none as locked");
+                std::collections::HashSet::new()
+            }
+        }
+    }
+
+    /// The stored text of every episode, read once per scan.
+    ///
+    /// The same shape and the same reason as
+    /// [`locked_items`](Self::locked_items): the episode providers' re-scan
+    /// gate needs what a previous scan achieved, and asking per item would
+    /// reinstate the `SELECT *`-per-item cost that read was introduced to
+    /// remove. Episodes only — they are the sole consumer.
+    async fn stored_episode_text(
+        &self,
+        planned: &[Planned],
+    ) -> std::collections::HashMap<Uuid, StoredText> {
+        if planned.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let Some(repo) = &self.item_repository else {
+            return std::collections::HashMap::new();
+        };
+        match repo
+            .item_text_rows(ferrofin_model::data::BaseItemKind::Episode)
             .await
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.is_locked)
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    Some((id, StoredText::from_row(&row)))
+                })
+                .collect(),
+            Err(err) => {
+                // A closed gate costs a re-fetch, never wrong data.
+                tracing::warn!(%err, "failed to read stored episode text; re-fetching all");
+                std::collections::HashMap::new()
+            }
+        }
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -3304,11 +3726,43 @@ impl LibraryScanner {
         }
     }
 
+    /// The `/tv/{id}/season/{n}` response for one season, fetched at most once
+    /// per scan.
+    ///
+    /// That single response carries the season poster, every episode's still
+    /// URL, and every episode's name/overview — so the metadata pass (episode
+    /// titles and synopses) and the image pass (season poster, episode stills)
+    /// both come through here rather than each paying for the request. A
+    /// resolved miss is cached as `None` so a season TMDB does not have is not
+    /// re-requested once per episode.
+    ///
+    /// `None` when TMDB is unwired, the series never matched TMDB, or the
+    /// request failed. A series with no cached TMDB id is NOT recorded as a
+    /// miss: nothing was asked, and the id may still arrive.
+    async fn season_details_cached<'a>(
+        &self,
+        cache: &'a mut ArtworkCache,
+        series_id: &str,
+        season: i32,
+    ) -> Option<&'a ferrofin_providers::tmdb::SeasonDetails> {
+        let key = (series_id.to_owned(), season);
+        if !cache.season_details.contains_key(&key) {
+            let tmdb = self.tmdb.as_ref()?;
+            // No series match yet → no request to make, and no miss to record.
+            let tmdb_id = series_tmdb_id_of(cache, series_id)?;
+            let details = tmdb.season_details(tmdb_id, season).await;
+            cache.season_details.insert(key.clone(), details);
+        }
+        cache.season_details.get(&key)?.as_ref()
+    }
+
     /// The season-poster / episode-still image pass, split out of
-    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** fetches
-    /// its poster + every episode still from TMDB in one request (caching the
-    /// stills); an **episode** downloads the still cached earlier this scan
-    /// (TVDB's, else TMDB's season-stills map).
+    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** takes
+    /// its poster from the cached `/tv/{id}/season/{n}` response; an
+    /// **episode** downloads the still cached earlier this scan (TVDB's, else
+    /// that same season response). Both go through
+    /// [`season_details_cached`](Self::season_details_cached), so the season
+    /// request is made at most once per scan no matter which pass asks first.
     async fn fetch_tv_still_images(
         &self,
         entity: &BaseItemEntity,
@@ -3319,26 +3773,21 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
     ) -> Vec<ItemImageInfo> {
         if short == "Season" {
-            // Season posters (and the episode-still cache) are TMDB's.
+            // Season posters are TMDB's.
             if !policy.image_enabled(short, fetcher_names::TMDB) {
                 return Vec::new();
             }
             let (Some(series_id), Some(season_num)) = (
-                entity.series_id.as_deref(),
+                entity.series_id.clone(),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) else {
                 return Vec::new();
             };
-            let Some(&tmdb_id) = cache.series_tmdb.get(series_id) else {
-                return Vec::new(); // series didn't match TMDB
-            };
-            // One request yields the season poster + every episode still.
-            let season = tmdb.season_images(tmdb_id, season_num).await;
-            cache
-                .season_stills
-                .insert((series_id.to_owned(), season_num), season.episode_stills);
-            let images = season
-                .poster
+            let poster = self
+                .season_details_cached(cache, &series_id, season_num)
+                .await
+                .and_then(|d| d.poster.clone());
+            let images = poster
                 .map(|url| {
                     vec![RemoteImage {
                         image_type: ImageType::Primary,
@@ -3349,31 +3798,33 @@ impl LibraryScanner {
             return download_images(tmdb, item_dir, &entity.id, images).await;
         }
         // Episode: prefer the TVDB still cached during the metadata pass; else
-        // fall back to the TMDB season-stills cache, and to OMDb's poster last
-        // (C# `OmdbImageProvider.Supports` covers Movie, Trailer and Episode).
-        let url = policy
+        // fall back to this episode's entry in the cached season response, and
+        // to OMDb's poster last (C# `OmdbImageProvider.Supports` covers Movie,
+        // Trailer and Episode).
+        let tvdb_still = policy
             .image_enabled(short, fetcher_names::TVDB)
             .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
-            .flatten()
-            .or_else(|| {
-                if !policy.image_enabled(short, fetcher_names::TMDB) {
-                    return None;
-                }
-                let (Some(series_id), Some(season_num), Some(ep_num)) = (
-                    entity.series_id.as_deref(),
+            .flatten();
+        let url = match tvdb_still {
+            Some(url) => Some(url),
+            None if policy.image_enabled(short, fetcher_names::TMDB) => {
+                match (
+                    entity.series_id.clone(),
                     entity
                         .parent_index_number
                         .and_then(|n| i32::try_from(n).ok()),
                     entity.index_number.and_then(|n| i32::try_from(n).ok()),
-                ) else {
-                    return None;
-                };
-                cache
-                    .season_stills
-                    .get(&(series_id.to_owned(), season_num))
-                    .and_then(|stills| stills.get(&ep_num))
-                    .cloned()
-            });
+                ) {
+                    (Some(series_id), Some(season_num), Some(ep_num)) => self
+                        .season_details_cached(cache, &series_id, season_num)
+                        .await
+                        .and_then(|d| episode_in_season(d, ep_num))
+                        .and_then(|ep| ep.still_url.clone()),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
         let mut images = url
             .map(|url| {
                 vec![RemoteImage {
@@ -5077,6 +5528,21 @@ fn known_provider_ids(
     )
 }
 
+/// What one scanned item contributes beyond its own row — the arguments
+/// [`LibraryScanner::persist_item_media`] would otherwise take positionally.
+struct ItemMedia<'a> {
+    /// The probed media streams.
+    streams: &'a [ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+    /// The probed chapters.
+    chapters: &'a [ferrofin_db::entities::base_items::ChapterEntity],
+    /// Images the file itself yielded (a photo, or a book's cover).
+    embedded_images: Vec<ItemImageInfo>,
+    /// The library's fetcher policy for this item.
+    policy: FetcherPolicy<'a>,
+    /// Whether the item is locked, in which case artwork is left alone.
+    locked: bool,
+}
+
 /// `local` followed by the entries of `remote` whose key `local` does not
 /// already hold.
 ///
@@ -5200,6 +5666,51 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
 }
 
+/// Whether the row's name is still the resolver's file-stem placeholder rather
+/// than a real title.
+///
+/// A provider title outranks the placeholder (upstream
+/// `MetadataService.MergeBaseItemData` runs with `replaceData=true` on a
+/// standard scan, so the provider replaces the stem the resolver stamped), but
+/// an NFO `<title>` still wins: `apply_nfo` ran first and changed the name away
+/// from the stem, which is exactly what this detects.
+///
+/// Shared by every episode provider so the two cannot disagree about what a
+/// placeholder is — a disagreement would show up as one provider silently
+/// refusing to title an episode.
+///
+/// One deliberate change from the inline version this replaces: a row with a
+/// blank name AND a path used to fall through to `"" == file_stem(path)`
+/// (false) and keep its blank name. A blank name is a placeholder by any
+/// reading, so it now matches first.
+fn name_is_file_stem_placeholder(entity: &BaseItemEntity) -> bool {
+    name_is_placeholder(entity.name.as_deref(), entity.path.as_deref())
+}
+
+/// [`name_is_file_stem_placeholder`] over the two fields it reads, so the
+/// narrow `ItemTextRow` projection can use the identical rule.
+fn name_is_placeholder(name: Option<&str>, path: Option<&str>) -> bool {
+    match (name, path) {
+        (None | Some(""), _) => true,
+        (Some(name), Some(path)) => name == file_stem(path),
+        _ => false,
+    }
+}
+
+/// Applies a provider's episode title to the row, replacing the resolver's
+/// file-stem placeholder. The derived sort name follows the new title, as
+/// `apply_nfo` does. A blank title, or a row already carrying a real title,
+/// is left alone.
+fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
+    if !name_is_file_stem_placeholder(entity) {
+        return;
+    }
+    if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        entity.name = Some(title.to_owned());
+        entity.sort_name = Some(derived_sort_name(entity, title));
+    }
+}
+
 /// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
 /// everything except the title, where the provider outranks the resolver's
 /// filename placeholder).
@@ -5207,29 +5718,37 @@ fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbE
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
-    // The episode's own title is authoritative over the resolver's
-    // filename-derived placeholder (upstream MetadataService.MergeBaseItemData
-    // runs with replaceData=true on a standard scan, so the provider title
-    // replaces the stem the resolver stamped). An NFO `<title>` still wins:
-    // `apply_nfo` ran first and changed the name away from the stem, which is
-    // exactly what the placeholder check detects. The derived sort name follows
-    // the new title, as `apply_nfo` does.
-    let name_is_placeholder = match (entity.name.as_deref(), entity.path.as_deref()) {
-        (Some(name), Some(path)) => name == file_stem(path),
-        (None | Some(""), _) => true,
-        _ => false,
-    };
-    if name_is_placeholder
-        && let Some(title) = d.name.as_deref().map(str::trim).filter(|s| !s.is_empty())
-    {
-        entity.name = Some(title.to_owned());
-        entity.sort_name = Some(derived_sort_name(entity, title));
-    }
+    apply_episode_title(entity, d.name.as_deref());
     if entity.production_year.is_none() {
         entity.production_year = d.production_year.map(i64::from);
     }
     if entity.premiere_date.is_none() {
         entity.premiere_date = d.aired.as_deref().and_then(parse_ymd);
+    }
+}
+
+/// Applies a matched TMDB **episode** entry from the season response to the row
+/// — the same fill-if-empty overview and placeholder-replacing title as
+/// [`apply_tvdb_episode`].
+///
+/// The air date and community rating come from the same season response — with
+/// TVDB unticked for `Episode` (the common shape on a Jellyfin-migrated
+/// library) this is the only fetcher that fills them, and a client shows an
+/// episode with no date and no rating where Jellyfin shows both.
+fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb::EpisodeDetails) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&d.overview);
+    }
+    apply_episode_title(entity, d.name.as_deref());
+    let aired = d.air_date.as_deref().and_then(parse_ymd);
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = aired;
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = aired.map(|d| i64::from(d.year()));
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = d.vote_average.map(f64::from);
     }
 }
 
@@ -6959,14 +7478,831 @@ mod tests {
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
 
         // No TMDB client wired → the episode's TVDB credits are used as-is.
-        let people = scanner.episode_people(Some(1399), 1, 1, &ep).await;
+        let people = scanner
+            .episode_people(Some(1399), 1, 1, &ep)
+            .await
+            .expect("TVDB credits are authoritative");
         let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["Guest Star", "Ep Director"]);
         assert_eq!(people[0].person_type.as_deref(), Some("GuestStar"));
 
         // Nor does a series without a TMDB id reach for TMDB.
-        let people = scanner.episode_people(None, 1, 1, &ep).await;
+        let people = scanner
+            .episode_people(None, 1, 1, &ep)
+            .await
+            .expect("TVDB credits are authoritative");
         assert_eq!(people.len(), 2);
+
+        // No TMDB client is wired here, so TMDB was never ATTEMPTED and TVDB is
+        // the only source: its empty record is authoritative and does clear a
+        // stale cast. (A request that was attempted and FAILED is the case that
+        // must not clear — covered by
+        // `a_failed_credits_request_does_not_wipe_a_stored_cast`.)
+        let bare = ferrofin_providers::TvdbEpisodeDetails::default();
+        assert_eq!(
+            scanner.episode_people(Some(1399), 1, 1, &bare).await,
+            Some(Vec::new()),
+            "a TVDB-only server must still be able to correct a stale cast"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // TMDB episode provider
+    // ---------------------------------------------------------------------
+
+    /// A minimal TMDB stand-in serving `/tv/{id}/season/{n}`, counting every
+    /// request it receives. Returns `(base_url, hit_counter)`.
+    ///
+    /// The counter is the point: the season response carries the episode text
+    /// AND the artwork, so both scan passes must share one request per season.
+    /// A regression that re-fetches per episode still produces correct data —
+    /// only the count catches it.
+    fn spawn_tmdb_server(
+        body: Option<&'static str>,
+        credits: Option<&'static str>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read as _, Write as _};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every request, not just season fetches: a series lookup never asks
+        // for a season, so a season-only counter cannot prove TMDB stayed out.
+        let all = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::clone(&hits);
+        let requests = Arc::clone(&all);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // `/credits` first: its path contains `/season/` too. A `None`
+                // body is a MISS — a real non-2xx, not an empty 200, so the
+                // caller's failure branch is the one under test.
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (status, payload) = if req.contains("/credits") {
+                    credits.map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/season/") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    body.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/search/tv") {
+                    ("200 OK", SERIES_SEARCH_JSON)
+                } else if req.contains("/tv/") {
+                    // `/tv/{id}` — a series detail fetch. Answering it (rather
+                    // than 404ing) is what lets a test prove the TVDB chain
+                    // stopped: if it did not, THIS overview wins.
+                    ("200 OK", SERIES_DETAILS_JSON)
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), hits, all)
+    }
+
+    /// The series search that gives the scan a TMDB id to hang seasons off.
+    const SERIES_SEARCH_JSON: &str = r#"{"results": [{"id": 1399, "name": "GoT"}]}"#;
+
+    /// `/tv/{id}` — deliberately a DIFFERENT overview from the TVDB fake's, so
+    /// a test can tell which provider wrote the row.
+    const SERIES_DETAILS_JSON: &str = r#"{"overview": "From TMDB.", "genres": []}"#;
+
+    /// One episode's credits: two billed regulars, a guest star, a director,
+    /// and a job Jellyfin does not map to a person type.
+    const CREDITS_JSON: &str = r#"{
+        "cast": [
+            {"id": 1, "name": "Sean Bean", "character": "Ned Stark"},
+            {"id": 2, "name": "Maisie Williams", "character": "Arya Stark"}
+        ],
+        "guest_stars": [
+            {"id": 3, "name": "Jason Momoa", "character": "Khal Drogo"}
+        ],
+        "crew": [
+            {"id": 4, "name": "Tim Van Patten", "job": "Director"},
+            {"id": 5, "name": "A Gaffer", "job": "Gaffer"}
+        ]
+    }"#;
+
+    const SEASON_JSON: &str = r#"{
+        "name": "Season 1",
+        "overview": "The first season.",
+        "poster_path": "/poster.jpg",
+        "episodes": [
+            {"id": 63056, "episode_number": 1, "name": "Winter Is Coming",
+             "overview": "Ned is summoned south.", "still_path": "/e1.jpg",
+             "air_date": "2011-04-17", "vote_average": 8.3},
+            {"id": 63057, "episode_number": 2, "name": "The Kingsroad",
+             "overview": "The party rides north.", "still_path": "/e2.jpg",
+             "air_date": "2011-04-24", "vote_average": 0.0}
+        ]
+    }"#;
+
+    /// Builds a scanner wired to a fake TMDB, plus the episode row the scan
+    /// would have planned (name = the file stem, no overview).
+    async fn tmdb_episode_fixture(
+        base_url: &str,
+        tmp: &std::path::Path,
+    ) -> (
+        LibraryScanner,
+        super::ArtworkCache,
+        ferrofin_db::entities::base_items::BaseItemEntity,
+    ) {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(base_url));
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata(tmdb, tmp.join("metadata"));
+
+        let mut cache = super::ArtworkCache::default();
+        cache.series_tmdb.insert("SERIES".to_owned(), 1399);
+
+        let episode = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+            name: Some("GoT.S01E01.1080p.Bluray".into()),
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
+            series_id: Some("SERIES".into()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..Default::default()
+        };
+        (scanner, cache, episode)
+    }
+
+    // The regression this whole change exists for: on a library migrated from
+    // Jellyfin, TheMovieDb is the only metadata fetcher saved for `Episode`, so
+    // TMDB must title the episode itself. Before the fix TMDB had no Episode
+    // branch at all and every episode kept its filename forever.
+    #[tokio::test]
+    async fn tmdb_episode_title_replaces_the_filename_placeholder() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let result = scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("applied");
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+        // An episode sorts by position, never alphabetically by the new title,
+        // or the client's play queue scrambles.
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("001 - 0001 - Winter Is Coming")
+        );
+        // The same response carries the air date and rating. With TheTVDB
+        // unticked for Episode — the shape that caused this bug — nothing else
+        // fills them, and the client shows a dateless, unrated episode.
+        assert_eq!(
+            episode
+                .premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("2011-04-17".to_owned())
+        );
+        assert_eq!(episode.production_year, Some(2011));
+        assert!((episode.community_rating.expect("rating") - 8.3).abs() < 1e-6);
+        // Upstream persists the episode's own Tmdb id.
+        assert_eq!(
+            result.provider_ids,
+            vec![("Tmdb".to_owned(), "63056".to_owned())]
+        );
+    }
+
+    // TMDB reports 0 for "nobody has rated this yet". Storing it as a rating of
+    // zero would show an episode rated 0/10 rather than unrated, and — because
+    // every fill here is fill-if-empty — permanently, since a later real rating
+    // could never replace it.
+    #[tokio::test]
+    async fn a_zero_tmdb_vote_is_unrated_not_a_rating_of_zero() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = Some("GoT.S01E02.1080p.Bluray".into());
+        episode.path = Some("/tv/GoT/Season 1/GoT.S01E02.1080p.Bluray.mkv".into());
+        episode.index_number = Some(2);
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("applied");
+        assert_eq!(episode.name.as_deref(), Some("The Kingsroad"));
+        assert_eq!(episode.community_rating, None);
+        // The air date still lands — only the rating was absent.
+        assert_eq!(episode.production_year, Some(2011));
+    }
+
+    // A library can rank TheTVDB first for `Series` while leaving `Episode` to
+    // TMDB. The series then resolves through TVDB and never populates
+    // `series_tmdb`, so without the fallback to the Tmdb id TVDB carries, every
+    // episode beneath it silently gets nothing.
+    #[tokio::test]
+    async fn an_episode_resolves_through_the_tmdb_id_tvdb_carries() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        // Only TVDB matched the series.
+        cache.series_tmdb.clear();
+        cache.series_tvdb.insert(
+            "SERIES".to_owned(),
+            ferrofin_providers::TvdbSeriesDetails {
+                tvdb_id: 121_361,
+                tmdb_id: Some("1399".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("resolves through TVDB's Tmdb id");
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+    }
+
+    // The episode page exists to show who was in THAT episode. Its credits are
+    // the regulars billed in it, then its guest stars, then its crew — never
+    // the series' regular cast, which is what every episode page listed before
+    // ca2f22c and again after 659b62e gated the only branch that fetched them.
+    #[tokio::test]
+    async fn tmdb_episode_credits_are_the_episodes_own() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let result = scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("applied");
+
+        let names: Vec<&str> = result.people.iter().map(|p| p.name.as_str()).collect();
+        // Billing order, then the guest star, then the crew. The unmapped
+        // "Gaffer" job is dropped, as upstream drops it.
+        assert_eq!(
+            names,
+            vec![
+                "Sean Bean",
+                "Maisie Williams",
+                "Jason Momoa",
+                "Tim Van Patten"
+            ]
+        );
+        assert_eq!(result.people[0].person_type.as_deref(), Some("Actor"));
+        assert_eq!(result.people[0].role.as_deref(), Some("Ned Stark"));
+        assert_eq!(result.people[2].person_type.as_deref(), Some("GuestStar"));
+        assert_eq!(result.people[3].person_type.as_deref(), Some("Director"));
+    }
+
+    // A series with no TMDB id yields "not fetched" rather than reaching for
+    // the network with a missing id — and "not fetched" is what stops the
+    // caller from clearing the episode's stored cast.
+    #[tokio::test]
+    async fn tmdb_episode_people_need_a_series_id() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        assert!(matches!(
+            scanner.tmdb_episode_people(None, 1, 1).await,
+            super::TmdbCredits::NotAttempted
+        ));
+        assert_eq!(
+            scanner
+                .tmdb_episode_people(Some(1399), 1, 1)
+                .await
+                .fetched()
+                .expect("credits fetched")
+                .len(),
+            4
+        );
+    }
+
+    // A failed credits request is `None` — distinct from an episode TMDB
+    // credits nobody on, which is `Some(vec![])`. Conflating them is what lets
+    // one 429 delete a cast.
+    #[tokio::test]
+    async fn a_failed_credits_request_is_not_an_empty_cast() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (failing, _, _) = spawn_tmdb_server(Some(SEASON_JSON), None);
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&failing, tmp.path()).await;
+        assert!(
+            matches!(
+                scanner.tmdb_episode_people(Some(1399), 1, 1).await,
+                super::TmdbCredits::Failed
+            ),
+            "a 500 is not an authoritative empty cast"
+        );
+
+        let (empty, _, _) = spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[]}"#));
+        let (scanner, _cache, _ep) = tmdb_episode_fixture(&empty, tmp.path()).await;
+        assert_eq!(
+            scanner
+                .tmdb_episode_people(Some(1399), 1, 1)
+                .await
+                .fetched(),
+            Some(Vec::new()),
+            "an answered request with no credits IS authoritative"
+        );
+    }
+
+    // An NFO <title> outranks the provider: `apply_nfo` ran first and moved the
+    // name off the file stem, which is exactly what the placeholder check reads.
+    // The overview is still filled, because it was empty.
+    #[tokio::test]
+    async fn tmdb_episode_keeps_an_nfo_title_but_fills_the_overview() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        episode.name = Some("A Title From The NFO".into());
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("applied");
+        assert_eq!(episode.name.as_deref(), Some("A Title From The NFO"));
+        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+    }
+
+    // `/tv/{id}/season/{n}` carries the episode text AND the season poster AND
+    // every episode still. One request must serve the whole season across both
+    // the metadata and the image pass — otherwise a 10k-episode library pays
+    // 10k requests for data it already had.
+    #[tokio::test]
+    async fn season_details_are_fetched_once_per_season() {
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut ep1) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        let mut ep2 = ep1.clone();
+        ep2.name = Some("GoT.S01E02.1080p.Bluray".into());
+        ep2.path = Some("/tv/GoT/Season 1/GoT.S01E02.1080p.Bluray.mkv".into());
+        ep2.index_number = Some(2);
+
+        scanner.fetch_tmdb_episode(&mut ep1, &mut cache, None).await;
+        scanner.fetch_tmdb_episode(&mut ep2, &mut cache, None).await;
+        // The image pass asks for the same season.
+        let poster = scanner
+            .season_details_cached(&mut cache, "SERIES", 1)
+            .await
+            .and_then(|d| d.poster.clone());
+
+        assert_eq!(ep1.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(ep2.name.as_deref(), Some("The Kingsroad"));
+        assert!(poster.is_some());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // Re-scan gate. It has to read the STORED row: the planned entity is
+    // rebuilt from the filesystem every scan, so its name is always the file
+    // stem and gating on it would never fire — every episode in the library
+    // would re-request its credits on every nightly scan.
+    //
+    // Skipping must also carry the stored title forward, because the scan
+    // upsert writes the entity's values: returning early without them would
+    // overwrite a good title with the placeholder, so one scan during a TMDB
+    // outage would revert the whole library to filenames.
+    #[tokio::test]
+    async fn a_previously_titled_episode_is_neither_re_requested_nor_reverted() {
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        // What an earlier scan achieved. `episode` is the freshly-planned row,
+        // still carrying the file stem and no overview.
+        let stored = super::StoredText::from_row(&ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some("001 - 0001 - Winter Is Coming".into()),
+            overview: Some("Ned is summoned south.".into()),
+            path: episode.path.clone(),
+        });
+
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
+            .await
+            .expect("nothing to do");
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+        assert_eq!(
+            episode.sort_name.as_deref(),
+            Some("001 - 0001 - Winter Is Coming")
+        );
+    }
+
+    // A season TMDB has nothing for is recorded as a miss, so a 24-episode
+    // season costs ONE failed request rather than 24. Without the negative
+    // caching every episode under an unmatched season re-asks.
+    #[tokio::test]
+    async fn a_season_miss_is_cached_and_not_re_requested() {
+        // `/season/` answers 404 — a real miss, not an empty 200.
+        let (base, hits, _all) = spawn_tmdb_server(None, Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut ep1) = tmdb_episode_fixture(&base, tmp.path()).await;
+
+        assert!(
+            scanner
+                .season_details_cached(&mut cache, "SERIES", 1)
+                .await
+                .is_none(),
+            "a non-2xx season response is a miss"
+        );
+        // The miss is remembered, so neither a second lookup nor an episode
+        // fetch spends another request.
+        assert!(
+            scanner
+                .season_details_cached(&mut cache, "SERIES", 1)
+                .await
+                .is_none()
+        );
+        assert!(
+            scanner
+                .fetch_tmdb_episode(&mut ep1, &mut cache, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The row keeps its placeholder for another fetcher to fill.
+        assert_eq!(ep1.name.as_deref(), Some("GoT.S01E01.1080p.Bluray"));
+    }
+
+    // A series that needs no metadata of its own returns before the search
+    // runs — and used to return without publishing its TMDB id, leaving every
+    // episode beneath it with no provider. That is the re-scan case: the shape
+    // a library is in on the second and every later scan, and the one a
+    // first-scan test cannot reach.
+    #[tokio::test]
+    async fn an_already_enriched_series_still_publishes_its_tmdb_id() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        // Nothing pre-seeded: the series must publish its own id.
+        cache.series_tmdb.clear();
+
+        // Overview set AND trailers already stored → every `wants_*` is false,
+        // so `fetch_tmdb_metadata` takes the short-circuit.
+        let mut series = BaseItemEntity {
+            id: "SERIES".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("GoT".into()),
+            overview: Some("A series that was enriched on an earlier scan.".into()),
+            data: Some(r#"{"RemoteTrailers":[{"Url":"https://y/t","Name":"Trailer"}]}"#.into()),
+            ..Default::default()
+        };
+        let result = scanner
+            .fetch_tmdb_metadata(&mut series, "Series", false, &mut cache, None, &[])
+            .await;
+
+        let result = result.expect("the series needed no fetch");
+        assert!(
+            result.people.is_empty() && !result.people_fetched,
+            "the short-circuit fetches no credits, so it must not claim to have"
+        );
+        assert_eq!(
+            series.overview.as_deref(),
+            Some("A series that was enriched on an earlier scan."),
+            "the short-circuit must not rewrite the row"
+        );
+        assert_eq!(
+            cache.series_tmdb.get("SERIES").copied(),
+            Some(1399),
+            "the id its episodes resolve through must be published anyway"
+        );
+
+        // And the episodes below it now resolve.
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .await
+            .expect("episode resolves through the published id");
+        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+    }
+
+    // A series with no cached TMDB id makes NO request and records NO miss —
+    // the id may still arrive (the series row is scanned before its episodes,
+    // but a gated-off Series fetcher leaves the cache empty).
+    #[tokio::test]
+    async fn an_unmatched_series_asks_tmdb_nothing() {
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.series_tmdb.clear();
+
+        assert!(
+            scanner
+                .fetch_tmdb_episode(&mut episode, &mut cache, None)
+                .await
+                .is_none()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(cache.season_details.is_empty());
+        // Untouched: the row keeps its placeholder for a later fetcher.
+        assert_eq!(episode.name.as_deref(), Some("GoT.S01E01.1080p.Bluray"));
+    }
+
+    /// A TVDB stand-in: `/login` issues a token, `/search` answers from
+    /// `search`, and `/series/…`/`/episodes/…` from `details`. A `None` body
+    /// 404s, which is how a miss is expressed.
+    ///
+    /// Exists because every TVDB **hit** path was unreachable from these tests
+    /// while `TvdbClient::with_base_url` was crate-private — the "a TVDB hit is
+    /// authoritative, do not also run TMDB" branches could be deleted with the
+    /// whole suite green.
+    fn spawn_tvdb_server(search: Option<&'static str>, details: Option<&'static str>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, payload) = if req.contains("/login") {
+                    ("200 OK", r#"{"data":{"token":"tok"}}"#)
+                } else if req.contains("/search") {
+                    search.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/series/") || req.contains("/episodes/") {
+                    details.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // A TVDB series hit is authoritative: TMDB must not also run and overwrite
+    // it. Nothing covered this branch — a full TVDB hit could be made to report
+    // a miss and every test still passed.
+    #[tokio::test]
+    async fn a_tvdb_series_hit_stops_the_chain() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        // `/search` → Envelope<Vec<SearchItem>>; `/series/{id}/extended` →
+        // Envelope<SeriesExtendedWire>. One fake serves both; the search item
+        // carries the id the details call is then made with.
+        const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
+        // No overview: `apply_tvdb_series` fills only what is empty, so if the
+        // chain fails to stop, TMDB's fill-if-empty genuinely writes
+        // "From TMDB." here. With an overview already set the assertion below
+        // could not fail for the reason it claims.
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT"}}"#;
+        let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
+        // TMDB answers a series fetch too, with a different overview — so if
+        // the chain fails to stop, the row ends up saying "From TMDB."
+        let (the_moviedb, _season_hits, tmdb_requests) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _ep) = tmdb_episode_fixture(&the_moviedb, tmp.path()).await;
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&the_tvdb),
+        ));
+
+        let mut series = BaseItemEntity {
+            id: "SERIES".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("GoT".into()),
+            ..Default::default()
+        };
+        let result = scanner
+            .fetch_remote_metadata(
+                &mut series,
+                &mut cache,
+                super::FetcherPolicy::default(),
+                None,
+                &[],
+            )
+            .await;
+
+        assert!(
+            cache.series_tvdb.contains_key("SERIES"),
+            "the hit must be cached — seasons and episodes key off it"
+        );
+        assert!(
+            result
+                .provider_ids
+                .iter()
+                .any(|(k, v)| k == "Tvdb" && v == "121361"),
+            "the TVDB id must be persisted: {:?}",
+            result.provider_ids
+        );
+        assert_eq!(
+            series.overview, None,
+            "TMDB must not have filled the overview the TVDB hit left empty"
+        );
+        assert_eq!(
+            tmdb_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "TMDB must not be asked anything after a TVDB hit"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Stale credits
+    // ---------------------------------------------------------------------
+
+    /// A one-episode TV library, scanned once with no metadata provider wired,
+    /// then given a stale cast — the state a library is left in by a scan that
+    /// wrote the series' regulars onto every episode.
+    ///
+    /// Returns everything a second scan needs, plus the episode's item id.
+    async fn library_with_a_stale_episode_cast(
+        tmp: &std::path::Path,
+    ) -> (
+        Arc<dyn VirtualFolderManager>,
+        Arc<FerrofinItemPersistenceService>,
+        Arc<crate::people_repository::FerrofinPeopleRepository>,
+        uuid::Uuid,
+    ) {
+        use ferrofin_db::entities::base_items::PeopleEntity;
+        use ferrofin_traits::persistence::PeopleRepository as _;
+
+        let tv = tmp.join("tv");
+        std::fs::create_dir_all(tv.join("GoT/Season 01")).unwrap();
+        std::fs::write(tv.join("GoT/Season 01/GoT S01E01.mkv"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "TV",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tv.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let people = Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+            db.clone(),
+        ));
+        // No TMDB wired: the episode row lands with its file-stem name and no
+        // overview, exactly as a library scanned before the provider existed.
+        LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+        .scan(None)
+        .await
+        .unwrap();
+
+        // The scan derives an item's id from its kind + path, so reproduce it
+        // rather than querying for it. The scanner was built with the default
+        // `IdDerivation::LegacyLowercase`, which is what `derive_item_id` uses.
+        let episode_id = crate::item_type_lookup::derive_item_id(
+            ferrofin_model::data::BaseItemKind::Episode,
+            &tv.join("GoT/Season 01/GoT S01E01.mkv").to_string_lossy(),
+        )
+        .expect("episode id");
+
+        // The stale rows: the series' regular cast, stamped on the episode.
+        people
+            .update_people(
+                episode_id,
+                &[
+                    PeopleEntity {
+                        id: String::new(),
+                        name: "A Series Regular".into(),
+                        person_type: Some("Actor".into()),
+                        ..Default::default()
+                    },
+                    PeopleEntity {
+                        id: String::new(),
+                        name: "Another Series Regular".into(),
+                        person_type: Some("Actor".into()),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(episode_credit_count(&people, episode_id).await, 2);
+
+        (vf, persistence, people, episode_id)
+    }
+
+    /// The credits stored against an item, read back through the same
+    /// repository the scan writes them with.
+    async fn episode_credit_count(
+        people: &crate::people_repository::FerrofinPeopleRepository,
+        item_id: uuid::Uuid,
+    ) -> usize {
+        use ferrofin_traits::persistence::PeopleRepository as _;
+        people
+            .get_people_batch(&[item_id])
+            .await
+            .expect("read credits")
+            .get(&item_id)
+            .map_or(0, Vec::len)
+    }
+
+    // `update_people` replaces an item's credit rows, but an empty result never
+    // reached it — so the series cast written onto every episode by an older
+    // scan could never be corrected, no matter how many re-scans ran. A fetch
+    // that COMPLETED is authoritative even when it found nobody.
+    #[tokio::test]
+    async fn a_completed_credits_fetch_clears_a_stale_cast() {
+        // Season text so the episode is worth fetching, and credits with nobody
+        // in them — a real TMDB answer for an episode it has no cast for.
+        let (base, _hits, _all) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+
+        let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata(tmdb, tmp.path().join("metadata"))
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan(None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            episode_credit_count(&people, episode_id).await,
+            0,
+            "a completed credits fetch that found nobody must clear the stale rows"
+        );
+    }
+
+    // The dangerous direction: a credits request that FAILED must not read as
+    // "this episode has no cast". TMDB answers 429 under exactly the load a
+    // first corrective scan of a large library generates, and the wipe would be
+    // permanent — the title and overview are written before the credits call,
+    // so the re-scan gate skips that episode from then on.
+    #[tokio::test]
+    async fn a_failed_credits_request_does_not_wipe_a_stored_cast() {
+        // Season text answers; `/credits` 500s.
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+
+        let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata(tmdb, tmp.path().join("metadata"))
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan(None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            episode_credit_count(&people, episode_id).await,
+            2,
+            "a failed credits request must leave the stored cast alone"
+        );
+    }
+
+    // The other direction, and the reason the flag exists rather than always
+    // writing: with no provider wired nothing was fetched, so the stored cast
+    // is all anyone has. A network outage or an unticked fetcher must never
+    // wipe a library's credits.
+    #[tokio::test]
+    async fn stored_credits_survive_a_scan_that_fetched_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (vf, persistence, people, episode_id) =
+            library_with_a_stale_episode_cast(tmp.path()).await;
+
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_people(people.clone() as Arc<dyn ferrofin_traits::persistence::PeopleRepository>)
+            .scan(None)
+            .await
+            .unwrap();
+
+        assert_eq!(episode_credit_count(&people, episode_id).await, 2);
     }
 
     // fetch_tvdb_metadata short-circuits (no network) when it can't act: a series
@@ -6991,10 +8327,13 @@ mod tests {
             type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
             ..Default::default()
         };
-        let result = scanner
-            .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
-            .await;
-        assert!(result.people.is_empty() && result.provider_ids.is_empty());
+        // A miss, not an empty hit: the caller must be able to fall through.
+        assert!(
+            scanner
+                .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
+                .await
+                .is_none()
+        );
         assert!(cache.series_tvdb.is_empty());
 
         // Episode whose series isn't in the TVDB cache → skipped (no network).
@@ -7005,10 +8344,51 @@ mod tests {
             index_number: Some(1),
             ..Default::default()
         };
+        assert!(
+            scanner
+                .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
+                .await
+                .is_none()
+        );
+    }
+
+    // With no saved TypeOptions both fetcher ranks are `usize::MAX`, so
+    // `tvdb_first` is true and TVDB runs first. An episode TVDB cannot resolve
+    // — alternate numbering, a special, something aired yesterday — must still
+    // reach TMDB. It did not: the caller returned unconditionally for episodes,
+    // because a series miss was detectable from the cache and an episode miss
+    // was not.
+    #[tokio::test]
+    async fn an_episode_tvdb_misses_still_reaches_tmdb() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        // TVDB is wired and ranked first (default policy: both fetcher ranks
+        // are `usize::MAX`, so `tvdb_first` is true), and misses — the fixture
+        // leaves `cache.series_tvdb` empty, so the episode arm returns at its
+        // cache lookup before any request. Point the client at a dead address
+        // regardless, so a future change to the fixture cannot turn this into a
+        // live TVDB login on every CI run.
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
+        ));
+
         let result = scanner
-            .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
+            .fetch_remote_metadata(
+                &mut episode,
+                &mut cache,
+                super::FetcherPolicy::default(),
+                None,
+                &[],
+            )
             .await;
-        assert!(result.people.is_empty());
+
+        assert_eq!(
+            episode.name.as_deref(),
+            Some("Winter Is Coming"),
+            "TMDB must get the episode TVDB could not resolve"
+        );
+        assert!(result.people_fetched);
     }
 
     // PersonInfo → PeopleEntity: type key is the Jellyfin PersonType name; no remote id/image.

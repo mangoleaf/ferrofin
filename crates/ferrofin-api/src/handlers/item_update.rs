@@ -31,7 +31,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, Re
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -52,7 +52,7 @@ use crate::state::AppState;
 )]
 pub(crate) async fn update_item(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Json(request): Json<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
@@ -355,7 +355,7 @@ struct ContentTypeQuery {
 )]
 async fn update_item_content_type(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ContentTypeQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -463,7 +463,7 @@ impl From<RefreshMode> for MetadataRefreshMode {
 )]
 async fn refresh_item(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -567,7 +567,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 )]
 async fn get_metadata_editor(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
     if state.library.get_item_by_id(item_id).await?.is_none() {

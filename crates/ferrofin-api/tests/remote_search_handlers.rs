@@ -17,7 +17,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
-use ferrofin_api::test_support::{authed_state_with_library_and_providers, minimal_base_item};
+use ferrofin_api::test_support::{
+    authed_state_with_library_and_providers, elevated_state_with_library_and_providers,
+    minimal_base_item,
+};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::base_items::PeopleEntity;
 use ferrofin_model::data::CollectionType;
@@ -252,7 +255,18 @@ impl ProviderManager for SearchProviders {
 }
 
 /// Builds the batch-4 [`AppState`] with the one-item library + search provider.
+///
+/// Elevated, because `RemoteSearch/Apply` and `RemoteSearch/Person` are
+/// `RequiresElevation` upstream. The asymmetry — those two gated, the other
+/// nine typed searches on plain `[Authorize]` — is pinned by
+/// [`only_person_and_apply_require_elevation`].
 fn state() -> AppState {
+    elevated_state_with_library_and_providers(Arc::new(OneItemLibrary), Arc::new(SearchProviders))
+}
+
+/// The plain-user [`AppState`], for proving which routes an ordinary account
+/// may still reach.
+fn user_state() -> AppState {
     authed_state_with_library_and_providers(Arc::new(OneItemLibrary), Arc::new(SearchProviders))
 }
 
@@ -346,4 +360,47 @@ async fn apply_missing_item_is_404() {
     let uri = format!("/Items/RemoteSearch/Apply/{missing}");
     let (status, _) = send("POST", &uri, Body::from("{}")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `ItemLookupController` gates exactly two of its actions with
+/// `RequiresElevation` at v10.11.8 — `RemoteSearch/Person` and
+/// `RemoteSearch/Apply/{itemId}` — and leaves the other nine typed searches on
+/// plain `[Authorize]`. That is asymmetric enough to look like a mistake, so it
+/// is pinned in both directions: over-gating would break ordinary metadata
+/// identification in every client.
+#[tokio::test]
+async fn only_person_and_apply_require_elevation() {
+    async fn post(state: AppState, uri: &str) -> StatusCode {
+        create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"SearchInfo":{}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    for uri in [
+        "/Items/RemoteSearch/Movie",
+        "/Items/RemoteSearch/Series",
+        "/Items/RemoteSearch/Book",
+        "/Items/RemoteSearch/MusicAlbum",
+    ] {
+        assert_ne!(
+            post(user_state(), uri).await,
+            StatusCode::FORBIDDEN,
+            "{uri} is plain [Authorize] upstream — an ordinary user must reach it"
+        );
+    }
+
+    assert_eq!(
+        post(user_state(), "/Items/RemoteSearch/Person").await,
+        StatusCode::FORBIDDEN,
+        "RemoteSearch/Person is RequiresElevation upstream"
+    );
 }

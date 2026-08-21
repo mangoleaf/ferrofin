@@ -175,6 +175,13 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
 /// `shutdown` sender is handed to the [`FerrofinLifecycleController`] so a
 /// `/System/Restart|Shutdown` request can trigger axum's graceful shutdown.
 ///
+/// `fpcalc` is the intro skipper's fallback fingerprint backend, pre-probed by
+/// the caller (`ferrofin_extensions::fingerprint::discover_fpcalc_async`)
+/// alongside the ffmpeg capability reads. Probing it here instead cost 18 ms of
+/// a 71 ms warm start, because it is a synchronous process spawn in the middle
+/// of an otherwise CPU-bound wiring sequence. `None` means "no `fpcalc`" — the
+/// same answer a failed probe gives.
+///
 /// Managers are constructed in dependency order: leaf repositories and the
 /// `Database`-only services first, then the managers that consume them, then the
 /// managers that consume *those*. The media-encoding seams are left as the
@@ -194,6 +201,7 @@ pub async fn build_app_state(
     db: &Database,
     config: &Config,
     ffmpeg: &FfmpegPaths,
+    fpcalc: Option<String>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
@@ -433,8 +441,9 @@ pub async fn build_app_state(
                 threads: 0,
                 // Frame extraction (chapter images) writes here, never next to
                 // the media file — media mounts are commonly read-only. The
-                // C# `TempDirectory` layout: a `temp` dir under the cache.
-                temp_dir: std::path::PathBuf::from(paths.cache_path()).join("temp"),
+                // path comes from `ServerApplicationPaths` so the chapter-image
+                // task's pre-flight probes the same directory this writes to.
+                temp_dir: std::path::PathBuf::from(paths.temp_path()),
             },
         ));
 
@@ -663,9 +672,26 @@ pub async fn build_app_state(
             }
         });
     }
-    if let Err(err) = library_monitor.start().await {
-        tracing::warn!(%err, "failed to start library monitor");
-    }
+    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
+    // inotify recursive watch adds one kernel watch per directory under every
+    // library root, so its cost scales with the library's directory count and
+    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
+    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
+    // far worse). Awaiting it here put that walk *before* the listener binds,
+    // where every millisecond is a client getting connection-refused rather
+    // than a slow response.
+    //
+    // Nothing needs the watches to exist before the server serves: they only
+    // feed realtime change detection, which is already blind for the whole of
+    // boot, and a change arriving during the walk is picked up by the next
+    // scheduled scan exactly as one arriving a moment earlier would be. So it
+    // is spawned and boot continues.
+    let monitor_start = Arc::clone(&library_monitor);
+    tokio::spawn(async move {
+        if let Err(err) = monitor_start.start().await {
+            tracing::warn!(%err, "failed to start library monitor");
+        }
+    });
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -788,12 +814,15 @@ pub async fn build_app_state(
     // `chromaprint` muxer, else `fpcalc`; otherwise it loads but reports
     // unavailable at run time.
     let fingerprinter: Option<Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>> =
-        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_ffmpeg_chromaprint(
+        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_backends(
             &ffmpeg.ffmpeg.to_string_lossy(),
             // Already probed by `discover_ffmpeg`, concurrently with the other
             // capability reads — re-probing here spawned `ffmpeg -muxers` a
-            // second time, synchronously, on the startup critical path.
+            // second time, synchronously, on the startup critical path. The
+            // `fpcalc` fallback arrives the same way and for the same reason:
+            // its own `-version` spawn was 18 ms of a 71 ms warm start.
             ffmpeg.chromaprint_muxer,
+            fpcalc,
         )
         .map(|fp| {
             tracing::debug!(backend = fp.backend(), "intro skipper: fingerprint backend");
@@ -974,7 +1003,10 @@ pub async fn build_app_state(
         .with_session_bus(Arc::clone(&session_bus))
         // So a playback-stopped report closes the live stream it names (C#
         // `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync`).
-        .with_media_sources(Arc::clone(&media_sources)),
+        .with_media_sources(Arc::clone(&media_sources))
+        // So casting an instant mix expands the seed into the mix (C#
+        // `SendPlayCommand` -> `TranslateItemForInstantMix`).
+        .with_music_manager(Arc::clone(&music)),
     );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -1250,6 +1282,10 @@ pub async fn build_app_state(
     let me_path_manager = Arc::clone(&path_manager);
     // The transcode planner resolves item/library display names for its logs.
     let me_library = Arc::clone(&library);
+    // SyncPlay resolves each member's library access; it is built after the
+    // state below, which takes ownership of these.
+    let sync_play_users = Arc::clone(&users);
+    let sync_play_library = Arc::clone(&library);
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(
@@ -1335,7 +1371,10 @@ pub async fn build_app_state(
     // The SyncPlay manager shares the session message bus (created with the
     // session manager above) to deliver group commands to member sockets.
     let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> = Arc::new(
-        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus)),
+        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus))
+            // So a group whose queue a user cannot see is hidden from them and
+            // refuses their join (C# `Group.HasAccessToPlayQueue`).
+            .with_library_access(sync_play_users, sync_play_library),
     );
     // A session that ended (its last socket closed, or it logged out) leaves its
     // SyncPlay group — port of `SyncPlayManager.OnSessionEnded`. Without it the
@@ -1449,7 +1488,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
-        let wired = build_app_state(&db, &config, &ffmpeg, tx)
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
             .await
             .expect("app state wires");
 

@@ -64,6 +64,10 @@ pub enum QueryShape {
     FullRows,
     /// Select only the id column (`SELECT bi."Id"`).
     IdsOnly,
+    /// Select the id and clean-name columns (`SELECT bi."Id", bi."CleanName"`) —
+    /// the by-name resolvers' projection, which needs the join key back but not
+    /// the row.
+    IdAndCleanName,
     /// Select `COUNT(*)` — no `ORDER BY` / paging is appended.
     Count,
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
@@ -75,8 +79,9 @@ pub enum QueryShape {
 ///
 /// The returned [`QueryBuilder`] is ready to `.build_query_as()` /
 /// `.build_query_scalar()`. Ordering and paging are appended for
-/// [`QueryShape::FullRows`] and [`QueryShape::IdsOnly`]; [`QueryShape::Count`]
-/// stops after the `WHERE` clause.
+/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`] and
+/// [`QueryShape::IdAndCleanName`]; [`QueryShape::Count`] stops after the
+/// `WHERE` clause.
 #[must_use]
 pub fn build_query<'a>(
     filter: &'a InternalItemsQuery,
@@ -85,6 +90,9 @@ pub fn build_query<'a>(
     let mut qb: QueryBuilder<'a, Sqlite> = QueryBuilder::new(match shape {
         QueryShape::FullRows => r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         QueryShape::IdsOnly => r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+        QueryShape::IdAndCleanName => {
+            r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" AS bi WHERE bi."Id" <> "#
+        }
         QueryShape::Count => r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
         QueryShape::TypeCounts => {
             r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE bi."Id" <> "#
@@ -100,7 +108,7 @@ pub fn build_query<'a>(
         QueryShape::TypeCounts => {
             qb.push(r#" GROUP BY bi."Type""#);
         }
-        QueryShape::FullRows | QueryShape::IdsOnly => {
+        QueryShape::FullRows | QueryShape::IdsOnly | QueryShape::IdAndCleanName => {
             append_order_by(&mut qb, filter);
             append_paging(&mut qb, filter);
         }

@@ -108,6 +108,16 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Whether an item with `id` exists.
+    ///
+    /// Semantically `get_item_by_id(id).is_some()` — which is the default — but
+    /// the concrete manager answers it with an existence probe rather than
+    /// decoding the whole row, so the "item must exist" `404` gate on the image
+    /// routes does not pay for a full `BaseItems` read it then discards.
+    async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
+        Ok(self.get_item_by_id(id).await?.is_some())
+    }
+
     /// Gets the image rows attached to an item.
     ///
     /// Port of the `BaseItem.ImageInfos` accessor the image controllers read
@@ -468,6 +478,28 @@ pub trait LibraryManager: Send + Sync {
             out.push(self.get_named_item(kind, name).await?);
         }
         Ok(out)
+    }
+
+    /// Id-only form of [`Self::get_named_items`]: resolves each of `names` to
+    /// the id of its by-name item row of `kind`, one slot per input name in
+    /// order (`None` where no row resolves).
+    ///
+    /// The DTO prefetch resolves a whole page's cast through this and reads
+    /// nothing but the id, so the concrete manager overrides it with a
+    /// two-column projection rather than materializing a full item row per
+    /// credited name. The default delegates to [`Self::get_named_items`], so
+    /// every implementation gets it for free with identical results.
+    async fn get_named_item_ids(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(self
+            .get_named_items(kind, names)
+            .await?
+            .into_iter()
+            .map(|row| row.and_then(|r| Uuid::parse_str(&r.id).ok()))
+            .collect())
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`

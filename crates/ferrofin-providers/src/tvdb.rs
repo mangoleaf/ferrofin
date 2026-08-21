@@ -329,10 +329,17 @@ impl TvdbClient {
         }
     }
 
-    /// Points the client at `base_url` (a mock server) for tests.
-    #[cfg(test)]
-    fn with_base_url(mut self, base_url: &str) -> Self {
-        self.base_url = base_url.to_owned();
+    /// Points the client at a different API root (a mock server in tests).
+    ///
+    /// `pub`, matching `TmdbClient::with_base_url`: while this was
+    /// crate-private, every TVDB **hit** path in the library scan was
+    /// structurally unreachable from `ferrofin-core`'s tests, so those branches
+    /// could be deleted with the whole suite still green.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        base_url
+            .trim_end_matches('/')
+            .clone_into(&mut self.base_url);
         self
     }
 

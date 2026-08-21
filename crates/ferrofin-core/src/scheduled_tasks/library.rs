@@ -381,8 +381,12 @@ impl AudioNormalizationTask {
         album_id: &str,
         track_paths: &[String],
     ) -> Result<Option<f64>, ServiceError> {
-        let temp_dir = Path::new(&self.paths.cache_path()).join("temp");
-        std::fs::create_dir_all(&temp_dir).map_err(|e| ServiceError::backend(e.to_string()))?;
+        // Same scratch directory the frame extractor uses, named once on the
+        // paths trait so the two cannot drift apart.
+        let temp_dir = std::path::PathBuf::from(self.paths.temp_path());
+        ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
+            ServiceError::backend(format!("temp directory `{}`: {e}", temp_dir.display()))
+        })?;
         let concat = temp_dir.join(format!("{album_id}.concat"));
         // ffmpeg concat-list quoting: single quotes with '\'' escapes.
         let lines: Vec<String> = track_paths
@@ -535,6 +539,11 @@ impl ChapterImagesTask {
 
     /// Extracts any missing chapter images for one video, returning `false`
     /// when an extraction failed (the video joins the failure history).
+    ///
+    /// Port of `ChapterManager.RefreshChapterImages`'s return, which is the
+    /// same bool: a video with nothing to do and a video that extracted are
+    /// both "success", because the only question the caller asks is whether to
+    /// record this video as failed.
     async fn refresh_video(
         &self,
         item_id: Uuid,
@@ -609,13 +618,18 @@ impl ChapterImagesTask {
                 )
                 .await
             {
-                Ok(extracted) => {
-                    if let Some(parent) = Path::new(&target).parent() {
+                Ok(frame) => Path::new(&target)
+                    .parent()
+                    // A directory the server cannot create is a server problem,
+                    // like the extraction failures around it — fail this video
+                    // the same way rather than aborting the whole method, which
+                    // would discard the chapters already resolved above AND
+                    // blocklist the video for something that is not its fault.
+                    .map_or(Ok(()), |parent| {
                         std::fs::create_dir_all(parent)
-                            .map_err(|e| ServiceError::backend(e.to_string()))?;
-                    }
-                    move_file(&extracted, &target)
-                }
+                            .map_err(|e| ServiceError::backend(e.to_string()))
+                    })
+                    .and_then(|()| move_file(&frame, &target)),
                 Err(e) => Err(e),
             };
             match moved {
@@ -625,7 +639,11 @@ impl ChapterImagesTask {
                     changed = true;
                 }
                 Err(e) => {
-                    tracing::warn!(item = %item_id, error = %e, "chapter image extraction failed");
+                    tracing::warn!(
+                        item = %item_id,
+                        error = %e,
+                        "chapter image could not be extracted or stored"
+                    );
                     ok = false;
                     break;
                 }
@@ -647,6 +665,46 @@ fn move_file(from: &str, to: &str) -> Result<(), ServiceError> {
                 .and_then(|()| std::fs::remove_file(from))
         })
         .map_err(|e| ServiceError::backend(e.to_string()))
+}
+
+impl ChapterImagesTask {
+    /// Proves the run can write everywhere it needs to before touching a single
+    /// video.
+    ///
+    /// An unwritable directory fails EVERY extraction, and without this the run
+    /// records the whole library as permanently failed — which is exactly what
+    /// happened: a server whose cache volume had a root-owned `temp/`
+    /// blocklisted ~3000 videos, then could not even rewrite the blocklist. A
+    /// misconfigured server must fail the task, loudly and once, and leave the
+    /// history untouched.
+    fn preflight_writable_dirs(&self, fail_history_path: &Path) -> Result<(), ServiceError> {
+        for dir in [
+            // ffmpeg writes the frame here ...
+            std::path::PathBuf::from(self.paths.temp_path()),
+            // ... and it is then moved under the internal metadata tree. Both
+            // live on the cache/metadata volume, and the outage this guards
+            // against - root-owned directories left by a container that once
+            // ran as root - hits whichever of them it happens to have created.
+            // Probing only the first leaves the same failure one directory
+            // over: extraction succeeds, every move fails, the library is
+            // blocklisted again.
+            std::path::PathBuf::from(self.paths.internal_metadata_path()),
+            fail_history_path
+                .parent()
+                .map_or_else(|| std::path::PathBuf::from("."), Path::to_path_buf),
+        ] {
+            // Returned, not logged: the task runner logs a failed task once, at
+            // the outermost layer, and the message names the directory.
+            ferrofin_util::file_helper::ensure_writable_dir(&dir).map_err(|e| {
+                ServiceError::backend(format!(
+                    "chapter image extraction needs a writable `{}`, so no images can be \
+                     produced until this is fixed: {e}",
+                    dir.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::unnecessary_literal_bound)]
@@ -688,16 +746,38 @@ impl ScheduledTask for ChapterImagesTask {
         // Failure history: videos whose extraction failed before are skipped
         // until their file changes (the key embeds the mtime).
         let fail_history_path = Path::new(&self.paths.cache_path()).join("chapter-failures.txt");
-        let mut failed: Vec<String> = std::fs::read_to_string(&fail_history_path)
-            .map(|text| {
-                text.split('|')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+
+        self.preflight_writable_dirs(&fail_history_path)?;
+
+        // A set, and lowercased once: the lookup is per video, and a history
+        // that has grown to thousands of entries turns a linear scan per video
+        // into O(videos × history).
+        let mut failed: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(&fail_history_path)
+                .map(|text| {
+                    text.split('|')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_lowercase)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        // A blocklist this large is almost always the fingerprint of a past
+        // systemic failure (an unwritable temp directory failing every
+        // extraction), not that many unreadable files. Nothing here can tell
+        // the two apart — the history records only path+mtime — so say how many
+        // videos are being skipped and let the operator judge. Silence is what
+        // let ~2950 wrongly-blocklisted videos look like a working task.
+        if !failed.is_empty() {
+            tracing::info!(
+                skipped = failed.len(),
+                path = %fail_history_path.display(),
+                "skipping videos recorded as previously failed; delete this file to retry them"
+            );
+        }
 
         let total = videos.len().max(1);
+        let mut history_dirty = false;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -716,8 +796,8 @@ impl ScheduledTask for ChapterImagesTask {
                 .ok()
                 .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            let history_key = format!("{path}{mtime}");
-            if failed.iter().any(|k| k.eq_ignore_ascii_case(&history_key)) {
+            let history_key = format!("{path}{mtime}").to_lowercase();
+            if failed.contains(&history_key) {
                 continue;
             }
             let outcome = self
@@ -728,18 +808,35 @@ impl ScheduledTask for ChapterImagesTask {
             }
             // A failed video (extraction failure or refresh error) joins the
             // failure history so it is skipped until its file changes.
+            // A failed video joins the failure history so it is skipped until
+            // its file changes — upstream's behaviour exactly. Nothing here can
+            // tell a per-file failure from a systemic one; that is what the
+            // pre-flight above and the skip-count log are for.
             if !matches!(outcome, Ok(true)) {
-                failed.push(history_key);
-                if let Some(parent) = fail_history_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(e) = std::fs::write(&fail_history_path, failed.join("|")) {
-                    tracing::warn!(error = %e, "failed to write chapter failure history");
-                }
+                failed.insert(history_key);
+                history_dirty = true;
             }
         }
+        write_failure_history(&fail_history_path, &failed, history_dirty);
         progress.report(100.0);
         Ok(())
+    }
+}
+
+/// Persists the chapter-image failure history, if the run added to it.
+///
+/// Written once per run rather than per failure: rewriting the whole file each
+/// time made a systemic failure quadratic in the history's own size.
+fn write_failure_history(path: &Path, failed: &std::collections::BTreeSet<String>, dirty: bool) {
+    if dirty
+        && let Err(e) = std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|"))
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "cannot write the chapter failure history; failures will be retried \
+             on every run until this is fixed"
+        );
     }
 }
 
@@ -2289,6 +2386,53 @@ mod tests {
             std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
                 .expect("history written");
         assert!(history.contains("film.mkv"));
+        drop(media);
+    }
+
+    // The failure mode that cost a real library every chapter image: the
+    // extraction temp directory was owned by another user, so ffmpeg produced
+    // nothing for every chapter of every video, and the run recorded ~3000
+    // videos as permanently failed. A directory the run cannot write is a
+    // server misconfiguration — fail the task and leave the history alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_temp_directory_fails_the_run_without_blocklisting_anything() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (media, _movie, chapters, task) = chapter_task_fixture(false).await;
+        let temp = std::path::PathBuf::from(task.paths.temp_path());
+        std::fs::create_dir_all(&temp).expect("create temp");
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let outcome = task.execute(&TaskProgress::default()).await;
+
+        // Running as root ignores the mode bits; only assert when the probe is
+        // meaningful for this uid.
+        if std::fs::File::create(temp.join("probe")).is_err() {
+            let err = outcome.expect_err("an unwritable temp directory must fail the task");
+            assert!(
+                err.to_string().contains("temp"),
+                "the error must name the directory: {err}"
+            );
+            assert!(
+                chapters
+                    .chapters
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .all(|c| c.image_path.is_none())
+            );
+            assert!(
+                !media
+                    .path()
+                    .join("cache")
+                    .join("chapter-failures.txt")
+                    .exists(),
+                "a misconfigured server must not blocklist the library"
+            );
+        }
+
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).expect("restore");
         drop(media);
     }
 }

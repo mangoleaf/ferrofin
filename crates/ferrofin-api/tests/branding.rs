@@ -73,7 +73,11 @@ fn user() -> UserEntity {
     }
 }
 
-/// An auth stub that authenticates as [`USER_ID`].
+/// An auth stub that authenticates as an API key.
+///
+/// `POST`/`DELETE /Branding/Splashscreen` are `RequiresElevation` upstream and
+/// gated with `RequireAdmin` here; an API key satisfies that policy without a
+/// user/policy lookup, exactly as C# does. (`GET` is anonymous either way.)
 struct OkAuth;
 
 #[async_trait]
@@ -85,6 +89,11 @@ impl AuthService for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             user: Some(user()),
+            // Must agree with `authenticate`: the router's auth layer inserts
+            // THIS value as a request extension and `RequireAuth` prefers it,
+            // so dropping `is_api_key` here silently downgrades every request
+            // to a non-elevated one.
+            is_api_key: true,
             is_authenticated: true,
             ..Default::default()
         })
@@ -100,6 +109,7 @@ impl AuthorizationContext for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             user: Some(user()),
+            is_api_key: true,
             is_authenticated: true,
             ..Default::default()
         })

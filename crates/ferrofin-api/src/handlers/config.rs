@@ -23,7 +23,7 @@ use ferrofin_model::branding::{BrandingOptions, BrandingOptionsDto};
 use ferrofin_model::configuration::{MetadataOptions, ServerConfiguration};
 use serde_json::Value;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -82,7 +82,7 @@ async fn get_configuration(
 )]
 async fn update_configuration(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Json(configuration): Json<ServerConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     state.config.update_configuration(&configuration).await?;
@@ -99,7 +99,7 @@ async fn update_configuration(
     responses((status = 200, description = "Metadata options returned", body = MetadataOptions)),
     tag = "ferrofin"
 )]
-async fn get_default_metadata_options(_auth: RequireAuth) -> Json<MetadataOptions> {
+async fn get_default_metadata_options(_auth: RequireAdmin) -> Json<MetadataOptions> {
     Json(MetadataOptions::default())
 }
 
@@ -117,7 +117,7 @@ async fn get_default_metadata_options(_auth: RequireAuth) -> Json<MetadataOption
 )]
 async fn update_branding_configuration(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Json(dto): Json<BrandingOptionsDto>,
 ) -> Result<StatusCode, ApiError> {
     let mut current = state.config.get_branding().await?;
@@ -283,7 +283,7 @@ async fn get_named_configuration(
 )]
 async fn update_named_configuration(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: RequireAdmin,
     Path(key): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {

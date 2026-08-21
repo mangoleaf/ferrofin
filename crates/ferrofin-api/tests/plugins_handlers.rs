@@ -428,12 +428,18 @@ async fn plugin_mutations_require_an_administrator() {
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
     }
-    // The reads stay plain-auth: the catalog is browseable by any account.
-    let resp = router()
-        .oneshot(authed("GET", "/Repositories", Body::empty()))
-        .await
-        .expect("resp");
-    assert_eq!(resp.status(), StatusCode::OK);
+    // The catalog reads are elevated too. `PackageController` carries a
+    // CLASS-level `[Authorize(Policy = Policies.RequiresElevation)]` at
+    // v10.11.8, so `GET /Repositories` and `GET /Packages` are admin-only
+    // upstream — jellyfin-web only surfaces the catalog inside the admin
+    // dashboard. Ferrofin previously let any account read them.
+    for uri in ["/Repositories", "/Packages"] {
+        let resp = router()
+            .oneshot(authed("GET", uri, Body::empty()))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "GET {uri}");
+    }
 }
 
 /// Captures what the transport forwards to a plugin and answers with

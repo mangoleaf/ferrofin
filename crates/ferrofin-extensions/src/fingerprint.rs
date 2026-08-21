@@ -70,6 +70,23 @@ impl ChromaprintFingerprinter {
         } else {
             discover_fpcalc()
         };
+        Self::with_backends(ffmpeg, ffmpeg_chromaprint, fpcalc)
+    }
+
+    /// [`Self::with_ffmpeg_chromaprint`] for a caller that has ALSO already
+    /// probed `fpcalc` (see [`discover_fpcalc_async`]).
+    ///
+    /// Spawns nothing: both backend facts are inputs. Selection is unchanged —
+    /// the ffmpeg muxer wins when present, `fpcalc` is the fallback, and
+    /// neither means no fingerprinter at all. `fpcalc` is ignored when the
+    /// muxer is available, exactly as when this type probed for it itself.
+    #[must_use]
+    pub fn with_backends(
+        ffmpeg: &str,
+        ffmpeg_chromaprint: bool,
+        fpcalc: Option<String>,
+    ) -> Option<Self> {
+        let fpcalc = if ffmpeg_chromaprint { None } else { fpcalc };
         (ffmpeg_chromaprint || fpcalc.is_some()).then(|| Self {
             fpcalc,
             ffmpeg: ffmpeg.to_owned(),
@@ -286,14 +303,53 @@ fn parse_fpcalc(output: &str) -> Result<Vec<u32>, String> {
 /// case the intro skipper loads but reports unavailable.
 #[must_use]
 pub fn discover_fpcalc() -> Option<String> {
-    let ok = std::process::Command::new("fpcalc")
+    blocking_version_probe_succeeds(FPCALC).then(|| FPCALC.to_owned())
+}
+
+/// [`discover_fpcalc`] for an async caller that wants the probe off the
+/// critical path.
+///
+/// Identical selection rule (`fpcalc -version` must exit `0`), but spawned
+/// through `tokio::process` so it can be `join!`ed with the composition root's
+/// other startup probes instead of blocking a worker thread for the whole
+/// spawn. The spawn itself costs ~16 ms — measured as 18 ms of a 71 ms warm
+/// start when it ran sequentially inside `build_app_state`, and 0 ms once
+/// folded into the concurrent `ffmpeg` probe round it now runs beside.
+pub async fn discover_fpcalc_async() -> Option<String> {
+    version_probe_succeeds(FPCALC)
+        .await
+        .then(|| FPCALC.to_owned())
+}
+
+/// Chromaprint's CLI, invoked by bare name so `$PATH` resolves it.
+const FPCALC: &str = "fpcalc";
+
+/// Whether `<program> -version` spawns AND exits `0` (async).
+///
+/// Starting is not proof of a usable tool: a program on `$PATH` that exits
+/// non-zero must read as absent, or the intro skipper selects a backend that
+/// fails on every episode instead of reporting that it has none.
+async fn version_probe_succeeds(program: &str) -> bool {
+    tokio::process::Command::new(program)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success());
-    ok.then(|| "fpcalc".to_owned())
+        .await
+        .is_ok_and(|s| s.success())
+}
+
+/// [`version_probe_succeeds`] for the blocking caller. Same rule, so the two
+/// probes cannot drift apart in what they accept.
+fn blocking_version_probe_succeeds(program: &str) -> bool {
+    std::process::Command::new(program)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]
@@ -349,6 +405,84 @@ mod tests {
         let fp = ChromaprintFingerprinter::with_ffmpeg_chromaprint("ferrofin-no-such-ffmpeg", true)
             .expect("a reported chromaprint muxer is a usable backend");
         assert_eq!(fp.backend(), "ffmpeg -f chromaprint");
+    }
+
+    #[test]
+    fn pre_probed_backends_spawn_nothing_at_all() {
+        // `with_backends` is the constructor the composition root uses so that
+        // NEITHER backend costs a process spawn during startup. Both arms are
+        // asserted against names that could not possibly execute: if either
+        // fact were re-derived by spawning, these would collapse to `None`.
+        let via_muxer =
+            ChromaprintFingerprinter::with_backends("ferrofin-no-such-ffmpeg", true, None)
+                .expect("a reported chromaprint muxer is a usable backend on its own");
+        assert_eq!(via_muxer.backend(), "ffmpeg -f chromaprint");
+        let via_fpcalc = ChromaprintFingerprinter::with_backends(
+            "ferrofin-no-such-ffmpeg",
+            false,
+            Some("ferrofin-no-such-fpcalc".to_owned()),
+        )
+        .expect("a supplied fpcalc is a usable backend on its own");
+        assert_eq!(via_fpcalc.backend(), "fpcalc");
+    }
+
+    #[test]
+    fn no_supplied_fpcalc_means_no_fingerprinter_even_where_one_is_installed() {
+        // The regression guard for the startup cost: told there is no muxer and
+        // handed no `fpcalc`, selection must answer `None` from its arguments
+        // alone. A reinstated `discover_fpcalc()` inside `with_backends` would
+        // return `Some` here on any host that has Chromaprint installed.
+        assert!(ChromaprintFingerprinter::with_backends("ffmpeg", false, None).is_none());
+    }
+
+    #[test]
+    fn a_present_muxer_discards_the_fpcalc_fallback() {
+        // Selection precedence is unchanged from when this type probed for
+        // itself: the muxer wins and `fpcalc` is not retained, so the fallback
+        // path cannot be reached on a build that has the muxer.
+        let fp = ChromaprintFingerprinter::with_backends("ffmpeg", true, Some("fpcalc".to_owned()))
+            .expect("muxer present");
+        assert_eq!(fp.fpcalc, None);
+        assert_eq!(fp.backend(), "ffmpeg -f chromaprint");
+    }
+
+    /// Writes an executable `name` under `dir` that exits `code`, so the
+    /// version probe can be driven against a program that exists but fails —
+    /// the case a real `$PATH` shim produces and a live `fpcalc` never does.
+    #[cfg(unix)]
+    fn write_exiting_program(dir: &std::path::Path, name: &str, code: u8) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nexit {code}\n")).expect("write probe stub");
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat probe stub")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod probe stub");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_that_runs_but_fails_reads_as_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ok = write_exiting_program(tmp.path(), "probe-ok", 0);
+        let bad = write_exiting_program(tmp.path(), "probe-bad", 3);
+        // Spawning successfully is not enough — the exit status decides.
+        assert!(version_probe_succeeds(&ok).await);
+        assert!(!version_probe_succeeds(&bad).await);
+        // And the blocking probe must accept exactly the same programs, or the
+        // startup path and the `discover` path would disagree about backends.
+        assert!(blocking_version_probe_succeeds(&ok));
+        assert!(!blocking_version_probe_succeeds(&bad));
+    }
+
+    #[tokio::test]
+    async fn the_async_fpcalc_probe_answers_exactly_like_the_blocking_one() {
+        // The composition root calls the async probe so it can be joined with
+        // the ffmpeg round; it must not drift from the selection rule the
+        // blocking probe implements (both: `fpcalc -version` exits 0).
+        assert_eq!(discover_fpcalc_async().await, discover_fpcalc());
     }
 
     #[test]
