@@ -68,10 +68,12 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_METRICS_SAMPLE_INTERVAL` | built-in | Seconds between process-metric samples. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Enable OTLP trace export to this endpoint (off by default). |
 
-## Remote metadata providers (feature-gated, off by default)
+## Remote metadata provider keys
 
-These are read only when the provider feature is compiled in; without a key the provider
-returns empty results. Never send user PII to these services.
+Every remote provider is compiled in and enabled per library through the fetcher
+checkboxes, as in Jellyfin. The keyed ones below additionally need their key: without one
+the provider returns empty results rather than failing the scan. Never send user PII to
+these services.
 
 | Variable | Purpose |
 |---|---|

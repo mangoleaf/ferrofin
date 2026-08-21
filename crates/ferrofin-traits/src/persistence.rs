@@ -543,6 +543,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The external ids already recorded for each of `item_ids`, keyed by item.
+    ///
+    /// A scanner reads these once up front so a re-scan resolves each item by
+    /// the id a previous pass matched — C# `info.GetProviderId` — instead of
+    /// searching by title again. The default is an empty map, for stub
+    /// services with no store behind them.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn provider_ids_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+        let _ = item_ids;
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Upserts one `(ProviderId, ProviderValue)` external-id row for an item
     /// (`BaseItemProviders`) — the write path behind provider-id lookups such
     /// as [`ItemRepository::get_items_with_provider_id`].

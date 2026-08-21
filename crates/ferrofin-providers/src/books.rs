@@ -1,17 +1,21 @@
 //! Book and comic local metadata — port of `MediaBrowser.Providers/Books`.
 //!
-//! Four readers, tried in the order `ComicProvider` tries them, plus the two
-//! cover extractors:
+//! Four readers, tried in `ComicProvider`'s DI registration order — the first
+//! with metadata wins — plus the two cover extractors:
 //!
-//! | Source | C# | What it reads |
-//! |---|---|---|
-//! | `ComicInfo.xml` inside a `.cbz` | `InternalComicInfoProvider` | the ComicRack schema |
-//! | `ComicInfo.xml` beside the file | `ExternalComicInfoProvider` | the same schema, as a sidecar |
-//! | the `.cbz` archive comment | `ComicBookInfoProvider` | the ComicBookInfo JSON schema |
-//! | `.opf` (standalone or inside a `.epub`) | `OpfProvider`/`EpubProvider` | Dublin Core + Calibre |
+//! | Order | Source | C# | What it reads |
+//! |---|---|---|---|
+//! | 1 | the `.cbz` archive comment | `ComicBookInfoProvider` | the ComicBookInfo JSON schema |
+//! | 2 | `<stem>.xml`, else `ComicInfo.xml`, beside the file | `ExternalComicInfoProvider` | the ComicRack schema, as a sidecar |
+//! | 3 | `ComicInfo.xml` inside a `.cbz` | `InternalComicInfoProvider` | the same schema, bundled |
+//! | 4 | `<stem>.opf`, `content.opf`, `metadata.opf`, or the one inside a `.epub` | `OpfProvider`/`EpubProvider` | Dublin Core + Calibre |
 //!
-//! Covers come from the first image in a comic archive
-//! (`ComicImageProvider`) or the EPUB's declared cover (`EpubImageProvider`).
+//! `OpfProvider` is unfiltered, so step 4 runs for a comic too — a `.cbz` in a
+//! Calibre directory resolves through it.
+//!
+//! Covers come from an explicitly named `cover.<ext>` in a comic archive, else
+//! its first page in name order (`ComicImageProvider`), or the EPUB's declared
+//! cover (`EpubImageProvider`).
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -26,14 +30,22 @@ use crate::xbmc::xml_reader::XmlCursor;
 /// (`ComicImageProvider._comicBookExtensions`).
 pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
 
-/// The archive extensions this port can actually open. `.cbr` is RAR and
-/// `.cb7` is 7z; neither has a maintained pure-Rust reader worth a dependency
-/// for a cover image, so those two are recognized as comics but yield no
-/// embedded metadata or cover.
-const READABLE_ARCHIVE_EXTENSIONS: [&str; 2] = ["cbz", "cbt"];
+/// The archive extensions this port can actually open — ZIP, and only ZIP.
+///
+/// `.cbr` is RAR, `.cb7` is 7z and `.cbt` is tar; none has a maintained
+/// pure-Rust reader worth a dependency for a cover image, so all three are
+/// recognized as comics (so the file is still a Book) but yield no embedded
+/// metadata or cover.
+const READABLE_ARCHIVE_EXTENSIONS: [&str; 1] = ["cbz"];
+
+/// The largest single archive entry this module will decompress into memory.
+///
+/// A cover page or an OPF document is kilobytes; the cap is what stops a
+/// malicious `.cbz`/`.epub` from turning a scan into an OOM abort.
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The image extensions a comic page may have, for the cover extractor.
-const PAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
+const PAGE_EXTENSIONS: [&str; 6] = ["png", "jpeg", "jpg", "webp", "bmp", "gif"];
 
 /// A book's parsed metadata — the subset of the C# `Book` entity the readers
 /// fill.
@@ -45,6 +57,9 @@ pub struct BookMetadata {
     pub original_title: Option<String>,
     /// `SeriesName`.
     pub series_name: Option<String>,
+    /// `ForcedSortName` — the OPF's `file-as` refinement of the main title, or
+    /// Calibre's `calibre:title_sort`.
+    pub sort_name: Option<String>,
     /// `IndexNumber` — the issue or series index.
     pub index_number: Option<i32>,
     /// `Overview`.
@@ -103,32 +118,54 @@ pub fn read_book_metadata(path: &str) -> Option<BookMetadata> {
             .and_then(|xml| parse_opf(&xml));
     }
     if COMIC_EXTENSIONS.contains(&extension.as_str()) {
-        // 1. ComicInfo.xml inside the archive.
-        if let Some(xml) = read_archive_entry_text(path, "comicinfo.xml")
-            && let Some(book) = parse_comic_info(&xml)
-        {
-            return Some(book);
-        }
-        // 2. A ComicInfo.xml sidecar next to the file.
-        if let Some(sidecar) = Path::new(path).parent().map(|d| d.join("ComicInfo.xml"))
-            && let Ok(xml) = std::fs::read_to_string(&sidecar)
-            && let Some(book) = parse_comic_info(&xml)
-        {
-            return Some(book);
-        }
-        // 3. The ComicBookInfo JSON in the archive comment.
+        // `ComicProvider` returns the first source with metadata, over the DI
+        // registration order: ComicBookInfoProvider, then External (sidecar),
+        // then Internal (in-archive). Reading the archive first would let a
+        // stale bundled ComicInfo.xml beat the comment the user rewrote.
+        // 1. The ComicBookInfo JSON in the archive comment.
         if let Some(comment) = read_archive_comment(path)
             && let Some(book) = parse_comic_book_info(&comment)
         {
             return Some(book);
         }
-        return None;
+        // 2. A sidecar next to the file. C# `GetXmlFilePath` prefers
+        //    `<stem>.xml` and only then the fixed `ComicInfo.xml`.
+        if let Some(xml) = read_sidecar(path, &["xml"], &["ComicInfo.xml"])
+            && let Some(book) = parse_comic_info(&xml)
+        {
+            return Some(book);
+        }
+        // 3. ComicInfo.xml inside the archive.
+        if let Some(xml) = read_archive_entry_text(path, "comicinfo.xml")
+            && let Some(book) = parse_comic_info(&xml)
+        {
+            return Some(book);
+        }
+        // `OpfProvider` is an unfiltered `ILocalMetadataProvider<Book>`, so it
+        // runs for a comic too: a `.cbz` in a Calibre directory still resolves
+        // through the sidecar chain below.
     }
-    // A plain book file may still have an `.opf` sidecar (Calibre's layout).
-    let sidecar = Path::new(path).with_extension("opf");
-    std::fs::read_to_string(sidecar)
-        .ok()
-        .and_then(|xml| parse_opf(&xml))
+    // A plain book file may still have an `.opf` sidecar. C# `GetXmlFile`
+    // probes `<stem>.opf` (most specific), then `content.opf`, then Calibre's
+    // `metadata.opf` — a Calibre library is the whole reason the last one is
+    // there, and without it such a library reads nothing.
+    read_sidecar(path, &["opf"], &["content.opf", "metadata.opf"]).and_then(|xml| parse_opf(&xml))
+}
+
+/// Reads the first sidecar that exists beside `path`: one named after the
+/// file's own stem with each of `stem_extensions`, then each of `fixed_names`
+/// in the file's directory.
+fn read_sidecar(path: &str, stem_extensions: &[&str], fixed_names: &[&str]) -> Option<String> {
+    let file = Path::new(path);
+    let dir = file.parent()?;
+    for extension in stem_extensions {
+        if let Ok(xml) = std::fs::read_to_string(file.with_extension(extension)) {
+            return Some(xml);
+        }
+    }
+    fixed_names
+        .iter()
+        .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())
 }
 
 /// An EPUB's metadata: the OPF the container points at.
@@ -240,7 +277,9 @@ pub fn parse_comic_book_info(json: &str) -> Option<BookMetadata> {
         book.studios = vec![publisher];
     }
     book.premiere_date = match (comic.publication_year, comic.publication_month) {
-        (Some(year), Some(month)) => three_part_date(Some(year), u32::try_from(month).ok(), None),
+        (Some(year), Some(month)) => u32::try_from(month)
+            .ok()
+            .and_then(|m| two_part_date(year, m)),
         _ => None,
     };
     for credit in comic.credits {
@@ -252,13 +291,7 @@ pub fn parse_comic_book_info(json: &str) -> Option<BookMetadata> {
             Some((last, first)) => format!("{} {}", first.trim(), last.trim()),
             None => person,
         };
-        // C# parses the role as a PersonKind, mapping the "Colorer" spelling.
-        let kind = if role.eq_ignore_ascii_case("Colorer") {
-            "Colorist".to_owned()
-        } else {
-            role
-        };
-        book.people.push((name, kind));
+        book.people.push((name, person_kind(&role)));
     }
     book.has_metadata().then_some(book)
 }
@@ -270,6 +303,12 @@ pub fn parse_comic_book_info(json: &str) -> Option<BookMetadata> {
 #[must_use]
 pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
     let mut book = BookMetadata::default();
+    // EPUB 3 refines the title through sibling `<meta property=…>` elements
+    // that point back at a `<dc:title id=…>`. They can appear either side of
+    // the title they refine, so both are collected and resolved at the end.
+    let mut titles: Vec<(Option<String>, String)> = Vec::new();
+    let mut refinements: Vec<(String, String, String)> = Vec::new();
+    let mut calibre_title_sort: Option<String> = None;
     let Ok(mut cursor) = XmlCursor::new(xml) else {
         return None;
     };
@@ -291,22 +330,21 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
             continue;
         }
         // Calibre's series/rating live on `<meta name= content= />` attributes,
-        // which carry no element text.
+        // which carry no element text; EPUB 3 refinements carry theirs as
+        // element text keyed by `property`.
         if name == "meta" || name.ends_with(":meta") {
-            let meta_name = cursor.get_attribute("name").unwrap_or_default().to_owned();
-            let content = cursor
-                .get_attribute("content")
-                .unwrap_or_default()
-                .to_owned();
-            match meta_name.to_ascii_lowercase().as_str() {
-                "calibre:series" => book.series_name = non_empty(Some(content)),
-                "calibre:series_index" => book.index_number = content.trim().parse().ok(),
-                "calibre:rating" => book.community_rating = content.trim().parse().ok(),
-                _ => {}
+            if read_opf_meta(
+                &mut cursor,
+                &mut book,
+                &mut refinements,
+                &mut calibre_title_sort,
+            ) {
+                continue;
             }
             cursor.read();
             continue;
         }
+        let element_id = cursor.get_attribute("id").map(str::to_owned);
         let scheme = cursor
             .get_attribute("opf:scheme")
             .or_else(|| cursor.get_attribute("scheme"))
@@ -322,11 +360,13 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
             continue;
         }
         match local.as_str() {
-            "title" if book.name.is_none() => book.name = Some(value.to_owned()),
+            "title" => titles.push((element_id, value.to_owned())),
             "description" => book.overview = Some(value.to_owned()),
             "publisher" => book.studios.push(value.to_owned()),
             "language" => book.language = Some(value.to_owned()),
-            "subject" => book.genres.extend(split_commas(value)),
+            // "specification has no rules about content and some books combine
+            // every genre into a single element" — C# splits on all five.
+            "subject" => book.genres.extend(split_genres(value)),
             "date" => {
                 if let Some(date) = parse_opf_date(value) {
                     book.production_year = Some(date.year());
@@ -339,13 +379,101 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
                 }
             }
             "creator" => {
-                book.people
-                    .push((value.to_owned(), opf_role(role.as_deref())));
+                let kind = opf_role(role.as_deref());
+                for name in split_creators(value) {
+                    book.people.push((name, kind.clone()));
+                }
             }
             _ => {}
         }
     }
+    // C# `FindMainTitle`: the title a `title-type` of `main` refines wins (the
+    // loop keeps the LAST such match), else the first `<dc:title>`. Without
+    // this an EPUB 3 that also declares a subtitle can name the book after it.
+    book.name = refinements
+        .iter()
+        .filter(|(property, _, value)| {
+            property == "title-type" && value.eq_ignore_ascii_case("main")
+        })
+        .filter_map(|(_, refines, _)| title_with_id(&titles, refines))
+        .next_back()
+        .or_else(|| titles.first().map(|(_, text)| text.clone()));
+    // C# `FindSortTitle`: the first `file-as` refining a real title, then
+    // OPF 2.0's `calibre:title_sort`.
+    book.sort_name = refinements
+        .iter()
+        .filter(|(property, _, _)| property == "file-as")
+        .find(|(_, refines, _)| title_with_id(&titles, refines).is_some())
+        .map(|(_, _, value)| value.clone())
+        .or(calibre_title_sort);
     book.has_metadata().then_some(book)
+}
+
+/// Applies one `<meta>` element to the book being parsed.
+///
+/// Returns `true` when the cursor was already advanced past the element (the
+/// refinement branch reads its text), `false` when the caller must advance it.
+fn read_opf_meta(
+    cursor: &mut XmlCursor,
+    book: &mut BookMetadata,
+    refinements: &mut Vec<(String, String, String)>,
+    calibre_title_sort: &mut Option<String>,
+) -> bool {
+    let meta_name = cursor.get_attribute("name").unwrap_or_default().to_owned();
+    let content = cursor
+        .get_attribute("content")
+        .unwrap_or_default()
+        .to_owned();
+    match meta_name.to_ascii_lowercase().as_str() {
+        "calibre:series" => book.series_name = non_empty(Some(content)),
+        // Calibre writes this as a float (`1.0`); C# rounds via
+        // `Convert.ToInt32(Convert.ToDouble(value))`.
+        "calibre:series_index" => {
+            book.index_number = content
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(f64::round)
+                .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
+                .map(|v| {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let rounded = v as i32;
+                    rounded
+                });
+        }
+        "calibre:rating" => book.community_rating = content.trim().parse().ok(),
+        // OPF 2.0's sort title.
+        "calibre:title_sort" => *calibre_title_sort = non_empty(Some(content)),
+        _ => {}
+    }
+    // EPUB 3 refinements carry their value as element TEXT, keyed by
+    // `property` and pointing at `refines="#id"`.
+    let property = cursor
+        .get_attribute("property")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(property.as_str(), "title-type" | "file-as") {
+        return false;
+    }
+    let refines = cursor
+        .get_attribute("refines")
+        .unwrap_or_default()
+        .trim_start_matches('#')
+        .to_owned();
+    let value = cursor.read_element_content_as_string();
+    let value = value.trim();
+    if !refines.is_empty() && !value.is_empty() {
+        refinements.push((property, refines, value.to_owned()));
+    }
+    true
+}
+
+/// The text of the collected `<dc:title>` carrying `id`.
+fn title_with_id(titles: &[(Option<String>, String)], id: &str) -> Option<String> {
+    titles
+        .iter()
+        .find(|(title_id, _)| title_id.as_deref() == Some(id))
+        .map(|(_, text)| text.clone())
 }
 
 /// The `ProviderIds` key an OPF `opf:scheme` maps to, or `None` for a scheme
@@ -359,13 +487,109 @@ fn opf_identifier_key(scheme: &str) -> Option<&'static str> {
     }
 }
 
-/// The person kind an OPF `opf:role` marks. Jellyfin maps the MARC relator
-/// `aut` to an author and treats everything else as an unknown credit.
+/// A ComicBookInfo credit role as a `PersonKind` name — port of C#'s
+/// `Enum.TryParse<PersonKind>(role)` with its `Unknown` fallback and the
+/// explicit `"Colorer"` → `Colorist` special case.
+fn person_kind(role: &str) -> String {
+    if role.eq_ignore_ascii_case("Colorer") {
+        return "Colorist".to_owned();
+    }
+    PERSON_KINDS
+        .iter()
+        .find(|kind| kind.eq_ignore_ascii_case(role))
+        .map_or_else(|| "Unknown".to_owned(), |kind| (*kind).to_owned())
+}
+
+/// The `PersonKind` names `Enum.TryParse` accepts, from
+/// `Jellyfin.Data/Enums/PersonKind.cs`.
+const PERSON_KINDS: [&str; 25] = [
+    "Unknown",
+    "Actor",
+    "Director",
+    "Composer",
+    "Writer",
+    "GuestStar",
+    "Producer",
+    "Conductor",
+    "Lyricist",
+    "Arranger",
+    "Engineer",
+    "Mixer",
+    "Remixer",
+    "Creator",
+    "Artist",
+    "AlbumArtist",
+    "Author",
+    "Illustrator",
+    "Penciller",
+    "Inker",
+    "Colorist",
+    "Letterer",
+    "CoverArtist",
+    "Editor",
+    "Translator",
+];
+
+/// The person kind an OPF `opf:role` MARC relator marks — port of
+/// `OpfReader.GetRole`, including its default-to-`Author` fallthrough.
 fn opf_role(role: Option<&str>) -> String {
     match role.map(str::trim) {
-        Some("aut") | None => "Author".to_owned(),
-        Some(other) => other.to_owned(),
+        Some("arr") => "Arranger",
+        Some("art") => "Artist",
+        Some("edt") => "Editor",
+        Some("ill") => "Illustrator",
+        Some("lyr") => "Lyricist",
+        Some("mus") => "AlbumArtist",
+        Some("nrt") => "Narrator",
+        Some("oth") => "Unknown",
+        Some("trl") => "Translator",
+        // `aut`/`aqt`/`aft`/`aui`, an unknown relator, and no role at all.
+        _ => "Author",
     }
+    .to_owned()
+}
+
+/// Splits one `<dc:creator>` into names — port of `FindAuthors`: entries are
+/// separated by `;`, a `"Last, First"` pair is flipped, and an initial that is
+/// not already followed by a space gets one (`"J.R.R. Tolkien"`).
+fn split_creators(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let flipped = match entry.split_once(',') {
+                Some((last, first)) if !last.trim().is_empty() && !first.trim().is_empty() => {
+                    format!("{} {}", first.trim(), last.trim())
+                }
+                _ => entry.to_owned(),
+            };
+            expand_initials(&flipped)
+        })
+        .collect()
+}
+
+/// C# `InitialsRegex` — `(?<=\p{L})\.(?!\s|$)` replaced by `". "`: a period
+/// that follows a letter and is not already followed by whitespace or the end
+/// of the string gains a space.
+fn expand_initials(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    for (index, ch) in chars.iter().enumerate() {
+        out.push(*ch);
+        if *ch != '.' {
+            continue;
+        }
+        let follows_letter = index
+            .checked_sub(1)
+            .and_then(|i| chars.get(i))
+            .is_some_and(|prev| prev.is_alphabetic());
+        let next_is_space_or_end = chars.get(index + 1).is_none_or(|next| next.is_whitespace());
+        if follows_letter && !next_is_space_or_end {
+            out.push(' ');
+        }
+    }
+    out
 }
 
 /// A parsed OPF `<dc:date>`.
@@ -415,16 +639,31 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
     }
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
-    // The first page in name order, as a comic reader would open it.
-    let mut pages: Vec<String> = (0..archive.len())
+    let names: Vec<String> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_owned()))
-        .filter(|name| PAGE_EXTENSIONS.contains(&extension_of(name).as_str()))
         .collect();
-    pages.sort();
-    let first = pages.into_iter().next()?;
+    // C# `FindCoverEntryInArchiveAsync` looks for an entry literally named
+    // `cover.<ext>` first, in ITS extension order, and only then falls back to
+    // the first image in name order. Skipping that pass hands back page 001 for
+    // every comic that names its cover explicitly.
+    let explicit = PAGE_EXTENSIONS.iter().find_map(|ext| {
+        names
+            .iter()
+            .find(|n| *n == &format!("cover.{ext}"))
+            .cloned()
+    });
+    let first = if let Some(cover) = explicit {
+        cover
+    } else {
+        let mut pages: Vec<&String> = names
+            .iter()
+            .filter(|name| PAGE_EXTENSIONS.contains(&extension_of(name).as_str()))
+            .collect();
+        pages.sort();
+        pages.into_iter().next()?.clone()
+    };
     let mut entry = archive.by_name(&first).ok()?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).ok()?;
+    let bytes = read_capped(&mut entry)?;
     Some((first, bytes))
 }
 
@@ -432,8 +671,12 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
 fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     let opf_path = read_epub_content_path(path)?;
     let opf = read_archive_entry_text(path, &opf_path.to_lowercase())?;
-    let cover_id = epub_cover_id(&opf)?;
-    let href = epub_manifest_href(&opf, &cover_id)?;
+    // C# `ReadCoverPath` probes in order: a manifest item with
+    // `properties="cover-image"` (the EPUB 3 way), then id `cover-image`,
+    // then id `cover`, and only then `<meta name="cover" content="…"/>`.
+    let href = epub_manifest_href_by_property(&opf, "cover-image")
+        .or_else(|| epub_manifest_href(&opf, "cover"))
+        .or_else(|| epub_cover_id(&opf).and_then(|id| epub_manifest_href(&opf, &id)))?;
     // Manifest hrefs are relative to the OPF's own directory.
     let root = Path::new(&opf_path)
         .parent()
@@ -471,6 +714,38 @@ fn epub_cover_id(opf: &str) -> Option<String> {
     None
 }
 
+/// The `href` of the manifest item carrying `properties="…"` — the EPUB 3
+/// declaration, which most modern books use instead of the `<meta>` pointer.
+fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
+    let Ok(mut cursor) = XmlCursor::new(opf) else {
+        return None;
+    };
+    while !cursor.eof() {
+        if cursor.is_element()
+            && cursor.name().eq_ignore_ascii_case("item")
+            && cursor
+                .get_attribute("properties")
+                .is_some_and(|v| v.split_whitespace().any(|p| p == property))
+            && cursor
+                .get_attribute("media-type")
+                .is_some_and(is_image_media_type)
+            && let Some(href) = cursor.get_attribute("href")
+        {
+            let href = href.trim().to_owned();
+            if !href.is_empty() {
+                return Some(href);
+            }
+        }
+        cursor.read();
+    }
+    None
+}
+
+/// Whether a manifest `media-type` names an image — C# `IsValidImage`.
+fn is_image_media_type(media_type: &str) -> bool {
+    media_type.trim().to_ascii_lowercase().starts_with("image/")
+}
+
 /// The `href` of the manifest item with `id`.
 fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
     let Ok(mut cursor) = XmlCursor::new(opf) else {
@@ -480,6 +755,10 @@ fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
         if cursor.is_element()
             && cursor.name().eq_ignore_ascii_case("item")
             && cursor.get_attribute("id").is_some_and(|v| v == id)
+            // C# probes `//opf:item[@id='cover' and @media-type='image/*']`:
+            // the common EPUB 2 `id="cover"` points at an XHTML wrapper page,
+            // and attaching that as the cover would store markup as an image.
+            && cursor.get_attribute("media-type").is_some_and(is_image_media_type)
             && let Some(href) = cursor.get_attribute("href")
         {
             let href = href.trim().to_owned();
@@ -508,8 +787,55 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
             .is_some_and(|e| e.name().to_lowercase() == wanted_lower)
     })?;
     let mut entry = archive.by_index(index).ok()?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).ok()?;
+    read_capped(&mut entry)
+}
+
+/// Reads one archive entry, refusing anything that inflates past
+/// [`MAX_ARCHIVE_ENTRY_BYTES`].
+///
+/// A comic page or an OPF is kilobytes. The cap is enforced on the BYTES READ,
+/// not on `ZipFile.size()`: that header field is attacker-controlled, so a
+/// zip bomb declaring a small size would sail past a header check and then
+/// inflate unbounded into memory. C# catches the resulting exception; an
+/// unbounded read here would abort the process on OOM instead.
+fn read_capped(entry: &mut zip::read::ZipFile<'_, impl std::io::Read>) -> Option<Vec<u8>> {
+    read_capped_to(entry, MAX_ARCHIVE_ENTRY_BYTES)
+}
+
+/// [`read_capped`] with an explicit cap, so the read-side enforcement can be
+/// exercised without a 128 MiB fixture.
+fn read_capped_to(
+    entry: &mut zip::read::ZipFile<'_, impl std::io::Read>,
+    cap: u64,
+) -> Option<Vec<u8>> {
+    let name = entry.name().to_owned();
+    // The declared size is still worth honouring as a capacity hint and as a
+    // cheap early-out, but only ever as a hint.
+    if entry.size() > cap {
+        tracing::warn!(
+            entry = name,
+            size = entry.size(),
+            "archive entry is implausibly large; skipping"
+        );
+        return None;
+    }
+    // The capacity hint is bounded by the cap as well as by the declared size,
+    // so a lying header cannot make this allocate more than one capped read
+    // could ever fill.
+    let hint = usize::try_from(entry.size().min(cap)).unwrap_or_default();
+    let mut bytes = Vec::with_capacity(hint);
+    // One byte past the cap is enough to tell "at the limit" from "over it".
+    entry
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > cap {
+        tracing::warn!(
+            entry = name,
+            "archive entry inflated past the cap; skipping"
+        );
+        return None;
+    }
     Some(bytes)
 }
 
@@ -536,6 +862,19 @@ fn extension_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Splits an OPF `<dc:subject>` on the separators C# uses (`/`, `&`, `,`, `;`
+/// and `" - "`), trimming and dropping empties.
+fn split_genres(value: &str) -> Vec<String> {
+    value
+        .replace(" - ", ",")
+        .replace(['/', '&', ';'], ",")
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Splits a comma-separated list, trimming and dropping empties.
 fn split_commas(value: &str) -> Vec<String> {
     value
@@ -558,14 +897,25 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
-/// A `(year, month, day)` triple as a UTC instant; a missing month or day
-/// defaults to 1, as C# `ReadThreePartDateInto` does.
+/// A `(year, month, day)` triple as a UTC instant.
+///
+/// C# `ReadThreePartDateInto` initialises all three parts to `0` and lets
+/// `new DateTime(year, month, day)` throw for a missing part, catching the
+/// exception and recording no date — so a `ComicInfo.xml` carrying only
+/// `<Year>` yields **no** `PremiereDate`, not January 1st.
 fn three_part_date(
     year: Option<i32>,
     month: Option<u32>,
     day: Option<u32>,
 ) -> Option<DateTime<Utc>> {
-    let date = NaiveDate::from_ymd_opt(year?, month.unwrap_or(1), day.unwrap_or(1))?;
+    let date = NaiveDate::from_ymd_opt(year?, month?, day?)?;
+    Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
+}
+
+/// A `(year, month)` pair as a UTC instant — C# `ReadTwoPartDateInto`, which
+/// passes `1` for the day, so a year+month pair *does* yield a date.
+fn two_part_date(year: i32, month: u32) -> Option<DateTime<Utc>> {
+    let date = NaiveDate::from_ymd_opt(year, month, 1)?;
     Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
 }
 
@@ -758,6 +1108,95 @@ mod tests {
     }
 
     #[test]
+    fn a_year_only_comic_info_has_no_premiere_date() {
+        // C# builds the date from three parts initialised to 0 and lets the
+        // DateTime constructor throw, so a Year on its own yields no date —
+        // NOT January 1st.
+        let book = parse_comic_info(r"<ComicInfo><Title>T</Title><Year>1988</Year></ComicInfo>")
+            .expect("metadata");
+        assert_eq!(book.production_year, Some(1988));
+        assert_eq!(book.premiere_date, None);
+
+        // All three parts present still yields a date.
+        let full = parse_comic_info(
+            r"<ComicInfo><Year>1988</Year><Month>3</Month><Day>29</Day></ComicInfo>",
+        )
+        .expect("metadata");
+        assert_eq!(
+            full.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some("1988-03-29".to_owned())
+        );
+    }
+
+    #[test]
+    fn comic_book_info_credits_map_to_real_person_kinds() {
+        let book = parse_comic_book_info(
+            r#"{"ComicBookInfo/1.0":{"title":"T","credits":[
+                {"person":"A","role":"Penciller"},
+                {"person":"B","role":"Colorer"},
+                {"person":"C","role":"Chief Vibes Officer"}]}}"#,
+        )
+        .expect("metadata");
+        let kinds: Vec<&str> = book.people.iter().map(|(_, k)| k.as_str()).collect();
+        // A real PersonKind survives, "Colorer" is normalized, and anything
+        // Enum.TryParse would reject becomes Unknown rather than a raw string.
+        assert_eq!(kinds, ["Penciller", "Colorist", "Unknown"]);
+    }
+
+    #[test]
+    fn opf_roles_map_marc_relators_and_default_to_author() {
+        assert_eq!(opf_role(Some("edt")), "Editor");
+        assert_eq!(opf_role(Some("ill")), "Illustrator");
+        assert_eq!(opf_role(Some("trl")), "Translator");
+        assert_eq!(opf_role(Some("oth")), "Unknown");
+        // `aut` and every unknown relator fall through to Author, as C# does.
+        assert_eq!(opf_role(Some("aut")), "Author");
+        assert_eq!(opf_role(Some("zzz")), "Author");
+        assert_eq!(opf_role(None), "Author");
+    }
+
+    #[test]
+    fn opf_creators_are_split_flipped_and_initial_spaced() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata>
+                   <dc:title>T</dc:title>
+                   <dc:creator>Herbert, Frank; Tolkien, J.R.R.</dc:creator>
+                 </metadata></package>"#,
+        )
+        .expect("metadata");
+        let names: Vec<&str> = book.people.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Frank Herbert", "J. R. R. Tolkien"]);
+    }
+
+    #[test]
+    fn a_calibre_float_series_index_is_rounded() {
+        // Calibre writes `1.0`, which an integer parse would reject outright.
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>T</dc:title>
+                 <meta name="calibre:series_index" content="1.0"/></metadata></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.index_number, Some(1));
+    }
+
+    #[test]
+    fn a_combined_subject_element_is_split_on_every_upstream_separator() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>T</dc:title>
+                 <dc:subject>Fantasy / Adventure &amp; Myth; Epic - Classic</dc:subject>
+                 </metadata></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(
+            book.genres,
+            ["Fantasy", "Adventure", "Myth", "Epic", "Classic"]
+        );
+    }
+
+    #[test]
     fn an_unrecognized_identifier_scheme_is_not_recorded() {
         assert_eq!(opf_identifier_key("uuid"), None);
         assert_eq!(opf_identifier_key("isbn"), Some("ISBN"));
@@ -787,6 +1226,183 @@ mod tests {
         }
         writer.finish().expect("finish archive");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_archive_comment_outranks_a_bundled_comic_info() {
+        // `ComicProvider` returns the first source with metadata over the DI
+        // order ComicBookInfo → external sidecar → in-archive. A bundled
+        // ComicInfo.xml must not beat the comment.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "issue.cbz",
+            &[(
+                "ComicInfo.xml",
+                br"<ComicInfo><Title>From the archive</Title></ComicInfo>",
+            )],
+            Some(r#"{"appID":"t","ComicBookInfo/1.0":{"title":"From the comment"}}"#),
+        );
+        let book = read_book_metadata(&path).expect("metadata");
+        assert_eq!(book.name.as_deref(), Some("From the comment"));
+
+        // …and a sidecar outranks the bundled file, but not the comment.
+        let plain = write_archive(
+            &dir,
+            "other.cbz",
+            &[(
+                "ComicInfo.xml",
+                br"<ComicInfo><Title>From the archive</Title></ComicInfo>",
+            )],
+            None,
+        );
+        std::fs::write(
+            dir.path().join("ComicInfo.xml"),
+            r"<ComicInfo><Title>From the sidecar</Title></ComicInfo>",
+        )
+        .expect("write sidecar");
+        let book = read_book_metadata(&plain).expect("metadata");
+        assert_eq!(book.name.as_deref(), Some("From the sidecar"));
+    }
+
+    #[test]
+    fn the_main_title_and_its_sort_form_win_over_a_subtitle() {
+        // C# `FindMainTitle` prefers the `<dc:title>` a `title-type` of `main`
+        // refines; `FindSortTitle` takes the matching `file-as`. Without the
+        // refinement pass an EPUB 3 gets named after whichever title came
+        // first, which is often the subtitle.
+        let parsed = parse_opf(
+            r##"<package xmlns:dc="http://purl.org/dc/elements/1.1/"
+                        xmlns:opf="http://www.idpf.org/2007/opf">
+                 <metadata>
+                   <dc:title id="sub">A Tale of Two Halves</dc:title>
+                   <dc:title id="main">The Hobbit</dc:title>
+                   <meta refines="#sub" property="title-type">subtitle</meta>
+                   <meta refines="#main" property="title-type">main</meta>
+                   <meta refines="#main" property="file-as">Hobbit, The</meta>
+                 </metadata>
+               </package>"##,
+        )
+        .expect("parse");
+        assert_eq!(parsed.name.as_deref(), Some("The Hobbit"));
+        assert_eq!(parsed.sort_name.as_deref(), Some("Hobbit, The"));
+    }
+
+    #[test]
+    fn an_opf_2_falls_back_to_the_first_title_and_calibre_sort() {
+        let parsed = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"
+                        xmlns:opf="http://www.idpf.org/2007/opf">
+                 <metadata>
+                   <dc:title>The Silmarillion</dc:title>
+                   <meta name="calibre:title_sort" content="Silmarillion, The"/>
+                 </metadata>
+               </package>"#,
+        )
+        .expect("parse");
+        assert_eq!(parsed.name.as_deref(), Some("The Silmarillion"));
+        assert_eq!(parsed.sort_name.as_deref(), Some("Silmarillion, The"));
+    }
+
+    #[test]
+    fn a_calibre_metadata_opf_is_found_beside_the_book() {
+        // C# `GetXmlFile` probes `<stem>.opf`, then `content.opf`, then
+        // Calibre's `metadata.opf`. Without the last one an entire Calibre
+        // library reads nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let book = dir.path().join("book.azw3");
+        std::fs::write(&book, b"").expect("write book");
+        std::fs::write(
+            dir.path().join("metadata.opf"),
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata>
+                 <dc:title>Calibre Title</dc:title></metadata></package>"#,
+        )
+        .expect("write opf");
+        let parsed = read_book_metadata(&book.to_string_lossy()).expect("metadata");
+        assert_eq!(parsed.name.as_deref(), Some("Calibre Title"));
+    }
+
+    #[test]
+    fn an_explicitly_named_cover_beats_the_first_page() {
+        // C# probes `cover.<ext>` over its own extension order before falling
+        // back to the first image in name order.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "named.cbz",
+            &[
+                ("001.jpg", b"page-one"),
+                ("cover.png", b"the-cover"),
+                ("002.jpg", b"page-two"),
+            ],
+            None,
+        );
+        let (name, bytes) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "cover.png");
+        assert_eq!(bytes, b"the-cover");
+
+        // With no explicit cover, the first image in name order wins.
+        let path = write_archive(
+            &dir,
+            "unnamed.cbz",
+            &[("002.jpg", b"page-two"), ("001.jpg", b"page-one")],
+            None,
+        );
+        let (name, _) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "001.jpg");
+    }
+
+    #[test]
+    fn an_entry_that_inflates_past_the_cap_is_refused() {
+        // The cap must bind on the BYTES READ, not on `ZipFile::size()` — that
+        // header field is attacker-controlled, so a zip bomb declaring a tiny
+        // size would sail past a header-only check and inflate unbounded.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(&dir, "bomb.cbz", &[("page.jpg", &[b'A'; 4096])], None);
+        let read = |cap: u64| {
+            let file = std::fs::File::open(&path).expect("open");
+            let mut archive =
+                zip::ZipArchive::new(std::io::BufReader::new(file)).expect("read archive");
+            let mut entry = archive.by_name("page.jpg").expect("entry");
+            super::read_capped_to(&mut entry, cap).map(|b| b.len())
+        };
+        // An honest header well over the cap: refused before any read.
+        assert_eq!(read(16), None);
+        assert_eq!(read(8192), Some(4096));
+        assert_eq!(read(4096), Some(4096), "content exactly at the cap is fine");
+
+        // The case that actually exercises the READ-side cap: a header that
+        // lies. `size()` claims 8 bytes so the early-out lets it through, but
+        // the entry inflates to 4096. Patch both the local-file-header and the
+        // central-directory uncompressed-size fields, which is exactly what a
+        // zip bomb does.
+        let mut raw = std::fs::read(&path).expect("read archive bytes");
+        let lie = 8u32.to_le_bytes();
+        // Local file header: PK\x03\x04, uncompressed size at +22.
+        let local = raw
+            .windows(4)
+            .position(|w| w == b"PK\x03\x04")
+            .expect("local header");
+        raw[local + 22..local + 26].copy_from_slice(&lie);
+        // Central directory: PK\x01\x02, uncompressed size at +24.
+        let central = raw
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central header");
+        raw[central + 24..central + 28].copy_from_slice(&lie);
+        let bomb = dir.path().join("lying.cbz");
+        std::fs::write(&bomb, &raw).expect("write patched archive");
+
+        let file = std::fs::File::open(&bomb).expect("open");
+        let mut archive =
+            zip::ZipArchive::new(std::io::BufReader::new(file)).expect("read archive");
+        let mut entry = archive.by_name("page.jpg").expect("entry");
+        assert_eq!(entry.size(), 8, "the header must be the one that lies");
+        assert_eq!(
+            super::read_capped_to(&mut entry, 64),
+            None,
+            "a lying header must not let 4096 bytes past a 64-byte cap"
+        );
     }
 
     #[test]
@@ -873,7 +1489,12 @@ mod tests {
                             <dc:title>Dune</dc:title>
                             <meta name="cover" content="cover-image"/>
                           </metadata>
-                          <manifest><item id="cover-image" href="cover.jpg"/></manifest>
+                          <manifest>
+                            <item id="cover-page" href="cover.xhtml"
+                                  media-type="application/xhtml+xml"/>
+                            <item id="cover-image" href="cover.jpg"
+                                  media-type="image/jpeg"/>
+                          </manifest>
                         </package>"#,
                 ),
                 ("OEBPS/cover.jpg", b"cover bytes"),

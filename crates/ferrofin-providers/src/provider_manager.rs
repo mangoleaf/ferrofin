@@ -191,8 +191,12 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                 name: Some(hit.name),
                 overview: hit.overview,
                 image_url: hit.poster_url,
+                // C# `TmdbBoxSetProvider` sets `MetadataProvider.Tmdb` on the
+                // box set itself — `TmdbCollection` is the key a *movie* uses
+                // to point at its collection, and is not read back for a
+                // BoxSet by the links table or the image path.
                 provider_ids: Some(std::collections::HashMap::from([(
-                    "TmdbCollection".to_owned(),
+                    "Tmdb".to_owned(),
                     hit.tmdb_id.to_string(),
                 )])),
                 search_provider_name: Some("TheMovieDb".to_owned()),
@@ -243,16 +247,40 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         &self,
         search_info: &ItemLookupInfo,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
-            return Ok(Vec::new());
+        // An id already on the item resolves it exactly; only a nameless item
+        // with no id has nothing to search on at all.
+        // Season/Episode narrow the query ONLY for an episode search; on a
+        // movie or series they would ask OMDb for a record that does not
+        // exist. Note that an episode search additionally needs the SERIES'
+        // IMDb id (C# reads `SeriesProviderIds`, not the episode's own, because
+        // OMDb keys a season listing by the series) — `ItemLookupInfo` carries
+        // no such field and no `OmdbKind::Episode` provider is registered, so
+        // that branch is unreachable until both exist.
+        let is_episode = self.kind == crate::OmdbKind::Episode;
+        let known = crate::OmdbSearchKey {
+            imdb_id: search_info
+                .provider_ids
+                .as_ref()
+                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
+                .map(|(_, value)| value.as_str())
+                .filter(|_| !is_episode),
+            season: is_episode
+                .then_some(search_info.parent_index_number)
+                .flatten(),
+            episode: is_episode.then_some(search_info.index_number).flatten(),
         };
+        let name = search_info.name.as_deref().unwrap_or_default();
+        if name.is_empty() && known.imdb_id.is_none() {
+            return Ok(Vec::new());
+        }
         Ok(self
             .omdb
-            .search(self.kind, name, search_info.year)
+            .search(self.kind, name, search_info.year, &known)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
                 production_year: hit.production_year(),
+                premiere_date: hit.premiere_date(),
                 image_url: hit.poster.clone(),
                 provider_ids: hit
                     .imdb_id
@@ -270,10 +298,10 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 ///
 /// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced
 /// to the object-safe surface the manager needs: a display name, the item kinds
-/// it serves, and the search itself. The concrete network fetchers are
-/// **deferred** (feature-gated, need API keys); this trait is the seam a host
-/// registers them against when they land, and the one the dedup/merge port in
-/// [`LocalProviderManager::remote_search`] drives.
+/// it serves, and the search itself. The concrete network fetchers (TMDB, TVDB,
+/// OMDb, MusicBrainz) implement it in this crate and are registered by the
+/// server's composition root; the dedup/merge port in
+/// [`LocalProviderManager::remote_search`] drives them all.
 #[async_trait]
 pub trait RemoteSearchProvider: Send + Sync {
     /// The provider's display name, stamped onto every result it returns.
@@ -1201,7 +1229,19 @@ impl ProviderManager for LocalProviderManager {
         {
             infos = crate::external_ids::external_id_infos(*kind);
         }
-        infos.extend(self.external_id_infos.iter().cloned());
+        // Supplied descriptors are *extra* providers (a host registering its
+        // own), so skip any that the kind-filtered set already advertises.
+        let extras: Vec<ExternalIdInfo> = self
+            .external_id_infos
+            .iter()
+            .filter(|extra| {
+                !infos
+                    .iter()
+                    .any(|known| known.key == extra.key && known.type_ == extra.type_)
+            })
+            .cloned()
+            .collect();
+        infos.extend(extras);
         Ok(infos)
     }
 
@@ -2335,10 +2375,9 @@ mod tests {
             .expect("results");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("The Matrix Collection"));
-        assert_eq!(
-            results[0].provider_ids.as_ref().unwrap()["TmdbCollection"],
-            "2344"
-        );
+        // The box set carries `Tmdb`, as C# `TmdbBoxSetProvider` sets it —
+        // `TmdbCollection` is a *movie*'s pointer at its collection.
+        assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tmdb"], "2344");
     }
 
     #[test]

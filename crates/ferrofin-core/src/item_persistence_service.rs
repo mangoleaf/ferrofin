@@ -230,13 +230,50 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         primary_version_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
-        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
-            .bind(primary_version_id.map(guid_to_db))
-            .bind(guid_to_db(item_id))
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        // C# `Video.SetPrimaryVersionId` also rewrites the presentation key,
+        // and `Video.CreatePresentationUniqueKey` returns the PRIMARY's id when
+        // there is one, else the item's own — both in the "N" (32 hex, no
+        // hyphen) form. That shared key is what makes every copy of a film
+        // count as one item in "similar", Next Up and the resume rows; leaving
+        // it stale makes a merged group behave as separate titles.
+        let presentation_key = primary_version_id
+            .unwrap_or(item_id)
+            .as_simple()
+            .to_string();
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1, "PresentationUniqueKey" = ?2
+               WHERE "Id" = ?3"#,
+        )
+        .bind(primary_version_id.map(guid_to_db))
+        .bind(presentation_key)
+        .bind(guid_to_db(item_id))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn provider_ids_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        if item_ids.is_empty() {
+            return Ok(map);
+        }
+        let stored: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
+        for (item_id, key, value) in self
+            .db
+            .provider_ids_for_items(&stored)
+            .await
+            .map_err(ServiceError::from)?
+        {
+            if let Ok(id) = Uuid::parse_str(&item_id) {
+                map.entry(id).or_default().push((key, value));
+            }
+        }
+        Ok(map)
     }
 
     async fn save_provider_id(
@@ -980,20 +1017,39 @@ mod tests {
         svc.set_primary_version_id(id, Some(primary))
             .await
             .expect("link");
-        let (name, ticks, pvid): (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
-            r#"SELECT "Name", "RunTimeTicks", "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#,
-        )
-        .bind(ferrofin_db::store::guid_to_db(id))
-        .fetch_one(db.pool())
-        .await
-        .expect("row");
+        let read =
+            async |id: Uuid| -> (Option<String>, Option<i64>, Option<String>, Option<String>) {
+                sqlx::query_as(
+                    r#"SELECT "Name", "RunTimeTicks", "PrimaryVersionId", "PresentationUniqueKey"
+                   FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+            };
+        let (name, ticks, pvid, key) = read(id).await;
         assert_eq!(pvid, Some(ferrofin_db::store::guid_to_db(primary)));
+        // C# `Video.SetPrimaryVersionId` rewrites the presentation key to the
+        // PRIMARY's id in "N" form, which is what makes every copy of a film
+        // count as one item in "similar", Next Up and the resume rows.
+        assert_eq!(
+            key.as_deref(),
+            Some(primary.as_simple().to_string().as_str())
+        );
         assert_eq!(
             name.as_deref(),
             Some("fresh title"),
             "link write must not touch Name"
         );
         assert_eq!(ticks, Some(42), "link write must not touch RunTimeTicks");
+
+        // Unlinking reverts the key to the item's own id, as
+        // `base.CreatePresentationUniqueKey()` does.
+        svc.set_primary_version_id(id, None).await.expect("unlink");
+        let (_, _, pvid, key) = read(id).await;
+        assert_eq!(pvid, None);
+        assert_eq!(key.as_deref(), Some(id.as_simple().to_string().as_str()));
 
         svc.set_primary_version_id(id, None).await.expect("unlink");
         let pvid: Option<String> =

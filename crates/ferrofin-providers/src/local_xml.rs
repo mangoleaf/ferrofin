@@ -8,6 +8,27 @@
 //! and a `<CollectionItems>`/`<PlaylistItems>` list of `<Path>`/`<ItemId>`
 //! links. Reading it is what lets Ferrofin adopt a library Jellyfin populated;
 //! writing it is what keeps the reverse true.
+//!
+//! # Not yet reachable from the server
+//!
+//! Both C# savers write to `Path.Combine(item.Path, …)`, and both parsers run
+//! against an item resolved from a folder on disk. Jellyfin gives a box set
+//! such a folder — `{DataPath}/collections/{Name} [boxset]/collection.xml` —
+//! so an **adopted** Jellyfin database does carry those paths and those files.
+//! Ferrofin, however, creates a `BoxSet` or `Playlist` as a **pathless** DB row
+//! (`collection_manager`'s `insert_named_item` writes no `Path`) and its
+//! scanner resolves no collection/playlist folders, so nothing in the server
+//! calls into this module today.
+//!
+//! Nothing is lost by that: membership lives in `BaseItems."Data"`, which is
+//! Jellyfin's own DB source of truth and is what the drop-in round trip
+//! actually exercises — an adopted collection reads back correctly from the
+//! row whether or not its `collection.xml` was parsed.
+//!
+//! This module is the complete, tested reader/writer pair, ready for the day
+//! Ferrofin materializes folder-backed containers. It is deliberately NOT
+//! wired to a synthetic path: writing `collection.xml` somewhere Jellyfin
+//! would not look for it would be worse than not writing it.
 
 use std::fmt::Write as _;
 
@@ -70,11 +91,13 @@ pub fn parse_container_xml(xml: &str) -> Option<LocalContainerXml> {
                 cursor.read();
             }
             "CollectionItem" | "PlaylistItem" => {
+                // `read_subtree` already advances the parent past the subtree
+                // it consumed; a `skip()` on top of it would step over the
+                // NEXT entry, dropping every second child.
                 let mut sub = cursor.read_subtree();
                 if let Some(child) = read_linked_child(&mut sub) {
                     out.children.push(child);
                 }
-                cursor.skip();
             }
             _ => {
                 let name = cursor.name().to_owned();
@@ -147,6 +170,21 @@ fn write_container_xml(
     if let Some(name) = container.name.as_deref().filter(|v| !v.is_empty()) {
         push_element(&mut xml, 2, "LocalTitle", name);
     }
+    if !container.children.is_empty() {
+        let _ = writeln!(xml, "  <{list_element}>");
+        for child in &container.children {
+            let _ = writeln!(xml, "    <{item_element}>");
+            // C# `AddLinkedChildren` writes only `<Path>` — it resolves ids to
+            // paths first. The reader accepts both, as upstream's does.
+            if let Some(path) = child.path.as_deref().filter(|v| !v.is_empty()) {
+                push_element(&mut xml, 6, "Path", path);
+            }
+            let _ = writeln!(xml, "    </{item_element}>");
+        }
+        let _ = writeln!(xml, "  </{list_element}>");
+    }
+    // C# emits this from `WriteCustomElementsAsync`, which runs *after*
+    // `AddCommonNodesAsync` writes the item list.
     if write_media_type
         && let Some(media_type) = container
             .playlist_media_type
@@ -154,20 +192,6 @@ fn write_container_xml(
             .filter(|v| !v.is_empty())
     {
         push_element(&mut xml, 2, "PlaylistMediaType", media_type);
-    }
-    if !container.children.is_empty() {
-        let _ = writeln!(xml, "  <{list_element}>");
-        for child in &container.children {
-            let _ = writeln!(xml, "    <{item_element}>");
-            if let Some(path) = child.path.as_deref().filter(|v| !v.is_empty()) {
-                push_element(&mut xml, 6, "Path", path);
-            }
-            if let Some(item_id) = child.item_id.as_deref().filter(|v| !v.is_empty()) {
-                push_element(&mut xml, 6, "ItemId", item_id);
-            }
-            let _ = writeln!(xml, "    </{item_element}>");
-        }
-        let _ = writeln!(xml, "  </{list_element}>");
     }
     xml.push_str("</Item>");
     xml
@@ -213,6 +237,27 @@ mod tests {
             parsed.children[0].path.as_deref(),
             Some("/media/The Matrix.mkv")
         );
+    }
+
+    #[test]
+    fn a_compact_document_keeps_every_member() {
+        // No whitespace between entries. `read_subtree` already advances the
+        // parent cursor, so an extra `skip()` here silently dropped every
+        // second child — invisible to any test whose XML is indented.
+        let parsed = parse_container_xml(
+            "<Item><CollectionItems>\
+             <CollectionItem><Path>/a.mkv</Path></CollectionItem>\
+             <CollectionItem><Path>/b.mkv</Path></CollectionItem>\
+             <CollectionItem><Path>/c.mkv</Path></CollectionItem>\
+             </CollectionItems></Item>",
+        )
+        .expect("parse");
+        let paths: Vec<_> = parsed
+            .children
+            .iter()
+            .filter_map(|c| c.path.as_deref())
+            .collect();
+        assert_eq!(paths, ["/a.mkv", "/b.mkv", "/c.mkv"]);
     }
 
     #[test]
@@ -277,7 +322,31 @@ mod tests {
         };
         let xml = save_playlist_xml(&original);
         assert!(xml.contains("<PlaylistMediaType>Audio</PlaylistMediaType>"));
-        assert_eq!(parse_container_xml(&xml).expect("reparse"), original);
+        // C# writes the media type from `WriteCustomElementsAsync`, which runs
+        // after the common nodes have emitted the item list.
+        assert!(
+            xml.find("<PlaylistItems>") < xml.find("<PlaylistMediaType>"),
+            "the item list comes first: {xml}"
+        );
+        // Only `<Path>` is written (C# `AddLinkedChildren` resolves ids to
+        // paths), so an id does not survive the round trip — the reader still
+        // accepts one, because a Jellyfin-written file may carry it.
+        let reparsed = parse_container_xml(&xml).expect("reparse");
+        assert_eq!(
+            reparsed.children,
+            vec![
+                LocalLinkedChild {
+                    path: Some("/music/a.flac".into()),
+                    item_id: None,
+                },
+                LocalLinkedChild {
+                    path: Some("/music/b.flac".into()),
+                    item_id: None,
+                },
+            ]
+        );
+        assert_eq!(reparsed.name, original.name);
+        assert_eq!(reparsed.playlist_media_type, original.playlist_media_type);
     }
 
     #[test]

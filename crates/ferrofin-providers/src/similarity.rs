@@ -22,13 +22,6 @@ use ferrofin_traits::library::{
 use crate::listenbrainz::ListenBrainzClient;
 use crate::tmdb::{TmdbClient, TmdbKind};
 
-/// How many `/similar` pages a TMDB lookup will walk before giving up.
-///
-/// C# walks until `page > totalPages` or enough local matches resolve; a real
-/// library rarely matches beyond the first page or two, and each page is a
-/// request, so the walk is bounded here.
-const MAX_TMDB_SIMILAR_PAGES: i32 = 3;
-
 /// How many days a TMDB similarity result is cached — C#
 /// `Plugins/Tmdb/Configuration/PluginConfiguration.SimilarItemsCacheDays`.
 pub const TMDB_SIMILAR_CACHE_DAYS: i64 = 7;
@@ -93,7 +86,10 @@ impl RemoteSimilarItemsProvider for TmdbSimilarProvider {
         let mut out = Vec::new();
         let mut page = 1;
         let mut total_pages = 1;
-        while page <= total_pages.min(MAX_TMDB_SIMILAR_PAGES) {
+        // Every page, as C# does: it walks until `page > totalPages`. The
+        // result set is cached for `cache_days`, so the walk happens once per
+        // seed per cache window rather than once per request.
+        while page <= total_pages {
             let (ids, reported) = self.tmdb.similar_page(self.kind, tmdb_id, page).await;
             if ids.is_empty() {
                 break;

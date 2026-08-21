@@ -50,10 +50,16 @@ pub enum NfoItemKind {
 impl NfoItemKind {
     /// Whether this kind derives from `Video` (`item is Video`).
     ///
-    /// True for `Video`, `Movie` and `MusicVideo`; false for the TV kinds.
+    /// True for `Video`, `Movie`, `MusicVideo` and `Episode` — `Episode : Video`
+    /// in the C# hierarchy, so an episode reads the `<fileinfo>` video fields
+    /// and, on the save side, gets no `<outline>`. `Series` and `Season` are
+    /// folders, not videos.
     #[must_use]
     pub fn is_video(self) -> bool {
-        matches!(self, Self::Video | Self::Movie | Self::MusicVideo)
+        matches!(
+            self,
+            Self::Video | Self::Movie | Self::MusicVideo | Self::Episode
+        )
     }
 
     /// Whether this kind supports an aspect ratio (`item is IHasAspectRatio`).
@@ -244,5 +250,23 @@ impl NfoBaseItem {
     /// matching `TrySetProviderId`'s no-throw contract.
     pub fn set_provider_id(&mut self, name: &str, value: &str) {
         set_provider_id(&mut self.provider_ids, name, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NfoItemKind;
+
+    #[test]
+    fn an_episode_is_a_video_but_a_series_is_not() {
+        // `Episode : Video` in the C# hierarchy, so an episode reads the
+        // `<fileinfo>` video fields and is saved without an `<outline>`.
+        // `Series`/`Season` are folders.
+        assert!(NfoItemKind::Episode.is_video());
+        assert!(NfoItemKind::Movie.is_video());
+        assert!(NfoItemKind::MusicVideo.is_video());
+        assert!(!NfoItemKind::Series.is_video());
+        assert!(!NfoItemKind::Season.is_video());
+        assert!(!NfoItemKind::MusicAlbum.is_video());
     }
 }

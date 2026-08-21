@@ -58,8 +58,9 @@ WebSocket push, playlists/collections, direct play + live HLS transcode, Live TV
 DVR), SyncPlay, all 17 scheduled tasks, metrics/tracing, and backup/restore. Runtime plugin
 installation is arriving as sandboxed WASM components (see
 [Plugins](#plugins-compiled-in-extensions--sandboxed-wasm)); the deliberate gaps: .NET-style
-native plugin loading (never — see below), DLNA SSDP discovery, and remote metadata
-providers (feature-gated off by default).
+native plugin loading (never — see below) and DLNA SSDP discovery. Remote metadata providers
+(TMDB/TVDB/OMDb/MusicBrainz/fanart) are compiled in and gated by the per-library fetcher
+checkboxes, exactly as Jellyfin gates them; the keyed ones stay inert until a key is set.
 
 ## Quickstart
 

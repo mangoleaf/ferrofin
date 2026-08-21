@@ -540,7 +540,10 @@ pub async fn build_app_state(
     let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
         FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository))
             .with_remote_providers(similar_providers, Arc::clone(&virtual_folders))
-            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("similar")),
+            // The cache root itself: the manager appends Jellyfin's own
+            // `{provider}-similar-{type}/{id}.json` layout under it, so a
+            // cache directory shared with a Jellyfin install stays valid.
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path())),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),

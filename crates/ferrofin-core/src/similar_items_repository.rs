@@ -137,9 +137,14 @@ impl SimilarItemsRepository {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
+                // COLLATE binds to the whole comparison, so it must sit on the
+                // *operand* to apply to each `IN` element — `IN (…) COLLATE
+                // NOCASE` is a silent no-op. And a collation on `ProviderId`
+                // defeats the ("ProviderId","ProviderValue","ItemId") index,
+                // turning every resolve into a full table scan.
                 r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"
-                   WHERE "ProviderId" = ?1 COLLATE NOCASE
-                     AND "ProviderValue" IN ({placeholders}) COLLATE NOCASE"#,
+                   WHERE "ProviderId" = ?1
+                     AND "ProviderValue" COLLATE NOCASE IN ({placeholders})"#,
             );
             let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(provider_key);
             for value in chunk {

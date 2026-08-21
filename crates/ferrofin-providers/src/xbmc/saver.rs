@@ -207,9 +207,13 @@ fn add_common_nodes(
 
     let overview = strip_html(item.overview.as_deref().unwrap_or_default());
 
-    // Music artist/album use biography/review; everything else uses plot.
-    // NfoBaseItem carries no Music{Artist,Album} kind, so this is always plot.
-    writer.element("plot", &overview);
+    // C# `BaseNfoSaver`: a MusicArtist's overview is `<biography>`, a
+    // MusicAlbum's is `<review>`, everything else uses `<plot>`.
+    match item.kind {
+        NfoItemKind::MusicArtist => writer.element("biography", &overview),
+        NfoItemKind::MusicAlbum => writer.element("review", &overview),
+        _ => writer.element("plot", &overview),
+    }
 
     if !is_video(item.kind) {
         writer.element("outline", &overview);
@@ -356,11 +360,14 @@ fn add_common_nodes(
         .premiere_date
         .filter(|_| item.kind != NfoItemKind::Episode)
     {
-        // Music artist uses <formed>; NfoBaseItem has no artist kind, so
-        // premiered/releasedate.
         let formatted = format_date(premiere, date_fmt);
-        writer.element("premiered", &formatted);
-        writer.element("releasedate", &formatted);
+        // A MusicArtist's premiere date is the date it `<formed>`.
+        if item.kind == NfoItemKind::MusicArtist {
+            writer.element("formed", &formatted);
+        } else {
+            writer.element("premiered", &formatted);
+            writer.element("releasedate", &formatted);
+        }
     }
 
     if let Some(end) = item.end_date.filter(|_| item.kind != NfoItemKind::Episode) {
@@ -395,9 +402,10 @@ fn add_common_nodes(
     for studio in sorted_trimmed(&item.studios) {
         writer.element("studio", &studio);
     }
+    // Both music kinds write their tags as `<style>`.
+    let tag_element = if is_music(item.kind) { "style" } else { "tag" };
     for tag in sorted_trimmed(&item.tags) {
-        // Music album/artist use <style>; NfoBaseItem has no such kind, so <tag>.
-        writer.element("tag", &tag);
+        writer.element(tag_element, &tag);
     }
 
     // The remaining fixed-order provider ids.
@@ -480,8 +488,18 @@ fn add_common_nodes(
     // Image paths (SaveImagePathsInNfo) and user data are deferred (off in
     // First-Light); the parser has no target for either.
 
-    // Actors (everything but music album/artist, which NfoBaseItem cannot be).
-    add_actors(writer, people);
+    // C# `if (item is not MusicAlbum && item is not MusicArtist)` — the music
+    // kinds get their credits from their own savers, not `<actor>` blocks.
+    if !is_music(item.kind) {
+        add_actors(writer, people);
+    }
+}
+
+/// Whether this kind is one of the two music kinds, which diverge from the
+/// common node set in four places (`biography`/`review`, `formed`, `style`,
+/// and no `<actor>` blocks).
+fn is_music(kind: NfoItemKind) -> bool {
+    matches!(kind, NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist)
 }
 
 /// The `dateadded` value for an item with no `DateCreated`.

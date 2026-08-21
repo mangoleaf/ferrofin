@@ -29,7 +29,7 @@
 //! are therefore not mapped: `Genres` and `Tags` come from TagLib#'s XMP/IPTC
 //! keyword aggregation, which `kamadak-exif` does not parse.
 
-use chrono::{DateTime, NaiveDateTime, TimeZone as _, Utc};
+use chrono::{DateTime, Datelike as _, NaiveDateTime, TimeZone as _, Utc};
 use ferrofin_model::drawing::ImageOrientation;
 use ferrofin_model::entities::ImageType;
 use ferrofin_traits::drawing::ImageProcessor;
@@ -46,10 +46,8 @@ const PROVIDER_NAME: &str = "Embedded Information";
 /// to open.
 ///
 /// Port of the C# `_includeExtensions` set. The C# comment notes the gate
-/// exists because "other extensions might cause taglib to hang"; it is kept
-/// here (and unit-tested) even though the EXIF branch itself is deferred, so
-/// the gate lands byte-for-byte and the later EXIF work only has to fill the
-/// branch body. Compared case-insensitively against the source extension.
+/// exists because "other extensions might cause taglib to hang". Compared
+/// case-insensitively against the source extension.
 const EXIF_INCLUDE_EXTENSIONS: [&str; 7] =
     [".jpg", ".jpeg", ".png", ".tiff", ".cr2", ".webp", ".avif"];
 
@@ -117,6 +115,15 @@ pub struct PhotoItem {
     /// Whether the item is backed by a local file (vs. a remote/URL source).
     /// Port of `BaseItem.IsFileProtocol`; gates [`has_changed`](PhotoProvider::has_changed).
     pub is_file_protocol: bool,
+
+    /// Set by [`PhotoProvider::fetch`] when EXIF was read from the file.
+    ///
+    /// Not a Jellyfin field: C# expresses the same thing by only entering the
+    /// assignment block inside its `try`. A caller must not write the
+    /// unconditionally-assigned fields (`overview`, `community_rating`) back
+    /// onto a row when this is `false`, or a file with no readable EXIF would
+    /// clear values it never spoke about.
+    pub exif_was_read: bool,
 
     /// The item's recorded last-modified time. Port of `BaseItem.DateModified`,
     /// compared against the on-disk time in [`has_changed`](PhotoProvider::has_changed).
@@ -293,10 +300,19 @@ impl PhotoProvider {
         // The EXIF branch, gated on the extension set (C#: "other extensions
         // might cause taglib to hang"). A file that cannot be read or carries no
         // EXIF simply leaves the fields alone — C# catches and logs.
-        if is_exif_candidate(&path)
-            && let Some(tags) = read_exif(&path)
-        {
-            apply_exif(item, &tags);
+        if is_exif_candidate(&path) {
+            // Opening and parsing the container is synchronous file IO, once
+            // per photo — an album is thousands of them. On a stalled NFS mount
+            // that would block an async worker thread, so it runs on the
+            // blocking pool like the book-archive reads do.
+            let owned = path.clone();
+            let tags = tokio::task::spawn_blocking(move || read_exif(&owned))
+                .await
+                .ok()
+                .flatten();
+            if let Some(tags) = tags {
+                apply_exif(item, &tags);
+            }
         }
 
         if (item.width <= 0 || item.height <= 0)
@@ -345,15 +361,25 @@ pub struct ExifTags {
     pub height: Option<i32>,
 }
 
-/// Reads `path`'s EXIF tags, or `None` when the file cannot be opened or holds
-/// no EXIF. Port of the C# `TagLib.File.Create` + `catch (Exception)` block.
+/// Reads `path`'s EXIF tags, or `None` when the file cannot be OPENED.
+///
+/// Port of the C# `TagLib.File.Create` + `catch (Exception)` block, and the
+/// distinction matters: TagLib opens an image with no EXIF quite happily and
+/// hands back an `ImageTag` whose fields are all null, which upstream then
+/// assigns — clearing the item's camera/GPS/comment. Only a genuine failure
+/// (an unreadable or unsupported file) throws and leaves the item alone.
+///
+/// So a missing or malformed EXIF block yields DEFAULT tags — the clearing
+/// case — while an IO error yields `None`, the leave-alone case.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
-    // A read failure is not worth failing a refresh over: most photos in a
-    // library carry no EXIF at all, which is exactly this error.
-    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
-    Some(tags_from(&exif))
+    Some(
+        exif::Reader::new()
+            .read_from_container(&mut reader)
+            .as_ref()
+            .map_or_else(|_| ExifTags::default(), tags_from),
+    )
 }
 
 /// Projects an [`exif::Exif`] onto [`ExifTags`]. Pure — the seam the mapping
@@ -368,10 +394,22 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             _ => None,
         }
     };
+    // Read the raw bytes, never `display_value()`: that renders an ASCII field
+    // quoted with every non-ASCII byte escaped (`café` → `caf\xc3\xa9`), and
+    // renders an unknown BYTE field as a comma-separated list of numbers.
     let text = |tag: Tag| -> Option<String> {
         let field = exif.get_field(tag, In::PRIMARY)?;
-        let value = field.display_value().to_string();
-        let value = value.trim().trim_matches('"').trim();
+        let value = match &field.value {
+            exif::Value::Ascii(parts) => {
+                let bytes: Vec<u8> = parts.concat();
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            // The Windows XP* tags are BYTE arrays holding UTF-16LE.
+            exif::Value::Byte(bytes) => utf16le(bytes),
+            exif::Value::Undefined(bytes, _) => undefined_text(tag, bytes)?,
+            _ => return None,
+        };
+        let value = value.trim_end_matches('\0').trim();
         (!value.is_empty()).then(|| value.to_owned())
     };
     let integer = |tag: Tag| -> Option<i32> {
@@ -396,16 +434,79 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             altitude: gps_altitude(exif),
             iso_speed_rating: integer(Tag::PhotographicSensitivity),
         },
-        comment: text(Tag::ImageDescription),
+        // TagLib's `ImageTag.Comment` prefers the standard EXIF UserComment and
+        // only falls back to the TIFF ImageDescription.
+        comment: text(Tag::UserComment).or_else(|| text(Tag::ImageDescription)),
         // XPTitle (0x9c9b) and Rating (0x4746) are Windows' TIFF extensions —
         // TagLib# surfaces both as ImageTag.Title/Rating, kamadak-exif has no
         // named constant for either.
-        title: text(XP_TITLE).or_else(|| text(Tag::ImageDescription)),
+        // Only a real title becomes the item name. Falling back to the
+        // description here would set Name == Overview for every photo that
+        // carries only a description.
+        title: text(XP_TITLE),
         rating: integer(RATING).map(f64::from),
         date_taken: exif_datetime(exif),
         width: integer(Tag::PixelXDimension),
         height: integer(Tag::PixelYDimension),
     }
+}
+
+/// Decodes an UNDEFINED-typed text field.
+///
+/// EXIF `UserComment` (0x9286) is UNDEFINED with a mandatory 8-byte character
+/// code prefix — `ASCII`, `UNICODE`, `JIS` or eight zeros for "undefined",
+/// each NUL-padded to 8 bytes. `kamadak-exif` hands the prefix through
+/// untouched, so it has to be stripped here or it lands in the overview.
+fn undefined_text(tag: exif::Tag, bytes: &[u8]) -> Option<String> {
+    if tag != exif::Tag::UserComment {
+        return Some(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let (code, text) = bytes.split_at_checked(USER_COMMENT_PREFIX_LEN)?;
+    match code {
+        b"ASCII\0\0\0" => Some(String::from_utf8_lossy(text).into_owned()),
+        // UTF-16 with no BOM is big-endian per the spec, but writers disagree;
+        // a BOM wins when present.
+        b"UNICODE\0" => Some(utf16_with_bom(text)),
+        // JIS and the all-zero "undefined" code carry no encoding this can
+        // decode faithfully, so they are dropped rather than mangled.
+        _ => None,
+    }
+}
+
+/// The fixed character-code prefix length of an EXIF `UserComment`.
+const USER_COMMENT_PREFIX_LEN: usize = 8;
+
+/// Decodes UTF-16 text, honouring a leading byte-order mark and defaulting to
+/// big-endian as the EXIF spec specifies.
+fn utf16_with_bom(bytes: &[u8]) -> String {
+    let (bytes, little_endian) = match bytes {
+        [0xff, 0xfe, rest @ ..] => (rest, true),
+        // A big-endian BOM and no BOM at all decode the same way: EXIF
+        // specifies big-endian as the default.
+        [0xfe, 0xff, rest @ ..] | rest => (rest, false),
+    };
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Decodes a UTF-16LE byte run, as the Windows `XP*` TIFF tags store text.
+fn utf16le(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// The Windows `XPTitle` TIFF tag (`0x9c9b`).
@@ -491,8 +592,13 @@ fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
 ///
 /// Every assignment is unconditional (as upstream's is) except the title, which
 /// C# skips for a locked `Name`, and the dimensions, which are only taken when
-/// the tags carry positive ones.
+/// the tags carry positive ones. Unconditional means a photo whose rating or
+/// comment tag was REMOVED has the field cleared on the next refresh — the file
+/// is the only source of truth for a photo, and upstream assigns both straight
+/// from the tag. It runs only when EXIF was actually read, so a file with none
+/// (or one that failed to open) never reaches here and keeps whatever it had.
 fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
+    item.exif_was_read = true;
     item.exif = tags.exif.clone();
     if let Some(width) = tags.width.filter(|w| *w > 0) {
         item.width = width;
@@ -500,12 +606,8 @@ fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     if let Some(height) = tags.height.filter(|h| *h > 0) {
         item.height = height;
     }
-    if tags.rating.is_some() {
-        item.community_rating = tags.rating;
-    }
-    if tags.comment.is_some() {
-        item.overview.clone_from(&tags.comment);
-    }
+    item.community_rating = tags.rating;
+    item.overview.clone_from(&tags.comment);
     if let Some(title) = tags.title.as_deref().filter(|t| !t.trim().is_empty())
         && !item.name_locked
     {
@@ -513,7 +615,7 @@ fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
     }
     if let Some(taken) = tags.date_taken {
         item.date_taken = Some(taken);
-        item.production_year = Some(taken.format("%Y").to_string().parse().unwrap_or_default());
+        item.production_year = Some(taken.year());
     }
 }
 
@@ -953,6 +1055,91 @@ mod tests {
         };
         provider.fetch(&mut item).await.expect("fetch");
         assert_eq!(item.exif.camera_make, None);
+    }
+
+    #[tokio::test]
+    async fn text_fields_decode_utf8_and_utf16_rather_than_debug_rendering() {
+        // Two real hazards: an ASCII field holding UTF-8 bytes (`display_value`
+        // escapes them), and the Windows XPTitle BYTE array holding UTF-16LE
+        // (`display_value` renders it as a list of numbers).
+        let make = "café".as_bytes();
+        let xp_title: Vec<u8> = "Sunset"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .chain([0, 0])
+            .collect();
+        let entries = [
+            (0x010f, 2u16, u32::try_from(make.len()).unwrap(), 0u32),
+            (0x9c9b, 1, u32::try_from(xp_title.len()).unwrap(), 0),
+        ];
+        let base = 8 + 2 + entries.len() * 12 + 4;
+        let mut extra = Vec::new();
+        extra.extend_from_slice(make);
+        let xp_offset = base + extra.len();
+        extra.extend_from_slice(&xp_title);
+        let entries = [
+            (
+                0x010f,
+                2u16,
+                u32::try_from(make.len()).unwrap(),
+                u32::try_from(base).unwrap().to_le_bytes(),
+            ),
+            (
+                0x9c9b,
+                1,
+                u32::try_from(xp_title.len()).unwrap(),
+                u32::try_from(xp_offset).unwrap().to_le_bytes(),
+            ),
+        ];
+        let jpeg = jpeg_with_exif(&entries, &extra, u32::try_from(base).unwrap());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &jpeg);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+
+        assert_eq!(
+            item.exif.camera_make.as_deref(),
+            Some("café"),
+            "a UTF-8 ASCII field must not come back escaped"
+        );
+        assert_eq!(
+            item.name.as_deref(),
+            Some("Sunset"),
+            "XPTitle is UTF-16LE, not a list of byte values"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_only_photo_keeps_its_filename_derived_name() {
+        // ImageDescription is a comment, not a title: it must fill Overview
+        // without overwriting the name.
+        let description = b"On the pier";
+        let entries = [(
+            0x010e,
+            2u16,
+            u32::try_from(description.len()).unwrap(),
+            50u32.to_le_bytes(),
+        )];
+        let jpeg = jpeg_with_exif(&entries, description, 26);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &jpeg);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            name: Some("DSC_0001".into()),
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.name.as_deref(), Some("DSC_0001"));
     }
 
     #[test]

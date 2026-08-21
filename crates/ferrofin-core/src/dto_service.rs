@@ -95,6 +95,14 @@ struct Prefetched {
     /// or the `ExternalUrls` field is requested — the "Links" row is built from
     /// the same ids, so one batch read serves both).
     provider_ids: HashMap<Uuid, HashMap<String, String>>,
+    /// `DisplayOrder` per *series* id, for the seasons/episodes on the page:
+    /// TMDB emits a season/episode link only for a series in aired order, and
+    /// the value lives in the SERIES' `Data` blob, not the child's.
+    series_display_order: HashMap<Uuid, String>,
+    /// Album name per *PhotoAlbum* id, for the photos on the page: a photo's
+    /// `Album`/`AlbumId` come from its parent album (C# `Photo.AlbumEntity`),
+    /// and one batch read serves the whole page.
+    photo_album_names: HashMap<Uuid, String>,
     /// Provider-id maps per *series* id, for the seasons/episodes on the page:
     /// their IMDb/TMDB links are built from the owning series' id, not their
     /// own (C# `ImdbExternalUrlProvider`/`TmdbExternalUrlProvider`).
@@ -341,22 +349,44 @@ fn attach_photo_exif(dto: &mut BaseItemDto, item: &BaseItemEntity) {
         .and_then(image_orientation_from_name);
 }
 
+/// Sets a photo's `Album`/`AlbumId` from its parent album — C#
+/// `SetPhotoProperties`, which reads `Photo.AlbumEntity` and leaves both unset
+/// when the photo has no album.
+fn attach_photo_album(dto: &mut BaseItemDto, item: &BaseItemEntity, names: &HashMap<Uuid, String>) {
+    if dto.type_ != BaseItemKind::Photo {
+        return;
+    }
+    let Some(album_id) = item
+        .parent_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+    else {
+        return;
+    };
+    if let Some(name) = names.get(&album_id) {
+        dto.album = Some(name.clone());
+        dto.album_id = Some(album_id);
+    }
+}
+
 /// The `ImageOrientation` whose name matches `value` (the `Data` blob stores
 /// the enum as its C# name, e.g. `"RightTop"`).
 fn image_orientation_from_name(value: &str) -> Option<ferrofin_model::drawing::ImageOrientation> {
     use ferrofin_model::drawing::ImageOrientation as O;
-    [
-        O::TopLeft,
-        O::TopRight,
-        O::BottomRight,
-        O::BottomLeft,
-        O::LeftTop,
-        O::RightTop,
-        O::RightBottom,
-        O::LeftBottom,
-    ]
-    .into_iter()
-    .find(|o| format!("{o:?}").eq_ignore_ascii_case(value))
+    // Spelled out rather than derived from `Debug`: this is the wire contract,
+    // and a `#[derive(Debug)]` on the model enum must not be able to silently
+    // change what a client sees. It also allocates nothing per photo.
+    Some(match value {
+        v if v.eq_ignore_ascii_case("TopLeft") => O::TopLeft,
+        v if v.eq_ignore_ascii_case("TopRight") => O::TopRight,
+        v if v.eq_ignore_ascii_case("BottomRight") => O::BottomRight,
+        v if v.eq_ignore_ascii_case("BottomLeft") => O::BottomLeft,
+        v if v.eq_ignore_ascii_case("LeftTop") => O::LeftTop,
+        v if v.eq_ignore_ascii_case("RightTop") => O::RightTop,
+        v if v.eq_ignore_ascii_case("RightBottom") => O::RightBottom,
+        v if v.eq_ignore_ascii_case("LeftBottom") => O::LeftBottom,
+        _ => return None,
+    })
 }
 
 /// The [`BaseItemKind`] of a row, defaulting to [`BaseItemKind::Folder`] for an
@@ -1132,6 +1162,16 @@ impl FerrofinDtoService {
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .and_then(|id| prefetched.series_provider_ids.get(&id));
+            // C# reads `season.Series.DisplayOrder` / `episode.Series.DisplayOrder`
+            // — the OWNING SERIES' value, out of its `Data` blob. Reading the
+            // season's or episode's own blob would always find nothing, and
+            // gating on `kind == Series` would never fire, because only a
+            // Season/Episode link consults it at all.
+            let display_order = item
+                .series_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| prefetched.series_display_order.get(&id));
             dto.external_urls = Some(ferrofin_providers::external_urls(
                 &ferrofin_providers::ExternalIdItem {
                     kind,
@@ -1141,7 +1181,7 @@ impl FerrofinDtoService {
                         .parent_index_number
                         .and_then(|n| i32::try_from(n).ok()),
                     series_provider_ids: series_ids,
-                    series_display_order: None,
+                    series_display_order: display_order.map(String::as_str),
                     musicbrainz_server: &self.musicbrainz_server,
                 },
             ));
@@ -1431,6 +1471,7 @@ impl FerrofinDtoService {
             .and_then(|s| Uuid::parse_str(s).ok());
 
         attach_photo_exif(dto, item);
+        attach_photo_album(dto, item, &prefetched.photo_album_names);
 
         Ok(())
     }
@@ -1464,6 +1505,69 @@ impl FerrofinDtoService {
                 if let Ok(id) = Uuid::parse_str(&item_id) {
                     map.entry(id).or_default().insert(key, value);
                 }
+            }
+        }
+        Ok(map)
+    }
+
+    /// The `DisplayOrder` of each of `series_ids` that declares one.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn load_series_display_order(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ServiceError> {
+        let mut map: HashMap<Uuid, String> = HashMap::new();
+        if series_ids.is_empty() {
+            return Ok(map);
+        }
+        let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
+        for (item_id, data) in self
+            .db
+            .item_data_blobs(&stored)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            if let Ok(id) = Uuid::parse_str(&item_id)
+                && let Some(order) = crate::item_data::read_data_string(
+                    &crate::item_data::parse_data(Some(&data)),
+                    "DisplayOrder",
+                )
+            {
+                map.insert(id, order);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Names the given PhotoAlbum rows, for the `Album`/`AlbumId` a photo's DTO
+    /// carries (C# `DtoService.SetPhotoProperties` reads `Photo.AlbumEntity`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn load_photo_album_names(
+        &self,
+        album_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ServiceError> {
+        let mut map: HashMap<Uuid, String> = HashMap::with_capacity(album_ids.len());
+        if album_ids.is_empty() {
+            return Ok(map);
+        }
+        // Only a real PhotoAlbum names a photo: a loose photo hangs off the
+        // library's collection folder, and calling that an album would send the
+        // client somewhere that is not one. The filter lives in the query.
+        let stored: Vec<String> = album_ids.iter().copied().map(guid_to_db).collect();
+        for (item_id, name) in self
+            .db
+            .photo_album_names(&stored)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            if let Ok(id) = Uuid::parse_str(&item_id) {
+                map.insert(id, name);
             }
         }
         Ok(map)
@@ -1873,6 +1977,7 @@ impl FerrofinDtoService {
         // A season/episode's links come from its series' ids, so collect the
         // distinct series on the page and read their ids in the same batched
         // way (one extra query for a page of episodes, none otherwise).
+        let mut series_display_order: HashMap<Uuid, String> = HashMap::new();
         let series_provider_ids = if want_external_urls {
             let mut series_ids: Vec<Uuid> = items
                 .iter()
@@ -1882,10 +1987,23 @@ impl FerrofinDtoService {
                 .collect();
             series_ids.sort_unstable();
             series_ids.dedup();
+            series_display_order = self.load_series_display_order(&series_ids).await?;
             self.load_provider_ids_batch(&series_ids).await?
         } else {
             HashMap::new()
         };
+        // A photo's album is its parent row. Collect the distinct parents of
+        // the page's photos and name them in one query — none at all for a page
+        // with no photos on it.
+        let mut album_ids: Vec<Uuid> = items
+            .iter()
+            .filter(|i| row_kind(i) == BaseItemKind::Photo)
+            .filter_map(|i| i.parent_id.as_deref())
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        album_ids.sort_unstable();
+        album_ids.dedup();
+        let photo_album_names = self.load_photo_album_names(&album_ids).await?;
         // Every credited person resolved to its by-name Person item, and the
         // ids whose images the projection will want.
         let (person_image_ids, person_ids_by_name) = if options.contains_field(ItemFields::People) {
@@ -2127,6 +2245,8 @@ impl FerrofinDtoService {
             user_data,
             media_streams,
             provider_ids,
+            series_display_order,
+            photo_album_names,
             series_provider_ids,
             people,
             person_images,
@@ -2191,8 +2311,8 @@ mod tests {
     use ferrofin_traits::dto::DtoService as _;
 
     use crate::test_support::{
-        fetch_item, fetch_item_opt, image_info, seed_folder_item, seed_images, seed_item_with_data,
-        seed_named_item, seed_provider_id, seed_user, test_db,
+        fetch_item, fetch_item_opt, image_info, seed_child_item, seed_folder_item, seed_images,
+        seed_item_with_data, seed_named_item, seed_provider_id, seed_user, test_db,
     };
 
     // ---- Fakes for the injected siblings -------------------------------------
@@ -3445,6 +3565,48 @@ mod tests {
             dto.image_orientation,
             Some(ferrofin_model::drawing::ImageOrientation::RightTop)
         );
+    }
+
+    #[tokio::test]
+    async fn a_photo_carries_its_albums_name_and_id() {
+        // C# `SetPhotoProperties` reads `Photo.AlbumEntity` and sets both
+        // fields; jellyfin-web's photo viewer pages through an album by AlbumId.
+        let db = test_db().await;
+        let album = Uuid::new_v4();
+        let photo = Uuid::new_v4();
+        let loose = Uuid::new_v4();
+        let folder = Uuid::new_v4();
+        seed_folder_item(&db, album, BaseItemKind::PhotoAlbum, "Iceland 2024", None).await;
+        seed_child_item(&db, photo, BaseItemKind::Photo, "DSC_0002", album).await;
+        // A loose photo hangs off the library's collection folder, which is not
+        // an album — neither field may be set for it.
+        seed_folder_item(&db, folder, BaseItemKind::CollectionFolder, "Photos", None).await;
+        seed_child_item(&db, loose, BaseItemKind::Photo, "DSC_0003", folder).await;
+
+        let svc = service(db.clone());
+        let dto = svc
+            .get_base_item_dto(
+                &fetch_item(&db, photo).await,
+                &DtoOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dto.album.as_deref(), Some("Iceland 2024"));
+        assert_eq!(dto.album_id, Some(album));
+
+        let dto = svc
+            .get_base_item_dto(
+                &fetch_item(&db, loose).await,
+                &DtoOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dto.album, None);
+        assert_eq!(dto.album_id, None);
     }
 
     #[tokio::test]

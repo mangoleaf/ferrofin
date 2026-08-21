@@ -19,6 +19,11 @@
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
@@ -37,6 +42,15 @@ pub struct OmdbClient {
     http: reqwest::Client,
     api_key: SecretString,
     base_url: String,
+    /// Season listings already fetched, keyed by `(series id, season)`.
+    ///
+    /// C# `EnsureSeasonInfo` caches the same JSON on disk under
+    /// `{cache}/omdb/{id}_season_{n}.json` for a day. Ferrofin keeps it in
+    /// memory instead — the cache directory is not wired into this client, and
+    /// the request that matters is the one repeated once per EPISODE of the
+    /// same season within a single scan. Same TTL, same effect on a scan; a
+    /// restart re-fetches where Jellyfin would not.
+    seasons: SeasonCache,
 }
 
 impl OmdbClient {
@@ -48,6 +62,7 @@ impl OmdbClient {
             http: reqwest::Client::new(),
             api_key: SecretString::from(api_key.trim()),
             base_url: API_BASE.to_owned(),
+            seasons: Arc::default(),
         }
     }
 
@@ -93,22 +108,58 @@ impl OmdbClient {
         item.is_found().then_some(item)
     }
 
-    /// The Identify-dialog result list for a title, from OMDb's search
-    /// endpoint (`&s=`) — the `isSearch` branch of the same C# method.
+    /// The Identify-dialog candidates for a title — port of
+    /// `OmdbItemProvider.GetSearchResultsInternal`.
+    ///
+    /// A known IMDb id short-circuits the whole search: C# sets
+    /// `isSearch = false` and asks for `&i=<id>`, so an item the user already
+    /// pinned resolves to exactly itself instead of a list of fuzzy title
+    /// matches. `episode` narrows that lookup with `&Season=`/`&Episode=`,
+    /// keyed by the SERIES' id rather than the episode's own.
     pub async fn search(
         &self,
         kind: OmdbKind,
         name: &str,
         year: Option<i32>,
+        known: &OmdbSearchKey<'_>,
     ) -> Vec<OmdbSearchHit> {
+        let season = known.season.map(|n| n.to_string());
+        let episode = known.episode.map(|n| n.to_string());
+        if let Some(imdb_id) = known.imdb_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let mut params = vec![("i", imdb_id), ("plot", "full"), ("r", "json")];
+            if let Some(episode) = episode.as_deref() {
+                params.push(("Episode", episode));
+            }
+            if let Some(season) = season.as_deref() {
+                params.push(("Season", season));
+            }
+            // The id branch answers with ONE record, not a `Search` array.
+            return self
+                .get::<OmdbSearchHit>(imdb_id, &params)
+                .await
+                .filter(|hit| hit.imdb_id.is_some() || hit.title.is_some())
+                .into_iter()
+                .collect();
+        }
         let name = name.trim();
         if name.is_empty() {
             return Vec::new();
         }
         let year = year.map(|y| y.to_string());
-        let mut params = vec![("s", name), ("type", kind.as_str()), ("r", "json")];
+        let mut params = vec![
+            ("plot", "full"),
+            ("r", "json"),
+            ("s", name),
+            ("type", kind.as_str()),
+        ];
         if let Some(year) = year.as_deref() {
             params.push(("y", year));
+        }
+        if let Some(episode) = episode.as_deref() {
+            params.push(("Episode", episode));
+        }
+        if let Some(season) = season.as_deref() {
+            params.push(("Season", season));
         }
         self.get::<OmdbSearchResults>(name, &params)
             .await
@@ -153,7 +204,22 @@ impl OmdbClient {
             ("season", season_str.as_str()),
             ("detail", "full"),
         ];
-        let listing: OmdbSeason = self.get(&series_id, &params).await?;
+        let key = (series_id.clone(), season);
+        let cached = self.seasons.lock().ok().and_then(|seasons| {
+            seasons
+                .get(&key)
+                .filter(|(at, _)| at.elapsed() < SEASON_CACHE_TTL)
+                .map(|(_, listing)| listing.clone())
+        });
+        let listing: OmdbSeason = if let Some(listing) = cached {
+            listing
+        } else {
+            let fetched: OmdbSeason = self.get(&series_id, &params).await?;
+            if let Ok(mut seasons) = self.seasons.lock() {
+                seasons.insert(key, (Instant::now(), fetched.clone()));
+            }
+            fetched
+        };
         let by_id = episode_imdb_id
             .and_then(normalize_imdb_id)
             .and_then(|wanted| {
@@ -261,6 +327,9 @@ pub struct OmdbSearchHit {
     /// `Poster` — an absolute image URL.
     #[serde(rename = "Poster", default, deserialize_with = "na_option")]
     pub poster: Option<String>,
+    /// `Released` — a full release date, e.g. `"16 Jul 2010"`.
+    #[serde(rename = "Released", default, deserialize_with = "na_option")]
+    pub released: Option<String>,
 }
 
 impl OmdbSearchHit {
@@ -269,10 +338,50 @@ impl OmdbSearchHit {
     pub fn production_year(&self) -> Option<i32> {
         self.year.as_deref()?.trim().get(..4)?.parse().ok()
     }
+
+    /// `Released` parsed as a date — the search hit's `PremiereDate`.
+    #[must_use]
+    pub fn premiere_date(&self) -> Option<DateTime<Utc>> {
+        parse_release_date(self.released.as_deref()?)
+    }
 }
 
+/// Parses OMDb's `Released` field — `"16 Jul 2010"`, the one form the API
+/// emits, with ISO accepted too since `DateTime.TryParse` takes it.
+fn parse_release_date(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    let date = NaiveDate::parse_from_str(value, "%d %b %Y")
+        .or_else(|_| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+        .ok()?;
+    Some(Utc.from_utc_datetime(&date.into()))
+}
+
+/// What an Identify request already knows about the item being searched for —
+/// C#'s `ItemLookupInfo` reduced to the three fields OMDb's query uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OmdbSearchKey<'a> {
+    /// The IMDb id already recorded for the item — for an episode, its SERIES'
+    /// id, as `GetSearchResultsInternal` reads `SeriesProviderIds`.
+    pub imdb_id: Option<&'a str>,
+    /// `ParentIndexNumber`, for an episode.
+    pub season: Option<i32>,
+    /// `IndexNumber`, for an episode.
+    pub episode: Option<i32>,
+}
+
+/// The season listings a client has already fetched, keyed by
+/// `(series id, season)` and stamped with when they were read.
+///
+/// Shared across clones of the client, so the composition root handing the same
+/// client to several subsystems does not multiply the requests.
+type SeasonCache = Arc<std::sync::Mutex<HashMap<(String, i32), (Instant, OmdbSeason)>>>;
+
+/// How long a cached season listing stays fresh — C# `EnsureSeasonInfo`'s
+/// `TotalDays <= 1`.
+const SEASON_CACHE_TTL: Duration = Duration::from_hours(24);
+
 /// One season listing (`&season=N`) — port of `OmdbProvider.SeasonRootObject`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 struct OmdbSeason {
     #[serde(rename = "Episodes", default)]
     episodes: Vec<OmdbItem>,
@@ -294,9 +403,6 @@ pub struct OmdbItem {
     /// `Rated` — the certificate (`PG-13`, `TV-MA`, …).
     #[serde(rename = "Rated", default, deserialize_with = "na_option")]
     pub rated: Option<String>,
-    /// `Runtime` — e.g. `"148 min"`.
-    #[serde(rename = "Runtime", default, deserialize_with = "na_option")]
-    pub runtime: Option<String>,
     /// `Genre` — comma-separated.
     #[serde(rename = "Genre", default, deserialize_with = "na_option")]
     pub genre: Option<String>,
@@ -352,7 +458,7 @@ impl OmdbItem {
     pub fn rotten_tomatoes(&self) -> Option<f32> {
         self.ratings
             .iter()
-            .find(|r| r.source == ROTTEN_TOMATOES)
+            .find(|r| r.source.eq_ignore_ascii_case(ROTTEN_TOMATOES))
             .and_then(|r| parse_percent(&r.value))
     }
 
@@ -373,20 +479,6 @@ impl OmdbItem {
     pub fn production_year(&self) -> Option<i32> {
         let year = self.year.as_deref()?.trim();
         year.get(..4)?.parse::<i32>().ok()
-    }
-
-    /// `Runtime` as ticks (100 ns units), from OMDb's `"N min"` form.
-    #[must_use]
-    pub fn run_time_ticks(&self) -> Option<i64> {
-        let minutes: i64 = self
-            .runtime
-            .as_deref()?
-            .trim()
-            .trim_end_matches("min")
-            .trim()
-            .parse()
-            .ok()?;
-        (minutes > 0).then(|| minutes * 60 * 10_000_000)
     }
 
     /// The genre list, split and trimmed (C# `AddGenre` per entry).
@@ -488,11 +580,15 @@ fn normalize_imdb_id(imdb_id: &str) -> Option<String> {
     if id.is_empty() {
         return None;
     }
-    Some(if id.len() >= 2 && id[..2].eq_ignore_ascii_case("tt") {
-        id.to_owned()
-    } else {
-        format!("tt{id}")
-    })
+    // `get` rather than a slice: a non-ASCII first character would make
+    // `id[..2]` panic mid-codepoint.
+    Some(
+        if id.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("tt")) {
+            id.to_owned()
+        } else {
+            format!("tt{id}")
+        },
+    )
 }
 
 /// Parses an OMDb percentage string (e.g. `"85%"`) into `0.0`–`100.0`.
@@ -562,7 +658,6 @@ mod tests {
         assert_eq!(item.title.as_deref(), Some("Inception"));
         assert_eq!(item.production_year(), Some(2010));
         assert_eq!(item.rated.as_deref(), Some("PG-13"));
-        assert_eq!(item.run_time_ticks(), Some(148 * 60 * 10_000_000));
         assert_eq!(item.genres(), ["Action", "Adventure", "Sci-Fi"]);
         assert_eq!(item.community_rating(), Some(8.8));
         assert_eq!(item.original_language().as_deref(), Some("English"));
@@ -586,7 +681,6 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(item.plot, None);
-        assert_eq!(item.run_time_ticks(), None);
         assert!(item.genres().is_empty());
         assert_eq!(item.community_rating(), None);
         assert_eq!(item.website, None);
@@ -675,6 +769,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_season_listing_is_fetched_once_for_the_whole_season() {
+        // C# `EnsureSeasonInfo` caches the listing for a day. Without a cache
+        // a scan issues one full season request PER EPISODE — the skip gate
+        // upstream of it cannot help, because `episode()` sends no
+        // `tomatoes=true` and so never fills the critic rating the gate wants.
+        let client = {
+            let server = MockServer::start(vec![("/", season_body())]).await;
+            let client = OmdbClient::new("key").with_base_url(&server.base_url);
+            let first = client.episode("tt0903747", 1, 1, None).await.expect("ep");
+            assert_eq!(first.title.as_deref(), Some("Pilot"));
+            client
+            // …and the server goes away here.
+        };
+        // A second episode of the same season must resolve without a request.
+        let second = client.episode("tt0903747", 1, 2, None).await.expect("ep");
+        assert_eq!(second.title.as_deref(), Some("Cat's in the Bag..."));
+        // A DIFFERENT season is a different key, so it has nothing to serve.
+        assert!(client.episode("tt0903747", 2, 1, None).await.is_none());
+    }
+
+    #[tokio::test]
     async fn an_episodes_own_imdb_id_wins_over_its_number() {
         // C# matches by id first: a mis-numbered row still resolves correctly.
         let server = MockServer::start(vec![("/", season_body())]).await;
@@ -706,22 +821,75 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(client.search(OmdbKind::Movie, "", None).await.is_empty());
+        assert!(
+            client
+                .search(OmdbKind::Movie, "", None, &OmdbSearchKey::default())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_id_resolves_to_itself_instead_of_a_title_search() {
+        // C# `GetSearchResultsInternal` sets `isSearch = false` and queries
+        // `&i=<id>` whenever the item already carries an IMDb id, so Identify
+        // on a pinned item offers exactly that title — not fuzzy matches.
+        let body = r#"{"Title":"Inception","Year":"2010","imdbID":"tt1375666",
+            "Released":"16 Jul 2010","Response":"True"}"#;
+        let server = MockServer::start(vec![("/", body.to_owned())]).await;
+        let client = OmdbClient::new("key").with_base_url(&server.base_url);
+        let hits = client
+            .search(
+                OmdbKind::Movie,
+                // A deliberately wrong name: the id must win over it.
+                "Not The Title",
+                None,
+                &OmdbSearchKey {
+                    imdb_id: Some("tt1375666"),
+                    ..OmdbSearchKey::default()
+                },
+            )
+            .await;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].imdb_id.as_deref(), Some("tt1375666"));
+        assert_eq!(hits[0].title.as_deref(), Some("Inception"));
+
+        // With no id and no name there is nothing to ask for.
+        let empty = client
+            .search(OmdbKind::Movie, "  ", None, &OmdbSearchKey::default())
+            .await;
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]
     async fn search_lists_identify_candidates() {
         let body = r#"{"Search":[
-            {"Title":"Inception","Year":"2010","imdbID":"tt1375666","Poster":"https://example.test/p.jpg"},
+            {"Title":"Inception","Year":"2010","imdbID":"tt1375666","Poster":"https://example.test/p.jpg","Released":"16 Jul 2010"},
             {"Title":"Inception: The Cobol Job","Year":"2010","imdbID":"tt5295894","Poster":"N/A"}
         ],"totalResults":"2","Response":"True"}"#;
         let server = MockServer::start(vec![("/", body.to_owned())]).await;
         let client = OmdbClient::new("key").with_base_url(&server.base_url);
-        let hits = client.search(OmdbKind::Movie, "Inception", None).await;
+        let hits = client
+            .search(
+                OmdbKind::Movie,
+                "Inception",
+                None,
+                &OmdbSearchKey::default(),
+            )
+            .await;
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].imdb_id.as_deref(), Some("tt1375666"));
         assert_eq!(hits[0].production_year(), Some(2010));
         assert_eq!(hits[1].poster, None, "N/A posters do not become a URL");
+        // `Released` becomes the candidate's PremiereDate, as C#
+        // `ResultToMetadataResult` sets it.
+        assert_eq!(
+            hits[0].premiere_date(),
+            chrono::NaiveDate::from_ymd_opt(2010, 7, 16)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|d| d.and_utc())
+        );
+        assert_eq!(hits[1].premiere_date(), None, "an absent Released is None");
     }
 
     #[tokio::test]
