@@ -23,12 +23,26 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The SQLite database file name inside the data directory.
 const DB_FILE_NAME: &str = "ferrofin.db";
+
+/// Serializes `POST /Backup/Create`.
+///
+/// Two reasons, either sufficient. The archive name is second-granular
+/// (`ferrofin-backup-%Y%m%d-%H%M%S.zip`), so two creates in the same second
+/// write the *same* path and one silently destroys the other. And
+/// [`write_backup`] reads the whole SQLite file into memory, so N concurrent
+/// creates hold N x database-size — on a large library that is an OOM.
+///
+/// Before this handler moved onto the blocking pool the runtime's worker count
+/// bounded that implicitly; dispatching to a 512-thread pool removed the bound,
+/// so it is made explicit here. A caller that loses the race gets the `503` the
+/// contract already documents for this operation rather than queueing.
+static BACKUP_IN_FLIGHT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// The subdirectory of the data path that holds the backup archives.
 const BACKUPS_DIR: &str = "backups";
@@ -107,9 +121,17 @@ fn read_manifest(archive_path: &Path) -> Option<BackupManifest> {
 )]
 async fn list_backups(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Json<Vec<BackupManifest>> {
-    Json(list_backups_in(&backups_dir(&state)))
+    // Opening every retained archive and inflating its manifest is blocking file
+    // I/O, unbounded in the number of backups kept and on possibly-network
+    // storage — the same reason `create_backup` does not run inline.
+    let dir = backups_dir(&state);
+    Json(
+        blocking(move || Ok(list_backups_in(&dir)))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Reads every `.zip` in `dir` and returns its manifest, newest first. A missing
@@ -156,7 +178,7 @@ struct ManifestQuery {
 )]
 async fn get_backup_manifest(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<ManifestQuery>,
 ) -> Result<Json<BackupManifest>, ApiError> {
     let name = query
@@ -208,16 +230,38 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 )]
 async fn create_backup(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     body: Option<Json<BackupOptions>>,
 ) -> Result<Json<BackupManifest>, ApiError> {
+    let Ok(_permit) = BACKUP_IN_FLIGHT.try_acquire() else {
+        return Err(ApiError::ServiceUnavailable(
+            "a backup is already in progress".to_owned(),
+        ));
+    };
     let options = body.map(|Json(b)| b).unwrap_or_default();
     // The restorable state lives at the program-data root: the SQLite DB file and
     // the whole `config/` tree.
     let program_data = PathBuf::from(state.config.application_paths().program_data_path());
-    write_backup(&backups_dir(&state), &program_data, options, Utc::now())
+    let dir = backups_dir(&state);
+    let now = Utc::now();
+    // Deflating the SQLite file (tens to hundreds of MB) plus the whole config
+    // tree is seconds of CPU + disk: it must not run on a runtime worker.
+    blocking(move || write_backup(&dir, &program_data, options, now))
+        .await
         .map(Json)
         .map_err(|e| io_err("create backup", &e))
+}
+
+/// Runs a blocking filesystem job on tokio's blocking pool, mapping a lost pool
+/// task to an `io::Error` so callers keep one error type.
+async fn blocking<T, F>(job: F) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(job)
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 /// Writes a backup archive (DB file + `config/` tree + `manifest.json`) under
@@ -290,7 +334,7 @@ struct RestoreQuery {
 )]
 async fn restore_backup(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<RestoreQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let name = query
@@ -305,7 +349,11 @@ async fn restore_backup(
     }
 
     let program_data = PathBuf::from(state.config.application_paths().program_data_path());
-    restore_archive(&archive_path, &program_data).map_err(|e| io_err("restore backup", &e))?;
+    // Inflating the archive back over the data + config tree is the same
+    // seconds-long blocking job as creating it.
+    blocking(move || restore_archive(&archive_path, &program_data))
+        .await
+        .map_err(|e| io_err("restore backup", &e))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -351,6 +399,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the backup tests against each other.
+    ///
+    /// They contend on two process-global resources: [`BACKUP_IN_FLIGHT`],
+    /// whose single permit one test deliberately holds, and the shared
+    /// `ferrofin-api-test-data/backups` directory that another wipes. `nextest`
+    /// gives each test its own process and hides both; plain `cargo test` runs
+    /// them as threads in one process, where they fail.
+    static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     use super::{BackupManifest, BackupOptions, add_dir_to_zip, read_manifest};
     use std::io::Write as _;
 
@@ -455,13 +512,91 @@ mod tests {
         assert!(list_backups_in(&tmp.path().join("nope")).is_empty());
     }
 
+    /// Every `/Backup*` route is `RequiresElevation` in the contract (each
+    /// documents a `403`), and restore in particular replaces the live
+    /// database — an ordinary account must never reach it.
+    #[tokio::test]
+    async fn backup_routes_reject_a_non_elevated_caller() {
+        use crate::create_router;
+        use crate::test_support::authed_fake_state;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        // `authed_fake_state` authenticates a plain user — not an API key and
+        // not an administrator.
+        let router = create_router(authed_fake_state());
+        for (method, uri) in [
+            ("GET", "/Backup"),
+            ("GET", "/Backup/Manifest?path=x.zip"),
+            ("POST", "/Backup/Create"),
+            ("POST", "/Backup/Restore"),
+        ] {
+            let res = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                res.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must require elevation"
+            );
+        }
+    }
+
+    /// A second concurrent create is refused with the contract's `503` rather
+    /// than queueing.
+    ///
+    /// Two creates in the same second write the SAME archive path (the name is
+    /// second-granular), so one would silently destroy the other; and each
+    /// holds the whole database in memory, so N in flight is N x database size.
+    #[tokio::test]
+    async fn a_second_concurrent_create_is_refused() {
+        use crate::create_router;
+        use crate::test_support::elevated_fake_state;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let _serial = TEST_SERIAL.lock().await;
+        // Hold the only permit, exactly as an in-flight create does.
+        let held = super::BACKUP_IN_FLIGHT
+            .try_acquire()
+            .expect("the first create takes the permit");
+
+        let res = create_router(elevated_fake_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Backup/Create")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(held);
+    }
+
     #[tokio::test]
     async fn create_list_and_manifest_via_router() {
         use crate::create_router;
-        use crate::test_support::authed_fake_state;
+        use crate::test_support::elevated_fake_state;
         use axum::body::{Body, to_bytes};
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt as _;
+
+        let _serial = TEST_SERIAL.lock().await;
 
         // The authed fake state's paths point under the temp dir; start clean.
         let backups = std::env::temp_dir()
@@ -469,7 +604,7 @@ mod tests {
             .join("backups");
         let _ = std::fs::remove_dir_all(&backups);
 
-        let router = create_router(authed_fake_state());
+        let router = create_router(elevated_fake_state());
         let send = |method: &str, uri: String, body: &str| {
             let router = router.clone();
             let (method, body) = (method.to_owned(), body.to_owned());
@@ -518,5 +653,84 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// Writing a backup archive must be dispatched to the blocking pool, never
+    /// run inline on a runtime worker.
+    ///
+    /// Deflating the SQLite file plus the whole config tree is seconds of CPU
+    /// and disk on a real library; done inline it parks one tokio worker for
+    /// that whole time, and every request already queued behind it waits.
+    ///
+    /// Discriminates by starving the pool, the same way
+    /// `image_info_size_stat_goes_through_the_blocking_pool` does: the runtime
+    /// gets exactly one blocking thread and that thread is held busy, so a
+    /// `spawn_blocking` job is *queued* and the request cannot finish — while an
+    /// inline `write_backup` runs on the worker itself and answers regardless of
+    /// the pool. Asserting the request makes no progress is what fails if the
+    /// inline call comes back.
+    #[test]
+    fn creating_a_backup_goes_through_the_blocking_pool() {
+        use crate::create_router;
+        use crate::test_support::elevated_fake_state;
+        use axum::body::Body;
+        use axum::http::Request;
+        use std::time::Duration;
+        use tower::ServiceExt as _;
+
+        // Only bounds the failing direction: an inline `write_backup` over the
+        // fake state's (tiny, DB-less) program-data dir returns in well under a
+        // millisecond, so any value above the noise floor works. Nothing waits
+        // on this when the code is correct.
+        const STARVED_WAIT: Duration = Duration::from_millis(250);
+
+        // Taken BEFORE the runtime exists, so `blocking_lock` cannot panic.
+        let _serial = TEST_SERIAL.blocking_lock();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let router = create_router(elevated_fake_state());
+
+            // Occupy the single blocking thread, and wait until it is provably
+            // busy so the backup job cannot win the race for it.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let create = |router: axum::Router| async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/Backup/Create")
+                            .header("Content-Type", "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            };
+
+            let starved = tokio::time::timeout(STARVED_WAIT, create(router.clone())).await;
+            assert!(
+                starved.is_err(),
+                "POST /Backup/Create answered with the blocking pool starved, so the archive \
+                 was written inline on the async worker thread"
+            );
+
+            // Free the pool and confirm the same request now answers.
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let _ = create(router).await;
+        });
     }
 }

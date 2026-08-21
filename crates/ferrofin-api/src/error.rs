@@ -56,6 +56,13 @@ pub enum ApiError {
     /// updating another user without elevation, disabling the last admin).
     #[error("forbidden: {0}")]
     Forbidden(String),
+
+    /// The operation cannot run right now because a conflicting one already is
+    /// → `503`. The contract documents this for `POST /Backup/Create`, which is
+    /// serialized: two creates in the same second would write the same archive
+    /// path, and each holds the whole database in memory.
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl ApiError {
@@ -72,6 +79,7 @@ impl ApiError {
             }
             Self::Service(ServiceError::Conflict(_)) | Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             // `Db`/`Backend` (and any future non-exhaustive variant) are internal
             // failures the client cannot act on.
