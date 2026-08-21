@@ -58,8 +58,13 @@ podAnnotations: {}
 # -- Labels added to the pod.
 podLabels: {}
 
-# -- Pod-level security context (e.g. fsGroup/runAsUser).
-podSecurityContext: {}
+# -- Pod-level security context. The image runs as uid 1000, so default
+# fsGroup 1000: kubelet fixes volume group-ownership on mount (only when the
+# volume root mismatches), so a PV written by root can never lock the server
+# out of its own cache.
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
 # -- Container-level security context (e.g. privileged for GPU passthrough).
 securityContext: {}
 

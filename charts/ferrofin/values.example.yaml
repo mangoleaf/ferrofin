@@ -35,6 +35,14 @@ imagePullSecrets:
 securityContext:
   privileged: true
 
+# Pod-level: the chart already defaults podSecurityContext to fsGroup 1000 with
+# fsGroupChangePolicy OnRootMismatch (the image runs as uid 1000), so kubelet
+# fixes volume ownership on mount — e.g. a cache PV once written by root.
+# Override only if your storage needs a different gid.
+# podSecurityContext:
+#   fsGroup: 1000
+#   fsGroupChangePolicy: OnRootMismatch
+
 service:
   type: ClusterIP
   port: 8096
