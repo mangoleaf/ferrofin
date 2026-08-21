@@ -175,6 +175,13 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
 /// `shutdown` sender is handed to the [`FerrofinLifecycleController`] so a
 /// `/System/Restart|Shutdown` request can trigger axum's graceful shutdown.
 ///
+/// `fpcalc` is the intro skipper's fallback fingerprint backend, pre-probed by
+/// the caller (`ferrofin_extensions::fingerprint::discover_fpcalc_async`)
+/// alongside the ffmpeg capability reads. Probing it here instead cost 18 ms of
+/// a 71 ms warm start, because it is a synchronous process spawn in the middle
+/// of an otherwise CPU-bound wiring sequence. `None` means "no `fpcalc`" — the
+/// same answer a failed probe gives.
+///
 /// Managers are constructed in dependency order: leaf repositories and the
 /// `Database`-only services first, then the managers that consume them, then the
 /// managers that consume *those*. The media-encoding seams are left as the
@@ -194,6 +201,7 @@ pub async fn build_app_state(
     db: &Database,
     config: &Config,
     ffmpeg: &FfmpegPaths,
+    fpcalc: Option<String>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
@@ -660,9 +668,26 @@ pub async fn build_app_state(
             }
         });
     }
-    if let Err(err) = library_monitor.start().await {
-        tracing::warn!(%err, "failed to start library monitor");
-    }
+    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
+    // inotify recursive watch adds one kernel watch per directory under every
+    // library root, so its cost scales with the library's directory count and
+    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
+    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
+    // far worse). Awaiting it here put that walk *before* the listener binds,
+    // where every millisecond is a client getting connection-refused rather
+    // than a slow response.
+    //
+    // Nothing needs the watches to exist before the server serves: they only
+    // feed realtime change detection, which is already blind for the whole of
+    // boot, and a change arriving during the walk is picked up by the next
+    // scheduled scan exactly as one arriving a moment earlier would be. So it
+    // is spawned and boot continues.
+    let monitor_start = Arc::clone(&library_monitor);
+    tokio::spawn(async move {
+        if let Err(err) = monitor_start.start().await {
+            tracing::warn!(%err, "failed to start library monitor");
+        }
+    });
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -785,12 +810,15 @@ pub async fn build_app_state(
     // `chromaprint` muxer, else `fpcalc`; otherwise it loads but reports
     // unavailable at run time.
     let fingerprinter: Option<Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>> =
-        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_ffmpeg_chromaprint(
+        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_backends(
             &ffmpeg.ffmpeg.to_string_lossy(),
             // Already probed by `discover_ffmpeg`, concurrently with the other
             // capability reads — re-probing here spawned `ffmpeg -muxers` a
-            // second time, synchronously, on the startup critical path.
+            // second time, synchronously, on the startup critical path. The
+            // `fpcalc` fallback arrives the same way and for the same reason:
+            // its own `-version` spawn was 18 ms of a 71 ms warm start.
             ffmpeg.chromaprint_muxer,
+            fpcalc,
         )
         .map(|fp| {
             tracing::debug!(backend = fp.backend(), "intro skipper: fingerprint backend");
@@ -1456,7 +1484,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
-        let wired = build_app_state(&db, &config, &ffmpeg, tx)
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
             .await
             .expect("app state wires");
 

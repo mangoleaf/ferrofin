@@ -74,7 +74,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
         .await
         .expect("wire app state");
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
@@ -384,7 +384,7 @@ async fn repository_install_stages_plugin_and_flags_restart() {
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
         .await
         .expect("wire app state");
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)

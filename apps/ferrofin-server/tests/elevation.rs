@@ -68,7 +68,7 @@ async fn boot() -> Harness {
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
         .await
         .expect("wire app state");
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
@@ -322,4 +322,96 @@ async fn an_anonymous_caller_is_unauthorized_not_forbidden() {
     let router = ferrofin_api::create_router(harness.wired.state.clone());
     let (status, _) = call_as(&router, "GET", "/Devices", None, "elev-anon", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Composition-root plumbing
+// ---------------------------------------------------------------------------
+
+/// Records the `backend` field of the composition root's "intro skipper:
+/// fingerprint backend" event, so the test can see which backend was wired.
+#[derive(Clone, Default)]
+struct BackendSpy(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BackendSpy {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Visit<'a>(&'a mut Vec<String>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "backend" {
+                    self.0.push(format!("{v:?}").trim_matches('"').to_owned());
+                }
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                if f.name() == "backend" {
+                    self.0.push(v.to_owned());
+                }
+            }
+        }
+        let mut guard = self.0.lock().expect("spy mutex");
+        event.record(&mut Visit(&mut guard));
+    }
+}
+
+/// Boots with `fpcalc` and returns whichever fingerprint backend was wired.
+///
+/// This pins the *argument passing* in `build_app_state`, which nothing else
+/// does: every other call site passes `None`, so discarding the probed value
+/// (`{ let _ = fpcalc; None }`) left all 110 server tests green. Without the
+/// probe reaching `with_backends`, the intro skipper silently loses its
+/// fallback backend and reports "no Chromaprint backend" at run time.
+async fn wired_backend(fpcalc: Option<String>) -> Vec<String> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let spy = BackendSpy::default();
+    let subscriber = tracing_subscriber::registry().with(spy.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    for d in ["config", "data", "cache"] {
+        std::fs::create_dir_all(temp.path().join(d)).expect("dir");
+    }
+    let config = Config {
+        server_name: "ferrofin-fpcalc".to_owned(),
+        ..Config::test_stub(temp.path())
+    };
+    let db = ferrofin_db::Database::connect(&config.database_url())
+        .await
+        .expect("open db");
+    db.run_migrations().await.expect("migrations");
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        ffmpeg: std::path::PathBuf::from("ffmpeg"),
+        ffprobe: std::path::PathBuf::from("ffprobe"),
+        filters: Vec::new(),
+        encoders: Vec::new(),
+        // Force the fallback path: with the muxer present, `with_backends`
+        // discards `fpcalc` by design and the test would prove nothing.
+        chromaprint_muxer: false,
+    };
+    let (shutdown_tx, _rx) = tokio::sync::oneshot::channel();
+    let _wired = build_app_state(&db, &config, &ffmpeg, fpcalc, shutdown_tx)
+        .await
+        .expect("wire app state");
+
+    // Clone out before `_guard` drops and restores the previous subscriber.
+    spy.0.lock().expect("spy mutex").clone()
+}
+
+#[tokio::test]
+async fn the_probed_fpcalc_reaches_the_fingerprint_backend() {
+    let with = wired_backend(Some("/usr/bin/fpcalc".to_owned())).await;
+    assert!(
+        with.iter().any(|b| b == "fpcalc"),
+        "a probed fpcalc must be wired as the fingerprint backend, got {with:?}"
+    );
+
+    let without = wired_backend(None).await;
+    assert!(
+        without.is_empty(),
+        "with no fpcalc and no chromaprint muxer there is no backend, got {without:?}"
+    );
 }

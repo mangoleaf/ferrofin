@@ -95,6 +95,57 @@ fn log_startup_banner(config: &Config) {
     );
 }
 
+/// Reports the discovered encoder, or a disabled-encoder placeholder.
+///
+/// ffmpeg is required for playback but not for the server to boot: on a failed
+/// discovery this warns and returns bare `ffmpeg`/`ffprobe` names, so the API
+/// still comes up on a host without ffmpeg installed and playback 500s (rather
+/// than the process failing to start) until a working ffmpeg is configured.
+///
+/// `?e` prints the full anyhow context chain — which candidate was tried and how
+/// it was resolved (`--ffmpeg` flag vs `$PATH`) — so "why no transcode" is
+/// answerable from that one log line.
+fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
+    match discovered {
+        Ok(paths) => {
+            tracing::info!(
+                ffmpeg = %paths.ffmpeg.display(),
+                ffprobe = %paths.ffprobe.display(),
+                "ffmpeg discovered",
+            );
+            paths
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "ffmpeg unavailable — transcoding/playback will be disabled until configured",
+            );
+            FfmpegPaths {
+                ffmpeg: "ffmpeg".into(),
+                ffprobe: "ffprobe".into(),
+                filters: Vec::new(),
+                encoders: Vec::new(),
+                chromaprint_muxer: false,
+            }
+        }
+    }
+}
+
+/// Logs how far into the boot each stage of [`run`] finished, at `debug`.
+///
+/// Cold start is a sequence of a handful of coarse stages (database + encoder
+/// probe, manager wiring, seeding, router, bind), and without a per-stage
+/// timestamp the only observable is the total — which says nothing about which
+/// stage to attack. Emitted with `RUST_LOG=ferrofin_server=debug`; a disabled
+/// `debug!` costs a single atomic load, so this is free in production.
+fn boot_stage(started: std::time::Instant, stage: &'static str) {
+    tracing::debug!(
+        stage,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "boot stage"
+    );
+}
+
 /// Waits for the first shutdown trigger and reports why, for the shutdown log.
 ///
 /// `"api"` — an API-initiated shutdown/restart (`POST /System/Shutdown|Restart`
@@ -189,53 +240,37 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     log_startup_banner(&config);
 
-    // Opening/migrating the database and probing ffmpeg share no state, and
-    // both are dominated by waiting (SQLite I/O; five `ffmpeg`/`ffprobe`
-    // spawns). Run them CONCURRENTLY — measured, this hides the whole database
-    // open behind the encoder probe on a populated library. Neither is skipped
-    // or reordered relative to what depends on it: `build_app_state` below
-    // still needs both.
-    let (db, ffmpeg) = tokio::join!(open_database(&config), discover_ffmpeg(&config, None));
+    // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
+    // no state, and all three are dominated by waiting (SQLite I/O; five
+    // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
+    // measured, this hides the whole database open AND the `fpcalc` probe behind
+    // the encoder probe (six concurrent spawns finish in 27.4 ms against 27.9 ms
+    // for five, so the `fpcalc` leg is free). Nothing is skipped or reordered
+    // relative to what depends on it: `build_app_state` still needs all three.
+    // `fpcalc` is probed unconditionally rather than only when the `chromaprint`
+    // muxer turns out to be missing, because waiting to learn whether it IS
+    // missing is exactly the 15 ms serial spawn this removes; the answer is
+    // simply discarded when the muxer is present.
+    let (db, ffmpeg, fpcalc) = tokio::join!(
+        open_database(&config),
+        discover_ffmpeg(&config, None),
+        ferrofin_extensions::fingerprint::discover_fpcalc_async(),
+    );
+    boot_stage(started, "db+encoder probe");
     let db = db?;
 
     // ffmpeg is required for playback but not for the server to boot: warn and
     // continue so the API comes up even on a host without ffmpeg installed.
     // `system.json` EncoderAppPath is not yet loaded at this bootstrap stage, so
-    // no persisted fallback is supplied here. When discovery fails, wire the
-    // encoder with bare `ffmpeg`/`ffprobe` names so playback 500s (rather than
-    // failing to boot) until a working ffmpeg is configured.
-    let ffmpeg = match ffmpeg {
-        Ok(paths) => {
-            tracing::info!(
-                ffmpeg = %paths.ffmpeg.display(),
-                ffprobe = %paths.ffprobe.display(),
-                "ffmpeg discovered",
-            );
-            paths
-        }
-        Err(e) => {
-            // `?e` prints the full anyhow context chain (which candidate was
-            // tried and how it was resolved — `--ffmpeg` flag vs $PATH), so
-            // "why no transcode" is answerable from this one line.
-            tracing::warn!(
-                error = ?e,
-                "ffmpeg unavailable — transcoding/playback will be disabled until configured",
-            );
-            FfmpegPaths {
-                ffmpeg: "ffmpeg".into(),
-                ffprobe: "ffprobe".into(),
-                filters: Vec::new(),
-                encoders: Vec::new(),
-                chromaprint_muxer: false,
-            }
-        }
-    };
+    // no persisted fallback is supplied here.
+    let ffmpeg = encoder_or_disabled(ffmpeg);
 
     // Wire every concrete manager into the shared AppState (the composition root).
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg, fpcalc, shutdown_tx)
         .await
         .context("failed to assemble application state")?;
+    boot_stage(started, "app state wired");
 
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
@@ -265,6 +300,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     }
 
+    boot_stage(started, "admin seeded");
     let mut router = mount_web(
         ferrofin_api::create_router(wired.state.clone()),
         &config.web_dir,
@@ -309,8 +345,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // `Router::layer`, which runs per-matched-route, too late to re-route).
     let app = axum::middleware::from_fn(canonicalize_path_case).layer(router);
 
+    boot_stage(started, "router mounted");
     let addr = SocketAddr::new(config.bind_addr, config.port);
     let listener = bind_listener(addr).await?;
+    boot_stage(started, "listener bound");
     tracing::info!(%addr, "ferrofin-server listening");
 
     axum::serve(
