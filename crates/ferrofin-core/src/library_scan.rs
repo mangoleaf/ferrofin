@@ -1017,6 +1017,9 @@ impl LibraryScanner {
         // never runs for that library's items, and the saved order picks
         // the authority when fetchers compete.
         let fetcher_policies = fetcher_policies(folders);
+        // One read of the locked-item set for the whole scan, replacing the
+        // per-item row hydration this loop used to pay (see `locked_items`).
+        let locked_items = self.locked_items(&planned).await;
         // ffprobe dominates scan wall time and touches nothing but the file it
         // reads, so it runs `probe_concurrency` files ahead of this loop. The
         // loop itself is unchanged: same plan order, same rows, same writes.
@@ -1033,7 +1036,7 @@ impl LibraryScanner {
             // when `IsLocked`), and leave its people/images untouched below.
             // The scan-upsert's `IsLocked` guard backstops the metadata
             // columns; file-derived facts (the probe) still update.
-            let locked = self.is_item_locked(item.id).await;
+            let locked = locked_items.contains(&item.id);
             let policy = policy_for(item, &fetcher_policies);
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
@@ -3015,18 +3018,46 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
-    /// editor's "lock this item"). Absent repository (unit-test builds) or a
-    /// missing/new row → unlocked.
-    async fn is_item_locked(&self, id: Uuid) -> bool {
+    /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
+    /// editor's "lock this item"), once per scan. Absent repository
+    /// (unit-test builds) or a read failure → nothing is treated as locked.
+    ///
+    /// This used to be a per-item `retrieve_item` — a full `SELECT *`
+    /// hydration of all 72 `BaseItems` columns to read one boolean, paid for
+    /// every planned item on every scan (O(items) queries). Locked items are
+    /// rare (usually none), so the whole answer is one small indexed read and
+    /// the loop looks the id up in the returned set.
+    ///
+    /// The index is what makes that true: `FerrofinIX_BaseItems_IsLocked`
+    /// (migration 0017) is PARTIAL (`WHERE "IsLocked" = 1`), so it holds only
+    /// the locked rows. Without it this is `SCAN BaseItems` — 26-53 ms warm on
+    /// a 100k-item table — which is tolerable amortized over a full scan but
+    /// not on `scan_paths`, the library-monitor path that runs for one or two
+    /// items on every filesystem event.
+    ///
+    /// A lock applied *while* this scan is running is not seen by it, exactly
+    /// as a lock applied one item too late was never seen before. The locked
+    /// item's stored metadata is protected regardless: the scan upsert guards
+    /// every user-owned column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`,
+    /// evaluated against the row's committed value at write time.
+    async fn locked_items(&self, planned: &[Planned]) -> std::collections::HashSet<Uuid> {
+        // Nothing to scan, nothing to look up. `run_scan` is shared with
+        // `scan_paths`, and a noisy directory (`.partial` files, stray
+        // subtitles) produces watcher events that plan zero items — which must
+        // not cost a database read at all.
+        if planned.is_empty() {
+            return std::collections::HashSet::new();
+        }
         let Some(repo) = &self.item_repository else {
-            return false;
+            return std::collections::HashSet::new();
         };
-        repo.retrieve_item(id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.is_locked)
+        match repo.locked_item_ids().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read locked items; treating none as locked");
+                std::collections::HashSet::new()
+            }
+        }
     }
 
     /// Appends rows for art files already sitting in the item's metadata art

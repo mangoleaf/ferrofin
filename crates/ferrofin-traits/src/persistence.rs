@@ -147,6 +147,15 @@ pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Returns the ids of every item whose metadata the user has **locked**
+    /// (`IsLocked = 1`).
+    ///
+    /// The library scan needs each item's lock state, and asking per item cost
+    /// it a full `SELECT *` row hydration for one boolean. Locked items are
+    /// rare — usually none — so the whole answer is one small query, and the
+    /// scan reads it from the returned set instead.
+    async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
+
     /// Walks the `ParentId` chain from `item_id` upward in a single query
     /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
     /// the starting item does not exist.

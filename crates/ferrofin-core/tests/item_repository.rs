@@ -138,6 +138,60 @@ async fn save_then_retrieve_roundtrips() {
     assert_eq!(got.type_, type_name(BaseItemKind::Movie));
 }
 
+/// `locked_item_ids` answers the library scan's "which items has the user
+/// locked?" question for the whole database in one query. It must return
+/// exactly the `IsLocked = 1` rows — a scan that got back everything would
+/// stop refreshing unlocked items, and one that got back nothing would
+/// trample a locked item's user-owned metadata.
+#[tokio::test]
+async fn locked_item_ids_returns_only_locked_rows() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+
+    let unlocked = Uuid::from_u128(0x2001);
+    let locked_a = Uuid::from_u128(0x2002);
+    let locked_b = Uuid::from_u128(0x2003);
+    let mut rows = vec![
+        item(unlocked, BaseItemKind::Movie, "Open"),
+        item(locked_a, BaseItemKind::Movie, "Pinned"),
+        item(locked_b, BaseItemKind::Series, "Also Pinned"),
+    ];
+    rows[1].is_locked = true;
+    rows[2].is_locked = true;
+    persist.save_items(&rows).await.expect("save");
+
+    let mut got = repository.locked_item_ids().await.expect("locked ids");
+    got.sort();
+    assert_eq!(got, vec![locked_a, locked_b]);
+    assert!(
+        !got.contains(&unlocked),
+        "unlocked rows must not be returned"
+    );
+}
+
+/// An empty answer on a library with nothing locked — the overwhelmingly
+/// common case, and the one the scan pays for on every run.
+#[tokio::test]
+async fn locked_item_ids_is_empty_when_nothing_is_locked() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+
+    persist
+        .save_items(&[item(Uuid::from_u128(0x2010), BaseItemKind::Movie, "Open")])
+        .await
+        .expect("save");
+
+    assert!(
+        repository
+            .locked_item_ids()
+            .await
+            .expect("locked ids")
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn retrieve_rejects_nil_and_misses_absent() {
     let db = fresh_db().await;

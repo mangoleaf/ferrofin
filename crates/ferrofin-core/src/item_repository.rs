@@ -582,6 +582,18 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(row)
     }
 
+    async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let rows: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "IsLocked" = 1"#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
     async fn get_ancestor_chain(
         &self,
         item_id: Uuid,
@@ -1207,6 +1219,36 @@ mod tests {
             .expect("get_items");
         assert_eq!(res.total_record_count, 1);
         assert_eq!(res.items.len(), 1);
+    }
+
+    /// The locked-item read must SEEK the partial index, never scan `BaseItems`.
+    ///
+    /// `run_scan` reads this set once, and it is shared with `scan_paths` —
+    /// the library-monitor path that runs for one or two items on every
+    /// filesystem event. Without `FerrofinIX_BaseItems_IsLocked` (migration
+    /// 0017) the plan is `SCAN BaseItems`: 26-53 ms warm on a 100k-item table,
+    /// paid per watcher event, where the old per-item lookup cost ~1 ms.
+    #[tokio::test]
+    async fn locked_item_ids_seeks_the_partial_index() {
+        let db = test_db().await;
+        let plan: Vec<String> = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            r#"EXPLAIN QUERY PLAN SELECT "Id" FROM "BaseItems" WHERE "IsLocked" = 1"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("explain query plan")
+        .into_iter()
+        .map(|(_, _, _, detail)| detail)
+        .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("FerrofinIX_BaseItems_IsLocked")),
+            "the locked-item read must use the partial index, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.trim() == "SCAN BaseItems"),
+            "the locked-item read must not scan BaseItems, got: {plan:?}"
+        );
     }
 
     /// Two rows sharing a `CleanName` must resolve to the SAME id under both

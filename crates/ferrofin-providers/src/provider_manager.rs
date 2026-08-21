@@ -1800,6 +1800,14 @@ mod tests {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
         }
+        async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|(_, row)| row.is_locked)
+                .map(|(id, _)| *id)
+                .collect())
+        }
         async fn get_ancestor_chain(
             &self,
             _item_id: Uuid,
