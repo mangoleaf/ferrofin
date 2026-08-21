@@ -6260,7 +6260,11 @@ mod tests {
         // Envelope<SeriesExtendedWire>. One fake serves both; the search item
         // carries the id the details call is then made with.
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
-        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB."}}"#;
+        // No overview: `apply_tvdb_series` fills only what is empty, so if the
+        // chain fails to stop, TMDB's fill-if-empty genuinely writes
+        // "From TMDB." here. With an overview already set the assertion below
+        // could not fail for the reason it claims.
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT"}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
         // TMDB answers a series fetch too, with a different overview — so if
         // the chain fails to stop, the row ends up saying "From TMDB."
@@ -6301,9 +6305,8 @@ mod tests {
             result.provider_ids
         );
         assert_eq!(
-            series.overview.as_deref(),
-            Some("From TVDB."),
-            "the TVDB hit must own the row"
+            series.overview, None,
+            "TMDB must not have filled the overview the TVDB hit left empty"
         );
         assert_eq!(
             tmdb_requests.load(std::sync::atomic::Ordering::SeqCst),
