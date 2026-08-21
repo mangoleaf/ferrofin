@@ -60,8 +60,8 @@ pub use similarity::{
 };
 pub use studios::StudiosClient;
 pub use tmdb::{
-    RemoteImage, SeasonImages, SeriesMatch, TmdbClient, TmdbCollection, TmdbCollectionHit,
-    TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
+    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbCollection,
+    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,

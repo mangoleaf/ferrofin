@@ -1318,6 +1318,7 @@ dependencies = [
  "ferrofin-common",
  "ferrofin-model",
  "ferrofin-traits",
+ "ferrofin-util",
  "quick-xml",
  "regex",
  "rstest",

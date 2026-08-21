@@ -156,6 +156,26 @@ pub trait ItemRepository: Send + Sync {
     /// scan reads it from the returned set instead.
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
 
+    /// The stored `Name`/`SortName`/`Overview`/`Path` of every item of `kind`,
+    /// in one query.
+    ///
+    /// The episode metadata providers gate a re-fetch on what a previous scan
+    /// already achieved, which only the stored row knows — `Planned.entity` is
+    /// rebuilt from the filesystem every scan, so its name is always the file
+    /// stem. Asking per item would reinstate exactly the `SELECT *`-per-item
+    /// cost that [`locked_item_ids`](Self::locked_item_ids) was introduced to
+    /// remove, so this is the same shape: one narrow read per scan.
+    ///
+    /// Defaults to empty — a repository that does not implement it simply
+    /// leaves every gate closed, which costs a re-fetch and never wrong data.
+    async fn item_text_rows(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
+        let _ = kind;
+        Ok(Vec::new())
+    }
+
     /// Walks the `ParentId` chain from `item_id` upward in a single query
     /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
     /// the starting item does not exist.

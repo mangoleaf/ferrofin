@@ -219,8 +219,14 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             .map(|i| format!(" -map 0:{i}"))
             .unwrap_or_default();
 
+        // `-v error`, not upstream's `-v quiet`: the only signal a failed
+        // extraction gives is a missing output file, and the caller reports
+        // ffmpeg's stderr tail to explain why. Under `-v quiet` that tail is
+        // always empty — an unreadable input, an unwritable output directory
+        // and a truly frameless offset all render as the same blank message.
+        // `error` adds nothing on the happy path.
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v quiet -vframes 1 -vf {vf} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf} -f image2 \"{output_path}\""
         );
 
         if let Some(offset) = offset_ticks {
@@ -365,8 +371,18 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         } else {
             self.config.temp_dir.clone()
         };
-        std::fs::create_dir_all(&temp_dir)
-            .map_err(|e| MediaEncodingError::process(format!("create temp dir: {e}")))?;
+        // Creating the directory is not enough to know ffmpeg can write into
+        // it: a pre-existing one owned by another user (a container that once
+        // ran as root, then dropped to an unprivileged uid) accepts
+        // `create_dir_all` and refuses every write. ffmpeg would then produce
+        // no file for every chapter of every video, which reads as "this media
+        // has no extractable frame". Name the real problem, once, here.
+        ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
+            MediaEncodingError::process(format!(
+                "frame-extraction temp directory `{}` is not writable: {e}",
+                temp_dir.display()
+            ))
+        })?;
         let output_path = temp_dir
             .join(format!(
                 "ferrofin-extract-{}.jpg",
@@ -694,5 +710,75 @@ mod tests {
             err.to_string().contains("produced no frame"),
             "error names the real failure, got: {err}"
         );
+    }
+
+    // A failed extraction is only ever reported as a missing output file, and
+    // the error carries ffmpeg's stderr tail to say why. Under `-v quiet`
+    // ffmpeg writes nothing to stderr, so an unreadable input, an unwritable
+    // output directory and a genuinely frameless offset all render as the same
+    // blank "(no stderr)" — which is what made a real chapter-image outage
+    // undiagnosable. The verbosity is load-bearing, so pin it.
+    #[test]
+    fn extraction_asks_ffmpeg_for_its_errors() {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/episode.mkv\"",
+            "",
+            None,
+            None,
+            None,
+            None,
+            true,
+            "/tmp/out.jpg",
+            0,
+        );
+        assert!(args.contains("-v error"), "got: {args}");
+        assert!(!args.contains("-v quiet"), "got: {args}");
+    }
+
+    // An extraction temp directory the process cannot write fails every frame
+    // for every video while ffmpeg itself is healthy. Catch it where the path
+    // is known and say so, instead of reporting each video as frameless.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extract_video_image_names_an_unwritable_temp_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().join("temp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let enc = MediaEncoderImpl::new(
+            Arc::new(FrameWritingTranscoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: temp_dir.clone(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let outcome = enc
+            .extract_video_image(
+                "/read-only/media/episode.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await;
+
+        // Root ignores the mode bits; only assert when the probe is meaningful.
+        if std::fs::File::create(temp_dir.join("probe")).is_err() {
+            let err = outcome.expect_err("an unwritable temp dir must fail");
+            let text = err.to_string();
+            assert!(text.contains("not writable"), "got: {text}");
+            assert!(
+                text.contains("temp"),
+                "the error names the path, got: {text}"
+            );
+        }
+
+        std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

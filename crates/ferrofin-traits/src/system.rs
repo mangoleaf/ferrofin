@@ -160,6 +160,20 @@ pub trait ServerApplicationPaths: Send + Sync {
             .to_string_lossy()
             .into_owned()
     }
+
+    /// The scratch directory single-frame extractions write to before the
+    /// result is moved into place (the C# `TempDirectory`). A `temp`
+    /// subdirectory of [`cache_path`](Self::cache_path).
+    ///
+    /// One owner for the layout: the media encoder writes here and the
+    /// chapter-image task pre-flights it, and the two must agree or the
+    /// pre-flight checks a directory nothing uses.
+    fn temp_path(&self) -> String {
+        std::path::Path::new(&self.cache_path())
+            .join("temp")
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 fn _assert_object_safe_server_application_paths(_: &dyn ServerApplicationPaths) {}

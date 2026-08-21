@@ -135,19 +135,9 @@ pub struct SeriesMatch {
     pub images: Vec<RemoteImage>,
 }
 
-/// One season's artwork from `/tv/{id}/season/{n}`: the season poster plus every
-/// episode's still, keyed by episode number.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SeasonImages {
-    /// The season poster URL, if any.
-    pub poster: Option<String>,
-    /// `episode_number` → still image URL.
-    pub episode_stills: std::collections::HashMap<i32, String>,
-}
-
 /// One season's metadata + artwork from `/tv/{id}/season/{n}`: the season's
 /// name/overview/poster and every episode's metadata, in a single request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SeasonDetails {
     /// The season's display name (e.g. "Season 2"), if any.
     pub name: Option<String>,
@@ -160,8 +150,10 @@ pub struct SeasonDetails {
 }
 
 /// One episode's metadata within a [`SeasonDetails`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EpisodeDetails {
+    /// The episode's own TMDB id, for the `Tmdb` provider id on its row.
+    pub tmdb_id: Option<i64>,
     /// The episode number within the season.
     pub episode_number: i32,
     /// The episode title, if any.
@@ -170,6 +162,10 @@ pub struct EpisodeDetails {
     pub overview: Option<String>,
     /// The episode still-frame URL, if any.
     pub still_url: Option<String>,
+    /// The original air date (`YYYY-MM-DD`), if any.
+    pub air_date: Option<String>,
+    /// TMDB's user rating out of 10, if any — the episode's community rating.
+    pub vote_average: Option<f32>,
 }
 
 /// Full title metadata from `/movie|tv/{id}` (the detail-page fields).
@@ -432,6 +428,8 @@ struct SeasonResponse {
 #[derive(Debug, Deserialize)]
 struct SeasonEpisode {
     #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
     episode_number: i32,
     #[serde(default)]
     name: Option<String>,
@@ -439,6 +437,10 @@ struct SeasonEpisode {
     overview: Option<String>,
     #[serde(default)]
     still_path: Option<String>,
+    #[serde(default)]
+    air_date: Option<String>,
+    #[serde(default)]
+    vote_average: Option<f32>,
 }
 
 /// Converts a raw season payload into [`SeasonDetails`], prefixing image paths
@@ -454,10 +456,15 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
             .episodes
             .into_iter()
             .map(|ep| EpisodeDetails {
+                tmdb_id: ep.id,
                 episode_number: ep.episode_number,
                 name: non_empty(ep.name),
                 overview: non_empty(ep.overview),
                 still_url: non_empty(ep.still_path).map(|p| format!("{IMAGE_BASE}{p}")),
+                air_date: non_empty(ep.air_date),
+                // TMDB reports 0 for "nobody has rated this", which is a
+                // missing rating, not a rating of zero.
+                vote_average: ep.vote_average.filter(|v| *v > 0.0),
             })
             .collect(),
     }
@@ -675,7 +682,8 @@ impl TmdbClient {
     /// Matches a TV series by name/year and returns its TMDB id + poster/backdrop.
     ///
     /// Unlike [`images_for`](Self::images_for) this keeps the id so seasons and
-    /// episodes of the same series can be fetched with [`season_images`]. `None`
+    /// episodes of the same series can be fetched with
+    /// [`season_details`](Self::season_details). `None`
     /// on no match or any network/parse error.
     pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
         let mut req = self
@@ -733,23 +741,6 @@ impl TmdbClient {
         }
         let parsed = resp.json::<SeasonResponse>().await.ok()?;
         Some(season_details_from(parsed))
-    }
-
-    /// Fetches one season's artwork (`/tv/{id}/season/{n}`): the season poster and
-    /// every episode's still. A projection of [`season_details`](Self::season_details)
-    /// (same request); empty on any failure.
-    pub async fn season_images(&self, tmdb_id: i64, season_number: i32) -> SeasonImages {
-        let Some(details) = self.season_details(tmdb_id, season_number).await else {
-            return SeasonImages::default();
-        };
-        SeasonImages {
-            poster: details.poster,
-            episode_stills: details
-                .episodes
-                .into_iter()
-                .filter_map(|ep| ep.still_url.map(|url| (ep.episode_number, url)))
-                .collect(),
-        }
     }
 
     /// Searches TMDB's collections by name (`/search/collection`) — port of
@@ -961,33 +952,33 @@ impl TmdbClient {
     /// Port of `TmdbEpisodeProvider`'s credits handling: the episode's own
     /// `cast` (the regulars credited in THIS episode, in billing order), then
     /// its `guest_stars` (typed `GuestStar`), then the wanted `crew` — which is
-    /// what fills an episode page's Cast & Crew upstream. Empty on any
-    /// network/parse error, so the caller can fall back.
+    /// what fills an episode page's Cast & Crew upstream.
+    ///
+    /// `None` on any network/HTTP/parse failure, distinct from `Some(vec![])`
+    /// for an episode TMDB genuinely credits nobody on. The caller persists
+    /// credits by replacement, so conflating the two lets one 429 during a
+    /// large scan delete an episode's stored cast.
     pub async fn episode_credits(
         &self,
         series_tmdb_id: i64,
         season: i32,
         episode: i32,
-    ) -> Vec<TmdbPerson> {
+    ) -> Option<Vec<TmdbPerson>> {
         let url = format!(
             "{}/tv/{series_tmdb_id}/season/{season}/episode/{episode}/credits",
             self.base_url
         );
-        let Ok(resp) = self
+        let resp = self
             .http
             .get(url)
             .query(&[("api_key", self.api_key.expose_secret())])
             .send()
             .await
-        else {
-            return Vec::new();
-        };
+            .ok()?;
         if !resp.status().is_success() {
-            return Vec::new();
+            return None;
         }
-        let Ok(credits) = resp.json::<CreditsResponse>().await else {
-            return Vec::new();
-        };
+        let credits = resp.json::<CreditsResponse>().await.ok()?;
         let mut people = Vec::new();
         let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
             for (order, c) in entries.into_iter().enumerate() {
@@ -1028,7 +1019,7 @@ impl TmdbClient {
                     .map(|p| format!("{IMAGE_BASE}{p}")),
             });
         }
-        people
+        Some(people)
     }
 
     /// Fetches full metadata for a title (overview, tagline, genres, studios,
@@ -1322,7 +1313,10 @@ mod tests {
         let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
 
-        let people = client.episode_credits(1399, 1, 1).await;
+        let people = client
+            .episode_credits(1399, 1, 1)
+            .await
+            .expect("credits fetched");
         let rows: Vec<(&str, &str, Option<&str>)> = people
             .iter()
             .map(|p| (p.name.as_str(), p.person_type.as_str(), p.role.as_deref()))
@@ -1442,18 +1436,5 @@ mod tests {
         assert_eq!(ep2.name, None);
         assert_eq!(ep2.overview, None);
         assert_eq!(ep2.still_url, None);
-
-        // The `SeasonImages` projection keeps the poster + stills-by-number shape.
-        let images = SeasonImages {
-            poster: details.poster.clone(),
-            episode_stills: details
-                .episodes
-                .iter()
-                .filter_map(|ep| ep.still_url.clone().map(|url| (ep.episode_number, url)))
-                .collect(),
-        };
-        assert_eq!(images.poster, details.poster);
-        assert_eq!(images.episode_stills.len(), 1);
-        assert!(images.episode_stills.contains_key(&1));
     }
 }

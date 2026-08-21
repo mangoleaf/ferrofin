@@ -594,6 +594,23 @@ impl ItemRepository for FerrofinItemRepository {
             .collect())
     }
 
+    async fn item_text_rows(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
+        let Some(type_name) = crate::item_type_lookup::stored_type_name(kind) else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as::<_, ferrofin_db::entities::base_items::ItemTextRow>(
+            r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
+               FROM "BaseItems" WHERE "Type" = ?1"#,
+        )
+        .bind(type_name)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     async fn get_ancestor_chain(
         &self,
         item_id: Uuid,
