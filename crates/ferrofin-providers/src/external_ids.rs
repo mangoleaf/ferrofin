@@ -112,6 +112,20 @@ impl<'a> ExternalIdItem<'a> {
     }
 }
 
+/// Orders two provider names the way .NET's default string comparer does.
+///
+/// `OrderBy(i => i.Name)` uses `Comparer<string>.Default`, a culture-aware
+/// comparison whose primary weight ignores case; a raw byte comparison would
+/// put every capital ahead of every lowercase letter and reorder names like
+/// "TMDB" against "TheAudioDb Artist". Case is the tie-break, so the order
+/// stays total.
+fn compare_provider_names(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
 /// Pushes `name` → `url` onto `out`.
 fn push(out: &mut Vec<ExternalUrl>, name: &str, url: String) {
     out.push(ExternalUrl {
@@ -143,7 +157,10 @@ pub fn external_urls(item: &ExternalIdItem<'_>) -> Vec<ExternalUrl> {
     audiodb_urls(item, &mut out);
     book_urls(item, &mut out);
     // Stable, so several links from one provider keep their emitted order.
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Case-INSENSITIVE: `OrderBy` uses .NET's culture-aware string comparer,
+    // whose primary weight ignores case, so "TheAudioDb Artist" precedes
+    // "TMDB" there while a byte comparison would reverse them.
+    out.sort_by(|a, b| compare_provider_names(a.name.as_deref(), b.name.as_deref()));
     out
 }
 
@@ -502,8 +519,9 @@ pub fn external_id_infos(kind: BaseItemKind) -> Vec<ExternalIdInfo> {
         .collect();
     // `ProviderManager` stores `externalIds.OrderBy(i => i.ProviderName)`, so
     // the Identify dialog's field order is alphabetical, not registration
-    // order.
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    // order — and alphabetical the way .NET orders it (see
+    // [`compare_provider_names`]).
+    out.sort_by(|a, b| compare_provider_names(a.name.as_deref(), b.name.as_deref()));
     out
 }
 
@@ -527,7 +545,9 @@ mod tests {
                 .filter_map(|info| info.name)
                 .collect();
             let mut sorted = names.clone();
-            sorted.sort();
+            // Case-insensitive, as .NET's default comparer orders — a plain
+            // byte sort would put "TMDB" ahead of "TheAudioDb Artist".
+            sorted.sort_by_key(|name| name.to_lowercase());
             assert_eq!(names, sorted, "{kind:?} ids are not name-ordered");
         }
         // And the order really is different from registration order for at
