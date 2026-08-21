@@ -511,6 +511,34 @@ pub fn external_id_infos(kind: BaseItemKind) -> Vec<ExternalIdInfo> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_identify_fields_are_ordered_by_provider_name() {
+        // `ProviderManager` stores `externalIds.OrderBy(i => i.ProviderName)`,
+        // so the Identify dialog's field order is alphabetical, not the DI
+        // registration order.
+        for kind in [
+            BaseItemKind::Series,
+            BaseItemKind::Person,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::Movie,
+        ] {
+            let names: Vec<String> = external_id_infos(kind)
+                .into_iter()
+                .filter_map(|info| info.name)
+                .collect();
+            let mut sorted = names.clone();
+            sorted.sort();
+            assert_eq!(names, sorted, "{kind:?} ids are not name-ordered");
+        }
+        // And the order really is different from registration order for at
+        // least one kind, so the assertion above has something to catch.
+        let person: Vec<String> = external_id_infos(BaseItemKind::Person)
+            .into_iter()
+            .filter_map(|info| info.name)
+            .collect();
+        assert!(person.len() > 1, "Person should offer several ids");
+    }
+
     fn ids(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
             .iter()

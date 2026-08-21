@@ -252,3 +252,21 @@ impl NfoBaseItem {
         set_provider_id(&mut self.provider_ids, name, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::NfoItemKind;
+
+    #[test]
+    fn an_episode_is_a_video_but_a_series_is_not() {
+        // `Episode : Video` in the C# hierarchy, so an episode reads the
+        // `<fileinfo>` video fields and is saved without an `<outline>`.
+        // `Series`/`Season` are folders.
+        assert!(NfoItemKind::Episode.is_video());
+        assert!(NfoItemKind::Movie.is_video());
+        assert!(NfoItemKind::MusicVideo.is_video());
+        assert!(!NfoItemKind::Series.is_video());
+        assert!(!NfoItemKind::Season.is_video());
+        assert!(!NfoItemKind::MusicAlbum.is_video());
+    }
+}

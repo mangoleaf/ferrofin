@@ -95,6 +95,10 @@ struct Prefetched {
     /// or the `ExternalUrls` field is requested — the "Links" row is built from
     /// the same ids, so one batch read serves both).
     provider_ids: HashMap<Uuid, HashMap<String, String>>,
+    /// `DisplayOrder` per *series* id, for the seasons/episodes on the page:
+    /// TMDB emits a season/episode link only for a series in aired order, and
+    /// the value lives in the SERIES' `Data` blob, not the child's.
+    series_display_order: HashMap<Uuid, String>,
     /// Album name per *PhotoAlbum* id, for the photos on the page: a photo's
     /// `Album`/`AlbumId` come from its parent album (C# `Photo.AlbumEntity`),
     /// and one batch read serves the whole page.
@@ -1158,18 +1162,16 @@ impl FerrofinDtoService {
                 .as_deref()
                 .and_then(|id| Uuid::parse_str(id).ok())
                 .and_then(|id| prefetched.series_provider_ids.get(&id));
-            // A Series' DisplayOrder lives in the `Data` blob, not a column.
-            // TMDB's season/episode links are suppressed for a series ordered
-            // by anything but aired order, so the value has to be read here or
-            // the link is emitted where Jellyfin emits none.
-            let display_order = (kind == BaseItemKind::Series)
-                .then(|| {
-                    crate::item_data::read_data_string(
-                        &crate::item_data::parse_data(item.data.as_deref()),
-                        "DisplayOrder",
-                    )
-                })
-                .flatten();
+            // C# reads `season.Series.DisplayOrder` / `episode.Series.DisplayOrder`
+            // — the OWNING SERIES' value, out of its `Data` blob. Reading the
+            // season's or episode's own blob would always find nothing, and
+            // gating on `kind == Series` would never fire, because only a
+            // Season/Episode link consults it at all.
+            let display_order = item
+                .series_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .and_then(|id| prefetched.series_display_order.get(&id));
             dto.external_urls = Some(ferrofin_providers::external_urls(
                 &ferrofin_providers::ExternalIdItem {
                     kind,
@@ -1179,7 +1181,7 @@ impl FerrofinDtoService {
                         .parent_index_number
                         .and_then(|n| i32::try_from(n).ok()),
                     series_provider_ids: series_ids,
-                    series_display_order: display_order.as_deref(),
+                    series_display_order: display_order.map(String::as_str),
                     musicbrainz_server: &self.musicbrainz_server,
                 },
             ));
@@ -1503,6 +1505,38 @@ impl FerrofinDtoService {
                 if let Ok(id) = Uuid::parse_str(&item_id) {
                     map.entry(id).or_default().insert(key, value);
                 }
+            }
+        }
+        Ok(map)
+    }
+
+    /// The `DisplayOrder` of each of `series_ids` that declares one.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn load_series_display_order(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, ServiceError> {
+        let mut map: HashMap<Uuid, String> = HashMap::new();
+        if series_ids.is_empty() {
+            return Ok(map);
+        }
+        let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
+        for (item_id, data) in self
+            .db
+            .item_data_blobs(&stored)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            if let Ok(id) = Uuid::parse_str(&item_id)
+                && let Some(order) = crate::item_data::read_data_string(
+                    &crate::item_data::parse_data(Some(&data)),
+                    "DisplayOrder",
+                )
+            {
+                map.insert(id, order);
             }
         }
         Ok(map)
@@ -1943,6 +1977,7 @@ impl FerrofinDtoService {
         // A season/episode's links come from its series' ids, so collect the
         // distinct series on the page and read their ids in the same batched
         // way (one extra query for a page of episodes, none otherwise).
+        let mut series_display_order: HashMap<Uuid, String> = HashMap::new();
         let series_provider_ids = if want_external_urls {
             let mut series_ids: Vec<Uuid> = items
                 .iter()
@@ -1952,6 +1987,7 @@ impl FerrofinDtoService {
                 .collect();
             series_ids.sort_unstable();
             series_ids.dedup();
+            series_display_order = self.load_series_display_order(&series_ids).await?;
             self.load_provider_ids_batch(&series_ids).await?
         } else {
             HashMap::new()
@@ -2206,6 +2242,7 @@ impl FerrofinDtoService {
             user_data,
             media_streams,
             provider_ids,
+            series_display_order,
             photo_album_names,
             series_provider_ids,
             people,

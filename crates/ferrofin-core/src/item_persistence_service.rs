@@ -239,6 +239,29 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn provider_ids_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+        let mut map: std::collections::HashMap<Uuid, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        if item_ids.is_empty() {
+            return Ok(map);
+        }
+        let stored: Vec<String> = item_ids.iter().copied().map(guid_to_db).collect();
+        for (item_id, key, value) in self
+            .db
+            .provider_ids_for_items(&stored)
+            .await
+            .map_err(ServiceError::from)?
+        {
+            if let Ok(id) = Uuid::parse_str(&item_id) {
+                map.entry(id).or_default().push((key, value));
+            }
+        }
+        Ok(map)
+    }
+
     async fn save_provider_id(
         &self,
         item_id: Uuid,

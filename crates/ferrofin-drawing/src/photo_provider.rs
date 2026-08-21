@@ -361,15 +361,25 @@ pub struct ExifTags {
     pub height: Option<i32>,
 }
 
-/// Reads `path`'s EXIF tags, or `None` when the file cannot be opened or holds
-/// no EXIF. Port of the C# `TagLib.File.Create` + `catch (Exception)` block.
+/// Reads `path`'s EXIF tags, or `None` when the file cannot be OPENED.
+///
+/// Port of the C# `TagLib.File.Create` + `catch (Exception)` block, and the
+/// distinction matters: TagLib opens an image with no EXIF quite happily and
+/// hands back an `ImageTag` whose fields are all null, which upstream then
+/// assigns — clearing the item's camera/GPS/comment. Only a genuine failure
+/// (an unreadable or unsupported file) throws and leaves the item alone.
+///
+/// So a missing or malformed EXIF block yields DEFAULT tags — the clearing
+/// case — while an IO error yields `None`, the leave-alone case.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
-    // A read failure is not worth failing a refresh over: most photos in a
-    // library carry no EXIF at all, which is exactly this error.
-    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
-    Some(tags_from(&exif))
+    Some(
+        exif::Reader::new()
+            .read_from_container(&mut reader)
+            .as_ref()
+            .map_or_else(|_| ExifTags::default(), tags_from),
+    )
 }
 
 /// Projects an [`exif::Exif`] onto [`ExifTags`]. Pure — the seam the mapping

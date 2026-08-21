@@ -242,6 +242,65 @@ impl Database {
         Ok(rows)
     }
 
+    /// Every `(item id, provider key, provider value)` recorded for `ids`, with
+    /// each id in its stored (uppercase, hyphenated) GUID form.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn provider_ids_for_items(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut out = Vec::new();
+        for chunk in ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" IN ({placeholders})"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
+    /// The `Data` blob of each of `ids` that has one, keyed by the id in its
+    /// stored (uppercase, hyphenated) GUID form.
+    ///
+    /// A season's or episode's TMDB link depends on its SERIES' `DisplayOrder`,
+    /// which lives in that blob rather than a column, so a page of episodes
+    /// reads the owning series' blobs in one query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "Data" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// Names the `PhotoAlbum` rows among `ids`, keyed by the id in its stored
     /// (uppercase, hyphenated) GUID form.
     ///

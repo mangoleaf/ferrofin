@@ -1,17 +1,21 @@
 //! Book and comic local metadata — port of `MediaBrowser.Providers/Books`.
 //!
-//! Four readers, tried in the order `ComicProvider` tries them, plus the two
-//! cover extractors:
+//! Four readers, tried in `ComicProvider`'s DI registration order — the first
+//! with metadata wins — plus the two cover extractors:
 //!
-//! | Source | C# | What it reads |
-//! |---|---|---|
-//! | `ComicInfo.xml` inside a `.cbz` | `InternalComicInfoProvider` | the ComicRack schema |
-//! | `ComicInfo.xml` beside the file | `ExternalComicInfoProvider` | the same schema, as a sidecar |
-//! | the `.cbz` archive comment | `ComicBookInfoProvider` | the ComicBookInfo JSON schema |
-//! | `.opf` (standalone or inside a `.epub`) | `OpfProvider`/`EpubProvider` | Dublin Core + Calibre |
+//! | Order | Source | C# | What it reads |
+//! |---|---|---|---|
+//! | 1 | the `.cbz` archive comment | `ComicBookInfoProvider` | the ComicBookInfo JSON schema |
+//! | 2 | `<stem>.xml`, else `ComicInfo.xml`, beside the file | `ExternalComicInfoProvider` | the ComicRack schema, as a sidecar |
+//! | 3 | `ComicInfo.xml` inside a `.cbz` | `InternalComicInfoProvider` | the same schema, bundled |
+//! | 4 | `<stem>.opf`, `content.opf`, `metadata.opf`, or the one inside a `.epub` | `OpfProvider`/`EpubProvider` | Dublin Core + Calibre |
 //!
-//! Covers come from the first image in a comic archive
-//! (`ComicImageProvider`) or the EPUB's declared cover (`EpubImageProvider`).
+//! `OpfProvider` is unfiltered, so step 4 runs for a comic too — a `.cbz` in a
+//! Calibre directory resolves through it.
+//!
+//! Covers come from an explicitly named `cover.<ext>` in a comic archive, else
+//! its first page in name order (`ComicImageProvider`), or the EPUB's declared
+//! cover (`EpubImageProvider`).
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -137,7 +141,9 @@ pub fn read_book_metadata(path: &str) -> Option<BookMetadata> {
         {
             return Some(book);
         }
-        return None;
+        // `OpfProvider` is an unfiltered `ILocalMetadataProvider<Book>`, so it
+        // runs for a comic too: a `.cbz` in a Calibre directory still resolves
+        // through the sidecar chain below.
     }
     // A plain book file may still have an `.opf` sidecar. C# `GetXmlFile`
     // probes `<stem>.opf` (most specific), then `content.opf`, then Calibre's
@@ -813,6 +819,9 @@ fn read_capped_to(
         );
         return None;
     }
+    // The capacity hint is bounded by the cap as well as by the declared size,
+    // so a lying header cannot make this allocate more than one capped read
+    // could ever fill.
     let hint = usize::try_from(entry.size().min(cap)).unwrap_or_default();
     let mut bytes = Vec::with_capacity(hint);
     // One byte past the cap is enough to tell "at the limit" from "over it".
@@ -1360,12 +1369,40 @@ mod tests {
         // An honest header well over the cap: refused before any read.
         assert_eq!(read(16), None);
         assert_eq!(read(8192), Some(4096));
-        assert_eq!(
-            read(4095),
-            None,
-            "content one byte past the cap must be refused"
-        );
         assert_eq!(read(4096), Some(4096), "content exactly at the cap is fine");
+
+        // The case that actually exercises the READ-side cap: a header that
+        // lies. `size()` claims 8 bytes so the early-out lets it through, but
+        // the entry inflates to 4096. Patch both the local-file-header and the
+        // central-directory uncompressed-size fields, which is exactly what a
+        // zip bomb does.
+        let mut raw = std::fs::read(&path).expect("read archive bytes");
+        let lie = 8u32.to_le_bytes();
+        // Local file header: PK\x03\x04, uncompressed size at +22.
+        let local = raw
+            .windows(4)
+            .position(|w| w == b"PK\x03\x04")
+            .expect("local header");
+        raw[local + 22..local + 26].copy_from_slice(&lie);
+        // Central directory: PK\x01\x02, uncompressed size at +24.
+        let central = raw
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central header");
+        raw[central + 24..central + 28].copy_from_slice(&lie);
+        let bomb = dir.path().join("lying.cbz");
+        std::fs::write(&bomb, &raw).expect("write patched archive");
+
+        let file = std::fs::File::open(&bomb).expect("open");
+        let mut archive =
+            zip::ZipArchive::new(std::io::BufReader::new(file)).expect("read archive");
+        let mut entry = archive.by_name("page.jpg").expect("entry");
+        assert_eq!(entry.size(), 8, "the header must be the one that lies");
+        assert_eq!(
+            super::read_capped_to(&mut entry, 64),
+            None,
+            "a lying header must not let 4096 bytes past a 64-byte cap"
+        );
     }
 
     #[test]

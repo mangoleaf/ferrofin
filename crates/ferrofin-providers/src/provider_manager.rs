@@ -249,14 +249,25 @@ impl RemoteSearchProvider for OmdbSearchProvider {
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         // An id already on the item resolves it exactly; only a nameless item
         // with no id has nothing to search on at all.
+        // Season/Episode narrow the query ONLY for an episode search; on a
+        // movie or series they would ask OMDb for a record that does not
+        // exist. Note that an episode search additionally needs the SERIES'
+        // IMDb id (C# reads `SeriesProviderIds`, not the episode's own, because
+        // OMDb keys a season listing by the series) — `ItemLookupInfo` carries
+        // no such field and no `OmdbKind::Episode` provider is registered, so
+        // that branch is unreachable until both exist.
+        let is_episode = self.kind == crate::OmdbKind::Episode;
         let known = crate::OmdbSearchKey {
             imdb_id: search_info
                 .provider_ids
                 .as_ref()
                 .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
-                .map(|(_, value)| value.as_str()),
-            season: search_info.parent_index_number,
-            episode: search_info.index_number,
+                .map(|(_, value)| value.as_str())
+                .filter(|_| !is_episode),
+            season: is_episode
+                .then_some(search_info.parent_index_number)
+                .flatten(),
+            episode: is_episode.then_some(search_info.index_number).flatten(),
         };
         let name = search_info.name.as_deref().unwrap_or_default();
         if name.is_empty() && known.imdb_id.is_none() {

@@ -187,7 +187,8 @@ pub fn write_playlist_file(path: &str, entries: &[PlaylistEntry]) -> String {
             for (index, (entry, rel)) in rows.iter().enumerate() {
                 let n = index + 1;
                 let _ = writeln!(out, "File{n}={rel}");
-                if let Some(title) = display_title(entry) {
+                let title = display_title(entry);
+                if !title.is_empty() {
                     let _ = writeln!(out, "Title{n}={title}");
                 }
                 if let Some(seconds) = entry.duration_seconds {
@@ -207,11 +208,16 @@ pub fn write_playlist_file(path: &str, entries: &[PlaylistEntry]) -> String {
             let mut out = format!("{header}\n<smil>\n  <body>\n    <seq>\n");
             for (entry, rel) in &rows {
                 let _ = write!(out, "      <media src=\"{}\"", escape(rel));
+                let duration = entry
+                    .duration_seconds
+                    .map(|seconds| seconds.saturating_mul(1000).to_string());
                 for (attribute, value) in [
                     ("albumTitle", entry.album.as_deref()),
                     ("albumArtist", entry.album_artist.as_deref()),
                     ("trackArtist", entry.artist.as_deref()),
                     ("trackTitle", entry.title.as_deref()),
+                    // `Wpl`/`ZplContent` write the duration in milliseconds.
+                    ("duration", duration.as_deref()),
                 ] {
                     if let Some(value) = value.filter(|v| !v.is_empty()) {
                         let _ = write!(out, " {attribute}=\"{}\"", escape(value));
@@ -232,15 +238,16 @@ pub fn write_playlist_file(path: &str, entries: &[PlaylistEntry]) -> String {
                 if let Some(artist) = entry.album_artist.as_deref().filter(|a| !a.is_empty()) {
                     let _ = writeln!(out, "#EXTART:{artist}");
                 }
-                if let Some(title) = display_title(entry) {
-                    // `#EXTINF:<seconds>,<title>` — PlaylistsNET writes -1 for
-                    // an unknown duration.
-                    let _ = writeln!(
-                        out,
-                        "#EXTINF:{},{title}",
-                        entry.duration_seconds.unwrap_or(-1)
-                    );
-                }
+                // `#EXTINF:<seconds>,<title>`. PlaylistsNET writes the line for
+                // every entry of an extended playlist, with
+                // `(int)TimeSpan.Zero.TotalSeconds` — i.e. 0 — when the item
+                // reported no runtime.
+                let _ = writeln!(
+                    out,
+                    "#EXTINF:{},{}",
+                    entry.duration_seconds.unwrap_or(0),
+                    display_title(entry)
+                );
                 out.push_str(rel);
                 out.push('\n');
             }
@@ -249,20 +256,13 @@ pub fn write_playlist_file(path: &str, entries: &[PlaylistEntry]) -> String {
     }
 }
 
-/// The `Artist - Title` an extended playlist labels an entry with, or just the
-/// title when there is no artist. `None` when the entry has neither.
-fn display_title(entry: &PlaylistEntry) -> Option<String> {
-    let title = entry.title.as_deref().filter(|t| !t.is_empty());
-    let artist = entry
-        .artist
-        .as_deref()
-        .or(entry.album_artist.as_deref())
-        .filter(|a| !a.is_empty());
-    match (artist, title) {
-        (Some(artist), Some(title)) => Some(format!("{artist} - {title}")),
-        (None, Some(title)) => Some(title.to_owned()),
-        _ => None,
-    }
+/// The label an extended playlist gives an entry.
+///
+/// `PlaylistManager` sets `Title = child.Name` and PlaylistsNET writes it
+/// verbatim — deriving an `Artist - Title` here would mislabel every line
+/// against what Jellyfin wrote.
+fn display_title(entry: &PlaylistEntry) -> &str {
+    entry.title.as_deref().unwrap_or_default()
 }
 
 /// Escapes the five XML entities.
@@ -469,7 +469,8 @@ mod tests {
         );
         assert!(written.contains("NumberOfEntries=1"));
         assert!(written.contains("File1=a.flac"), "{written}");
-        assert!(written.contains("Title1=Radiohead - Airbag"), "{written}");
+        // `Title = child.Name`, verbatim — no composed "Artist - Title".
+        assert!(written.contains("Title1=Airbag"), "{written}");
         assert!(written.contains("Length1=284"), "{written}");
     }
 
@@ -491,13 +492,11 @@ mod tests {
         );
         assert!(written.contains("#EXTALB:OK Computer"), "{written}");
         assert!(written.contains("#EXTART:Radiohead"), "{written}");
-        assert!(
-            written.contains("#EXTINF:284,Radiohead - Airbag"),
-            "{written}"
-        );
-        // An entry with no tags at all still writes just its path.
+        assert!(written.contains("#EXTINF:284,Airbag"), "{written}");
+        // An entry with no tags still gets its #EXTINF line, with the zero
+        // duration PlaylistsNET writes for an unknown runtime.
         let bare = write_playlist_file("/m/l.m3u", &[PlaylistEntry::new("/m/a.flac")]);
-        assert_eq!(bare, "#EXTM3U\na.flac\n");
+        assert_eq!(bare, "#EXTM3U\n#EXTINF:0,\na.flac\n");
     }
 
     #[test]
