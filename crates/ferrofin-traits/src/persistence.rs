@@ -170,6 +170,29 @@ pub trait ItemRepository: Send + Sync {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Returns `(Id, CleanName)` for every row matching the query, in the same
+    /// order — and under the same predicates, ordering and paging — as
+    /// [`Self::get_item_list`].
+    ///
+    /// The by-name resolvers ([`crate::library::LibraryManager::get_named_item_ids`])
+    /// join a page's names against `CleanName` and then read nothing but the id,
+    /// so materializing a full item row per name is pure waste: on a cast-heavy
+    /// page that is hundreds of 72-column rows decoded and dropped. The default
+    /// delegates to [`Self::get_item_list`], so every implementation keeps
+    /// working; the concrete repository overrides it with a two-column
+    /// projection over the identical query.
+    async fn get_item_id_clean_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        Ok(self
+            .get_item_list(filter)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.clean_name))
+            .collect())
+    }
+
     /// Returns the latest item rows for the given collection type (Latest API).
     async fn get_latest_item_list(
         &self,

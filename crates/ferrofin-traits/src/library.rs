@@ -480,6 +480,28 @@ pub trait LibraryManager: Send + Sync {
         Ok(out)
     }
 
+    /// Id-only form of [`Self::get_named_items`]: resolves each of `names` to
+    /// the id of its by-name item row of `kind`, one slot per input name in
+    /// order (`None` where no row resolves).
+    ///
+    /// The DTO prefetch resolves a whole page's cast through this and reads
+    /// nothing but the id, so the concrete manager overrides it with a
+    /// two-column projection rather than materializing a full item row per
+    /// credited name. The default delegates to [`Self::get_named_items`], so
+    /// every implementation gets it for free with identical results.
+    async fn get_named_item_ids(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(self
+            .get_named_items(kind, names)
+            .await?
+            .into_iter()
+            .map(|row| row.and_then(|r| Uuid::parse_str(&r.id).ok()))
+            .collect())
+    }
+
     /// Gets the library's production years, resolved to their by-name `Year`
     /// item rows, sorted ascending and paged by `start_index`/`limit`.
     ///

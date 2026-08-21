@@ -318,6 +318,49 @@ impl LibraryManager for FerrofinLibraryManager {
             .collect())
     }
 
+    async fn get_named_item_ids(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        // Same resolution as `get_named_items` — same predicates, same ordering,
+        // same first-match-wins — over a two-column projection, because the
+        // caller wants the id and nothing else. On a cast-heavy page this is the
+        // difference between decoding one 72-column row per credited name and
+        // decoding two columns.
+        let trimmed: Vec<String> = names.iter().map(|n| n.trim().to_owned()).collect();
+        let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
+        if lookup.is_empty() {
+            return Ok(vec![None; names.len()]);
+        }
+        let rows = self
+            .items
+            .get_item_id_clean_names(&InternalItemsQuery {
+                names: lookup,
+                include_item_types: vec![kind],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let mut by_clean: HashMap<String, String> = HashMap::new();
+        for (id, clean) in rows {
+            if let Some(clean) = clean {
+                by_clean.entry(clean).or_insert(id);
+            }
+        }
+        Ok(trimmed
+            .into_iter()
+            .map(|n| {
+                if n.is_empty() {
+                    None
+                } else {
+                    by_clean
+                        .get(&crate::text_util::get_clean_value(&n))
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                }
+            })
+            .collect())
+    }
+
     async fn get_latest_item_list(
         &self,
         query: &InternalItemsQuery,
@@ -1131,6 +1174,118 @@ mod tests {
                 .await
                 .expect("empty")
                 .is_empty()
+        );
+    }
+
+    /// Two rows of the SAME kind sharing a `CleanName` must resolve to the same
+    /// id every time — the resolver keeps the FIRST match.
+    ///
+    /// Person rows have `SortName IS NULL`, so the resolver's bare
+    /// `ORDER BY SortName` is a total tie among duplicates and the row order is
+    /// whatever the sorter emits. Keeping the first match is what makes the
+    /// answer stable and makes it agree with `get_named_items`. Flipping
+    /// `or_insert` to `insert` (last-match-wins) passed all 4,221 other tests.
+    #[tokio::test]
+    async fn duplicate_names_of_one_kind_resolve_to_the_first_match() {
+        let db = test_db().await;
+        for n in [0x230u128, 0x231, 0x232] {
+            let id = Uuid::from_u128(n);
+            seed_named_item(&db, id, BaseItemKind::Person, "Jane Doe").await;
+            set_clean_name(&db, id, "Jane Doe").await;
+        }
+        let mgr = manager(&db);
+
+        let first = mgr
+            .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .await
+            .expect("ids");
+        assert_eq!(first.len(), 1, "one name in, one slot out");
+        let resolved = first[0].expect("the name resolves");
+
+        // It must be the same id the row-returning resolver picks...
+        let rows = mgr
+            .get_named_items(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .await
+            .expect("rows");
+        assert_eq!(
+            rows[0].as_ref().map(|r| r.id.clone()),
+            Some(ferrofin_db::store::guid_to_db(resolved)),
+            "the id-only and row-returning resolvers must agree on the duplicate"
+        );
+
+        // ...and it must not drift between calls.
+        for round in 0..5 {
+            let again = mgr
+                .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+                .await
+                .expect("ids");
+            assert_eq!(
+                again[0].as_ref(),
+                Some(&resolved),
+                "round {round}: the resolved id must be stable across calls"
+            );
+        }
+    }
+
+    // The id-only twin of the batch resolver: the DTO prefetch resolves a page's
+    // whole cast through it and reads nothing but the id, so it must agree with
+    // `get_named_items` slot for slot — same order, same wrong-kind exclusion,
+    // same `None` for an unresolved name, same blank-name handling — while
+    // never materializing a row.
+    #[tokio::test]
+    async fn get_named_item_ids_matches_get_named_items_slot_for_slot() {
+        let db = test_db().await;
+        // The same-name row of a WRONG kind is seeded first, so it would win the
+        // first-match-wins lookup if the kind filter were ever dropped.
+        let studio = Uuid::from_u128(0x220);
+        seed_named_item(&db, studio, BaseItemKind::Studio, "Drama").await;
+        set_clean_name(&db, studio, "Drama").await;
+        let scifi = Uuid::from_u128(0x221);
+        let drama = Uuid::from_u128(0x222);
+        seed_named_item(&db, scifi, BaseItemKind::Genre, "Science Fiction").await;
+        set_clean_name(&db, scifi, "Science Fiction").await;
+        seed_named_item(&db, drama, BaseItemKind::Genre, "Drama").await;
+        set_clean_name(&db, drama, "Drama").await;
+        let mgr = manager(&db);
+
+        // Untrimmed, blank and differently-cased names exercise the same
+        // normalization both paths apply before the CleanName join.
+        let names = vec![
+            "  Drama ".to_owned(),
+            "Nope".to_owned(),
+            "   ".to_owned(),
+            "science fiction".to_owned(),
+        ];
+        let ids = mgr
+            .get_named_item_ids(BaseItemKind::Genre, &names)
+            .await
+            .expect("id lookup");
+        assert_eq!(ids, vec![Some(drama), None, None, Some(scifi)]);
+
+        // And it agrees with the row-returning form it replaces.
+        let rows = mgr
+            .get_named_items(BaseItemKind::Genre, &names)
+            .await
+            .expect("row lookup");
+        let from_rows: Vec<Option<Uuid>> = rows
+            .into_iter()
+            .map(|r| r.and_then(|e| Uuid::parse_str(&e.id).ok()))
+            .collect();
+        assert_eq!(ids, from_rows);
+
+        // Empty input yields an empty result without a query; a blank name is a
+        // slot that resolves to nothing rather than a dropped slot.
+        assert!(
+            mgr.get_named_item_ids(BaseItemKind::Genre, &[])
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert_eq!(
+            mgr.get_named_item_ids(BaseItemKind::Genre, &[String::new(), " ".to_owned()])
+                .await
+                .expect("blank"),
+            vec![None, None]
         );
     }
 
