@@ -1,19 +1,14 @@
 //! The [`ProviderManager`] trait implementation — port of the
 //! `MediaBrowser.Providers.Manager.ProviderManager` surface.
 //!
-//! Scope note (First-Light): the full C# `ProviderManager` couples the metadata
-//! *refresh orchestration* to the library item store, the image-saving pipeline,
-//! and the (deferred, feature-gated) remote provider plugins — none of which are
-//! available in this wave. The high-value, test-backed deliverable in this crate
-//! is the XbmcMetadata NFO parser subsystem ([`crate::xbmc`]).
-//!
-//! This type therefore implements the [`ferrofin_traits::providers::ProviderManager`]
-//! trait as a thin, dependency-free shell: read-only descriptor queries return
-//! empty/default results, and the operations that require the (not-yet-ported)
-//! library store or network I/O return [`ServiceError::Backend`] describing the
-//! deferral rather than silently succeeding. The external-id descriptor set —
-//! which the NFO parsers consume — is fully wired.
+//! Scope note: the C# `ProviderManager` couples metadata *refresh orchestration*
+//! to the library item store and the image-saving pipeline. Ferrofin splits that
+//! — the scan/refresh pipeline lives in `ferrofin-core`'s library scanner, and
+//! this type carries the client-facing surface: remote search ("Identify"),
+//! remote images ("Choose Image"), the external-id descriptor set, and the
+//! external-URL ("Links") table.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,12 +19,12 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::net::mime_types;
 use ferrofin_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo,
-    RemoteImageQuery, RemoteSearchResult,
+    ExternalIdInfo, ImageProviderInfo, ItemLookupInfo, RemoteImageInfo, RemoteImageQuery,
+    RemoteSearchResult,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ItemTypeLookup};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
     RemoteSearchRequest,
@@ -155,6 +150,122 @@ impl RemoteSearchProvider for TvdbSearchProvider {
     }
 }
 
+/// A [`RemoteSearchProvider`] over TMDB's *collections* — the "Identify" flow
+/// for a box set. Port of `TmdbBoxSetProvider.GetSearchResults`.
+pub struct TmdbBoxSetSearchProvider {
+    tmdb: Arc<TmdbClient>,
+}
+
+impl TmdbBoxSetSearchProvider {
+    /// A TMDB collection search provider.
+    #[must_use]
+    pub fn new(tmdb: Arc<TmdbClient>) -> Self {
+        Self { tmdb }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "TheMovieDb"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == BaseItemKind::BoxSet
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .tmdb
+            .search_collection(name)
+            .await
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                name: Some(hit.name),
+                overview: hit.overview,
+                image_url: hit.poster_url,
+                provider_ids: Some(std::collections::HashMap::from([(
+                    "TmdbCollection".to_owned(),
+                    hit.tmdb_id.to_string(),
+                )])),
+                search_provider_name: Some("TheMovieDb".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
+
+/// A [`RemoteSearchProvider`] backed by OMDb — the "Identify" flow's IMDb-keyed
+/// candidates. Port of `OmdbItemProvider.GetSearchResults`; inert (no results)
+/// until an OMDb API key is configured.
+pub struct OmdbSearchProvider {
+    omdb: Arc<crate::omdb::OmdbClient>,
+    kind: crate::omdb::OmdbKind,
+    supported: BaseItemKind,
+}
+
+impl OmdbSearchProvider {
+    /// An OMDb search provider for `kind` (movie, series or episode).
+    #[must_use]
+    pub fn new(omdb: Arc<crate::omdb::OmdbClient>, kind: crate::omdb::OmdbKind) -> Self {
+        let supported = match kind {
+            crate::omdb::OmdbKind::Movie => BaseItemKind::Movie,
+            crate::omdb::OmdbKind::Series => BaseItemKind::Series,
+            crate::omdb::OmdbKind::Episode => BaseItemKind::Episode,
+        };
+        Self {
+            omdb,
+            kind,
+            supported,
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteSearchProvider for OmdbSearchProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "The Open Movie Database"
+    }
+
+    fn supports(&self, item_kind: BaseItemKind) -> bool {
+        item_kind == self.supported
+    }
+
+    async fn get_search_results(
+        &self,
+        search_info: &ItemLookupInfo,
+    ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+        let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .omdb
+            .search(self.kind, name, search_info.year)
+            .await
+            .into_iter()
+            .map(|hit| RemoteSearchResult {
+                production_year: hit.production_year(),
+                image_url: hit.poster.clone(),
+                provider_ids: hit
+                    .imdb_id
+                    .clone()
+                    .map(|id| std::collections::HashMap::from([("Imdb".to_owned(), id)])),
+                name: hit.title,
+                search_provider_name: Some("The Open Movie Database".to_owned()),
+                ..RemoteSearchResult::default()
+            })
+            .collect())
+    }
+}
+
 /// A single remote metadata-search fetcher (e.g. a TMDb or MusicBrainz plugin).
 ///
 /// Port of `MediaBrowser.Controller.Providers.IRemoteSearchProvider<T>` reduced
@@ -207,6 +318,10 @@ pub struct LocalProviderManager {
     /// The Studio Images client, used to supply a `Studio` item's thumb from the
     /// artwork repository. Absent → studios contribute no remote images.
     studios: Option<Arc<crate::studios::StudiosClient>>,
+    /// Stored `BaseItems.Type` name → [`BaseItemKind`], inverted once from the
+    /// [`ItemTypeLookup`] table. Present enables the kind-filtered built-in
+    /// external-id descriptors.
+    kind_by_type_name: HashMap<String, BaseItemKind>,
 }
 
 impl std::fmt::Debug for LocalProviderManager {
@@ -223,6 +338,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_items", &self.items.is_some())
             .field("has_studios", &self.studios.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
+            .field("kind_by_type_name", &self.kind_by_type_name.len())
             .finish()
     }
 }
@@ -245,7 +361,24 @@ impl LocalProviderManager {
             tmdb: None,
             items: None,
             studios: None,
+            kind_by_type_name: HashMap::new(),
         }
+    }
+
+    /// Enables the kind-filtered built-in external-id descriptors by supplying
+    /// the item-type table (inverted once here) — a port of the C#
+    /// `IExternalId.Supports(item)` filter, which needs the item's type.
+    ///
+    /// Without it (and without an item store) only the descriptors handed to
+    /// [`new`](Self::new) are advertised.
+    #[must_use]
+    pub fn with_item_types(mut self, types: &dyn ItemTypeLookup) -> Self {
+        self.kind_by_type_name = types
+            .base_item_kind_names()
+            .into_iter()
+            .map(|(kind, name)| (name, kind))
+            .collect();
+        self
     }
 
     /// Attaches the Studio Images client, so a `Studio` item's remote images
@@ -351,6 +484,50 @@ impl LocalProviderManager {
         tmdb.season_details(hit.tmdb_id, season_number).await
     }
 
+    /// The box-set refresh arm — port of `TmdbBoxSetProvider` +
+    /// `TmdbBoxSetImageProvider`: search TMDB's collections by the box set's
+    /// name, take the top hit, and apply its name/overview and artwork.
+    async fn refresh_box_set(
+        &self,
+        tmdb: &Arc<TmdbClient>,
+        entity: &mut BaseItemEntity,
+        item_id: Uuid,
+        name: &str,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+            return Ok(());
+        };
+        let Some(collection) = tmdb.collection(hit.tmdb_id).await else {
+            return Ok(());
+        };
+        if wants_fetch(options.metadata_refresh_mode) {
+            apply_name_overview(
+                entity,
+                Some(collection.name.as_str()),
+                collection.overview.as_deref(),
+                options.replace_all_metadata,
+            );
+            if let Some(store) = &self.image_store {
+                store.save_items(std::slice::from_ref(entity)).await?;
+            }
+        }
+        if wants_fetch(options.image_refresh_mode) && self.image_store.is_some() {
+            for image_type in [ImageType::Primary, ImageType::Backdrop] {
+                if let Some(image) = collection
+                    .images
+                    .iter()
+                    .find(|i| i.image_type == image_type)
+                {
+                    let _ = self
+                        .save_image_from_url(item_id, &image.url, image_type, None)
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a season's/episode's fetched name/overview (+ Primary artwork URL)
     /// onto the row — the shared second half of the two TV refresh arms. The
     /// metadata pass persists via the item store; the image download is
@@ -453,6 +630,12 @@ enum RefreshTarget {
         /// The season number within the series.
         season_number: i32,
     },
+    /// A box set: search TMDB's *collections* by name, then fetch
+    /// `/collection/{id}` (C# `TmdbBoxSetProvider`).
+    BoxSet {
+        /// The collection title to search for.
+        name: String,
+    },
     /// An episode: like a season, then select the episode within it.
     Episode {
         /// The parent series title driving the TMDB search.
@@ -502,6 +685,13 @@ fn refresh_target_of(
             name,
             year,
         });
+    }
+    if kind == "BoxSet" {
+        return entity
+            .name
+            .clone()
+            .filter(|n| !n.is_empty())
+            .map(|name| RefreshTarget::BoxSet { name });
     }
     if !matches!(kind, "Season" | "Episode") {
         return None;
@@ -706,6 +896,10 @@ impl ProviderManager for LocalProviderManager {
                     }
                 }
             }
+            RefreshTarget::BoxSet { name } => {
+                self.refresh_box_set(tmdb, &mut entity, item_id, &name, options)
+                    .await?;
+            }
             RefreshTarget::Season {
                 series_name,
                 series_year,
@@ -900,6 +1094,30 @@ impl ProviderManager for LocalProviderManager {
         let Some(tmdb) = &self.tmdb else {
             return Ok(Vec::new());
         };
+        // A box set's artwork is its TMDB *collection*'s (C#
+        // `TmdbBoxSetImageProvider`), a different endpoint from a title's.
+        if short_kind(&entity) == "BoxSet" {
+            let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                return Ok(Vec::new());
+            };
+            let Some(hit) = tmdb.search_collection(name).await.into_iter().next() else {
+                return Ok(Vec::new());
+            };
+            let Some(collection) = tmdb.collection(hit.tmdb_id).await else {
+                return Ok(Vec::new());
+            };
+            return Ok(collection
+                .images
+                .into_iter()
+                .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
+                .map(|img| RemoteImageInfo {
+                    provider_name: Some("TheMovieDb".to_owned()),
+                    url: Some(img.url),
+                    type_: img.image_type,
+                    ..RemoteImageInfo::default()
+                })
+                .collect());
+        }
         let Some((kind, name, year)) = title_lookup(&entity) else {
             return Ok(Vec::new());
         };
@@ -968,15 +1186,23 @@ impl ProviderManager for LocalProviderManager {
         Ok(())
     }
 
-    async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
-        Ok(Vec::new())
-    }
-
     async fn get_external_id_infos(
         &self,
-        _item_id: Uuid,
+        item_id: Uuid,
     ) -> Result<Vec<ExternalIdInfo>, ServiceError> {
-        Ok(self.external_id_infos.clone())
+        // C# filters every registered `IExternalId` by `Supports(item)`, so the
+        // Identify dialog offers only the id fields that apply to the item's
+        // type. That needs the item; without a store (or the type table) fall
+        // back to the descriptors supplied at construction.
+        let mut infos = Vec::new();
+        if let (Some(items), false) = (self.items.as_ref(), self.kind_by_type_name.is_empty())
+            && let Some(item) = items.retrieve_item(item_id).await?
+            && let Some(kind) = self.kind_by_type_name.get(item.type_.as_str())
+        {
+            infos = crate::external_ids::external_id_infos(*kind);
+        }
+        infos.extend(self.external_id_infos.iter().cloned());
+        Ok(infos)
     }
 
     async fn remote_search(
@@ -1293,6 +1519,88 @@ mod tests {
         assert!(infos.is_empty());
     }
 
+    /// An [`ItemTypeLookup`] over the two names the descriptor tests need.
+    struct FakeTypes;
+
+    impl ferrofin_traits::persistence::ItemTypeLookup for FakeTypes {
+        fn music_genre_types(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn base_item_kind_names(&self) -> HashMap<BaseItemKind, String> {
+            HashMap::from([
+                (
+                    BaseItemKind::Movie,
+                    "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+                ),
+                (
+                    BaseItemKind::Book,
+                    "MediaBrowser.Controller.Entities.Book".to_owned(),
+                ),
+            ])
+        }
+    }
+
+    /// Builds a manager over one row of `type_name`, wired for kind filtering.
+    fn manager_over(item_id: Uuid, type_name: &str) -> LocalProviderManager {
+        let mut item = row("Book", "irrelevant");
+        item.id = item_id.to_string();
+        item.type_ = type_name.to_owned();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, item)]),
+            seen: tx,
+        });
+        LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_item_types(&FakeTypes)
+    }
+
+    #[tokio::test]
+    async fn external_id_infos_are_filtered_to_the_items_kind() {
+        let item_id = Uuid::new_v4();
+        let mgr = manager_over(item_id, "MediaBrowser.Controller.Entities.Movies.Movie");
+        let keys: Vec<_> = mgr
+            .get_external_id_infos(item_id)
+            .await
+            .expect("descriptors")
+            .into_iter()
+            .filter_map(|i| i.key)
+            .collect();
+        assert!(keys.contains(&"Imdb".to_owned()));
+        assert!(keys.contains(&"Tmdb".to_owned()));
+        assert!(
+            !keys.contains(&"ISBN".to_owned()),
+            "a movie must not offer a book id field"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_book_offers_only_the_book_id_fields() {
+        let item_id = Uuid::new_v4();
+        let mgr = manager_over(item_id, "MediaBrowser.Controller.Entities.Book");
+        let keys: Vec<_> = mgr
+            .get_external_id_infos(item_id)
+            .await
+            .expect("descriptors")
+            .into_iter()
+            .filter_map(|i| i.key)
+            .collect();
+        assert_eq!(keys, vec!["ComicVine", "GoogleBooks", "ISBN"]);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_item_falls_back_to_the_supplied_descriptors() {
+        let seed = vec![ExternalIdInfo::new("Tmdb".into(), "tmdb".into(), None)];
+        let mgr = LocalProviderManager::new(seed.clone())
+            .with_item_types(&FakeTypes)
+            .with_remote_search_providers(Vec::new());
+        // No item store wired, so the kind is unknowable: only the seed shows.
+        assert_eq!(
+            mgr.get_external_id_infos(Uuid::new_v4()).await.unwrap(),
+            seed
+        );
+    }
+
     #[tokio::test]
     async fn new_advertises_supplied_external_ids_for_every_item() {
         let seed = vec![ExternalIdInfo::new("Tmdb".into(), "tmdb".into(), None)];
@@ -1465,7 +1773,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(mgr.get_external_urls(id).await.unwrap().is_empty());
         // The metadata-plugin registry projects the compiled-in providers, so it
         // is non-empty (covered in detail by `library_options` tests).
         assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
@@ -1492,6 +1799,14 @@ mod tests {
         async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
+        }
+        async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|(_, row)| row.is_locked)
+                .map(|(id, _)| *id)
+                .collect())
         }
         async fn get_ancestor_chain(
             &self,
@@ -1914,8 +2229,109 @@ mod tests {
             Some(super::RefreshTarget::Title { .. }) => "Title",
             Some(super::RefreshTarget::Season { .. }) => "Season",
             Some(super::RefreshTarget::Episode { .. }) => "Episode",
+            Some(super::RefreshTarget::BoxSet { .. }) => "BoxSet",
             None => "None",
         }
+    }
+
+    #[test]
+    fn a_box_set_resolves_to_a_collection_target() {
+        use super::refresh_target_of;
+        match refresh_target_of(&row("Movies.BoxSet", "The Matrix Collection"), None) {
+            Some(super::RefreshTarget::BoxSet { name }) => {
+                assert_eq!(name, "The Matrix Collection");
+            }
+            other => panic!(
+                "expected a BoxSet target, got {}",
+                target_name(other.as_ref())
+            ),
+        }
+        // An unnamed box set has nothing to search for.
+        let mut unnamed = row("Movies.BoxSet", "");
+        unnamed.name = None;
+        assert!(refresh_target_of(&unnamed, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn box_set_remote_images_come_from_the_tmdb_collection() {
+        // "Choose Image" on a box set searches TMDB's collections, then lists
+        // that collection's artwork — TMDB's own pick first.
+        let search = r#"{"results":[{"id":2344,"name":"The Matrix Collection",
+                         "poster_path":"/c.jpg","overview":"Neo."}]}"#;
+        let collection = r#"{"id":2344,"name":"The Matrix Collection","overview":"Neo.",
+            "poster_path":"/pick.jpg","backdrop_path":"/back.jpg",
+            "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/search/collection", search.to_owned()),
+            ("/collection/", collection.to_owned()),
+        ])
+        .await;
+        let item_id = Uuid::new_v4();
+        let mut boxset = row("Movies.BoxSet", "The Matrix Collection");
+        boxset.id = item_id.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, boxset)]),
+            seen: tx,
+        });
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let mgr = LocalProviderManager::default().with_remote_images(tmdb, items);
+
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .expect("images");
+        let urls: Vec<_> = images.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://image.tmdb.org/t/p/original/pick.jpg",
+                "https://image.tmdb.org/t/p/original/back.jpg",
+                "https://image.tmdb.org/t/p/original/alt.jpg",
+            ]
+        );
+        assert_eq!(images[0].type_, ImageType::Primary);
+        assert_eq!(images[1].type_, ImageType::Backdrop);
+
+        // The query's type filter still applies.
+        let posters = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    image_type: Some(ImageType::Backdrop),
+                    ..RemoteImageQuery::default()
+                },
+            )
+            .await
+            .expect("images");
+        assert_eq!(posters.len(), 1);
+        assert_eq!(posters[0].type_, ImageType::Backdrop);
+    }
+
+    #[tokio::test]
+    async fn the_box_set_identify_provider_returns_collection_candidates() {
+        let search = r#"{"results":[{"id":2344,"name":"The Matrix Collection",
+                         "poster_path":"/c.jpg","overview":"Neo."}]}"#;
+        let server =
+            crate::mock_http::MockServer::start(vec![("/search/collection", search.to_owned())])
+                .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let provider = super::TmdbBoxSetSearchProvider::new(tmdb);
+        assert!(provider.supports(BaseItemKind::BoxSet));
+        assert!(!provider.supports(BaseItemKind::Movie));
+        let results = provider
+            .get_search_results(&ItemLookupInfo {
+                name: Some("Matrix".to_owned()),
+                ..ItemLookupInfo::default()
+            })
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("The Matrix Collection"));
+        assert_eq!(
+            results[0].provider_ids.as_ref().unwrap()["TmdbCollection"],
+            "2344"
+        );
     }
 
     #[test]

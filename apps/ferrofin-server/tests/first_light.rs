@@ -193,7 +193,7 @@ async fn boot() -> Harness {
         chromaprint_muxer: false,
     };
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
         .await
         .expect("wire app state");
 

@@ -46,7 +46,7 @@ use ferrofin_model::playlists::{
     PlaylistUserUpdateRequest,
 };
 use ferrofin_model::providers::{
-    ExternalIdInfo, ExternalUrl, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
+    ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery,
 };
 use ferrofin_model::providers::{LyricProviderInfo, RemoteSubtitleInfo, SubtitleProviderInfo};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -160,6 +160,52 @@ pub fn authed_fake_state() -> AppState {
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
         Arc::new(AuthedAuthService),
+        Arc::new(FakeQuickConnect),
+        Arc::new(FakePlaylists),
+        Arc::new(FakeCollections),
+        Arc::new(FakeTvSeries),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeDevices),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeApiKeys),
+        Arc::new(FakeLocalization),
+        Arc::new(FakeDisplayPreferences),
+        Arc::new(FakeActivity),
+        Arc::new(FakeFileSystem),
+        Arc::new(FakeTasks),
+    )
+}
+
+/// Like [`authed_fake_state`] but authenticated as an **API key**, which
+/// satisfies Jellyfin's `RequiresElevation` policy without a user/policy
+/// lookup — so [`RequireAdmin`](crate::auth::RequireAdmin)-guarded routes
+/// reach their handler.
+///
+/// Use this for tests of an admin-only controller's behaviour. The gate itself
+/// is pinned end to end by `apps/ferrofin-server/tests/elevation.rs`, against a
+/// real non-administrator token.
+#[must_use]
+pub fn elevated_fake_state() -> AppState {
+    AppState::new(
+        Arc::new(FakeLibrary),
+        Arc::new(FakeUsers),
+        Arc::new(FakeUserViews),
+        Arc::new(FakeUserData),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(FakeDto),
+        Arc::new(FakeAuthContext),
+        Arc::new(ApiKeyAuthService),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -1096,9 +1142,6 @@ impl ProviderManager for FakeProviders {
         _item_id: Uuid,
         _update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_external_urls(&self, _item_id: Uuid) -> Result<Vec<ExternalUrl>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_external_id_infos(

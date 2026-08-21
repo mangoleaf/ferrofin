@@ -30,7 +30,11 @@ Deep-verified against a real Jellyfin server:
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
-  path-scoped ingest; virtual folders; item read + write/edit + delete.
+  path-scoped ingest; virtual folders; item read + write/edit + delete. Deep-verified for
+  `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
+  libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
+  `boxsets` is the one library type not resolved off disk (its members are curated through
+  the collection API).
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
@@ -48,6 +52,12 @@ Deep-verified against a real Jellyfin server:
 - **Scheduled tasks** — all 17 dashboard tasks plus the trigger scheduler.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
+- **Photos & books** — a home-videos library resolves its images into `Photo` items with
+  their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
+  library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
+  metadata and the cover extracted from the archive.
+- **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
+  external-id fields the Identify dialog offers.
 - **Backup & restore.**
 
 ## Implemented, less battle-tested / known partial
@@ -56,11 +66,49 @@ Wired and working, with a documented limitation or lighter verification:
 
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
-- **Similar-items scoring** — a simplified scorer relative to Jellyfin's exact weighting.
-- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / OMDb / fanart) — implemented but
-  **feature-gated off by default**; they return empty results until enabled with an API key.
+- **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
+  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  that ticked them under "Similarity providers", and resolve against items already in the
+  library. The local scorer is a single query rather than upstream's six per-kind
+  providers, which are identical in behaviour.
+- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / AudioDb / fanart / Studio Images)
+  — compiled in and **on by default** with built-in keys, gated per library by the
+  "Metadata downloaders" / "Image fetchers" checkboxes. **OMDb** is the exception: it stays
+  inert until `FERROFIN_OMDB_KEY` (config `omdb_api_key`) is set.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
+- **Books / audiobooks** — a `books` library resolves documents (`.azw .azw3 .cb7 .cbr .cbt
+  .cbz .epub .mobi .pdf`) to `Book` and audio files to `AudioBook`, and serves them through
+  `/Items/{id}/File` + `/Items/{id}/Download`, which is what jellyfin-web's epub/comic/pdf
+  readers fetch. Verified against Ferrofin over real HTTP and in unit tests, but **not
+  diffed against a live Jellyfin server** — treat it as the least-verified entry here.
+  Notable behaviours and divergences:
+  - **Accepted divergence (ahead of the contract):** name / series / index / year come from
+    `Emby.Naming.Book.BookFileNameParser`, which is on upstream `master` and **not** in the
+    pinned 10.11.8 contract. Against 10.11.8 a book is named from its bare filename; Ferrofin
+    parses `A Study in Scarlet (Sherlock Holmes, #1) (1887)` into its parts.
+  - **Faithful upstream limitation:** a multi-file audiobook is **one item per file**, not one
+    stacked item. `AudioResolver` skips stacked results outright ("until multi-part books are
+    handled"), and `ResolvePaths` then falls back to per-file resolution — Ferrofin reproduces
+    that rather than inventing stacking Jellyfin clients have never seen.
+  - **Flattening divergence:** upstream turns a folder it cannot resolve to a book into a
+    `Folder` item and parents the books under it; Ferrofin parents every book directly to the
+    collection folder, exactly as the movie scan does. This scanner materializes no
+    intermediate `Folder` rows.
+  - **Naming divergence at the library root:** a books library whose *root* holds exactly one
+    audio file is named after the **library folder** by Jellyfin (and dated from it) — an
+    artefact of the root going through the multi-item resolver. Ferrofin names it from the
+    file, with no year. Naming a book after the library it sits in is an upstream wart, not
+    behaviour worth reproducing; every other shape matches upstream exactly.
+  - Metadata comes from the file itself: `ComicInfo.xml` (inside the archive or beside it),
+    the ComicBookInfo JSON in a `.cbz`'s archive comment, and EPUB/OPF Dublin Core + Calibre
+    fields, with the cover extracted from the archive. There is still no *remote* book
+    provider — that is the third-party Bookshelf plugin.
+  - **`.cbr` / `.cb7`** are recognized and browsable, but yield no embedded metadata or
+    cover: those are RAR and 7z archives, and neither has a maintained pure-Rust reader
+    worth the dependency. `.cbz` and `.cbt` are fully read.
+- **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
+  `Tags`, which upstream aggregates from XMP/IPTC keywords.
 
 ## Not implemented (by design)
 

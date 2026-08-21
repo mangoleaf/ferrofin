@@ -424,19 +424,7 @@ impl ItemCountService for FerrofinItemCountService {
         // batching, which dominated the by-name browse endpoints.
         let ids: Vec<String> = folder_ids.iter().copied().map(guid_to_db).collect();
         let grouped = |extra_join: &str, extra_where: &str| {
-            // Merged alternate versions (PrimaryVersionId set) are hidden
-            // duplicates of their primary — counting them inflated every
-            // series/season episode total after a merge-versions pass.
-            let mut sql = format!(
-                r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
-                   FROM "AncestorIds" a
-                   JOIN "BaseItems" bi ON bi."Id" = a."ItemId"{extra_join}
-                   WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL{extra_where}
-                     AND a."ParentItemId" IN ("#
-            );
-            sql.push_str(&placeholders(ids.len()));
-            sql.push_str(r#") GROUP BY a."ParentItemId""#);
-            sql
+            folder_leaf_count_sql(ids.len(), extra_join, extra_where)
         };
 
         let total_sql = grouped("", "");
@@ -584,6 +572,43 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
         sql.push(')');
     }
     sql.push_str(r#" GROUP BY p."Name", bi."Type""#);
+    sql
+}
+
+/// The grouped leaf-descendant count for a page of folders: `parents` bound
+/// folder ids, plus an optional extra join and extra `WHERE` fragment (the
+/// played subset adds a `UserData` join).
+///
+/// The leaf test is an `EXISTS`, not a `JOIN`, and that is load-bearing. As an
+/// inner join, `bi."IsFolder" = 0` is a predicate SQLite may use to DRIVE the
+/// query: with more than a handful of parents it picks
+/// `IX_BaseItems_IsFolder_TopParentId_IsVirtualItem_PresentationUniqueKey_DateCreated
+/// (IsFolder=?)` and walks EVERY non-folder row in the library (people
+/// included), probing `AncestorIds` per row and sorting the result into a temp
+/// b-tree for the `GROUP BY` — O(library), not O(descendants). An `EXISTS`
+/// cannot be a driving term, so the plan stays `AncestorIds (ParentItemId=?)`
+/// → `BaseItems (Id=?)`. `bi."Id"` is unique, so the inner join could never
+/// multiply rows: the two forms are exactly equivalent.
+///
+/// Measured on the bench library (9,862 items / 6,795 ancestor edges) for the
+/// 24-series page `/Items?includeItemTypes=Series`, alternating legs in
+/// process: 23.5 ms → 1.96 ms p50, rows identical.
+///
+/// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
+/// their primary — counting them inflated every series/season episode total
+/// after a merge-versions pass.
+fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) -> String {
+    let mut sql = format!(
+        r#"SELECT a."ParentItemId", COUNT(DISTINCT a."ItemId")
+           FROM "AncestorIds" a{extra_join}
+           WHERE EXISTS (SELECT 1 FROM "BaseItems" bi
+                         WHERE bi."Id" = a."ItemId"
+                           AND bi."IsFolder" = 0
+                           AND bi."PrimaryVersionId" IS NULL){extra_where}
+             AND a."ParentItemId" IN ("#
+    );
+    sql.push_str(&placeholders(parents));
+    sql.push_str(r#") GROUP BY a."ParentItemId""#);
     sql
 }
 
@@ -1448,5 +1473,52 @@ mod tests {
                 .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
             "value counts must reach BaseItems by id, got: {plan:?}"
         );
+    }
+
+    /// The folder leaf-count aggregate must be driven by the ancestor closure,
+    /// never by `BaseItems."IsFolder"`. Turning the `EXISTS` back into an inner
+    /// join lets SQLite pick the `IsFolder` index and walk every non-folder row
+    /// in the library per request (23.5 ms vs 1.96 ms on the bench library for
+    /// a 24-series page), so the shape is pinned here: `AncestorIds` is the
+    /// outermost loop and `BaseItems` is reached by id.
+    ///
+    /// **Only the `total` arm discriminates.** `played` is driven by
+    /// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` under
+    /// both the `EXISTS` and the inner-join form, so `IsFolder` is never a
+    /// candidate driving term there and `bi` is reached by `Id=?` either way —
+    /// it passes against the unfixed SQL. It is kept as a smoke check that the
+    /// `UserData` variant still builds and still seeks, not as a regression
+    /// pin. Anyone re-verifying this test must delete the `total` case, not the
+    /// `played` one.
+    #[tokio::test]
+    async fn folder_leaf_counts_seek_from_the_ancestor_closure() {
+        let db = test_db().await;
+
+        for (label, extra_join, extra_where, binds) in [
+            ("total", "", "", 24),
+            (
+                "played",
+                r#" JOIN "UserData" ud ON ud."ItemId" = a."ItemId""#,
+                r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
+                25,
+            ),
+        ] {
+            let sql = folder_leaf_count_sql(24, extra_join, extra_where);
+            let plan = query_plan(&db, &sql, binds).await;
+            assert!(
+                !plan.iter().any(|s| s.contains("IsFolder=?")),
+                "{label} count must not be driven by the IsFolder index, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.contains(" a ") && s.contains("AncestorIds")),
+                "{label} count must reach AncestorIds through one of its indexes, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+                "{label} count must reach BaseItems by id, got: {plan:?}"
+            );
+        }
     }
 }

@@ -9,8 +9,13 @@
 //! Password hashing is delegated to the injected [`AuthenticationManager`]
 //! providers (the built-in [`DefaultAuthenticationProvider`] plus the fallback
 //! [`InvalidAuthProvider`]); this manager never touches crypto directly. The C#
-//! `_userLock` per-user async mutex is dropped — SQLite serializes writes and
-//! the ported operations are individually atomic — and the `.NET` event manager
+//! `_userLock` per-user async mutex is dropped: SQLite gives us exactly one
+//! writer connection, so an operation whose guard reads run **inside** its
+//! writing transaction is already atomic against every other writer. That is
+//! load-bearing rather than incidental — a guard evaluated on the *read* pool
+//! and acted on through the *writer* pool is a check-then-act, and the
+//! last-user / last-admin / duplicate-name guards below are all written in the
+//! transaction that acts on them for exactly that reason. The `.NET` event manager
 //! (`UserCreated`/`UserUpdated`/…) is out of scope (event wiring lands
 //! separately).
 //!
@@ -39,7 +44,7 @@ use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_model::dto::{NameIdPair, UserDto};
 use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, SyncPlayUserAccessType, UserPolicy};
-use sqlx::Sqlite;
+use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -256,13 +261,24 @@ impl FerrofinUserManager {
         self
     }
 
-    /// Fetches a user row by id, or `None`.
-    async fn fetch_user(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+    /// Fetches a user row by id from any executor, or `None`.
+    ///
+    /// Executor-generic so a guard that must not be overtaken can read it from
+    /// the *writing* transaction rather than the read pool.
+    async fn fetch_user_on<'e, E>(executor: E, id: Uuid) -> Result<Option<UserEntity>, ServiceError>
+    where
+        E: SqliteExecutor<'e>,
+    {
         sqlx::query_as::<_, UserEntity>(r#"SELECT * FROM "Users" WHERE "Id" = ?1 LIMIT 1"#)
             .bind(guid_to_db(id))
-            .fetch_optional(self.db.pool())
+            .fetch_optional(executor)
             .await
             .map_err(db_err)
+    }
+
+    /// Fetches a user row by id, or `None`.
+    async fn fetch_user(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        Self::fetch_user_on(self.db.pool(), id).await
     }
 
     /// Fetches a user row by id or returns [`ServiceError::NotFound`].
@@ -272,16 +288,54 @@ impl FerrofinUserManager {
             .ok_or_else(|| ServiceError::not_found(format!("user {id}")))
     }
 
-    /// The count of user rows.
-    async fn user_count(&self) -> Result<i64, ServiceError> {
+    /// The id of the user holding `name` (case-insensitively), ignoring
+    /// `exclude` when given — the duplicate-name guard shared by create and
+    /// rename, both of which run it inside their writing transaction because
+    /// `IX_Users_Username` is UNIQUE and losing that race is a `500`.
+    async fn user_id_by_name_on<'e, E>(
+        executor: E,
+        name: &str,
+        exclude: Option<String>,
+    ) -> Result<Option<String>, ServiceError>
+    where
+        E: SqliteExecutor<'e>,
+    {
+        // `IS NOT` (not `!=`): with no exclusion the bind is NULL, and
+        // `"Id" != NULL` is NULL — i.e. matches nothing — where
+        // `"Id" IS NOT NULL` is the intended "no exclusion".
+        sqlx::query_scalar(
+            r#"SELECT "Id" FROM "Users"
+               WHERE "Username" = ?1 COLLATE NOCASE AND "Id" IS NOT ?2 LIMIT 1"#,
+        )
+        .bind(name)
+        .bind(exclude)
+        .fetch_optional(executor)
+        .await
+        .map_err(db_err)
+    }
+
+    /// The count of user rows, from any executor.
+    async fn user_count_on<'e, E>(executor: E) -> Result<i64, ServiceError>
+    where
+        E: SqliteExecutor<'e>,
+    {
         sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "Users""#)
-            .fetch_one(self.db.pool())
+            .fetch_one(executor)
             .await
             .map_err(db_err)
     }
 
-    /// The count of enabled administrator users (C# admin-deletion guard).
-    async fn admin_count(&self) -> Result<i64, ServiceError> {
+    /// The count of user rows.
+    async fn user_count(&self) -> Result<i64, ServiceError> {
+        Self::user_count_on(self.db.pool()).await
+    }
+
+    /// The count of administrator users, from any executor (C# admin-deletion
+    /// guard).
+    async fn admin_count_on<'e, E>(executor: E) -> Result<i64, ServiceError>
+    where
+        E: SqliteExecutor<'e>,
+    {
         sqlx::query_scalar::<_, i64>(
             r#"SELECT COUNT(*) FROM "Users" u
                WHERE EXISTS (
@@ -290,15 +344,20 @@ impl FerrofinUserManager {
                )"#,
         )
         .bind(i32::from(PermissionKind::IsAdministrator))
-        .fetch_one(self.db.pool())
+        .fetch_one(executor)
         .await
         .map_err(db_err)
     }
 
-    /// The next legacy `InternalId` (C# `max(InternalId) + 1`).
-    async fn next_internal_id(&self) -> Result<i64, ServiceError> {
+    /// The next legacy `InternalId` (C# `max(InternalId) + 1`), from any
+    /// executor. Read inside the insert's transaction so two concurrent
+    /// creations cannot mint the same id.
+    async fn next_internal_id_on<'e, E>(executor: E) -> Result<i64, ServiceError>
+    where
+        E: SqliteExecutor<'e>,
+    {
         let max: Option<i64> = sqlx::query_scalar(r#"SELECT MAX("InternalId") FROM "Users""#)
-            .fetch_one(self.db.pool())
+            .fetch_one(executor)
             .await
             .map_err(db_err)?;
         Ok(max.unwrap_or(0) + 1)
@@ -308,6 +367,12 @@ impl FerrofinUserManager {
     /// inside one transaction (C# `CreateUserInternalAsync` + `Add`), returning
     /// the persisted row. `configure` runs against the open transaction so the
     /// caller can grant bootstrap permissions atomically.
+    ///
+    /// The duplicate-name guard and the `InternalId` high-water read live in
+    /// that same transaction. Run outside it they were a check-then-act against
+    /// the UNIQUE `IX_Users_Username`: concurrent creates of one name all saw
+    /// "absent", all inserted, and every loser turned the contract's `400` into
+    /// a `500` (measured live: 15 of 16 concurrent requests).
     async fn insert_user<F>(&self, name: &str, configure: F) -> Result<UserEntity, ServiceError>
     where
         F: for<'t> FnOnce(
@@ -319,9 +384,17 @@ impl FerrofinUserManager {
     {
         let id = Uuid::new_v4();
         let id_str = guid_to_db(id);
-        let internal_id = self.next_internal_id().await?;
 
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        if Self::user_id_by_name_on(&mut *tx, name, None)
+            .await?
+            .is_some()
+        {
+            return Err(ServiceError::invalid_input(format!(
+                "A user with the name '{name}' already exists."
+            )));
+        }
+        let internal_id = Self::next_internal_id_on(&mut *tx).await?;
         sqlx::query(
             r#"INSERT INTO "Users"
                ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
@@ -480,29 +553,31 @@ impl UserManager for FerrofinUserManager {
             ));
         }
 
-        let clash: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "Users"
-               WHERE "Username" = ?1 COLLATE NOCASE AND "Id" != ?2 LIMIT 1"#,
-        )
-        .bind(new_name)
-        .bind(guid_to_db(user_id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        if clash.is_some() {
+        // Clash guard, existence check and the UPDATE in ONE writer
+        // transaction: `IX_Users_Username` is UNIQUE, so a guard read from the
+        // read pool loses the same way `create_user`'s did — the rename that
+        // gets there second fails the index and turns a `400` into a `500`.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        if Self::user_id_by_name_on(&mut *tx, new_name, Some(guid_to_db(user_id)))
+            .await?
+            .is_some()
+        {
             return Err(ServiceError::invalid_input(format!(
                 "A user with the name '{new_name}' already exists."
             )));
         }
 
         // Ensure the user exists before updating (C# throws ResourceNotFound).
-        self.require_user(user_id).await?;
+        if Self::fetch_user_on(&mut *tx, user_id).await?.is_none() {
+            return Err(ServiceError::not_found(format!("user {user_id}")));
+        }
         sqlx::query(r#"UPDATE "Users" SET "Username" = ?2 WHERE "Id" = ?1"#)
             .bind(guid_to_db(user_id))
             .bind(new_name)
-            .execute(self.db.writer())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -574,28 +649,28 @@ impl UserManager for FerrofinUserManager {
 
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError> {
         require_valid_username(name)?;
-
-        let existing: Option<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "Users" WHERE "Username" = ?1 COLLATE NOCASE LIMIT 1"#,
-        )
-        .bind(name)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        if existing.is_some() {
-            return Err(ServiceError::invalid_input(format!(
-                "A user with the name '{name}' already exists."
-            )));
-        }
-
+        // The "name already taken" guard lives inside `insert_user`'s
+        // transaction — see its docs for why it cannot live out here.
         self.insert_user(name, |_tx, _uid| Box::pin(async { Ok(()) }))
             .await
     }
 
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
-        let user = self.require_user(user_id).await?;
+        // "At least one user" and "at least one admin" are invariants over the
+        // whole table, so they are read INSIDE the transaction that deletes —
+        // SQLite has a single writer connection, which makes that read
+        // unovertakeable. Read from the pool instead, they were a check-then-act:
+        // two concurrent deletes of the last two accounts both read "2 users, 2
+        // admins", both passed, and the table went 2 -> 0 (measured live — every
+        // account and its data gone, with no admin left to recover through).
+        // The row deletions are in the same transaction, so a failure part-way
+        // no longer strands a user's permissions/preferences either.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let user = Self::fetch_user_on(&mut *tx, user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
 
-        if self.user_count().await? == 1 {
+        if Self::user_count_on(&mut *tx).await? == 1 {
             return Err(ServiceError::invalid_input(format!(
                 "The user '{}' cannot be deleted because there must be at least one user \
                  in the system.",
@@ -603,8 +678,8 @@ impl UserManager for FerrofinUserManager {
             )));
         }
 
-        if has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await?
-            && self.admin_count().await? == 1
+        if has_permission(&mut *tx, &user.id, PermissionKind::IsAdministrator).await?
+            && Self::admin_count_on(&mut *tx).await? == 1
         {
             return Err(ServiceError::invalid_input(format!(
                 "The user '{}' cannot be deleted because there must be at least one admin \
@@ -625,15 +700,16 @@ impl UserManager for FerrofinUserManager {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(&sql)
                 .bind(guid_to_db(user_id))
-                .execute(self.db.writer())
+                .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
         }
         sqlx::query(r#"DELETE FROM "Users" WHERE "Id" = ?1"#)
             .bind(guid_to_db(user_id))
-            .execute(self.db.writer())
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1250,7 +1326,7 @@ async fn build_user_policy(
         enabled_devices,
         enabled_folders,
         enable_content_deletion_from_folders: content_deletion_folders,
-        sync_play_access: sync_play_from_i32(user.sync_play_access),
+        sync_play_access: SyncPlayUserAccessType::from_stored(user.sync_play_access),
         blocked_channels: Some(blocked_channels),
         blocked_media_folders: Some(blocked_media_folders),
         block_unrated_items,
@@ -1314,15 +1390,6 @@ fn subtitle_mode_from_i32(value: i32) -> SubtitlePlaybackMode {
         3 => SubtitlePlaybackMode::None,
         4 => SubtitlePlaybackMode::Smart,
         _ => SubtitlePlaybackMode::Default,
-    }
-}
-
-/// Maps a stored `SyncPlayAccess` discriminant to its enum.
-fn sync_play_from_i32(value: i32) -> SyncPlayUserAccessType {
-    match value {
-        1 => SyncPlayUserAccessType::JoinGroups,
-        2 => SyncPlayUserAccessType::None,
-        _ => SyncPlayUserAccessType::CreateAndJoinGroups,
     }
 }
 

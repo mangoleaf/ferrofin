@@ -18,8 +18,16 @@ suite/run.sh all      # parity, then perf, same build + fixture → suite/result
 suite/run.sh publish  # parity once + BENCH_RUNS × perf → suite/results/agg-<sha>.{json,md} (median±IQR distributions)
 suite/run.sh merge    # join the latest ledger + perf into the run record (no measurement)
 suite/run.sh gate [--measure|--rebaseline]   # regression gate over the merged record
+suite/run.sh push     # against a RUNNING Ferrofin → WebSocket push checks (cast + SyncPlay)
 suite/viewer/serve.sh # → http://127.0.0.1:8125/suite/viewer/   (THE dashboard, one page)
 ```
+
+`push` is the odd one out: it manages no containers and needs a Ferrofin
+already running (`FERROFIN_BASE`/`FERROFIN_USER`/`FERROFIN_PASS`). It exists
+because body diffing is blind to the server→client half of the API — for
+remote control and SyncPlay the observable behaviour *is* the pushed
+WebSocket message, so those ops were status-code-verified only. See
+[`ws/README.md`](ws/README.md).
 
 ## Where the old dashboards went (bookmark update)
 

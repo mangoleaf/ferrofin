@@ -250,6 +250,28 @@ pub struct BaseItemTrailerTypeEntity {
     pub item_id: String,
 }
 
+/// The stored text a metadata provider's re-scan gate consults, for one item.
+///
+/// A narrow projection on purpose: the gate needs four columns, and hydrating
+/// all 72 `BaseItems` columns per planned item is exactly what the batched
+/// locked-item read exists to avoid. Read once per scan, like
+/// `locked_item_ids`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+pub struct ItemTextRow {
+    /// The item's `Guid`, hyphenated (`Id`).
+    pub id: String,
+    /// The stored display name (`Name`).
+    pub name: Option<String>,
+    /// The stored sort name (`SortName`).
+    pub sort_name: Option<String>,
+    /// The stored synopsis (`Overview`).
+    pub overview: Option<String>,
+    /// The media path (`Path`) — the gate compares `Name` against its stem to
+    /// tell a real title from the resolver's placeholder.
+    pub path: Option<String>,
+}
+
 /// A row of the `Chapters` table — one chapter marker on an item.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]

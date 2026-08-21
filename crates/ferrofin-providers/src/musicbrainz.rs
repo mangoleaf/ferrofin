@@ -66,13 +66,93 @@ struct ReleaseSearch {
 struct Release {
     id: String,
     #[serde(rename = "release-group", default)]
-    release_group: Option<Entity>,
+    group: Option<Entity>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtistLookup {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "life-span", default)]
+    span: Option<LifeSpan>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LifeSpan {
+    #[serde(default)]
+    begin: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReleaseGroupLookup {
     #[serde(default)]
     releases: Vec<Entity>,
+}
+
+/// A MusicBrainz date, which may specify only a year or a year and month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialDate {
+    /// The year.
+    pub year: i32,
+    /// The month (1 when the source gave none).
+    pub month: u32,
+    /// The day (1 when the source gave none).
+    pub day: u32,
+}
+
+impl PartialDate {
+    /// The date as a UTC instant at midnight.
+    #[must_use]
+    pub fn to_utc(self) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::TimeZone as _;
+        let date = chrono::NaiveDate::from_ymd_opt(self.year, self.month, self.day)?;
+        Some(chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?))
+    }
+}
+
+/// One release's metadata beyond its ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseDetails {
+    /// The release title.
+    pub name: Option<String>,
+    /// The release date.
+    pub premiere_date: Option<PartialDate>,
+    /// The release year.
+    pub production_year: Option<i32>,
+}
+
+/// One artist's metadata beyond its id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtistDetails {
+    /// The artist name as MusicBrainz spells it.
+    pub name: Option<String>,
+    /// The life-span begin date (a band's formation).
+    pub premiere_date: Option<PartialDate>,
+    /// The life-span end date (a band's break-up), which the artist NFO saver
+    /// writes as `<disbanded>`.
+    pub end_date: Option<PartialDate>,
+}
+
+/// Parses a MusicBrainz partial date (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`).
+fn parse_partial_date(value: &str) -> Option<PartialDate> {
+    let mut parts = value.trim().split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month = parts.next().and_then(|m| m.parse().ok()).unwrap_or(1);
+    let day = parts.next().and_then(|d| d.parse().ok()).unwrap_or(1);
+    (1..=12).contains(&month).then_some(())?;
+    (1..=31).contains(&day).then_some(())?;
+    Some(PartialDate { year, month, day })
+}
+
+/// A trimmed, non-empty string.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
 /// A MusicBrainz client. Cheap to clone semantics via `Arc` at the call site;
@@ -179,7 +259,7 @@ impl MusicBrainzClient {
             .next()
             .map_or_else(AlbumIds::default, |r| AlbumIds {
                 release_id: Some(r.id),
-                release_group_id: r.release_group.map(|g| g.id),
+                release_group_id: r.group.map(|g| g.id),
             })
     }
 
@@ -191,7 +271,7 @@ impl MusicBrainzClient {
                 &[("inc", "release-groups".to_owned())],
             )
             .await?;
-        result.release_group.map(|g| g.id)
+        result.group.map(|g| g.id)
     }
 
     /// Looks up a release group to get its first release id (`inc=releases`).
@@ -203,6 +283,35 @@ impl MusicBrainzClient {
             )
             .await?;
         result.releases.into_iter().next().map(|r| r.id)
+    }
+
+    /// One release's own metadata — port of the fields
+    /// `MusicBrainzAlbumProvider` writes onto a `MusicAlbum` beyond its ids.
+    ///
+    /// MusicBrainz dates may be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`; the missing
+    /// parts default to January 1st, as C#'s partial-date handling does.
+    pub async fn release_details(&self, release_id: &str) -> Option<ReleaseDetails> {
+        let release: Release = self
+            .get(&format!("/ws/2/release/{release_id}"), &[])
+            .await?;
+        let date = release.date.as_deref().and_then(parse_partial_date);
+        Some(ReleaseDetails {
+            name: non_empty(release.title),
+            premiere_date: date,
+            production_year: date.map(|d| d.year),
+        })
+    }
+
+    /// One artist's own metadata — port of the fields
+    /// `MusicBrainzArtistProvider` writes onto a `MusicArtist`.
+    pub async fn artist_details(&self, artist_id: &str) -> Option<ArtistDetails> {
+        let artist: ArtistLookup = self.get(&format!("/ws/2/artist/{artist_id}"), &[]).await?;
+        let life_span = artist.span.unwrap_or_default();
+        Some(ArtistDetails {
+            name: non_empty(artist.name),
+            premiere_date: life_span.begin.as_deref().and_then(parse_partial_date),
+            end_date: life_span.end.as_deref().and_then(parse_partial_date),
+        })
     }
 
     /// The full album-id resolution with the faithful precedence: fill the
@@ -278,6 +387,51 @@ fn lucene_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn partial_dates_default_the_missing_parts_to_the_first() {
+        assert_eq!(
+            super::parse_partial_date("1997"),
+            Some(super::PartialDate {
+                year: 1997,
+                month: 1,
+                day: 1
+            })
+        );
+        assert_eq!(
+            super::parse_partial_date("1997-06"),
+            Some(super::PartialDate {
+                year: 1997,
+                month: 6,
+                day: 1
+            })
+        );
+        assert_eq!(
+            super::parse_partial_date(" 1997-06-16 "),
+            Some(super::PartialDate {
+                year: 1997,
+                month: 6,
+                day: 16
+            })
+        );
+        // Out-of-range parts are not a date.
+        assert_eq!(super::parse_partial_date("1997-13"), None);
+        assert_eq!(super::parse_partial_date("1997-06-40"), None);
+        assert_eq!(super::parse_partial_date("not a date"), None);
+    }
+
+    #[test]
+    fn a_partial_date_converts_to_midnight_utc() {
+        let date = super::PartialDate {
+            year: 1997,
+            month: 6,
+            day: 16,
+        };
+        assert_eq!(
+            date.to_utc().map(|d| d.to_rfc3339()),
+            Some("1997-06-16T00:00:00+00:00".to_owned())
+        );
+    }
     use super::*;
 
     #[test]
@@ -336,7 +490,7 @@ mod tests {
         .expect("release search");
         let first = s.releases.into_iter().next().unwrap();
         assert_eq!(first.id, "rel-1");
-        assert_eq!(first.release_group.map(|g| g.id).as_deref(), Some("rg-1"));
+        assert_eq!(first.group.map(|g| g.id).as_deref(), Some("rg-1"));
     }
 
     #[test]

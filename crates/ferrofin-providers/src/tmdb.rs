@@ -470,6 +470,101 @@ fn season_details_from(resp: SeasonResponse) -> SeasonDetails {
     }
 }
 
+/// `None` for an absent or empty string — TMDB returns `""` as often as `null`.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// One page of `/movie|tv/{id}/similar`.
+#[derive(Debug, Deserialize)]
+struct SimilarResponse {
+    #[serde(default)]
+    results: Vec<SimilarHit>,
+    #[serde(default)]
+    total_pages: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SimilarHit {
+    #[serde(default)]
+    id: i64,
+}
+
+/// One `/search/collection` result.
+#[derive(Debug, Deserialize)]
+struct CollectionSearchResponse {
+    #[serde(default)]
+    results: Vec<CollectionSearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionSearchHit {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionResponse {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    poster_path: Option<String>,
+    #[serde(default)]
+    backdrop_path: Option<String>,
+    #[serde(default)]
+    images: CollectionImages,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CollectionImages {
+    #[serde(default)]
+    posters: Vec<CollectionImage>,
+    #[serde(default)]
+    backdrops: Vec<CollectionImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionImage {
+    #[serde(default)]
+    file_path: Option<String>,
+}
+
+/// One TMDB collection search candidate (the box-set Identify row).
+#[derive(Debug, Clone)]
+pub struct TmdbCollectionHit {
+    /// The collection's TMDB id.
+    pub tmdb_id: i64,
+    /// The collection's name.
+    pub name: String,
+    /// The collection's overview, when TMDB has one.
+    pub overview: Option<String>,
+    /// The collection poster's absolute URL.
+    pub poster_url: Option<String>,
+}
+
+/// One TMDB collection's details plus its artwork.
+#[derive(Debug, Clone)]
+pub struct TmdbCollection {
+    /// The collection's TMDB id.
+    pub tmdb_id: i64,
+    /// The collection's name.
+    pub name: String,
+    /// The collection's overview.
+    pub overview: Option<String>,
+    /// Poster/backdrop candidates, TMDB's own pick first.
+    pub images: Vec<RemoteImage>,
+}
+
 /// A TMDB artwork client. Cheap to clone (wraps a [`reqwest::Client`]).
 #[derive(Debug, Clone)]
 pub struct TmdbClient {
@@ -648,6 +743,88 @@ impl TmdbClient {
         Some(season_details_from(parsed))
     }
 
+    /// Searches TMDB's collections by name (`/search/collection`) — port of
+    /// `TmdbClientManager.SearchCollectionAsync`, the box-set half of the
+    /// Identify flow. Empty on no match or any error.
+    pub async fn search_collection(&self, name: &str) -> Vec<TmdbCollectionHit> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/search/collection", self.base_url))
+            .query(&[("api_key", self.api_key.expose_secret()), ("query", name)])
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<CollectionSearchResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .results
+            .into_iter()
+            .map(|hit| TmdbCollectionHit {
+                tmdb_id: hit.id,
+                name: hit.name.unwrap_or_default(),
+                overview: non_empty(hit.overview),
+                poster_url: non_empty(hit.poster_path).map(|p| format!("{IMAGE_BASE}{p}")),
+            })
+            .collect()
+    }
+
+    /// One collection's details plus its artwork (`/collection/{id}` with
+    /// `append_to_response=images`) — port of
+    /// `TmdbClientManager.GetCollectionAsync`, which backs both
+    /// `TmdbBoxSetProvider` and `TmdbBoxSetImageProvider`.
+    pub async fn collection(&self, tmdb_id: i64) -> Option<TmdbCollection> {
+        let resp = self
+            .http
+            .get(format!("{}/collection/{tmdb_id}", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("append_to_response", "images"),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let parsed: CollectionResponse = resp.json().await.ok()?;
+        // The single `poster_path`/`backdrop_path` come first (they are TMDB's
+        // own pick), then the rest of the `images` lists — same order the C#
+        // `ConvertPostersToRemoteImageInfo`/`ConvertBackdrops…` pair yields.
+        let mut images = Vec::new();
+        let mut push = |path: Option<String>, image_type: ImageType| {
+            if let Some(path) = non_empty(path) {
+                images.push(RemoteImage {
+                    image_type,
+                    url: format!("{IMAGE_BASE}{path}"),
+                });
+            }
+        };
+        push(parsed.poster_path, ImageType::Primary);
+        push(parsed.backdrop_path, ImageType::Backdrop);
+        for poster in parsed.images.posters {
+            push(poster.file_path, ImageType::Primary);
+        }
+        for backdrop in parsed.images.backdrops {
+            push(backdrop.file_path, ImageType::Backdrop);
+        }
+        Some(TmdbCollection {
+            tmdb_id: parsed.id,
+            name: parsed.name.unwrap_or_default(),
+            overview: non_empty(parsed.overview),
+            images,
+        })
+    }
+
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"
     /// flow). Empty on no match or any error.
     pub async fn search(
@@ -690,6 +867,42 @@ impl TmdbClient {
                 overview: hit.overview.filter(|o| !o.is_empty()),
             })
             .collect()
+    }
+
+    /// One page of TMDB's "similar titles" for a movie or series
+    /// (`/movie|tv/{id}/similar`) — port of
+    /// `TmdbClientManager.GetMovieSimilarPageAsync`/its TV twin.
+    ///
+    /// Returns the page's TMDB ids and the reported total page count, so the
+    /// caller can walk the pages the way the C# provider does. Empty on any
+    /// error.
+    pub async fn similar_page(&self, kind: TmdbKind, tmdb_id: i64, page: i32) -> (Vec<i64>, i32) {
+        let path = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Series => "tv",
+        };
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
+            .query(&[
+                ("api_key", self.api_key.expose_secret()),
+                ("page", &page.max(1).to_string()),
+            ])
+            .send()
+            .await
+        else {
+            return (Vec::new(), 0);
+        };
+        if !resp.status().is_success() {
+            return (Vec::new(), 0);
+        }
+        let Ok(parsed) = resp.json::<SimilarResponse>().await else {
+            return (Vec::new(), 0);
+        };
+        (
+            parsed.results.into_iter().map(|hit| hit.id).collect(),
+            parsed.total_pages,
+        )
     }
 
     /// Lists **all** poster (Primary) + backdrop images TMDB has for a title (the
@@ -1004,6 +1217,80 @@ mod tests {
     // regulars credited in it (billing order), then its guest stars (typed
     // GuestStar), then the wanted crew — the shape upstream's
     // TmdbEpisodeProvider produces.
+    #[tokio::test]
+    async fn collection_search_and_details_map_the_box_set_shape() {
+        let search = r#"{"results":[
+            {"id":2344,"name":"The Matrix Collection","poster_path":"/c.jpg","overview":"Neo."},
+            {"id":9,"name":"Other","poster_path":null,"overview":""}
+        ]}"#;
+        let collection = r#"{"id":2344,"name":"The Matrix Collection","overview":"Neo.",
+            "poster_path":"/pick.jpg","backdrop_path":"/back.jpg",
+            "images":{"posters":[{"file_path":"/alt.jpg"}],
+                      "backdrops":[{"file_path":"/alt-back.jpg"}]}}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/search/collection", search.to_owned()),
+            ("/collection/", collection.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let hits = client.search_collection("Matrix").await;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].tmdb_id, 2344);
+        assert_eq!(
+            hits[0].poster_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/c.jpg")
+        );
+        // An empty poster path / overview is `None`, not an empty string.
+        assert_eq!(hits[1].poster_url, None);
+        assert_eq!(hits[1].overview, None);
+
+        let details = client.collection(2344).await.expect("collection");
+        assert_eq!(details.name, "The Matrix Collection");
+        assert_eq!(details.overview.as_deref(), Some("Neo."));
+        // TMDB's own pick first, then the rest of each list.
+        let urls: Vec<&str> = details.images.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://image.tmdb.org/t/p/original/pick.jpg",
+                "https://image.tmdb.org/t/p/original/back.jpg",
+                "https://image.tmdb.org/t/p/original/alt.jpg",
+                "https://image.tmdb.org/t/p/original/alt-back.jpg",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_collection_search_term_makes_no_request() {
+        let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
+        assert!(client.search_collection("  ").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn similar_pages_yield_their_ids_and_page_count() {
+        let body = r#"{"page":1,"total_pages":3,"results":[{"id":603},{"id":604}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![("/similar", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (ids, total) = client.similar_page(TmdbKind::Movie, 27205, 1).await;
+        assert_eq!(ids, [603, 604]);
+        assert_eq!(total, 3);
+        // The TV path is the same shape.
+        let (ids, _) = client.similar_page(TmdbKind::Series, 1396, 1).await;
+        assert_eq!(ids, [603, 604]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_similar_request_yields_no_ids() {
+        // Nothing listening: the client must degrade, not error.
+        let client = TmdbClient::new().with_base_url("http://127.0.0.1:1");
+        assert_eq!(
+            client.similar_page(TmdbKind::Movie, 1, 1).await,
+            (vec![], 0)
+        );
+        assert!(client.collection(1).await.is_none());
+    }
+
     #[tokio::test]
     async fn episode_credits_map_cast_guests_and_crew() {
         use crate::mock_http::MockServer;

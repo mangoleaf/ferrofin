@@ -175,6 +175,13 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
 /// `shutdown` sender is handed to the [`FerrofinLifecycleController`] so a
 /// `/System/Restart|Shutdown` request can trigger axum's graceful shutdown.
 ///
+/// `fpcalc` is the intro skipper's fallback fingerprint backend, pre-probed by
+/// the caller (`ferrofin_extensions::fingerprint::discover_fpcalc_async`)
+/// alongside the ffmpeg capability reads. Probing it here instead cost 18 ms of
+/// a 71 ms warm start, because it is a synchronous process spawn in the middle
+/// of an otherwise CPU-bound wiring sequence. `None` means "no `fpcalc`" — the
+/// same answer a failed probe gives.
+///
 /// Managers are constructed in dependency order: leaf repositories and the
 /// `Database`-only services first, then the managers that consume them, then the
 /// managers that consume *those*. The media-encoding seams are left as the
@@ -194,6 +201,7 @@ pub async fn build_app_state(
     db: &Database,
     config: &Config,
     ffmpeg: &FfmpegPaths,
+    fpcalc: Option<String>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<WiredApp> {
     // ---- paths (concrete) -------------------------------------------------
@@ -308,6 +316,10 @@ pub async fn build_app_state(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
     ));
+    // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
+    // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
+    // `omdb_api_key`) is set: every call returns nothing without a key.
+    let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -320,6 +332,18 @@ pub async fn build_app_state(
         Arc::new(ferrofin_providers::TvdbSearchProvider::new(Arc::clone(
             &the_tvdb,
         ))),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Series,
+        )),
+        // Box sets identify against TMDB's collections, a separate endpoint.
+        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
     ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
@@ -370,7 +394,10 @@ pub async fn build_app_state(
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
-            .with_studios(Arc::clone(&studios_client)),
+            .with_studios(Arc::clone(&studios_client))
+            // Enables the kind-filtered built-in external-id descriptors the
+            // Identify dialog renders as id input fields.
+            .with_item_types(item_type_lookup.as_ref()),
     );
     let file_system: Arc<dyn ferrofin_traits::filesystem::FileSystem> =
         Arc::new(FerrofinFileSystem::new());
@@ -463,9 +490,6 @@ pub async fn build_app_state(
     );
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
-    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
-        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository)),
-    );
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
         Arc::new(FerrofinSearchManager::new(Arc::clone(&item_repository)));
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
@@ -495,6 +519,29 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // Similar items: the local weighted-overlap scorer always runs; the remote
+    // providers below run only for a library that ticked them in its
+    // "Similarity providers" list, in the admin's configured order.
+    let similar_providers: Vec<Arc<dyn ferrofin_traits::library::RemoteSimilarItemsProvider>> = vec![
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Movie,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Series,
+            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
+        )),
+        Arc::new(ferrofin_providers::ListenBrainzSimilarArtistProvider::new(
+            Arc::new(ferrofin_providers::ListenBrainzClient::default()),
+        )),
+    ];
+    let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
+        FerrofinSimilarItemsManager::new(db.clone(), Arc::clone(&item_repository))
+            .with_remote_providers(similar_providers, Arc::clone(&virtual_folders))
+            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("similar")),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -526,11 +573,11 @@ pub async fn build_app_state(
         (!config.fanart_personal_api_key.is_empty())
             .then(|| config.fanart_personal_api_key.clone()),
     )))
-    // Rotten Tomatoes critic ratings via OMDb — enabled only when an OMDb API
-    // key is configured (FERROFIN_OMDB_KEY / config.toml `omdb_api_key`).
-    .with_omdb(Arc::new(ferrofin_providers::OmdbClient::new(
-        &config.omdb_api_key,
-    )))
+    // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
+    // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
+    // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
+    // config.toml `omdb_api_key`).
+    .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
     // Resolve MusicBrainz ids for music items in the post-scan enrichment pass
@@ -622,9 +669,26 @@ pub async fn build_app_state(
             }
         });
     }
-    if let Err(err) = library_monitor.start().await {
-        tracing::warn!(%err, "failed to start library monitor");
-    }
+    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
+    // inotify recursive watch adds one kernel watch per directory under every
+    // library root, so its cost scales with the library's directory count and
+    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
+    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
+    // far worse). Awaiting it here put that walk *before* the listener binds,
+    // where every millisecond is a client getting connection-refused rather
+    // than a slow response.
+    //
+    // Nothing needs the watches to exist before the server serves: they only
+    // feed realtime change detection, which is already blind for the whole of
+    // boot, and a change arriving during the walk is picked up by the next
+    // scheduled scan exactly as one arriving a moment earlier would be. So it
+    // is spawned and boot continues.
+    let monitor_start = Arc::clone(&library_monitor);
+    tokio::spawn(async move {
+        if let Err(err) = monitor_start.start().await {
+            tracing::warn!(%err, "failed to start library monitor");
+        }
+    });
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -747,12 +811,15 @@ pub async fn build_app_state(
     // `chromaprint` muxer, else `fpcalc`; otherwise it loads but reports
     // unavailable at run time.
     let fingerprinter: Option<Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>> =
-        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_ffmpeg_chromaprint(
+        ferrofin_extensions::fingerprint::ChromaprintFingerprinter::with_backends(
             &ffmpeg.ffmpeg.to_string_lossy(),
             // Already probed by `discover_ffmpeg`, concurrently with the other
             // capability reads — re-probing here spawned `ffmpeg -muxers` a
-            // second time, synchronously, on the startup critical path.
+            // second time, synchronously, on the startup critical path. The
+            // `fpcalc` fallback arrives the same way and for the same reason:
+            // its own `-version` spawn was 18 ms of a 71 ms warm start.
             ffmpeg.chromaprint_muxer,
+            fpcalc,
         )
         .map(|fp| {
             tracing::debug!(backend = fp.backend(), "intro skipper: fingerprint backend");
@@ -895,18 +962,22 @@ pub async fn build_app_state(
         ));
 
     // ---- dto (consumes many of the above) ---------------------------------
-    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(FerrofinDtoService::new(
-        db.clone(),
-        server_id.clone(),
-        Arc::clone(&library),
-        Arc::clone(&user_data),
-        Arc::clone(&item_count_service),
-        Arc::clone(&image_processor),
-        Arc::clone(&media_sources),
-        Arc::clone(&chapters),
-        Arc::clone(&trickplay),
-        Arc::clone(&providers),
-    ));
+    let dto: Arc<dyn ferrofin_traits::dto::DtoService> = Arc::new(
+        FerrofinDtoService::new(
+            db.clone(),
+            server_id.clone(),
+            Arc::clone(&library),
+            Arc::clone(&user_data),
+            Arc::clone(&item_count_service),
+            Arc::clone(&image_processor),
+            Arc::clone(&media_sources),
+            Arc::clone(&chapters),
+            Arc::clone(&trickplay),
+        )
+        // The music "Links" row points at the configured MusicBrainz mirror, as
+        // Jellyfin's link providers use the plugin's configured server.
+        .with_musicbrainz_server(&config.musicbrainz_base_url),
+    );
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because
@@ -929,7 +1000,10 @@ pub async fn build_app_state(
         .with_session_bus(Arc::clone(&session_bus))
         // So a playback-stopped report closes the live stream it names (C#
         // `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync`).
-        .with_media_sources(Arc::clone(&media_sources)),
+        .with_media_sources(Arc::clone(&media_sources))
+        // So casting an instant mix expands the seed into the mix (C#
+        // `SendPlayCommand` -> `TranslateItemForInstantMix`).
+        .with_music_manager(Arc::clone(&music)),
     );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -1205,6 +1279,10 @@ pub async fn build_app_state(
     let me_path_manager = Arc::clone(&path_manager);
     // The transcode planner resolves item/library display names for its logs.
     let me_library = Arc::clone(&library);
+    // SyncPlay resolves each member's library access; it is built after the
+    // state below, which takes ownership of these.
+    let sync_play_users = Arc::clone(&users);
+    let sync_play_library = Arc::clone(&library);
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(
@@ -1290,7 +1368,10 @@ pub async fn build_app_state(
     // The SyncPlay manager shares the session message bus (created with the
     // session manager above) to deliver group commands to member sockets.
     let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> = Arc::new(
-        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus)),
+        ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus))
+            // So a group whose queue a user cannot see is hidden from them and
+            // refuses their join (C# `Group.HasAccessToPlayQueue`).
+            .with_library_access(sync_play_users, sync_play_library),
     );
     // A session that ended (its last socket closed, or it logged out) leaves its
     // SyncPlay group — port of `SyncPlayManager.OnSessionEnded`. Without it the
@@ -1404,7 +1485,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::oneshot::channel();
 
-        let wired = build_app_state(&db, &config, &ffmpeg, tx)
+        let wired = build_app_state(&db, &config, &ffmpeg, None, tx)
             .await
             .expect("app state wires");
 

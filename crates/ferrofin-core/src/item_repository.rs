@@ -83,6 +83,22 @@ impl FerrofinItemRepository {
         Ok(rows)
     }
 
+    /// Runs a translated query returning only the id and clean-name columns.
+    ///
+    /// Same statement as [`Self::fetch_rows`] but for the projection, so the
+    /// rows — and their order — are identical to what `get_item_list` would
+    /// have returned.
+    async fn fetch_id_clean_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        let mut qb = build_query(filter, QueryShape::IdAndCleanName);
+        qb.build_query_as::<(String, Option<String>)>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
+    }
+
     /// Runs a translated query returning only the id column.
     async fn fetch_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         let mut qb = build_query(filter, QueryShape::IdsOnly);
@@ -566,6 +582,35 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(row)
     }
 
+    async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let rows: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "IsLocked" = 1"#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn item_text_rows(
+        &self,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
+        let Some(type_name) = crate::item_type_lookup::stored_type_name(kind) else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_as::<_, ferrofin_db::entities::base_items::ItemTextRow>(
+            r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
+               FROM "BaseItems" WHERE "Type" = ?1"#,
+        )
+        .bind(type_name)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     async fn get_ancestor_chain(
         &self,
         item_id: Uuid,
@@ -634,6 +679,13 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         self.fetch_rows(filter, QueryShape::FullRows).await
+    }
+
+    async fn get_item_id_clean_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        self.fetch_id_clean_names(filter).await
     }
 
     async fn get_latest_item_list(
@@ -1144,7 +1196,8 @@ mod tests {
     use super::*;
     use crate::item_type_lookup::ItemTypeLookup;
     use crate::test_support::{
-        seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, test_db,
+        seed_item, seed_item_genre, seed_named_item, seed_user, seed_user_data, set_clean_name,
+        test_db,
     };
     use ferrofin_db::Database;
     use ferrofin_model::data::BaseItemKind;
@@ -1183,6 +1236,194 @@ mod tests {
             .expect("get_items");
         assert_eq!(res.total_record_count, 1);
         assert_eq!(res.items.len(), 1);
+    }
+
+    /// The locked-item read must SEEK the partial index, never scan `BaseItems`.
+    ///
+    /// `run_scan` reads this set once, and it is shared with `scan_paths` —
+    /// the library-monitor path that runs for one or two items on every
+    /// filesystem event. Without `FerrofinIX_BaseItems_IsLocked` (migration
+    /// 0017) the plan is `SCAN BaseItems`: 26-53 ms warm on a 100k-item table,
+    /// paid per watcher event, where the old per-item lookup cost ~1 ms.
+    #[tokio::test]
+    async fn locked_item_ids_seeks_the_partial_index() {
+        let db = test_db().await;
+        let plan: Vec<String> = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            r#"EXPLAIN QUERY PLAN SELECT "Id" FROM "BaseItems" WHERE "IsLocked" = 1"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("explain query plan")
+        .into_iter()
+        .map(|(_, _, _, detail)| detail)
+        .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("FerrofinIX_BaseItems_IsLocked")),
+            "the locked-item read must use the partial index, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.trim() == "SCAN BaseItems"),
+            "the locked-item read must not scan BaseItems, got: {plan:?}"
+        );
+    }
+
+    /// Two rows sharing a `CleanName` must resolve to the SAME id under both
+    /// projections — the tie-break the by-name resolvers depend on.
+    ///
+    /// This is the one place the narrower projection could legitimately change
+    /// the answer. `get_named_item_ids` passes a default query, so the ORDER BY
+    /// is the bare `SortName`, and Person rows in a real database have
+    /// `SortName IS NULL` — a total tie, where row order among duplicates is
+    /// whatever the sorter happens to emit. The resolvers keep the first match
+    /// (`or_insert`), so the two forms must agree on which row comes first.
+    ///
+    /// It is currently latent rather than live: `BaseItems.Id` is a TEXT PRIMARY
+    /// KEY on a rowid table, so no index covers either projection and
+    /// EXPLAIN QUERY PLAN is byte-identical for both. This test is what would
+    /// catch that changing.
+    #[tokio::test]
+    async fn duplicate_clean_names_resolve_identically_under_both_projections() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        // Same CleanName, no SortName — the total-tie case.
+        for n in [0x9201u128, 0x9202, 0x9203] {
+            seed_named_item(&db, Uuid::from_u128(n), BaseItemKind::Person, "Jane Doe").await;
+            set_clean_name(&db, Uuid::from_u128(n), "Jane Doe").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Id" = ?1"#)
+                .bind(guid_to_db(Uuid::from_u128(n)))
+                .execute(db.writer())
+                .await
+                .expect("null sort name");
+        }
+
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Person],
+            ..InternalItemsQuery::default()
+        };
+
+        let first_full = |rows: Vec<ferrofin_db::entities::base_items::BaseItemEntity>| {
+            rows.first().map(|r| r.id.clone())
+        };
+        // Repeated, because a tie-break that is merely *usually* stable is not a
+        // tie-break — the resolvers cache the first id they see.
+        for round in 0..5 {
+            let full = first_full(repository.get_item_list(&query).await.expect("rows"));
+            let pairs = repository
+                .get_item_id_clean_names(&query)
+                .await
+                .expect("pairs");
+            assert_eq!(
+                pairs.len(),
+                3,
+                "round {round}: both forms must return every duplicate"
+            );
+            assert_eq!(
+                full,
+                pairs.first().map(|(id, _)| id.clone()),
+                "round {round}: the two projections disagree on which duplicate is first, \
+                 so the by-name resolvers would resolve different ids"
+            );
+        }
+    }
+
+    // The two-column projection is only safe because it runs the SAME statement
+    // as `get_item_list` — same predicates, same ordering, same paging — so its
+    // rows must line up with the full-row form one for one. If the two ever
+    // drift, the by-name resolvers silently resolve the wrong id.
+    #[tokio::test]
+    async fn id_clean_name_projection_matches_the_full_row_query() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        for (n, name) in [(0x9101, "Zulu"), (0x9102, "Alpha"), (0x9103, "Mike")] {
+            seed_named_item(&db, Uuid::from_u128(n), BaseItemKind::Movie, name).await;
+            // The clean name is the join key the by-name resolvers match on, so
+            // the projection has to carry the CLEANED value, not the display name.
+            set_clean_name(&db, Uuid::from_u128(n), name).await;
+            // A real SortName, so the shared ORDER BY actually orders and the
+            // two forms are compared on a non-trivial row order.
+            sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(Uuid::from_u128(n)))
+                .bind(name.to_lowercase())
+                .execute(db.writer())
+                .await
+                .expect("sort name");
+        }
+        // A different kind must be excluded by both forms alike.
+        seed_named_item(&db, Uuid::from_u128(0x9104), BaseItemKind::Series, "Alpha").await;
+
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            ..InternalItemsQuery::default()
+        };
+        let rows = repository.get_item_list(&query).await.expect("rows");
+        let pairs = repository
+            .get_item_id_clean_names(&query)
+            .await
+            .expect("pairs");
+        assert_eq!(pairs.len(), 3, "the Series row must not leak in");
+        assert_eq!(
+            pairs.iter().map(|(_, c)| c.clone()).collect::<Vec<_>>(),
+            vec![
+                Some("alpha".to_owned()),
+                Some("mike".to_owned()),
+                Some("zulu".to_owned())
+            ],
+            "the projection carries the CLEAN name, in the query's sort order"
+        );
+        let expected: Vec<(String, Option<String>)> =
+            rows.into_iter().map(|r| (r.id, r.clean_name)).collect();
+        assert_eq!(pairs, expected);
+
+        // Descending is the order no unordered scan can produce by accident, so
+        // this is what pins the shared ORDER BY rather than a lucky row order.
+        let desc = InternalItemsQuery {
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Descending,
+            )],
+            ..query.clone()
+        };
+        assert_eq!(
+            repository
+                .get_item_id_clean_names(&desc)
+                .await
+                .expect("desc pairs")
+                .iter()
+                .map(|(_, c)| c.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("zulu".to_owned()),
+                Some("mike".to_owned()),
+                Some("alpha".to_owned())
+            ]
+        );
+
+        // Paging applies to the projection exactly as it does to the rows.
+        let paged = InternalItemsQuery {
+            limit: Some(2),
+            start_index: Some(1),
+            ..query.clone()
+        };
+        let paged_rows: Vec<(String, Option<String>)> = repository
+            .get_item_list(&paged)
+            .await
+            .expect("paged rows")
+            .into_iter()
+            .map(|r| (r.id, r.clean_name))
+            .collect();
+        assert_eq!(paged_rows.len(), 2);
+        assert_eq!(
+            repository
+                .get_item_id_clean_names(&paged)
+                .await
+                .expect("paged pairs"),
+            paged_rows
+        );
     }
 
     #[tokio::test]

@@ -814,12 +814,6 @@ impl ProviderManager for StubProviders {
     async fn save_metadata(&self, _i: Uuid, _u: ItemUpdateType) -> Result<(), ServiceError> {
         unimplemented!()
     }
-    async fn get_external_urls(
-        &self,
-        _i: Uuid,
-    ) -> Result<Vec<ferrofin_model::providers::ExternalUrl>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_all_metadata_plugins(
         &self,
     ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError> {

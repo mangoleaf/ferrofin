@@ -31,9 +31,11 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
-use ferrofin_model::io::FileSystemEntryType;
+use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_model::media_info::MediaInfo;
 use ferrofin_naming::audio::is_audio_file;
+use ferrofin_naming::audiobook::AudioBookListResolver;
+use ferrofin_naming::book::book_file_name_parser;
 use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
@@ -78,6 +80,9 @@ struct ArtworkCache {
     /// Item id → the external ids the metadata match yielded, so the image pass
     /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
     item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Item id → OMDb's poster URL, captured during the metadata pass so the
+    /// image pass can use it without a second OMDb request.
+    omdb_poster: std::collections::HashMap<String, String>,
 }
 
 /// What a remote metadata fetch yields for one item: the cast/crew to persist
@@ -124,12 +129,12 @@ struct StoredText {
 }
 
 impl StoredText {
-    fn from_row(row: &BaseItemEntity) -> Self {
+    fn from_row(row: &ferrofin_db::entities::base_items::ItemTextRow) -> Self {
         Self {
             name: row.name.clone(),
             sort_name: row.sort_name.clone(),
             overview: row.overview.clone(),
-            titled: !name_is_file_stem_placeholder(row),
+            titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
         }
     }
 
@@ -300,6 +305,28 @@ impl<'a> FetcherPolicy<'a> {
                 .iter()
                 .any(|f| f.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// The library's preferred metadata language, lowercased. Jellyfin's own
+    /// default is `en`, which is what a library with no saved value gets.
+    fn metadata_language(self) -> String {
+        self.options
+            .and_then(|o| o.preferred_metadata_language.as_deref())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or("en")
+            .to_lowercase()
+    }
+
+    /// The library's metadata country code, lowercased (Jellyfin defaults to
+    /// `US`). OMDb's certificate is only taken for the US.
+    fn country_code(self) -> String {
+        self.options
+            .and_then(|o| o.metadata_country_code.as_deref())
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("US")
+            .to_lowercase()
     }
 
     /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order.
@@ -1087,17 +1114,18 @@ impl LibraryScanner {
         // never runs for that library's items, and the saved order picks
         // the authority when fetchers compete.
         let fetcher_policies = fetcher_policies(folders);
+        // One read of the locked-item set for the whole scan, replacing the
+        // per-item row hydration this loop used to pay (see `locked_items`).
+        let locked_items = self.locked_items(&planned).await;
+        // Same one-read-per-scan shape, for the episode providers' gate.
+        let stored_text = self.stored_episode_text(&planned).await;
         // ffprobe dominates scan wall time and touches nothing but the file it
         // reads, so it runs `probe_concurrency` files ahead of this loop. The
         // loop itself is unchanged: same plan order, same rows, same writes.
         let mut probes = self.probe_pipeline(&planned);
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
-            // Bounded progress cadence (RULES_LOGGING volume rule); `0` disables it.
-            if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every)
-            {
-                tracing::info!(scanned, total = planned.len(), "library scan progress");
-            }
+            self.log_scan_progress(scanned, planned.len());
             if self.events.is_some() && !self.persistence.item_exists(item.id).await.unwrap_or(true)
             {
                 items_added.push(item);
@@ -1107,18 +1135,11 @@ impl LibraryScanner {
             // when `IsLocked`), and leave its people/images untouched below.
             // The scan-upsert's `IsLocked` guard backstops the metadata
             // columns; file-derived facts (the probe) still update.
-            // Reduced immediately: only the small carrier crosses the awaits
-            // below, never the whole row.
-            let (locked, stored) = self.stored_row(item.id).await.map_or_else(
-                || (false, None),
-                |row| (row.is_locked, Some(StoredText::from_row(&row))),
-            );
-            let policy = item
-                .ancestors
-                .first()
-                .and_then(|id| fetcher_policies.get(id))
-                .copied()
-                .unwrap_or_default();
+            let locked = locked_items.contains(&item.id);
+            let policy = policy_for(item, &fetcher_policies);
+            // What a previous scan already achieved for this row, from the same
+            // read-once-per-scan batch the lock set uses.
+            let stored = stored_text.get(&item.id);
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
@@ -1145,15 +1166,18 @@ impl LibraryScanner {
                 // the per-item future, and inlining it puts the whole scan
                 // future over clippy's `large_futures` ceiling — the scan loop
                 // is held across every await in it.
-                Box::pin(self.fetch_remote_metadata(
-                    &mut entity,
-                    &mut art_cache,
-                    policy,
-                    stored.as_ref(),
-                ))
-                .await
+                Box::pin(self.fetch_remote_metadata(&mut entity, &mut art_cache, policy, stored))
+                    .await
             };
             let people_fetched = remote.people_fetched;
+            // Photos and books carry their metadata inside the file, not on any
+            // remote provider. A photo's Primary image is the file itself; a
+            // book's is the cover extracted from its archive.
+            let (embedded_people, embedded_images) =
+                self.enrich_from_file(&mut entity, locked).await;
+            if people.is_empty() {
+                people = embedded_people;
+            }
             if people.is_empty() {
                 people = remote.people;
             }
@@ -1191,14 +1215,17 @@ impl LibraryScanner {
             if let (false, Some(repo)) = (streams.is_empty(), &self.media_streams) {
                 repo.save_media_streams(item.id, &streams).await?;
             }
-            if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
-                repo.save_chapters(item.id, &chapters).await?;
-            }
+            self.save_chapters(item.id, &chapters).await?;
             // Artwork — locked items skip the rewrite entirely: their image
             // rows are user-owned.
             if !locked {
-                self.persist_artwork(item.id, &entity, &streams, &mut art_cache, policy)
-                    .await;
+                let art = ArtworkPass {
+                    entity: &entity,
+                    streams: &streams,
+                    policy,
+                    embedded_images,
+                };
+                self.persist_artwork(item.id, art, &mut art_cache).await;
             }
             // Per-library refresh % for open dashboards (`RefreshProgress`),
             // at the same bounded cadence as the progress log plus each
@@ -1410,8 +1437,8 @@ impl LibraryScanner {
     /// share, detached drive) walks as empty, which is indistinguishable from
     /// "everything was deleted" — such libraries are skipped with a warning
     /// rather than mass-pruned. Collection types the planner doesn't scan
-    /// (books/photos/…) are also skipped: their empty plan means "not
-    /// managed", not "deleted".
+    /// (`boxsets`) are also skipped: their empty plan means "not managed", not
+    /// "deleted".
     ///
     /// Returns the deleted item ids per library, feeding the scan-end
     /// `LibraryChanged` push.
@@ -1446,6 +1473,7 @@ impl LibraryScanner {
                         | CollectionTypeOptions::homevideos
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed
+                        | CollectionTypeOptions::books
                 )
             );
             if !planner_scans_type {
@@ -1738,6 +1766,7 @@ impl LibraryScanner {
                     .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
                     .await;
             }
+            apply_release_details(&mut updated, mb, resolved.release_id.as_deref()).await;
 
             self.enrich_album_artwork(
                 album_uuid,
@@ -1847,6 +1876,30 @@ impl LibraryScanner {
             let mut updated = artist.clone();
             let mut changed = false;
             let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
+            // MusicBrainz's own artist fields (C# `MusicBrainzArtistProvider`
+            // writes more than the id): the life span, whose end is what the
+            // artist NFO saver emits as `<disbanded>`.
+            if mb_enabled
+                && (updated.premiere_date.is_none() || updated.end_date.is_none())
+                && let Some(details) = mb.artist_details(&id).await
+            {
+                if updated.premiere_date.is_none()
+                    && let Some(begin) = details
+                        .premiere_date
+                        .and_then(ferrofin_providers::PartialDate::to_utc)
+                {
+                    updated.premiere_date = Some(begin);
+                    changed = true;
+                }
+                if updated.end_date.is_none()
+                    && let Some(end) = details
+                        .end_date
+                        .and_then(ferrofin_providers::PartialDate::to_utc)
+                {
+                    updated.end_date = Some(end);
+                    changed = true;
+                }
+            }
             if policy.metadata_enabled("MusicArtist", fetcher_names::AUDIODB)
                 && let Some(adb) = &self.audiodb
                 && let Some(a) = adb.artist(&id).await
@@ -1986,6 +2039,8 @@ impl LibraryScanner {
             "Series" => NfoItemKind::Series,
             "Season" => NfoItemKind::Season,
             "Episode" => NfoItemKind::Episode,
+            "MusicAlbum" => NfoItemKind::MusicAlbum,
+            "MusicArtist" => NfoItemKind::MusicArtist,
             _ => return Vec::new(),
         };
         let Some(path) = entity.path.as_deref() else {
@@ -2019,6 +2074,9 @@ impl LibraryScanner {
             }
             NfoItemKind::Episode => {
                 xbmc::fetch_episode(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist => {
+                xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
             _ => return Vec::new(),
         };
@@ -2222,7 +2280,173 @@ impl LibraryScanner {
         {
             return result;
         }
+        // Nothing upstream matched: OMDb closes the chain, matching its C#
+        // `Order = 2` (behind TMDB and TVDB, ahead of nothing).
+        if omdb_on {
+            return self
+                .fetch_omdb_metadata(entity, &short, cache, policy)
+                .await;
+        }
         RemoteMetadata::default()
+    }
+
+    /// The photo embedded-information pass — port of `Emby.Photos.PhotoProvider`.
+    ///
+    /// Sets the Primary image to the photo file itself, reads the EXIF tags off
+    /// it, and writes them onto the row: the dedicated columns Ferrofin has
+    /// (name/overview/rating/dates/width/height) plus the EXIF-only fields,
+    /// which live in the `Data` blob under Jellyfin's own property names.
+    ///
+    /// Returns the Primary image row for the artwork pass to persist. A locked
+    /// item is skipped entirely, as it is for every other provider.
+    async fn enrich_photo(&self, entity: &mut BaseItemEntity, locked: bool) -> Vec<ItemImageInfo> {
+        if !entity.type_.ends_with(".Photo") {
+            return Vec::new();
+        }
+        let Some(processor) = self.image_processor.as_ref() else {
+            return Vec::new();
+        };
+        let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
+            return Vec::new();
+        };
+        let item_id = Uuid::parse_str(&entity.id).unwrap_or_else(|_| Uuid::nil());
+        let mut photo = ferrofin_drawing::photo_provider::PhotoItem {
+            id: item_id,
+            path,
+            is_file_protocol: true,
+            width: entity
+                .width
+                .and_then(|w| i32::try_from(w).ok())
+                .unwrap_or(0),
+            height: entity
+                .height
+                .and_then(|h| i32::try_from(h).ok())
+                .unwrap_or(0),
+            name: entity.name.clone(),
+            name_locked: locked,
+            ..Default::default()
+        };
+        let provider = ferrofin_drawing::photo_provider::PhotoProvider::new(Arc::clone(processor));
+        if let Err(err) = provider.fetch(&mut photo).await {
+            tracing::warn!(%err, item = %entity.id, "photo embedded-information pass failed");
+            return Vec::new();
+        }
+        if photo.width > 0 {
+            entity.width = Some(i64::from(photo.width));
+        }
+        if photo.height > 0 {
+            entity.height = Some(i64::from(photo.height));
+        }
+        if !locked {
+            if let Some(name) = photo.name.filter(|n| !n.is_empty()) {
+                entity.name = Some(name);
+            }
+            if photo.overview.is_some() {
+                entity.overview = photo.overview;
+            }
+            if photo.community_rating.is_some() {
+                entity.community_rating = photo.community_rating;
+            }
+            if let Some(taken) = photo.date_taken {
+                entity.premiere_date = Some(taken);
+                entity.production_year = photo.production_year.map(i64::from);
+            }
+        }
+        if let Some(data) = crate::item_data::merge_data_fields(
+            entity.data.as_deref(),
+            &photo_exif_fields(&photo.exif),
+        ) {
+            entity.data = Some(data);
+        }
+        photo.images
+    }
+
+    /// The OMDb fetcher — port of `OmdbItemProvider` and `OmdbEpisodeProvider`.
+    ///
+    /// Movies and series resolve through OMDb's exact-title endpoint (upstream's
+    /// `GetImdbId` fallback when the item carries no IMDb id); an episode is read
+    /// out of its series' season listing, keyed by the series' IMDb id recorded
+    /// earlier in this scan. A row that already has an overview and both ratings
+    /// has nothing left for OMDb to fill, so a re-scan makes no request.
+    ///
+    /// `Rated` and `Genres` are only taken for an English library (OMDb has no
+    /// localization — C# `IsConfiguredForEnglish`), and `Rated` additionally only
+    /// for a US metadata country, both exactly as upstream gates them.
+    async fn fetch_omdb_metadata(
+        &self,
+        entity: &mut BaseItemEntity,
+        short: &str,
+        cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
+    ) -> RemoteMetadata {
+        let Some(omdb) = self.omdb.as_ref().filter(|o| o.is_enabled()) else {
+            return RemoteMetadata::default();
+        };
+        let has_overview = entity.overview.as_deref().is_some_and(|o| !o.is_empty());
+        if has_overview && entity.community_rating.is_some() && entity.critic_rating.is_some() {
+            return RemoteMetadata::default();
+        }
+        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        let name = entity.name.as_deref().filter(|n| !n.is_empty());
+        let item = match short {
+            "Movie" | "Series" => {
+                let kind = if short == "Movie" {
+                    ferrofin_providers::OmdbKind::Movie
+                } else {
+                    ferrofin_providers::OmdbKind::Series
+                };
+                match name {
+                    Some(name) => omdb.find_by_title(kind, name, year).await,
+                    None => None,
+                }
+            }
+            "Episode" => {
+                let series_imdb = entity
+                    .series_id
+                    .as_deref()
+                    .and_then(|series| cache.item_provider_ids.get(series))
+                    .and_then(|ids| {
+                        ids.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("Imdb"))
+                            .map(|(_, v)| v.clone())
+                    });
+                match (
+                    series_imdb,
+                    entity
+                        .parent_index_number
+                        .and_then(|n| i32::try_from(n).ok()),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) {
+                    (Some(series), Some(season), Some(number)) => {
+                        omdb.episode(&series, season, number, None).await
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(item) = item else {
+            return RemoteMetadata::default();
+        };
+        let english = policy.metadata_language() == "en";
+        let us = policy.country_code() == "us";
+        apply_omdb(entity, &item, english, us);
+        if let Some(poster) = item.poster.as_deref().filter(|p| p.starts_with("http")) {
+            cache
+                .omdb_poster
+                .insert(entity.id.clone(), poster.to_owned());
+        }
+        let mut provider_ids = Vec::new();
+        if let Some(id) = item.imdb_id.as_deref().filter(|s| !s.is_empty()) {
+            provider_ids.push(("Imdb".to_owned(), id.to_owned()));
+        }
+        // A completed OMDb fetch, so its credits are authoritative even when
+        // empty — same rule as the TMDB and TVDB arms.
+        RemoteMetadata {
+            people: omdb_people(&item),
+            provider_ids,
+            people_fetched: true,
+        }
     }
 
     /// The TMDB half of the remote-metadata pass. `None` means TMDB had no
@@ -2836,11 +3060,26 @@ impl LibraryScanner {
     async fn persist_artwork(
         &self,
         item_id: Uuid,
-        entity: &BaseItemEntity,
-        streams: &[MediaStreamInfoEntity],
+        art: ArtworkPass<'_>,
         art_cache: &mut ArtworkCache,
-        policy: FetcherPolicy<'_>,
     ) {
+        let ArtworkPass {
+            entity,
+            streams,
+            policy,
+            embedded_images,
+        } = art;
+        // A photo's own file IS its Primary image (C# `PhotoProvider` sets it
+        // before any discovery runs), and a book's cover comes out of its own
+        // archive — neither needs the discovery chain below.
+        if !embedded_images.is_empty() {
+            let mut images = embedded_images;
+            self.fill_image_metadata(&mut images).await;
+            if let Err(err) = self.persistence.save_item_images(item_id, &images).await {
+                tracing::warn!(%err, item = %item_id, "failed to persist embedded artwork");
+            }
+            return;
+        }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // "Local Images" is the media-adjacent discovery (poster.jpg next
         // to the file); the metadata art dir below is Ferrofin-owned
@@ -3092,25 +3331,82 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Whether the stored row for `id` is locked (`IsLocked`, the metadata
-    /// editor's "lock this item"). Absent repository (unit-test builds) or a
-    /// missing/new row → unlocked.
-    /// The row already stored for this item, if any.
+    /// Loads the ids of every metadata-locked item (`IsLocked`, the metadata
+    /// editor's "lock this item"), once per scan. Absent repository
+    /// (unit-test builds) or a read failure → nothing is treated as locked.
     ///
-    /// One read serves two callers: the `IsLocked` guard, and the episode
-    /// providers' re-scan gate. `Planned.entity` is rebuilt from the filesystem
-    /// on every scan — its `name` is always the file stem and its `overview`
-    /// always `None` — so a gate that reads the *planned* entity can never
-    /// fire, and a scan that fetches nothing would write the placeholder back
-    /// over a good title. Only the stored row knows what a previous scan
-    /// achieved.
-    async fn stored_row(&self, id: Uuid) -> Option<BaseItemEntity> {
-        self.item_repository
-            .as_ref()?
-            .retrieve_item(id)
+    /// This used to be a per-item `retrieve_item` — a full `SELECT *`
+    /// hydration of all 72 `BaseItems` columns to read one boolean, paid for
+    /// every planned item on every scan (O(items) queries). Locked items are
+    /// rare (usually none), so the whole answer is one small indexed read and
+    /// the loop looks the id up in the returned set.
+    ///
+    /// The index is what makes that true: `FerrofinIX_BaseItems_IsLocked`
+    /// (migration 0017) is PARTIAL (`WHERE "IsLocked" = 1`), so it holds only
+    /// the locked rows. Without it this is `SCAN BaseItems` — 26-53 ms warm on
+    /// a 100k-item table — which is tolerable amortized over a full scan but
+    /// not on `scan_paths`, the library-monitor path that runs for one or two
+    /// items on every filesystem event.
+    ///
+    /// A lock applied *while* this scan is running is not seen by it, exactly
+    /// as a lock applied one item too late was never seen before. The locked
+    /// item's stored metadata is protected regardless: the scan upsert guards
+    /// every user-owned column with `CASE WHEN "IsLocked" = 1 THEN "<col>"`,
+    /// evaluated against the row's committed value at write time.
+    async fn locked_items(&self, planned: &[Planned]) -> std::collections::HashSet<Uuid> {
+        // Nothing to scan, nothing to look up. `run_scan` is shared with
+        // `scan_paths`, and a noisy directory (`.partial` files, stray
+        // subtitles) produces watcher events that plan zero items — which must
+        // not cost a database read at all.
+        if planned.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let Some(repo) = &self.item_repository else {
+            return std::collections::HashSet::new();
+        };
+        match repo.locked_item_ids().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read locked items; treating none as locked");
+                std::collections::HashSet::new()
+            }
+        }
+    }
+
+    /// The stored text of every episode, read once per scan.
+    ///
+    /// The same shape and the same reason as
+    /// [`locked_items`](Self::locked_items): the episode providers' re-scan
+    /// gate needs what a previous scan achieved, and asking per item would
+    /// reinstate the `SELECT *`-per-item cost that read was introduced to
+    /// remove. Episodes only — they are the sole consumer.
+    async fn stored_episode_text(
+        &self,
+        planned: &[Planned],
+    ) -> std::collections::HashMap<Uuid, StoredText> {
+        if planned.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let Some(repo) = &self.item_repository else {
+            return std::collections::HashMap::new();
+        };
+        match repo
+            .item_text_rows(ferrofin_model::data::BaseItemKind::Episode)
             .await
-            .ok()
-            .flatten()
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    Some((id, StoredText::from_row(&row)))
+                })
+                .collect(),
+            Err(err) => {
+                // A closed gate costs a re-fetch, never wrong data.
+                tracing::warn!(%err, "failed to read stored episode text; re-fetching all");
+                std::collections::HashMap::new()
+            }
+        }
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
@@ -3188,6 +3484,12 @@ impl LibraryScanner {
                 {
                     append_fanart(&mut images, fanart.movie_images(&id).await);
                 }
+                // OMDb's poster is the last-resort Primary (C# `Order = 90`,
+                // "after other internet providers, because they're better").
+                // Appending it last means the dedup keeps it only when nothing
+                // above supplied a Primary. The URL was captured during the
+                // metadata pass, so this costs no extra request.
+                append_omdb_poster(&mut images, entity, cache, policy, short);
                 download_images(tmdb, &item_dir, &entity.id, dedup_images_by_type(images)).await
             }
             "Series" => {
@@ -3305,7 +3607,9 @@ impl LibraryScanner {
             return download_images(tmdb, item_dir, &entity.id, images).await;
         }
         // Episode: prefer the TVDB still cached during the metadata pass; else
-        // fall back to this episode's entry in the cached season response.
+        // fall back to this episode's entry in the cached season response, and
+        // to OMDb's poster last (C# `OmdbImageProvider.Supports` covers Movie,
+        // Trailer and Episode).
         let tvdb_still = policy
             .image_enabled(short, fetcher_names::TVDB)
             .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
@@ -3330,14 +3634,19 @@ impl LibraryScanner {
             }
             None => None,
         };
-        let Some(url) = url else {
+        let mut images = url
+            .map(|url| {
+                vec![RemoteImage {
+                    image_type: ImageType::Primary,
+                    url,
+                }]
+            })
+            .unwrap_or_default();
+        append_omdb_poster(&mut images, entity, cache, policy, short);
+        if images.is_empty() {
             return Vec::new();
-        };
-        let images = vec![RemoteImage {
-            image_type: ImageType::Primary,
-            url,
-        }];
-        download_images(tmdb, item_dir, &entity.id, images).await
+        }
+        download_images(tmdb, item_dir, &entity.id, dedup_images_by_type(images)).await
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -3346,8 +3655,12 @@ impl LibraryScanner {
     /// Dispatches by the library's collection type: `tvshows` builds the
     /// Series→Season→Episode hierarchy, `music` builds MusicAlbum→Audio, and the
     /// video types (`movies`/`homevideos`/`musicvideos`/`mixed`) plus an untyped
-    /// library flatten every video file to a `Movie`. Other types (books, photos,
-    /// …) are not scanned yet.
+    /// library flatten every video file to a `Movie`, and `books` flattens every
+    /// document to a `Book` and every audio file to an `AudioBook`. `boxsets` is
+    /// the one remaining type that is not scanned (its members are curated
+    /// through the collection API, not resolved off disk). Upstream's separate
+    /// `photos` type has no `CollectionTypeOptions` variant here — Ferrofin
+    /// folds it into `homevideos`.
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
         let naming = NamingOptions::new();
         let mut out = Vec::new();
@@ -3363,14 +3676,31 @@ impl LibraryScanner {
                     Some(CollectionTypeOptions::music) => {
                         self.plan_music(location, cf, &naming, &mut out);
                     }
+                    Some(CollectionTypeOptions::books) => {
+                        self.plan_books(location, location, cf, &naming, &mut out);
+                    }
                     None
                     | Some(
                         CollectionTypeOptions::movies
                         | CollectionTypeOptions::homevideos
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
-                    ) => self.plan_movies(location, location, cf, &naming, &mut out),
-                    // books / photos / boxsets / … aren't scanned in v1.
+                    ) => {
+                        self.plan_movies(location, location, cf, &naming, &mut out);
+                        // Upstream folds the separate `photos` collection type
+                        // into `homevideos`, where photos are resolved only when
+                        // the library enables them (`PhotoResolver.Resolve`).
+                        if folder.collection_type == Some(CollectionTypeOptions::homevideos)
+                            && folder
+                                .library_options
+                                .as_ref()
+                                .is_none_or(|o| o.enable_photos)
+                        {
+                            self.plan_photos(location, location, cf, cf, &naming, &mut out);
+                        }
+                    }
+                    // `boxsets` is the only type left: a BoxSet's members are
+                    // curated through the collection API, not resolved off disk.
                     Some(_) => {}
                 }
             }
@@ -3878,6 +4208,194 @@ impl LibraryScanner {
         self.plan_music_album(dir, cf, naming, out);
     }
 
+    /// Persists an item's probed chapter markers, when there are any and a
+    /// chapter repository is wired.
+    async fn save_chapters(
+        &self,
+        item_id: Uuid,
+        chapters: &[ferrofin_db::entities::base_items::ChapterEntity],
+    ) -> Result<(), ServiceError> {
+        if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
+            repo.save_chapters(item_id, chapters).await?;
+        }
+        Ok(())
+    }
+
+    /// Emits the bounded per-item progress line (RULES_LOGGING volume rule);
+    /// a `progress_every` of `0` disables it.
+    fn log_scan_progress(&self, scanned: usize, total: usize) {
+        if scanned > 0 && self.progress_every > 0 && scanned.is_multiple_of(self.progress_every) {
+            tracing::info!(scanned, total, "library scan progress");
+        }
+    }
+
+    /// The embedded-metadata passes for the kinds whose metadata lives inside
+    /// the file rather than on a remote provider: photos (EXIF) and books
+    /// (`ComicInfo`/`ComicBookInfo`/OPF). Returns the credits and the image
+    /// extracted from the file, for the artwork pass.
+    async fn enrich_from_file(
+        &self,
+        entity: &mut BaseItemEntity,
+        locked: bool,
+    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>) {
+        let mut images = self.enrich_photo(entity, locked).await;
+        let (people, book_images) = self.enrich_book(entity, locked).await;
+        images.extend(book_images);
+        (people, images)
+    }
+
+    /// The book embedded-metadata pass — port of `ComicProvider`,
+    /// `ComicBookInfoProvider`, `EpubProvider` and `OpfProvider`, plus the two
+    /// cover extractors.
+    ///
+    /// Fills only what the row still lacks, like every other local reader, and
+    /// returns the cast (writer/penciller/…) plus the cover image to persist.
+    async fn enrich_book(
+        &self,
+        entity: &mut BaseItemEntity,
+        locked: bool,
+    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>) {
+        if !entity.type_.ends_with(".Book") || locked {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let people = match ferrofin_providers::read_book_metadata(&path) {
+            Some(book) => {
+                apply_book(entity, &book);
+                book_people(&book)
+            }
+            None => Vec::new(),
+        };
+        (people, self.extract_book_cover(entity, &path).await)
+    }
+
+    /// Writes a book's embedded cover into its metadata art directory and
+    /// returns the image row — the shape `download_images` produces for a
+    /// remote fetch, so the artwork pass treats both the same.
+    async fn extract_book_cover(&self, entity: &BaseItemEntity, path: &str) -> Vec<ItemImageInfo> {
+        let Some(meta_root) = &self.metadata_dir else {
+            return Vec::new();
+        };
+        let item_dir = meta_root.join(&entity.id);
+        if let Some(existing) = existing_art_file(&item_dir, "primary") {
+            return vec![ItemImageInfo {
+                path: existing.to_string_lossy().into_owned(),
+                image_type: ImageType::Primary,
+                date_modified: file_date_modified(&existing),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }];
+        }
+        let Some((name, bytes)) = ferrofin_providers::read_book_cover(path) else {
+            return Vec::new();
+        };
+        let extension = Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_ascii_lowercase();
+        if tokio::fs::create_dir_all(&item_dir).await.is_err() {
+            return Vec::new();
+        }
+        let out = item_dir.join(format!("primary.{extension}"));
+        if let Err(err) = tokio::fs::write(&out, &bytes).await {
+            tracing::warn!(%err, item = %entity.id, "failed to write book cover");
+            return Vec::new();
+        }
+        vec![ItemImageInfo {
+            path: out.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: file_date_modified(&out),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }]
+    }
+
+    /// Resolves the photos under `dir` — port of `PhotoResolver` and
+    /// `PhotoAlbumResolver`.
+    ///
+    /// Every image file that is not artwork owned by a sibling video becomes a
+    /// `Photo`; a **sub**directory holding at least one such image becomes a
+    /// `PhotoAlbum` its photos hang off (the library root is the collection
+    /// folder itself and never an album, matching upstream's `args.Parent.IsRoot`
+    /// guard elsewhere in the resolver chain).
+    fn plan_photos(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        parent: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        let entries = self.file_system.get_file_system_entries(dir);
+        let files: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.type_ != FileSystemEntryType::Directory)
+            .map(|e| e.path.as_str())
+            .collect();
+        let photos: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|path| is_photo_file(path))
+            .filter(|path| !is_owned_by_media(&files, path, naming))
+            .collect();
+
+        // A sub-directory with photos in it is a PhotoAlbum; the library root
+        // is the collection folder itself and never an album, so its loose
+        // photos hang off it directly.
+        let (photo_parent, ancestors) = if !photos.is_empty() && dir != root {
+            let name = file_stem(dir);
+            match self.base_item(BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
+                Some((album_id, album)) => {
+                    let mut ancestors = vec![cf];
+                    if parent != cf {
+                        ancestors.push(parent);
+                    }
+                    out.push(Planned {
+                        id: album_id,
+                        entity: album,
+                        ancestors: ancestors.clone(),
+                    });
+                    ancestors.push(album_id);
+                    (album_id, ancestors)
+                }
+                None => (parent, vec![cf]),
+            }
+        } else {
+            (parent, vec![cf])
+        };
+
+        for path in photos {
+            let Some((id, mut entity)) = self.base_item(
+                BaseItemKind::Photo,
+                cf,
+                photo_parent,
+                file_stem(path),
+                path,
+                false,
+            ) else {
+                continue;
+            };
+            entity.media_type = Some("Photo".to_owned());
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: ancestors.clone(),
+            });
+        }
+
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_photos(&entry.path, root, cf, photo_parent, naming, out);
+            }
+        }
+    }
+
     /// Resolves one directory beneath a music library: a `MusicAlbum` (port of
     /// `MusicAlbumResolver`), or a container to walk through — an artist folder
     /// or one of its release subfolders (`albums`, `live`, …).
@@ -4020,6 +4538,232 @@ impl LibraryScanner {
         }
         disc_subfolders > 0
     }
+
+    /// Books library: every document flattens to a `Book` and every audio file
+    /// to an `AudioBook`, both directly under the collection folder.
+    ///
+    /// Port of `BookResolver` + the `books` arms of `AudioResolver`. The order
+    /// of the two directory checks is upstream's resolver priority:
+    /// `BookResolver` is `ResolverPriority.First`, `AudioResolver` `Fifth`, so a
+    /// folder holding both one document and audio is the book.
+    /// - a directory holding **exactly one** document *is* that book, named
+    ///   after the directory ("other library structures with multiple books to
+    ///   a directory will get picked up as individual files"). A resolved book
+    ///   is not a `Folder`, so the directory is not descended into — same as
+    ///   upstream;
+    /// - a directory whose audio resolves to a single one-file audiobook *is*
+    ///   that audiobook, named after the directory
+    ///   (`AudioResolver.FindAudioBook`);
+    /// - anything else recurses, and each loose file becomes its own row.
+    ///
+    /// Two deliberate divergences, both pre-existing patterns in this scanner:
+    /// - **Flattening.** Upstream resolves an unclaimed directory to a `Folder`
+    ///   item and parents its books under *that*; Ferrofin parents every book
+    ///   directly to the collection folder, exactly as [`Self::plan_movies`]
+    ///   does for per-title folders. This scanner materializes no intermediate
+    ///   `Folder` rows.
+    /// - **Name/series/index/year parsing** comes from `BookFileNameParser`,
+    ///   which post-dates the pinned 10.11.8 contract (it is on upstream
+    ///   `master`). Against 10.11.8 a book is named from its bare filename.
+    ///
+    /// Both are recorded in `docs/FEATURES.md`.
+    fn plan_books(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        naming: &NamingOptions,
+        out: &mut Vec<Planned>,
+    ) {
+        let entries = self.file_system.get_file_system_entries(dir);
+        // The library root itself is the CollectionFolder, never an item — so
+        // neither directory rule applies to it and its loose files each become
+        // their own row. (Upstream reaches the root through the multi-item
+        // resolver instead, which for a root holding exactly ONE audio file
+        // names that audiobook after the LIBRARY folder and dates it from that
+        // folder's name too. Naming a book after the library it sits in is an
+        // upstream wart, not behaviour worth reproducing; the file stem and no
+        // year are used here. Every other root shape matches upstream exactly.
+        // Recorded as an accepted divergence in `docs/FEATURES.md`.)
+        if dir != root {
+            if let Some(book) = single_book_file(&entries) {
+                self.push_book(&book, folder_name(dir), cf, out);
+                return;
+            }
+            if let Some((audio, year)) = single_audio_book(&entries, naming) {
+                self.push_audio_book(&audio, folder_name(dir), year, cf, out);
+                return;
+            }
+        }
+        for entry in &entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                self.plan_books(&entry.path, root, cf, naming, out);
+            } else if is_book_file(&entry.path) {
+                self.push_book(&entry.path, None, cf, out);
+            } else if is_audio_file(&entry.path, naming) && !is_cue_sheet(&entry.path) {
+                self.push_audio_book(&entry.path, None, None, cf, out);
+            }
+        }
+    }
+
+    /// Emits the `Book` row for the document at `path`.
+    ///
+    /// `folder` is the directory name when the containing directory *is* the
+    /// book (`BookResolver.GetBook`): the name is parsed from it and a missing
+    /// series becomes the empty string, which is what upstream stores and — via
+    /// `WhenWritingNull` — what it serializes. Omitting the key instead would be
+    /// a `SeriesName` body diff on the common `Dracula/dracula.epub` shape.
+    /// Otherwise the file's own stem is parsed and the containing directory name
+    /// stands in for a missing series (`BookResolver.Resolve`).
+    fn push_book(&self, path: &str, folder: Option<String>, cf: Uuid, out: &mut Vec<Planned>) {
+        let (parsed_from, series_fallback) = match folder {
+            Some(name) => (name, Some(String::new())),
+            None => (file_stem(path), parent_folder_name(path)),
+        };
+        let parsed = book_file_name_parser::parse(Some(&parsed_from));
+        // Upstream leaves an unparsed name empty and lets
+        // `ResolverHelper.EnsureName` fill it from the file/folder name.
+        let name = parsed
+            .name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| parsed_from.clone());
+        let Some((id, mut entity)) = self.base_item(BaseItemKind::Book, cf, cf, name, path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some("Book".to_owned());
+        entity.run_time_ticks = Some(BOOK_RUN_TIME_TICKS);
+        entity.index_number = parsed.index.map(i64::from);
+        entity.parent_index_number = parsed.parent_index.map(i64::from);
+        entity.production_year = parsed.year.map(i64::from);
+        entity.series_name = parsed.series_name.or(series_fallback);
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        });
+    }
+
+    /// Emits the `AudioBook` row for the audio file at `path`, named after
+    /// `folder` when the containing directory is the audiobook and after the
+    /// file otherwise. `MediaType = Audio` is what makes the scan ffprobe it,
+    /// so it gets a runtime, streams, and its embedded tags — upstream probes
+    /// `AudioBook` through the same `ProbeProvider` as `Audio`.
+    ///
+    /// `year` is set only for the folder-is-an-audiobook shape, which is the
+    /// only one upstream dates: `ResolveMultipleAudio` carries the parsed year
+    /// onto the item, while the per-file fallback goes through
+    /// `ResolverHelper.EnsureName` and sets none.
+    fn push_audio_book(
+        &self,
+        path: &str,
+        folder: Option<String>,
+        year: Option<i32>,
+        cf: Uuid,
+        out: &mut Vec<Planned>,
+    ) {
+        let name = folder.unwrap_or_else(|| file_stem(path));
+        let Some((id, mut entity)) =
+            self.base_item(BaseItemKind::AudioBook, cf, cf, name, path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some("Audio".to_owned());
+        entity.production_year = year.map(i64::from);
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        });
+    }
+}
+
+/// The document extensions a `books` library resolves as a `Book` — copied from
+/// `BookResolver._validExtensions`.
+const BOOK_EXTENSIONS: &[&str] = &[
+    "azw", "azw3", "cb7", "cbr", "cbt", "cbz", "epub", "mobi", "pdf",
+];
+
+/// A `Book`'s runtime: upstream's `Book()` constructor hardcodes
+/// `TimeSpan.TicksPerSecond`, so a book is nominally one second long and
+/// position-ticks resume has a non-zero denominator to work against.
+const BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
+
+/// Whether `path` is a `.cue` sheet.
+///
+/// A cue sheet counts as audio by extension (it is in `AudioFileExtensions`),
+/// but upstream `AudioResolver.Resolve` bails on it explicitly before building
+/// any item: a cue sheet *describes* a rip, it is not one, so resolving it puts
+/// a phantom row in the library next to the file it indexes.
+///
+/// Only the per-file arm needs this. `single_audio_book` passes every file to
+/// `AudioBookListResolver` exactly as `ResolveMultipleAudio` does, and a
+/// `book.m4b` + `book.cue` pair fails the single-audiobook guard there on both
+/// sides, falling through to this arm.
+fn is_cue_sheet(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+}
+
+/// Whether `path` is one of the [`BOOK_EXTENSIONS`] documents.
+fn is_book_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| BOOK_EXTENSIONS.iter().any(|b| b.eq_ignore_ascii_case(ext)))
+}
+
+/// The one document in `entries`, or `None` when there is none or several —
+/// port of `BookResolver.GetBook`'s `bookFiles.Count != 1` guard.
+fn single_book_file(entries: &[FileSystemEntryInfo]) -> Option<String> {
+    let mut books = entries
+        .iter()
+        .filter(|e| e.type_ != FileSystemEntryType::Directory && is_book_file(&e.path));
+    let first = books.next()?.path.clone();
+    books.next().is_none().then_some(first)
+}
+
+/// The single audio file a directory resolves to as one `AudioBook`, with the
+/// year parsed off the directory name — or `None` when the directory holds no
+/// audiobook or several.
+///
+/// Port of `AudioResolver.FindAudioBook`: the directory's audio must group into
+/// exactly one audiobook, of exactly one file, with no extras and no alternate
+/// versions — upstream skips the rest "until multi-part books are handled", so
+/// a multi-file audiobook folder falls back to a row per file, exactly as
+/// `ResolvePaths` does when the multi-item resolver claims nothing.
+///
+/// The year rides along because `ResolveMultipleAudio` sets
+/// `ProductionYear = resolvedItem.Year` and `FindAudioBook` overrides only
+/// `Name` — so the usual `Author/Title (2011)/book.m4b` layout is dated by its
+/// folder. `AudioBookListResolver` parses it off the stack name (the directory).
+fn single_audio_book(
+    entries: &[FileSystemEntryInfo],
+    naming: &NamingOptions,
+) -> Option<(String, Option<i32>)> {
+    let files: Vec<ferrofin_naming::io::FileSystemMetadata> = entries
+        .iter()
+        .filter(|e| e.type_ != FileSystemEntryType::Directory)
+        .map(|e| ferrofin_naming::io::FileSystemMetadata::new(e.path.clone(), false))
+        .collect();
+    let mut resolved = AudioBookListResolver::new(naming).resolve(&files);
+    if resolved.len() != 1 {
+        return None;
+    }
+    let info = resolved.remove(0);
+    (info.files.len() == 1 && info.extras.is_empty() && info.alternate_versions.is_empty())
+        .then(|| (info.files[0].path.clone(), info.year))
+}
+
+/// The name of the directory containing `path`, if any (C#
+/// `Path.GetFileName(Path.GetDirectoryName(path))`).
+fn parent_folder_name(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
 }
 
 /// The album name the tracks agree on: the `Album` tag every tagged track
@@ -4068,6 +4812,166 @@ fn collage_item_kinds(folder: &VirtualFolderInfo) -> Vec<BaseItemKind> {
             BaseItemKind::Series,
         ],
     }
+}
+
+/// Projects the EXIF fields onto their `Data` keys, in C#'s `Photo` property
+/// spelling. A `None` clears the key (see
+/// [`merge_data_fields`](crate::item_data::merge_data_fields)).
+fn photo_exif_fields(
+    exif: &ferrofin_drawing::photo_provider::PhotoExif,
+) -> Vec<(&'static str, Option<serde_json::Value>)> {
+    let text = |value: &Option<String>| value.clone().map(serde_json::Value::String);
+    let number = |value: Option<f64>| value.and_then(serde_json::Number::from_f64).map(Into::into);
+    vec![
+        ("CameraMake", text(&exif.camera_make)),
+        ("CameraModel", text(&exif.camera_model)),
+        ("Software", text(&exif.software)),
+        ("ExposureTime", number(exif.exposure_time)),
+        ("FocalLength", number(exif.focal_length)),
+        (
+            "Orientation",
+            exif.orientation
+                .map(|o| serde_json::Value::String(format!("{o:?}"))),
+        ),
+        ("Aperture", number(exif.aperture)),
+        ("ShutterSpeed", number(exif.shutter_speed)),
+        ("Latitude", number(exif.latitude)),
+        ("Longitude", number(exif.longitude)),
+        ("Altitude", number(exif.altitude)),
+        (
+            "IsoSpeedRating",
+            exif.iso_speed_rating.map(serde_json::Value::from),
+        ),
+    ]
+}
+
+/// One item's inputs to the artwork pass, grouped so
+/// [`LibraryScanner::persist_artwork`] keeps a readable signature.
+struct ArtworkPass<'a> {
+    /// The scanned row (already enriched, not yet re-read from the DB).
+    entity: &'a BaseItemEntity,
+    /// The row's probed media streams — the embedded-cover source.
+    streams: &'a [MediaStreamInfoEntity],
+    /// The owning library's image-fetcher gate.
+    policy: FetcherPolicy<'a>,
+    /// The image embedded in the item's own file — a photo (the file itself)
+    /// or a book cover — when the row has one.
+    embedded_images: Vec<ItemImageInfo>,
+}
+
+/// The fetcher policy of the library an item belongs to — every `Planned` item
+/// carries its collection-folder id as its first ancestor. A library with no
+/// resolved options gets the permissive default.
+fn policy_for<'a>(
+    item: &Planned,
+    policies: &'a std::collections::HashMap<Uuid, FetcherPolicy<'a>>,
+) -> FetcherPolicy<'a> {
+    item.ancestors
+        .first()
+        .and_then(|id| policies.get(id))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Applies a book's embedded metadata to the row, filling only what is still
+/// empty (mirrors [`apply_details`]).
+fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetadata) {
+    if let Some(name) = book
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        entity.name = Some(name.to_owned());
+        entity.sort_name = Some(derived_sort_name(entity, name));
+    }
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&book.original_title);
+    }
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&book.overview);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = book.production_year.map(i64::from);
+    }
+    if entity.premiere_date.is_none() {
+        entity.premiere_date = book.premiere_date;
+    }
+    if entity.index_number.is_none() {
+        entity.index_number = book.index_number.map(i64::from);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = book.community_rating;
+    }
+    merge_multi_value(&mut entity.genres, &book.genres);
+    merge_multi_value(&mut entity.studios, &book.studios);
+    merge_multi_value(&mut entity.tags, &book.tags);
+}
+
+/// Maps a book's credits to persistable rows. Comic and OPF sources carry no
+/// per-person id or image.
+fn book_people(book: &ferrofin_providers::BookMetadata) -> Vec<PeopleEntity> {
+    book.people
+        .iter()
+        .map(|(name, kind)| PeopleEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            name: name.clone(),
+            person_type: Some(kind.clone()),
+            role: None,
+            primary_image_url: None,
+            provider_id: None,
+        })
+        .collect()
+}
+
+/// Filename prefixes that mark an image as *artwork*, never a photo. Port of
+/// `PhotoResolver._ignoreFiles` (matched case-insensitively as a prefix).
+const PHOTO_IGNORE_PREFIXES: [&str; 9] = [
+    "folder",
+    "thumb",
+    "landscape",
+    "fanart",
+    "backdrop",
+    "poster",
+    "cover",
+    "logo",
+    "default",
+];
+
+/// The image extensions a photo may have — port of the C# encoder's
+/// `SupportedInputFormats`, which is what `PhotoResolver.IsImageFile` tests
+/// against.
+const PHOTO_EXTENSIONS: [&str; 17] = [
+    "jpeg", "jpg", "png", "dng", "webp", "gif", "bmp", "ico", "astc", "ktx", "pkm", "wbmp", "cr2",
+    "nef", "arw", "svg", "tiff",
+];
+
+/// Whether `path` is an image file that is not artwork — port of
+/// `PhotoResolver.IsImageFile`.
+fn is_photo_file(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !PHOTO_EXTENSIONS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+        return false;
+    }
+    let stem = stem.to_ascii_lowercase();
+    !PHOTO_IGNORE_PREFIXES
+        .iter()
+        .any(|prefix| stem.starts_with(prefix))
+}
+
+/// Whether `path` is artwork belonging to one of the `siblings` videos — port of
+/// `PhotoResolver.IsOwnedByMedia`: a video file in the same directory whose own
+/// stem is a prefix of the image's stem (so `Movie-thumb.jpg` belongs to
+/// `Movie.mkv`).
+fn is_owned_by_media(siblings: &[&str], path: &str, naming: &NamingOptions) -> bool {
+    let stem = file_stem(path).to_ascii_lowercase();
+    siblings.iter().any(|sibling| {
+        video_resolver::is_video_file(sibling, naming)
+            && stem.starts_with(&file_stem(sibling).to_ascii_lowercase())
+    })
 }
 
 /// The `VideoType` of a plain video file: `.iso`/`.img` are disc images,
@@ -4212,6 +5116,10 @@ fn nfo_candidates(
     match kind {
         NfoItemKind::Series => vec![p.join("tvshow.nfo")],
         NfoItemKind::Season => vec![p.join("season.nfo")],
+        // C# `AlbumNfoProvider`/`ArtistNfoProvider.GetXmlFile`: a fixed
+        // filename inside the album/artist folder.
+        NfoItemKind::MusicAlbum => vec![p.join("album.nfo")],
+        NfoItemKind::MusicArtist => vec![p.join("artist.nfo")],
         NfoItemKind::Movie if is_folder => vec![p.join("movie.nfo")],
         NfoItemKind::Movie => {
             let mut c = vec![p.with_extension("nfo")];
@@ -4336,6 +5244,94 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
 }
 
+/// Fills an album's release date and year from MusicBrainz — C#
+/// `MusicBrainzAlbumProvider` writes more onto a `MusicAlbum` than its ids, and
+/// for a tagless album this is the only year there is. A row that already has a
+/// date makes no request.
+async fn apply_release_details(
+    album: &mut BaseItemEntity,
+    mb: &ferrofin_providers::MusicBrainzClient,
+    release_id: Option<&str>,
+) {
+    if album.premiere_date.is_some() {
+        return;
+    }
+    let Some(release) = release_id else {
+        return;
+    };
+    let Some(details) = mb.release_details(release).await else {
+        return;
+    };
+    if let Some(date) = details
+        .premiere_date
+        .and_then(ferrofin_providers::PartialDate::to_utc)
+    {
+        album.premiere_date = Some(date);
+    }
+    if album.production_year.is_none() {
+        album.production_year = details.production_year.map(i64::from);
+    }
+}
+
+/// Applies an OMDb record to the row, filling only what is still empty (a local
+/// NFO, an earlier fetcher, or a prior scan wins), mirroring [`apply_details`].
+///
+/// `english` and `us` are C#'s two localization gates: OMDb serves English data
+/// only, so `Genres` (which upstream prefers over TVDB's) and the certificate
+/// are skipped for a non-English library, and the certificate additionally
+/// requires a US metadata country.
+fn apply_omdb(
+    entity: &mut BaseItemEntity,
+    item: &ferrofin_providers::OmdbItem,
+    english: bool,
+    us: bool,
+) {
+    if entity.overview.is_none() {
+        entity.overview.clone_from(&item.plot);
+    }
+    if entity.community_rating.is_none() {
+        entity.community_rating = item.community_rating().map(f64::from);
+    }
+    if entity.critic_rating.is_none() {
+        entity.critic_rating = item.rotten_tomatoes().map(f64::from);
+    }
+    if entity.production_year.is_none() {
+        entity.production_year = item.production_year().map(i64::from);
+    }
+    if entity.run_time_ticks.is_none() {
+        entity.run_time_ticks = item.run_time_ticks();
+    }
+    if english {
+        if us && entity.official_rating.is_none() {
+            entity.official_rating.clone_from(&item.rated);
+        }
+        merge_multi_value(&mut entity.genres, &item.genres());
+    }
+}
+
+/// Maps OMDb's credited people to persistable rows: the director, the writer,
+/// then each actor. OMDb carries no per-person id or image.
+fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
+    item.people()
+        .into_iter()
+        .map(|(name, kind)| PeopleEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            name,
+            person_type: Some(
+                match kind {
+                    ferrofin_providers::OmdbPersonKind::Director => "Director",
+                    ferrofin_providers::OmdbPersonKind::Writer => "Writer",
+                    ferrofin_providers::OmdbPersonKind::Actor => "Actor",
+                }
+                .to_owned(),
+            ),
+            role: None,
+            primary_image_url: None,
+            provider_id: None,
+        })
+        .collect()
+}
+
 /// The three-letter country code TVDB content ratings are resolved against
 /// (USA fallback is built into [`TvdbClient::series_details`]). Jellyfin uses the
 /// server's metadata country; Ferrofin fixes it to USA for now.
@@ -4383,7 +5379,13 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
 /// (false) and keep its blank name. A blank name is a placeholder by any
 /// reading, so it now matches first.
 fn name_is_file_stem_placeholder(entity: &BaseItemEntity) -> bool {
-    match (entity.name.as_deref(), entity.path.as_deref()) {
+    name_is_placeholder(entity.name.as_deref(), entity.path.as_deref())
+}
+
+/// [`name_is_file_stem_placeholder`] over the two fields it reads, so the
+/// narrow `ItemTextRow` projection can use the identical rule.
+fn name_is_placeholder(name: Option<&str>, path: Option<&str>) -> bool {
+    match (name, path) {
         (None | Some(""), _) => true,
         (Some(name), Some(path)) => name == file_stem(path),
         _ => false,
@@ -4581,6 +5583,30 @@ fn append_fanart(images: &mut Vec<RemoteImage>, fanart: Vec<ferrofin_providers::
         image_type: img.image_type,
         url: img.url,
     }));
+}
+
+/// Appends OMDb's poster as a `Primary` candidate, when the library enabled the
+/// OMDb image fetcher and the metadata pass captured a poster URL for the item.
+///
+/// Always appended **last** so [`dedup_images_by_type`] keeps it only when no
+/// better provider supplied a Primary — C# gives `OmdbImageProvider` `Order = 90`
+/// for the same reason.
+fn append_omdb_poster(
+    images: &mut Vec<RemoteImage>,
+    entity: &BaseItemEntity,
+    cache: &ArtworkCache,
+    policy: FetcherPolicy<'_>,
+    short: &str,
+) {
+    if !policy.image_enabled(short, fetcher_names::OMDB) {
+        return;
+    }
+    if let Some(url) = cache.omdb_poster.get(&entity.id) {
+        images.push(RemoteImage {
+            image_type: ImageType::Primary,
+            url: url.clone(),
+        });
+    }
 }
 
 /// Keeps the first image of each type (the primary provider's, then fanart's
@@ -4982,6 +6008,442 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    // PhotoResolver.IsImageFile: the extension set, minus the artwork prefixes.
+    #[test]
+    fn photo_files_exclude_artwork_and_non_images() {
+        assert!(super::is_photo_file("/p/DSC_0001.JPG"));
+        assert!(super::is_photo_file("/p/holiday.png"));
+        assert!(super::is_photo_file("/p/raw.cr2"));
+        // Artwork prefixes are never photos, whatever their case.
+        for artwork in [
+            "folder.jpg",
+            "Thumb.png",
+            "landscape.jpg",
+            "fanart.jpg",
+            "backdrop.jpg",
+            "poster.png",
+            "cover.jpg",
+            "logo.png",
+            "default.jpg",
+        ] {
+            assert!(
+                !super::is_photo_file(&format!("/p/{artwork}")),
+                "{artwork} is artwork, not a photo"
+            );
+        }
+        // A prefix match, as upstream does it: "poster-2.jpg" is still artwork.
+        assert!(!super::is_photo_file("/p/poster-2.jpg"));
+        assert!(!super::is_photo_file("/p/clip.mkv"));
+        assert!(!super::is_photo_file("/p/no-extension"));
+    }
+
+    // PhotoResolver.IsOwnedByMedia: an image whose stem starts with a sibling
+    // video's stem is that video's artwork, not a photo of its own.
+    #[test]
+    fn images_owned_by_a_sibling_video_are_not_photos() {
+        let naming = super::NamingOptions::new();
+        let siblings = ["/m/Movie.mkv", "/m/Movie-thumb.jpg", "/m/Sunset.jpg"];
+        assert!(super::is_owned_by_media(
+            &siblings,
+            "/m/Movie-thumb.jpg",
+            &naming
+        ));
+        assert!(!super::is_owned_by_media(
+            &siblings,
+            "/m/Sunset.jpg",
+            &naming
+        ));
+    }
+
+    // The EXIF fields round-trip through the `Data` blob under Jellyfin's own
+    // property names, so an adopted database keeps its photo metadata.
+    #[test]
+    fn photo_exif_fields_use_jellyfins_data_keys() {
+        let exif = ferrofin_drawing::photo_provider::PhotoExif {
+            camera_make: Some("ACME".into()),
+            aperture: Some(2.8),
+            orientation: Some(ferrofin_model::drawing::ImageOrientation::RightTop),
+            iso_speed_rating: Some(400),
+            ..Default::default()
+        };
+        let fields = super::photo_exif_fields(&exif);
+        let keys: Vec<_> = fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            crate::item_data::PHOTO_EXIF_KEYS,
+            "the Data keys must match the ones Jellyfin serializes"
+        );
+        let data = crate::item_data::merge_data_fields(None, &fields).expect("data");
+        let parsed = crate::item_data::parse_data(Some(&data));
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "CameraMake").as_deref(),
+            Some("ACME")
+        );
+        assert_eq!(
+            crate::item_data::read_data_f64(&parsed, "Aperture"),
+            Some(2.8)
+        );
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "Orientation").as_deref(),
+            Some("RightTop")
+        );
+        assert_eq!(
+            crate::item_data::read_data_i32(&parsed, "IsoSpeedRating"),
+            Some(400)
+        );
+        // A field the file has no value for is absent, not null.
+        assert!(!parsed.contains_key("CameraModel"));
+    }
+
+    // A re-scan of a photo whose EXIF was stripped must clear the stale values
+    // rather than leave the old ones behind.
+    #[test]
+    fn re_scanning_a_stripped_photo_clears_its_exif_keys() {
+        let with_exif = crate::item_data::merge_data_fields(
+            None,
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif {
+                camera_make: Some("ACME".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("data");
+        let cleared = crate::item_data::merge_data_fields(
+            Some(&with_exif),
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif::default()),
+        )
+        .expect("data changed");
+        assert!(!crate::item_data::parse_data(Some(&cleared)).contains_key("CameraMake"));
+    }
+
+    // Unrelated Data keys (playlist membership, VideoType, …) survive the merge.
+    #[test]
+    fn merging_exif_preserves_other_data_keys() {
+        let existing = crate::item_data::set_data_field(None, "VideoType", "VideoFile");
+        let merged = crate::item_data::merge_data_fields(
+            existing.as_deref(),
+            &super::photo_exif_fields(&ferrofin_drawing::photo_provider::PhotoExif {
+                software: Some("Darktable".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("data");
+        let parsed = crate::item_data::parse_data(Some(&merged));
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "VideoType").as_deref(),
+            Some("VideoFile")
+        );
+        assert_eq!(
+            crate::item_data::read_data_string(&parsed, "Software").as_deref(),
+            Some("Darktable")
+        );
+    }
+
+    // A sub-directory holding photos is a PhotoAlbum the photos hang off; the
+    // library root is the collection folder itself and never an album.
+    #[tokio::test]
+    async fn photo_albums_are_the_sub_directories_not_the_library_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("loose.jpg"), b"x").expect("write");
+        std::fs::create_dir(root.join("Holiday")).expect("mkdir");
+        std::fs::write(root.join("Holiday").join("DSC_0001.jpg"), b"x").expect("write");
+        // Artwork prefixes are still excluded inside an album folder.
+        std::fs::write(root.join("Holiday").join("folder.jpg"), b"x").expect("write");
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(dir.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let mut out = Vec::new();
+        let root_str = root.to_string_lossy().into_owned();
+        let cf = uuid::Uuid::from_u128(0x7000);
+        scanner.plan_photos(
+            &root_str,
+            &root_str,
+            cf,
+            cf,
+            &super::NamingOptions::new(),
+            &mut out,
+        );
+
+        let kinds: Vec<(&str, String)> = out
+            .iter()
+            .map(|p| {
+                (
+                    p.entity.type_.rsplit('.').next().unwrap_or_default(),
+                    p.entity.name.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("Photo", "loose".to_owned())),
+            "a root photo is parented to the library: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("PhotoAlbum", "Holiday".to_owned())),
+            "the sub-directory became an album: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Photo", "DSC_0001".to_owned())),
+            "the album's photo was resolved: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|(_, name)| name == "folder"),
+            "artwork inside an album folder is not a photo: {kinds:?}"
+        );
+        // The album's photo is parented to the album, not the library.
+        let album = out
+            .iter()
+            .find(|p| p.entity.type_.ends_with(".PhotoAlbum"))
+            .expect("album");
+        let child = out
+            .iter()
+            .find(|p| p.entity.name.as_deref() == Some("DSC_0001"))
+            .expect("child");
+        assert!(child.ancestors.contains(&album.id));
+    }
+
+    // BookResolver's extension set, matched case-insensitively.
+    #[test]
+    fn book_files_are_recognized_by_extension() {
+        for book in [
+            "Dune.epub",
+            "Dune.EPUB",
+            "batman.cbz",
+            "manual.pdf",
+            "x.azw3",
+        ] {
+            assert!(super::is_book_file(&format!("/b/{book}")), "{book}");
+        }
+        for other in ["cover.jpg", "notes.txt", "movie.mkv", "no-extension"] {
+            assert!(!super::is_book_file(&format!("/b/{other}")), "{other}");
+        }
+    }
+
+    // Embedded book metadata fills only what the row still lacks, but the title
+    // is authoritative (as it is for NFO).
+    #[test]
+    fn apply_book_fills_empty_fields_and_takes_the_title() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let book = ferrofin_providers::BookMetadata {
+            name: Some("The Killing Joke".into()),
+            overview: Some("One bad day.".into()),
+            production_year: Some(1988),
+            genres: vec!["Superhero".into()],
+            studios: vec!["DC Comics".into()],
+            tags: vec!["classic".into()],
+            index_number: Some(1),
+            ..Default::default()
+        };
+        let mut entity = BaseItemEntity {
+            name: Some("batman - the killing joke".into()),
+            overview: Some("from a sidecar".into()),
+            ..Default::default()
+        };
+        super::apply_book(&mut entity, &book);
+        assert_eq!(entity.name.as_deref(), Some("The Killing Joke"));
+        assert_eq!(entity.overview.as_deref(), Some("from a sidecar")); // kept
+        assert_eq!(entity.production_year, Some(1988));
+        assert_eq!(entity.genres.as_deref(), Some("Superhero"));
+        assert_eq!(entity.studios.as_deref(), Some("DC Comics"));
+        assert_eq!(entity.tags.as_deref(), Some("classic"));
+        assert_eq!(entity.index_number, Some(1));
+        assert!(
+            entity.sort_name.is_some(),
+            "the sort name follows the title"
+        );
+    }
+
+    #[test]
+    fn book_credits_become_people_rows() {
+        let book = ferrofin_providers::BookMetadata {
+            people: vec![
+                ("Alan Moore".to_owned(), "Author".to_owned()),
+                ("Brian Bolland".to_owned(), "Penciller".to_owned()),
+            ],
+            ..Default::default()
+        };
+        let people = super::book_people(&book);
+        assert_eq!(people.len(), 2);
+        assert_eq!(people[0].name, "Alan Moore");
+        assert_eq!(people[0].person_type.as_deref(), Some("Author"));
+        assert!(people[1].provider_id.is_none());
+    }
+
+    /// An OMDb record parsed from a body shaped like the real API's.
+    fn omdb_item(json: &str) -> ferrofin_providers::OmdbItem {
+        serde_json::from_str(json).expect("parse omdb body")
+    }
+
+    // OMDb fills only what is still empty, exactly like the TMDB/NFO appliers.
+    #[test]
+    fn apply_omdb_fills_only_empty_fields() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(
+            r#"{"Plot":"from omdb","Year":"2010","Rated":"PG-13","Runtime":"148 min",
+                "Genre":"Action, Sci-Fi","imdbRating":"8.8",
+                "Ratings":[{"Source":"Rotten Tomatoes","Value":"87%"}]}"#,
+        );
+        let mut e = BaseItemEntity {
+            overview: Some("already set".into()),
+            community_rating: Some(1.0),
+            ..Default::default()
+        };
+        super::apply_omdb(&mut e, &item, true, true);
+        assert_eq!(e.overview.as_deref(), Some("already set")); // not overwritten
+        assert_eq!(e.community_rating, Some(1.0)); // not overwritten
+        assert_eq!(e.critic_rating, Some(87.0)); // filled
+        assert_eq!(e.production_year, Some(2010));
+        assert_eq!(e.official_rating.as_deref(), Some("PG-13"));
+        assert_eq!(e.run_time_ticks, Some(148 * 60 * 10_000_000));
+        assert_eq!(e.genres.as_deref(), Some("Action|Sci-Fi"));
+    }
+
+    // OMDb serves English data only, so C# skips the genres and the certificate
+    // for a library set to any other metadata language.
+    #[test]
+    fn apply_omdb_skips_localized_fields_for_a_non_english_library() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(r#"{"Plot":"plot","Rated":"PG-13","Genre":"Action"}"#);
+        let mut e = BaseItemEntity::default();
+        super::apply_omdb(&mut e, &item, false, true);
+        assert_eq!(e.overview.as_deref(), Some("plot")); // language-neutral
+        assert_eq!(e.official_rating, None);
+        assert_eq!(e.genres, None);
+    }
+
+    // The certificate is a US rating; C# only takes it for a US library.
+    #[test]
+    fn apply_omdb_skips_the_certificate_outside_the_us() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let item = omdb_item(r#"{"Rated":"PG-13","Genre":"Action"}"#);
+        let mut e = BaseItemEntity::default();
+        super::apply_omdb(&mut e, &item, true, false);
+        assert_eq!(e.official_rating, None);
+        assert_eq!(e.genres.as_deref(), Some("Action")); // genres are not US-gated
+    }
+
+    // Credits land as Director, Writer, then one row per actor.
+    #[test]
+    fn omdb_people_map_to_director_writer_then_actors() {
+        let item = omdb_item(
+            r#"{"Director":"Christopher Nolan","Writer":"Jonathan Nolan",
+                "Actors":"Leonardo DiCaprio, Elliot Page"}"#,
+        );
+        let people = super::omdb_people(&item);
+        let kinds: Vec<_> = people
+            .iter()
+            .map(|p| p.person_type.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(kinds, ["Director", "Writer", "Actor", "Actor"]);
+        assert_eq!(people[3].name, "Elliot Page");
+        assert!(people.iter().all(|p| p.provider_id.is_none()));
+    }
+
+    // A library that saved no TypeOptions gets Jellyfin's own defaults, so the
+    // English/US gates above are open unless the admin changed them.
+    #[test]
+    fn fetcher_policy_defaults_to_english_us() {
+        let policy = super::FetcherPolicy::default();
+        assert_eq!(policy.metadata_language(), "en");
+        assert_eq!(policy.country_code(), "us");
+    }
+
+    #[test]
+    fn fetcher_policy_reads_the_librarys_language_and_country() {
+        let options = ferrofin_model::configuration::LibraryOptions {
+            preferred_metadata_language: Some("DE".to_owned()),
+            metadata_country_code: Some("de".to_owned()),
+            ..Default::default()
+        };
+        let policy = super::FetcherPolicy {
+            options: Some(&options),
+        };
+        assert_eq!(policy.metadata_language(), "de");
+        assert_eq!(policy.country_code(), "de");
+    }
+
+    // OMDb's poster is appended last so the dedup keeps it only as a last
+    // resort, and never at all when the library disabled the OMDb image fetcher.
+    #[test]
+    fn omdb_poster_is_the_last_resort_primary() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let entity = BaseItemEntity {
+            id: "item-1".to_owned(),
+            ..Default::default()
+        };
+        let mut cache = super::ArtworkCache::default();
+        cache
+            .omdb_poster
+            .insert("item-1".to_owned(), "https://omdb.test/p.jpg".to_owned());
+
+        // Nothing else supplied a Primary: OMDb's poster is used.
+        let mut images = Vec::new();
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy::default(),
+            "Movie",
+        );
+        let deduped = super::dedup_images_by_type(images);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].url, "https://omdb.test/p.jpg");
+
+        // A better provider already supplied one: OMDb's is dropped.
+        let mut images = vec![ferrofin_providers::RemoteImage {
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            url: "https://tmdb.test/p.jpg".to_owned(),
+        }];
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy::default(),
+            "Movie",
+        );
+        let deduped = super::dedup_images_by_type(images);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].url, "https://tmdb.test/p.jpg");
+    }
+
+    #[test]
+    fn omdb_poster_is_skipped_when_the_library_disabled_the_fetcher() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let entity = BaseItemEntity {
+            id: "item-1".to_owned(),
+            ..Default::default()
+        };
+        let mut cache = super::ArtworkCache::default();
+        cache
+            .omdb_poster
+            .insert("item-1".to_owned(), "https://omdb.test/p.jpg".to_owned());
+        // A saved TypeOptions listing only TMDB means OMDb's checkbox is off.
+        let options = ferrofin_model::configuration::LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetchers: vec!["TheMovieDb".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        super::append_omdb_poster(
+            &mut images,
+            &entity,
+            &cache,
+            super::FetcherPolicy {
+                options: Some(&options),
+            },
+            "Movie",
+        );
+        assert!(images.is_empty());
     }
 
     // The post-scan music pass resolves each album's + artist's MusicBrainz ids
@@ -6071,20 +7533,18 @@ mod tests {
     // outage would revert the whole library to filenames.
     #[tokio::test]
     async fn a_previously_titled_episode_is_neither_re_requested_nor_reverted() {
-        use ferrofin_db::entities::base_items::BaseItemEntity;
-
         let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
         // What an earlier scan achieved. `episode` is the freshly-planned row,
         // still carrying the file stem and no overview.
-        let stored = super::StoredText::from_row(&BaseItemEntity {
+        let stored = super::StoredText::from_row(&ferrofin_db::entities::base_items::ItemTextRow {
+            id: String::new(),
             name: Some("Winter Is Coming".into()),
             sort_name: Some("001 - 0001 - Winter Is Coming".into()),
             overview: Some("Ned is summoned south.".into()),
             path: episode.path.clone(),
-            ..Default::default()
         });
 
         scanner
@@ -9004,5 +10464,294 @@ mod tests {
             "a non-jpg upload is found by stem"
         );
         assert_eq!(super::existing_art_file(tmp.path(), "backdrop"), None);
+    }
+
+    /// Writes an empty file at `dir/file`, creating `dir`. Shared by the books
+    /// scan tests, which only care that a path exists with the right name.
+    fn touch(dir: &std::path::Path, file: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(file), b"").unwrap();
+    }
+
+    /// Every `BaseItems` row of one kind, ordered by name.
+    async fn scanned_by_kind(
+        db: &Database,
+        kind: ferrofin_model::data::BaseItemKind,
+    ) -> Vec<ferrofin_db::entities::base_items::BaseItemEntity> {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let mut items = repo
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![kind],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .expect("items");
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        items
+    }
+
+    // Documents in a books library resolve to `Book` across every structural
+    // shape upstream handles: a loose file, a folder that IS one book, and a
+    // folder holding several (which flattens to one row per file).
+    #[tokio::test]
+    async fn scan_builds_books_from_documents() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+
+        // A loose document names and dates itself from its own filename.
+        touch(
+            &media,
+            "A Study in Scarlet (Sherlock Holmes, #1) (1887).epub",
+        );
+        // A folder holding exactly one document IS that book, named after the
+        // folder — the file inside can be called anything.
+        touch(&media.join("Dracula"), "dracula-text-final.epub");
+        // Two documents in one folder are two books; the folder name stands in
+        // for a series the filename does not name.
+        let holmes = media.join("Sherlock Holmes");
+        touch(&holmes, "Sherlock Holmes #2.epub");
+        touch(&holmes, "The Hound of the Baskervilles.epub");
+        // Extension matching is case-insensitive, and the comic volume/chapter
+        // pattern fills ParentIndexNumber/IndexNumber. At the root, so it takes
+        // the file arm — in its own folder it would be the folder-is-a-book
+        // shape and parse the folder name instead.
+        touch(&media, "Saga v02 c07.CBZ");
+        // Not a document — never an item.
+        touch(&media, "README.txt");
+
+        let (db, cf) = scan_one(CollectionTypeOptions::books, "Books", &media).await;
+        let books = scanned_by_kind(&db, BaseItemKind::Book).await;
+
+        assert_eq!(
+            books.iter().map(|b| b.name.as_deref()).collect::<Vec<_>>(),
+            vec![
+                Some("A Study in Scarlet"),
+                Some("Dracula"),
+                // The comic regex feeds volume/chapter but does NOT trim them
+                // off the name: upstream assigns the whole `name` group, not
+                // the comic sub-capture.
+                Some("Saga v02 c07"),
+                // The series/index pattern captures no title of its own, so
+                // upstream's empty `Name` falls back to the file stem
+                // (`ResolverHelper.EnsureName`) rather than to the series.
+                Some("Sherlock Holmes #2"),
+                Some("The Hound of the Baskervilles"),
+            ],
+            "README.txt must not resolve, and each shape must name itself"
+        );
+
+        let study = &books[0];
+        assert_eq!(study.series_name.as_deref(), Some("Sherlock Holmes"));
+        assert_eq!(study.index_number, Some(1));
+        assert_eq!(study.production_year, Some(1887));
+        assert_eq!(study.media_type.as_deref(), Some("Book"));
+        // Upstream's `Book()` gives every book a one-second runtime.
+        assert_eq!(study.run_time_ticks, Some(super::BOOK_RUN_TIME_TICKS));
+        assert!(!study.is_folder);
+
+        // The single-document folder points at the file, not the folder.
+        assert!(
+            books[1]
+                .path
+                .as_deref()
+                .unwrap()
+                .ends_with("dracula-text-final.epub"),
+            "path is the document: {:?}",
+            books[1].path
+        );
+        // Upstream's `GetBook` sets `SeriesName = result.SeriesName ?? ""`, and
+        // serializes the empty string rather than omitting the key.
+        assert_eq!(books[1].series_name.as_deref(), Some(""));
+
+        // `.CBZ` matched case-insensitively, and the comic `vNN cNN` pattern
+        // reached ParentIndexNumber/IndexNumber through the row.
+        let saga = &books[2];
+        assert_eq!(saga.parent_index_number, Some(2), "comic volume");
+        assert_eq!(saga.index_number, Some(7), "comic chapter");
+        // A root-level file with no parseable series falls back to the name of
+        // its containing directory — which for the root IS the library folder.
+        // Surprising, but it is exactly `BookResolver.Resolve`'s
+        // `Path.GetFileName(Path.GetDirectoryName(args.Path))`.
+        assert_eq!(saga.series_name.as_deref(), Some("books"));
+
+        // "Sherlock Holmes #2" parses its own series; its neighbour does not,
+        // so the containing folder name is the fallback.
+        assert_eq!(books[3].series_name.as_deref(), Some("Sherlock Holmes"));
+        assert_eq!(books[3].index_number, Some(2));
+        assert_eq!(books[4].series_name.as_deref(), Some("Sherlock Holmes"));
+
+        // Everything hangs off the library, so `?ParentId=<library>` lists it.
+        assert!(
+            books
+                .iter()
+                .all(|i| i.top_parent_id.as_deref() == Some(cf.as_str()))
+        );
+    }
+
+    // Audio in a books library resolves to `AudioBook`: a folder holding one
+    // audio file IS that audiobook, while the shapes upstream refuses to stack
+    // fall back to a row per file.
+    #[tokio::test]
+    async fn scan_builds_audiobooks_from_audio() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+
+        // One audio file in a folder is one audiobook, named AND dated after
+        // the folder (upstream carries `resolvedItem.Year` onto the item).
+        touch(&media.join("The Hobbit (1937)"), "hobbit.mp3");
+        // A folder whose extra audio is classified as an EXTRA (a name that
+        // does not contain the audiobook's own) fails the single-audiobook
+        // guard and falls back to a row per file — upstream's
+        // `Extras.Count > 0` continue.
+        let dune = media.join("Dune");
+        touch(&dune, "Dune.mp3");
+        touch(&dune, "interview-with-the-author.mp3");
+        // A multi-part audiobook is a row per file (upstream skips the stack
+        // "until multi-part books are handled").
+        let neuromancer = media.join("Neuromancer");
+        touch(&neuromancer, "Neuromancer Part 1.mp3");
+        touch(&neuromancer, "Neuromancer Part 2.mp3");
+        // The same book in two containers and no part numbers: the list
+        // resolver keeps one and files the other as an ALTERNATE VERSION, which
+        // is the third of `ResolveMultipleAudio`'s guards and the only one the
+        // shapes above never reach. Both files fall through to a row each.
+        let foundation = media.join("Foundation");
+        touch(&foundation, "Foundation.mp3");
+        touch(&foundation, "Foundation.m4b");
+        // A cue sheet counts as audio by extension but is never an item — it
+        // describes the rip beside it (`AudioResolver.Resolve` bails on .cue).
+        let dracula = media.join("Dracula");
+        touch(&dracula, "dracula.m4b");
+        touch(&dracula, "dracula.cue");
+
+        let (db, cf) = scan_one(CollectionTypeOptions::books, "Books", &media).await;
+        let audiobooks = scanned_by_kind(&db, BaseItemKind::AudioBook).await;
+
+        assert_eq!(
+            audiobooks
+                .iter()
+                .map(|b| b.name.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                // The extras guard rejected the folder, so both files stand
+                // alone under their own stems.
+                Some("Dune"),
+                // The alternate-version guard rejected this folder, likewise.
+                Some("Foundation"),
+                Some("Foundation"),
+                Some("Neuromancer Part 1"),
+                Some("Neuromancer Part 2"),
+                // The RAW folder name, year and all: `FindAudioBook` overrides
+                // the parsed name with `Path.GetFileName(ContainingFolderPath)`
+                // while keeping the parsed year on ProductionYear.
+                Some("The Hobbit (1937)"),
+                // The .cue beside it produced no row of its own.
+                Some("dracula"),
+                Some("interview-with-the-author"),
+            ],
+        );
+        // MediaType=Audio is what makes the scan ffprobe them for a runtime.
+        assert!(
+            audiobooks
+                .iter()
+                .all(|a| a.media_type.as_deref() == Some("Audio"))
+        );
+        // Only the folder-is-an-audiobook shape carries a year, off the folder
+        // name — the per-file fallback rows carry none, as upstream does.
+        let hobbit = audiobooks
+            .iter()
+            .find(|a| a.name.as_deref() == Some("The Hobbit (1937)"))
+            .expect("hobbit");
+        assert_eq!(hobbit.production_year, Some(1937));
+        assert!(
+            audiobooks
+                .iter()
+                .filter(|a| a.name.as_deref() != Some("The Hobbit (1937)"))
+                .all(|a| a.production_year.is_none()),
+            "per-file fallback rows are undated"
+        );
+        assert!(
+            audiobooks
+                .iter()
+                .all(|i| i.top_parent_id.as_deref() == Some(cf.as_str()))
+        );
+    }
+
+    // A books library takes part in the deleted-item prune like any other; it
+    // used to be excluded, which would leave removed books in the library
+    // forever now that the scan produces them.
+    #[tokio::test]
+    async fn books_library_prunes_deleted_items() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("Dune.epub"), b"").unwrap();
+        std::fs::write(media.join("Emma.epub"), b"").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join(".views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Books",
+            Some(CollectionTypeOptions::books),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = Arc::new(crate::FerrofinItemRepository::new(db.clone(), lookup));
+        let scanner = LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(repo.clone());
+
+        scanner.scan_all().await.unwrap();
+        let books = async || {
+            let mut items = repo
+                .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Book],
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("items");
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            items
+        };
+        let first = books().await;
+        assert_eq!(first.len(), 2);
+        let dune_id = first[0].id.clone();
+
+        std::fs::remove_file(media.join("Emma.epub")).unwrap();
+        scanner.scan_all().await.unwrap();
+        let second = books().await;
+        assert_eq!(second.len(), 1, "the deleted book must be pruned");
+        // The id is derived from (kind, path), so a survivor keeps it across
+        // rescans — favourites, play-state and client deep links all key on it,
+        // and a Jellyfin-identical derivation is what makes the DB drop-in safe.
+        assert_eq!(second[0].id, dune_id, "the survivor keeps its id");
     }
 }

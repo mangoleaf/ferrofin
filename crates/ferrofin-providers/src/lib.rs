@@ -3,15 +3,21 @@
 //!
 //! Ports the `ProviderManager` (implements the `ferrofin-traits` trait), the
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
-//! metadata. The remote API plugins (TMDB/MusicBrainz/OMDB/AudioDb/ListenBrainz)
-//! are feature-gated and deferred (enrichment; need keys; not First-Light).
+//! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
+//! Studio Images) are compiled in unconditionally and gated at runtime by the
+//! per-library fetcher checkboxes — OMDb additionally needs an API key before
+//! it does anything.
 
 pub mod audiodb;
+pub mod books;
 pub mod container_types;
 pub mod error;
+pub mod external_ids;
 pub mod fanart;
 pub mod library_options;
+pub mod listenbrainz;
 pub mod local_images;
+pub mod local_xml;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
@@ -21,13 +27,22 @@ pub mod musicbrainz;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
+pub mod playlist_file;
 pub mod provider_manager;
+pub mod similarity;
 pub mod studios;
 pub mod tmdb;
 pub mod tvdb;
 pub mod xbmc;
 
+pub use books::{BookMetadata, read_book_cover, read_book_metadata};
 pub use error::ProvidersError;
+pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
+pub use local_xml::{
+    LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
+    save_playlist_xml,
+};
+pub use playlist_file::{is_playlist_file, read_playlist_file, write_playlist_file};
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};
@@ -37,12 +52,16 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
-pub use musicbrainz::{AlbumIds, MusicBrainzClient};
-pub use omdb::OmdbClient;
+pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
+pub use musicbrainz::{AlbumIds, ArtistDetails, MusicBrainzClient, PartialDate, ReleaseDetails};
+pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit};
+pub use similarity::{
+    ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
+};
 pub use studios::StudiosClient;
 pub use tmdb::{
-    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbDetails, TmdbImage,
-    TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
+    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbCollection,
+    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
@@ -60,6 +79,9 @@ pub use local_images::{
 };
 pub use mediainfo::{FFProbeVideoInfo, VideoProbeInput};
 pub use provider_manager::{
-    LocalProviderManager, RemoteSearchProvider, TmdbSearchProvider, TvdbSearchProvider,
+    LocalProviderManager, OmdbSearchProvider, RemoteSearchProvider, TmdbBoxSetSearchProvider,
+    TmdbSearchProvider, TvdbSearchProvider,
 };
-pub use xbmc::saver::{save_episode, save_movie, save_season, save_series};
+pub use xbmc::saver::{
+    NfoAlbum, NfoTrack, save_album, save_artist, save_episode, save_movie, save_season, save_series,
+};

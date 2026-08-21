@@ -18,23 +18,19 @@
 //!
 //! # Always-on vs. conditional
 //!
-//! The unit deliberately splits the **always-on** dimension backfill (shipped
-//! here) from the **conditional** EXIF metadata mapping (aperture / shutter /
-//! make / model / rating / comment / title / date-taken / genres / keywords /
-//! software / orientation / exposure / focal length / lat-long-alt / ISO).
+//! Two halves, as in C#: the **always-on** dimension backfill, and the
+//! **conditional** EXIF mapping behind the extension gate
+//! ([`is_exif_candidate`]) — aperture / shutter / make / model / rating /
+//! comment / title / date-taken / software / orientation / exposure / focal
+//! length / lat-long-alt / ISO.
 //!
-//! The C# EXIF block reads into a `Photo` entity via TagLib#. This port would
-//! replace TagLib# with `kamadak-exif`, but the mapping requires **both** a
-//! `Photo` domain entity to write those fields onto **and** the
-//! `ICustomMetadataProvider` provider trait to hang off. Neither exists in
-//! `ferrofin-model` / `ferrofin-traits` yet (the provider layer is explicitly
-//! deferred to `ferrofin-core` match logic, and there is no `Photo` struct). Per
-//! the unit's conditional gate, EXIF is therefore **deferred**: the
-//! extension gate ([`is_exif_candidate`]) is ported and unit-tested so the EXIF
-//! branch can be dropped in later without reshaping this file, but no
-//! `kamadak-exif` dependency is added and no fields are mapped.
+//! C# reads the tags through TagLib#; this port uses `kamadak-exif`, which
+//! reads the same TIFF/EXIF IFDs. Two upstream fields have no EXIF source and
+//! are therefore not mapped: `Genres` and `Tags` come from TagLib#'s XMP/IPTC
+//! keyword aggregation, which `kamadak-exif` does not parse.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone as _, Utc};
+use ferrofin_model::drawing::ImageOrientation;
 use ferrofin_model::entities::ImageType;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
@@ -106,12 +102,9 @@ pub trait DirectoryService: Send + Sync {
 /// The photo whose embedded information is being refreshed.
 ///
 /// A value struct standing in for the C# `Photo` (a `BaseItem` subclass), holding
-/// only the fields [`fetch`](PhotoProvider::fetch) and
-/// [`has_changed`](PhotoProvider::has_changed) actually read or write. The many
-/// EXIF-only fields of the C# `Photo` (aperture, shutter, camera make/model, …)
-/// are **omitted** because the EXIF branch is deferred; they arrive with the
-/// `Photo` entity in a later unit.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// the fields [`fetch`](PhotoProvider::fetch) and
+/// [`has_changed`](PhotoProvider::has_changed) read or write.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PhotoItem {
     /// The item's stable identity. Port of `BaseItem.Id`; forwarded to
     /// [`ImageProcessor::get_item_image_dimensions`] (which uses it only for a
@@ -141,6 +134,60 @@ pub struct PhotoItem {
     /// Port of `BaseItem.ImageInfos`; [`fetch`](PhotoProvider::fetch) sets the
     /// Primary entry and reads it back for dimension probing.
     pub images: Vec<ItemImageInfo>,
+
+    /// The EXIF fields read off the file. Port of the `Photo` subclass's
+    /// EXIF-only properties, filled by [`fetch`](PhotoProvider::fetch).
+    pub exif: PhotoExif,
+
+    /// `BaseItem.Name` — replaced by the EXIF title when the file carries one
+    /// and the field is not locked.
+    pub name: Option<String>,
+
+    /// `BaseItem.Overview` — the EXIF user comment.
+    pub overview: Option<String>,
+
+    /// `BaseItem.CommunityRating` — the EXIF rating.
+    pub community_rating: Option<f64>,
+
+    /// `BaseItem.PremiereDate` / `DateCreated`, from the EXIF date-taken.
+    pub date_taken: Option<DateTime<Utc>>,
+
+    /// `BaseItem.ProductionYear`, the year of [`date_taken`](Self::date_taken).
+    pub production_year: Option<i32>,
+
+    /// Whether `Name` is admin-locked. Port of
+    /// `item.LockedFields.Contains(MetadataField.Name)`, which suppresses the
+    /// EXIF title.
+    pub name_locked: bool,
+}
+
+/// The EXIF-only fields of the C# `Photo`, in the order `FetchAsync` sets them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhotoExif {
+    /// `Photo.Aperture` — the EXIF `ApertureValue` rational.
+    pub aperture: Option<f64>,
+    /// `Photo.ShutterSpeed` — the EXIF `ShutterSpeedValue` rational.
+    pub shutter_speed: Option<f64>,
+    /// `Photo.CameraMake` — TIFF `Make`.
+    pub camera_make: Option<String>,
+    /// `Photo.CameraModel` — TIFF `Model`.
+    pub camera_model: Option<String>,
+    /// `Photo.Software` — TIFF `Software`.
+    pub software: Option<String>,
+    /// `Photo.Orientation` — TIFF `Orientation`, `None` for the unset value.
+    pub orientation: Option<ImageOrientation>,
+    /// `Photo.ExposureTime` — the EXIF `ExposureTime` rational, in seconds.
+    pub exposure_time: Option<f64>,
+    /// `Photo.FocalLength` — the EXIF `FocalLength` rational, in millimetres.
+    pub focal_length: Option<f64>,
+    /// `Photo.Latitude` — GPS latitude as signed decimal degrees.
+    pub latitude: Option<f64>,
+    /// `Photo.Longitude` — GPS longitude as signed decimal degrees.
+    pub longitude: Option<f64>,
+    /// `Photo.Altitude` — GPS altitude in metres (negative below sea level).
+    pub altitude: Option<f64>,
+    /// `Photo.IsoSpeedRating` — the EXIF `PhotographicSensitivity`.
+    pub iso_speed_rating: Option<i32>,
 }
 
 impl PhotoItem {
@@ -230,11 +277,10 @@ impl PhotoProvider {
     /// (ArgumentException)`) is swallowed, leaving the dimensions untouched;
     /// every other error propagates.
     ///
-    /// The EXIF-metadata mapping is deferred (see the module docs), so the C#
-    /// `ImageUpdate | MetadataImport` combined result collapses to
+    /// The C# `ImageUpdate | MetadataImport` combined result collapses to
     /// [`ItemUpdateType::ImageUpdate`] — the non-`[Flags]`
     /// [`ItemUpdateType`](ferrofin_traits::providers::ItemUpdateType) port has no
-    /// combined variant, and this unit only ever performs an image update.
+    /// combined variant.
     ///
     /// # Errors
     ///
@@ -244,8 +290,14 @@ impl PhotoProvider {
         let path = item.path.clone();
         item.set_image_path(ImageType::Primary, &path);
 
-        // EXIF branch deferred: the gate is preserved (`is_exif_candidate`) and
-        // unit-tested, but there is no `Photo` entity to map onto yet.
+        // The EXIF branch, gated on the extension set (C#: "other extensions
+        // might cause taglib to hang"). A file that cannot be read or carries no
+        // EXIF simply leaves the fields alone — C# catches and logs.
+        if is_exif_candidate(&path)
+            && let Some(tags) = read_exif(&path)
+        {
+            apply_exif(item, &tags);
+        }
 
         if (item.width <= 0 || item.height <= 0)
             && let Some(info) = item.image_info(ImageType::Primary).cloned()
@@ -268,6 +320,200 @@ impl PhotoProvider {
         }
 
         Ok(ItemUpdateType::ImageUpdate)
+    }
+}
+
+/// The EXIF fields read off one file, plus the image dimensions the tags carry.
+///
+/// A flat intermediate so the tag→item mapping ([`apply_exif`]) stays pure and
+/// unit-testable without a file on disk.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExifTags {
+    /// The EXIF-only fields.
+    pub exif: PhotoExif,
+    /// `ImageDescription`/`UserComment` — C# `ImageTag.Comment`.
+    pub comment: Option<String>,
+    /// `XPTitle`/`ImageDescription` — C# `ImageTag.Title`.
+    pub title: Option<String>,
+    /// `Rating` — C# `ImageTag.Rating`, 0–5.
+    pub rating: Option<f64>,
+    /// `DateTimeOriginal` (falling back to `DateTime`) — C# `ImageTag.DateTime`.
+    pub date_taken: Option<DateTime<Utc>>,
+    /// `PixelXDimension` — C# `Properties.PhotoWidth`.
+    pub width: Option<i32>,
+    /// `PixelYDimension` — C# `Properties.PhotoHeight`.
+    pub height: Option<i32>,
+}
+
+/// Reads `path`'s EXIF tags, or `None` when the file cannot be opened or holds
+/// no EXIF. Port of the C# `TagLib.File.Create` + `catch (Exception)` block.
+fn read_exif(path: &str) -> Option<ExifTags> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    // A read failure is not worth failing a refresh over: most photos in a
+    // library carry no EXIF at all, which is exactly this error.
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    Some(tags_from(&exif))
+}
+
+/// Projects an [`exif::Exif`] onto [`ExifTags`]. Pure — the seam the mapping
+/// tests drive with a synthetic in-memory image.
+fn tags_from(exif: &exif::Exif) -> ExifTags {
+    use exif::{In, Tag};
+
+    let rational = |tag: Tag| -> Option<f64> {
+        match exif.get_field(tag, In::PRIMARY)?.value {
+            exif::Value::Rational(ref v) => v.first().map(exif::Rational::to_f64),
+            exif::Value::SRational(ref v) => v.first().map(exif::SRational::to_f64),
+            _ => None,
+        }
+    };
+    let text = |tag: Tag| -> Option<String> {
+        let field = exif.get_field(tag, In::PRIMARY)?;
+        let value = field.display_value().to_string();
+        let value = value.trim().trim_matches('"').trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    };
+    let integer = |tag: Tag| -> Option<i32> {
+        exif.get_field(tag, In::PRIMARY)?
+            .value
+            .get_uint(0)
+            .and_then(|v| i32::try_from(v).ok())
+    };
+
+    ExifTags {
+        exif: PhotoExif {
+            aperture: rational(Tag::ApertureValue),
+            shutter_speed: rational(Tag::ShutterSpeedValue),
+            camera_make: text(Tag::Make),
+            camera_model: text(Tag::Model),
+            software: text(Tag::Software),
+            orientation: integer(Tag::Orientation).and_then(orientation_from),
+            exposure_time: rational(Tag::ExposureTime),
+            focal_length: rational(Tag::FocalLength),
+            latitude: gps_degrees(exif, Tag::GPSLatitude, Tag::GPSLatitudeRef, 'S'),
+            longitude: gps_degrees(exif, Tag::GPSLongitude, Tag::GPSLongitudeRef, 'W'),
+            altitude: gps_altitude(exif),
+            iso_speed_rating: integer(Tag::PhotographicSensitivity),
+        },
+        comment: text(Tag::ImageDescription),
+        // XPTitle (0x9c9b) and Rating (0x4746) are Windows' TIFF extensions —
+        // TagLib# surfaces both as ImageTag.Title/Rating, kamadak-exif has no
+        // named constant for either.
+        title: text(XP_TITLE).or_else(|| text(Tag::ImageDescription)),
+        rating: integer(RATING).map(f64::from),
+        date_taken: exif_datetime(exif),
+        width: integer(Tag::PixelXDimension),
+        height: integer(Tag::PixelYDimension),
+    }
+}
+
+/// The Windows `XPTitle` TIFF tag (`0x9c9b`).
+const XP_TITLE: exif::Tag = exif::Tag(exif::Context::Tiff, 0x9c9b);
+/// The Windows `Rating` TIFF tag (`0x4746`), 0–5.
+const RATING: exif::Tag = exif::Tag(exif::Context::Tiff, 0x4746);
+
+/// The TIFF orientation value as an [`ImageOrientation`]. `0` (the "None" value
+/// C# maps to `null`) and anything out of range yield `None`.
+fn orientation_from(value: i32) -> Option<ImageOrientation> {
+    Some(match value {
+        1 => ImageOrientation::TopLeft,
+        2 => ImageOrientation::TopRight,
+        3 => ImageOrientation::BottomRight,
+        4 => ImageOrientation::BottomLeft,
+        5 => ImageOrientation::LeftTop,
+        6 => ImageOrientation::RightTop,
+        7 => ImageOrientation::RightBottom,
+        8 => ImageOrientation::LeftBottom,
+        _ => return None,
+    })
+}
+
+/// A GPS coordinate as signed decimal degrees: EXIF stores it as a
+/// degrees/minutes/seconds triple plus a hemisphere reference letter.
+fn gps_degrees(
+    exif: &exif::Exif,
+    tag: exif::Tag,
+    ref_tag: exif::Tag,
+    negative_ref: char,
+) -> Option<f64> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    let exif::Value::Rational(ref dms) = field.value else {
+        return None;
+    };
+    let [d, m, sec] = dms.get(..3)? else {
+        return None;
+    };
+    let degrees = d.to_f64() + m.to_f64() / 60.0 + sec.to_f64() / 3600.0;
+    let hemisphere = exif
+        .get_field(ref_tag, exif::In::PRIMARY)
+        .map(|f| f.display_value().to_string());
+    let negative = hemisphere
+        .as_deref()
+        .is_some_and(|h| h.trim().starts_with(negative_ref));
+    Some(if negative { -degrees } else { degrees })
+}
+
+/// GPS altitude in metres; `GPSAltitudeRef == 1` means below sea level.
+fn gps_altitude(exif: &exif::Exif) -> Option<f64> {
+    let field = exif.get_field(exif::Tag::GPSAltitude, exif::In::PRIMARY)?;
+    let exif::Value::Rational(ref v) = field.value else {
+        return None;
+    };
+    let metres = v.first()?.to_f64();
+    let below = exif
+        .get_field(exif::Tag::GPSAltitudeRef, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        == Some(1);
+    Some(if below { -metres } else { metres })
+}
+
+/// The date the photo was taken: `DateTimeOriginal`, else `DateTime`. EXIF
+/// stores local time with no zone, which C# also treats as local — Ferrofin
+/// stamps it as UTC so the value round-trips unchanged.
+fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
+    for tag in [exif::Tag::DateTimeOriginal, exif::Tag::DateTime] {
+        let Some(field) = exif.get_field(tag, exif::In::PRIMARY) else {
+            continue;
+        };
+        let raw = field.display_value().to_string();
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S") {
+            return Utc.from_utc_datetime(&naive).into();
+        }
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw.trim(), "%Y:%m:%d %H:%M:%S") {
+            return Utc.from_utc_datetime(&naive).into();
+        }
+    }
+    None
+}
+
+/// Writes the read tags onto the item, in the order C# `FetchAsync` does.
+///
+/// Every assignment is unconditional (as upstream's is) except the title, which
+/// C# skips for a locked `Name`, and the dimensions, which are only taken when
+/// the tags carry positive ones.
+fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
+    item.exif = tags.exif.clone();
+    if let Some(width) = tags.width.filter(|w| *w > 0) {
+        item.width = width;
+    }
+    if let Some(height) = tags.height.filter(|h| *h > 0) {
+        item.height = height;
+    }
+    if tags.rating.is_some() {
+        item.community_rating = tags.rating;
+    }
+    if tags.comment.is_some() {
+        item.overview.clone_from(&tags.comment);
+    }
+    if let Some(title) = tags.title.as_deref().filter(|t| !t.trim().is_empty())
+        && !item.name_locked
+    {
+        item.name = Some(title.to_owned());
+    }
+    if let Some(taken) = tags.date_taken {
+        item.date_taken = Some(taken);
+        item.production_year = Some(taken.format("%Y").to_string().parse().unwrap_or_default());
     }
 }
 
@@ -594,5 +840,180 @@ mod tests {
     fn name_is_embedded_information() {
         let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
         assert_eq!(provider.name(), "Embedded Information");
+    }
+
+    /// A minimal but real JPEG carrying an EXIF APP1 segment built from
+    /// `entries` — `(tag, type, count, value-or-offset)` little-endian IFD0
+    /// rows plus the raw bytes any of them point at.
+    ///
+    /// Hand-assembled rather than pulled from a fixture file so the expected
+    /// values are visible in the test and no binary lands in the repo.
+    fn jpeg_with_exif(
+        entries: &[(u16, u16, u32, [u8; 4])],
+        extra: &[u8],
+        extra_base: u32,
+    ) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II\x2a\x00"); // little-endian TIFF header
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+        tiff.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(value);
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no IFD1
+        assert_eq!(
+            u32::try_from(tiff.len()).unwrap(),
+            extra_base,
+            "extra_base must be where the out-of-line bytes actually start"
+        );
+        tiff.extend_from_slice(extra);
+
+        let mut app1 = Vec::from(b"Exif\x00\x00".as_slice());
+        app1.extend_from_slice(&tiff);
+
+        let mut jpeg = Vec::from(b"\xff\xd8".as_slice()); // SOI
+        jpeg.extend_from_slice(b"\xff\xe1");
+        jpeg.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(b"\xff\xd9"); // EOI
+        jpeg
+    }
+
+    /// Writes `bytes` to a temp file with `name` and returns the path.
+    fn write_temp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("write");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn fetch_reads_camera_make_model_and_orientation_from_a_real_file() {
+        // IFD0 with Make ("ACME\0", 5 ASCII bytes, out of line), Model ("X1\0"
+        // inline) and Orientation = 6 (RightTop).
+        let entries = [
+            (0x010f, 2u16, 5u32, 50u32.to_le_bytes()), // Make -> offset 50
+            (0x0110, 2, 3, *b"X1\0\0"),                // Model, inline
+            (0x0112, 3, 1, 6u32.to_le_bytes()),        // Orientation = 6
+        ];
+        let jpeg = jpeg_with_exif(&entries, b"ACME\0", 50);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &jpeg);
+
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path: path.clone(),
+            width: 100,
+            height: 100,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+
+        assert_eq!(item.exif.camera_make.as_deref(), Some("ACME"));
+        assert_eq!(item.exif.camera_model.as_deref(), Some("X1"));
+        assert_eq!(item.exif.orientation, Some(ImageOrientation::RightTop));
+        // The Primary image path is still set, as before.
+        assert_eq!(
+            item.image_info(ImageType::Primary).map(|i| i.path.as_str()),
+            Some(path.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_without_exif_leaves_every_field_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Two bytes of nothing: openable, but no EXIF container.
+        let path = write_temp(&dir, "empty.jpg", b"\xff\xd8");
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(4, 3)));
+        let mut item = PhotoItem {
+            path,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.exif, PhotoExif::default());
+        // The always-on dimension backfill still runs.
+        assert_eq!((item.width, item.height), (4, 3));
+    }
+
+    #[tokio::test]
+    async fn a_non_candidate_extension_is_never_opened_for_exif() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A real EXIF payload, but under an extension the gate excludes.
+        let entries = [(0x010f, 2u16, 5u32, 26u32.to_le_bytes())];
+        let jpeg = jpeg_with_exif(&entries, b"ACME\0", 26);
+        let path = write_temp(&dir, "photo.heic", &jpeg);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.exif.camera_make, None);
+    }
+
+    #[test]
+    fn orientation_zero_and_out_of_range_are_none() {
+        // C# maps TagLib's `ImageOrientation.None` to a null Orientation.
+        assert_eq!(orientation_from(0), None);
+        assert_eq!(orientation_from(9), None);
+        assert_eq!(orientation_from(1), Some(ImageOrientation::TopLeft));
+        assert_eq!(orientation_from(8), Some(ImageOrientation::LeftBottom));
+    }
+
+    #[test]
+    fn apply_exif_writes_title_rating_comment_and_date() {
+        let tags = ExifTags {
+            title: Some("Sunset".into()),
+            comment: Some("On the pier".into()),
+            rating: Some(4.0),
+            date_taken: Some(ts(1_600_000_000)),
+            width: Some(4032),
+            height: Some(3024),
+            ..ExifTags::default()
+        };
+        let mut item = PhotoItem::default();
+        apply_exif(&mut item, &tags);
+        assert_eq!(item.name.as_deref(), Some("Sunset"));
+        assert_eq!(item.overview.as_deref(), Some("On the pier"));
+        assert_eq!(item.community_rating, Some(4.0));
+        assert_eq!(item.date_taken, Some(ts(1_600_000_000)));
+        assert_eq!(item.production_year, Some(2020));
+        assert_eq!((item.width, item.height), (4032, 3024));
+    }
+
+    #[test]
+    fn a_locked_name_keeps_its_value() {
+        // C# skips the EXIF title when MetadataField.Name is locked.
+        let tags = ExifTags {
+            title: Some("Sunset".into()),
+            ..ExifTags::default()
+        };
+        let mut item = PhotoItem {
+            name: Some("Curated name".into()),
+            name_locked: true,
+            ..Default::default()
+        };
+        apply_exif(&mut item, &tags);
+        assert_eq!(item.name.as_deref(), Some("Curated name"));
+    }
+
+    #[test]
+    fn zero_dimensions_in_the_tags_do_not_overwrite_known_ones() {
+        let tags = ExifTags {
+            width: Some(0),
+            height: Some(0),
+            ..ExifTags::default()
+        };
+        let mut item = PhotoItem {
+            width: 800,
+            height: 600,
+            ..Default::default()
+        };
+        apply_exif(&mut item, &tags);
+        assert_eq!((item.width, item.height), (800, 600));
     }
 }

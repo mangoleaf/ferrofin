@@ -69,7 +69,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
-| `ferrofin-providers` | metadata providers (local NFO always on; remote TMDB/TVDB/MusicBrainz/OMDb/fanart feature-gated) |
+| `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb needs a key) |
 | `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
@@ -249,8 +249,9 @@ classified as accepted divergences. Working end-to-end: authentication/users/Qui
 library scan + live filesystem watch, browse/query/DTO, images, sessions/playstate/remote
 control, WebSocket push, playlists/collections, direct play + live HLS transcode (subtitle
 burn-in, fMP4 HEVC/AV1), Live TV (M3U/XMLTV + DVR timers), SyncPlay, all 17 scheduled tasks,
-metrics/tracing, trickplay/chapters/lyrics/media segments, and backup/restore. See
-`docs/FEATURES.md` for the tiered status matrix.
+metrics/tracing, trickplay/chapters/lyrics/media segments, photo and book libraries
+(EXIF / `ComicInfo` / OPF), and backup/restore. See `docs/FEATURES.md` for the tiered
+status matrix.
 
 The real remaining gaps are **by design**, not un-ported routes:
 - **.NET-style native plugin loading** — never (no stable Rust ABI, and full-trust loading is
@@ -270,8 +271,10 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`FERROFIN_WASM_GUEST_TESTS=1`).
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
-- **Remote metadata providers** (TMDB/TVDB/MusicBrainz/OMDb/fanart) are feature-gated **off**
-  by default and return empty results until enabled with an API key.
+- **OMDb** ships compiled in but **inert without an API key** (`FERROFIN_OMDB_KEY` /
+  config `omdb_api_key`). Every other remote provider (TMDB/TVDB/MusicBrainz/AudioDb/
+  fanart/Studio Images) is on by default with a built-in key, gated per library by the
+  "Metadata downloaders" / "Image fetchers" checkboxes.
 
 The design invariant still holds for any **future** route added to the contract: every path
 is registered, an un-ported one returns `501` (never `404`), and the pattern is — write the

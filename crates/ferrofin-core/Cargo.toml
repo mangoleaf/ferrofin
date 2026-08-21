@@ -10,11 +10,11 @@ description = "Core manager implementations for Ferrofin (port of Emby/Jellyfin.
 workspace = true
 
 [dependencies]
+ferrofin-util.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
-ferrofin-util.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
@@ -30,6 +30,8 @@ chrono.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
+# The photo embedded-information provider (EXIF) runs during the scan.
+ferrofin-drawing.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

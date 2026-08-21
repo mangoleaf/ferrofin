@@ -2217,12 +2217,6 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unimplemented!("fake")
         }
-        async fn get_external_urls(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<ferrofin_model::providers::ExternalUrl>, ServiceError> {
-            unimplemented!("fake")
-        }
         async fn get_external_id_infos(
             &self,
             _item_id: Uuid,

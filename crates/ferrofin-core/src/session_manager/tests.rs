@@ -19,8 +19,10 @@ use uuid::Uuid;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::net::WebSocketConnection;
 use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::persistence::ItemPersistenceService;
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -152,19 +154,25 @@ impl WebSocketConnection for FakeConnection {
     }
 }
 
+/// The real library manager over `db` — shared by the session manager under
+/// test and the fixtures that write through it.
+fn library_manager(db: &Database) -> Arc<FerrofinLibraryManager> {
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ItemTypeLookup::new());
+    Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ))
+}
+
 /// Builds a session manager wired over `db` with the real sibling managers.
 fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
     let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
         config: default_server_configuration(),
     });
-    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-        Arc::new(ItemTypeLookup::new());
-    let library = Arc::new(FerrofinLibraryManager::new(
-        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
-        Arc::new(FerrofinItemCountService::new(db.clone())),
-        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-        Arc::new(FerrofinPeopleRepository::new(db.clone())),
-    ));
+    let library = library_manager(db);
     Arc::new(FerrofinSessionManager::new(
         Arc::new(FerrofinUserManager::new(db.clone())),
         Arc::new(FerrofinDeviceManager::new(db.clone())),
@@ -1123,4 +1131,887 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
         again.supports_media_control,
         "the recreated session inherits the device's reported capabilities"
     );
+}
+
+// ── cast play translation (C# `SendPlayCommand`) ───────────────────────────
+
+/// A music manager returning a canned instant mix, so the `PlayInstantMix`
+/// translation is testable without the real recommendation logic.
+struct CannedMix {
+    items: Vec<Uuid>,
+}
+
+#[async_trait]
+impl ferrofin_traits::library::MusicManager for CannedMix {
+    async fn get_instant_mix_from_item(
+        &self,
+        _item_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(self
+            .items
+            .iter()
+            .map(|id| BaseItemEntity {
+                id: guid_to_db(*id),
+                ..BaseItemEntity::default()
+            })
+            .collect())
+    }
+    async fn get_instant_mix_from_artist(
+        &self,
+        _artist_id: Uuid,
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_instant_mix_from_genres(
+        &self,
+        _genres: &[String],
+        _user_id: Option<Uuid>,
+        _dto_options: &DtoOptions,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A bus-wired manager plus that bus — the shape every cast test needs.
+fn cast_manager(
+    db: &Database,
+) -> (
+    Arc<FerrofinSessionManager>,
+    Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
+) {
+    let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
+        Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mgr = Arc::new(
+        manager(db)
+            .as_ref()
+            .clone()
+            .with_session_bus(Arc::clone(&bus)),
+    );
+    (mgr, bus)
+}
+
+/// Opens a bus-connected session for `user`, returning `(session id, its pushes)`.
+async fn cast_target(
+    mgr: &FerrofinSessionManager,
+    bus: &dyn ferrofin_traits::session_bus::SessionMessageBus,
+    user: &UserEntity,
+    device_id: &str,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", device_id, "TV", "e", user)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&received);
+    bus.register(
+        session_id.clone(),
+        Box::new(move |msg| sink.lock().unwrap().push(msg)),
+    );
+    (session_id, received)
+}
+
+/// The `Data` object of the single message pushed to a cast target.
+fn only_pushed_data(received: &Arc<Mutex<Vec<String>>>) -> serde_json::Value {
+    let messages = received.lock().unwrap();
+    assert_eq!(messages.len(), 1, "expected exactly one push: {messages:?}");
+    let envelope: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+    envelope["Data"].clone()
+}
+
+/// The `ItemIds` of a pushed `Play`, as `Uuid`s.
+fn pushed_item_ids(data: &serde_json::Value) -> Vec<Uuid> {
+    data["ItemIds"]
+        .as_array()
+        .expect("ItemIds array")
+        .iter()
+        .map(|v| Uuid::parse_str(v.as_str().unwrap()).unwrap())
+        .collect()
+}
+
+/// Records `child` as a descendant of `parent` — the row the recursive
+/// (`AncestorIds`) child query joins through.
+async fn seed_ancestor(db: &Database, child: Uuid, parent: Uuid) {
+    // Through the production writer, so the fixture cannot drift from how the
+    // scanner actually registers a descendant.
+    FerrofinItemPersistenceService::new(db.clone())
+        .set_ancestors(child, &[parent])
+        .await
+        .expect("set ancestors");
+}
+
+/// Sets an item's `SortName` through the production writer — the fixture insert
+/// leaves it NULL, which makes a `SortName` ordering assertion meaningless.
+async fn set_sort_name(db: &Database, id: Uuid, sort_name: &str) {
+    let library = library_manager(db);
+    let mut row = library
+        .get_item_by_id(id)
+        .await
+        .expect("load item")
+        .expect("item present");
+    row.sort_name = Some(sort_name.to_owned());
+    library
+        .update_items(std::slice::from_ref(&row), None)
+        .await
+        .expect("set sort name");
+}
+
+/// Grants the playback permission `GetPlayAccess` gates every cast on.
+async fn allow_playback(db: &Database, user: &UserEntity) {
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableMediaPlayback,
+        true,
+    )
+    .await
+    .unwrap();
+}
+
+/// A `PlayNow` cast of exactly these ids.
+fn play_now(item_ids: Vec<Uuid>) -> ferrofin_model::session::PlayRequest {
+    ferrofin_model::session::PlayRequest {
+        item_ids,
+        play_command: ferrofin_model::session::PlayCommand::PlayNow,
+        ..ferrofin_model::session::PlayRequest::default()
+    }
+}
+
+#[tokio::test]
+async fn casting_a_folder_expands_to_its_playable_children() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // A series with two real episodes and one virtual (missing) one.
+    let series = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        series,
+        ferrofin_model::data::BaseItemKind::Series,
+        "Show",
+        None,
+    )
+    .await;
+    let ep_a = Uuid::new_v4();
+    let ep_b = Uuid::new_v4();
+    let ep_missing = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        ep_a,
+        ferrofin_model::data::BaseItemKind::Episode,
+        "A Episode",
+    )
+    .await;
+    crate::test_support::seed_named_item(
+        &db,
+        ep_b,
+        ferrofin_model::data::BaseItemKind::Episode,
+        "B Episode",
+    )
+    .await;
+    crate::test_support::seed_episode(&db, ep_missing, "k", 1, 3, true, None).await;
+    for child in [ep_a, ep_b, ep_missing] {
+        seed_ancestor(&db, child, series).await;
+    }
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![series]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![ep_a, ep_b],
+        "the series expands to its real episodes in SortName order, minus the virtual one"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_box_set_expands_to_its_linked_members() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // A box set's membership is a manual LinkedChildren edge, NOT the physical
+    // `AncestorIds` closure the recursive folder query walks — so expanding it
+    // the folder way yields nothing and the cast silently plays an empty queue.
+    let boxset = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        boxset,
+        ferrofin_model::data::BaseItemKind::BoxSet,
+        "Trilogy",
+        None,
+    )
+    .await;
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    let mut members = Vec::new();
+    for name in ["A Part", "B Part"] {
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            &db,
+            id,
+            ferrofin_model::data::BaseItemKind::Movie,
+            name,
+        )
+        .await;
+        set_sort_name(&db, id, name).await;
+        links
+            .upsert_linked_child(boxset, id, 0)
+            .await
+            .expect("link");
+        members.push(id);
+    }
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![boxset]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        members,
+        "the box set expands to its linked members, in SortName order"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_playlist_expands_through_a_nested_box_set() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let playlist = Uuid::new_v4();
+    let boxset = Uuid::new_v4();
+    for (id, kind, name) in [
+        (
+            playlist,
+            ferrofin_model::data::BaseItemKind::Playlist,
+            "Mix",
+        ),
+        (
+            boxset,
+            ferrofin_model::data::BaseItemKind::BoxSet,
+            "Trilogy",
+        ),
+    ] {
+        crate::test_support::seed_folder_item(&db, id, kind, name, None).await;
+    }
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    links
+        .upsert_linked_child(playlist, boxset, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(boxset, movie, 0)
+        .await
+        .expect("link");
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![playlist]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![movie],
+        "nesting is flattened, not left as a container id the client cannot play"
+    );
+}
+
+#[tokio::test]
+async fn a_member_reachable_twice_is_queued_once() {
+    use crate::linked_children_service::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService;
+
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // The movie is linked into the playlist directly AND through a nested box
+    // set, so a blind flatten would queue it twice.
+    let playlist = Uuid::new_v4();
+    let boxset = Uuid::new_v4();
+    for (id, kind, name) in [
+        (
+            playlist,
+            ferrofin_model::data::BaseItemKind::Playlist,
+            "Mix",
+        ),
+        (
+            boxset,
+            ferrofin_model::data::BaseItemKind::BoxSet,
+            "Trilogy",
+        ),
+    ] {
+        crate::test_support::seed_folder_item(&db, id, kind, name, None).await;
+    }
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+
+    let links = FerrofinLinkedChildrenService::new(db.clone());
+    links
+        .upsert_linked_child(playlist, movie, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(playlist, boxset, 0)
+        .await
+        .expect("link");
+    links
+        .upsert_linked_child(boxset, movie, 0)
+        .await
+        .expect("link");
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![playlist]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![movie],
+        "a member reachable by two paths appears once, as upstream's keyed accumulation gives"
+    );
+}
+
+#[tokio::test]
+async fn a_container_member_with_an_unparseable_id_is_skipped_not_nil() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // Degrading the unparseable id to the nil GUID would be far worse than a
+    // bad entry: `translate_query` skips the parent predicate entirely when
+    // `parent_id` is nil, so the "container" would expand to the whole library.
+    let boxset = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        boxset,
+        ferrofin_model::data::BaseItemKind::BoxSet,
+        "Trilogy",
+        None,
+    )
+    .await;
+    let good = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        good,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Part One",
+    )
+    .await;
+    {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(boxset, good, 0)
+            .await
+            .expect("link");
+    }
+    crate::test_support::seed_child_with_raw_id(
+        &db,
+        "not-a-guid",
+        ferrofin_model::data::BaseItemKind::Movie,
+        boxset,
+    )
+    .await;
+    // An unrelated item that must NOT appear: its presence would mean the
+    // parent scope was dropped.
+    let elsewhere = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        elsewhere,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Unrelated",
+    )
+    .await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![boxset]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![good],
+        "the corrupt row is dropped and the scope holds — no nil GUID, no library-wide queue"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_plain_item_passes_through_unexpanded() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Movie",
+    )
+    .await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command(
+        "",
+        &session_id,
+        &ferrofin_model::session::PlayRequest {
+            play_command: ferrofin_model::session::PlayCommand::PlayNext,
+            ..play_now(vec![movie])
+        },
+    )
+    .await
+    .unwrap();
+
+    let data = only_pushed_data(&received);
+    assert_eq!(pushed_item_ids(&data), vec![movie]);
+    assert_eq!(
+        data["PlayCommand"], "PlayNext",
+        "a queue command is preserved, not rewritten"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    // A genre is stored as a by-name folder row; tagged items reference it.
+    let genre = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        genre,
+        ferrofin_model::data::BaseItemKind::Genre,
+        "Jazz",
+        None,
+    )
+    .await;
+    let track = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        track,
+        ferrofin_model::data::BaseItemKind::Audio,
+        "Track",
+    )
+    .await;
+    crate::test_support::seed_item_genre(&db, track, "Jazz").await;
+    // The by-name filter joins the item's `ItemValues.CleanValue` to the genre
+    // row's `CleanName`, which the scanner writes and the fixture must too.
+    crate::test_support::set_clean_name(&db, genre, "jazz").await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![genre]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![track],
+        "the genre expands to the tagged track, not to itself"
+    );
+}
+
+#[tokio::test]
+async fn casting_a_nonexistent_id_contributes_nothing() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![Uuid::new_v4()]))
+        .await
+        .unwrap();
+
+    // C# logs and drops the id rather than failing the whole command.
+    assert!(pushed_item_ids(&only_pushed_data(&received)).is_empty());
+}
+
+#[tokio::test]
+async fn play_shuffle_becomes_play_now_over_the_expanded_list() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let album = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        album,
+        ferrofin_model::data::BaseItemKind::MusicAlbum,
+        "Album",
+        None,
+    )
+    .await;
+    let mut tracks = Vec::new();
+    for n in 0..8 {
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            &db,
+            id,
+            ferrofin_model::data::BaseItemKind::Audio,
+            &format!("Track {n}"),
+        )
+        .await;
+        seed_ancestor(&db, id, album).await;
+        tracks.push(id);
+    }
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command(
+        "",
+        &session_id,
+        &ferrofin_model::session::PlayRequest {
+            play_command: ferrofin_model::session::PlayCommand::PlayShuffle,
+            ..play_now(vec![album])
+        },
+    )
+    .await
+    .unwrap();
+
+    let data = only_pushed_data(&received);
+    assert_eq!(
+        data["PlayCommand"], "PlayNow",
+        "the client never sees an unresolved PlayShuffle"
+    );
+    let mut ids = pushed_item_ids(&data);
+    let mut expected = tracks.clone();
+    ids.sort();
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "shuffling permutes the queue, it does not drop from it"
+    );
+}
+
+#[tokio::test]
+async fn play_instant_mix_becomes_play_now_over_the_mix() {
+    let db = test_db().await;
+    let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
+        Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mix: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    let mgr = Arc::new(
+        manager(&db)
+            .as_ref()
+            .clone()
+            .with_session_bus(Arc::clone(&bus))
+            .with_music_manager(Arc::new(CannedMix { items: mix.clone() })),
+    );
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let seed = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        seed,
+        ferrofin_model::data::BaseItemKind::Audio,
+        "Seed",
+    )
+    .await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command(
+        "",
+        &session_id,
+        &ferrofin_model::session::PlayRequest {
+            play_command: ferrofin_model::session::PlayCommand::PlayInstantMix,
+            ..play_now(vec![seed])
+        },
+    )
+    .await
+    .unwrap();
+
+    let data = only_pushed_data(&received);
+    assert_eq!(data["PlayCommand"], "PlayNow");
+    assert_eq!(pushed_item_ids(&data), mix);
+}
+
+#[tokio::test]
+async fn instant_mix_without_a_music_manager_plays_the_seed_item() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    allow_playback(&db, &user).await;
+
+    let seed = Uuid::new_v4();
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command(
+        "",
+        &session_id,
+        &ferrofin_model::session::PlayRequest {
+            play_command: ferrofin_model::session::PlayCommand::PlayInstantMix,
+            ..play_now(vec![seed])
+        },
+    )
+    .await
+    .unwrap();
+
+    let data = only_pushed_data(&received);
+    assert_eq!(data["PlayCommand"], "PlayNow");
+    assert_eq!(
+        pushed_item_ids(&data),
+        vec![seed],
+        "the cast degrades to the seed item rather than failing"
+    );
+}
+
+#[tokio::test]
+async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let controller_id = Uuid::new_v4();
+    let controller = seed_named_user(&db, controller_id, "controller").await;
+    let target_user = seed_named_user(&db, Uuid::new_v4(), "target").await;
+    allow_playback(&db, &target_user).await;
+
+    let controlling_session = mgr
+        .log_session_activity("Web", "1.0", "dev-controller", "Phone", "e", &controller)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let (target_session, received) =
+        cast_target(&mgr, bus.as_ref(), &target_user, "dev-target").await;
+
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Movie",
+    )
+    .await;
+    mgr.send_play_command(
+        &controlling_session,
+        &target_session,
+        &play_now(vec![movie]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        only_pushed_data(&received)["ControllingUserId"],
+        serde_json::json!(controller_id.to_string()),
+        "the target learns who cast to it"
+    );
+
+    received.lock().unwrap().clear();
+    mgr.send_playstate_command(
+        &controlling_session,
+        &target_session,
+        &ferrofin_model::session::PlaystateRequest {
+            command: ferrofin_model::session::PlaystateCommand::Pause,
+            ..ferrofin_model::session::PlaystateRequest::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        only_pushed_data(&received)["ControllingUserId"],
+        serde_json::json!(controller_id.simple().to_string()),
+        "C# stamps the playstate command with the dashless guid form"
+    );
+}
+
+#[tokio::test]
+async fn casting_to_a_user_without_playback_permission_is_rejected() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    // `EnableMediaPlayback` is off for a bare seeded user.
+    let user = seed_named_user(&db, Uuid::new_v4(), "noplay").await;
+    let movie = Uuid::new_v4();
+    crate::test_support::seed_named_item(
+        &db,
+        movie,
+        ferrofin_model::data::BaseItemKind::Movie,
+        "Movie",
+    )
+    .await;
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    let err = mgr
+        .send_play_command("", &session_id, &play_now(vec![movie]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "a rejected cast pushes nothing"
+    );
+}
+
+#[tokio::test]
+async fn casting_one_episode_queues_the_rest_of_the_series() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user_id = Uuid::new_v4();
+    let mut user = seed_named_user(&db, user_id, "alice").await;
+    allow_playback(&db, &user).await;
+    // Through the real user writer, so the fixture exercises the same column
+    // mapping production does.
+    user.enable_next_episode_auto_play = true;
+    let users = FerrofinUserManager::new(db.clone());
+    users.update_user(&user).await.expect("update user");
+
+    let series = Uuid::new_v4();
+    crate::test_support::seed_folder_item(
+        &db,
+        series,
+        ferrofin_model::data::BaseItemKind::Series,
+        "Show",
+        None,
+    )
+    .await;
+    let library = library_manager(&db);
+    let mut episodes = Vec::new();
+    for n in 0..3 {
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            &db,
+            id,
+            ferrofin_model::data::BaseItemKind::Episode,
+            &format!("Ep {n}"),
+        )
+        .await;
+        let mut row = library
+            .get_item_by_id(id)
+            .await
+            .expect("load episode")
+            .expect("episode present");
+        row.series_id = Some(guid_to_db(series));
+        library
+            .update_items(std::slice::from_ref(&row), Some(series))
+            .await
+            .expect("set series id");
+        seed_ancestor(&db, id, series).await;
+        episodes.push(id);
+    }
+
+    let (session_id, received) = cast_target(&mgr, bus.as_ref(), &user, "dev-cast").await;
+    mgr.send_play_command("", &session_id, &play_now(vec![episodes[1]]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pushed_item_ids(&only_pushed_data(&received)),
+        vec![episodes[1], episodes[2]],
+        "auto-play queues from the cast episode to the end of the series"
+    );
+}
+
+/// `MaxActiveSessions` is a check-then-act: the count is read from the live
+/// session pool, but the session it is counting for is only inserted several
+/// awaits later (device row, `upsert_session`). Without the admission gate every
+/// login in a concurrent burst reads the same pre-burst count and all of them
+/// are admitted — a user capped at one session gets as many as the burst is
+/// wide (measured over real HTTP: 23 of 24 accepted, where the sequential
+/// control accepts exactly 1).
+///
+/// Each login uses a DISTINCT device id, so every admitted login is its own
+/// session; a shared device id would collapse them into one and hide the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_logins_cannot_exceed_max_active_sessions() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "capped").await;
+    // Cap the account through the same API an admin uses, then allow the
+    // devices (`update_policy` does not touch `EnableAllDevices`).
+    let users: Arc<dyn ferrofin_traits::library::UserManager> =
+        Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
+    users
+        .update_policy(
+            user_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let logins = 16;
+    let gate = Arc::new(tokio::sync::Barrier::new(logins));
+    let mut tasks = Vec::new();
+    for i in 0..logins {
+        let mgr = Arc::clone(&mgr);
+        let gate = Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            let request = AuthenticationRequest {
+                user_id: Some(user_id),
+                app: Some("Web".to_owned()),
+                app_version: Some("1.0".to_owned()),
+                device_id: Some(format!("dev-{i}")),
+                device_name: Some("Chrome".to_owned()),
+                ..AuthenticationRequest::default()
+            };
+            gate.wait().await;
+            mgr.authenticate_direct(&request).await
+        }));
+    }
+
+    let mut admitted = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => admitted += 1,
+            Err(ServiceError::Unauthorized(msg)) => {
+                assert!(msg.contains("maximum number of sessions"), "{msg}");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
+
+    assert_eq!(
+        admitted, 1,
+        "MaxActiveSessions = 1 must admit exactly one login, not {admitted}"
+    );
+    let live = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(live, 1, "and exactly one session may be live afterwards");
 }
