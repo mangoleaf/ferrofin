@@ -5714,12 +5714,20 @@ mod tests {
     fn spawn_tmdb_server(
         body: Option<&'static str>,
         credits: Option<&'static str>,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::io::{Read as _, Write as _};
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Every request, not just season fetches: a series lookup never asks
+        // for a season, so a season-only counter cannot prove TMDB stayed out.
+        let all = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let counter = Arc::clone(&hits);
+        let requests = Arc::clone(&all);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { break };
@@ -5729,6 +5737,7 @@ mod tests {
                 // `/credits` first: its path contains `/season/` too. A `None`
                 // body is a MISS — a real non-2xx, not an empty 200, so the
                 // caller's failure branch is the one under test.
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let (status, payload) = if req.contains("/credits") {
                     credits.map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
                 } else if req.contains("/season/") {
@@ -5736,6 +5745,11 @@ mod tests {
                     body.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
                 } else if req.contains("/search/tv") {
                     ("200 OK", SERIES_SEARCH_JSON)
+                } else if req.contains("/tv/") {
+                    // `/tv/{id}` — a series detail fetch. Answering it (rather
+                    // than 404ing) is what lets a test prove the TVDB chain
+                    // stopped: if it did not, THIS overview wins.
+                    ("200 OK", SERIES_DETAILS_JSON)
                 } else {
                     ("404 Not Found", "{}")
                 };
@@ -5746,14 +5760,15 @@ mod tests {
                 );
             }
         });
-        (format!("http://{addr}"), hits)
+        (format!("http://{addr}"), hits, all)
     }
 
     /// The series search that gives the scan a TMDB id to hang seasons off.
-    /// `/tv/{id}` itself stays a 404 in the fake, so the series row gets no
-    /// metadata of its own — which is the interesting case: the episodes below
-    /// it must still resolve.
     const SERIES_SEARCH_JSON: &str = r#"{"results": [{"id": 1399, "name": "GoT"}]}"#;
+
+    /// `/tv/{id}` — deliberately a DIFFERENT overview from the TVDB fake's, so
+    /// a test can tell which provider wrote the row.
+    const SERIES_DETAILS_JSON: &str = r#"{"overview": "From TMDB.", "genres": []}"#;
 
     /// One episode's credits: two billed regulars, a guest star, a director,
     /// and a job Jellyfin does not map to a person type.
@@ -5828,7 +5843,7 @@ mod tests {
     // branch at all and every episode kept its filename forever.
     #[tokio::test]
     async fn tmdb_episode_title_replaces_the_filename_placeholder() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -5868,7 +5883,7 @@ mod tests {
     // could never replace it.
     #[tokio::test]
     async fn a_zero_tmdb_vote_is_unrated_not_a_rating_of_zero() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         episode.name = Some("GoT.S01E02.1080p.Bluray".into());
@@ -5891,7 +5906,7 @@ mod tests {
     // episode beneath it silently gets nothing.
     #[tokio::test]
     async fn an_episode_resolves_through_the_tmdb_id_tvdb_carries() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         // Only TVDB matched the series.
@@ -5918,7 +5933,7 @@ mod tests {
     // ca2f22c and again after 659b62e gated the only branch that fetched them.
     #[tokio::test]
     async fn tmdb_episode_credits_are_the_episodes_own() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -5950,7 +5965,7 @@ mod tests {
     // caller from clearing the episode's stored cast.
     #[tokio::test]
     async fn tmdb_episode_people_need_a_series_id() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -5976,7 +5991,7 @@ mod tests {
     async fn a_failed_credits_request_is_not_an_empty_cast() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let (failing, _) = spawn_tmdb_server(Some(SEASON_JSON), None);
+        let (failing, _, _) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&failing, tmp.path()).await;
         assert!(
             matches!(
@@ -5986,7 +6001,7 @@ mod tests {
             "a 500 is not an authoritative empty cast"
         );
 
-        let (empty, _) = spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[]}"#));
+        let (empty, _, _) = spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[]}"#));
         let (scanner, _cache, _ep) = tmdb_episode_fixture(&empty, tmp.path()).await;
         assert_eq!(
             scanner
@@ -6003,7 +6018,7 @@ mod tests {
     // The overview is still filled, because it was empty.
     #[tokio::test]
     async fn tmdb_episode_keeps_an_nfo_title_but_fills_the_overview() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         episode.name = Some("A Title From The NFO".into());
@@ -6022,7 +6037,7 @@ mod tests {
     // 10k requests for data it already had.
     #[tokio::test]
     async fn season_details_are_fetched_once_per_season() {
-        let (base, hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut ep1) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -6058,7 +6073,7 @@ mod tests {
     async fn a_previously_titled_episode_is_neither_re_requested_nor_reverted() {
         use ferrofin_db::entities::base_items::BaseItemEntity;
 
-        let (base, hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -6092,7 +6107,7 @@ mod tests {
     #[tokio::test]
     async fn a_season_miss_is_cached_and_not_re_requested() {
         // `/season/` answers 404 — a real miss, not an empty 200.
-        let (base, hits) = spawn_tmdb_server(None, Some(CREDITS_JSON));
+        let (base, hits, _all) = spawn_tmdb_server(None, Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut ep1) = tmdb_episode_fixture(&base, tmp.path()).await;
 
@@ -6131,7 +6146,7 @@ mod tests {
     async fn an_already_enriched_series_still_publishes_its_tmdb_id() {
         use ferrofin_db::entities::base_items::BaseItemEntity;
 
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         // Nothing pre-seeded: the series must publish its own id.
@@ -6180,7 +6195,7 @@ mod tests {
     // but a gated-off Series fetcher leaves the cache empty).
     #[tokio::test]
     async fn an_unmatched_series_asks_tmdb_nothing() {
-        let (base, hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         cache.series_tmdb.clear();
@@ -6247,8 +6262,10 @@ mod tests {
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
         const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB."}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
-        // TMDB answers too — if the chain does not stop, its title wins.
-        let (the_moviedb, tmdb_hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        // TMDB answers a series fetch too, with a different overview — so if
+        // the chain fails to stop, the row ends up saying "From TMDB."
+        let (the_moviedb, _season_hits, tmdb_requests) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
 
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, _ep) = tmdb_episode_fixture(&the_moviedb, tmp.path()).await;
@@ -6284,9 +6301,14 @@ mod tests {
             result.provider_ids
         );
         assert_eq!(
-            tmdb_hits.load(std::sync::atomic::Ordering::SeqCst),
+            series.overview.as_deref(),
+            Some("From TVDB."),
+            "the TVDB hit must own the row"
+        );
+        assert_eq!(
+            tmdb_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "TMDB must not run after a TVDB hit"
+            "TMDB must not be asked anything after a TVDB hit"
         );
     }
 
@@ -6407,7 +6429,8 @@ mod tests {
     async fn a_completed_credits_fetch_clears_a_stale_cast() {
         // Season text so the episode is worth fetching, and credits with nobody
         // in them — a real TMDB answer for an episode it has no cast for.
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
+        let (base, _hits, _all) =
+            spawn_tmdb_server(Some(SEASON_JSON), Some(r#"{"cast":[],"crew":[]}"#));
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id) =
             library_with_a_stale_episode_cast(tmp.path()).await;
@@ -6435,7 +6458,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_credits_request_does_not_wipe_a_stored_cast() {
         // Season text answers; `/credits` 500s.
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), None);
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), None);
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id) =
             library_with_a_stale_episode_cast(tmp.path()).await;
@@ -6529,7 +6552,7 @@ mod tests {
     // was not.
     #[tokio::test]
     async fn an_episode_tvdb_misses_still_reaches_tmdb() {
-        let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         // TVDB is wired and ranked first (default policy: both fetcher ranks

@@ -614,7 +614,15 @@ impl ChapterImagesTask {
             ..MediaSourceInfo::default()
         };
 
+        // `changed` drives the row save; `extracted` drives the health signal
+        // the caller's failure-streak guard reads. They are NOT the same: a
+        // chapter whose image is already on disk updates the row without ffmpeg
+        // running at all, and reporting that as an extraction resets the streak
+        // on evidence of nothing. The scan re-probes every file and rewrites
+        // chapter rows with a null `image_path`, so "image on disk, row stale"
+        // is the normal state after any scan, not an edge case.
         let mut changed = false;
+        let mut extracted = false;
         let mut ok = true;
         for chapter in &mut chapters {
             // A chapter in the last seconds of the file (common for a final
@@ -653,13 +661,18 @@ impl ChapterImagesTask {
                 )
                 .await
             {
-                Ok(extracted) => {
-                    if let Some(parent) = Path::new(&target).parent() {
+                Ok(frame) => Path::new(&target)
+                    .parent()
+                    // A directory the server cannot create is a server problem,
+                    // like the extraction failures around it — fail this video
+                    // the same way rather than aborting the whole method, which
+                    // would discard the chapters already resolved above AND
+                    // blocklist the video for something that is not its fault.
+                    .map_or(Ok(()), |parent| {
                         std::fs::create_dir_all(parent)
-                            .map_err(|e| ServiceError::backend(e.to_string()))?;
-                    }
-                    move_file(&extracted, &target)
-                }
+                            .map_err(|e| ServiceError::backend(e.to_string()))
+                    })
+                    .and_then(|()| move_file(&frame, &target)),
                 Err(e) => Err(e),
             };
             match moved {
@@ -667,6 +680,7 @@ impl ChapterImagesTask {
                     chapter.image_path = Some(target);
                     chapter.image_date_modified = Utc::now();
                     changed = true;
+                    extracted = true;
                 }
                 Err(e) => {
                     tracing::warn!(item = %item_id, error = %e, "chapter image extraction failed");
@@ -678,10 +692,11 @@ impl ChapterImagesTask {
         if changed {
             self.chapters.save_chapters(item_id, &chapters).await?;
         }
-        Ok(match (ok, changed) {
+        Ok(match (ok, extracted) {
             (false, _) => ChapterRefresh::Failed,
-            // Nothing failed, but nothing was extracted either: every chapter
-            // already had its image, or sat inside the end-of-file margin.
+            // Nothing failed, but ffmpeg never produced a frame either: every
+            // chapter already had its image on disk, or sat inside the
+            // end-of-file margin. Says nothing about whether extraction works.
             (true, false) => ChapterRefresh::NothingToDo,
             (true, true) => ChapterRefresh::Extracted,
         })
@@ -800,7 +815,11 @@ impl ScheduledTask for ChapterImagesTask {
 
         let total = videos.len().max(1);
         let mut history_dirty = false;
-        let mut failure_streak = 0_u32;
+        // The keys of the current run of consecutive failures. If the streak
+        // reaches the limit these are the server's fault, not the files', so
+        // they are withdrawn from the history rather than blocklisting videos
+        // that were never given a fair try. Cleared by any real extraction.
+        let mut streak_keys: Vec<String> = Vec::new();
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -832,26 +851,31 @@ impl ScheduledTask for ChapterImagesTask {
             // A failed video (extraction failure or refresh error) joins the
             // failure history so it is skipped until its file changes.
             match outcome {
-                // Proof the server can extract frames: the streak restarts.
-                Ok(ChapterRefresh::Extracted) => failure_streak = 0,
+                // Proof the server can extract frames: the streak restarts, and
+                // the failures in it stand as genuine per-file failures.
+                Ok(ChapterRefresh::Extracted) => streak_keys.clear(),
                 // Says nothing either way, so it must NOT reset the streak — a
                 // library with chapterless videos interleaved between the
                 // failures would otherwise never reach the limit, which is the
                 // shape of the library this guard exists for.
                 Ok(ChapterRefresh::NothingToDo) => {}
                 Ok(ChapterRefresh::Failed) | Err(_) => {
-                    failure_streak += 1;
-                    if failure_streak >= CHAPTER_FAILURE_STREAK_LIMIT {
-                        // Keep the failures recorded before the streak began —
-                        // those were separated by real extractions, so they are
-                        // per-file failures — but not this one, and nothing
-                        // after it.
+                    streak_keys.push(history_key.clone());
+                    if streak_keys.len() >= CHAPTER_FAILURE_STREAK_LIMIT as usize {
+                        // Withdraw the whole streak: the run has just concluded
+                        // these failures are the server's, and a blocklist entry
+                        // outlives the outage (the key only changes when the
+                        // file's mtime does). Failures from BEFORE the streak
+                        // were separated by real extractions, so they stand.
+                        for key in &streak_keys {
+                            failed.remove(key);
+                        }
                         write_failure_history(&fail_history_path, &failed, history_dirty);
                         return Err(ServiceError::backend(format!(
-                            "chapter image extraction failed on {failure_streak} videos in a \
-                             row, which is a server problem rather than a media one (check \
-                             ffmpeg and free disk space); giving up rather than recording the \
-                             rest of the library as failed"
+                            "chapter image extraction failed on {} videos in a row, which is a \
+                             server problem rather than a media one (check ffmpeg and free \
+                             disk space); giving up rather than recording the library as failed",
+                            streak_keys.len()
                         )));
                     }
                     failed.insert(history_key);
@@ -2570,18 +2594,24 @@ mod tests {
             "the error must say it is a server problem: {err}"
         );
 
-        // Exactly the failures seen before the streak reached the limit: the
-        // video that tripped it is not recorded, and nothing after it is
-        // reached. `entries < count` would pass even if 25 were blocklisted.
-        let history =
-            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
-                .unwrap_or_default();
-        let entries = history.split('|').filter(|e| !e.is_empty()).count();
+        // NOTHING is blocklisted. Every failure in this run belongs to the
+        // streak the guard just attributed to the server, so recording any of
+        // them would blocklist a video until its mtime changes for a failure
+        // that was never its fault.
+        let entries = blocklist_entries(&media);
         assert_eq!(
-            entries,
-            CHAPTER_FAILURE_STREAK_LIMIT as usize - 1,
+            entries, 0,
             "a broken server must not blocklist the library: {entries} of {count}"
         );
+    }
+
+    /// The number of videos recorded in the chapter failure history.
+    fn blocklist_entries(media: &tempfile::TempDir) -> usize {
+        std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+            .unwrap_or_default()
+            .split('|')
+            .filter(|e| !e.is_empty())
+            .count()
     }
 
     /// A library of `count` videos, every other one chapterless, with a
@@ -2672,12 +2702,41 @@ mod tests {
             .await
             .expect_err("a broken server must fail the run even on a mixed library");
         assert!(err.to_string().contains("in a row"), "{err}");
+        assert_eq!(blocklist_entries(&media), 0);
+        drop(media);
+    }
 
-        let history =
-            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
-                .unwrap_or_default();
-        let entries = history.split('|').filter(|e| !e.is_empty()).count();
-        assert_eq!(entries, CHAPTER_FAILURE_STREAK_LIMIT as usize - 1);
+    // The third way a "success" can mean no work: the chapter image is already
+    // on disk and only the row is stale, so the video is adopted without ffmpeg
+    // running. The scan re-probes every file and rewrites chapter rows with a
+    // null image path, so that is the NORMAL state after any scan — treating it
+    // as an extraction would reset the streak between every real failure on a
+    // mature library, defeating the guard exactly as a chapterless video did.
+    #[tokio::test]
+    async fn adopting_an_existing_image_does_not_reset_the_failure_streak() {
+        let count = (CHAPTER_FAILURE_STREAK_LIMIT + 5) * 2;
+        let (media, task) = mixed_chapter_library(count, false, None).await;
+
+        // Pre-place every other video's chapter image, leaving the row stale.
+        for i in (0..count).step_by(2) {
+            let id = Uuid::from_u128(u128::from(0xE000 + i));
+            let target = task.path_manager.chapter_image_path(
+                id,
+                &media.path().join(format!("film-{i}.mkv")).to_string_lossy(),
+                0,
+            );
+            if let Some(parent) = Path::new(&target).parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&target, b"jpg").expect("seed image");
+        }
+
+        let err = task
+            .execute(&TaskProgress::default())
+            .await
+            .expect_err("adopting an on-disk image is not proof extraction works");
+        assert!(err.to_string().contains("in a row"), "{err}");
+        assert_eq!(blocklist_entries(&media), 0);
         drop(media);
     }
 
@@ -2695,12 +2754,8 @@ mod tests {
             .await
             .expect("a bad folder must not abort an otherwise-healthy run");
 
-        let history =
-            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
-                .unwrap_or_default();
-        let entries = history.split('|').filter(|e| !e.is_empty()).count();
         assert_eq!(
-            entries,
+            blocklist_entries(&media),
             count as usize - 1,
             "every failure is recorded; only the one that extracted is not"
         );
