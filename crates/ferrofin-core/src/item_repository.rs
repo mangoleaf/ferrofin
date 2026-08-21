@@ -17,11 +17,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
+use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity, ItemTextRow};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
-use ferrofin_model::data::CollectionType;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
@@ -596,19 +596,33 @@ impl ItemRepository for FerrofinItemRepository {
 
     async fn item_text_rows(
         &self,
-        kind: ferrofin_model::data::BaseItemKind,
-    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
-        let Some(type_name) = crate::item_type_lookup::stored_type_name(kind) else {
+        kind: BaseItemKind,
+        ids: &[Uuid],
+    ) -> Result<Vec<ItemTextRow>, ServiceError> {
+        let Some(type_name) = stored_type_name(kind) else {
             return Ok(Vec::new());
         };
-        sqlx::query_as::<_, ferrofin_db::entities::base_items::ItemTextRow>(
-            r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
-               FROM "BaseItems" WHERE "Type" = ?1"#,
-        )
-        .bind(type_name)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)
+        let mut rows = Vec::new();
+        // 500 stays far below SQLite's conservative 999-host-variable floor.
+        for chunk in ids.chunks(500) {
+            // The anonymous `?` list must come FIRST: SQLite gives an
+            // anonymous parameter the next index after the largest assigned so
+            // far, so an explicit `?N` ahead of the list pushes every `?` in it
+            // past the bound arguments and the query silently matches nothing.
+            let sql = format!(
+                r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
+                   FROM "BaseItems" WHERE "Id" IN ({}) AND "Type" = ?{}"#,
+                placeholders(chunk.len()),
+                chunk.len() + 1
+            );
+            let mut query = sqlx::query_as::<_, ItemTextRow>(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            query = query.bind(type_name);
+            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+        Ok(rows)
     }
 
     async fn get_ancestor_chain(

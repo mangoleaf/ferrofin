@@ -1808,6 +1808,13 @@ mod tests {
                 .map(|(id, _)| *id)
                 .collect())
         }
+        async fn item_text_rows(
+            &self,
+            _kind: ferrofin_model::data::BaseItemKind,
+            _ids: &[Uuid],
+        ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
+            unimplemented!()
+        }
         async fn get_ancestor_chain(
             &self,
             _item_id: Uuid,

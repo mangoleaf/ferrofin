@@ -129,12 +129,15 @@ struct StoredText {
 }
 
 impl StoredText {
-    fn from_row(row: &ferrofin_db::entities::base_items::ItemTextRow) -> Self {
+    /// Takes the row by value: the caller owns it and drops it immediately, so
+    /// cloning three `String`s per episode is pure waste at library scale.
+    /// `titled` is computed first, while `path` is still in hand.
+    fn from_row(row: ferrofin_db::entities::base_items::ItemTextRow) -> Self {
         Self {
-            name: row.name.clone(),
-            sort_name: row.sort_name.clone(),
-            overview: row.overview.clone(),
             titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
+            name: row.name,
+            sort_name: row.sort_name,
+            overview: row.overview,
         }
     }
 
@@ -3384,25 +3387,55 @@ impl LibraryScanner {
         &self,
         planned: &[Planned],
     ) -> std::collections::HashMap<Uuid, StoredText> {
-        if planned.is_empty() {
-            return std::collections::HashMap::new();
-        }
         let Some(repo) = &self.item_repository else {
             return std::collections::HashMap::new();
         };
+        // Only the episodes this scan planned. Reading every episode row
+        // instead costs ~113 ms and ~30 MB on a 60k-episode library — paid in
+        // full by `scan_paths`, which the library monitor runs for one changed
+        // file, and paid by libraries with no episodes in them at all.
+        let episode_type =
+            item_type_lookup::stored_type_name(ferrofin_model::data::BaseItemKind::Episode);
+        let ids: Vec<Uuid> = planned
+            .iter()
+            .filter(|p| Some(p.entity.type_.as_str()) == episode_type)
+            .map(|p| p.id)
+            .collect();
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
         match repo
-            .item_text_rows(ferrofin_model::data::BaseItemKind::Episode)
+            .item_text_rows(ferrofin_model::data::BaseItemKind::Episode, &ids)
             .await
         {
-            Ok(rows) => rows
-                .into_iter()
-                .filter_map(|row| {
-                    let id = Uuid::parse_str(&row.id).ok()?;
-                    Some((id, StoredText::from_row(&row)))
-                })
-                .collect(),
+            Ok(rows) => {
+                let mut dropped = 0_usize;
+                let map: std::collections::HashMap<Uuid, StoredText> = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        // Parse before the move: `from_row` takes the row by
+                        // value, so the borrow of `row.id` must end first.
+                        let parsed = Uuid::parse_str(&row.id);
+                        if let Ok(id) = parsed {
+                            Some((id, StoredText::from_row(row)))
+                        } else {
+                            dropped += 1;
+                            None
+                        }
+                    })
+                    .collect();
+                if dropped > 0 {
+                    // Silently dropping rows here would look like "no previous
+                    // scan" and re-fetch forever, so say it happened.
+                    tracing::debug!(dropped, "stored episode rows with unparseable ids");
+                }
+                map
+            }
             Err(err) => {
-                // A closed gate costs a re-fetch, never wrong data.
+                // A closed gate re-fetches; it does NOT protect the stored
+                // title, because the scan upsert writes `excluded."Name"` for
+                // an unlocked row. A fetch that then misses would put the
+                // file-stem placeholder back.
                 tracing::warn!(%err, "failed to read stored episode text; re-fetching all");
                 std::collections::HashMap::new()
             }
@@ -7539,7 +7572,7 @@ mod tests {
 
         // What an earlier scan achieved. `episode` is the freshly-planned row,
         // still carrying the file stem and no overview.
-        let stored = super::StoredText::from_row(&ferrofin_db::entities::base_items::ItemTextRow {
+        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
             id: String::new(),
             name: Some("Winter Is Coming".into()),
             sort_name: Some("001 - 0001 - Winter Is Coming".into()),

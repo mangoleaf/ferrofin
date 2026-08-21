@@ -26,7 +26,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::{
-    AttachmentStreamInfoEntity, BaseItemEntity, ChapterEntity, KeyframeDataEntity,
+    AttachmentStreamInfoEntity, BaseItemEntity, ChapterEntity, ItemTextRow, KeyframeDataEntity,
     MediaStreamInfoEntity, PeopleEntity,
 };
 use ferrofin_db::entities::users::UserEntity;
@@ -156,25 +156,34 @@ pub trait ItemRepository: Send + Sync {
     /// scan reads it from the returned set instead.
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
 
-    /// The stored `Name`/`SortName`/`Overview`/`Path` of every item of `kind`,
-    /// in one query.
+    /// The stored `Name`/`SortName`/`Overview`/`Path` of the given items of
+    /// `kind`, chunked into as few queries as the host-variable limit allows.
     ///
     /// The episode metadata providers gate a re-fetch on what a previous scan
     /// already achieved, which only the stored row knows — `Planned.entity` is
     /// rebuilt from the filesystem every scan, so its name is always the file
-    /// stem. Asking per item would reinstate exactly the `SELECT *`-per-item
-    /// cost that [`locked_item_ids`](Self::locked_item_ids) was introduced to
-    /// remove, so this is the same shape: one narrow read per scan.
+    /// stem and its overview always `None`. Asking per item would reinstate the
+    /// `SELECT *`-per-item cost that
+    /// [`locked_item_ids`](Self::locked_item_ids) removed, so the scan asks
+    /// once for the set it planned.
     ///
-    /// Defaults to empty — a repository that does not implement it simply
-    /// leaves every gate closed, which costs a re-fetch and never wrong data.
+    /// **Scoped by `ids` on purpose.** Reading every row of `kind` instead
+    /// looks similar but is not: `locked_item_ids` rides a partial index and
+    /// touches no rows in the normal case, whereas a whole-kind read of these
+    /// four text columns is a non-covering index scan — ~113 ms and ~30 MB for
+    /// 60k episodes, paid even by `scan_paths`, the library-monitor path that
+    /// runs for a single changed file. Keep this O(planned).
+    ///
+    /// Returns rows only for ids that exist; callers must not assume a row per
+    /// id.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
     async fn item_text_rows(
         &self,
-        kind: ferrofin_model::data::BaseItemKind,
-    ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
-        let _ = kind;
-        Ok(Vec::new())
-    }
+        kind: BaseItemKind,
+        ids: &[Uuid],
+    ) -> Result<Vec<ItemTextRow>, ServiceError>;
 
     /// Walks the `ParentId` chain from `item_id` upward in a single query
     /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
