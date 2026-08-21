@@ -6197,6 +6197,99 @@ mod tests {
         assert_eq!(episode.name.as_deref(), Some("GoT.S01E01.1080p.Bluray"));
     }
 
+    /// A TVDB stand-in: `/login` issues a token, `/search` answers from
+    /// `search`, and `/series/…`/`/episodes/…` from `details`. A `None` body
+    /// 404s, which is how a miss is expressed.
+    ///
+    /// Exists because every TVDB **hit** path was unreachable from these tests
+    /// while `TvdbClient::with_base_url` was crate-private — the "a TVDB hit is
+    /// authoritative, do not also run TMDB" branches could be deleted with the
+    /// whole suite green.
+    fn spawn_tvdb_server(search: Option<&'static str>, details: Option<&'static str>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, payload) = if req.contains("/login") {
+                    ("200 OK", r#"{"data":{"token":"tok"}}"#)
+                } else if req.contains("/search") {
+                    search.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/series/") || req.contains("/episodes/") {
+                    details.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+                } else {
+                    ("404 Not Found", "{}")
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // A TVDB series hit is authoritative: TMDB must not also run and overwrite
+    // it. Nothing covered this branch — a full TVDB hit could be made to report
+    // a miss and every test still passed.
+    #[tokio::test]
+    async fn a_tvdb_series_hit_stops_the_chain() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        // `/search` → Envelope<Vec<SearchItem>>; `/series/{id}/extended` →
+        // Envelope<SeriesExtendedWire>. One fake serves both; the search item
+        // carries the id the details call is then made with.
+        const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB."}}"#;
+        let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
+        // TMDB answers too — if the chain does not stop, its title wins.
+        let (the_moviedb, tmdb_hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _ep) = tmdb_episode_fixture(&the_moviedb, tmp.path()).await;
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&the_tvdb),
+        ));
+
+        let mut series = BaseItemEntity {
+            id: "SERIES".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("GoT".into()),
+            ..Default::default()
+        };
+        let result = scanner
+            .fetch_remote_metadata(
+                &mut series,
+                &mut cache,
+                super::FetcherPolicy::default(),
+                None,
+            )
+            .await;
+
+        assert!(
+            cache.series_tvdb.contains_key("SERIES"),
+            "the hit must be cached — seasons and episodes key off it"
+        );
+        assert!(
+            result
+                .provider_ids
+                .iter()
+                .any(|(k, v)| k == "Tvdb" && v == "121361"),
+            "the TVDB id must be persisted: {:?}",
+            result.provider_ids
+        );
+        assert_eq!(
+            tmdb_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "TMDB must not run after a TVDB hit"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // Stale credits
     // ---------------------------------------------------------------------
@@ -6439,9 +6532,15 @@ mod tests {
         let (base, _hits) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
-        // TVDB is wired and ranked first (default policy), but knows nothing:
-        // its client points at no server, so every lookup misses.
-        let scanner = scanner.with_tvdb(Arc::new(ferrofin_providers::TvdbClient::new()));
+        // TVDB is wired and ranked first (default policy: both fetcher ranks
+        // are `usize::MAX`, so `tvdb_first` is true), and misses — the fixture
+        // leaves `cache.series_tvdb` empty, so the episode arm returns at its
+        // cache lookup before any request. Point the client at a dead address
+        // regardless, so a future change to the fixture cannot turn this into a
+        // live TVDB login on every CI run.
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
+        ));
 
         let result = scanner
             .fetch_remote_metadata(

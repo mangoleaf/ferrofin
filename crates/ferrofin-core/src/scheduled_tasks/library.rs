@@ -495,6 +495,25 @@ impl ScheduledTask for AudioNormalizationTask {
 /// image: there is not enough remaining video for ffmpeg to decode a frame.
 const CHAPTER_IMAGE_EOF_MARGIN_TICKS: i64 = 10 * TICKS_PER_SECOND;
 
+/// What one video's chapter-image pass actually did.
+///
+/// The distinction that matters is `Extracted` vs `NothingToDo`: only the
+/// former is evidence the server can extract frames at all. Collapsing them
+/// into one "success" makes the failure-streak guard below useless on a real
+/// library, where chapterless videos are interleaved everywhere and would
+/// reset the streak between every failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChapterRefresh {
+    /// At least one frame was extracted and stored.
+    Extracted,
+    /// The video had no chapters, no video stream, or every chapter was
+    /// already imaged — nothing was attempted, so this says nothing about
+    /// whether extraction works.
+    NothingToDo,
+    /// An extraction or its move failed.
+    Failed,
+}
+
 /// How many videos may fail **in a row** before the run gives up and concludes
 /// the server, not the media, is broken.
 ///
@@ -555,17 +574,20 @@ impl ChapterImagesTask {
         }
     }
 
-    /// Extracts any missing chapter images for one video, returning `false`
-    /// when an extraction failed (the video joins the failure history).
+    /// Extracts any missing chapter images for one video.
+    ///
+    /// Distinguishes a real extraction from a video there was nothing to do
+    /// for: the caller's failure-streak guard can only judge the server's
+    /// health from videos that actually attempted work.
     async fn refresh_video(
         &self,
         item_id: Uuid,
         media_path: &str,
         run_time_ticks: Option<i64>,
-    ) -> Result<bool, ServiceError> {
+    ) -> Result<ChapterRefresh, ServiceError> {
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         if chapters.is_empty() {
-            return Ok(true);
+            return Ok(ChapterRefresh::NothingToDo);
         }
         // The stored video stream drives the extraction arguments.
         let video_stream = self
@@ -579,7 +601,7 @@ impl ChapterImagesTask {
             .into_iter()
             .next();
         let Some(video_stream) = video_stream else {
-            return Ok(true);
+            return Ok(ChapterRefresh::NothingToDo);
         };
         let stream = MediaStream {
             stream_type: MediaStreamType::Video,
@@ -656,7 +678,13 @@ impl ChapterImagesTask {
         if changed {
             self.chapters.save_chapters(item_id, &chapters).await?;
         }
-        Ok(ok)
+        Ok(match (ok, changed) {
+            (false, _) => ChapterRefresh::Failed,
+            // Nothing failed, but nothing was extracted either: every chapter
+            // already had its image, or sat inside the end-of-file margin.
+            (true, false) => ChapterRefresh::NothingToDo,
+            (true, true) => ChapterRefresh::Extracted,
+        })
     }
 }
 
@@ -803,22 +831,32 @@ impl ScheduledTask for ChapterImagesTask {
             }
             // A failed video (extraction failure or refresh error) joins the
             // failure history so it is skipped until its file changes.
-            if matches!(outcome, Ok(true)) {
-                failure_streak = 0;
-            } else {
-                failure_streak += 1;
-                // Bail BEFORE recording this one: nothing about a run this
-                // broken says anything about the media, and the entries would
-                // outlive the outage.
-                if failure_streak >= CHAPTER_FAILURE_STREAK_LIMIT {
-                    return Err(ServiceError::backend(format!(
-                        "chapter image extraction failed on {failure_streak} videos in a row, \
-                         which is a server problem rather than a media one (check ffmpeg and \
-                         free disk space); giving up without recording them as failed"
-                    )));
+            match outcome {
+                // Proof the server can extract frames: the streak restarts.
+                Ok(ChapterRefresh::Extracted) => failure_streak = 0,
+                // Says nothing either way, so it must NOT reset the streak — a
+                // library with chapterless videos interleaved between the
+                // failures would otherwise never reach the limit, which is the
+                // shape of the library this guard exists for.
+                Ok(ChapterRefresh::NothingToDo) => {}
+                Ok(ChapterRefresh::Failed) | Err(_) => {
+                    failure_streak += 1;
+                    if failure_streak >= CHAPTER_FAILURE_STREAK_LIMIT {
+                        // Keep the failures recorded before the streak began —
+                        // those were separated by real extractions, so they are
+                        // per-file failures — but not this one, and nothing
+                        // after it.
+                        write_failure_history(&fail_history_path, &failed, history_dirty);
+                        return Err(ServiceError::backend(format!(
+                            "chapter image extraction failed on {failure_streak} videos in a \
+                             row, which is a server problem rather than a media one (check \
+                             ffmpeg and free disk space); giving up rather than recording the \
+                             rest of the library as failed"
+                        )));
+                    }
+                    failed.insert(history_key);
+                    history_dirty = true;
                 }
-                failed.insert(history_key);
-                history_dirty = true;
             }
         }
         write_failure_history(&fail_history_path, &failed, history_dirty);
@@ -1517,6 +1555,8 @@ mod tests {
     /// a marker file next to the input (or fails when `fail` is set).
     struct FakeEncoder {
         fail_extract: bool,
+        /// Path substring that extracts successfully regardless.
+        succeeds_for: Option<String>,
     }
 
     #[async_trait]
@@ -1552,7 +1592,14 @@ mod tests {
             _threed_format: Option<ferrofin_model::entities::Video3DFormat>,
             _offset_ticks: Option<i64>,
         ) -> Result<String, ServiceError> {
-            if self.fail_extract {
+            // `succeeds_for` names a substring of the input path that extracts
+            // successfully even when everything else fails — the shape of a
+            // library where most videos fail but some genuinely work.
+            let forced_ok = self
+                .succeeds_for
+                .as_deref()
+                .is_some_and(|m| input_file.contains(m));
+            if self.fail_extract && !forced_ok {
                 return Err(ServiceError::backend("extract failed"));
             }
             let out = format!("{input_file}.image.jpg");
@@ -1792,6 +1839,48 @@ mod tests {
         chapters: Mutex<Vec<ChapterInfo>>,
     }
 
+    /// A chapter manager that only some items have chapters for — the shape of
+    /// every real library, where extras, specials and home video sit between
+    /// the chaptered films.
+    struct FakeChaptersFor {
+        with_chapters: std::collections::HashSet<Uuid>,
+    }
+
+    #[async_trait]
+    impl ChapterManager for FakeChaptersFor {
+        async fn supports(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: Uuid,
+            _chapters: &[ChapterInfo],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_chapter(
+            &self,
+            _item_id: Uuid,
+            _index: i32,
+        ) -> Result<Option<ChapterInfo>, ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn get_chapters(&self, item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
+            Ok(if self.with_chapters.contains(&item_id) {
+                vec![ChapterInfo {
+                    start_position_ticks: 0,
+                    name: Some("Chapter".to_owned()),
+                    ..ChapterInfo::default()
+                }]
+            } else {
+                Vec::new()
+            })
+        }
+        async fn delete_chapter_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!("fake")
+        }
+    }
+
     #[async_trait]
     impl ChapterManager for FakeChapters {
         async fn supports(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
@@ -1907,6 +1996,7 @@ mod tests {
             )),
             Arc::new(FakeEncoder {
                 fail_extract: false,
+                succeeds_for: None,
             }),
             runner.clone(),
             paths,
@@ -1962,6 +2052,7 @@ mod tests {
             Arc::new(FakeFolders(Vec::new())),
             Arc::new(FakeEncoder {
                 fail_extract: false,
+                succeeds_for: None,
             }),
             runner.clone(),
             paths,
@@ -2284,6 +2375,7 @@ mod tests {
             Arc::clone(&keyframes),
             Arc::new(FakeEncoder {
                 fail_extract: false,
+                succeeds_for: None,
             }),
         );
         assert_eq!(task.key(), "KeyframeExtraction");
@@ -2356,7 +2448,10 @@ mod tests {
             )),
             Arc::clone(&chapters) as Arc<dyn ChapterManager>,
             Arc::new(streams),
-            Arc::new(FakeEncoder { fail_extract }),
+            Arc::new(FakeEncoder {
+                fail_extract,
+                succeeds_for: None,
+            }),
             path_manager,
             app_paths,
         );
@@ -2458,7 +2553,10 @@ mod tests {
             Arc::clone(&chapters) as Arc<dyn ChapterManager>,
             Arc::new(streams),
             // Every extraction fails — the shape of an unusable ffmpeg.
-            Arc::new(FakeEncoder { fail_extract: true }),
+            Arc::new(FakeEncoder {
+                fail_extract: true,
+                succeeds_for: None,
+            }),
             path_manager,
             app_paths,
         );
@@ -2472,16 +2570,141 @@ mod tests {
             "the error must say it is a server problem: {err}"
         );
 
-        // The blocklist holds at most the failures seen before the guard
-        // tripped, and never the whole library.
+        // Exactly the failures seen before the streak reached the limit: the
+        // video that tripped it is not recorded, and nothing after it is
+        // reached. `entries < count` would pass even if 25 were blocklisted.
         let history =
             std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
                 .unwrap_or_default();
         let entries = history.split('|').filter(|e| !e.is_empty()).count();
-        assert!(
-            entries < count as usize,
+        assert_eq!(
+            entries,
+            CHAPTER_FAILURE_STREAK_LIMIT as usize - 1,
             "a broken server must not blocklist the library: {entries} of {count}"
         );
+    }
+
+    /// A library of `count` videos, every other one chapterless, with a
+    /// per-item chapter manager and an encoder that fails unless the path
+    /// contains `succeeds_for`.
+    async fn mixed_chapter_library(
+        count: u32,
+        every_other_chapterless: bool,
+        succeeds_for: Option<&str>,
+    ) -> (tempfile::TempDir, ChapterImagesTask) {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library = library_manager_over(db.clone());
+
+        let mut with_chapters = std::collections::HashSet::new();
+        let mut streams = Vec::new();
+        for i in 0..count {
+            let id = Uuid::from_u128(u128::from(0xE000 + i));
+            seed_named_item(&db, id, BaseItemKind::Movie, &format!("Film {i}")).await;
+            set_media_type(&db, id, "Video").await;
+            // The "good" marker rides the filename so the encoder fake can pick
+            // it out; only ever applied to a chaptered video.
+            let good = succeeds_for.is_some() && i == count / 2;
+            let name = if good {
+                format!("film-{i}-good.mkv")
+            } else {
+                format!("film-{i}.mkv")
+            };
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+            if !every_other_chapterless || i % 2 == 0 || good {
+                with_chapters.insert(id);
+            }
+            streams.push(MediaStreamInfoEntity {
+                item_id: id.to_string(),
+                stream_index: 0,
+                stream_type: media_stream_type_disc(StreamTypeEnum::Video),
+                codec: Some("h264".to_owned()),
+                ..MediaStreamInfoEntity::default()
+            });
+        }
+
+        let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            media.path().join("data"),
+            media.path().join("logs"),
+            media.path().join("config"),
+            media.path().join("cache"),
+            media.path().join("web"),
+        ));
+        let path_manager: Arc<dyn PathManager> =
+            Arc::new(crate::FerrofinPathManager::new(Arc::clone(&app_paths)));
+        let task = ChapterImagesTask::new(
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_chapter_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                &media.path().to_string_lossy(),
+            )),
+            Arc::new(FakeChaptersFor { with_chapters }) as Arc<dyn ChapterManager>,
+            Arc::new(FakeStreams(streams)),
+            Arc::new(FakeEncoder {
+                fail_extract: true,
+                succeeds_for: succeeds_for.map(str::to_owned),
+            }),
+            path_manager,
+            app_paths,
+        );
+        (media, task)
+    }
+
+    // A video with no chapters is not evidence the server works — nothing was
+    // attempted. Counting it as a success resets the streak, and on a real
+    // library (chapterless extras interleaved everywhere) a totally broken
+    // ffmpeg then never reaches the limit: the run reports success and
+    // blocklists every chaptered video, which is the ~2950-entry outcome the
+    // guard exists to prevent.
+    #[tokio::test]
+    async fn chapterless_videos_do_not_reset_the_failure_streak() {
+        let count = (CHAPTER_FAILURE_STREAK_LIMIT + 5) * 2;
+        let (media, task) = mixed_chapter_library(count, true, None).await;
+
+        let err = task
+            .execute(&TaskProgress::default())
+            .await
+            .expect_err("a broken server must fail the run even on a mixed library");
+        assert!(err.to_string().contains("in a row"), "{err}");
+
+        let history =
+            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+                .unwrap_or_default();
+        let entries = history.split('|').filter(|e| !e.is_empty()).count();
+        assert_eq!(entries, CHAPTER_FAILURE_STREAK_LIMIT as usize - 1);
+        drop(media);
+    }
+
+    // The other half of the streak decision: a real extraction resets it, so a
+    // bad folder in the middle of an otherwise-healthy library is recorded and
+    // the run finishes. A total-failure counter would abort here instead.
+    #[tokio::test]
+    async fn a_real_extraction_resets_the_failure_streak() {
+        // One genuinely-extracting video sits in the middle; everything else
+        // fails. Neither run of failures reaches the limit on its own.
+        let count = CHAPTER_FAILURE_STREAK_LIMIT * 2 - 2;
+        let (media, task) = mixed_chapter_library(count, false, Some("good")).await;
+
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("a bad folder must not abort an otherwise-healthy run");
+
+        let history =
+            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+                .unwrap_or_default();
+        let entries = history.split('|').filter(|e| !e.is_empty()).count();
+        assert_eq!(
+            entries,
+            count as usize - 1,
+            "every failure is recorded; only the one that extracted is not"
+        );
+        drop(media);
     }
 
     // The failure mode that cost a real library every chapter image: the
