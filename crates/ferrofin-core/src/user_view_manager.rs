@@ -136,7 +136,19 @@ impl FerrofinUserViewManager {
             .await
             .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
         let entity = BaseItemEntity {
-            id: id.to_string(),
+            // `guid_to_db`, NOT `to_string()`. Jellyfin stores Guid columns
+            // UPPERCASE-hyphenated and `BaseItems."Id"` is plain TEXT with no
+            // COLLATE NOCASE, so a lowercase id is a different row as far as
+            // SQLite is concerned. Writing one here meant the `item_exists`
+            // check above — which binds `guid_to_db(id)` — could never see the
+            // row it had just written, so EVERY `GET /Library/MediaFolders`
+            // re-ran `create_dir_all` plus this upsert through the single
+            // writer connection. Under load that serialized the endpoint:
+            // 1355 ms p50 and 31% errors in the benchmark against Jellyfin's
+            // 0.23 ms. It also leaked into the response — the folder came back
+            // with a lowercase `Id` where Jellyfin sends uppercase, which is
+            // why the suite scored this operation as diverging from upstream.
+            id: ferrofin_db::store::guid_to_db(id),
             type_: item_type_lookup::stored_type_name(BaseItemKind::ManualPlaylistsFolder)
                 .unwrap_or_default()
                 .to_owned(),
@@ -436,11 +448,48 @@ mod tests {
         // The backing directory is created on disk.
         assert!(playlists_path.is_dir());
 
-        // Provisioning is idempotent — a second read does not add a duplicate.
+        // The id is stored the way Jellyfin stores Guid columns: UPPERCASE
+        // hyphenated. `BaseItems."Id"` is plain TEXT with no COLLATE NOCASE, so
+        // a lowercase id is a different row to SQLite — the existence check
+        // below would never match it, and the folder would also come back to
+        // clients with a lowercase `Id` where Jellyfin sends uppercase.
+        assert_eq!(
+            playlists.id,
+            playlists.id.to_uppercase(),
+            "the provisioned id must be stored in guid_to_db form, got {}",
+            playlists.id
+        );
+
+        // Provisioning is idempotent — and this checks that the second read
+        // does not WRITE, not merely that it does not duplicate. An upsert on
+        // the same id can never duplicate, so a row count proves nothing; the
+        // bug this guards against re-ran the upsert on every single request and
+        // still left exactly one row. Renaming the row out from under the
+        // manager makes a rewrite observable: if provisioning runs again it
+        // stamps `Name` back to "Playlists".
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        let mut renamed_row = playlists.clone();
+        renamed_row.name = Some("SENTINEL".to_owned());
+        persistence
+            .save_items(std::slice::from_ref(&renamed_row))
+            .await
+            .expect("rename the provisioned row");
+
         let again = mgr
             .get_media_folders(Uuid::from_u128(9))
             .await
             .expect("media folders again");
         assert_eq!(again.len(), libraries + 1);
+        let renamed = again
+            .iter()
+            .find(|f| f.id == playlists.id)
+            .expect("the provisioned row is still there");
+        assert_eq!(
+            renamed.name.as_deref(),
+            Some("SENTINEL"),
+            "a second read re-provisioned the folder — the existence check did \
+             not match the row it wrote, so every request pays a filesystem \
+             call and a write through the single writer connection"
+        );
     }
 }

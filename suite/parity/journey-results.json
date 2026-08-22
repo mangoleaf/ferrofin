@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "bad303e 2026-08-21",
+  "last_verified": "51cb10e 2026-08-21",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -54,9 +54,9 @@
       "note": "H=True J=False"
     },
     "DELETE /ScheduledTasks/Running/{taskId}": {
-      "classification": "ok",
-      "deep_verified": true,
-      "note": "H=True J=True"
+      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "deep_verified": false,
+      "note": "H=True J=False"
     },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
