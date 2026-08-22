@@ -177,28 +177,7 @@ impl NextUpService for FerrofinNextUpService {
 
         // Series (by presentation key) whose most-recently-played episode within
         // the requested libraries is at/after the cutoff, newest first.
-        let mut sql = String::from(
-            r#"SELECT bi."SeriesPresentationUniqueKey" AS key,
-                      MAX(ud."LastPlayedDate") AS last_played
-               FROM "BaseItems" bi
-               JOIN "UserData" ud ON ud."ItemId" = bi."Id"
-               WHERE bi."Type" = ? AND ud."UserId" = ?
-                 AND ud."ItemId" <> ?
-                 AND bi."SeriesPresentationUniqueKey" IS NOT NULL
-                 AND bi."TopParentId" IN ("#,
-        );
-        for i in 0..filter.top_parent_ids.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push('?');
-        }
-        sql.push_str(
-            r#") GROUP BY bi."SeriesPresentationUniqueKey"
-               HAVING last_played IS NOT NULL AND last_played >= ?
-               ORDER BY last_played DESC"#,
-        );
-
+        let sql = next_up_series_keys_sql(filter.top_parent_ids.len());
         let mut query = sqlx::query_scalar::<_, String>(&sql)
             .bind(episode_type)
             .bind(&user.id)
@@ -525,6 +504,51 @@ fn first_after(positions: &[EpisodePos], after: Option<(i64, i64)>) -> Option<Uu
             Some(pos) => sort_key(p.season, p.episode) > pos,
         })
         .map(|p| p.id)
+}
+
+/// The series-keys aggregate for next-up, with `parents` bound `TopParentId`
+/// placeholders.
+///
+/// Driven from `UserData`, not `BaseItems`, and pinned with CROSS JOIN.
+///
+/// Left to itself SQLite seeds from `BaseItems` on
+/// `(Type, SeriesPresentationUniqueKey)` and then seeks `UserData` once
+/// per episode — every episode in the library, however few the user has
+/// actually watched. On the bench fixture that is 1,997 seeks for a user
+/// with ONE `UserData` row, and it is the single most expensive
+/// statement in the request: 0.92 ms of nextup's 2.33 ms CPU, which is
+/// what pushed the endpoint past its 4-core budget at the benchmark's
+/// 1849 rps and collapsed it to a 1.5-2 s p50.
+///
+/// Seeding from `UserData (UserId = ?)` instead makes the work scale
+/// with what the user has watched rather than with library size — the
+/// covering index answers it directly. Same rows either way: both are
+/// inner joins over the identical predicates; CROSS JOIN only removes
+/// the planner's freedom to reorder them.
+#[must_use]
+pub fn next_up_series_keys_sql(parents: usize) -> String {
+    let mut sql = String::from(
+        r#"SELECT bi."SeriesPresentationUniqueKey" AS key,
+                  MAX(ud."LastPlayedDate") AS last_played
+           FROM "UserData" ud
+           CROSS JOIN "BaseItems" bi ON bi."Id" = ud."ItemId"
+           WHERE bi."Type" = ? AND ud."UserId" = ?
+             AND ud."ItemId" <> ?
+             AND bi."SeriesPresentationUniqueKey" IS NOT NULL
+             AND bi."TopParentId" IN ("#,
+    );
+    for i in 0..parents {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('?');
+    }
+    sql.push_str(
+        r#") GROUP BY bi."SeriesPresentationUniqueKey"
+           HAVING last_played IS NOT NULL AND last_played >= ?
+           ORDER BY last_played DESC"#,
+    );
+    sql
 }
 
 #[cfg(test)]

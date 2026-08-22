@@ -122,11 +122,14 @@ impl FerrofinTvSeriesManager {
             ..InternalItemsQuery::default()
         };
         query.parent_id = uuid::Uuid::nil();
-        let folders = self.library_manager.get_item_list(&query).await?;
-        Ok(folders
-            .into_iter()
-            .filter_map(|f| uuid::Uuid::parse_str(&f.id).ok())
-            .collect())
+        // `get_item_ids`, not `get_item_list`: only the ids are used, and the
+        // full-row form materializes every column of every folder to reach
+        // them. There is no parent filter here (a nil `parent_id` is "unset",
+        // not "parent IS NULL"), so this matches every folder in the library —
+        // seasons, studios and genres included, 249 of them on the bench
+        // fixture. Measured on that data: `SELECT bi.*` 0.685 ms vs
+        // `SELECT bi."Id"` 0.044 ms, and this runs on every `/Shows/NextUp`.
+        self.library_manager.get_item_ids(&query).await
     }
 
     /// Runs the batched next-up algorithm for a set of series keys and returns
@@ -439,11 +442,21 @@ mod tests {
                 Vec::new(),
             ))
         }
+        // Derived from the SAME source as `get_item_list`, because the real
+        // pair are two projections of one query and callers may use either.
+        // This returned an empty Vec while `get_item_list` returned the
+        // folders, so a caller that switched projections silently saw no
+        // libraries — which is exactly what happened when `resolve_top_parents`
+        // moved to the id-only form.
         async fn get_item_ids(
             &self,
             _query: &InternalItemsQuery,
         ) -> Result<Vec<Uuid>, ServiceError> {
-            Ok(Vec::new())
+            Ok(self
+                .top_folders
+                .iter()
+                .filter_map(|f| Uuid::parse_str(&f.id).ok())
+                .collect())
         }
         async fn get_item_list(
             &self,
