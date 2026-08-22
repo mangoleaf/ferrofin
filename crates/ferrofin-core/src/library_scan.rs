@@ -9634,6 +9634,11 @@ mod tests {
     /// every sidecar poster once options were saved.
     #[tokio::test]
     async fn saved_type_options_never_disable_local_artwork() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository;
+
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         std::fs::create_dir_all(&media).unwrap();
@@ -9665,19 +9670,40 @@ mod tests {
         .await
         .unwrap();
 
-        let scanner =
-            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence);
+        let scanner = LibraryScanner::new(
+            vf.clone(),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        );
         scanner.scan_all().await.unwrap();
 
-        let (count,): (i64,) =
-            sqlx::query_as(r#"SELECT COUNT(*) FROM "BaseItemImageInfos" WHERE "ImageType" = 0"#)
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
+        // Assert through the repository seam (the SQL-boundary ratchet forbids new raw
+        // queries in this file): the scanned movie carries the poster as its Primary.
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(db, lookup));
+        let ids = items
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "the movie was scanned in");
+        let primaries: Vec<_> = items
+            .get_image_infos(ids[0])
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.image_type == ferrofin_model::entities::ImageType::Primary)
+            .collect();
         assert_eq!(
-            count, 1,
+            primaries.len(),
+            1,
             "the sidecar poster must survive an empty ImageFetchers list"
         );
+        assert!(primaries[0].path.ends_with("poster.jpg"));
     }
 
     // With an image processor wired, the scan fills each artwork's pixel dimensions and
