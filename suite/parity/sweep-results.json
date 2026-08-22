@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/sweep.py",
-  "last_verified": "51cb10e 2026-08-21",
+  "last_verified": "92a5ec5 2026-08-22",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",
@@ -10932,7 +10932,6 @@
           "versions[]"
         ],
         "missing": [
-          "imageUrl",
           "versions[0].changelog",
           "versions[0].checksum",
           "versions[0].sourceUrl",
@@ -11065,9 +11064,7 @@
       "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          " (whole item)"
-        ],
+        "extra": [],
         "mismatch": [],
         "missing": [
           " (whole item)",
@@ -12116,9 +12113,7 @@
       "classification": "flagged: read diff vs Jellyfin (sweep single-item align)",
       "deep_verified": false,
       "diffs": {
-        "extra": [
-          " (whole item)"
-        ],
+        "extra": [],
         "mismatch": [],
         "missing": [
           " (whole item)"

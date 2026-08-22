@@ -573,15 +573,28 @@ impl DtoService for OkDto {
     ) -> Result<BaseItemDto, ServiceError> {
         Ok(entity_to_dto(item))
     }
+    /// Mirrors the real service on the ONE axis these tests assert: a `user`
+    /// produces a `UserData` block, no user produces none. Ignoring the
+    /// argument made "media folders carry no UserData" pass whether or not the
+    /// handler passed a user.
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
         _options: &DtoOptions,
-        _user: Option<&UserEntity>,
+        user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(entity_to_dto).collect())
+        Ok(items
+            .iter()
+            .map(|e| {
+                let mut dto = entity_to_dto(e);
+                if user.is_some() {
+                    dto.user_data = Some(canned_dto(Uuid::nil(), false, None));
+                }
+                dto
+            })
+            .collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -844,6 +857,22 @@ async fn media_folders_returns_collection_folders() {
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
     assert_eq!(result.items.len(), 2);
+
+    // No `UserData`, because upstream projects these WITHOUT a user:
+    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
+    // and `IDtoService.GetBaseItemDtos(items, options, User? user = null, …)`
+    // defaults the user to null. Passing one added a block Jellyfin never
+    // sends AND paid for the user-data prefetch to build it — the endpoint
+    // scored `comparable: false` in the perf suite for exactly this.
+    let raw: serde_json::Value = serde_json::from_slice(&body).expect("folders json");
+    for item in raw["Items"].as_array().expect("Items array") {
+        assert!(
+            item.get("UserData").is_none(),
+            "media folders must carry no UserData — upstream projects them \
+             with no user: {item}"
+        );
+    }
 }
 
 // The remaining path-scoped `/Users/{userId}/…` aliases forward to the modern

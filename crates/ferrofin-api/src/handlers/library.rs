@@ -469,9 +469,19 @@ async fn get_media_folders(
         state.user_views.get_media_folders(user_uuid).await?
     };
     let options = DtoOptions::default();
+    // NO user, matching C# `GetMediaFolders`:
+    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
+    //
+    // `IDtoService.GetBaseItemDtos(items, options, User? user = null, ...)` —
+    // the call passes no user, so upstream's media folders carry no `UserData`.
+    // Ferrofin was passing `Some(&user)`, which both added a `UserData` block
+    // Jellyfin does not send AND paid for the user-data prefetch to build it.
+    // The user is still needed ABOVE to choose which folders the caller may
+    // see; it just has no place in the projection.
     let dtos = state
         .dto
-        .get_base_item_dtos(&folders, &options, Some(&user), None, true)
+        .get_base_item_dtos(&folders, &options, None, None, true)
         .await?;
     Ok(Json(QueryResult::from_items(dtos)))
 }

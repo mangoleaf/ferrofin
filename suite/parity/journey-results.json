@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "51cb10e 2026-08-21",
+  "last_verified": "92a5ec5 2026-08-22",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",
@@ -54,9 +54,9 @@
       "note": "H=True J=False"
     },
     "DELETE /ScheduledTasks/Running/{taskId}": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
-      "deep_verified": false,
-      "note": "H=True J=False"
+      "classification": "ok",
+      "deep_verified": true,
+      "note": "H=True J=True"
     },
     "DELETE /Sessions/{sessionId}/User/{userId}": {
       "classification": "ok",
@@ -219,24 +219,24 @@
       "note": "H=True J=True"
     },
     "POST /MergeVersions/MergeEpisodes": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=False J=False"
     },
     "POST /MergeVersions/MergeMovies": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=False J=False"
     },
     "POST /MergeVersions/SplitEpisodes": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=False J=False"
     },
     "POST /MergeVersions/SplitMovies": {
-      "classification": "flagged: Jellyfin read-back differed (verify: oracle setup or Ferrofin extra)",
+      "classification": "flagged: write effect not observed on either server (likely corpus/setup)",
       "deep_verified": false,
-      "note": "H=True J=False"
+      "note": "H=False J=False"
     },
     "POST /PlayingItems/{itemId}": {
       "classification": "ok",
