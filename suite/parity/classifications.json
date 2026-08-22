@@ -36,7 +36,7 @@
     },
     "GET /UserViews": {
       "category": "instance",
-      "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir."
+      "classification": "instance: view Path (and path-derived id) differ only by /config vs /data data-dir; identical under a shared data-dir. (Historic note: until the with_all_fields(false) fix the views also lacked ~25 default fields Jellyfin emits — that was a real defect, not instance noise; re-verify on the next sweep.)"
     },
     "GET /Library/MediaFolders": {
       "category": "instance",

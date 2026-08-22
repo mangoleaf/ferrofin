@@ -38,8 +38,8 @@
 //! LiveTV program/channel enrichment (`AddInfoToProgramDto`/`AddChannelInfo`)
 //! and active-recording rewrites depend on the `ILiveTvManager`/
 //! `IRecordingsManager` seams, which are not injected into this unit; those
-//! branches are skipped and flagged. `CanDelete`/`CanDownload`/`Etag` collapse
-//! to thin defaults (the C# logic needs the domain tree). Everything else — the
+//! branches are skipped and flagged. `CanDelete`/`CanDownload` collapse to thin
+//! defaults (the C# logic needs the domain tree). Everything else — the
 //! full field/image/user-data/people/media-source/chapter/trickplay mapping —
 //! is ported.
 
@@ -314,6 +314,19 @@ fn parse_user_id(id: &str) -> Result<Uuid, ServiceError> {
 /// `parse_user_id` sibling for the cases where the fallback *was* observable.
 fn row_id(item: &BaseItemEntity) -> Uuid {
     Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())
+}
+
+/// C# `BaseItem.GetEtag`: MD5 (Guid byte layout, `"N"` format) of the pipe-joined
+/// etag values — the base list is just `DateLastSaved.Ticks` (100 ns units since
+/// 0001-01-01; a never-saved row matches C#'s `DateTime.MinValue` = 0 ticks).
+fn compute_etag(date_last_saved: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+    let ticks = date_last_saved.map_or(0, |d| {
+        UNIX_EPOCH_TICKS + d.timestamp() * 10_000_000 + i64::from(d.timestamp_subsec_nanos() / 100)
+    });
+    ferrofin_common::extensions::get_md5(&ticks.to_string())
+        .simple()
+        .to_string()
 }
 
 /// Copies a photo's EXIF fields out of the row's `Data` blob onto the DTO —
@@ -1117,6 +1130,15 @@ impl FerrofinDtoService {
 
         if options.contains_field(ItemFields::DateCreated) {
             dto.date_created = item.date_created;
+        }
+
+        // C# `DtoService` sets DateLastMediaAdded only for `Folder` items.
+        if options.contains_field(ItemFields::DateLastMediaAdded) && item.is_folder {
+            dto.date_last_media_added = item.date_last_media_added;
+        }
+
+        if options.contains_field(ItemFields::Etag) {
+            dto.etag = Some(compute_etag(item.date_last_saved));
         }
 
         if options.contains_field(ItemFields::Settings) {
@@ -2301,7 +2323,7 @@ impl FerrofinDtoService {
 mod tests {
     use super::*;
 
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, TimeZone as _, Utc};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
     use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
@@ -2574,6 +2596,17 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn etag_matches_csharp_get_etag() {
+        // `DateTime(2000,1,1, UTC).Ticks` is the .NET constant 630_822_816_000_000_000;
+        // expected strings derived independently (python: MD5 of the UTF-16LE tick
+        // string, bytes laid out as a .NET `Guid`, `"N"` format) — not via `get_md5`.
+        let d = Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(compute_etag(Some(d)), "52fe91fd23a6cb2a7569d114180b4a38");
+        // A never-saved row matches C#'s `DateTime.MinValue` (0 ticks).
+        assert_eq!(compute_etag(None), "543b6ca4c9f21c87d81daf7a932499c0");
     }
 
     #[test]
