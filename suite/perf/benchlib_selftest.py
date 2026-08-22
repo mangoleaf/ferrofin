@@ -16,7 +16,10 @@ Covers the rules a live run cannot cheaply re-check:
 Run: python3 suite/perf/benchlib_selftest.py   (exit 0 = green). No test
 framework by design, matching the other suite self-tests.
 """
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -71,5 +74,41 @@ try:
         "a failed probe yields '' rather than raising mid-bring-up"
 finally:
     benchlib.get_json = _real_get_json
+
+# ── authenticate waits out Jellyfin's SetupServer→real-server handover ───────
+# The stub Kestrel answers the readiness probe and the wizard, then drops the
+# socket when the real ApplicationHost takes over — a publish run died there.
+# A connection error must retry; a real rejection must NOT (else a broken
+# password stalls the whole leg for the readiness timeout before failing).
+_real_request, _real_sleep = benchlib.request, time.sleep
+try:
+    time.sleep = lambda _: None
+    os.environ["BENCH_COLD_READY_TIMEOUT_SECS"] = "5"
+
+    replies = iter([(0, b""), (503, b""), (200, json.dumps(
+        {"AccessToken": "tok", "User": {"Id": "uid"}}).encode())])
+    benchlib.request = lambda *a, **k: next(replies)
+    assert benchlib.authenticate("http://x", "jellyfin") == {"token": "tok", "userId": "uid"}, \
+        "auth must retry through the handover and return the real token"
+
+    calls = []
+    benchlib.request = lambda *a, **k: (calls.append(1), (401, b"nope"))[1]
+    try:
+        benchlib.authenticate("http://x", "jellyfin")
+        raise AssertionError("a 401 must raise, not retry")
+    except RuntimeError:
+        pass
+    assert len(calls) == 1, f"a real rejection must not retry, got {len(calls)} attempts"
+
+    os.environ["BENCH_COLD_READY_TIMEOUT_SECS"] = "0"
+    benchlib.request = lambda *a, **k: (0, b"")
+    try:
+        benchlib.authenticate("http://x", "jellyfin")
+        raise AssertionError("an unreachable server must still fail loud")
+    except RuntimeError:
+        pass
+finally:
+    benchlib.request, time.sleep = _real_request, _real_sleep
+    os.environ.pop("BENCH_COLD_READY_TIMEOUT_SECS", None)
 
 print("benchlib self-test: all assertions passed")

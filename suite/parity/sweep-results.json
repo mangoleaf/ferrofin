@@ -1,6 +1,6 @@
 {
   "generated_by": "suite/parity/sweep.py",
-  "last_verified": "122bf3d 2026-08-18",
+  "last_verified": "bad303e 2026-08-21",
   "rows": {
     "DELETE /Audio/{itemId}/Lyrics": {
       "note": "write: deferred to Layer-2 journey",
@@ -10232,11 +10232,15 @@
           "TypeOptions[0].ImageFetchers[Name=The Open Movie Database] (whole item)",
           "TypeOptions[0].ImageFetchers[Name=TheTVDB] (whole item)",
           "TypeOptions[0].MetadataFetchers[Name=TheTVDB] (whole item)",
+          "TypeOptions[0].SimilarItemProviders",
           "TypeOptions[1].ImageFetchers[Name=TheTVDB] (whole item)",
           "TypeOptions[1].MetadataFetchers[Name=TheTVDB] (whole item)",
+          "TypeOptions[1].SimilarItemProviders",
           "TypeOptions[2].ImageFetchers[Name=TheTVDB] (whole item)",
           "TypeOptions[2].MetadataFetchers[Name=TheTVDB] (whole item)",
-          "TypeOptions[3].ImageFetchers[Name=FanArt] (whole item)"
+          "TypeOptions[2].SimilarItemProviders",
+          "TypeOptions[3].ImageFetchers[Name=FanArt] (whole item)",
+          "TypeOptions[3].SimilarItemProviders"
         ],
         "mismatch": [
           "TypeOptions[0].DefaultImageOptions[0].MinWidth",
@@ -10285,7 +10289,7 @@
         ]
       },
       "note": "H=200 J=200",
-      "schema_valid": true,
+      "schema_valid": false,
       "status_conformant": true
     },
     "GET /Library/MediaFolders": {

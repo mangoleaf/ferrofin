@@ -154,16 +154,31 @@ class PooledClient:
 
 
 def authenticate(base, target):
-    """Login as the bench admin → {'token', 'userId'}; raises on failure."""
-    status, body = request(
-        "POST", f"{base}/Users/AuthenticateByName",
-        {"Username": USER, "Pw": PASS},
-        {"Content-Type": "application/json", "Authorization": f"MediaBrowser {CLIENT_ID}"},
-    )
-    if status != 200:
-        raise RuntimeError(f"[{target}] auth failed: {status} {body[:200]!r}")
-    b = json.loads(body)
-    return {"token": b["AccessToken"], "userId": b["User"]["Id"]}
+    """Login as the bench admin → {'token', 'userId'}; raises on failure.
+
+    Retries while the server is merely *answering* rather than ready. Jellyfin
+    10.11 binds a stub Kestrel (ServerSetupApp.SetupServer) that serves
+    /System/Info/Public and the whole /Startup/* wizard before the real
+    ApplicationHost takes over the socket — so run.sh's first-200 coldstart
+    probe and jellyfin_first_run_wizard above can both pass against the stub,
+    and the handover then drops connections. Observed live: publish run 2 died
+    on `auth failed: 0` one second after a "cold-start: 1.0s". Connection
+    errors and 503 retry until BENCH_COLD_READY_TIMEOUT_SECS; a real rejection
+    (401/…) still raises at once, so a genuinely broken login stays loud.
+    """
+    deadline = time.monotonic() + float(os.environ.get("BENCH_COLD_READY_TIMEOUT_SECS", 120))
+    while True:
+        status, body = request(
+            "POST", f"{base}/Users/AuthenticateByName",
+            {"Username": USER, "Pw": PASS},
+            {"Content-Type": "application/json", "Authorization": f"MediaBrowser {CLIENT_ID}"},
+        )
+        if status == 200:
+            b = json.loads(body)
+            return {"token": b["AccessToken"], "userId": b["User"]["Id"]}
+        if status not in (0, 503) or time.monotonic() >= deadline:
+            raise RuntimeError(f"[{target}] auth failed: {status} {body[:200]!r}")
+        time.sleep(1)
 
 
 def item_count(base, ctx, include_types=None):

@@ -11,7 +11,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Albums/{itemId}/Similar",
@@ -37,7 +37,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Artists/AlbumArtists",
@@ -50,7 +50,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Artists/InstantMix",
@@ -76,7 +76,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Artists/{itemId}/Similar",
@@ -115,7 +115,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Artists/{name}/Images/{imageType}/{imageIndex}",
@@ -128,7 +128,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Audio/{itemId}/Lyrics",
@@ -362,7 +362,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Auth/Keys",
@@ -375,7 +375,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Auth/Keys/{key}",
@@ -388,7 +388,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Auth/PasswordResetProviders",
@@ -401,7 +401,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Auth/Providers",
@@ -414,7 +414,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Backup",
@@ -427,7 +427,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Backup/Create",
@@ -479,7 +479,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Branding/Css",
@@ -492,7 +492,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Branding/Css.css",
@@ -505,7 +505,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Branding/Splashscreen",
@@ -518,7 +518,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Branding/Splashscreen",
@@ -531,7 +531,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Branding/Splashscreen",
@@ -544,7 +544,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Channels",
@@ -557,7 +557,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Channels/Features",
@@ -570,7 +570,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Channels/Items/Latest",
@@ -583,7 +583,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Channels/{channelId}/Features",
@@ -622,7 +622,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Collections",
@@ -635,7 +635,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Collections/{collectionId}/Items",
@@ -648,7 +648,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Collections/{collectionId}/Items",
@@ -661,7 +661,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Devices",
@@ -674,7 +674,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Devices",
@@ -687,7 +687,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Devices/Info",
@@ -700,7 +700,7 @@
       "note": "H=400 J=400",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Devices/Options",
@@ -713,7 +713,7 @@
       "note": "H=400 J=400",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Devices/Options",
@@ -726,7 +726,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /DisplayPreferences/{displayPreferencesId}",
@@ -752,7 +752,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Environment/DefaultDirectoryBrowser",
@@ -765,7 +765,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Environment/DirectoryContents",
@@ -804,7 +804,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Environment/ParentPath",
@@ -830,7 +830,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Episode/{Id}/Timestamps",
@@ -882,7 +882,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /FallbackFont/Fonts/{name}",
@@ -895,7 +895,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /FileTransformation/RegisterTransformation",
@@ -999,7 +999,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /IntroSkipper",
@@ -1142,7 +1142,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items",
@@ -1155,7 +1155,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/Counts",
@@ -1168,7 +1168,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/Filters",
@@ -1181,7 +1181,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/Filters2",
@@ -1194,7 +1194,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/Latest",
@@ -1207,7 +1207,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/RemoteSearch/Apply/{itemId}",
@@ -1376,7 +1376,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}",
@@ -1428,7 +1428,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/CriticReviews",
@@ -1441,7 +1441,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/Download",
@@ -1493,7 +1493,7 @@
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "flagged: read diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Items/{itemId}/Images/{imageType}",
@@ -1506,7 +1506,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}",
@@ -1519,7 +1519,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}",
@@ -1532,7 +1532,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}",
@@ -1545,7 +1545,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1558,7 +1558,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1571,7 +1571,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1584,7 +1584,7 @@
       "note": "H=404 J=200",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1597,7 +1597,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index",
@@ -1610,7 +1610,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -1623,7 +1623,7 @@
       "note": "H=404 J=400",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}",
@@ -1636,7 +1636,7 @@
       "note": "H=404 J=400",
       "deep_verified": false,
       "classification": "flagged: asset property diff vs Jellyfin (verify)",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/InstantMix",
@@ -1649,7 +1649,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/Intros",
@@ -1662,7 +1662,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/LocalTrailers",
@@ -1675,7 +1675,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/MetadataEditor",
@@ -1714,7 +1714,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/{itemId}/Refresh",
@@ -1727,7 +1727,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/RemoteImages",
@@ -1779,7 +1779,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}",
@@ -1818,7 +1818,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/ThemeMedia",
@@ -1831,7 +1831,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/ThemeSongs",
@@ -1844,7 +1844,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Items/{itemId}/ThemeVideos",
@@ -1857,7 +1857,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo",
@@ -1879,7 +1879,7 @@
       "route": "registered",
       "depth": "REAL",
       "status_conformant": true,
-      "schema_valid": true,
+      "schema_valid": false,
       "note": "H=200 J=200",
       "deep_verified": false,
       "classification": "verified 2026-08-11: LibraryOptionsResultDto (MetadataReaders/MetadataSavers/SubtitleFetchers/LyricFetchers/MediaSegmentProviders/TypeOptions), status+schema conformant.",
@@ -1961,7 +1961,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/Series/Added",
@@ -2000,7 +2000,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Library/VirtualFolders",
@@ -2013,7 +2013,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/VirtualFolders",
@@ -2026,7 +2026,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/VirtualFolders/LibraryOptions",
@@ -2039,7 +2039,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/VirtualFolders/Name",
@@ -2052,7 +2052,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Library/VirtualFolders/Paths",
@@ -2065,7 +2065,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/VirtualFolders/Paths",
@@ -2078,7 +2078,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Library/VirtualFolders/Paths/Update",
@@ -2091,7 +2091,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /LiveStreams/Close",
@@ -2156,7 +2156,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Channels/{channelId}",
@@ -2195,7 +2195,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /LiveTv/ListingProviders",
@@ -2234,7 +2234,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/ListingProviders/Lineups",
@@ -2299,7 +2299,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /LiveTv/Programs",
@@ -2325,7 +2325,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Programs/{programId}",
@@ -2351,7 +2351,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Recordings/Folders",
@@ -2364,7 +2364,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Recordings/Groups",
@@ -2377,7 +2377,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Recordings/Groups/{groupId}",
@@ -2403,7 +2403,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /LiveTv/Recordings/{recordingId}",
@@ -2442,7 +2442,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /LiveTv/SeriesTimers",
@@ -2507,7 +2507,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /LiveTv/Timers",
@@ -2624,7 +2624,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /LiveTv/Tuners/Discvover",
@@ -2637,7 +2637,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /LiveTv/Tuners/{tunerId}/Reset",
@@ -2663,7 +2663,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Localization/Cultures",
@@ -2676,7 +2676,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Localization/Options",
@@ -2689,7 +2689,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Localization/ParentalRatings",
@@ -2702,7 +2702,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /MediaSegments/{itemId}",
@@ -2715,7 +2715,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /MediaSegmentsApi",
@@ -2884,7 +2884,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}",
@@ -2897,7 +2897,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -2910,7 +2910,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}",
@@ -2923,7 +2923,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /MusicGenres/{name}/InstantMix",
@@ -2936,7 +2936,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Packages",
@@ -3001,7 +3001,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Persons/{name}",
@@ -3027,7 +3027,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}",
@@ -3040,7 +3040,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -3053,7 +3053,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Persons/{name}/Images/{imageType}/{imageIndex}",
@@ -3066,7 +3066,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Playback/BitrateTest",
@@ -3092,7 +3092,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /PlayingItems/{itemId}",
@@ -3105,7 +3105,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /PlayingItems/{itemId}/Progress",
@@ -3118,7 +3118,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Playlists",
@@ -3131,7 +3131,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Playlists/{itemId}/InstantMix",
@@ -3157,7 +3157,7 @@
       "note": "unresolved path param: playlistId",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Playlists/{playlistId}",
@@ -3170,7 +3170,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Playlists/{playlistId}/Items",
@@ -3183,7 +3183,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Items",
@@ -3196,7 +3196,7 @@
       "note": "unresolved path param: playlistId",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Playlists/{playlistId}/Items",
@@ -3209,7 +3209,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}",
@@ -3222,7 +3222,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Playlists/{playlistId}/Users",
@@ -3235,7 +3235,7 @@
       "note": "unresolved path param: playlistId",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Playlists/{playlistId}/Users/{userId}",
@@ -3261,7 +3261,7 @@
       "note": "unresolved path param: playlistId",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Playlists/{playlistId}/Users/{userId}",
@@ -3274,7 +3274,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Plugins",
@@ -3430,7 +3430,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /QuickConnect/Connect",
@@ -3443,7 +3443,7 @@
       "note": "H=404 J=400",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /QuickConnect/Enabled",
@@ -3456,7 +3456,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /QuickConnect/Initiate",
@@ -3469,7 +3469,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Repositories",
@@ -3521,7 +3521,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /ScheduledTasks/Running/{taskId}",
@@ -3534,7 +3534,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /ScheduledTasks/{taskId}",
@@ -3547,7 +3547,7 @@
       "note": "unresolved path param: taskId",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /ScheduledTasks/{taskId}/Triggers",
@@ -3560,7 +3560,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Search/Hints",
@@ -3586,7 +3586,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Capabilities",
@@ -3599,7 +3599,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Capabilities/Full",
@@ -3612,7 +3612,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Logout",
@@ -3625,7 +3625,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Playing",
@@ -3638,7 +3638,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Playing/Ping",
@@ -3651,7 +3651,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Playing/Progress",
@@ -3664,7 +3664,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Playing/Stopped",
@@ -3677,7 +3677,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/Viewing",
@@ -3690,7 +3690,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Command",
@@ -3703,7 +3703,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Command/{command}",
@@ -3716,7 +3716,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Message",
@@ -3729,7 +3729,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Playing",
@@ -3742,7 +3742,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Playing/{command}",
@@ -3755,7 +3755,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/System/{command}",
@@ -3768,7 +3768,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Sessions/{sessionId}/User/{userId}",
@@ -3781,7 +3781,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/User/{userId}",
@@ -3794,7 +3794,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Sessions/{sessionId}/Viewing",
@@ -3807,7 +3807,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Shows/NextUp",
@@ -3820,7 +3820,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Shows/Upcoming",
@@ -3833,7 +3833,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Shows/{itemId}/Similar",
@@ -3911,7 +3911,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Startup/Complete",
@@ -3937,7 +3937,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Startup/Configuration",
@@ -3963,7 +3963,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Startup/RemoteAccess",
@@ -3989,7 +3989,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Startup/User",
@@ -4015,7 +4015,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Studios/{name}",
@@ -4041,7 +4041,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}",
@@ -4054,7 +4054,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -4067,7 +4067,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /Studios/{name}/Images/{imageType}/{imageIndex}",
@@ -4080,7 +4080,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /SyncPlay/Buffering",
@@ -4132,7 +4132,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /SyncPlay/MovePlaylistItem",
@@ -4405,7 +4405,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /System/Configuration/Branding",
@@ -4418,7 +4418,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Configuration/MetadataOptions/Default",
@@ -4431,7 +4431,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Configuration/{key}",
@@ -4444,7 +4444,7 @@
       "note": "unresolved path param: key",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /System/Configuration/{key}",
@@ -4457,7 +4457,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Endpoint",
@@ -4470,7 +4470,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Info",
@@ -4483,7 +4483,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Info/Public",
@@ -4496,7 +4496,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /System/Info/Storage",
@@ -4561,7 +4561,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /System/Restart",
@@ -4600,7 +4600,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Trailers",
@@ -4639,7 +4639,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /UserFavoriteItems/{itemId}",
@@ -4652,7 +4652,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /UserImage",
@@ -4665,7 +4665,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /UserImage",
@@ -4678,7 +4678,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "HEAD /UserImage",
@@ -4691,7 +4691,7 @@
       "note": "H=404 J=404",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /UserImage",
@@ -4704,7 +4704,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /UserItems/Resume",
@@ -4717,7 +4717,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /UserItems/{itemId}/Rating",
@@ -4730,7 +4730,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /UserItems/{itemId}/Rating",
@@ -4743,7 +4743,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /UserItems/{itemId}/UserData",
@@ -4756,7 +4756,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /UserItems/{itemId}/UserData",
@@ -4769,7 +4769,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /UserPlayedItems/{itemId}",
@@ -4782,7 +4782,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /UserPlayedItems/{itemId}",
@@ -4795,7 +4795,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /UserViews",
@@ -4821,7 +4821,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Users",
@@ -4834,7 +4834,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users",
@@ -4847,7 +4847,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/AuthenticateByName",
@@ -4860,7 +4860,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/AuthenticateWithQuickConnect",
@@ -4873,7 +4873,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/Configuration",
@@ -4886,7 +4886,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/ForgotPassword",
@@ -4925,7 +4925,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/New",
@@ -4938,7 +4938,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/Password",
@@ -4951,7 +4951,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Users/Public",
@@ -4964,7 +4964,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Users/{userId}",
@@ -4977,7 +4977,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Users/{userId}",
@@ -4990,7 +4990,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Users/{userId}/Policy",
@@ -5003,7 +5003,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Videos/ActiveEncodings",
@@ -5016,7 +5016,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Videos/MergeVersions",
@@ -5029,7 +5029,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "GET /Videos/{itemId}/AdditionalParts",
@@ -5042,7 +5042,7 @@
       "note": "H=200 J=200",
       "deep_verified": true,
       "classification": "",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Videos/{itemId}/AlternateSources",
@@ -5055,7 +5055,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "POST /Videos/{itemId}/Subtitles",
@@ -5068,7 +5068,7 @@
       "note": "write: deferred to Layer-2 journey",
       "deep_verified": true,
       "classification": "ok",
-      "last_verified": "122bf3d 2026-08-18"
+      "last_verified": "bad303e 2026-08-21"
     },
     {
       "operation": "DELETE /Videos/{itemId}/Subtitles/{index}",

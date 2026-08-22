@@ -1,7 +1,7 @@
 {
   "errors": {},
   "generated_by": "suite/parity/journeys.py",
-  "last_verified": "122bf3d 2026-08-18",
+  "last_verified": "bad303e 2026-08-21",
   "rows": {
     "DELETE /Auth/Keys/{key}": {
       "classification": "ok",

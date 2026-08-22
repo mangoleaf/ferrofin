@@ -40,6 +40,10 @@ const JSON_ROUTE: &str = "/System/Info/Public";
 
 /// A [`SystemManager`] whose public info is large enough to be worth
 /// compressing, so the size predicate is not what the test is measuring.
+///
+/// "Large enough" means over [`MIN_COMPRESSIBLE_BYTES`] (one TCP segment), so
+/// `server_name` is padded rather than left at a realistic length — these tests
+/// are about encoding correctness, and the floor has its own unit tests.
 struct StubSystem;
 
 #[async_trait]
@@ -52,7 +56,8 @@ impl SystemManager for StubSystem {
         _request: &RequestContext,
     ) -> Result<PublicSystemInfo, ServiceError> {
         Ok(PublicSystemInfo {
-            server_name: Some("Ferrofin compression fixture server".to_owned()),
+            // Padded past the one-MTU compression floor on purpose (see above).
+            server_name: Some("Ferrofin compression fixture server ".repeat(64)),
             version: Some("10.11.8".to_owned()),
             product_name: Some("Jellyfin Server".to_owned()),
             id: Some("0123456789abcdef0123456789abcdef".to_owned()),

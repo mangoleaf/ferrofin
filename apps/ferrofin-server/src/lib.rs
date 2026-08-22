@@ -814,7 +814,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
-        std::fs::write(dir.path().join("a.js"), "hello world\n".repeat(100)).unwrap();
+        // Over the one-MTU compression floor (see `compression::MIN_COMPRESSIBLE_BYTES`);
+        // this test is about the transformed body being encoded, not the size gate.
+        // Derived, not hardcoded, so the two cannot drift apart again.
+        const LINES: usize = 200;
+        std::fs::write(dir.path().join("a.js"), "hello world\n".repeat(LINES)).unwrap();
 
         let service = transformations(dir.path());
         service
@@ -843,7 +847,7 @@ mod tests {
             .expect("valid gzip stream");
         assert_eq!(
             String::from_utf8(decoded).unwrap(),
-            "HELLO WORLD\n".repeat(100),
+            "HELLO WORLD\n".repeat(LINES),
             "the transformed text must survive compression unchanged"
         );
     }

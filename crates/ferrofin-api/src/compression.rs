@@ -48,11 +48,35 @@ pub const COMPRESSIBLE_MIME_TYPES: &[&str] = &[
     "application/wasm",
 ];
 
-/// Smallest response worth compressing, in bytes.
+/// Smallest response worth compressing, in bytes — one TCP segment.
 ///
-/// `tower_http`'s own default. A body below this is dominated by the gzip/brotli
-/// framing, so compressing it costs CPU to make the response bigger.
-const MIN_COMPRESSIBLE_BYTES: u16 = 32;
+/// Below one MTU the whole response already travels in a single segment, so
+/// compressing it cannot save a round trip. All it can do is spend CPU, and on
+/// a small body that cost is most of the request:
+///
+/// | body | identity | brotli | cost |
+/// |---|---|---|---|
+/// | `/System/Info` (832 B) | 0.061 ms | 0.089 ms | +0.028 ms |
+/// | `/Sessions` (<1400 B) | 0.142 ms | 0.177 ms | +0.035 ms |
+/// | `/Users/Me` (2054 B) | 0.064 ms | 0.099 ms | +0.035 ms |
+///
+/// The cost is roughly fixed per response, so it barely registers on a 49 KB
+/// page (+6%) and nearly doubles a 200-byte one. **70% of the benchmark's GET
+/// endpoints return under 1400 bytes**, which is why adding compression halved
+/// the measured median speedup against Jellyfin while the bandwidth win it
+/// bought on those rows was exactly zero.
+///
+/// Raising the floor to one MTU removes that: measured at 1400, `/System/Info`
+/// goes +0.028 ms -> 0.000 ms and `/Sessions` +0.035 -> +0.002, while
+/// `/Users/Me` at 2054 bytes keeps compressing and keeps its 7x size win.
+///
+/// This is a deliberate divergence: ASP.NET's `ResponseCompressionMiddleware`
+/// has no minimum size and Jellyfin therefore compresses sub-MTU bodies too.
+/// It is a cost upstream pays for nothing, not a contract we owe clients — the
+/// decoded bytes are identical either way, and `Content-Encoding` is negotiated
+/// per response. Revert to `32` (tower_http's default) to match upstream
+/// exactly.
+const MIN_COMPRESSIBLE_BYTES: u16 = 1400;
 
 /// Splits a `Content-Type` header value into its bare media type, lowercased.
 ///
@@ -187,6 +211,30 @@ mod tests {
     fn never_compresses_a_response_with_no_content_type() {
         let p = JellyfinCompressible::new();
         assert!(!p.should_compress(&resp("", 4096)));
+    }
+
+    /// A sub-MTU body is passed through, and one just over it is compressed.
+    ///
+    /// The boundary is the point of the constant: below one TCP segment
+    /// compression cannot save a round trip, so it is pure CPU.
+    #[test]
+    fn a_sub_mtu_body_is_not_compressed_but_one_over_it_is() {
+        let p = JellyfinCompressible::new();
+        assert!(
+            !p.should_compress(&resp("application/json", 832)),
+            "832 bytes fits one segment — compressing it buys nothing"
+        );
+        assert!(
+            !p.should_compress(&resp(
+                "application/json",
+                MIN_COMPRESSIBLE_BYTES as usize - 1
+            )),
+            "just under the floor must pass through"
+        );
+        assert!(
+            p.should_compress(&resp("application/json", 2054)),
+            "a 2 KB body spans segments — it still compresses"
+        );
     }
 
     #[test]
