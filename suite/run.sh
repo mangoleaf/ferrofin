@@ -2,7 +2,7 @@
 # suite/run.sh — the one entry point for the merged parity + perf suite (Plan 6).
 #
 #   suite/run.sh calibrate  measure per-endpoint capacity on Jellyfin → suite/perf/rates.json
-#   suite/run.sh parity   both servers up   → sweep + reads + journeys + assets → ledger (+fingerprints)
+#   suite/run.sh parity   both servers up   → sweep + reads + journeys + assets → ledger
 #   suite/run.sh perf     one-at-a-time     → open-loop vegeta bench → per-endpoint latencies (+fingerprints)
 #   suite/run.sh all      parity, then perf, same build + same fixture → merged run record
 #   suite/run.sh publish  parity once, then BENCH_RUNS × (perf + merge) → agg-<sha> distributions

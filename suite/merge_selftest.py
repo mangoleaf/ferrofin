@@ -57,4 +57,68 @@ skipped, missing = merge.manifest_check(v2op, perf, None, {})
 assert skipped == ["b"] and missing == [], (skipped, missing)
 os.environ.pop("SKIP_VARIANTS", None)
 
+# ---- shape_check: the honesty excluder (Ferrofin-vs-baseline) + informational cross-server ----
+
+F = {"hash": "aaaa", "paths": ["Id", "Name", "Genres"]}
+J_SAME = {"hash": "aaaa", "paths": ["Id", "Name", "Genres"]}
+J_DIFF = {"hash": "bbbb", "paths": ["Id", "Name", "Genres", "ImageTags.Primary"]}
+
+# Write rows / uncaptured variants are exempt entirely.
+assert merge.shape_check(None, J_DIFF, None, False) == (None, None, None)
+
+# First sighting seeds the baseline, never excludes.
+r, blk, upd = merge.shape_check(F, J_SAME, None, False)
+assert r is None and blk["baseline"] == "new" and upd is F
+
+# Stable shape matching baseline: comparable, no baseline churn.
+r, blk, upd = merge.shape_check(F, J_SAME, {"hash": "aaaa", "paths": F["paths"]}, False)
+assert r is None and upd is None and blk["matches_jellyfin"] is True
+
+# Cross-server divergence alone NEVER excludes — it is published with a field diff.
+r, blk, upd = merge.shape_check(F, J_DIFF, {"hash": "aaaa", "paths": F["paths"]}, False)
+assert r is None, "jellyfin divergence must be informational, not an exclusion"
+assert blk["matches_jellyfin"] is False
+assert blk["diff_vs_jellyfin"] == {"missing": ["ImageTags.Primary"], "extra": []}
+
+# Ferrofin's own shape changing vs baseline excludes (the hollow-body catch)…
+base = {"hash": "cccc", "paths": ["Id", "Name", "Genres", "People[].Name"]}
+r, blk, upd = merge.shape_check(F, J_SAME, base, False)
+assert r and "changed since baseline" in r and upd is None
+assert blk["diff_vs_baseline"] == {"missing": ["People[].Name"], "extra": []}
+
+# …until the change is reviewed and acked, which advances the baseline.
+r, blk, upd = merge.shape_check(F, J_SAME, base, True)
+assert r is None and blk["ack"] is True and upd is F
+
+# Legacy hash-only captures still work — no paths means no diff, same verdicts.
+r, blk, upd = merge.shape_check({"hash": "aaaa", "paths": None}, {"hash": "bbbb", "paths": None},
+                                {"hash": "aaaa", "paths": None}, False)
+assert r is None and blk["matches_jellyfin"] is False and "diff_vs_jellyfin" not in blk
+
+# A failed probe is NO capture: it must never seed the baseline, exclude, or publish.
+assert merge.shape_check({"hash": "error:HTTPError", "paths": []}, J_SAME, None, False) == \
+    (None, None, None)
+# A Jellyfin-side probe error suppresses the cross-server verdict; the row still
+# gates on the Ferrofin baseline as usual.
+r, blk, upd = merge.shape_check(F, {"hash": "error:HTTPError", "paths": []},
+                                {"hash": "aaaa", "paths": F["paths"]}, False)
+assert r is None and "matches_jellyfin" not in blk and "j" not in blk
+
+# An oversized one-sided diff is capped with an elided-count tail, not embedded whole.
+big = merge.shape_diff(["A"], [f"P{i}" for i in range(merge.DIFF_PATH_CAP + 5)])
+assert len(big["missing"]) == merge.DIFF_PATH_CAP + 1
+assert big["missing"][-1].startswith("… +")
+
+# run_signature covers measured numbers ONLY: a pre-ack merge and its acked re-merge
+# (same raw artifacts, different headline/exclusions) must collapse to one trend entry.
+_rec = {"meta": {"footprint": {"rss": 1}}, "headline": {"comparable_rows": 70},
+        "operations": [{"perf": {"variant": "v", "f_p50": 1, "j_p50": 2,
+                                 "f_p99": 3, "j_p99": 4}}]}
+assert merge.run_signature(_rec) == merge.run_signature({**_rec, "headline": {"comparable_rows": 113}})
+
+# fp_entry: per-variant (new) keys win, op-keyed legacy files still resolve.
+assert merge.fp_entry({"items_movies": {"hash": "x", "paths": []}}, "items_movies", "GET /Items")["hash"] == "x"
+assert merge.fp_entry({"GET /Items": "y"}, "items_movies", "GET /Items") == {"hash": "y", "paths": None}
+assert merge.fp_entry({}, "items_movies", "GET /Items") is None
+
 print("merge self-check: all assertions passed")

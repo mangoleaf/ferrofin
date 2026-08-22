@@ -82,19 +82,19 @@ def aggregate(runs):
         ep = {"op": v["op"], "owner": v["owner"],
               "n_runs": len(rows),
               "n_comparable": sum(1 for p in rows if p.get("comparable"))}
-        for side in ("h", "j"):
+        for side in ("f", "j"):
             for m in METRICS:
                 ep[f"{side}_{m}"] = dist([p.get(f"{side}_{m}") for p in rows])
         # C2 + D1: see paired_speedup_of — sub-floor pairs get NO ratio.
-        h50, j50 = ep["h_p50"], ep["j_p50"]
+        h50, j50 = ep["f_p50"], ep["j_p50"]
         ep["paired_speedup"], is_tie = paired_speedup_of(
             h50 and h50["med"], j50 and j50["med"], CONFIG["BENCH_NOISE_FLOOR_MS"])
         if is_tie:
             ep["paired_tie"] = True
-        cold_firsts_h = [((p.get("cold") or {}).get("h_first")) for p in rows]
+        cold_firsts_h = [((p.get("cold") or {}).get("f_first")) for p in rows]
         cold_firsts_j = [((p.get("cold") or {}).get("j_first")) for p in rows]
         if any(x is not None for x in cold_firsts_h + cold_firsts_j):
-            ep["cold_first"] = {"h": dist(cold_firsts_h), "j": dist(cold_firsts_j)}
+            ep["cold_first"] = {"f": dist(cold_firsts_h), "j": dist(cold_firsts_j)}
         endpoints[variant] = ep
 
     heads = [r["headline"] for r in runs]
@@ -151,10 +151,10 @@ def render_md(agg, sha):
     out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for variant, ep in agg["endpoints"].items():
         cold = ep.get("cold_first")
-        cold_s = f"{fmt_dist(cold['h'])} / {fmt_dist(cold['j'])}" if cold else "—"
-        out.append(f"| `{variant}` | {ep['owner']} | {fmt_dist(ep['h_p50'])} | {fmt_dist(ep['j_p50'])} "
-                   f"| {fmt_dist(ep['h_p95'])} | {fmt_dist(ep['j_p95'])} "
-                   f"| {fmt_dist(ep['h_p99'])} | {fmt_dist(ep['j_p99'])} "
+        cold_s = f"{fmt_dist(cold['f'])} / {fmt_dist(cold['j'])}" if cold else "—"
+        out.append(f"| `{variant}` | {ep['owner']} | {fmt_dist(ep['f_p50'])} | {fmt_dist(ep['j_p50'])} "
+                   f"| {fmt_dist(ep['f_p95'])} | {fmt_dist(ep['j_p95'])} "
+                   f"| {fmt_dist(ep['f_p99'])} | {fmt_dist(ep['j_p99'])} "
                    f"| {ep['paired_speedup'] or '—'}× | {cold_s} | {ep['n_comparable']}/{ep['n_runs']} |")
     fn = h["median_speedup_footnote"]
     out.append(f"\n> Footnote — headline `median_speedup` per run was {fn['values']}: {fn['caveat']}.\n")

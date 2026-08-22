@@ -143,11 +143,11 @@ bench() {  # $1=service $2=port $3=TARGET
 
   [ "${RUN_TRANSCODE:-0}" = "1" ] && python3 ttfs.py --target "$target" --base "$base" || true
   suite_count_items "$base" "$ctok" "$cuid" > "results/raw/$target-count.txt" 2>/dev/null || echo "?" > "results/raw/$target-count.txt"
-  # Perf-side body fingerprint, BOTH servers — merge.py compares Ferrofin's shape
-  # against Jellyfin's from this same leg (same fresh-scan DB state), flagging
-  # "fast because the body went hollow/differently-shaped" at bench time.
-  # (Comparing against the parity pass false-flagged ~25 ops: parity's write
-  # journeys leave play-state fields the fresh perf scan legitimately lacks.)
+  # Perf-side body fingerprint, BOTH servers. merge.py uses the captures two ways:
+  # Ferrofin's shape vs the committed shape baseline is the EXCLUDER ("fast because
+  # the body went hollow" — an unreviewed change drops the row until acked), and
+  # Ferrofin-vs-Jellyfin from this same leg is published on the row as information
+  # (the parity ledger owns that verdict; gating on it exiled documented divergences).
   mkdir -p ../results/raw
   python3 ../fingerprint.py capture "$base" "../results/raw/perf-fingerprints-$target.json" "$ctok" "$cuid" || true
 

@@ -33,6 +33,6 @@ echo ">> Layer-3 binary/asset differential"
 python3 ../parity/assets.py
 echo ">> regenerating ledger"
 python3 ../parity/gen-ledger.py
-echo ">> capturing Ferrofin body fingerprints (mid-run honesty baseline for merge.py)"
-mkdir -p ../results/raw
-python3 ../fingerprint.py capture http://localhost:18096 ../results/raw/parity-fingerprints.json || true
+# (No fingerprint capture here: merge.py's shape check runs against the committed
+# suite/results/shape-baseline.json + the perf leg's own captures — a parity-leg capture
+# would compare different fixtures/DB state and was never read after 15ddd6d.)

@@ -263,7 +263,9 @@ function render() {
       <td>${num(p.j_p50)}</td><td>${num(p.j_p95)}</td><td>${num(p.j_p99)}</td>
       <td>${p.cold ? `${num(p.cold.f_first)} / ${num(p.cold.j_first)}` : "—"}</td>
       <td>${delta}</td><td>${spd}</td>
-      <td>${verdict}</td><td class="l muted">${p.comparable ? "" : (p.reason || "")}</td>
+      <td>${verdict}</td><td class="l muted">${p.comparable
+        ? (o.shape && o.shape.matches_jellyfin === false ? "shape ≠ jellyfin (see ledger)" : "")
+        : (p.reason || "")}</td>
     </tr>`;
   }).join("");
 }
@@ -337,7 +339,7 @@ fetch("/suite/results/aggregates.json?t=" + Date.now()).then(r => r.json()).then
     <td>${fd(ep.f_p50)}</td><td>${fd(ep.j_p50)}</td>
     <td>${fd(ep.f_p99)}</td><td>${fd(ep.j_p99)}</td>
     <td>${ep.paired_speedup == null ? "—" : `<span class="${ep.paired_speedup >= 1 ? "good" : "bad"}">${ep.paired_speedup}×</span>`}</td>
-    <td>${ep.cold_first ? `${fd(ep.cold_first.h)} / ${fd(ep.cold_first.j)}` : "—"}</td>
+    <td>${ep.cold_first ? `${fd(ep.cold_first.f)} / ${fd(ep.cold_first.j)}` : "—"}</td>
     <td>${ep.n_comparable}/${ep.n_runs}</td>
   </tr>`).join("");
 }).catch(() => {});

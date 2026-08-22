@@ -12,7 +12,7 @@ the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 ## Entry points
 
 ```
-suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → suite/parity/ledger.json (+fingerprints)
+suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets → suite/parity/ledger.json
 suite/run.sh perf     # one at a time    → open-loop vegeta bench → suite/perf/results/raw/*-summary.json (+fingerprints)
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
 suite/run.sh publish  # parity once + BENCH_RUNS × perf → suite/results/agg-<sha>.{json,md} (median±IQR distributions)
@@ -41,9 +41,18 @@ Serve it and go to **http://127.0.0.1:8125/suite/viewer/**.
 ## Why the numbers are fair (the whole point)
 
 - **Speed is shown only for deep-verified ops.** A row is `comparable` only if the parity ledger
-  deep-verified that op, both servers answered 200, and the body didn't drift since the parity pass
-  (`suite/fingerprint.py`). Median-speedup / win-rate are computed over comparable rows **only** —
-  so "Ferrofin got slower" can't secretly mean "Ferrofin started doing the work correctly."
+  deep-verified that op, both servers answered 200, and Ferrofin's body shape matches the
+  reviewed baseline (`suite/results/shape-baseline.json`, captured per variant by
+  `suite/fingerprint.py`). An UNREVIEWED shape change — the "fast because the body went
+  hollow" signature — excludes the row until a human reviews the field-level diff and
+  re-merges with `MERGE_ACK_SHAPES=1` (all changed variants) or
+  `MERGE_ACK_SHAPES=<variant,list>` (selective), which advances the committed baseline,
+  like a perf rebaseline. Ferrofin-vs-Jellyfin shape is **published on every row**
+  (`shape.matches_jellyfin` + `shape.diff_vs_jellyfin`) but never excludes: the parity
+  ledger owns that verdict per-op, and gating the bench on it silently exiled every
+  documented divergence from the comparison forever. Median-speedup / win-rate are
+  computed over comparable rows **only** — so "Ferrofin got slower" can't secretly mean
+  "Ferrofin started doing the work correctly."
 - **Write (non-GET) rows are fingerprint-exempt by design** — a fingerprint probe would itself
   mutate state, and write bodies mint per-run tokens/timestamps. Their honesty gate instead:
   `deep_verified` must come from the parity **write journey**, and both servers must hit 100%
