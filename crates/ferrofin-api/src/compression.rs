@@ -148,6 +148,21 @@ pub fn compression_layer() -> CompressionLayer<JellyfinCompressible> {
     CompressionLayer::new()
         .gzip(true)
         .br(true)
+        // ASP.NET's gzip and brotli providers both default to
+        // `CompressionLevel.Fastest`, and `tower_http`'s default is not the
+        // same thing — it is the codec's own default, which is far more
+        // aggressive. Measured against a live Jellyfin 10.11.8 on the same
+        // ~29.7 KB `/Localization/Cultures` body:
+        //
+        //   leg                 gzip     br
+        //   Jellyfin           5,890  5,533
+        //   Ferrofin Fastest   5,860  5,321
+        //   Ferrofin Default   4,115  3,548
+        //
+        // Ferrofin was compressing HARDER than upstream — spending materially
+        // more CPU to send a smaller body than the server we are matching.
+        // `Fastest` is the parity-correct level, not a shortcut.
+        .quality(tower_http::CompressionLevel::Fastest)
         .compress_when(JellyfinCompressible::new())
 }
 

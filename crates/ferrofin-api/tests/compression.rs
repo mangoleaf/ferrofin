@@ -41,6 +41,14 @@ const JSON_ROUTE: &str = "/System/Info/Public";
 /// A [`SystemManager`] whose public info is large enough to be worth
 /// compressing, so the size predicate is not what the test is measuring.
 ///
+/// Note what these tests deliberately do NOT cover: the encoder's *level*.
+/// `compression_layer` pins ASP.NET's `Fastest`, and that is not observable
+/// from outside — on synthetic fixtures every level lands within ~6% of the
+/// same size, so any threshold tight enough to catch a regression is loose
+/// enough to break on a codec bump. The level was established by comparing
+/// byte-for-byte against a live Jellyfin 10.11.8 (see `compression.rs`), and
+/// the parity/perf suite is what would catch a silent change.
+///
 /// "Large enough" means over [`MIN_COMPRESSIBLE_BYTES`] (one TCP segment), so
 /// `server_name` is padded rather than left at a realistic length — these tests
 /// are about encoding correctness, and the floor has its own unit tests.
