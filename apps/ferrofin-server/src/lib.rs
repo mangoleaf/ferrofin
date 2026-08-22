@@ -812,12 +812,13 @@ mod tests {
     async fn transformed_web_files_are_compressed_too() {
         use std::io::Read as _;
 
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
         // Over the one-MTU compression floor (see `compression::MIN_COMPRESSIBLE_BYTES`);
         // this test is about the transformed body being encoded, not the size gate.
         // Derived, not hardcoded, so the two cannot drift apart again.
         const LINES: usize = 200;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
         std::fs::write(dir.path().join("a.js"), "hello world\n".repeat(LINES)).unwrap();
 
         let service = transformations(dir.path());
