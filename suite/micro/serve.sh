@@ -27,6 +27,11 @@ export FERROFIN_ADMIN_USER=${FERROFIN_ADMIN_USER:-bench}
 export FERROFIN_ADMIN_PASSWORD=${FERROFIN_ADMIN_PASSWORD:-benchpass123}
 # Never let a background scan or a plugin task run during a measurement — the
 # whole point of this harness is that only the endpoint under test moves.
+#
+# NOTE: this was a no-op until the server actually grew the switch. The var was
+# set here from the start, but nothing read it, and `bool::from_str` would have
+# rejected "1" even if something had. Measurements taken before that fix ran
+# WITH the compiled-in extensions live.
 export FERROFIN_DISABLE_EXTENSIONS=${FERROFIN_DISABLE_EXTENSIONS:-1}
 
 args=(--data-dir "$DATA" --bind 127.0.0.1 --port "$PORT")

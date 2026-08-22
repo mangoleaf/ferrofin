@@ -711,7 +711,15 @@ pub async fn build_app_state(
     // feed the plugin manager below (so they appear in `/Plugins`); their tasks
     // are registered once `media_segments` exists, and the `task_manager` is
     // wrapped into the `tasks` seam after that.
-    let extensions = ferrofin_extensions::builtin_extensions();
+    // Suppressed wholesale when `disable_extensions` is set: no descriptors in
+    // `/Plugins`, no scheduled tasks, no event hooks. A benchmark leg must
+    // compare like with like, and the Jellyfin leg runs with no plugins.
+    let extensions = if config.disable_extensions {
+        tracing::info!("extensions disabled by configuration");
+        Vec::new()
+    } else {
+        ferrofin_extensions::builtin_extensions()
+    };
     let media_sources: Arc<dyn ferrofin_traits::library::MediaSourceManager> = Arc::new(
         FerrofinMediaSourceManager::new(
             Arc::clone(&item_repository),

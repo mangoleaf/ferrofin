@@ -30,6 +30,11 @@ services:
       FERROFIN_PORT: "8096"
       # Pool-sweep knob (benchmark/pool-sweep.sh): empty ⇒ Ferrofin's own default.
       FERROFIN_DB_POOL: ${FERROFIN_DB_POOL:-}
+      # Fairness: the Jellyfin leg runs with no plugins installed, so Ferrofin
+      # must run with no extensions. Otherwise the intro skipper's and merge-
+      # versions' scheduled tasks and event hooks fire inside Ferrofin's
+      # measurement window and not inside Jellyfin's.
+      FERROFIN_DISABLE_EXTENSIONS: ${BENCH_DISABLE_EXTENSIONS:-1}
       # Lets the sweep surface the db_pool sampler (RUST_LOG=ferrofin_server=debug).
       RUST_LOG: ${BENCH_RUST_LOG:-info}
     volumes:

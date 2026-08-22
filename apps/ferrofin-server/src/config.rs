@@ -120,6 +120,7 @@ struct FileConfig {
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
     enable_metrics: Option<bool>,
+    disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
@@ -263,6 +264,21 @@ pub struct Config {
     /// unset. It is a bootstrap knob only — NOT added to the API `ServerConfiguration`,
     /// so `/System/Configuration` stays byte-identical to Jellyfin.
     pub enable_metrics: Option<bool>,
+
+    /// Suppress the compiled-in extensions (intro skipper, file
+    /// transformation, merge versions) — `true` registers none of them.
+    ///
+    /// This exists for measurement. A benchmark leg has to compare like with
+    /// like, and the Jellyfin leg runs with no plugins installed; leaving
+    /// Ferrofin's extensions on means its scheduled tasks and event hooks fire
+    /// inside the measurement window while Jellyfin's do not. `suite/micro`
+    /// and the perf compose both set `FERROFIN_DISABLE_EXTENSIONS=1`.
+    ///
+    /// Resolved `FERROFIN_DISABLE_EXTENSIONS` env > `disable_extensions` in
+    /// `config.toml` > `false`. A bootstrap knob only — not part of the API
+    /// `ServerConfiguration`, so `/System/Configuration` stays byte-identical
+    /// to Jellyfin.
+    pub disable_extensions: bool,
 
     /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
     /// (aligned with the Prometheus scrape interval). Resolved
@@ -535,7 +551,10 @@ impl Config {
             admin_user,
             admin_password,
             db_pool,
-            enable_metrics: parse_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
+            enable_metrics: parse_bool_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
+            disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
+                .or(file.disable_extensions)
+                .unwrap_or(false),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
@@ -636,6 +655,7 @@ impl Config {
             admin_password: String::new(),
             db_pool: None,
             enable_metrics: None,
+            disable_extensions: false,
             metrics_sample_interval: None,
             scan_progress_every: None,
             scan_probe_concurrency: None,
@@ -770,6 +790,22 @@ trait Env {
 /// unset or does not parse.
 fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
     env.var(key).and_then(|v| v.parse().ok())
+}
+
+/// A boolean env var, accepting the forms people actually write in a container
+/// or CI file — not just what `bool::from_str` takes.
+///
+/// `bool::from_str` accepts ONLY `"true"`/`"false"`, so plain [`parse_var`]
+/// silently discards `FERROFIN_ENABLE_METRICS=1`: it parses as `None`, falls
+/// through to the file/default, and the operator sees a knob that did nothing
+/// and said nothing. Accepted here, case-insensitively: `1`/`0`, `true`/`false`,
+/// `yes`/`no`, `on`/`off`. Anything else is `None`, same as before.
+fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
+    match env.var(key)?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// The real process environment.
@@ -955,6 +991,64 @@ mod tests {
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
+    }
+
+    /// The extension kill-switch resolves env > file > off, and accepts the
+    /// boolean spellings people actually write.
+    ///
+    /// `bool::from_str` takes ONLY `"true"`/`"false"`, so before
+    /// [`parse_bool_var`] a `FERROFIN_DISABLE_EXTENSIONS=1` parsed as `None`,
+    /// fell through to the default, and disabled nothing while reporting
+    /// nothing. `suite/micro/serve.sh` had been setting exactly that for the
+    /// whole life of the harness.
+    #[test]
+    fn disable_extensions_accepts_the_usual_boolean_spellings() {
+        let load = |env: &FakeEnv| {
+            Config::load_from(Cli::default(), env)
+                .unwrap()
+                .disable_extensions
+        };
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(
+                load(&FakeEnv::new().with("FERROFIN_DISABLE_EXTENSIONS", on)),
+                "{on:?} must read as true"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert!(
+                !load(&FakeEnv::new().with("FERROFIN_DISABLE_EXTENSIONS", off)),
+                "{off:?} must read as false"
+            );
+        }
+        // Unset defaults to OFF — extensions are a product feature; only the
+        // benchmark turns them off.
+        assert!(!load(&FakeEnv::new()));
+        // Unparseable is ignored rather than guessed.
+        assert!(!load(
+            &FakeEnv::new().with("FERROFIN_DISABLE_EXTENSIONS", "maybe")
+        ));
+
+        // config.toml sets it, and env still wins.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "disable_extensions = true\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .disable_extensions
+        );
+        assert!(
+            !Config::load_from(
+                cli(),
+                &FakeEnv::new().with("FERROFIN_DISABLE_EXTENSIONS", "0")
+            )
+            .unwrap()
+            .disable_extensions
+        );
     }
 
     #[test]
