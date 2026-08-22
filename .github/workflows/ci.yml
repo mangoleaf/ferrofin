@@ -34,6 +34,18 @@ jobs:
         # the ferrofin:plugin WIT contract can't drift silently.
       - run: FERROFIN_WASM_GUEST_TESTS=1 cargo test --workspace
 
+        # The "no silent omissions" gate: every operation in the vendored
+        # contract must be either measured by the benchmark
+        # (suite/registry.json) or skipped with a written reason
+        # (suite/coverage.py). Adding a path to the spec, or dropping a bench
+        # row, fails this until someone does one or the other.
+        #
+        # It was only reachable through `suite/run.bats`, which no workflow
+        # runs — so the property held by habit rather than by CI. Pure Python,
+        # no Docker, no fixture: it belongs in `lint`.
+      - name: benchmark coverage (contract accounted for)
+        run: python3 suite/coverage.py
+
   # Best-effort perf gate (plans 04/08): non-blocking (`continue-on-error`)
   # because shared runners are noisy — the MANDATORY gate is the local
   # `cd benchmark && ./perf-gate.sh` documented in CLAUDE.md. Fairness rule:
