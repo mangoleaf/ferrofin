@@ -95,6 +95,22 @@ pub fn is_item_by_name(kind: BaseItemKind) -> bool {
     )
 }
 
+/// Whether items of this kind can own media sources — the rows in
+/// `MediaStreamInfos`, `Chapters` and `TrickplayInfos`, and the alternate
+/// versions that point at them through `PrimaryVersionId`.
+///
+/// Stated as an exclusion (`not a folder, not an item-by-name`) rather than a
+/// list of media kinds, so a leaf kind can never lose its relations by being
+/// forgotten here: only the kinds that provably own none — every `Folder`
+/// subclass and every `IItemByName` — are excluded. Upstream never asks the
+/// question because a C# `Folder`/`Person` simply has no streams in memory;
+/// here the answer decides whether a page pays four DB round trips to learn
+/// the same thing.
+#[must_use]
+pub fn has_media_sources(kind: BaseItemKind) -> bool {
+    !is_folder(kind) && !is_item_by_name(kind)
+}
+
 /// Whether items of this kind carry cast/crew people
 /// (C# `BaseItem.SupportsPeople`, `false` by default, `true` for `Video`).
 #[must_use]
