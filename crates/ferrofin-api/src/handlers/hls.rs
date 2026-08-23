@@ -96,10 +96,27 @@ struct HlsQuery {
     #[serde(default, alias = "TranscodingMaxAudioChannels")]
     transcoding_max_audio_channels: Option<i32>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
-    #[serde(default, alias = "VideoBitrate")]
+    ///
+    /// The contract (and every Jellyfin client) spells this `videoBitRate`
+    /// (capital `R`, `DynamicHlsController`'s `int? videoBitRate`), while the
+    /// PlaybackInfo `TranscodingUrl` emits `VideoBitrate`. All four spellings
+    /// must parse: dropping the contract form silently lost the negotiated cap
+    /// (no `-maxrate`/`-bufsize`, and a source-bitrate BANDWIDTH in the master).
+    #[serde(
+        default,
+        alias = "VideoBitrate",
+        alias = "VideoBitRate",
+        alias = "videoBitRate"
+    )]
     video_bitrate: Option<i32>,
-    /// The negotiated audio bitrate cap in bit/s.
-    #[serde(default, alias = "AudioBitrate")]
+    /// The negotiated audio bitrate cap in bit/s (`audioBitRate` in the
+    /// contract; see [`Self::video_bitrate`] for the spellings).
+    #[serde(
+        default,
+        alias = "AudioBitrate",
+        alias = "AudioBitRate",
+        alias = "audioBitRate"
+    )]
     audio_bitrate: Option<i32>,
     /// The maximum output width in pixels (bounds the scale filter).
     #[serde(default, alias = "MaxWidth")]
@@ -522,13 +539,14 @@ mod tests {
     fn hls_query_parses_pascal_and_camel_case() {
         let pascal: HlsQuery = serde_urlencoded::from_str(
             "DeviceId=d1&PlaySessionId=p1&MediaSourceId=m1&VideoCodec=h264&\
-             VideoBitrate=8000000&MaxWidth=1920&MaxFramerate=30&\
+             VideoBitrate=8000000&AudioBitrate=192000&MaxWidth=1920&MaxFramerate=30&\
              TranscodingMaxAudioChannels=2&SegmentContainer=mp4&Static=false",
         )
         .expect("pascal query parses");
         assert_eq!(pascal.device_id.as_deref(), Some("d1"));
         assert_eq!(pascal.play_session_id.as_deref(), Some("p1"));
         assert_eq!(pascal.video_bitrate, Some(8_000_000));
+        assert_eq!(pascal.audio_bitrate, Some(192_000));
         assert_eq!(pascal.max_width, Some(1920));
         assert_eq!(pascal.max_framerate, Some(30.0));
         assert_eq!(pascal.transcoding_max_audio_channels, Some(2));
@@ -541,6 +559,23 @@ mod tests {
         assert_eq!(camel.play_session_id.as_deref(), Some("p1"));
         assert_eq!(camel.video_bitrate, Some(8_000_000));
         assert_eq!(camel.allow_video_stream_copy, Some(false));
+
+        // The OpenAPI contract spells the caps `videoBitRate`/`audioBitRate`
+        // (capital R) — the form jellyfin-web and the parity harness send. They
+        // used to parse as `None`: no `-maxrate`, no `-b:a`, and the master
+        // playlist fell back to the source bitrate.
+        let contract: HlsQuery =
+            serde_urlencoded::from_str("videoBitRate=1000000&audioBitRate=128000")
+                .expect("contract query parses");
+        assert_eq!(contract.video_bitrate, Some(1_000_000));
+        assert_eq!(contract.audio_bitrate, Some(128_000));
+        let contract_pascal: HlsQuery =
+            serde_urlencoded::from_str("VideoBitRate=1000000&AudioBitRate=128000")
+                .expect("pascal contract query parses");
+        assert_eq!(contract_pascal.video_bitrate, Some(1_000_000));
+        assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
+        let lower: HlsQuery = serde_urlencoded::from_str("audioBitrate=96000").expect("parses");
+        assert_eq!(lower.audio_bitrate, Some(96_000));
     }
 
     #[test]
