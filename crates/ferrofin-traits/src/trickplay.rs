@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
+use ferrofin_model::configuration::LibraryOptions;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -36,10 +37,15 @@ pub trait TrickplayManager: Send + Sync {
     /// (Re)generates trickplay images and metadata for a video.
     ///
     /// `replace` forces existing data to be regenerated rather than reused.
+    /// `library_options` are the item's library's options (C#
+    /// `ILibraryManager.GetLibraryOptions(item)`): when
+    /// `enable_trickplay_image_extraction` is off, existing tiles and rows for
+    /// the item are pruned instead of generated.
     async fn refresh_trickplay_data(
         &self,
         item_id: Uuid,
         replace: bool,
+        library_options: &LibraryOptions,
     ) -> Result<(), ServiceError>;
 
     /// Gets the available trickplay resolutions for an item, keyed by the width

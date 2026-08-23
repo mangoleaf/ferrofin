@@ -1005,6 +1005,7 @@ pub async fn build_app_state(
         )));
         task_manager.register(Arc::new(lib_tasks::TrickplayImagesTask::new(
             Arc::clone(&library),
+            Arc::clone(&virtual_folders),
             Arc::clone(&trickplay),
         )));
         task_manager.register(Arc::new(maint_tasks::CleanActivityLogTask::new(

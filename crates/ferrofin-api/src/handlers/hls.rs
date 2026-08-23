@@ -283,7 +283,8 @@ async fn get_audio_variant_playlist(
 
 /// Parses the axum-captured `{segmentId}` segment (the `.container` suffix was
 /// dropped by path normalization) into a segment index, `400` on a bad value.
-fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
+/// Shared with the trickplay tile handler (`{index}.jpg`).
+pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
     // The captured value can be `<index>` or `<index>.<ext>` when the client hit
     // the un-normalized form; take the leading integer either way.
     let head = segment_id.split('.').next().unwrap_or(segment_id);

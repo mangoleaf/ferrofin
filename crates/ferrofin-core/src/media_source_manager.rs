@@ -202,8 +202,14 @@ impl FerrofinMediaSourceManager {
             })
             .map(|s| s.index);
 
+        // C# `BaseItem.GetVersionInfo` (behind `Video.GetMediaSources`) reports
+        // the source id as `item.Id.ToString("N")` — the dashless form; clients
+        // key the trickplay manifest (and echo `MediaSourceId`) with exactly
+        // this string.
+        let id =
+            Uuid::parse_str(&item.id).map_or_else(|_| item.id.clone(), |u| u.simple().to_string());
         let mut source = MediaSourceInfo {
-            id: Some(item.id.clone()),
+            id: Some(id),
             path: item.path.clone(),
             name: item.name.clone(),
             container: container_of(item),
@@ -1142,6 +1148,12 @@ mod tests {
             .await
             .expect("sources");
         assert_eq!(sources.len(), 1);
+        // The wire id is the dashless `ToString("N")` form (the row stores it
+        // uppercase-hyphenated) — the key clients use for `Trickplay`.
+        assert_eq!(
+            sources[0].id.as_deref(),
+            Some(id.simple().to_string().as_str())
+        );
         assert_eq!(sources[0].path.as_deref(), Some("/media/m.mkv"));
         assert_eq!(sources[0].container.as_deref(), Some("mkv"));
         assert_eq!(sources[0].run_time_ticks, Some(100));

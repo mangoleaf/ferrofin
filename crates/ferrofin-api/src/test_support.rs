@@ -1572,6 +1572,7 @@ impl TrickplayManager for FakeTrickplay {
         &self,
         _item_id: Uuid,
         _replace: bool,
+        _library_options: &ferrofin_model::configuration::LibraryOptions,
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }

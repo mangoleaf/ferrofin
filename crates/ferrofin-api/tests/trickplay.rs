@@ -255,6 +255,7 @@ impl TrickplayManager for CannedTrickplay {
         &self,
         _item_id: Uuid,
         _replace: bool,
+        _library_options: &ferrofin_model::configuration::LibraryOptions,
     ) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -432,10 +433,25 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (ok, body) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
+    // jellyfin-web requests `{index}.jpg` — the vendored route shape.
+    let (ok, body) = call(
+        app.clone(),
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0.jpg"),
+    )
+    .await;
     assert_eq!(ok, StatusCode::OK);
     assert!(body.starts_with(&[0xff, 0xd8]));
     std::fs::remove_file(&path).ok();
+
+    // A non-numeric index is a client error, not a crash or a 404.
+    let (bad, _) = call(
+        app,
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/x.jpg"),
+    )
+    .await;
+    assert_eq!(bad, StatusCode::BAD_REQUEST);
 
     // No tile path resolved → 404.
     let app = state(
@@ -444,6 +460,11 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (missing, _) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
+    let (missing, _) = call(
+        app,
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0.jpg"),
+    )
+    .await;
     assert_eq!(missing, StatusCode::NOT_FOUND);
 }
