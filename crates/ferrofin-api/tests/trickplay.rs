@@ -432,9 +432,29 @@ async fn trickplay_tile_serves_file_then_404() {
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
     );
-    let (ok, body) = call(app, "GET", &format!("/Videos/{ITEM_ID}/Trickplay/320/0")).await;
+    // The playlist names tiles `0.jpg`: the `.jpg` suffix rides along in the capture.
+    let (ok, body) = call(
+        app.clone(),
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0.jpg"),
+    )
+    .await;
     assert_eq!(ok, StatusCode::OK);
     assert!(body.starts_with(&[0xff, 0xd8]));
+    let (ok, _) = call(
+        app.clone(),
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/0"),
+    )
+    .await;
+    assert_eq!(ok, StatusCode::OK);
+    let (bad, _) = call(
+        app,
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/320/zero.jpg"),
+    )
+    .await;
+    assert_eq!(bad, StatusCode::BAD_REQUEST);
     std::fs::remove_file(&path).ok();
 
     // No tile path resolved → 404.

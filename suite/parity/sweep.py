@@ -355,9 +355,20 @@ def resolve_fixtures(base, token, user):
     session = sessions[0]["Id"] if sessions else None
     logs = get_json(base, "/System/Logs", token) or []
     log_name = logs[0]["Name"] if logs and logs[0].get("Name") else None
+
+    def source_id(item_id):
+        """The item's media source id from PlaybackInfo — what a client sends as
+        mediaSourceId (Ferrofin's is not the item id's hyphenated spelling)."""
+        if not item_id:
+            return None
+        info = get_json(base, f"/Items/{item_id}/PlaybackInfo?userId={user}", token) or {}
+        sources = info.get("MediaSources") or []
+        return (sources[0].get("Id") or item_id) if sources else item_id
+
+    movie_src = source_id(movie or any_item)
     fx = {
         "itemId": any_item, "videoId": movie or any_item, "id": any_item, "Id": any_item,
-        "routeItemId": any_item, "mediaSourceId": movie or any_item, "routeMediaSourceId": movie or any_item,
+        "routeItemId": any_item, "mediaSourceId": movie_src, "routeMediaSourceId": movie_src,
         "seriesId": series or any_item, "SeriesId": series or any_item,
         "SeasonId": season or any_item, "userId": user, "sessionId": session,
         "name": genre, "genreName": genre, "imageType": "Primary",
@@ -368,7 +379,7 @@ def resolve_fixtures(base, token, user):
         "routeStartPositionTicks": "0", "streamId": "0", "logName": log_name,
         # Not a path param: the first track, so the /Audio/* ops probe a real audio item
         # (see `audio_fixtures`).
-        "_audio": audio,
+        "_audio": audio, "_audio_src": source_id(audio),
     }
     return {k: v for k, v in fx.items() if v is not None}
 
@@ -379,7 +390,7 @@ def audio_fixtures(fixtures):
     audio = fixtures.get("_audio")
     if not audio:
         return fixtures
-    return {**fixtures, "itemId": audio, "mediaSourceId": audio}
+    return {**fixtures, "itemId": audio, "mediaSourceId": fixtures.get("_audio_src") or audio}
 
 
 # REQUIRED query params the breadth sweep can fill from the shared fixture — the query-side

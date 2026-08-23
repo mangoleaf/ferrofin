@@ -9,7 +9,7 @@
 //!
 //! 1. parses the request's route + query into an [`HlsStreamRequest`], and
 //! 2. calls the seam and serves the result — either a playlist string (with the
-//!    HLS `application/x-mpegURL` content type) or a [`ServedFile`] streamed from
+//!    HLS `application/vnd.apple.mpegurl` content type) or a [`ServedFile`] streamed from
 //!    the transcode cache with its resolved MIME type.
 //!
 //! Routes ported:
@@ -45,7 +45,11 @@ use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
 /// `MimeTypes.GetMimeType("playlist.m3u8")`.
-const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/x-mpegURL";
+// Jellyfin's own `MimeTypes` table has `.m3u8` only in its reverse (mime → extension)
+// map, so `GetMimeType("playlist.m3u8")` falls through to the `MimeTypes` NuGet
+// package's mime-db lookup: `application/vnd.apple.mpegurl`. (The vendored OpenAPI
+// still advertises `application/x-mpegURL` — that is the attribute, not the runtime.)
+const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
 /// The `?static` / segment-shaping query parameters common to every HLS route.
 ///

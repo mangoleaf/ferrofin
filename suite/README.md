@@ -12,7 +12,7 @@ the hub scripts here, the perf leg in `perf/`, the parity leg in `parity/`.
 ## Entry points
 
 ```
-suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets+terminal → suite/parity/ledger.json
+suite/run.sh parity   # both servers up  → sweep+reads+journeys+assets+streams+terminal → suite/parity/ledger.json
 suite/run.sh perf     # one at a time    → open-loop vegeta bench → suite/perf/results/raw/*-summary.json (+fingerprints)
 suite/run.sh all      # parity, then perf, same build + fixture → suite/results/run-<sha>.json
 suite/run.sh publish  # parity once + BENCH_RUNS × perf → suite/results/agg-<sha>.{json,md} (median±IQR distributions)

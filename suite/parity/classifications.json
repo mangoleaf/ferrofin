@@ -170,54 +170,6 @@
       "category": "deferred-remote-or-feature-gated",
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
     },
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.aac": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/hls/{segmentId}/stream.mp3": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/main.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Audio/{itemId}/universal": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Audio/{itemId}/universal": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
     "GET /Channels/{channelId}/Features": {
       "category": "requires-livetv-tuner",
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
@@ -606,78 +558,6 @@
       "category": "verified-by-push-probe",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
-    "DELETE /Videos/{itemId}/Subtitles/{index}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
-    },
-    "GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/live.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/main.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/master.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "HEAD /Videos/{itemId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
-    },
     "GET /web/ConfigurationPage": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
@@ -721,22 +601,6 @@
     "GET /Years/{year}": {
       "category": "expected-extension",
       "classification": "expected-extension: Ferrofin does not materialize Year items (documented out-of-scope; matches the GET /Years classification), so a single year has no item to return (H=404 vs J=200)."
-    },
-    "GET /Artists/{name}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: by-name artist lookup needs a music library; the parity fixture is movies+TV only, so there is no artist corpus to diff (H=404 vs J=200)."
-    },
-    "GET /MusicGenres/{genreName}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: by-name music-genre lookup needs a music library, absent from the movies+TV parity fixture (H=404 vs J=200)."
-    },
-    "GET /Artists/InstantMix": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: an artist instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid artist)."
-    },
-    "GET /MusicGenres/InstantMix": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: a music-genre instant mix needs a music library, absent from the movies+TV parity fixture (both servers 400 without a valid genre)."
     },
     "GET /Playlists/{itemId}/InstantMix": {
       "category": "expected-extension",

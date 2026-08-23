@@ -122,7 +122,7 @@ impl HlsStreamManager for FakeHls {
             .unwrap()
             .push((file_name.to_owned(), require_m3u8));
         self.served(if require_m3u8 {
-            "application/x-mpegURL"
+            "application/vnd.apple.mpegurl"
         } else {
             "video/mp2t"
         })
@@ -645,7 +645,7 @@ async fn video_master_playlist_returns_m3u8() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers().get("content-type").unwrap(),
-        "application/x-mpegURL"
+        "application/vnd.apple.mpegurl"
     );
     let last = rec.last.lock().unwrap().clone().unwrap();
     assert_eq!(last.item_id, ITEM_ID);
@@ -697,7 +697,7 @@ async fn video_main_and_live_and_audio_playlists() {
         assert_eq!(resp.status(), StatusCode::OK, "uri {uri}");
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
-            "application/x-mpegURL"
+            "application/vnd.apple.mpegurl"
         );
         assert!(body_string(resp).await.contains(marker), "uri {uri}");
     }

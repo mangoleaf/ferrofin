@@ -549,8 +549,8 @@ async fn get_subtitle_js_alias_maps_to_json_mime() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    // js → json; JSON subtitles are served as text/plain by the small MIME map.
-    assert_eq!(ct.as_deref(), Some("text/plain"));
+    // js → json; served as application/json (Jellyfin: MimeTypes.GetMimeType("file.json")).
+    assert_eq!(ct.as_deref(), Some("application/json"));
 }
 
 #[tokio::test]
@@ -596,7 +596,7 @@ async fn subtitle_playlist_builds_segments() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(ct.as_deref(), Some("application/x-mpegURL"));
+    assert_eq!(ct.as_deref(), Some("application/vnd.apple.mpegurl"));
     let text = String::from_utf8(body).unwrap();
     assert!(text.starts_with("#EXTM3U"));
     assert!(text.contains("#EXT-X-TARGETDURATION:10"));

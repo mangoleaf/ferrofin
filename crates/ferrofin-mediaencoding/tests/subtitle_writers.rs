@@ -76,19 +76,36 @@ fn srt_writer_clamps_negative_timecode_to_zero() {
 
 // -- VTT writer ------------------------------------------------------------
 
+const VTT_HEADER: &str = "\u{feff}WEBVTT\n\nRegion: id:subtitle width:80% lines:3 \
+                          regionanchor:50%,100% viewportanchor:50%,90%\n\n";
+
 #[test]
-fn vtt_to_text_has_signature_and_dot_millis() {
+fn vtt_to_text_matches_jellyfins_vtt_writer() {
+    // BOM + signature + the region block, then `start --> end region:subtitle line:90%`,
+    // the text, a blank line — byte for byte what VttWriter emits on Linux.
     let s = subtitle_with(&[("Hi", 61_500, 62_250)]);
     let out = vtt::to_text(&s);
-    assert!(out.starts_with(&format!("WEBVTT{NL}{NL}")));
-    assert!(out.contains("00:01:01.500 --> 00:01:02.250"));
-    assert!(out.contains(&format!("Hi{NL}{NL}")));
+    assert_eq!(
+        out,
+        format!("{VTT_HEADER}00:01:01.500 --> 00:01:02.250 region:subtitle line:90%\nHi\n\n")
+    );
 }
 
 #[test]
 fn vtt_empty_subtitle_is_header_only() {
     let out = vtt::to_text(&Subtitle::new());
-    assert_eq!(out, format!("WEBVTT{NL}{NL}"));
+    assert_eq!(out, VTT_HEADER);
+}
+
+#[test]
+fn vtt_stretches_non_sequential_cues_and_unescapes_newlines() {
+    // end <= start → end = start + 1 ms; a literal `\n` escape becomes a space.
+    let s = subtitle_with(&[("a\\nb", 1_000, 1_000)]);
+    let out = vtt::to_text(&s);
+    assert!(
+        out.contains("00:00:01.000 --> 00:00:01.001 region:subtitle line:90%\na b\n"),
+        "{out}"
+    );
 }
 
 // -- SSA / ASS writers -----------------------------------------------------

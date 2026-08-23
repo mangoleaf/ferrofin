@@ -219,8 +219,8 @@ def build_curated():
     if os.path.exists(sp):
         sweep_stamp = json.load(open(sp)).get("last_verified")
     # Precedence: static seed < sweep single-item diff < live curated read diff < write journeys
-    # < terminal phase < asset layer < curated accepted classifications (later, more
-    # authoritative wins).
+    # < terminal phase < asset layer < stream layer < curated accepted classifications
+    # (later, more authoritative wins).
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
     for k, v in sweep.items():
         if "deep_verified" in v:   # only GET 200/200 ops the sweep deep-diffed
@@ -243,6 +243,10 @@ def build_curated():
     assets, as_stamp = load_layer2("suite/parity/asset-results.json")
     for k, v in assets.items():
         curated[k] = {**v, "last_verified": as_stamp}
+    # The stream-signature layer (direct play / HLS / subtitles / trickplay): same shape.
+    streams, st_stamp = load_layer2("suite/parity/stream-results.json")
+    for k, v in streams.items():
+        curated[k] = {**v, "last_verified": st_stamp}
     # Curated accepted-divergence classifications win the classification field over the auto
     # "flagged: verify" text (human decision > detector). deep_verified stays as the live layer
     # reported it (these diverge by design and are not deep-verified); a row not otherwise present

@@ -40,6 +40,8 @@ echo ">> Layer-2 write journeys"
 python3 ../parity/journeys.py
 echo ">> Layer-3 binary/asset differential"
 python3 ../parity/assets.py
+echo ">> Layer-3 stream-signature differential (direct / HLS / subtitles / trickplay)"
+python3 ../parity/streams.py
 echo ">> terminal phase: restore / restart / shutdown (ends the differential)"
 python3 ../parity/terminal.py
 echo ">> regenerating ledger"

@@ -104,7 +104,7 @@ pub trait StreamStatePlanner: Send + Sync {
 
 /// The MIME type for an HLS playlist, matching Jellyfin's
 /// `MimeTypes.GetMimeType("playlist.m3u8")`.
-const HLS_PLAYLIST_MIME: &str = "application/x-mpegURL";
+const HLS_PLAYLIST_MIME: &str = "application/vnd.apple.mpegurl";
 
 /// The ffmpeg program handed to the transcoder seam.
 ///
@@ -1455,7 +1455,7 @@ mod tests {
         std::fs::write(tmp.path().join("pl.m3u8"), b"#EXTM3U").unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let served = mgr.resolve_transcode_file("pl.m3u8", true).await.unwrap();
-        assert_eq!(served.content_type, "application/x-mpegURL");
+        assert_eq!(served.content_type, "application/vnd.apple.mpegurl");
     }
 
     #[tokio::test]
@@ -1494,7 +1494,7 @@ mod tests {
         assert_eq!(segment_extension("ts"), ".ts");
         assert_eq!(segment_extension("mp4"), ".mp4");
         assert_eq!(segment_extension(""), ".ts");
-        assert_eq!(mime_for_extension(".m3u8"), "application/x-mpegURL");
+        assert_eq!(mime_for_extension(".m3u8"), "application/vnd.apple.mpegurl");
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");
         assert_eq!(mime_for_extension(".mp3"), "audio/mpeg");

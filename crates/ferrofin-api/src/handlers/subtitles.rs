@@ -46,7 +46,7 @@ use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
 /// (`MimeTypes.GetMimeType("playlist.m3u8")`).
-const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/x-mpegURL";
+const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
 /// The number of 100-ns ticks in one second (`TimeSpan.TicksPerSecond`), used to
 /// convert the `segmentLength` (seconds) into the tick space the playlist math
@@ -269,6 +269,7 @@ fn subtitle_mime(format: &str) -> &'static str {
         "vtt" => "text/vtt",
         "srt" | "subrip" => "application/x-subrip",
         "ass" | "ssa" => "text/x-ssa",
+        "json" => "application/json",
         _ => "text/plain",
     }
 }
@@ -338,7 +339,11 @@ async fn encode_subtitle_response(
     // For WebVTT with AddVttTimeMap, splice the MPEG-TS offset the HLS spec wants
     // (port of the `WEBVTT` → `WEBVTT\nX-TIMESTAMP-MAP=…` string replace).
     if format.eq_ignore_ascii_case("vtt") && query.add_vtt_time_map {
-        let text = String::from_utf8_lossy(&bytes).replace(
+        // Jellyfin reads the encoded stream through a BOM-detecting StreamReader and
+        // re-encodes the text without a preamble, so the writer's BOM does not survive
+        // this path.
+        let text = String::from_utf8_lossy(&bytes);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace(
             "WEBVTT",
             "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
         );
