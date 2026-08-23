@@ -456,14 +456,34 @@ fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
 
 /// Cap on how many ffprobe processes the scan keeps in flight by default.
 ///
-/// The probe is ~95% of scan wall time (measured: 74 s of a 78 s, 2 100-item
-/// scan) and is a pure per-file read, so probing one file at a time leaves
-/// every core but one idle. This ceiling is deliberately modest rather than
-/// core-count-wide: the win is close to linear on a local SSD, but a library on
-/// a spinning disk or a network mount turns a wide window into seek thrash, and
-/// a scan must never starve playback. Operators who know their storage raise it
-/// with `FERROFIN_SCAN_PROBE_CONCURRENCY` / `scan_probe_concurrency`.
-pub const DEFAULT_SCAN_PROBE_CONCURRENCY: usize = 4;
+/// The probe dominates scan wall time — ffprobe child processes burn 82.2 s of
+/// CPU against the server's own 13.3 s, ~86% of everything a scan costs — and
+/// it is a pure per-file read, so a narrow window leaves cores idle waiting on
+/// I/O. Measured on a local SSD over a 1,100-item library:
+///
+/// | window | items/s | ffprobe wait as share of the scan loop |
+/// |---|---|---|
+/// | 4 | 133 | 64.1% |
+/// | 8 | 239 | — |
+/// | 16 | 365 | — |
+/// | 32 | 405 | 1.4% |
+///
+/// 4 -> 8 is the largest marginal step (+80%); the curve flattens after 16.
+///
+/// Still deliberately modest rather than core-count-wide. The win is close to
+/// linear on a local SSD, but a library on a spinning disk or a network mount
+/// turns a wide window into seek thrash, and a scan must never starve playback.
+/// Note what bounds the risk: [`default_probe_concurrency`] clamps this to the
+/// visible cores, so raising it from 4 to 8 changes NOTHING on a 1-, 2- or
+/// 4-core NAS — the machines the conservative value was protecting. It only
+/// widens the window where there are already 8+ cores to fill.
+///
+/// Honest limit on the evidence: the seek-thrash concern is reasoned, not
+/// measured, and it was equally unmeasured when this was 4. Operators who know
+/// their storage tune it with `FERROFIN_SCAN_PROBE_CONCURRENCY` /
+/// `scan_probe_concurrency`; a spinning-disk or NFS library is the case to
+/// lower it for.
+pub const DEFAULT_SCAN_PROBE_CONCURRENCY: usize = 8;
 
 /// The effective default probe window: [`DEFAULT_SCAN_PROBE_CONCURRENCY`],
 /// never more than the visible cores (a single-core NAS gains nothing from
