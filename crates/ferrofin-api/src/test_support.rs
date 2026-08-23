@@ -570,12 +570,30 @@ impl UserManager for FakeUsers {
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         unimplemented!("fake")
     }
+    /// An ordinary, non-administrator account.
+    ///
+    /// This one is implemented rather than `unimplemented!()` because
+    /// `RequireAdmin` resolves the caller's role through it, so a panic here
+    /// means no test can exercise the *denied* side of an elevated route
+    /// without hand-rolling a whole `UserManager`. A default [`UserPolicy`] has
+    /// `is_administrator: false`, which is what makes `FakeUsers` a usable
+    /// stand-in for "some logged-in user who is not an admin". Tests wanting
+    /// the allowed side use an API-key caller, which `RequireAdmin`
+    /// short-circuits.
     async fn get_user_dto(
         &self,
         _user: &UserEntity,
         _server_id: Option<String>,
     ) -> Result<UserDto, ServiceError> {
-        unimplemented!("fake")
+        // Carry the caller's identity through: a fake that returns a nil id and
+        // an empty name for a real `UserEntity` lets a test assert `200` on a
+        // body describing a user that does not exist.
+        Ok(UserDto {
+            id: Uuid::parse_str(&_user.id).unwrap_or_default(),
+            name: Some(_user.username.clone()),
+            policy: Some(ferrofin_model::users::UserPolicy::default()),
+            ..UserDto::default()
+        })
     }
     async fn update_configuration(
         &self,
