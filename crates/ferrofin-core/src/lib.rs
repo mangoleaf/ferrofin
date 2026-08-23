@@ -165,6 +165,7 @@ pub mod device_manager;
 mod device_repository;
 pub mod display_preferences_manager;
 pub mod dto_service;
+pub mod dynamic_images;
 pub mod event_manager;
 pub mod external_data_manager;
 pub mod file_system;
@@ -211,8 +212,10 @@ pub mod tv_series_manager;
 pub mod user_data_manager;
 pub mod user_entity_ext;
 pub mod user_manager;
+pub mod user_root_folder;
 pub mod user_view_manager;
 pub mod virtual_folder_manager;
+pub mod years;
 
 #[cfg(test)]
 mod test_support;
@@ -275,5 +278,7 @@ pub use trickplay_manager::FerrofinTrickplayManager;
 pub use tv_series_manager::FerrofinTvSeriesManager;
 pub use user_data_manager::FerrofinUserDataManager;
 pub use user_manager::FerrofinUserManager;
+pub use user_root_folder::UserRootFolderStore;
 pub use user_view_manager::FerrofinUserViewManager;
 pub use virtual_folder_manager::FerrofinVirtualFolderManager;
+pub use years::YearStore;

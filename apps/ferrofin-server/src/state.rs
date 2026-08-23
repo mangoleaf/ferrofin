@@ -594,12 +594,33 @@ pub async fn build_app_state(
             // `EnableExternalContentInSuggestions` (Trailer/LiveTvProgram fold-in).
             .with_configuration(Arc::clone(&config_trait)),
     );
+    // The by-name `Year` provisioner (`GetYear`): one row per production year
+    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id. Shared
+    // by the scan's post-pass (every scanned year) and the library manager's
+    // on-demand `/Years/{year}` resolution.
+    let year_store = ferrofin_core::YearStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.year_path(),
+    );
+    // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
+    // `Items/Root` resolves to and the parent of every library's
+    // `CollectionFolder` (the virtual-folder manager builds its own over the
+    // same root + store, so both land on the one derived id).
+    let user_root_store = ferrofin_core::UserRootFolderStore::new(
+        Arc::clone(&item_persistence_service),
+        id_derivation.clone(),
+        paths.default_user_views_path(),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
         Arc::clone(&item_persistence_service),
     )
     .with_id_derivation(id_derivation)
+    // Materialize a `Year` item per distinct ProductionYear at the end of
+    // every scan (needs the item repository wired via `with_music` below).
+    .with_years(year_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
     .with_localization(Arc::new(LocalizationManager::new(
@@ -676,7 +697,11 @@ pub async fn build_app_state(
         .with_scanner(Arc::clone(&library_scanner))
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
-        .with_chapters(Arc::clone(&chapter_repository)),
+        .with_chapters(Arc::clone(&chapter_repository))
+        // `Items/Root` creates the root on first use; `/Years/{year}` creates
+        // the year on first use — both as Jellyfin does.
+        .with_user_root(user_root_store)
+        .with_years(year_store),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the

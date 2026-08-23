@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use tracing::Instrument as _;
 
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
 use ferrofin_model::entities::{ImageType, MediaStreamType};
@@ -78,6 +79,13 @@ pub struct FerrofinLibraryManager {
     /// repository (not the `ChapterManager`) is held because the manager is
     /// built on top of this manager — taking it here would be a cycle.
     chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
+    /// The `UserRootFolder` provisioner (`GetUserRootFolder()`), set by the
+    /// composition root. `None` (unit tests) falls back to resolving an
+    /// already-persisted root row.
+    user_root: Option<crate::user_root_folder::UserRootFolderStore>,
+    /// The `Year` by-name item provisioner (`GetYear`), set by the composition
+    /// root. `None` (unit tests) resolves only persisted `Year` rows.
+    years: Option<crate::years::YearStore>,
 }
 
 /// What a queued scan covers.
@@ -132,7 +140,71 @@ impl FerrofinLibraryManager {
             scan_in_flight: Arc::new(AtomicBool::new(false)),
             scan_pending: Arc::new(std::sync::Mutex::new(None)),
             chapters: None,
+            user_root: None,
+            years: None,
         }
+    }
+
+    /// Attaches the `UserRootFolder` provisioner so `get_user_root_folder`
+    /// creates the root on first use, as Jellyfin's `GetUserRootFolder()` does.
+    #[must_use]
+    pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
+        self.user_root = Some(store);
+        self
+    }
+
+    /// Attaches the `Year` provisioner so a by-name `Year` lookup creates the
+    /// item on demand (`GetYear` → `CreateItemByName<Year>`).
+    #[must_use]
+    pub fn with_years(mut self, store: crate::years::YearStore) -> Self {
+        self.years = Some(store);
+        self
+    }
+
+    /// `GetYear` for every slot of a by-name `Year` resolution that came back
+    /// empty: a name that parses as a positive year gets its row created
+    /// (directory + item) and the slot filled. No-op without the provisioner.
+    async fn create_missing_years(
+        &self,
+        names: &[String],
+        resolved: &mut [Option<BaseItemEntity>],
+    ) -> Result<(), ServiceError> {
+        let Some(years) = &self.years else {
+            return Ok(());
+        };
+        let missing: Vec<i32> = names
+            .iter()
+            .zip(resolved.iter())
+            .filter(|(_, row)| row.is_none())
+            .filter_map(|(name, _)| name.trim().parse::<i32>().ok())
+            .filter(|y| *y > 0)
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let created = years.ensure_missing(&missing).await?;
+        for (name, slot) in names.iter().zip(resolved.iter_mut()) {
+            if slot.is_some() {
+                continue;
+            }
+            let Some(year) = name.trim().parse::<i32>().ok().filter(|y| *y > 0) else {
+                continue;
+            };
+            let Some(id) = years.id_of(year) else {
+                continue;
+            };
+            // Prefer the entity just written; a year whose row exists but
+            // did not match by CleanName reads back from storage.
+            let row = match created
+                .iter()
+                .find(|e| e.id.eq_ignore_ascii_case(&guid_to_db(id)))
+            {
+                Some(row) => Some(row.clone()),
+                None => self.items.retrieve_item(id).await?,
+            };
+            *slot = row;
+        }
+        Ok(())
     }
 
     /// Attaches the chapter seam so chapter thumbnails can be served (their
@@ -304,18 +376,50 @@ impl LibraryManager for FerrofinLibraryManager {
                 by_clean.entry(clean).or_insert(row);
             }
         }
-        Ok(trimmed
-            .into_iter()
+        let mut resolved: Vec<Option<BaseItemEntity>> = trimmed
+            .iter()
             .map(|n| {
                 if n.is_empty() {
                     None
                 } else {
-                    by_clean
-                        .get(&crate::text_util::get_clean_value(&n))
-                        .cloned()
+                    by_clean.get(&crate::text_util::get_clean_value(n)).cloned()
                 }
             })
-            .collect())
+            .collect();
+        if kind == BaseItemKind::Year {
+            self.create_missing_years(&trimmed, &mut resolved).await?;
+        }
+        Ok(resolved)
+    }
+
+    async fn get_named_item(
+        &self,
+        kind: BaseItemKind,
+        name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        // The single-name form of `get_named_items` — same CleanName match,
+        // first row wins — so a `Year` lookup also materializes on demand.
+        Ok(self
+            .get_named_items(kind, std::slice::from_ref(&name.to_owned()))
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
+    }
+
+    async fn get_user_root_folder(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
+        // `GetUserRootFolder()`: create the directory + row on first use, then
+        // resolve it by its deterministic id. Without the provisioner wired
+        // (unit tests) fall back to the persisted-row lookup.
+        let Some(root) = &self.user_root else {
+            let query = InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::UserRootFolder],
+                ..InternalItemsQuery::default()
+            };
+            return Ok(self.items.get_item_list(&query).await?.into_iter().next());
+        };
+        let id = root.ensure().await?;
+        self.items.retrieve_item(id).await
     }
 
     async fn get_named_item_ids(
@@ -415,6 +519,22 @@ impl LibraryManager for FerrofinLibraryManager {
             // Already gone — deletion is idempotent.
             return Ok(());
         };
+        // C# `LibraryController.DeleteItem`: `!item.CanDelete(user)` is a 401
+        // "Unauthorized access". The kind half of that rule lives here, on the
+        // one path every delete takes: the user root, the aggregate root, a
+        // library's collection folder, the views, and the by-name items are
+        // never deletable — and with `ParentId` a cascading foreign key,
+        // deleting the root would delete every library and all of its items.
+        let kind = crate::item_type_lookup::kind_from_type_name(&row.type_)
+            .unwrap_or(BaseItemKind::Folder);
+        let has_parent = row
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok())
+            .is_some_and(|p| !p.is_nil());
+        if !crate::kinds::can_delete(kind, has_parent) {
+            return Err(ServiceError::unauthorized("Unauthorized access"));
+        }
         let mut ids = vec![id];
         // C# `DeleteItem` cascades to a folder's children; gather the direct-child
         // ids so the row deletion removes the subtree too. Physical file deletion
@@ -1111,6 +1231,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_item_refuses_the_structural_and_by_name_rows() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let root = Uuid::from_u128(0x5001);
+        seed_named_item(&db, root, BaseItemKind::UserRootFolder, "Media Folders").await;
+        let library = Uuid::from_u128(0x5002);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        let year = Uuid::from_u128(0x5003);
+        seed_named_item(&db, year, BaseItemKind::Year, "1999").await;
+        for id in [root, library, year] {
+            let err = mgr
+                .delete_item(id, &DeleteOptions::default())
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, ServiceError::Unauthorized(_)), "{err}");
+            assert!(mgr.get_item_by_id(id).await.expect("read").is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn queue_library_scan_is_a_successful_no_op() {
         let db = test_db().await;
         let mgr = manager(&db);
@@ -1516,6 +1656,75 @@ mod tests {
             .expect("root")
             .expect("some");
         assert_eq!(Uuid::parse_str(&resolved.id).expect("uuid"), root);
+    }
+
+    /// With the provisioners wired (the composition root's shape), the root is
+    /// created on first use and a `Year` lookup creates the year — Jellyfin's
+    /// `GetUserRootFolder()` / `GetYear` on a database that has neither.
+    #[tokio::test]
+    async fn root_and_years_are_created_on_first_use() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let persistence: Arc<dyn ItemPersistenceService> =
+            Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let mode = crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let mgr = manager(&db)
+            .with_user_root(crate::user_root_folder::UserRootFolderStore::new(
+                Arc::clone(&persistence),
+                mode.clone(),
+                tmp.path().join("root/default"),
+            ))
+            .with_years(crate::years::YearStore::new(
+                persistence,
+                mode,
+                tmp.path().join("metadata/Year"),
+            ));
+
+        let root = mgr
+            .get_user_root_folder()
+            .await
+            .expect("root")
+            .expect("created on first use");
+        assert_eq!(root.name.as_deref(), Some("Media Folders"));
+        assert!(tmp.path().join("root/default").is_dir());
+
+        // A year with no item and no row resolves (and now exists); a
+        // non-year name of the kind does not.
+        let year = mgr
+            .get_named_item(BaseItemKind::Year, "1999")
+            .await
+            .expect("year")
+            .expect("created on demand");
+        assert_eq!(year.name.as_deref(), Some("1999"));
+        assert!(tmp.path().join("metadata/Year/1999").is_dir());
+        assert!(
+            mgr.get_named_item(BaseItemKind::Year, "not-a-year")
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        // The batch form fills every slot, reusing the row it already made.
+        let batch = mgr
+            .get_named_items(BaseItemKind::Year, &["1999".to_owned(), "2004".to_owned()])
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch[0].as_ref().map(|r| r.id.clone()),
+            Some(year.id.clone()),
+            "the existing row is reused"
+        );
+        assert!(batch[1].is_some(), "the second year was created");
+        let years = mgr
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Year],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("list");
+        assert_eq!(years.len(), 2);
     }
 
     /// Sets a row's `Width` column so the merge primary-selection heuristic has a

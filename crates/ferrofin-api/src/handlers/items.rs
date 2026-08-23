@@ -22,6 +22,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{BaseItemDto, ItemCounts};
 use ferrofin_model::querying::QueryResult;
@@ -535,9 +536,49 @@ struct AncestorsQuery {
     user_id: Option<Uuid>,
 }
 
+/// The stored `BaseItems.Type` short name of a row (`AggregateFolder`,
+/// `CollectionFolder`, …).
+fn short_type(item: &BaseItemEntity) -> &str {
+    item.type_.rsplit('.').next().unwrap_or(&item.type_)
+}
+
+/// Port of `LibraryController.TranslateParentItem`: for a user, a physical
+/// library root (a folder whose parent is the `AggregateFolder`, as in a
+/// database scanned by Jellyfin) is shown as the user's view containing it —
+/// the `CollectionFolder` whose `PhysicalLocations` include the folder's path.
+/// `None` when no view contains it (the C# `FirstOrDefault` miss, which ends
+/// the walk). Items Ferrofin scanned already parent straight to their
+/// `CollectionFolder`, so the hop only fires on adopted data.
+async fn translate_parent_item(
+    state: &AppState,
+    item: &BaseItemEntity,
+    grandparent: Option<&BaseItemEntity>,
+) -> Result<Option<BaseItemEntity>, ApiError> {
+    if grandparent.is_none_or(|g| short_type(g) != "AggregateFolder") {
+        return Ok(Some(item.clone()));
+    }
+    let Some(path) = item.path.as_deref() else {
+        return Ok(None);
+    };
+    let folders = state.virtual_folders.get_virtual_folders().await?;
+    let Some(view_id) = folders
+        .iter()
+        .find(|vf| vf.locations.iter().any(|loc| loc == path))
+        .and_then(|vf| vf.item_id.as_deref())
+        .and_then(|id| Uuid::parse_str(id).ok())
+    else {
+        return Ok(None);
+    };
+    Ok(state.library.get_item_by_id(view_id).await?)
+}
+
 /// `GET /Items/{itemId}/Ancestors` — an item's parents, nearest first.
 ///
-/// Port of `LibraryController.GetAncestors`. A missing item is a `404`.
+/// Port of `LibraryController.GetAncestors`: walks `GetParent()` from the
+/// item, translating each hop through [`translate_parent_item`] when a user
+/// is in scope (a physical root becomes the user's view, whose own parent is
+/// the `UserRootFolder`), and stops at the first hop that translates to
+/// nothing. A missing item is a `404`.
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/Ancestors",
@@ -555,11 +596,38 @@ async fn get_ancestors(
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    let ancestors = state
+    let mut chain = state
         .library
         .get_ancestors(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let mut ancestors: Vec<BaseItemEntity> = Vec::with_capacity(chain.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut index = 0;
+    while let Some(parent) = chain.get(index) {
+        let parent = if user.is_some() {
+            match translate_parent_item(&state, parent, chain.get(index + 1)).await? {
+                Some(translated) => translated,
+                None => break,
+            }
+        } else {
+            parent.clone()
+        };
+        if !seen.insert(parent.id.to_ascii_uppercase()) {
+            break;
+        }
+        // A translated hop re-roots the walk: the view's parents (the user
+        // root), not the physical folder's (the aggregate root), come next.
+        let translated = !parent.id.eq_ignore_ascii_case(&chain[index].id);
+        let translated_id = Uuid::parse_str(&parent.id).ok();
+        ancestors.push(parent);
+        if translated && let Some(id) = translated_id {
+            chain = state.library.get_ancestors(id).await?.unwrap_or_default();
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
     let options = DtoOptions::default();
     let dtos = state
         .dto

@@ -21,13 +21,17 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::entities::ExtraType;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, UserManager, UserViewManager};
+use ferrofin_traits::library::{
+    LibraryManager, UserManager, UserViewManager, VirtualFolderManager,
+};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
@@ -320,16 +324,63 @@ impl UserManager for OkUsers {
     }
 }
 
+/// The physical library-root `Folder` an item scanned by Jellyfin parents to.
+const PHYSICAL_FOLDER_ID: Uuid = Uuid::from_u128(0xF01);
+/// The `AggregateFolder` (`{data}/root`) that physical folder parents to.
+const AGGREGATE_ID: Uuid = Uuid::from_u128(0xA66);
+/// The library's `CollectionFolder` whose locations include the physical path.
+const COLLECTION_FOLDER_ID: Uuid = Uuid::from_u128(0xC0F);
+/// The `UserRootFolder` the collection folder parents to.
+const USER_ROOT_ID: Uuid = Uuid::from_u128(0x500);
+/// The physical folder's on-disk path (= one of the library's locations).
+const PHYSICAL_PATH: &str = "/media/movies-real";
+
 /// A [`LibraryManager`] returning one item from `query_items`, and resolving a
 /// single known item id in `get_item_by_id` (any other id is `None`).
+///
+/// With `adopted_tree` set it also models a tree scanned by Jellyfin: the item
+/// parents to a physical `Folder` under the `AggregateFolder`, while the
+/// library's `CollectionFolder` parents to the `UserRootFolder`.
 struct OkLibrary {
     item_id: Uuid,
+    adopted_tree: bool,
 }
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if self.adopted_tree && id == COLLECTION_FOLDER_ID {
+            return Ok(Some(item_entity(
+                COLLECTION_FOLDER_ID,
+                "Movies",
+                BaseItemKind::CollectionFolder,
+            )));
+        }
         Ok((id == self.item_id).then(|| base_item_entity(self.item_id)))
+    }
+    async fn get_ancestors(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
+        if !self.adopted_tree {
+            return Ok((item_id == self.item_id).then(Vec::new));
+        }
+        if item_id == self.item_id {
+            let mut physical = item_entity(PHYSICAL_FOLDER_ID, "movies-real", BaseItemKind::Folder);
+            physical.path = Some(PHYSICAL_PATH.to_owned());
+            return Ok(Some(vec![
+                physical,
+                item_entity(AGGREGATE_ID, "root", BaseItemKind::AggregateFolder),
+            ]));
+        }
+        if item_id == COLLECTION_FOLDER_ID {
+            return Ok(Some(vec![item_entity(
+                USER_ROOT_ID,
+                "Media Folders",
+                BaseItemKind::UserRootFolder,
+            )]));
+        }
+        Ok(None)
     }
     async fn query_items(
         &self,
@@ -518,10 +569,65 @@ impl DtoService for OkDto {
     }
 }
 
+/// A [`VirtualFolderManager`] listing one library whose locations include
+/// [`PHYSICAL_PATH`] and whose item is [`COLLECTION_FOLDER_ID`].
+struct OneLibrary;
+
+#[async_trait]
+impl VirtualFolderManager for OneLibrary {
+    async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        Ok(vec![VirtualFolderInfo {
+            name: Some("Movies".to_owned()),
+            locations: vec![PHYSICAL_PATH.to_owned()],
+            item_id: Some(COLLECTION_FOLDER_ID.to_string()),
+            ..VirtualFolderInfo::default()
+        }])
+    }
+    async fn add_virtual_folder(
+        &self,
+        _name: &str,
+        _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+        _options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn rename_virtual_folder(&self, _name: &str, _new: &str) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn add_media_path(&self, _name: &str, _p: &MediaPathInfo) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn update_media_path(&self, _name: &str, _p: &MediaPathInfo) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn remove_media_path(&self, _name: &str, _path: &str) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn update_library_options(
+        &self,
+        _name: &str,
+        _options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+}
+
 /// Assembles an [`AppState`] wired for the success paths.
 fn ok_state(item_id: Uuid) -> AppState {
+    ok_state_with(OkLibrary {
+        item_id,
+        adopted_tree: false,
+    })
+}
+
+/// [`ok_state`] over an explicit library fake.
+fn ok_state_with(library: OkLibrary) -> AppState {
+    let item_id = library.item_id;
     AppState::new(
-        Arc::new(OkLibrary { item_id }),
+        Arc::new(library),
         Arc::new(OkUsers),
         Arc::new(OkUserViews { item_id }),
         Arc::new(FakeUserData),
@@ -1063,6 +1169,56 @@ async fn ancestors_of_root_item_is_empty_array() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert!(json.as_array().is_some_and(std::vec::Vec::is_empty));
+}
+
+/// `GET /Items/{itemId}/Ancestors` on a Jellyfin-scanned tree (the item
+/// parents to a physical folder under the `AggregateFolder`): with a user in
+/// scope — the explicit `userId`, or the authenticated caller, as C#
+/// `RequestHelpers.GetUserId` resolves it — `TranslateParentItem` swaps the
+/// physical folder for the user's view containing it, and the walk continues
+/// up the view's own chain to the `UserRootFolder`.
+#[tokio::test]
+async fn ancestors_translate_physical_root_to_the_users_view() {
+    let item_id = Uuid::from_u128(0x54);
+    let state = ok_state_with(OkLibrary {
+        item_id,
+        adopted_tree: true,
+    })
+    .with_virtual_folders(Arc::new(OneLibrary));
+    let router = create_router(state);
+
+    for uri in [
+        format!("/Items/{item_id}/Ancestors"),
+        format!("/Items/{item_id}/Ancestors?userId={USER_ID}"),
+    ] {
+        let translated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(translated.status(), StatusCode::OK);
+        let translated = json_body(translated).await;
+        let ids: Vec<String> = translated
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["Id"].as_str().unwrap().to_ascii_uppercase())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                COLLECTION_FOLDER_ID.to_string().to_ascii_uppercase(),
+                USER_ROOT_ID.to_string().to_ascii_uppercase(),
+            ],
+            "{uri}: the view, then the user root: {translated}"
+        );
+    }
 }
 
 /// `GET /Items/{itemId}/Ancestors` for a missing item is a `404`.

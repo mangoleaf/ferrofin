@@ -653,6 +653,24 @@ fn append_media_attribute_predicates(
         );
     }
 
+    // Image presence: an `EXISTS` over the item's image rows whose `ImageType`
+    // discriminant is in the requested set (C# `BaseItemRepository.TranslateQuery`:
+    // `e.Images!.Any(w => imgTypes.Contains(w.ImageType))`). The dynamic image
+    // providers sample their collage sources with `ImageTypes = [Primary]`.
+    if !filter.image_types.is_empty() {
+        let discs: Vec<i64> = filter
+            .image_types
+            .iter()
+            .map(|t| i64::from(crate::item_repository::image_type_to_disc(*t)))
+            .collect();
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "BaseItemImageInfos" ii
+                WHERE ii."ItemId" = bi."Id" AND "#,
+        );
+        push_in_list(qb, r#"ii."ImageType""#, &discs);
+        qb.push(")");
+    }
+
     // Owned extras: `ExtraType` discriminants match `extra_type_from_disc`
     // (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo).
     let mut extra_exists = |want: bool, cond: &str| {
@@ -1431,6 +1449,32 @@ mod tests {
             leading_name.matches(r#"bi."Name" ASC"#).count(),
             "no extra Name tiebreaker for a leading Name key: {leading_name}"
         );
+    }
+
+    /// `ImageTypes` is an `EXISTS` over the item's image rows (C#
+    /// `e.Images!.Any(w => imgTypes.Contains(w.ImageType))`), and costs nothing
+    /// when unset — every other query must stay textually untouched.
+    #[test]
+    fn image_types_filter_is_an_exists_over_image_rows() {
+        use ferrofin_model::entities::ImageType;
+        let filtered = build_query(
+            &InternalItemsQuery {
+                image_types: vec![ImageType::Primary, ImageType::Thumb],
+                ..InternalItemsQuery::default()
+            },
+            QueryShape::FullRows,
+        )
+        .into_sql();
+        assert!(
+            filtered.contains(r#"EXISTS (SELECT 1 FROM "BaseItemImageInfos" ii"#),
+            "{filtered}"
+        );
+        assert!(
+            filtered.contains(r#"ii."ImageType" IN (?, ?)"#),
+            "{filtered}"
+        );
+        let plain = build_query(&InternalItemsQuery::default(), QueryShape::FullRows).into_sql();
+        assert!(!plain.contains("BaseItemImageInfos"), "{plain}");
     }
 
     /// The exact `ORDER BY` text for each shape, because the *text* is what

@@ -730,6 +730,10 @@ pub struct LibraryScanner {
     /// Item repository for the post-scan music-enrichment pass (querying the
     /// MusicAlbum/MusicArtist rows + tracks it created). Absent → no music pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
+    /// The `Year` by-name provisioner for the post-scan year pass (one `Year`
+    /// row per distinct scanned `ProductionYear`, so `/Years` lists every
+    /// year without a write on the read path). Absent → no year pass.
+    years: Option<crate::years::YearStore>,
     /// Studio artwork-repository client for the post-scan studio-thumb pass.
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
@@ -792,6 +796,7 @@ impl LibraryScanner {
             musicbrainz: None,
             audiodb: None,
             item_repository: None,
+            years: None,
             studios_client: None,
             metadata_dir: None,
             people: None,
@@ -823,6 +828,15 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_id_derivation(mut self, mode: item_type_lookup::IdDerivation) -> Self {
         self.id_derivation = mode;
+        self
+    }
+
+    /// Attaches the `Year` provisioner so every scan ends by materializing a
+    /// `Year` item per distinct production year (needs
+    /// [`with_items`](Self::with_items) for the distinct-year query).
+    #[must_use]
+    pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
+        self.years = Some(years);
         self
     }
 
@@ -1250,7 +1264,10 @@ impl LibraryScanner {
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
-        self.post_scan_passes(folders).await;
+        // Boxed: the post-scan passes (music, years, studio/library/dynamic
+        // images) run once per scan, and inlining their state kept the scan
+        // future at clippy's `large_futures` ceiling.
+        Box::pin(self.post_scan_passes(folders)).await;
         Ok(planned.len())
     }
 
@@ -1409,6 +1426,12 @@ impl LibraryScanner {
         if let Err(err) = self.enrich_music(&policies).await {
             tracing::warn!(%err, "music enrichment pass failed");
         }
+        // One `Year` item per distinct ProductionYear now in the library
+        // (Jellyfin creates them lazily from `/Years`; doing it here keeps
+        // that read write-free and lists every year on first request).
+        if let Err(err) = self.materialize_years().await {
+            tracing::warn!(%err, "year pass failed");
+        }
         // Studio thumbs from the artwork repository for the by-name Studio
         // rows the item-values step materialized, so the TV Networks /
         // Studios tabs carry artwork.
@@ -1423,6 +1446,45 @@ impl LibraryScanner {
         if let Err(err) = self.refresh_library_images(folders).await {
             tracing::warn!(%err, "library image pass failed");
         }
+        // Genre / music-genre / playlist / photo-album Primaries (upstream's
+        // `BaseDynamicImageProvider` family, run by the by-name validators at
+        // the end of library validation). Same ordering reason as the library
+        // tiles: the collages sample the artwork the passes above produced.
+        if let (Some(items), Some(processor), Some(meta_root)) = (
+            &self.item_repository,
+            &self.image_processor,
+            &self.metadata_dir,
+        ) {
+            let providers = crate::dynamic_images::DynamicImageProviders::new(
+                Arc::clone(items),
+                Arc::clone(&self.persistence),
+                Arc::clone(processor),
+                meta_root.clone(),
+            );
+            if let Err(err) = providers.refresh_all().await {
+                tracing::warn!(%err, "dynamic image pass failed");
+            }
+        }
+    }
+
+    /// The post-scan year pass: reads the distinct `ProductionYear`s across
+    /// the whole library and creates the `Year` rows that are missing. No-op
+    /// unless both the item repository and the year provisioner are wired.
+    async fn materialize_years(&self) -> Result<(), ServiceError> {
+        let (Some(items), Some(years)) = (&self.item_repository, &self.years) else {
+            return Ok(());
+        };
+        let distinct = items
+            .get_distinct_years(&InternalItemsQuery {
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let created = years.ensure_missing(&distinct).await?;
+        if !created.is_empty() {
+            tracing::info!(created = created.len(), "materialized year items");
+        }
+        Ok(())
     }
 
     /// Resolves the folder set a scan covers: all libraries, or — when `only`
@@ -6078,48 +6140,10 @@ fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
     }
 }
 
-/// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`: lowercase the name, apply the
-/// default `SortReplace`/`SortRemove` characters and strip a leading article, then left-pad each
-/// run of digits to 10 so numbers sort naturally (e.g. `Movie 0001 (2020)` →
-/// `movie 0000000001 (0000002020)`).
-fn create_sort_name(name: &str) -> String {
-    let mut s = name.trim().to_lowercase();
-    for c in [',', '&', '-', '{', '}', '\''] {
-        s = s.replace(c, ""); // default SortRemoveCharacters
-    }
-    for c in ['.', '+', '%'] {
-        s = s.replace(c, " "); // default SortReplaceCharacters → space
-    }
-    for article in ["the ", "a ", "an "] {
-        if let Some(rest) = s.strip_prefix(article) {
-            s = rest.to_owned();
-            break;
-        }
-    }
-    modify_sort_chunks(&s)
-}
-
-/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`.
-fn modify_sort_chunks(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut chars = name.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            let mut digits = String::new();
-            while chars.peek().is_some_and(char::is_ascii_digit) {
-                digits.push(chars.next().unwrap());
-            }
-            for _ in digits.len()..10 {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else {
-            out.push(c);
-            chars.next();
-        }
-    }
-    out
-}
+/// Port of C# `BaseItem.CreateSortName` + `ModifySortChunks`; the shared
+/// implementation lives in `ferrofin-util` so the metadata providers (Identify
+/// renames) compute the same sort key as the scanner.
+pub(crate) use ferrofin_util::sort_name::create_sort_name;
 
 /// The final path segment (folder name) of a directory path, if any. Mirrors C#
 /// `Path.GetFileName(ContainingFolderPath)` for naming folder-based movies.

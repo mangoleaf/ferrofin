@@ -269,6 +269,79 @@ pub fn derive_item_id_with(
 /// resolved a different one).
 #[must_use]
 pub fn person_path(people_path: &str, name: &str) -> String {
+    let valid = valid_filename(name);
+    match valid.chars().find(|c| c.is_alphanumeric()) {
+        Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
+        None => format!("{people_path}/{valid}"),
+    }
+}
+
+/// The deterministic by-name `Person` item id for `name` — Jellyfin's
+/// `GetItemByNameId<Person>(Person.GetPath(name))`, one id per name.
+#[must_use]
+pub fn person_item_id(mode: &IdDerivation, people_path: &str, name: &str) -> Option<uuid::Uuid> {
+    derive_item_id_with(mode, BaseItemKind::Person, &person_path(people_path, name))
+}
+
+/// Derives a *by-name* item's id from its metadata path — the port of
+/// `LibraryManager.GetItemByNameId<T>(path)`, which is
+/// `GetNewItemIdInternal(path, typeof(T), forceCaseInsensitive:
+/// EnableNormalizedItemByNameIds)`. That setting defaults to `true`, so unlike
+/// a scanned item's id the key is lowercased *after* the data-dir rewrite
+/// (verified against a 10.11.8 database: `Year` `2026` at
+/// `/config/metadata/Year/2026` hashes `metadata\year\2026`, not
+/// `metadata\Year\2026`). Under [`IdDerivation::LegacyLowercase`] the key is
+/// already lowercase, so both modes agree on the normalization.
+#[must_use]
+pub fn by_name_item_id(mode: &IdDerivation, kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
+    let type_name = stored_type_name(kind)?;
+    let key = match mode {
+        IdDerivation::Jellyfin { program_data_path } => {
+            let rewritten = program_data_path
+                .as_deref()
+                .and_then(|data| path.strip_prefix(data))
+                .map(|rel| rel.trim_start_matches(['/', '\\']).replace('/', "\\"));
+            rewritten.unwrap_or_else(|| path.to_owned()).to_lowercase()
+        }
+        IdDerivation::LegacyLowercase => path.to_lowercase(),
+    };
+    Some(ferrofin_common::extensions::get_md5(&format!(
+        "{type_name}{key}"
+    )))
+}
+
+/// The metadata path identifying a `Year` by-name item — port of
+/// `Year.GetPath(name)`: the filename-sanitized name (invalid path chars →
+/// space, trimmed, trailing periods dropped) directly under the Year metadata
+/// dir (`{metadata}/Year/{name}`; no first-letter subfolder, unlike people).
+#[must_use]
+pub fn year_path(year_root: &str, name: &str) -> String {
+    let valid = valid_filename(name);
+    format!("{year_root}/{valid}")
+}
+
+/// The deterministic by-name `Year` item id for `name` (the production year
+/// as a string) — Jellyfin's `GetItemByNameId<Year>(Year.GetPath(name))`.
+#[must_use]
+pub fn year_item_id(mode: &IdDerivation, year_root: &str, name: &str) -> Option<uuid::Uuid> {
+    by_name_item_id(mode, BaseItemKind::Year, &year_path(year_root, name))
+}
+
+/// The `UserRootFolder` item id for the default user-views directory —
+/// `GetNewItemId(DefaultUserViewsPath, typeof(UserRootFolder))`, the one row
+/// `Items/Root` resolves to (case-sensitive, like every scanned folder; an
+/// adopted 10.11.8 database already carries exactly this id).
+#[must_use]
+pub fn user_root_folder_id(
+    mode: &IdDerivation,
+    default_user_views_path: &str,
+) -> Option<uuid::Uuid> {
+    derive_item_id_with(mode, BaseItemKind::UserRootFolder, default_user_views_path)
+}
+
+/// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
+/// single path segment every by-name `GetPath` builds from an item name.
+fn valid_filename(name: &str) -> String {
     // `ManagedFileSystem._invalidPathCharacters`, verbatim.
     const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
     let sanitized: String = name
@@ -281,18 +354,7 @@ pub fn person_path(people_path: &str, name: &str) -> String {
             }
         })
         .collect();
-    let valid = sanitized.trim().trim_end_matches('.');
-    match valid.chars().find(|c| c.is_alphanumeric()) {
-        Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
-        None => format!("{people_path}/{valid}"),
-    }
-}
-
-/// The deterministic by-name `Person` item id for `name` — Jellyfin's
-/// `GetItemByNameId<Person>(Person.GetPath(name))`, one id per name.
-#[must_use]
-pub fn person_item_id(mode: &IdDerivation, people_path: &str, name: &str) -> Option<uuid::Uuid> {
-    derive_item_id_with(mode, BaseItemKind::Person, &person_path(people_path, name))
+    sanitized.trim().trim_end_matches('.').to_owned()
 }
 
 /// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for
@@ -455,6 +517,41 @@ mod tests {
             ),
             Some(uuid::Uuid::parse_str("F137A2DD-21BB-C1B9-9AA5-C0F6BF02A805").expect("uuid")),
         );
+    }
+
+    /// Oracle values from the same real 10.11.8 database: the `UserRootFolder`
+    /// row at `/config/root/default` and a `Year` row at
+    /// `/config/metadata/Year/2026` (stored as `%MetadataPath%/Year/2026`).
+    #[test]
+    fn root_and_year_ids_match_a_real_database() {
+        use super::{by_name_item_id, user_root_folder_id, year_item_id, year_path};
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        assert_eq!(
+            user_root_folder_id(&mode, "/config/root/default"),
+            Some(uuid::Uuid::parse_str("E9D5075A-555C-1CBC-394E-EC4CEF295274").expect("uuid")),
+        );
+        assert_eq!(
+            year_path("/config/metadata/Year", "2026"),
+            "/config/metadata/Year/2026"
+        );
+        assert_eq!(
+            year_item_id(&mode, "/config/metadata/Year", "2026"),
+            Some(uuid::Uuid::parse_str("FEF3DB72-E066-FC0B-F454-F305935D09B6").expect("uuid")),
+        );
+        // The by-name key is case-normalized (EnableNormalizedItemByNameIds);
+        // the case-sensitive scanned-item derivation gives a different id.
+        assert_ne!(
+            by_name_item_id(&mode, BaseItemKind::Year, "/config/metadata/Year/2026"),
+            derive_item_id_with(&mode, BaseItemKind::Year, "/config/metadata/Year/2026"),
+        );
+    }
+
+    #[test]
+    fn year_path_sanitizes_like_get_valid_filename() {
+        use super::year_path;
+        assert_eq!(year_path("/m/Year", " 19:99. "), "/m/Year/19 99");
     }
 
     #[test]
