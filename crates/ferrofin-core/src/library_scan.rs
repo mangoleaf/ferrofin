@@ -3986,6 +3986,17 @@ impl LibraryScanner {
     ) -> Option<(Uuid, BaseItemEntity)> {
         let id = item_type_lookup::derive_item_id_with(&self.id_derivation, kind, path)?;
         let sort_name = create_sort_name(&name);
+        // One stat per file feeds both dates (a second `getattr` round-trip
+        // per item adds up on an NFS-backed library); `std::fs::metadata`
+        // follows symlinks, matching upstream's `LinkTarget` resolution. A
+        // path that cannot be stat'ed at all is stamped with the scan time
+        // (upstream's `dateCreated == MinValue` guard). A folder is never
+        // stat'ed for its dates at all (see below).
+        let times = if is_folder {
+            None
+        } else {
+            std::fs::metadata(path).ok().map(|m| FileTimes::of(&m))
+        };
         let entity = BaseItemEntity {
             id: guid_to_db(id),
             type_: item_type_lookup::stored_type_name(kind)
@@ -3997,10 +4008,23 @@ impl LibraryScanner {
             parent_id: Some(guid_to_db(parent)),
             top_parent_id: Some(guid_to_db(cf)),
             is_folder,
-            // "Date Added" is the FILE's creation time (upstream sets
-            // `DateCreated = info.CreationTimeUtc` at resolve): scan wall-clock
-            // made a first scan order the whole library by directory traversal.
-            date_created: Some(file_date_created(path)),
+            // Port of `ResolverHelper.SetDateCreated` (+ `EnsureDates`): with
+            // `UseFileCreationTimeForDateAdded` (the default) a FILE's "Date
+            // Added" is its creation time and `DateModified` its mtime — scan
+            // wall-clock would order a first scan by directory traversal. A
+            // DIRECTORY is different: `ManagedFileSystem.GetFileSystemMetadata`
+            // only fills `CreationTimeUtc`/`LastWriteTimeUtc` for a `FileInfo`,
+            // so every folder item (Series, Season, MusicAlbum, PhotoAlbum, a
+            // disc-rip Movie whose path is the directory) resolves with
+            // `MinValue` dates → `DateCreated = DateTime.UtcNow` at FIRST
+            // resolve and `DateModified` unset (stored NULL). The scan upsert's
+            // `coalesce("DateCreated", excluded."DateCreated")` is what keeps
+            // that first-resolve stamp stable across rescans.
+            date_created: Some(match &times {
+                Some(times) => creation_time_from(times).into(),
+                None => Utc::now(),
+            }),
+            date_modified: times.map(|t| t.mtime.into()),
             ..BaseItemEntity::default()
         };
         Some((id, entity))
@@ -5358,13 +5382,56 @@ fn owner_for_extra(
     }
 }
 
-/// The file's creation time (falling back to modification time, then to now)
-/// — what "Date Added" sorts by, as upstream's resolvers stamp it.
-fn file_date_created(path: &str) -> chrono::DateTime<Utc> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
-        .map_or_else(Utc::now, chrono::DateTime::<Utc>::from)
+/// The three stat timestamps the creation-time rule reads.
+#[derive(Debug, Clone, Copy)]
+struct FileTimes {
+    /// The statx birth time, when the filesystem reports one.
+    birth: Option<std::time::SystemTime>,
+    /// The inode change time (`st_ctime`).
+    ctime: std::time::SystemTime,
+    /// The content modification time (`st_mtime`).
+    mtime: std::time::SystemTime,
+}
+
+impl FileTimes {
+    /// Reads the timestamps off a stat result. `Metadata::created()` is
+    /// `ErrorKind::Unsupported` exactly when statx reports no `STATX_BTIME` —
+    /// the same condition as .NET's `HasBirthTime`.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        Self {
+            birth: meta.created().ok(),
+            ctime: ctime_of(meta).unwrap_or(mtime),
+            mtime,
+        }
+    }
+}
+
+/// `st_ctime` as a [`SystemTime`](std::time::SystemTime) (Unix only; other
+/// targets have no change time and fall back to the mtime).
+#[cfg(unix)]
+fn ctime_of(meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    use std::os::unix::fs::MetadataExt as _;
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    let nanos = u32::try_from(meta.ctime_nsec()).ok()?;
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos))
+}
+
+#[cfg(not(unix))]
+fn ctime_of(_meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// .NET's `FileSystemInfo.CreationTimeUtc` on Unix (`FileStatus.Unix.cs`
+/// `GetCreationTime`): the statx birth time when the filesystem has one,
+/// otherwise "the oldest time we have in between change and modify time" —
+/// the older of `ctime` and `mtime`. Ported for fidelity rather than effect:
+/// `min(ctime, mtime)` only differs from the mtime alone when the mtime lies
+/// in the future of the inode change (clock skew, a future-dated copy) — a
+/// `cp -p`/rsync-preserved file still dates by its preserved mtime, exactly
+/// as it does on Jellyfin.
+fn creation_time_from(times: &FileTimes) -> std::time::SystemTime {
+    times.birth.unwrap_or_else(|| times.ctime.min(times.mtime))
 }
 
 /// The file name without its extension — a lightweight display name until real
@@ -5474,6 +5541,18 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     }
     if entity.end_date.is_none() {
         entity.end_date = n.end_date;
+    }
+    // `<dateadded>` overrides the resolver's stamp (`BaseNfoParser`:
+    // `item.DateCreated = dateCreated`, and `MetadataService.MergeData` copies
+    // a non-MinValue `DateCreated` from the provider result onto the item).
+    // Accepted divergence: this lands on FIRST import only — the scan upsert
+    // (`item_persistence_service::scan_upsert_sql`) coalesces `DateCreated`,
+    // so a `<dateadded>` added or edited later is not re-applied on rescan or
+    // refresh, where upstream's `MergeData` re-stamps it on every refresh.
+    // Letting an NFO-sourced `DateCreated` win that coalesce is the
+    // persistence-side follow-up.
+    if n.date_created.is_some() {
+        entity.date_created = n.date_created;
     }
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
@@ -6270,6 +6349,9 @@ mod tests {
     use super::LibraryScanner;
     use crate::file_system::FerrofinFileSystem;
     use crate::item_persistence_service::FerrofinItemPersistenceService;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
 
     // date_modified must be the file's mtime (stable across rescans), never the
     // scan time: it feeds ImageTags and the resize-cache key, so a churning value
@@ -6293,6 +6375,210 @@ mod tests {
         let missing = super::file_date_modified(&dir.join("nope.jpg"));
         assert!((chrono::Utc::now() - missing).num_seconds().abs() < 60);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// .NET `GetCreationTime` on Unix: the birth time wins; without one the
+    /// OLDER of ctime and mtime (not the mtime alone).
+    #[rstest::rstest]
+    #[case(Some(10), 20, 30, 10)]
+    #[case(Some(40), 20, 30, 40)]
+    #[case(None, 20, 30, 20)]
+    #[case(None, 30, 20, 20)]
+    #[case(None, 25, 25, 25)]
+    fn creation_time_is_birth_time_or_oldest_of_ctime_mtime(
+        #[case] birth: Option<u64>,
+        #[case] ctime: u64,
+        #[case] mtime: u64,
+        #[case] expected: u64,
+    ) {
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let times = super::FileTimes {
+            birth: birth.map(at),
+            ctime: at(ctime),
+            mtime: at(mtime),
+        };
+        assert_eq!(super::creation_time_from(&times), at(expected));
+    }
+
+    /// On a real file the stat rule agrees with the filesystem: the statx
+    /// birth time when there is one, else the older of ctime/mtime.
+    #[test]
+    fn file_times_read_the_birth_time_when_the_filesystem_has_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("movie.mkv");
+        std::fs::write(&file, b"x").expect("write");
+        let meta = std::fs::metadata(&file).expect("stat");
+        let times = super::FileTimes::of(&meta);
+        let expected = meta
+            .created()
+            .ok()
+            .unwrap_or_else(|| times.ctime.min(times.mtime));
+        assert_eq!(super::creation_time_from(&times), expected);
+    }
+
+    /// `ResolverHelper.SetDateCreated` + the `ManagedFileSystem` directory
+    /// quirk: a FILE row carries its creation time and mtime; a FOLDER row is
+    /// stamped with the resolve time and no `DateModified` (upstream only
+    /// fills the dates for a `FileInfo`, so directories resolve with
+    /// `MinValue` → `UtcNow`).
+    #[tokio::test]
+    async fn base_item_stamps_folders_with_now_and_files_with_file_times() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let series_dir = dir.path().join("Series 01");
+        std::fs::create_dir(&series_dir).expect("mkdir");
+        let file = series_dir.join("S01E01.mkv");
+        std::fs::write(&file, b"x").expect("write");
+        // Push the directory's own mtime into the past so "now" is
+        // distinguishable from the directory's timestamps. On a filesystem
+        // with birth times the just-created directory's btime is also "now",
+        // so the `created > past` check only bites the old behaviour on
+        // btime-less filesystems; the `date_modified == None` assertion is
+        // the discriminating one everywhere.
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&series_dir)
+            .expect("open dir")
+            .set_modified(past)
+            .expect("set dir mtime");
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(dir.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let cf = uuid::Uuid::from_u128(0x7100);
+
+        let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let (_, folder) = scanner
+            .base_item(
+                BaseItemKind::Series,
+                cf,
+                cf,
+                "Series 01".into(),
+                &series_dir.to_string_lossy(),
+                true,
+            )
+            .expect("series row");
+        let created = folder.date_created.expect("folders are stamped");
+        assert!(
+            created >= before,
+            "a folder is stamped with the resolve time"
+        );
+        assert!(
+            created > chrono::DateTime::<chrono::Utc>::from(past),
+            "not the directory's own timestamp"
+        );
+        assert_eq!(folder.date_modified, None, "a folder has no DateModified");
+
+        let (_, episode) = scanner
+            .base_item(
+                BaseItemKind::Episode,
+                cf,
+                cf,
+                "S01E01".into(),
+                &file.to_string_lossy(),
+                false,
+            )
+            .expect("episode row");
+        let meta = std::fs::metadata(&file).expect("stat");
+        assert_eq!(
+            episode.date_created,
+            Some(chrono::DateTime::<chrono::Utc>::from(
+                super::creation_time_from(&super::FileTimes::of(&meta))
+            )),
+            "a file's DateCreated is its creation time"
+        );
+        assert_eq!(
+            episode.date_modified,
+            Some(chrono::DateTime::<chrono::Utc>::from(
+                meta.modified().expect("mtime")
+            )),
+            "a file's DateModified is its mtime"
+        );
+
+        // A path that cannot be stat'ed is stamped with the scan time —
+        // upstream's `MinValue → UtcNow` guard.
+        let (_, ghost) = scanner
+            .base_item(
+                BaseItemKind::Movie,
+                cf,
+                cf,
+                "Ghost".into(),
+                &dir.path().join("nope.mkv").to_string_lossy(),
+                false,
+            )
+            .expect("ghost row");
+        let created = ghost.date_created.expect("stamped");
+        assert!((chrono::Utc::now() - created).num_seconds().abs() < 60);
+        assert_eq!(ghost.date_modified, None);
+    }
+
+    /// A folder's first-resolve stamp survives a rescan: the scan upsert
+    /// coalesces `DateCreated`, so the `now` of a later scan never replaces
+    /// the `now` of the first (what makes the folder's "Date Added" stable).
+    #[tokio::test]
+    async fn rescan_preserves_folder_date_created() {
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        let id = uuid::Uuid::from_u128(0x7200);
+        let first = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut series = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Series)
+                .unwrap()
+                .to_owned(),
+            name: Some("Series 01".into()),
+            is_folder: true,
+            date_created: Some(first),
+            ..Default::default()
+        };
+        persistence
+            .save_scanned_items(std::slice::from_ref(&series))
+            .await
+            .expect("first scan");
+        series.date_created = Some(chrono::Utc::now());
+        persistence
+            .save_scanned_items(std::slice::from_ref(&series))
+            .await
+            .expect("rescan");
+        let stored = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(stored.date_created, Some(first));
+    }
+
+    /// An NFO `<dateadded>` overrides the resolver's stamp (`BaseNfoParser`
+    /// sets `item.DateCreated`; `MergeData` copies a non-MinValue value).
+    #[test]
+    fn apply_nfo_applies_dateadded_as_date_created() {
+        let resolver_stamp = chrono::Utc::now();
+        let added = chrono::DateTime::parse_from_rfc3339("2020-05-06T07:08:09Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut entity = BaseItemEntity {
+            date_created: Some(resolver_stamp),
+            ..Default::default()
+        };
+        let nfo = ferrofin_providers::xbmc::item::NfoBaseItem {
+            date_created: Some(added),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut entity, &nfo);
+        assert_eq!(entity.date_created, Some(added));
+
+        // No `<dateadded>` leaves the resolver's stamp alone.
+        let mut entity = BaseItemEntity {
+            date_created: Some(resolver_stamp),
+            ..Default::default()
+        };
+        super::apply_nfo(
+            &mut entity,
+            &ferrofin_providers::xbmc::item::NfoBaseItem::default(),
+        );
+        assert_eq!(entity.date_created, Some(resolver_stamp));
     }
 
     // Port of C# CreateSortName: lowercase, strip a leading article, zero-pad digit runs to 10.
