@@ -92,6 +92,25 @@ READS = [
     user("GET /Persons/{name}", "/Persons/{person}?userId={u}"),
     user("GET /Shows/{seriesId}/Seasons", "/Shows/{series}/Seasons?userId={u}"),
     user("GET /Shows/{seriesId}/Episodes", "/Shows/{series}/Episodes?userId={u}"),
+    # by-name music (needs the music fixture: tagged tracks → identical artists/genres on
+    # both); {artist}/{musicgenre} are URL-encoded names, {artist_id} is per-server.
+    user("GET /Artists", "/Artists?userId={u}"),
+    user("GET /Artists/AlbumArtists", "/Artists/AlbumArtists?userId={u}"),
+    user("GET /Artists/{name}", "/Artists/{artist}?userId={u}"),
+    user("GET /MusicGenres", "/MusicGenres?userId={u}"),
+    user("GET /MusicGenres/{genreName}", "/MusicGenres/{musicgenre}?userId={u}"),
+    # Instant mixes are shuffled: the diff aligns by Name, so the SET of tracks is what is
+    # compared (with the whole fixture under `limit`, both sides hold every track).
+    user("GET /Artists/InstantMix", "/Artists/InstantMix?id={artist_id}&userId={u}&limit=100"),
+    user("GET /MusicGenres/InstantMix", "/MusicGenres/InstantMix?name={musicgenre}&userId={u}&limit=100"),
+    # Live TV (needs the tuner fixture): channels are keyed by Name across servers; the
+    # airing programmes by Name too (the guide is identical on both).
+    user("GET /LiveTv/Channels", "/LiveTv/Channels?userId={u}"),
+    user("GET /LiveTv/Channels/{channelId}", "/LiveTv/Channels/{channel}?userId={u}"),
+    user("GET /LiveTv/Programs", "/LiveTv/Programs?channelIds={channel}&isAiring=true&userId={u}"),
+    user("GET /LiveTv/Programs/Recommended", "/LiveTv/Programs/Recommended?userId={u}&isAiring=true&limit=5"),
+    user("GET /LiveTv/Info", "/LiveTv/Info"),
+    user("GET /LiveTv/TunerHosts/Types", "/LiveTv/TunerHosts/Types"),
     # resolvable-path-param GETs the breadth sweep couldn't fill (needs a real id).
     user("GET /ScheduledTasks/{taskId}", "/ScheduledTasks/{task}"),
     user("GET /DisplayPreferences/{displayPreferencesId}",
@@ -128,9 +147,14 @@ def correlate(hmap, jmap):
 def resolve_named(base, token, user_id):
     """Per-server context for the by-name/shows endpoints. Names are URL-encoded (shared across
     servers via the same NFO); the series id is per-server (same title on both)."""
+    def first_named(path):
+        """The first item of a by-name listing, by SortName so both servers pick the same one."""
+        items = (get_json(base, f"{path}?userId={user_id}&limit=1&sortBy=SortName", token)
+                 or {}).get("Items") or []
+        return items[0] if items else {}
+
     def first_name(path):
-        items = (get_json(base, f"{path}?userId={user_id}&limit=1", token) or {}).get("Items") or []
-        return urllib.parse.quote(items[0]["Name"]) if items and items[0].get("Name") else ""
+        return urllib.parse.quote(first_named(path).get("Name") or "")
 
     def first_id(kind):
         b = get_json(base, f"/Items?userId={user_id}&recursive=true&includeItemTypes={kind}"
@@ -146,7 +170,10 @@ def resolve_named(base, token, user_id):
         items = (get_json(base, "/Devices", token) or {}).get("Items") or []
         return items[0]["Id"] if items and items[0].get("Id") else ""
 
+    artist = first_named("/Artists")
+    channels = (get_json(base, f"/LiveTv/Channels?userId={user_id}&limit=1", token) or {}).get("Items") or []
     return {
+        "channel": channels[0]["Id"] if channels else "",
         "user": user_id,   # item() reads c["user"]
         "u": user_id,       # user() URL templates use {u}
         "genre": first_name("/Genres"),
@@ -155,6 +182,9 @@ def resolve_named(base, token, user_id):
         "series": first_id("Series"),
         "task": first_task(),
         "device": first_device(),
+        "artist": urllib.parse.quote(artist.get("Name") or ""),
+        "artist_id": artist.get("Id") or "",
+        "musicgenre": first_name("/MusicGenres"),
     }
 
 
@@ -270,7 +300,8 @@ def selfcheck():
     # every {placeholder} in a user() URL must be a key resolve_named() produces (guards the
     # {u} vs "user" KeyError). Format each with a fully-populated context; a KeyError fails here.
     ctx = {"user": "U", "u": "U", "genre": "G", "studio": "S", "person": "P", "series": "SE",
-           "task": "T", "device": "D"}
+           "task": "T", "device": "D", "artist": "A", "artist_id": "AID", "musicgenre": "MG",
+           "channel": "CH"}
     for ep in READS:
         if ep["kind"] == "user":
             ep["url"](ctx)  # raises KeyError if a placeholder has no context key

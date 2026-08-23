@@ -27,32 +27,14 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, authenticate, bring_up, compose, compose_service, ROOT  # noqa: E402
+from sweep import (http, get_json, authenticate, bring_up, compose, compose_service, ROOT,  # noqa: E402
+                   UP_TIMEOUT_S, api_alive as alive, wait_until as wait_for)
 
 DOWN_TIMEOUT_S = 60      # a drain must start within this
-# A restart (Jellyfin replays a DB restore from JSON) must finish within this; the one
-# host-speed-dependent bound, so a slow CI host can raise it without editing code.
-UP_TIMEOUT_S = int(os.environ.get("PARITY_UP_TIMEOUT_S", "300"))
 STAY_DOWN_S = 5          # a shutdown must stay down for this long
-POLL_S = 0.02            # fast enough to catch Ferrofin's sub-second in-process restart gap
 AUTH_RETRY_S = 0.5       # between login attempts while the API finishes coming up
-
-
-def alive(base):
-    """Reachable AND serving the API: while Jellyfin re-boots it answers every route with
-    its HTML "Startup" page, so a bare 200 is not enough — the body must be the JSON."""
-    st, raw = http("GET", base + "/System/Info/Public")
-    return st == 200 and raw.lstrip().startswith(b"{")
-
-
-def wait_for(base, up, timeout_s):
-    """True when the server reaches the wanted liveness within timeout_s."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if alive(base) == up:
-            return True
-        time.sleep(POLL_S)
-    return False
+# UP_TIMEOUT_S (PARITY_UP_TIMEOUT_S), the liveness probe and the poll cadence are sweep.py's —
+# one copy, shared with the plugin-install restart in provisioning.
 
 
 def wait_auth(base):

@@ -132,6 +132,10 @@ def authenticate(base):
 
 
 def provision(base, target, token):
+    # The opt-in OpenSubtitles plugin install restarts Jellyfin: it must happen BEFORE the
+    # libraries are added, or the initial scan (which has no startup trigger to resume it)
+    # is cut short and Jellyfin settles on a partial library.
+    provision_opensubtitles(base, target, token)
     # Send BOTH servers the realistic jellyfin-web body shape: TypeOptions entries that OMIT
     # ImageOptions (and other arrays). This disables remote fetchers for fairness AND exercises the
     # exact deserialization path real clients use — a server missing serde container defaults 422s
@@ -139,7 +143,8 @@ def provision(base, target, token):
     no_remote = {"LibraryOptions": {"EnableRealtimeMonitor": False, "SaveLocalMetadata": False,
         "TypeOptions": [{"Type": t, "MetadataFetchers": [], "MetadataFetcherOrder": [],
                          "ImageFetchers": [], "ImageFetcherOrder": []}
-                        for t in ("Movie", "Series", "Season", "Episode")]}}
+                        for t in ("Movie", "Series", "Season", "Episode",
+                                  "MusicArtist", "MusicAlbum", "Audio")]}}
     for lib in json.loads(os.environ.get("LIBRARIES", "[]")):
         q = (f"name={urllib.parse.quote(lib['name'])}&collectionType={lib['type']}"
              f"&paths={urllib.parse.quote(lib['path'])}")
@@ -152,9 +157,148 @@ def provision(base, target, token):
         http("POST", base + "/Library/Refresh", token, None)
 
 
+# Jellyfin's OpenSubtitles plugin (official repository) and Ferrofin's compiled-in provider.
+OPENSUBTITLES_JELLYFIN_GUID = "4b9ed42f-5185-48b5-9803-6ff2989014c4"
+OPENSUBTITLES_FERROFIN_GUID = "4a3f8e21-6c94-4d17-a2b8-0f5e9c3d7a10"
+
+
+def opensubtitles_credentials():
+    """(username, password, api_key) from the environment, or None — the remote-subtitle
+    ops need a real opensubtitles.com account and the public internet, so they are opt-in:
+    OPENSUBTITLES_USERNAME / OPENSUBTITLES_PASSWORD / OPENSUBTITLES_API_KEY."""
+    u, p, k = (os.environ.get("OPENSUBTITLES_USERNAME"), os.environ.get("OPENSUBTITLES_PASSWORD"),
+               os.environ.get("OPENSUBTITLES_API_KEY"))
+    return (u, p, k) if u and p and k else None
+
+
+# How long a restart (Jellyfin replays plugin/DB work on boot) may take; shared with
+# terminal.py so a slow host raises one knob.
+UP_TIMEOUT_S = int(os.environ.get("PARITY_UP_TIMEOUT_S", "300"))
+
+
+POLL_S = 0.02   # fast enough to catch Ferrofin's sub-second in-process restart gap
+
+
+def api_alive(base):
+    """Reachable AND the real API is up. While Jellyfin re-boots in-process it runs a setup
+    server on the same port that answers /System/Info/Public with JSON — but with
+    StartupWizardCompleted=false — so a bare JSON 200 is not enough; both real servers
+    report true here. (A plain-text 503 "Server is loading" follows for a moment after.)"""
+    st, raw = http("GET", base + "/System/Info/Public")
+    if st != 200 or not raw.lstrip().startswith(b"{"):
+        return False
+    try:
+        return json.loads(raw).get("StartupWizardCompleted") is True
+    except ValueError:
+        return False
+
+
+def wait_until(base, up, timeout_s):
+    """True when the server reaches the wanted liveness within timeout_s."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if api_alive(base) == up:
+            return True
+        time.sleep(POLL_S)
+    return False
+
+
+def wait_bounce(base, down_timeout_s=60):
+    """After a restart request: the server goes unreachable, then reachable again."""
+    return wait_until(base, False, down_timeout_s) and wait_until(base, True, UP_TIMEOUT_S)
+
+
+def post_until_ready(base, path, token, body):
+    """POST, retrying while the server is still coming up (connection refused → 0, or the
+    plain-text 503 "Server is loading"). Returns the final status (0 = never reachable)."""
+    deadline = time.time() + UP_TIMEOUT_S
+    st = 0
+    while time.time() < deadline:
+        st, _ = http("POST", base + path, token, body)
+        if st not in (0, 503):
+            return st
+        time.sleep(2)
+    return st
+
+
+def provision_opensubtitles(base, target, token):
+    """With credentials in the environment: give both servers an OpenSubtitles provider.
+    Ferrofin's is compiled in (configure {ApiKey, Username, Password}); Jellyfin's is the
+    official plugin — installed from its repository, activated by an in-process restart,
+    then configured with {Username, Password} (the plugin ships its own API key, so quota
+    and result differences against Ferrofin's user key are possible)."""
+    creds = opensubtitles_credentials()
+    if not creds:
+        return
+    username, password, api_key = creds
+    if target == "jellyfin":
+        packages = get_json(base, "/Packages", token) or []
+        pkg = next((p for p in packages if p.get("guid", "").lower() == OPENSUBTITLES_JELLYFIN_GUID
+                    or (p.get("name") or "").lower() == "open subtitles"), None)
+        if not pkg:
+            raise SystemExit(f"{base}: the Open Subtitles package is not in the configured repositories")
+        st, raw = http("POST", f"{base}/Packages/Installed/{urllib.parse.quote(pkg['name'])}"
+                               f"?assemblyGuid={OPENSUBTITLES_JELLYFIN_GUID}", token, "")
+        # 0 here is the 30 s client timeout on a slow repository: the server-side install
+        # carries on, the /Packages/Installing poll below covers it, and a plugin that never
+        # lands surfaces as a 404 on the configuration POST — so only a real error status fails.
+        if st >= 300:
+            raise SystemExit(f"{base}: plugin install failed {st}: {raw[:200]!r}")
+        for _ in range(120):   # download + stage
+            if not (get_json(base, "/Packages/Installing", token) or []):
+                break
+            time.sleep(2)
+        http("POST", base + "/System/Restart", token, "")
+        if not wait_bounce(base):
+            raise SystemExit(f"{base}: did not bounce after the plugin-activating restart")
+        st = post_until_ready(base, f"/Plugins/{OPENSUBTITLES_JELLYFIN_GUID}/Configuration", token,
+                              json.dumps({"Username": username, "Password": password}))
+    else:
+        st = post_until_ready(base, f"/Plugins/{OPENSUBTITLES_FERROFIN_GUID}/Configuration", token,
+                              json.dumps({"Username": username, "Password": password, "ApiKey": api_key}))
+    if st == 0 or st >= 300:
+        raise SystemExit(f"{target}: opensubtitles configuration failed (status {st})")
+
+
+def provision_livetv(base, token):
+    """The Live TV fixture: one M3U tuner host + one XMLTV listings provider (both read
+    from the shared mount), then the guide refresh task, waited on until channels and
+    programmes are listed. No-op when the fixture is off (LIVETV_M3U unset)."""
+    m3u, xmltv = os.environ.get("LIVETV_M3U"), os.environ.get("LIVETV_XMLTV")
+    if not m3u or not xmltv:
+        return
+    st, raw = http("POST", base + "/LiveTv/TunerHosts", token,
+                   json.dumps({"Type": "m3u", "Url": m3u, "FriendlyName": "Parity tuner",
+                               "ImportFavoritesOnly": False, "AllowHWTranscoding": False}))
+    if st >= 300:
+        raise SystemExit(f"{base}: add tuner host failed {st}: {raw[:200]!r}")
+    st, raw = http("POST", base + "/LiveTv/ListingProviders?validateListings=false", token,
+                   json.dumps({"Type": "xmltv", "Path": xmltv, "EnableAllTuners": True}))
+    if st >= 300:
+        raise SystemExit(f"{base}: add listings provider failed {st}: {raw[:200]!r}")
+    tasks = get_json(base, "/ScheduledTasks", token) or []
+    guide = next((t for t in tasks if t.get("Key") == "RefreshGuide"), None)
+    if guide:
+        http("POST", f"{base}/ScheduledTasks/Running/{guide['Id']}", token, "")
+    for _ in range(120):
+        channels = get_json(base, f"/LiveTv/Channels?userId={CTX_USER[base]}", token) or {}
+        ids = [c["Id"] for c in channels.get("Items") or []]
+        if ids:
+            programs = get_json(base, f"/LiveTv/Programs?channelIds={ids[0]}&isAiring=true"
+                                      f"&userId={CTX_USER[base]}", token) or {}
+            if programs.get("Items"):
+                return
+        time.sleep(5)
+    raise SystemExit(f"{base}: live tv channels/programmes never appeared")
+
+
 def wait_for_scan(base, token):
+    """Until the library scan has settled: the Movie+Episode count is stable for 40 s and
+    non-zero. Counted by type on purpose — Live TV channels and music tracks are items too,
+    and a couple of them appearing first must not read as "the scan is done"."""
     def count():
-        b = get_json(base, "/Items?userId=%s&recursive=true&limit=0" % CTX_USER[base], token)
+        b = get_json(base, "/Items?userId=%s&recursive=true&includeItemTypes=Movie,Episode&limit=0"
+                     % CTX_USER[base], token)
         return b.get("TotalRecordCount", 0) if b else -1
     last, stable = -1, 0
     for _ in range(480):
@@ -185,6 +329,9 @@ def bring_up(base, target):
     CTX_USER[base] = user
     provision(base, target, token)
     wait_for_scan(base, token)
+    # After the scan: the tuner/guide refresh must not compete with it, and its channel
+    # items must not be mistaken for scan progress.
+    provision_livetv(base, token)
     return token, user
 
 # ---------------------------------------------------------------- fixtures + request generation
@@ -200,6 +347,7 @@ def resolve_fixtures(base, token, user):
     series = first("Series")
     season = first("Season")
     episode = first("Episode")
+    audio = first("Audio")
     any_item = movie or series or episode
     genres = get_json(base, f"/Genres?userId={user}&limit=1", token) or {}
     genre = (genres.get("Items") or [{}])[0].get("Name") or "Action"
@@ -218,8 +366,20 @@ def resolve_fixtures(base, token, user):
         "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
         "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",
         "routeStartPositionTicks": "0", "streamId": "0", "logName": log_name,
+        # Not a path param: the first track, so the /Audio/* ops probe a real audio item
+        # (see `audio_fixtures`).
+        "_audio": audio,
     }
     return {k: v for k, v in fx.items() if v is not None}
+
+
+def audio_fixtures(fixtures):
+    """The fixtures with the item/source ids swapped for the first audio track — what the
+    /Audio/* ops are about. Unchanged when the fixture has no music library."""
+    audio = fixtures.get("_audio")
+    if not audio:
+        return fixtures
+    return {**fixtures, "itemId": audio, "mediaSourceId": audio}
 
 
 # REQUIRED query params the breadth sweep can fill from the shared fixture — the query-side
@@ -339,11 +499,13 @@ def sweep(ferrofin_url, jellyfin_url):
                 results[opkey] = {"status_conformant": None, "schema_valid": None,
                                   "note": "write: deferred to Layer-2 journey"}
                 continue
-            hurl, skip = build_url(path, fixtures)   # per-server ids: Ferrofin's on Ferrofin
+            fx_h = audio_fixtures(fixtures) if path.startswith("/Audio/") else fixtures
+            fx_j = audio_fixtures(fixtures_j) if path.startswith("/Audio/") else fixtures_j
+            hurl, skip = build_url(path, fx_h)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
                 continue
-            hs, hraw = http(method, ferrofin_url + with_user_query(hurl, op, params, hu, fixtures), ht)
+            hs, hraw = http(method, ferrofin_url + with_user_query(hurl, op, params, hu, fx_h), ht)
             # schema_valid: Ferrofin 2xx JSON vs response schema (needs no oracle)
             sv = None
             sch = response_schema(op)
@@ -353,11 +515,11 @@ def sweep(ferrofin_url, jellyfin_url):
                 except ValueError:
                     sv = False
             if jellyfin_url:
-                jurl, jskip = build_url(path, fixtures_j)   # Jellyfin's own ids on Jellyfin
+                jurl, jskip = build_url(path, fx_j)   # Jellyfin's own ids on Jellyfin
                 if jskip:
                     results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs} J=n/a"}
                     continue
-                js, jraw = http(method, jellyfin_url + with_user_query(jurl, op, params, ju, fixtures_j), jt)
+                js, jraw = http(method, jellyfin_url + with_user_query(jurl, op, params, ju, fx_j), jt)
                 row = {"status_conformant": (hs // 100) == (js // 100),
                        "schema_valid": sv, "note": f"H={hs} J={js}"}
                 # Layer-2 deep diff over the whole GET surface: when BOTH return 200 JSON, diff the
@@ -425,6 +587,9 @@ def selfcheck():
                          {"name": "deviceProfileId", "in": "query", "required": True}]}
     url = with_user_query("/Videos/abc/master.m3u8", op, {"itemId"}, "u1", {"mediaSourceId": "abc"})
     assert url == "/Videos/abc/master.m3u8?mediaSourceId=abc&static=true", url
+    # the /Audio/* ops swap in the first track; no music library → unchanged.
+    assert audio_fixtures({"itemId": "m", "_audio": "a"})["itemId"] == "a"
+    assert audio_fixtures({"itemId": "m"})["itemId"] == "m"
     # status-class comparison is by hundreds bucket.
     assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
     print("ok: nullable, $ref, param-fill, skip, query-inject, required-fill, status-class")

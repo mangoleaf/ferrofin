@@ -55,6 +55,18 @@ services:
       - jellyfin-config:/config
       - jellyfin-cache:/cache
 
+  # The Live TV fixture's "broadcast": an endless, real-time-paced MPEG-TS over HTTP on
+  # the compose network (http://livetv-source:8000/live.ts), so both servers' M3U tuners
+  # see a real network source that never ends (see livetv-source.py). Started by the
+  # PARITY leg only — `docker compose up -d ferrofin jellyfin` (the perf leg) never does.
+  livetv-source:
+    image: python:3-alpine
+    # loop.ts is the 60 s clip gen-fixtures.sh writes: the length paces the broadcast.
+    command: ["python", "/srv/livetv-source.py", "/media/synth/livetv/loop.ts", "60", "8000"]
+    volumes:
+      - ./livetv-source.py:/srv/livetv-source.py:ro
+      - ./fixtures/media:/media/synth:ro
+
 # Named volumes so `docker compose down -v` gives each run a clean DB.
 volumes:
   ferrofin-data:
