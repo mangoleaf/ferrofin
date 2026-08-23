@@ -371,6 +371,16 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     ferrofin_core::item_data::reconcile_container_data(&db)
         .await
         .context("failed to reconcile playlist/collection Data JSON")?;
+    // Rows written before the persistence service derived `SortName` still
+    // carry NULL, which makes them unsortable AND unreachable by the A-Z
+    // `nameStartsWith` filter. A no-op once repaired, and on an adopted
+    // Jellyfin database (which already populates the column).
+    let repaired = ferrofin_core::item_persistence_service::backfill_missing_sort_names(&db)
+        .await
+        .context("failed to backfill missing sort names")?;
+    if repaired > 0 {
+        tracing::info!(items = repaired, "backfilled missing sort names");
+    }
     tracing::info!(database = %config.database_path().display(), "database ready");
     spawn_pool_sampler(&db);
     Ok(db)

@@ -29,7 +29,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::ItemPersistenceService;
 
 use crate::item_type_lookup::{self, IdDerivation};
-use crate::resolvers::sort_name as create_sort_name;
+use ferrofin_util::sort_name::create_sort_name;
 
 /// The display name Jellyfin gives the user root folder.
 pub const USER_ROOT_FOLDER_NAME: &str = "Media Folders";

@@ -2110,14 +2110,18 @@ mod tests {
         assert_eq!(names(&for_user), vec!["Unplayed".to_owned()]);
 
         // Without a user there is no watch state to filter on (C# skips the
-        // predicate when `User` is null).
+        // predicate when `User` is null). Both share the seed's one genre, so
+        // the similarity scores tie and the sort name breaks it — alphabetical,
+        // as upstream, where `BaseItem.SortName` is never null. This assertion
+        // read `["Unplayed", "Played"]` while the column was NULL for both and
+        // the tie fell through to insertion order.
         let anonymous = mgr
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
             .expect("similar");
         assert_eq!(
             names(&anonymous),
-            vec!["Unplayed".to_owned(), "Played".to_owned()]
+            vec!["Played".to_owned(), "Unplayed".to_owned()]
         );
     }
 

@@ -1315,7 +1315,11 @@ impl FerrofinDtoService {
                 .sort_name
                 .clone()
                 .filter(|s| !s.is_empty())
-                .or_else(|| item.name.as_deref().map(crate::resolvers::sort_name));
+                .or_else(|| {
+                    item.name
+                        .as_deref()
+                        .map(ferrofin_util::sort_name::create_sort_name)
+                });
         }
         if options.contains_field(ItemFields::CustomRating) {
             dto.custom_rating = item.custom_rating.clone();

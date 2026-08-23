@@ -196,6 +196,7 @@ impl FerrofinVirtualFolderManager {
                 .unwrap_or_default()
                 .to_owned(),
             name: Some(name.to_owned()),
+            sort_name: Some(ferrofin_util::sort_name::create_sort_name(name)),
             path: Some(folder_path.to_string_lossy().into_owned()),
             parent_id: Some(guid_to_db(root_id)),
             is_folder: true,

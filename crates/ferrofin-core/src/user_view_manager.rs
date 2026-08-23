@@ -29,7 +29,7 @@ use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, LatestItemsQuery}
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
-use crate::resolvers::sort_name as create_sort_name;
+use ferrofin_util::sort_name::create_sort_name;
 
 /// How many latest items to return per view by default (C#
 /// `GetLatestItems` uses the request's `Limit`, defaulting to 20 when unset).

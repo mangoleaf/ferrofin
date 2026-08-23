@@ -119,15 +119,20 @@ async fn insert_named_item(
     let type_name = stored_type_name(kind)
         .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))?;
     sqlx::query(
+        // `SortName` persisted, not derived on read. jellyfin-web's Collections
+        // and Playlists tabs both send `SortBy=SortName`; with the column NULL
+        // they came back in creation order while each DTO still carried a
+        // correctly COMPUTED SortName, which is what made this hard to see.
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
-            "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
-           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4)"#,
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "SortName")
+           VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, 0, ?4, ?5)"#,
     )
     .bind(guid_to_db(id))
     .bind(type_name)
     .bind(i64::from(is_folder))
     .bind(name)
+    .bind(ferrofin_util::sort_name::create_sort_name(name))
     .execute(db.writer())
     .await
     .map_err(db_err)?;
