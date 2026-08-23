@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::by_name::{ByNameItemQuery, project_item_rows};
+use crate::handlers::by_name::{ByNameItemQuery, additional_dto_options, project_item_rows};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -71,6 +71,23 @@ struct PersonsQuery {
     /// Comma-delimited person types to exclude.
     #[serde(default)]
     exclude_person_types: Option<String>,
+    /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to
+    /// populate on each DTO. Absent/empty ⇒ the base DTO.
+    #[serde(default)]
+    fields: Option<String>,
+    /// Whether image information is populated (C# default `true`).
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// The maximum number of images to return, per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType) set to
+    /// populate. Empty ⇒ every type, as upstream.
+    #[serde(default)]
+    enable_image_types: Option<String>,
+    /// Whether user data is populated.
+    #[serde(default)]
+    enable_user_data: Option<bool>,
 }
 
 /// Splits a comma-delimited query value into trimmed, non-empty items.
@@ -125,7 +142,13 @@ async fn get_persons(
         ..InternalPeopleQuery::default()
     };
     let result = state.library.get_people_items(&people_query).await?;
-    let options = DtoOptions::with_all_fields(false);
+    let options = additional_dto_options(
+        query.fields.as_deref(),
+        query.enable_images,
+        query.enable_user_data,
+        query.image_type_limit,
+        query.enable_image_types.as_deref(),
+    );
     // People carry no aggregated counts (Jellyfin passes none here).
     let projected = project_item_rows(&state, result, &options, Some(&user)).await?;
     Ok(Json(projected))
