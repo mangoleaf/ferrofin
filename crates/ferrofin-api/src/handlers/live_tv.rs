@@ -40,6 +40,8 @@ use ferrofin_model::live_tv::{
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 
+use ferrofin_traits::stubs::LiveTvChannelQuery;
+
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
@@ -81,42 +83,138 @@ async fn get_guide_info(RequireAuth(_auth): RequireAuth) -> Json<GuideInfo> {
     })
 }
 
+/// The query parameters honoured by `GET /LiveTv/Channels`.
+///
+/// One field per `GetLiveTvChannels` parameter in the vendored contract, bound
+/// the same way [`ProgramsQuery`] binds its set (delimited multi-values arrive
+/// raw and are split in the handler).
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+#[allow(clippy::struct_excessive_bools)] // one field per contract parameter
+struct ChannelsQuery {
+    /// Filter by channel type (`TV`/`Radio`).
+    #[serde(rename = "type")]
+    type_: Option<ferrofin_model::live_tv::ChannelType>,
+    /// The target user; defaults to the authenticated caller when absent.
+    user_id: Option<Uuid>,
+    /// The index of the first record to return.
+    start_index: Option<i32>,
+    /// Filter for movie channels.
+    is_movie: Option<bool>,
+    /// Filter for series channels.
+    is_series: Option<bool>,
+    /// Filter for news channels.
+    is_news: Option<bool>,
+    /// Filter for kids' channels.
+    is_kids: Option<bool>,
+    /// Filter for sports channels.
+    is_sports: Option<bool>,
+    /// The maximum number of records to return.
+    limit: Option<i32>,
+    /// Filter by channels the user has (not) favourited.
+    is_favorite: Option<bool>,
+    /// Filter by channels the user has (not) liked.
+    is_liked: Option<bool>,
+    /// Filter by channels the user has (not) disliked.
+    is_disliked: Option<bool>,
+    /// Whether image information is included.
+    enable_images: Option<bool>,
+    /// The maximum number of images returned per image type.
+    image_type_limit: Option<i32>,
+    /// Comma-delimited image types to include.
+    enable_image_types: Option<String>,
+    /// Comma-delimited additional DTO fields.
+    fields: Option<String>,
+    /// Whether user data is included.
+    enable_user_data: Option<bool>,
+    /// Comma-delimited sort columns.
+    sort_by: Option<String>,
+    /// The sort order applied to every sort column.
+    sort_order: Option<SortOrder>,
+    /// Whether favourited/liked channels sort first (contract default `false`).
+    enable_favorite_sorting: Option<bool>,
+    /// Whether each channel carries its current programme (contract default
+    /// `true`).
+    add_current_program: Option<bool>,
+}
+
 /// `GET /LiveTv/Channels` — the user's Live TV channels.
 ///
-/// Port of `LiveTvController.GetLiveTvChannels`, minus its filters: the
-/// contract's `startIndex`/`limit`/`userId`/`is*` parameters are accepted and
-/// ignored, because `LiveTvManager::get_channels` takes only a [`DtoOptions`] —
-/// there is no query on that seam to carry them (unlike
-/// `LiveTvManager::get_programs`, which takes an [`InternalItemsQuery`]).
-/// Honouring them needs the trait signature widened in `ferrofin-traits` +
-/// `ferrofin-livetv`; paging here instead would move filtering into the HTTP
-/// layer and report a total record count the manager never computed. The whole
-/// channel list is returned meanwhile.
+/// Port of `LiveTvController.GetLiveTvChannels`: the whole parameter set binds
+/// into a [`LiveTvChannelQuery`] + [`DtoOptions`] and the manager filters,
+/// sorts, pages and projects (with the current programme attached unless
+/// `addCurrentProgram=false`).
 async fn get_channels(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
+    Query(query): Query<ChannelsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    match state.live_tv.as_ref() {
-        Some(m) => Ok(Json(m.get_channels(&DtoOptions::default()).await?)),
-        None => Ok(Json(QueryResult::default())),
-    }
+    let Some(m) = state.live_tv.as_ref() else {
+        return Ok(Json(QueryResult::default()));
+    };
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    let mut options = program_dto_options(
+        parse_csv_enums_lenient(query.fields.as_deref()),
+        query.enable_images,
+        query.image_type_limit,
+        parse_csv_enums_lenient(query.enable_image_types.as_deref()),
+        query.enable_user_data,
+    );
+    // C# `dtoOptions.AddCurrentProgram = addCurrentProgram` (default true).
+    options.add_current_program = query.add_current_program.unwrap_or(true);
+    let channel_query = LiveTvChannelQuery {
+        channel_type: query.type_,
+        user,
+        start_index: query.start_index,
+        limit: query.limit,
+        is_favorite: query.is_favorite,
+        is_liked: query.is_liked,
+        is_disliked: query.is_disliked,
+        enable_favorite_sorting: query.enable_favorite_sorting.unwrap_or(false),
+        is_movie: query.is_movie,
+        is_series: query.is_series,
+        is_news: query.is_news,
+        is_kids: query.is_kids,
+        is_sports: query.is_sports,
+        sort_by: parse_csv_enums_lenient(query.sort_by.as_deref()),
+        sort_order: query.sort_order,
+        add_current_program: query.add_current_program.unwrap_or(true),
+    };
+    Ok(Json(m.get_channels(&channel_query, &options).await?))
 }
 
 /// `GET /LiveTv/Channels/{channelId}` — a single channel.
 ///
-/// Port of `LiveTvController.GetChannel`. `404` when the channel is unknown.
+/// Port of `LiveTvController.GetChannel`: `new DtoOptions()` means every field
+/// ([`DtoOptions::default`] matches), `userId` falls back to the authenticated
+/// caller. `404` when the channel is unknown.
+///
+/// Accepted divergence: upstream special-cases `Guid.Empty` to return the
+/// user root folder DTO (`channelId.IsEmpty() ? GetUserRootFolder() : …`);
+/// Ferrofin answers the nil id with the same `404` as any unknown channel —
+/// no known client requests a channel by the empty guid.
 async fn get_channel(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(channel_id): Path<Uuid>,
+    Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("channel".into()));
     };
-    m.get_channel(channel_id, &DtoOptions::default())
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    m.get_channel(channel_id, user.as_ref(), &DtoOptions::default())
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("channel".into()))
+}
+
+/// The lone optional `userId` query parameter several `{id}` lookups take.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct UserIdQuery {
+    /// The target user; defaults to the authenticated caller when absent.
+    user_id: Option<Uuid>,
 }
 
 /// The query parameters honoured by `GET /LiveTv/Programs`.
@@ -618,16 +716,20 @@ async fn get_recommended_programs(
 
 /// `GET /LiveTv/Programs/{programId}` — a single programme.
 ///
-/// Port of `LiveTvController.GetProgram`. `404` when the programme is unknown.
+/// Port of `LiveTvController.GetProgram`: `new DtoOptions()` means every field,
+/// `userId` falls back to the authenticated caller. `404` when the programme is
+/// unknown.
 async fn get_program(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(program_id): Path<Uuid>,
+    Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("program".into()));
     };
-    m.get_program(program_id, &DtoOptions::default())
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    m.get_program(program_id, user.as_ref(), &DtoOptions::default())
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("program".into()))
@@ -1261,11 +1363,15 @@ mod tests {
     async fn query_ops_empty_when_no_manager() {
         let state = fake_state();
         assert_eq!(
-            get_channels(State(state.clone()), auth())
-                .await
-                .unwrap()
-                .0
-                .total_record_count,
+            get_channels(
+                State(state.clone()),
+                auth(),
+                Query(ChannelsQuery::default())
+            )
+            .await
+            .unwrap()
+            .0
+            .total_record_count,
             0
         );
         assert_eq!(
@@ -1317,9 +1423,14 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
-        let err = get_channel(State(state), auth(), Path(Uuid::nil()))
-            .await
-            .unwrap_err();
+        let err = get_channel(
+            State(state),
+            auth(),
+            Path(Uuid::nil()),
+            Query(UserIdQuery::default()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -1448,6 +1559,8 @@ mod tests {
         recording_path: Option<String>,
         programs_query: std::sync::Mutex<Option<InternalItemsQuery>>,
         programs_options: std::sync::Mutex<Option<DtoOptions>>,
+        channels_query: std::sync::Mutex<Option<LiveTvChannelQuery>>,
+        channels_options: std::sync::Mutex<Option<DtoOptions>>,
     }
 
     #[async_trait::async_trait]
@@ -1501,13 +1614,17 @@ mod tests {
         }
         async fn get_channels(
             &self,
-            _options: &DtoOptions,
+            query: &LiveTvChannelQuery,
+            options: &DtoOptions,
         ) -> Result<QueryResult<BaseItemDto>, ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            *self.channels_query.lock().unwrap() = Some(query.clone());
+            *self.channels_options.lock().unwrap() = Some(options.clone());
+            Ok(QueryResult::from_items(vec![BaseItemDto::default()]))
         }
         async fn get_channel(
             &self,
             _id: Uuid,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
             _options: &DtoOptions,
         ) -> Result<Option<BaseItemDto>, ferrofin_traits::error::ServiceError> {
             unimplemented!()
@@ -1524,6 +1641,7 @@ mod tests {
         async fn get_program(
             &self,
             _id: Uuid,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
             _options: &DtoOptions,
         ) -> Result<Option<BaseItemDto>, ferrofin_traits::error::ServiceError> {
             unimplemented!()
@@ -1754,6 +1872,76 @@ mod tests {
                 (ItemSortBy::Name, SortOrder::Descending),
             ]
         );
+    }
+
+    /// Binds `uri`'s query string exactly as axum would, runs
+    /// `GET /LiveTv/Channels`, and returns the channel query + options the
+    /// handler handed the manager.
+    async fn recorded_channels_query(uri: &str) -> (LiveTvChannelQuery, DtoOptions) {
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let state = fake_state().with_live_tv(fake.clone());
+        let uri: axum::http::Uri = uri.parse().expect("uri");
+        let query = Query::<ChannelsQuery>::try_from_uri(&uri).expect("query binds");
+        let _ = get_channels(State(state), auth(), query).await.expect("ok");
+        let recorded_query = fake.channels_query.lock().unwrap().clone();
+        let recorded_options = fake.channels_options.lock().unwrap().clone();
+        (
+            recorded_query.expect("the manager was called"),
+            recorded_options.expect("options recorded"),
+        )
+    }
+
+    #[tokio::test]
+    async fn channels_query_carries_every_contract_filter() {
+        // Every tri-state flag gets a different value so a cross-wiring cannot
+        // round-trip clean.
+        let (query, options) = recorded_channels_query(
+            "/LiveTv/Channels?type=Radio&startIndex=3&limit=7\
+             &isMovie=true&isSeries=false&isNews=true&isKids=false&isSports=true\
+             &isFavorite=true&isLiked=false&isDisliked=true\
+             &enableFavoriteSorting=true&addCurrentProgram=false\
+             &sortBy=DateCreated,SortName&sortOrder=Descending\
+             &fields=Overview&enableUserData=false&enableImages=false",
+        )
+        .await;
+
+        assert_eq!(
+            query.channel_type,
+            Some(ferrofin_model::live_tv::ChannelType::Radio)
+        );
+        assert_eq!(query.start_index, Some(3));
+        assert_eq!(query.limit, Some(7));
+        assert_eq!(query.is_movie, Some(true));
+        assert_eq!(query.is_series, Some(false));
+        assert_eq!(query.is_news, Some(true));
+        assert_eq!(query.is_kids, Some(false));
+        assert_eq!(query.is_sports, Some(true));
+        assert_eq!(query.is_favorite, Some(true));
+        assert_eq!(query.is_liked, Some(false));
+        assert_eq!(query.is_disliked, Some(true));
+        assert!(query.enable_favorite_sorting);
+        assert!(!query.add_current_program);
+        assert_eq!(
+            query.sort_by,
+            vec![ItemSortBy::DateCreated, ItemSortBy::SortName]
+        );
+        assert_eq!(query.sort_order, Some(SortOrder::Descending));
+        assert!(options.contains_field(ItemFields::Overview));
+        assert!(!options.enable_user_data);
+        assert!(!options.enable_images);
+        assert!(!options.add_current_program);
+    }
+
+    #[tokio::test]
+    async fn channels_query_defaults_add_the_current_program() {
+        let (query, options) = recorded_channels_query("/LiveTv/Channels").await;
+        assert!(query.add_current_program, "contract default is true");
+        assert!(options.add_current_program);
+        assert!(!query.enable_favorite_sorting, "contract default is false");
+        assert_eq!(query.channel_type, None);
+        assert!(query.sort_by.is_empty());
+        assert!(options.enable_user_data);
+        assert!(options.enable_images);
     }
 
     #[tokio::test]

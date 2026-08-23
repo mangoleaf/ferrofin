@@ -670,6 +670,7 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     }
     async fn get_channels(
         &self,
+        _query: &ferrofin_traits::stubs::LiveTvChannelQuery,
         _options: &ferrofin_traits::options::DtoOptions,
     ) -> Result<QueryResult<ferrofin_model::dto::BaseItemDto>, ServiceError> {
         unreachable!()
@@ -677,6 +678,7 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn get_channel(
         &self,
         _id: Uuid,
+        _user: Option<&ferrofin_db::entities::users::UserEntity>,
         _options: &ferrofin_traits::options::DtoOptions,
     ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
         unreachable!()
@@ -691,6 +693,7 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn get_program(
         &self,
         _id: Uuid,
+        _user: Option<&ferrofin_db::entities::users::UserEntity>,
         _options: &ferrofin_traits::options::DtoOptions,
     ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
         unreachable!()

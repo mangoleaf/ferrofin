@@ -924,6 +924,7 @@ mod tests {
         }
         async fn get_channels(
             &self,
+            _query: &ferrofin_traits::stubs::LiveTvChannelQuery,
             _options: &ferrofin_traits::options::DtoOptions,
         ) -> Result<
             ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
@@ -934,6 +935,7 @@ mod tests {
         async fn get_channel(
             &self,
             _id: Uuid,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
             _options: &ferrofin_traits::options::DtoOptions,
         ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
             Ok(None)
@@ -951,6 +953,7 @@ mod tests {
         async fn get_program(
             &self,
             _id: Uuid,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
             _options: &ferrofin_traits::options::DtoOptions,
         ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
             Ok(None)

@@ -442,12 +442,6 @@ pub async fn build_app_state(
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers),
     );
-    let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> =
-        Arc::new(FerrofinLiveTvManager::new(
-            db.clone(),
-            Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
-            server_id.clone(),
-        ));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
@@ -500,6 +494,20 @@ pub async fn build_app_state(
     let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
         FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
     );
+    // Live TV. Built after `users` (EnabledUsers needs the user manager) and
+    // kept concrete: the DTO service the channel/programme projections need is
+    // built later — it consumes the media-source manager, which consumes this
+    // manager — so `set_dto` closes that cycle below once the DTO service
+    // exists (the C# equivalent is its `Lazy<ILiveTvManager>`).
+    let live_tv_impl = Arc::new(
+        FerrofinLiveTvManager::new(
+            db.clone(),
+            Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
+            server_id.clone(),
+        )
+        .with_users(Arc::clone(&users)),
+    );
+    let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
         Arc::new(FerrofinDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn ferrofin_traits::security::ApiKeyManager> =
@@ -1024,6 +1032,9 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url),
     );
+    // Close the Live TV ↔ media-sources ↔ DTO cycle: the channel/programme
+    // projections run through the same DTO service as every other item.
+    live_tv_impl.set_dto(Arc::clone(&dto));
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because

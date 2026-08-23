@@ -29,7 +29,7 @@ pub use hls_stream::{
     DisabledAttachmentExtractor, DisabledHlsStreamManager, DisabledSubtitleEncoder,
 };
 pub use library_monitor::NoopLibraryMonitor;
-pub use live_tv::LiveTvManager;
+pub use live_tv::{LiveTvChannelQuery, LiveTvManager};
 pub use lyrics::{LyricManager, LyricProvider, LyricResponse, RemoteLyricInfo};
 pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
 pub use virtual_folders::DisabledVirtualFolderManager;

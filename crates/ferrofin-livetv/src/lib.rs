@@ -7,8 +7,10 @@
 
 pub mod error;
 pub mod fetch;
+pub mod guide_repository;
 pub mod m3u;
 pub mod manager;
+pub mod projection;
 pub mod xmltv;
 
 pub use error::LiveTvError;
