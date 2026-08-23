@@ -1514,7 +1514,10 @@ pub async fn build_app_state(
 
     // ---- playback-decision metrics (feeds the benchmark suite) -------------
     let playback_metrics: Arc<dyn ferrofin_traits::metrics::PlaybackMetrics> =
-        Arc::new(ferrofin_core::FerrofinPlaybackMetrics::new(db.clone()));
+        Arc::new(ferrofin_core::FerrofinPlaybackMetrics::with_queue_depth(
+            db.clone(),
+            config.playback_metrics_queue.unwrap_or(0) as usize,
+        ));
 
     // The runtime plugins' URL space (`/Plugins/{id}/web/…`).
     let plugin_routes: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler> = Arc::new(
