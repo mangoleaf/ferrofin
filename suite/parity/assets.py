@@ -90,20 +90,27 @@ def ct_family(ct):
 
 
 # ------------------------------------------------------------- HTTP with raw bytes
-def raw(method, base, path, token):
-    """Returns (status, content_type, body_bytes)."""
+def raw_headers(method, base, path, token, extra=None):
+    """Returns (status, {lowercased header: value}, body_bytes). `extra` adds request headers."""
     import urllib.request
     import urllib.error
     hdr = {"Authorization": f'MediaBrowser Token="{token}", '
            'Client="parity", Device="parity", DeviceId="parity", Version="1.0"'}
+    hdr.update(extra or {})
     req = urllib.request.Request(base + path, method=method, headers=hdr)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, r.headers.get("Content-Type", ""), r.read()
+            return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Content-Type", ""), e.read()
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
     except (urllib.error.URLError, TimeoutError, ConnectionError):
-        return 0, "", b""
+        return 0, {}, b""
+
+
+def raw(method, base, path, token):
+    """Returns (status, content_type, body_bytes)."""
+    st, h, body = raw_headers(method, base, path, token)
+    return st, h.get("content-type", ""), body
 
 
 def post_bytes(base, path, token, body, content_type):
@@ -136,13 +143,16 @@ def resolve(base, token, user_id):
             break
     if not item and b.get("Items"):
         item = b["Items"][0]["Id"]                 # fall back to any item (image likely absent)
+    # The file probes diff sha256, so they need the SAME file on both servers: the first movie
+    # by SortName (same title → same Path), independent of which items carry images.
+    file_item = b["Items"][0]["Id"] if b.get("Items") else ""
 
     def first_name(path):
         items = (get_json(base, f"{path}?userId={user_id}&limit=1", token) or {}).get("Items") or []
         return urllib.parse.quote(items[0]["Name"]) if items and items[0].get("Name") else "Nobody"
 
     return {
-        "user": user_id, "item": item, "tag": tag or "x",
+        "user": user_id, "item": item, "tag": tag or "x", "file_item": file_item,
         "genre": first_name("/Genres"), "studio": first_name("/Studios"),
         "person": first_name("/Persons"), "artist": "Nobody", "musicgenre": "Nobody",
     }
@@ -201,7 +211,41 @@ def read_signatures(base, token, c):
     for op, path in heads:
         st, ct, _ = raw("HEAD", base, path, token)
         out[op] = (st // 100, ct_family(ct) if st == 200 else "")
+    # File-family ops. Both servers serve the SAME hardlinked fixture file, so the bar is the
+    # file's sha256 plus the headers a download client depends on (type, ranges, disposition).
+    fi = c.get("file_item")
+    if fi:
+        out["GET /Items/{itemId}/Download"] = file_sig(base, f"/Items/{fi}/Download", token)
+        out["GET /Items/{itemId}/File"] = file_sig(base, f"/Items/{fi}/File", token, ranged=True)
+    # BitrateTest is opaque bytes whose contract is "at least `size` of them": Jellyfin's
+    # ArrayPool.Rent(1000) hands back a 1024-byte buffer and it ships the whole thing, so an
+    # exact-length bar would flag the oracle's own over-delivery, not a Ferrofin gap.
+    st, h, body = raw_headers("GET", base, "/Playback/BitrateTest?size=1000", token)
+    out["GET /Playback/BitrateTest"] = ((2, ct_family(h.get("content-type")), len(body) >= 1000)
+                                        if st == 200 else (st // 100, ""))
+    # A log file's contents differ per instance by nature: type + non-empty is the contract.
+    logs = get_json(base, "/System/Logs", token) or []
+    name = logs[0]["Name"] if logs and logs[0].get("Name") else "missing.log"
+    st, h, body = raw_headers("GET", base, "/System/Logs/Log?name=" + urllib.parse.quote(name), token)
+    out["GET /System/Logs/Log"] = ((2, (h.get("content-type") or "").split(";")[0].strip(), bool(body))
+                                   if st == 200 else (st // 100, ""))
     return out
+
+
+def file_sig(base, path, token, ranged=False):
+    """Signature of a served file: (2, 'file', sha256, content-type, accept-ranges,
+    content-disposition) — plus the 206 status, Content-Range and sha256 of a 100-byte Range
+    request when `ranged`. Non-200: (status_class, '')."""
+    import hashlib
+    st, h, body = raw_headers("GET", base, path, token)
+    if st != 200:
+        return (st // 100, "")
+    sig = (2, "file", hashlib.sha256(body).hexdigest(), (h.get("content-type") or "").lower(),
+           (h.get("accept-ranges") or "").lower(), h.get("content-disposition") or "")
+    if ranged:
+        rs, rh, rbody = raw_headers("GET", base, path, token, {"Range": "bytes=0-99"})
+        sig += (rs, rh.get("content-range") or "", hashlib.sha256(rbody).hexdigest())
+    return sig
 
 
 def sig_match(h, j):

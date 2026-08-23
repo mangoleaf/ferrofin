@@ -27,7 +27,7 @@ import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, bring_up, ROOT   # reuse HTTP + provisioning
+from sweep import http, get_json, bring_up, ROOT, USER, PASS   # reuse HTTP + provisioning
 
 
 def q(base, path, token, user):
@@ -44,6 +44,40 @@ def user_data(base, token, user, mid):
     return (q(base, f"/Items/{mid}", token, user) or {}).get("UserData", {}) or {}
 
 # ---------------------------------------------------------------- journeys (per server → {op: effect_ok})
+
+def j_startup(base, token, user, _m, _m2):
+    """The first-run wizard endpoints. Setup is complete on both servers by the time journeys
+    run, but the controller's policy is FirstTimeSetupOrElevated — an admin can drive it after
+    setup — so each POST is replayed with exactly the values the harness provisioned and its
+    effect confirmed on the read-back (nothing actually changes). Must run FIRST: Startup/User
+    rewrites "the first user", which is only the admin while no throwaway users exist."""
+    r = {}
+    cfg = {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"}
+    st, _ = http("POST", f"{base}/Startup/Configuration", token, json.dumps(cfg))
+    back = get_json(base, "/Startup/Configuration", token) or {}
+    r["POST /Startup/Configuration"] = st < 300 and all(back.get(k) == v for k, v in cfg.items())
+    # Post-setup the first user already has a password, and the contract is 403 (the Forbid
+    # guard upstream added in v12, which Ferrofin ports). Jellyfin 10.11.8 predates it and
+    # silently re-sets the admin password instead — sending the provisioned credentials keeps
+    # that a no-op. Classified in classifications.json; this asserts the correct contract.
+    # Jellyfin picks `Users.First()` from an unordered dictionary, so the call is only safe
+    # while the admin is the ONLY user — a stray user from a failed cleanup would be the one
+    # renamed/re-passworded instead. Guarded rather than assumed.
+    if len(get_json(base, "/Users", token) or []) == 1:
+        st, _ = http("POST", f"{base}/Startup/User", token, json.dumps({"Name": USER, "Password": PASS}))
+        back = get_json(base, "/Startup/User", token) or {}
+        r["POST /Startup/User"] = st == 403 and back.get("Name") == USER
+    else:
+        r["POST /Startup/User"] = False   # not attempted: more than one user on the instance
+    st, _ = http("POST", f"{base}/Startup/RemoteAccess", token,
+                 json.dumps({"EnableRemoteAccess": True, "EnableAutomaticPortMapping": False}))
+    net = get_json(base, "/System/Configuration/network", token) or {}
+    r["POST /Startup/RemoteAccess"] = st < 300 and net.get("EnableRemoteAccess") is True
+    st, _ = http("POST", f"{base}/Startup/Complete", token, "")
+    pub = get_json(base, "/System/Info/Public", None) or {}
+    r["POST /Startup/Complete"] = st < 300 and pub.get("StartupWizardCompleted") is True
+    return r
+
 
 def j_favorites(base, token, user, mid, _m2):
     r = {}
@@ -758,7 +792,8 @@ def j_users_password(base, token, user, _m, _m2):
     return r
 
 
-JOURNEYS = [j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
+JOURNEYS = [j_startup,   # first: see its docstring
+            j_favorites, j_played, j_rating, j_playlist, j_collection, j_users, j_item_edit,
             j_api_keys, j_user_item_data, j_display_prefs, j_scheduled_task_triggers,
             j_device_options, j_playstate, j_capabilities, j_user_config, j_system_config,
             j_playlist_share, j_item_delete, j_capabilities_query, j_environment_validate,

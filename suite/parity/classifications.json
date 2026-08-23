@@ -235,8 +235,8 @@
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
     },
     "GET /Episode/{id}/IntroSkipperSegments": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: IntroSkipper is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /FileTransformation/RegisterTransformation": {
       "category": "expected-extension",
@@ -317,14 +317,6 @@
     "POST /Items/RemoteSearch/Trailer": {
       "category": "deferred-remote-or-feature-gated",
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
-    },
-    "GET /Items/{itemId}/Download": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
-    },
-    "GET /Items/{itemId}/File": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "POST /Items/{itemId}/RemoteImages/Download": {
       "category": "deferred-remote-or-feature-gated",
@@ -455,16 +447,16 @@
       "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
     },
     "GET /MediaSegmentsApi": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /MediaSegmentsApi/{itemId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "DELETE /MediaSegmentsApi/{segmentId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
+      "category": "expected-extension",
+      "classification": "expected-extension: MediaSegmentsApi is a compiled-in Ferrofin plugin; stock Jellyfin 10.11.8 lacks it (J=404 without the plugin installed). JSON API, not streaming."
     },
     "POST /Packages/Installed/{name}": {
       "category": "accepted-divergence",
@@ -477,10 +469,6 @@
     "GET /Packages/{name}": {
       "category": "instance",
       "classification": "instance: resolves a package by name/assemblyGuid from the aggregated repository catalog \u2014 catalog content is repository-config-specific, and the harness instances configure none, so there is no package to diff. Route verified 2026-08-14 by unit + server HTTP tests."
-    },
-    "GET /Playback/BitrateTest": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
     },
     "DELETE /Plugins/{pluginId}": {
       "category": "accepted-divergence",
@@ -618,10 +606,6 @@
       "category": "verified-by-push-probe",
       "classification": "verified-by-push-probe: the response body carries no signal here \u2014 the observable behaviour is the SyncPlayCommand/SyncPlayGroupUpdate pushed to member sockets. Verified end-to-end over two real WebSockets by `suite/run.sh push` (suite/ws/probe_remote_control.py)."
     },
-    "GET /System/Logs/Log": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
-    },
     "DELETE /Videos/{itemId}/Subtitles/{index}": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
@@ -714,21 +698,9 @@
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff."
     },
-    "POST /Startup/Complete": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint; the provisioned server has already completed setup, so there is no wizard state to advance or diff."
-    },
-    "POST /Startup/Configuration": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint (initial server config); only meaningful before setup completes, which the provisioned server has already done."
-    },
-    "POST /Startup/RemoteAccess": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint; only meaningful during initial setup, already completed on the provisioned server."
-    },
     "POST /Startup/User": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: first-run setup-wizard endpoint (seed admin user); only meaningful before setup completes, already done on the provisioned server."
+      "category": "accepted-divergence",
+      "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204)."
     },
     "POST /Users/ForgotPassword": {
       "category": "not-testable-this-way",
@@ -737,14 +709,6 @@
     "POST /Users/ForgotPassword/Pin": {
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: completes the forgot-password flow using a PIN written to a host-instance file; no cross-server-stable body to diff."
-    },
-    "GET /Environment/DirectoryContents": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: lists the server host's filesystem, which differs per container instance."
-    },
-    "GET /Environment/ParentPath": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: resolves a parent path on the server host filesystem; instance-specific."
     },
     "GET /Backup/Manifest": {
       "category": "not-testable-this-way",

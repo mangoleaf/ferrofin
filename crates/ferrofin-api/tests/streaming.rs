@@ -508,8 +508,17 @@ async fn download_sets_content_disposition() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    assert!(cd.contains("attachment"), "got: {cd}");
-    assert!(cd.contains("movie.mkv"), "got: {cd}");
+    // Both forms ASP.NET's FileResult emits (Jellyfin parity): the token-safe name
+    // (unquoted — it is a plain HTTP token) and the RFC 5987 `filename*`.
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("file name");
+    assert_eq!(
+        cd,
+        format!("attachment; filename={name}; filename*=UTF-8''{name}"),
+        "got: {cd}"
+    );
 }
 
 #[tokio::test]

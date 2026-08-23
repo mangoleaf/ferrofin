@@ -98,6 +98,11 @@ READS = [
          "/DisplayPreferences/usersettings?userId={u}&client=emby"),
     user("GET /Devices/Info", "/Devices/Info?id={device}"),
     # GET /Devices/Options is exercised in the write journey (needs a device that has options set).
+    # Host-filesystem browsing: both containers mount the identical fixture tree at /media/synth,
+    # so the listing and the parent resolution are byte-identical — not instance-specific.
+    plain("GET /Environment/DirectoryContents",
+          "/Environment/DirectoryContents?path=%2Fmedia%2Fsynth%2Fmovies&includeFiles=true&includeDirectories=true"),
+    plain("GET /Environment/ParentPath", "/Environment/ParentPath?path=%2Fmedia%2Fsynth%2Fmovies"),
 ]
 
 # ---------------------------------------------------------------- correlation

@@ -170,6 +170,8 @@ def resolve_fixtures(base, token, user):
     genre = (genres.get("Items") or [{}])[0].get("Name") or "Action"
     sessions = get_json(base, "/Sessions", token) or []
     session = sessions[0]["Id"] if sessions else None
+    logs = get_json(base, "/System/Logs", token) or []
+    log_name = logs[0]["Name"] if logs and logs[0].get("Name") else None
     fx = {
         "itemId": any_item, "videoId": movie or any_item, "id": any_item, "Id": any_item,
         "routeItemId": any_item, "mediaSourceId": movie or any_item, "routeMediaSourceId": movie or any_item,
@@ -180,14 +182,22 @@ def resolve_fixtures(base, token, user):
         "year": "2020", "container": "mp4", "segmentContainer": "ts", "format": "ts",
         "routeFormat": "ts", "width": "400", "maxWidth": "400", "maxHeight": "400",
         "percentPlayed": "0", "unplayedCount": "0", "tag": "x", "language": "eng",
-        "routeStartPositionTicks": "0", "streamId": "0",
+        "routeStartPositionTicks": "0", "streamId": "0", "logName": log_name,
     }
     return {k: v for k, v in fx.items() if v is not None}
 
 
-# Streaming/HLS endpoints don't return a prompt JSON status (they block or stream) — a status
-# sweep can't classify them; Layer-2/transcode.js covers playback. Skipped, not silently passed.
-STREAMING = re.compile(r"(/stream(\.|$)|\.m3u8|/live\.|/hls/|/Videos/\{itemId\}/stream)")
+# REQUIRED query params the breadth sweep can fill from the shared fixture — the query-side
+# counterpart of resolve_fixtures(): the item's own media source, a subtitle segment length,
+# the shared media mount (identical in both containers), the first log file. A required param
+# NOT listed here stays unfilled: the op then 400s on both and says so. (`path` also reaches
+# GET /Backup/Manifest, where it names an archive: both 404 on the media dir — status parity.)
+QUERY_FILL = {
+    "mediaSourceId": lambda fx: fx.get("mediaSourceId"),
+    "segmentLength": lambda fx: "10",
+    "path": lambda fx: "/media/synth/movies",
+    "name": lambda fx: fx.get("logName"),
+}
 
 
 def build_url(path, fixtures):
@@ -202,11 +212,25 @@ def build_url(path, fixtures):
     return url, None
 
 
-def with_user_query(url, op, params, user):
-    """Inject userId as a query param when the op declares one and it isn't in the path."""
-    qp = {pp.get("name") for pp in op.get("parameters", []) if pp.get("in") == "query"}
+def with_user_query(url, op, params, user, fixtures=None):
+    """Inject the query params a breadth probe needs: userId when the op declares one (and it
+    isn't in the path), every REQUIRED query param QUERY_FILL can supply, and `static=true` on
+    ops that declare it — direct play on the /stream ops, copy codecs on the HLS playlists, so
+    Layer-1 never spawns a transcode; the transcode path is streams.py's job."""
+    fixtures = fixtures or {}
+    qp = {pp.get("name"): pp for pp in op.get("parameters", []) if pp.get("in") == "query"}
+    add = []
     if "userId" in qp and "userId" not in params:
-        url += ("&" if "?" in url else "?") + "userId=" + user
+        add.append(("userId", user))
+    for name, pp in qp.items():
+        if pp.get("required") and name in QUERY_FILL and name not in params:
+            v = QUERY_FILL[name](fixtures)
+            if v is not None:
+                add.append((name, str(v)))
+    if "static" in qp:
+        add.append(("static", "true"))
+    if add:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(add)
     return url
 
 # ---------------------------------------------------------------- schema validation
@@ -280,15 +304,11 @@ def sweep(ferrofin_url, jellyfin_url):
                 results[opkey] = {"status_conformant": None, "schema_valid": None,
                                   "note": "write: deferred to Layer-2 journey"}
                 continue
-            if STREAMING.search(path):
-                results[opkey] = {"status_conformant": None, "schema_valid": None,
-                                  "note": "streaming: not status-classifiable"}
-                continue
             hurl, skip = build_url(path, fixtures)   # per-server ids: Ferrofin's on Ferrofin
             if skip:
                 results[opkey] = {"status_conformant": None, "schema_valid": None, "note": skip}
                 continue
-            hs, hraw = http(method, ferrofin_url + with_user_query(hurl, op, params, hu), ht)
+            hs, hraw = http(method, ferrofin_url + with_user_query(hurl, op, params, hu, fixtures), ht)
             # schema_valid: Ferrofin 2xx JSON vs response schema (needs no oracle)
             sv = None
             sch = response_schema(op)
@@ -302,7 +322,7 @@ def sweep(ferrofin_url, jellyfin_url):
                 if jskip:
                     results[opkey] = {"status_conformant": None, "schema_valid": sv, "note": f"H={hs} J=n/a"}
                     continue
-                js, jraw = http(method, jellyfin_url + with_user_query(jurl, op, params, ju), jt)
+                js, jraw = http(method, jellyfin_url + with_user_query(jurl, op, params, ju, fixtures_j), jt)
                 row = {"status_conformant": (hs // 100) == (js // 100),
                        "schema_valid": sv, "note": f"H={hs} J={js}"}
                 # Layer-2 deep diff over the whole GET surface: when BOTH return 200 JSON, diff the
@@ -362,12 +382,17 @@ def selfcheck():
     # userId query injection.
     url = with_user_query("/Genres", {"parameters": [{"name": "userId", "in": "query"}]}, set(), "u1")
     assert url == "/Genres?userId=u1", url
-    # streaming endpoints are excluded.
-    assert STREAMING.search("/Videos/{itemId}/stream") and STREAMING.search("/Audio/{itemId}/main.m3u8")
-    assert not STREAMING.search("/Items/{itemId}")
+    # required-query fill (+ static=true on ops that declare it); an unfillable required param
+    # is left alone, an optional one is never filled.
+    op = {"parameters": [{"name": "mediaSourceId", "in": "query", "required": True},
+                         {"name": "static", "in": "query"},
+                         {"name": "segmentLength", "in": "query"},
+                         {"name": "deviceProfileId", "in": "query", "required": True}]}
+    url = with_user_query("/Videos/abc/master.m3u8", op, {"itemId"}, "u1", {"mediaSourceId": "abc"})
+    assert url == "/Videos/abc/master.m3u8?mediaSourceId=abc&static=true", url
     # status-class comparison is by hundreds bucket.
     assert (200 // 100) == (204 // 100) and (404 // 100) != (500 // 100)
-    print("ok: nullable, $ref, param-fill, skip, query-inject, streaming, status-class")
+    print("ok: nullable, $ref, param-fill, skip, query-inject, required-fill, status-class")
 
 
 def main():
