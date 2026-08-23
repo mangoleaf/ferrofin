@@ -275,8 +275,8 @@
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
     },
     "POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
+      "category": "remote-opt-in",
+      "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live."
     },
     "POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo": {
       "category": "expected-extension",
@@ -415,8 +415,8 @@
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
     },
     "GET /Providers/Subtitles/Subtitles/{subtitleId}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: binary/subtitle file output \u2014 not a JSON body to diff."
+      "category": "remote-opt-in",
+      "classification": "remote-opt-in: needs an opensubtitles.com account and the public internet. With OPENSUBTITLES_USERNAME/PASSWORD/API_KEY set, the parity leg installs the plugin on the oracle, configures both, and the remote-subtitle journey (search -> download -> stream read-back -> provider file) runs live."
     },
     "POST /Repositories": {
       "category": "instance",

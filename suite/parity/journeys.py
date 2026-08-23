@@ -28,7 +28,7 @@ import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT   # reuse HTTP + provisioning
+from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT, opensubtitles_credentials   # reuse HTTP + provisioning
 
 
 def q(base, path, token, user):
@@ -1016,6 +1016,47 @@ def j_livetv(base, token, user, _m, _m2):
     return r
 
 
+def j_remote_subtitles(base, token, user, mid, _m2):
+    """Remote subtitles through OpenSubtitles — only when credentials are configured (see
+    sweep.opensubtitles_credentials). The fixture's first movie carries a real IMDb id in
+    its NFO, so both servers search the same title: search → download the first hit → the
+    item gains an external subtitle stream → the provider's own subtitle file is fetched.
+    Cost: two provider downloads per server (the POST and the Providers GET both download),
+    so four quota units per two-leg run. Jellyfin's plugin uses its own bundled API key,
+    Ferrofin uses OPENSUBTITLES_API_KEY — an exhausted quota can therefore flag one side only."""
+    if not opensubtitles_credentials():
+        return {}
+    r = {}
+    hits = get_json(base, f"/Items/{mid}/RemoteSearch/Subtitles/eng", token) or []
+    r["GET /Items/{itemId}/RemoteSearch/Subtitles/{language}"] = bool(hits)
+    sub_id = hits[0].get("Id") if hits else None
+    if not sub_id:
+        return r
+    before = set(external_subtitle_indexes(base, token, user, mid))
+    st, _ = http("POST", f"{base}/Items/{mid}/RemoteSearch/Subtitles/{urllib.parse.quote(sub_id, safe='')}",
+                 token, "")
+    # Jellyfin answers 204 even when the download failed (it logs and swallows), and only
+    # QUEUES the refresh that creates the stream row — the read-back below is the verdict.
+    # The verdict wants the stream the search asked for: a new EXTERNAL stream tagged eng
+    # (the provider id carries the language; a server that drops it lands an "und" stream).
+    added = []
+    for _ in range(SUBTITLE_REFRESH_WAIT_S):
+        added = [i for i, lang in external_subtitles(base, token, user, mid)
+                 if i not in before and lang == "eng"]
+        if added:
+            break
+        time.sleep(1)
+    r["POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}"] = st < 300 and bool(added)
+    st, raw = http("GET", f"{base}/Providers/Subtitles/Subtitles/{urllib.parse.quote(sub_id, safe='')}", token)
+    r["GET /Providers/Subtitles/Subtitles/{subtitleId}"] = st == 200 and bool(raw)
+    for i, lang in external_subtitles(base, token, user, mid):   # reap, whichever path ran
+        # Our own debris whatever language the server gave it, plus any external eng stream
+        # (the fixture's own eng track is embedded, never external).
+        if i not in before or lang == "eng":
+            http("DELETE", f"{base}/Videos/{mid}/Subtitles/{i}", token)
+    return r
+
+
 def j_backup(base, token, user, _m, _m2):
     """Backup create → manifest → list on the server's own data dir. The manifest must echo
     the posted options, the Manifest route must read the same manifest back by the returned
@@ -1049,7 +1090,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
-            j_forgot_password, j_backup, j_livetv,
+            j_forgot_password, j_backup, j_livetv, j_remote_subtitles,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]
