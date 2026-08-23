@@ -58,7 +58,13 @@ impl Transcoder for TokioTranscoder {
             .args(split_args(arguments))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Scheduled-task cancellation is `JoinHandle::abort` — the future is
+            // dropped, and a tokio `Child` outlives its future unless told not
+            // to. Upstream kills the process on the cancellation token; this is
+            // the same contract (observed: a stopped trickplay task left its 4K
+            // ffmpeg running to completion).
+            .kill_on_drop(true);
 
         let mut child = command
             .spawn()
@@ -92,6 +98,7 @@ impl Transcoder for TokioTranscoder {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .status()
             .await
             .is_ok_and(|status| status.success())
@@ -101,6 +108,60 @@ impl Transcoder for TokioTranscoder {
 #[cfg(test)]
 mod tests {
     use super::split_args;
+
+    /// Whether some live (non-zombie) process has exactly this argv.
+    #[cfg(target_os = "linux")]
+    fn process_with_argv_exists(argv: &[&str]) -> bool {
+        let want: Vec<u8> = argv.iter().flat_map(|a| a.bytes().chain([0])).collect();
+        std::fs::read_dir("/proc").is_ok_and(|d| {
+            d.flatten()
+                .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == want))
+        })
+    }
+
+    /// The scheduled-task cancel path is `JoinHandle::abort`, i.e. the future
+    /// running the child is dropped. The child must die with it — otherwise a
+    /// stopped trickplay task leaves its ffmpeg burning CPU to completion
+    /// (observed live).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_the_caller_kills_the_child_process() {
+        use super::TokioTranscoder;
+        use crate::encoder::Transcoder as _;
+
+        // A duration no other process on the box is sleeping for (integer:
+        // fractional `sleep` is a GNU/busybox extension).
+        let marker = format!("{}", 70_000 + std::process::id() % 10_000);
+        let task = tokio::spawn({
+            let marker = marker.clone();
+            async move {
+                TokioTranscoder
+                    .get_process_output("sleep", &marker, false, None)
+                    .await
+            }
+        });
+        for _ in 0..100 {
+            if process_with_argv_exists(&["sleep", &marker]) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            process_with_argv_exists(&["sleep", &marker]),
+            "child never started"
+        );
+
+        task.abort();
+        let _ = task.await;
+
+        for _ in 0..100 {
+            if !process_with_argv_exists(&["sleep", &marker]) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("`sleep {marker}` outlived the aborted task");
+    }
 
     #[test]
     fn quoted_path_with_spaces_stays_one_arg() {

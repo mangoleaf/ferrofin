@@ -232,6 +232,8 @@ impl FfmpegRunner for TokioFfmpegRunner {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            // Task cancel = future drop; the child must not outlive it.
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| ServiceError::backend(format!("failed to start {program}: {e}")))?;

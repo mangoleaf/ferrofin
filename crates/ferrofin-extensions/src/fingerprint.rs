@@ -214,6 +214,9 @@ async fn output(program: &str, args: &[&str]) -> Result<Output, String> {
     tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::null())
+        // The intro-skipper task cancels by dropping this future; fpcalc /
+        // ffmpeg must die with it (a fingerprint is minutes of CPU per file).
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("spawn {program}: {e}"))
@@ -335,6 +338,7 @@ async fn version_probe_succeeds(program: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status()
         .await
         .is_ok_and(|s| s.success())
