@@ -41,7 +41,6 @@ use ferrofin_model::playlists::{
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
-use ferrofin_traits::options::DtoOptions;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -216,6 +215,21 @@ struct GetPlaylistItemsQuery {
     /// The maximum number of records to return.
     #[serde(default)]
     limit: Option<i32>,
+    /// Comma-delimited `ItemFields` to include beyond the base projection.
+    #[serde(default)]
+    fields: Option<String>,
+    /// Whether to include image tags.
+    #[serde(default)]
+    enable_images: Option<bool>,
+    /// Whether to include per-user data.
+    #[serde(default)]
+    enable_user_data: Option<bool>,
+    /// Maximum images to return per image type.
+    #[serde(default)]
+    image_type_limit: Option<i32>,
+    /// Comma-delimited image types to include.
+    #[serde(default)]
+    enable_image_types: Option<String>,
 }
 
 /// `GET /Playlists/{playlistId}/Items` — the playlist's member items, paged.
@@ -269,7 +283,24 @@ async fn get_playlist_items(
         items.truncate(limit);
     }
 
-    let options = DtoOptions::default();
+    // Built from the CLIENT's parameters, matching C#:
+    //   var dtoOptions = new DtoOptions { Fields = fields }
+    //       .AddClientFields(User)
+    //       .AddAdditionalDtoOptions(enableImages, enableUserData, imageTypeLimit,
+    //                                enableImageTypes);
+    //
+    // This was `DtoOptions::default()` — every field, always — and the query
+    // struct did not even accept the five parameters the contract lists, so a
+    // client asking for a lean page got the full projection anyway. On a
+    // 50-item playlist that is 542 KB and 9.6 ms of CPU where the same 50 items
+    // through `/Items` (which does honour `fields`) are 45 KB and 1.6 ms.
+    let options = super::tv_shows::build_dto_options(
+        query.fields.as_deref(),
+        query.enable_images,
+        query.image_type_limit,
+        query.enable_image_types.as_deref(),
+        query.enable_user_data,
+    );
     let mut dtos = state
         .dto
         .get_base_item_dtos(&items, &options, user.as_ref(), None, true)

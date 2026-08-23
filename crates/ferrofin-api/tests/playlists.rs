@@ -276,7 +276,12 @@ impl UserManager for OkUsers {
 }
 
 /// A [`DtoService`] projecting each entity to a bare id/name DTO.
-struct OkDto;
+/// Records the `DtoOptions` the handler built, so a test can assert the
+/// CLIENT's `fields` reached the projection rather than a hardcoded default.
+#[derive(Default)]
+struct OkDto {
+    seen_fields: std::sync::Mutex<Vec<Vec<ferrofin_model::querying::ItemFields>>>,
+}
 
 #[async_trait]
 impl DtoService for OkDto {
@@ -298,11 +303,15 @@ impl DtoService for OkDto {
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
-        _options: &DtoOptions,
+        options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.seen_fields
+            .lock()
+            .expect("seen_fields mutex")
+            .push(options.fields.clone());
         Ok(items
             .iter()
             .map(|item| BaseItemDto {
@@ -513,6 +522,16 @@ impl CollectionManager for RecordingCollections {
 
 /// Assembles an [`AppState`] over the recording playlist/collection fakes.
 fn state(playlists: Arc<RecordingPlaylists>, collections: Arc<RecordingCollections>) -> AppState {
+    state_with_dto(playlists, collections, Arc::new(OkDto::default()))
+}
+
+/// [`state`] with a caller-held `OkDto`, so a test can read back the
+/// `DtoOptions` the handler built.
+fn state_with_dto(
+    playlists: Arc<RecordingPlaylists>,
+    collections: Arc<RecordingCollections>,
+    dto: Arc<OkDto>,
+) -> AppState {
     AppState::new(
         Arc::new(ferrofin_api::test_support::FakeLibrary),
         Arc::new(OkUsers),
@@ -527,7 +546,7 @@ fn state(playlists: Arc<RecordingPlaylists>, collections: Arc<RecordingCollectio
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(OkDto),
+        dto,
         Arc::new(OkAuth),
         Arc::new(OkAuth),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
@@ -620,6 +639,45 @@ async fn get_missing_playlist_is_404() {
     let missing = Uuid::from_u128(0xDEAD);
     let (status, _) = send(app, "GET", &format!("/Playlists/{missing}"), Body::empty()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn playlist_items_projects_the_fields_the_client_asked_for() {
+    // C# builds the options from the REQUEST:
+    //   var dtoOptions = new DtoOptions { Fields = fields }.AddClientFields(User)
+    //       .AddAdditionalDtoOptions(enableImages, enableUserData, …);
+    // Ferrofin hardcoded `DtoOptions::default()` — every field, always — and the
+    // query struct did not even accept `fields`. A 50-item playlist came back as
+    // 542 KB / 52 keys per item where the same items through `/Items` are 45 KB /
+    // 20, and it cost 9.6 ms of CPU against 1.6 ms.
+    let dto = Arc::new(OkDto::default());
+    let app = state_with_dto(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+        dto.clone(),
+    );
+    let (status, _) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?fields=Path"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let seen = dto.seen_fields.lock().expect("seen_fields mutex").clone();
+    let fields = seen.first().expect("the projection ran");
+    assert!(
+        fields.contains(&ferrofin_model::querying::ItemFields::Path),
+        "the client asked for Path and it must reach the projection: {fields:?}"
+    );
+    // The point of honouring `fields` is that it BOUNDS the projection. A
+    // hardcoded default would carry the whole ItemFields set here.
+    assert!(
+        fields.len() < 10,
+        "asking for one field must not project everything — got {} fields: {fields:?}",
+        fields.len()
+    );
 }
 
 #[tokio::test]

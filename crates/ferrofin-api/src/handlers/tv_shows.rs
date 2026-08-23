@@ -50,7 +50,7 @@ use crate::state::AppState;
 /// the parsed `fields` list rides through, `enable_images` defaults on (C#'s
 /// `enableImages ?? true`), the image-type limit falls back to Jellyfin's
 /// unbounded default, and any explicit `enableImageTypes` narrow the set.
-fn build_dto_options(
+pub(crate) fn build_dto_options(
     fields: Option<&str>,
     enable_images: Option<bool>,
     image_type_limit: Option<i32>,
