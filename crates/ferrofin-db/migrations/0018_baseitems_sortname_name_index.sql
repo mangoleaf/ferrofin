@@ -1,0 +1,41 @@
+-- Index BaseItems by (SortName, Name) — Ferrofin-own, FerrofinIX_ namespace.
+--
+-- `GET /Items?sortBy=SortName` is the library browse every client opens on, and
+-- it is the single most expensive statement Ferrofin issues:
+--
+--   SELECT bi.* FROM "BaseItems" AS bi
+--    WHERE … ORDER BY bi."SortName" ASC, bi."Name" ASC LIMIT 100
+--
+-- With no index on the sort key `EXPLAIN QUERY PLAN` is `SCAN bi` +
+-- `USE TEMP B-TREE FOR ORDER BY`: every row in the library is read out of the
+-- table — all 70-odd columns of it — and fed to a sorter, just to keep the
+-- first 100. The cost is O(library), not O(page). Leading the index with the
+-- sort key turns it into an ordered index walk that stops after 100 rows.
+--
+-- Measured on the bench library (9,862 items / 64 MB), interleaved in-process
+-- with the order reshuffled every round (21 rounds, A-vs-A noise floor 0.7%):
+--
+--   ORDER BY SortName, Name  LIMIT 100 (mixed browse)   5.19 ms -> 0.62 ms  (8.4x)
+--   ORDER BY SortName        LIMIT 100 (default sort)   3.46 ms -> 0.48 ms  (7.3x)
+--
+-- Inside the running server, two long-lived processes on the same binary and
+-- the same fixture, driven request-at-a-time in an order-flipped A,B cycle,
+-- sqlx's own per-statement timing: the `/Items?limit=100&sortBy=SortName` page
+-- query went 4.24 ms -> 0.46 ms p50 and the endpoint's total DB time per
+-- request 7.83 ms -> 4.67 ms.
+--
+-- ORDER-IDENTICAL, and that is load-bearing. An index walk pins the order of
+-- rows that TIE on the sort key; a sort does not. For the ascending
+-- `(SortName, Name)` ordering the two agree exactly — all 9,679 rows of the
+-- unfiltered browse come back in the same order with and without this index,
+-- because SQLite's sorter and the index both leave a tie in rowid order. The
+-- descending walk and the bare `ORDER BY SortName` (no `Name` tiebreaker, and
+-- 7,093 of the rows here are people/studios/genres with a NULL `SortName`) do
+-- NOT agree, so `translate_query` pins those two shapes to the sort with
+-- SQLite's unary `+` — see `SORT_PLAN_PIN` there for the row counts.
+--
+-- Write cost: one extra b-tree insert per BaseItems row, i.e. per item written
+-- by a scan. Two short text columns; the index measured 80 pages — 320 KB, or
+-- ~34 bytes per row — against a 9,679-row / 64 MB database.
+CREATE INDEX IF NOT EXISTS "FerrofinIX_BaseItems_SortName_Name"
+    ON "BaseItems" ("SortName", "Name");

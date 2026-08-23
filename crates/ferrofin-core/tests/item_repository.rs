@@ -119,6 +119,20 @@ fn repo(db: &Database) -> FerrofinItemRepository {
     FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
 }
 
+/// `EXPLAIN QUERY PLAN` for `sql`, flattened to one line.
+async fn plan(db: &Database, sql: &str) -> String {
+    use sqlx::Row as _;
+
+    sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|r| r.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 #[tokio::test]
 async fn save_then_retrieve_roundtrips() {
     let db = fresh_db().await;
@@ -815,4 +829,125 @@ async fn child_counts_exclude_merged_alternate_versions() {
         Some(1),
         "a merged duplicate must not inflate the episode count"
     );
+}
+
+/// An explicit `sortBy=SortName` must break `SortName` ties on `Name`, the way
+/// upstream's `ApplyOrder` does:
+///
+/// ```csharp
+/// if (firstOrdering.OrderBy is ItemSortBy.Default or ItemSortBy.SortName)
+/// {
+///     orderedQuery = firstOrdering.SortOrder is SortOrder.Ascending
+///         ? orderedQuery.ThenBy(e => e.Name)
+///         : orderedQuery.ThenByDescending(e => e.Name);
+/// }
+/// ```
+///
+/// (`ItemSortBy.Default` is filtered out of `orderBy` before that branch, so it
+/// fires exactly when the caller asked for `SortName`.)
+///
+/// Without the tiebreaker the tied rows come back in whatever order the storage
+/// engine's sort produced, i.e. insertion order — which on a real library is
+/// most of the page: every Person/Studio/Genre row shares the same (null)
+/// `SortName`, so the whole by-name half of a mixed browse ties.
+#[tokio::test]
+async fn explicit_sort_name_breaks_ties_on_name() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+
+    // Same SortName, inserted in an order that is neither their Name order nor
+    // its reverse — so a missing tiebreaker (which leaves the rows in the
+    // storage engine's own order) cannot accidentally look alphabetical.
+    //
+    // The *descending* assertion below is the load-bearing one: an ascending
+    // `SortName` sort is served by `FerrofinIX_BaseItems_SortName_Name`, whose
+    // second column is `Name`, so ascending comes back alphabetical even when
+    // the SQL forgets to ask for it. Descending is pinned to a real sort
+    // (`SORT_PLAN_PIN`), so only the SQL can order it.
+    let mut rows = Vec::new();
+    for (n, name) in [(0x50u128, "Mike"), (0x51, "Zulu"), (0x52, "Alpha")] {
+        let mut row = item(Uuid::from_u128(n), BaseItemKind::Movie, name);
+        row.sort_name = Some("tie".to_owned());
+        rows.push(row);
+    }
+    persist.save_items(&rows).await.expect("save");
+
+    let ascending = InternalItemsQuery {
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        ..Default::default()
+    };
+    let names: Vec<_> = repository
+        .get_item_list(&ascending)
+        .await
+        .expect("list")
+        .iter()
+        .filter_map(|r| r.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Alpha", "Mike", "Zulu"],
+        "ties on SortName must fall back to Name ascending"
+    );
+
+    let descending = InternalItemsQuery {
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Descending)],
+        ..Default::default()
+    };
+    let names: Vec<_> = repository
+        .get_item_list(&descending)
+        .await
+        .expect("list")
+        .iter()
+        .filter_map(|r| r.name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Zulu", "Mike", "Alpha"],
+        "a descending SortName sort takes ThenByDescending(Name)"
+    );
+}
+
+/// `FerrofinIX_BaseItems_SortName_Name` (migration 0018) must serve the
+/// ascending `(SortName, Name)` browse as an ordered index walk — not a table
+/// scan into a sorter — and must NOT be allowed to serve the two orderings
+/// whose tie order it would change (see `SORT_PLAN_PIN` in `translate_query`).
+///
+/// This asserts the *plan*, because the plan is the whole point: the rows come
+/// back identical either way, so a lost index would be invisible to every other
+/// test in this file while the query silently went back to O(library).
+#[tokio::test]
+async fn sort_name_browse_uses_the_index_and_the_pinned_shapes_do_not() {
+    const INDEX: &str = "FerrofinIX_BaseItems_SortName_Name";
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    persist
+        .save_items(&[item(Uuid::from_u128(0x70), BaseItemKind::Movie, "Solaris")])
+        .await
+        .expect("save");
+
+    let indexed = plan(
+        &db,
+        r#"SELECT bi.* FROM "BaseItems" AS bi ORDER BY bi."SortName" ASC, bi."Name" ASC LIMIT 100"#,
+    )
+    .await;
+    assert!(
+        indexed.contains(INDEX) && !indexed.contains("TEMP B-TREE"),
+        "the ascending (SortName, Name) browse must walk {INDEX}, got: {indexed}"
+    );
+
+    for sql in [
+        // Descending: the index walked backwards reverses ties.
+        r#"SELECT bi.* FROM "BaseItems" AS bi ORDER BY +bi."SortName" DESC, bi."Name" DESC LIMIT 100"#,
+        // No tiebreaker (the no-`sortBy` default): SortName alone is not a
+        // total order, and the index would reorder every tied row.
+        r#"SELECT bi.* FROM "BaseItems" AS bi ORDER BY +bi."SortName" LIMIT 100"#,
+    ] {
+        let pinned = plan(&db, sql).await;
+        assert!(
+            !pinned.contains(INDEX) && pinned.contains("TEMP B-TREE"),
+            "the pinned ordering must keep its sort, got: {pinned}\n  for: {sql}"
+        );
+    }
 }

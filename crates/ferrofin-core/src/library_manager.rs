@@ -595,6 +595,13 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_query_filters_legacy(query).await
     }
 
+    async fn get_distinct_years(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<i32>, ServiceError> {
+        self.items.get_distinct_years(query).await
+    }
+
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,

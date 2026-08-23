@@ -392,6 +392,21 @@ pub trait ItemRepository: Send + Sync {
         filter: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError>;
 
+    /// Gets just the distinct production years of the matching items,
+    /// ascending — the one facet `/Years` needs.
+    ///
+    /// The default reads the whole legacy filter aggregate and throws three
+    /// quarters of it away; an implementation that can answer the years alone
+    /// should override this. See [`LibraryManager::get_distinct_years`].
+    ///
+    /// [`LibraryManager::get_distinct_years`]: crate::library::LibraryManager::get_distinct_years
+    async fn get_distinct_years(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<i32>, ServiceError> {
+        Ok(self.get_query_filters_legacy(filter).await?.years)
+    }
+
     /// Reports whether all children of `id` are played for the given user.
     async fn get_is_played(
         &self,

@@ -1050,6 +1050,16 @@ impl ItemRepository for FerrofinItemRepository {
         })
     }
 
+    async fn get_distinct_years(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<i32>, ServiceError> {
+        // `/Years` wants the years and nothing else. Going through
+        // `get_query_filters_legacy` for them also ran the official-ratings
+        // scan and both `ItemValues` MIN aggregates and dropped all three.
+        self.distinct_years(filter).await
+    }
+
     async fn get_is_played(
         &self,
         user: &UserEntity,
@@ -2118,6 +2128,63 @@ mod tests {
             .await
             .expect("empty filters");
         assert!(empty.years.is_empty() && empty.genres.is_empty());
+    }
+
+    /// `/Years` reads the year facet on its own. The override must answer
+    /// exactly what the four-statement aggregate's `years` field held — the
+    /// same filter, the same values, the same order — for every shape the
+    /// aggregate handles, including the empty one.
+    #[tokio::test]
+    async fn distinct_years_answers_the_aggregates_year_facet() {
+        let db = test_db().await;
+        let repository = repo(&db);
+
+        for (n, year) in [(0xA201_u128, 1999), (0xA202, 1977), (0xA203, 1999)] {
+            let id = Uuid::from_u128(n);
+            seed_named_item(&db, id, BaseItemKind::Movie, &format!("Film {n}")).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(i64::from(year))
+                .execute(db.writer())
+                .await
+                .expect("set year");
+        }
+        // A yearless row must not become a phantom facet value.
+        seed_named_item(&db, Uuid::from_u128(0xA204), BaseItemKind::Movie, "No Year").await;
+
+        for filter in [
+            InternalItemsQuery::default(),
+            InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Movie],
+                ..Default::default()
+            },
+            // Matches nothing.
+            InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Book],
+                ..Default::default()
+            },
+        ] {
+            let aggregate = repository
+                .get_query_filters_legacy(&filter)
+                .await
+                .expect("aggregate");
+            let direct = repository
+                .get_distinct_years(&filter)
+                .await
+                .expect("distinct years");
+            assert_eq!(
+                direct, aggregate.years,
+                "the year-only read must match the aggregate's facet"
+            );
+        }
+        assert_eq!(
+            repository
+                .get_distinct_years(&InternalItemsQuery::default())
+                .await
+                .expect("years"),
+            vec![1977, 1999],
+            "distinct, ascending, and no entry for the yearless row"
+        );
     }
 
     #[tokio::test]
