@@ -137,6 +137,8 @@ fi
 # never ends for both servers to treat it as live) and an XMLTV guide with hourly
 # programmes over FIXTURE_GUIDE_DAYS, so "what's on now" resolves until the window runs
 # out (regenerate the fixture then). Both servers read the M3U/XMLTV from the shared mount.
+# The two channels play the same broadcast but must have DISTINCT URLs: Jellyfin derives a
+# channel's id from the MD5 of its URL line and would collapse them into one channel.
 # loop.ts is 60 s: docker-compose.yml passes that length to the sidecar for pacing.
 if [ "$LIVETV" -gt 0 ]; then
   echo "generating live tv fixture..."
@@ -149,9 +151,9 @@ if [ "$LIVETV" -gt 0 ]; then
   cat > "$ROOT/livetv/channels.m3u" <<M3U
 #EXTM3U
 #EXTINF:-1 tvg-id="parity1" tvg-chno="1" tvg-name="Parity One",Parity One
-http://livetv-source:8000/live.ts
+http://livetv-source:8000/live.ts?ch=1
 #EXTINF:-1 tvg-id="parity2" tvg-chno="2" tvg-name="Parity Two",Parity Two
-http://livetv-source:8000/live.ts
+http://livetv-source:8000/live.ts?ch=2
 M3U
   python3 - "$ROOT/livetv/guide.xml" "$GUIDE_DAYS" <<'PY'
 import sys, datetime

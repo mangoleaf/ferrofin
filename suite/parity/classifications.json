@@ -171,12 +171,12 @@
       "classification": "deferred-remote-or-feature-gated: remote metadata/lyric providers are feature-gated off (no network/keys in the harness)."
     },
     "GET /Channels/{channelId}/Features": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "category": "requires-channel-plugin",
+      "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV \u2014 no tuner journey can reach these; they need a channel plugin on both servers."
     },
     "GET /Channels/{channelId}/Items": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "category": "requires-channel-plugin",
+      "classification": "requires-channel-plugin: the ChannelsController serves IChannel plugin channels, not Live TV \u2014 no tuner journey can reach these; they need a channel plugin on both servers."
     },
     "GET /Episode/{Id}/Timestamps": {
       "category": "expected-extension",
@@ -304,99 +304,55 @@
     },
     "GET /LiveTv/ChannelMappingOptions": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a channel-mapping probe against the fixture's listings provider."
     },
     "POST /LiveTv/ChannelMappings": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Channels/{channelId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a channel-mapping probe against the fixture's listings provider."
     },
     "DELETE /LiveTv/ListingProviders": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/ListingProviders": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a journey that removes the fixture's listings provider and observes the guide emptying."
     },
     "GET /LiveTv/ListingProviders/Lineups": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/LiveRecordings/{recordingId}/stream": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
-    },
-    "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: streaming/HLS/segment output \u2014 not a JSON body to diff (Layer-1 status-conformance applies)."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a lineup probe (needs a Schedules Direct-style provider; xmltv has none)."
     },
     "POST /LiveTv/Programs": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Programs/{programId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a programmes-by-body probe (the POST form of /LiveTv/Programs)."
     },
     "GET /LiveTv/Recordings/Groups/{groupId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "DELETE /LiveTv/Recordings/{recordingId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Recordings/{recordingId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a recordings-group probe once a recording exists."
     },
     "POST /LiveTv/SeriesTimers": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete)."
     },
     "DELETE /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete)."
     },
     "GET /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete)."
     },
     "POST /LiveTv/SeriesTimers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/Timers": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "DELETE /LiveTv/Timers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "GET /LiveTv/Timers/{timerId}": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a series-timer journey (create from a programme \u2192 list \u2192 delete)."
     },
     "POST /LiveTv/Timers/{timerId}": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs an update step in the timer journey (change pre-padding, read back)."
     },
     "DELETE /LiveTv/TunerHosts": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
-    },
-    "POST /LiveTv/TunerHosts": {
-      "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a journey that removes the fixture tuner and observes its channels going."
     },
     "POST /LiveTv/Tuners/{tunerId}/Reset": {
       "category": "requires-livetv-tuner",
-      "classification": "requires-livetv-tuner: requires a real Live TV tuner/DVR (channels/recordings/timers) the fixture harness has no source for."
+      "classification": "requires-livetv-tuner: the fixture tuner (M3U + XMLTV, two channels) exists, but no probe exercises this op yet \u2014 needs a tuner-reset probe with the fixture tuner's id."
     },
     "GET /MediaSegmentsApi": {
       "category": "expected-extension",
@@ -561,14 +517,6 @@
     "GET /web/ConfigurationPage": {
       "category": "expected-extension",
       "classification": "expected-extension: compiled-in/extension route not on the stock Jellyfin surface the fixture exercises."
-    },
-    "POST /LiveStreams/Open": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: opening a live stream is only meaningful for a tuner/transcode context; on a static direct-play fixture item neither server returns a LiveStreamId to diff."
-    },
-    "POST /LiveStreams/Close": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
     },
     "POST /Startup/User": {
       "category": "accepted-divergence",

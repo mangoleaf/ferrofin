@@ -28,7 +28,7 @@ import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS   # reuse HTTP + provisioning
+from sweep import http, get_json, bring_up, container_read, ROOT, USER, PASS, CLIENT   # reuse HTTP + provisioning
 
 
 def q(base, path, token, user):
@@ -877,6 +877,145 @@ def j_forgot_password(base, token, user, _m, _m2):
     return r
 
 
+LIVETV_OPS = [
+    "POST /LiveTv/TunerHosts", "POST /LiveTv/ListingProviders",
+    "POST /LiveStreams/Open", "GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
+    "POST /LiveStreams/Close", "GET /LiveTv/Programs/{programId}", "POST /LiveTv/Timers",
+    "GET /LiveTv/Timers/{timerId}", "GET /LiveTv/LiveRecordings/{recordingId}/stream",
+    "GET /LiveTv/Recordings/{recordingId}", "DELETE /LiveTv/Timers/{timerId}",
+    "DELETE /LiveTv/Recordings/{recordingId}",
+]
+RECORDING_START_WAIT_S = 60   # the recorder opens the tuner stream + the Recordings folder refreshes
+RECORDING_POLL_S = 5
+STREAM_PREFIX_BYTES = 16384   # ~87 TS packets: enough for is_mpegts, cheap to pull
+STREAM_READ_TIMEOUT_S = 30
+
+
+def read_prefix(base, path, token, n=STREAM_PREFIX_BYTES, timeout=STREAM_READ_TIMEOUT_S):
+    """(status, content-type, first n bytes) of a progressive/endless response — a live tuner
+    stream or an in-progress recording never ends, so only a prefix is read."""
+    hdr = {"Authorization": f'MediaBrowser Token="{token}", {CLIENT}'}
+    req = urllib.request.Request(base + path, headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read(n)
+    except urllib.error.HTTPError as e:
+        return e.code, "", b""
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, "", b""
+
+
+def is_mpegts(body):
+    return body[:1] == b"\x47" and len(body) > 188 and body[188:189] == b"\x47"
+
+
+def mpegts_response(st, ct, body):
+    return st == 200 and ct.split(";")[0].strip().lower() == "video/mp2t" and is_mpegts(body)
+
+
+def j_livetv(base, token, user, _m, _m2):
+    """The Live TV flow on the M3U fixture tuner: PlaybackInfo on a channel hands out an
+    OpenToken → LiveStreams/Open returns a live media source → its LiveStreamFiles stream
+    is a real MPEG-TS → Close revokes it. Then a timer on the programme airing now starts
+    a recording → the in-progress recording streams → timer and recording are deleted.
+    Every op starts False so an early exit (no channels, no programme, no timer) leaves a
+    flagged row, never a missing one."""
+    r = dict.fromkeys(LIVETV_OPS, False)
+    channels = (get_json(base, f"/LiveTv/Channels?userId={user}", token) or {}).get("Items") or []
+    # Provisioning (sweep.provision_livetv) added the tuner host and the listings provider;
+    # their effect is what this journey runs on: channels from the tuner, programmes from
+    # the guide.
+    r["POST /LiveTv/TunerHosts"] = bool(channels)
+    if not channels:
+        return r
+    ch = channels[0]["Id"]
+    programs = (get_json(base, f"/LiveTv/Programs?channelIds={ch}&isAiring=true&userId={user}", token)
+                or {}).get("Items") or []
+    r["POST /LiveTv/ListingProviders"] = bool(programs)
+    # --- live stream -------------------------------------------------------------------
+    _, raw = http("POST", f"{base}/Items/{ch}/PlaybackInfo?userId={user}", token, json.dumps({}))
+    try:
+        sources = json.loads(raw).get("MediaSources") or []
+    except ValueError:
+        sources = []
+    token_src = next((s for s in sources if s.get("OpenToken")), None)
+    live = {}
+    if token_src:
+        st, raw = http("POST", f"{base}/LiveStreams/Open", token, json.dumps({
+            "OpenToken": token_src["OpenToken"], "UserId": user, "ItemId": ch,
+            "PlaySessionId": "parity-livetv", "EnableDirectPlay": True, "EnableDirectStream": True}))
+        try:
+            live = json.loads(raw).get("MediaSource") or {}
+        except ValueError:
+            live = {}
+        r["POST /LiveStreams/Open"] = st == 200 and bool(live.get("LiveStreamId"))
+    stream_id = live.get("LiveStreamId") or ""
+    path = live.get("Path") or ""
+    if "/LiveTv/LiveStreamFiles/" in path:
+        stream_id = path.split("/LiveTv/LiveStreamFiles/", 1)[1].split("/", 1)[0]
+    if stream_id:
+        r["GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}"] = mpegts_response(
+            *read_prefix(base, f"/LiveTv/LiveStreamFiles/{stream_id}/stream.ts", token))
+    if live.get("LiveStreamId"):
+        st, _ = http("POST", f"{base}/LiveStreams/Close?liveStreamId={urllib.parse.quote(live['LiveStreamId'])}",
+                     token, "")
+        gone = read_prefix(base, f"/LiveTv/LiveStreamFiles/{stream_id}/stream.ts", token, timeout=10)[0]
+        r["POST /LiveStreams/Close"] = st < 300 and gone != 200
+    # --- timer → in-progress recording -------------------------------------------------
+    if not programs:
+        return r
+    prog = programs[0]["Id"]
+    got = get_json(base, f"/LiveTv/Programs/{prog}?userId={user}", token) or {}
+    r["GET /LiveTv/Programs/{programId}"] = got.get("Id") == prog
+    defaults = get_json(base, f"/LiveTv/Timers/Defaults?programId={prog}", token) or {}
+    st, _ = http("POST", f"{base}/LiveTv/Timers", token, json.dumps(defaults))
+    timers = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+    timer = next((t for t in timers if t.get("ProgramId") == prog), None) or (timers[0] if timers else None)
+    r["POST /LiveTv/Timers"] = st < 300 and timer is not None
+    if not timer:
+        return r
+    tid = timer.get("Id")
+    rec = None
+    try:
+        r["GET /LiveTv/Timers/{timerId}"] = (get_json(base, f"/LiveTv/Timers/{tid}", token) or {}).get("Id") == tid
+        for _ in range(RECORDING_START_WAIT_S // RECORDING_POLL_S):
+            recs = (get_json(base, f"/LiveTv/Recordings?isInProgress=true&userId={user}", token)
+                    or {}).get("Items") or []
+            if recs:
+                rec = recs[0]
+                break
+            time.sleep(RECORDING_POLL_S)
+        if rec:
+            rid = rec["Id"]
+            # An in-progress recording is served through /LiveTv/LiveRecordings/{id}/stream,
+            # keyed by Jellyfin's INTERNAL timer id (not the timer DTO's hashed id): the only
+            # way a client learns it is PlaybackInfo on the recording item, whose media
+            # source carries that URL as EncoderPath (the direct Path is the growing file).
+            _, raw = http("POST", f"{base}/Items/{rid}/PlaybackInfo?userId={user}", token, json.dumps({}))
+            try:
+                paths = [(m.get("EncoderPath") or "") + " " + (m.get("Path") or "")
+                         for m in json.loads(raw).get("MediaSources") or []]
+            except ValueError:
+                paths = []
+            live_path = next((p for p in paths if "/LiveTv/LiveRecordings/" in p), "")
+            if live_path:
+                key = live_path.split("/LiveTv/LiveRecordings/", 1)[1].split("/", 1)[0]
+                r["GET /LiveTv/LiveRecordings/{recordingId}/stream"] = mpegts_response(
+                    *read_prefix(base, f"/LiveTv/LiveRecordings/{key}/stream", token))
+            r["GET /LiveTv/Recordings/{recordingId}"] = (
+                (get_json(base, f"/LiveTv/Recordings/{rid}?userId={user}", token) or {}).get("Id") == rid)
+    finally:
+        # Whatever happened above, the timer (and with it the recording in progress) goes.
+        st, _ = http("DELETE", f"{base}/LiveTv/Timers/{tid}", token)
+        left = (get_json(base, f"/LiveTv/Timers?channelId={ch}", token) or {}).get("Items") or []
+        r["DELETE /LiveTv/Timers/{timerId}"] = st < 300 and all(t.get("Id") != tid for t in left)
+        if rec:
+            st, _ = http("DELETE", f"{base}/LiveTv/Recordings/{rec['Id']}", token)
+            still = get_json(base, f"/LiveTv/Recordings/{rec['Id']}?userId={user}", token)
+            r["DELETE /LiveTv/Recordings/{recordingId}"] = st < 300 and not still
+    return r
+
+
 def j_backup(base, token, user, _m, _m2):
     """Backup create → manifest → list on the server's own data dir. The manifest must echo
     the posted options, the Manifest route must read the same manifest back by the returned
@@ -910,7 +1049,7 @@ JOURNEYS = [j_startup,   # first: see its docstring
             j_scheduled_run, j_playbackinfo_post, j_active_encodings, j_clientlog,
             j_authenticate, j_user_update, j_devices_delete, j_bulk_item_delete,
             j_subtitles_upload, j_quickconnect, j_system_and_refresh,
-            j_forgot_password, j_backup,
+            j_forgot_password, j_backup, j_livetv,
             # Destructive: merges/splits the shared movies, so it must run LAST so its
             # mutations can't corrupt the items other journeys read/refresh.
             j_merge_versions_controller]
