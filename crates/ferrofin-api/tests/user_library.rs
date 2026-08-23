@@ -205,8 +205,13 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
-/// A [`UserManager`] resolving the fixed authenticated user.
-struct OkUsers;
+/// A [`UserManager`] resolving the fixed authenticated user. The
+/// `latest_item_excludes` ride on the user DTO's configuration, where
+/// `/Items/Latest` reads them (C# `PreferenceKind.LatestItemExcludes`).
+#[derive(Default)]
+struct OkUsers {
+    latest_item_excludes: Vec<Uuid>,
+}
 
 #[async_trait]
 impl UserManager for OkUsers {
@@ -274,6 +279,10 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            configuration: Some(ferrofin_model::configuration::UserConfiguration {
+                latest_items_excludes: self.latest_item_excludes.clone(),
+                ..ferrofin_model::configuration::UserConfiguration::default()
+            }),
             ..ferrofin_model::dto::UserDto::default()
         })
     }
@@ -460,9 +469,9 @@ impl UserViewManager for StubUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         Ok(vec![(
-            item_entity(ROOT_ID, "Movies", BaseItemKind::CollectionFolder),
+            None,
             vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
         )])
     }
@@ -637,7 +646,7 @@ fn virtual_folders() -> ferrofin_api::test_support::FakeVirtualFolders {
 fn state_as(elevated: bool) -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
-        Arc::new(OkUsers),
+        Arc::new(OkUsers::default()),
         Arc::new(StubUserViews),
         Arc::new(RecordingUserData::default()),
         Arc::new(FakeMediaSources),
@@ -1111,4 +1120,395 @@ async fn user_scoped_views_and_grouping_options_forward() {
     .await;
     assert_eq!(modern_status, StatusCode::OK);
     assert_eq!(body, modern_body);
+}
+
+// ---- `GET /Items/Latest` — the `GetLatestMedia` projection ---------------------
+//
+// The manager returns the C# `(container, items)` tuples; these tests pin what
+// the handler does with them: which entity is emitted, its `ChildCount`, and
+// which query/options reach the manager.
+
+const SERIES_ID: Uuid = Uuid::from_u128(0x5E51);
+const ALBUM_ID: Uuid = Uuid::from_u128(0xA1B0);
+const EP1_ID: Uuid = Uuid::from_u128(0xE001);
+const EP2_ID: Uuid = Uuid::from_u128(0xE002);
+const TRACK_ID: Uuid = Uuid::from_u128(0x7A01);
+
+/// A [`UserViewManager`] serving canned latest groups and recording the query
+/// the handler sent.
+struct LatestViews {
+    groups: Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>,
+    recorded: Mutex<Option<ferrofin_traits::options::LatestItemsQuery>>,
+}
+
+impl LatestViews {
+    fn new(groups: Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>) -> Arc<Self> {
+        Arc::new(Self {
+            groups,
+            recorded: Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait]
+impl UserViewManager for LatestViews {
+    async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("latest fake")
+    }
+    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("latest fake")
+    }
+    async fn get_latest_items(
+        &self,
+        query: &ferrofin_traits::options::LatestItemsQuery,
+        _options: &DtoOptions,
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
+        *self.recorded.lock().expect("lock") = Some(query.clone());
+        Ok(self.groups.clone())
+    }
+}
+
+/// A [`DtoService`] that, like the real one, emits `ImageTags` only when the
+/// options enable images — so `enableImages=false` is observable on the wire.
+struct LatestDto;
+
+#[async_trait]
+impl DtoService for LatestDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items
+            .iter()
+            .map(|e| {
+                let mut dto = entity_to_dto(e);
+                if options.enable_images {
+                    dto.image_tags = Some(
+                        [(
+                            ferrofin_model::entities::ImageType::Primary,
+                            "tag".to_owned(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    );
+                }
+                dto
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+}
+
+/// An [`AuthService`] / [`AuthorizationContext`] whose user hides played
+/// items from "latest" (`HidePlayedInLatest`).
+struct HidingAuth;
+
+impl HidingAuth {
+    fn info() -> AuthorizationInfo {
+        let mut user = user_entity(USER_ID, "alice");
+        user.hide_played_in_latest = true;
+        AuthorizationInfo {
+            user: Some(user),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for HidingAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for HidingAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+/// The user-library state with the latest fakes swapped in.
+fn latest_state(
+    views: Arc<LatestViews>,
+    hide_played: bool,
+    latest_item_excludes: Vec<Uuid>,
+) -> AppState {
+    let (auth_context, auth_service): (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>) =
+        if hide_played {
+            (Arc::new(HidingAuth), Arc::new(HidingAuth))
+        } else {
+            (
+                Arc::new(OkAuth { elevated: false }),
+                Arc::new(OkAuth { elevated: false }),
+            )
+        };
+    AppState::new(
+        Arc::new(StubLibrary),
+        Arc::new(OkUsers {
+            latest_item_excludes,
+        }),
+        views,
+        Arc::new(RecordingUserData::default()),
+        Arc::new(FakeMediaSources),
+        Arc::new(FakeSessions),
+        Arc::new(FakeSystem),
+        Arc::new(FakeAppHost),
+        Arc::new(FakeConfig),
+        Arc::new(FakeProviders),
+        Arc::new(FakeMusic),
+        Arc::new(FakeSimilarItems),
+        Arc::new(FakeSearch),
+        Arc::new(LatestDto),
+        auth_context,
+        auth_service,
+        Arc::new(ferrofin_api::test_support::FakeQuickConnect),
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        Arc::new(ferrofin_api::test_support::FakeCollections),
+        Arc::new(ferrofin_api::test_support::FakeTvSeries),
+        Arc::new(ferrofin_api::test_support::FakeSubtitles),
+        Arc::new(ferrofin_api::test_support::FakeLyrics),
+        Arc::new(ferrofin_api::test_support::FakeMediaSegments),
+        Arc::new(ferrofin_api::test_support::FakeTrickplay),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+        Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
+        Arc::new(ferrofin_api::test_support::FakeApiKeys),
+        Arc::new(ferrofin_api::test_support::FakeLocalization),
+        Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(ferrofin_api::test_support::FakeFileSystem),
+        Arc::new(ferrofin_api::test_support::FakeTasks),
+    )
+    .with_virtual_folders(Arc::new(virtual_folders()))
+}
+
+/// Drives `GET <uri>` through a latest-wired router; returns the status, the
+/// raw body and the parsed DTOs.
+async fn send_latest(
+    views: &Arc<LatestViews>,
+    uri: &str,
+    hide_played: bool,
+) -> (StatusCode, Vec<u8>, Vec<BaseItemDto>) {
+    let router = create_router(latest_state(Arc::clone(views), hide_played, Vec::new()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", "Token abc")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec();
+    let dtos: Vec<BaseItemDto> = if status == StatusCode::OK {
+        serde_json::from_slice(&bytes).expect("dtos")
+    } else {
+        Vec::new()
+    };
+    (status, bytes, dtos)
+}
+
+fn series() -> BaseItemEntity {
+    item_entity(SERIES_ID, "Series", BaseItemKind::Series)
+}
+fn episode(id: Uuid) -> BaseItemEntity {
+    item_entity(id, "Episode", BaseItemKind::Episode)
+}
+fn album() -> BaseItemEntity {
+    item_entity(ALBUM_ID, "Album", BaseItemKind::MusicAlbum)
+}
+fn track() -> BaseItemEntity {
+    item_entity(TRACK_ID, "Track", BaseItemKind::Audio)
+}
+
+/// `i.Item1 is not null && i.Item2.Count > 1` → the container, with
+/// `ChildCount` = the number of new items under it.
+#[tokio::test]
+async fn latest_collapses_series_with_two_episodes_into_series_with_child_count() {
+    let views = LatestViews::new(vec![(
+        Some(series()),
+        vec![episode(EP1_ID), episode(EP2_ID)],
+    )]);
+    let (status, _, dtos) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, SERIES_ID);
+    assert_eq!(dtos[0].child_count, Some(2));
+}
+
+/// One new episode of a series is the episode itself (`Item2[0]`), not the
+/// series — `ChildCount` 0.
+#[tokio::test]
+async fn latest_returns_single_episode_itself_with_child_count_zero() {
+    let views = LatestViews::new(vec![(Some(series()), vec![episode(EP1_ID)])]);
+    let (status, _, dtos) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, EP1_ID);
+    assert_eq!(dtos[0].child_count, Some(0));
+}
+
+/// `|| i.Item1 is MusicAlbum`: an album collapses even with one new track.
+#[tokio::test]
+async fn latest_always_collapses_music_album_even_with_one_track() {
+    let views = LatestViews::new(vec![(Some(album()), vec![track()])]);
+    let (status, _, dtos) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dtos.len(), 1);
+    assert_eq!(dtos[0].id, ALBUM_ID);
+    assert_eq!(dtos[0].child_count, Some(1));
+}
+
+/// An ungrouped row carries `"ChildCount":0` on the wire — serialized, since
+/// `0` is not null (strict clients read it).
+#[tokio::test]
+async fn latest_ungrouped_items_carry_child_count_zero() {
+    let views = LatestViews::new(vec![(
+        None,
+        vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
+    )]);
+    let (status, body, dtos) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(dtos[0].id, ITEM_ID);
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(json[0]["ChildCount"], serde_json::json!(0));
+}
+
+/// The request's `groupItems`/`isPlayed`/`limit`/`parentId`/`includeItemTypes`
+/// reach the manager, the user rides along, and a `HidePlayedInLatest` user
+/// turns an unset `isPlayed` into `false`.
+#[tokio::test]
+async fn latest_passes_group_items_and_is_played_through() {
+    let views = LatestViews::new(Vec::new());
+    let (status, _, _) = send_latest(
+        &views,
+        &format!("/Items/Latest?groupItems=false&isPlayed=true&limit=7&parentId={SERIES_ID}&includeItemTypes=Episode,Movie"),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let q = views
+        .recorded
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the manager was called");
+    assert!(!q.group_items);
+    assert_eq!(q.is_played, Some(true));
+    assert_eq!(q.limit, Some(7));
+    assert_eq!(q.parent_id, Some(SERIES_ID));
+    assert_eq!(
+        q.include_item_types,
+        vec![BaseItemKind::Episode, BaseItemKind::Movie]
+    );
+    assert_eq!(
+        q.user.as_ref().map(|u| u.id.as_str()),
+        Some(USER_ID.to_string().as_str())
+    );
+
+    // Defaults: grouped, limit 20, no played filter for a user who shows
+    // played items …
+    let (status, _, _) = send_latest(&views, "/Items/Latest", false).await;
+    assert_eq!(status, StatusCode::OK);
+    let q = views
+        .recorded
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("called");
+    assert!(q.group_items);
+    assert_eq!(q.limit, Some(20));
+    assert_eq!(q.is_played, None);
+
+    // … and `isPlayed = false` for one who hides them.
+    let (status, _, _) = send_latest(&views, "/Items/Latest", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let q = views
+        .recorded
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("called");
+    assert_eq!(q.is_played, Some(false));
+}
+
+/// `enableImages=false` reaches the DTO options (C# `AddAdditionalDtoOptions`).
+#[tokio::test]
+async fn latest_honours_enable_images_false() {
+    let views = LatestViews::new(vec![(
+        None,
+        vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
+    )]);
+    let (_, _, with) = send_latest(&views, "/Items/Latest", false).await;
+    assert!(with[0].image_tags.is_some(), "images are on by default");
+    let (_, _, without) = send_latest(&views, "/Items/Latest?enableImages=false", false).await;
+    assert!(without[0].image_tags.is_none());
+}
+
+/// The user's `LatestItemExcludes` (read off the user DTO's configuration)
+/// reach the manager — drop the `get_user_dto` lookup and this fails.
+#[tokio::test]
+async fn latest_forwards_the_users_latest_item_excludes() {
+    let views = LatestViews::new(Vec::new());
+    let excluded = Uuid::from_u128(0xE8C1);
+    let router = create_router(latest_state(Arc::clone(&views), false, vec![excluded]));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/Items/Latest")
+                .header("Authorization", "Token abc")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let q = views
+        .recorded
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the manager was called");
+    assert_eq!(q.latest_item_excludes, vec![excluded]);
 }

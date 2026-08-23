@@ -506,14 +506,6 @@ pub async fn build_app_state(
         Arc::new(FerrofinApiKeyManager::new(db.clone()));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
-    // The playlists media folder lives at `{data}/playlists` (C#
-    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily.
-    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
-    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
-        FerrofinUserViewManager::new(Arc::clone(&item_repository))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
-            .with_id_derivation(id_derivation.clone()),
-    );
     let music: Arc<dyn ferrofin_traits::library::MusicManager> =
         Arc::new(FerrofinMusicManager::new(Arc::clone(&item_repository)));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> =
@@ -545,6 +537,18 @@ pub async fn build_app_state(
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
+    // The playlists media folder lives at `{data}/playlists` (C#
+    // `ManualPlaylistsFolder`); the user-view seam provisions it lazily. The
+    // virtual-folder manager gives `/Items/Latest` each library's collection
+    // type (C# `CollectionFolder.CollectionType`), which is why this is built
+    // after it.
+    let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
+    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
+        FerrofinUserViewManager::new(Arc::clone(&item_repository))
+            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
+            .with_id_derivation(id_derivation.clone())
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.

@@ -924,18 +924,28 @@ pub trait UserViewManager: Send + Sync {
     /// a user-root child).
     async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Gets latest items grouped per parent view.
+    /// Gets the user's latest media, grouped by index container.
     ///
-    /// The query scopes which views contribute (`parent_id`), which kinds the
-    /// underlying rows may be (`include_item_types`), and how many rows per
-    /// view to fetch (`limit`, over-fetched ×2 as in C# `GetLatestItemsInternal`
-    /// so the caller's post-filters don't starve the page). Virtual items are
-    /// always excluded, matching upstream.
+    /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
+    /// (the user's views minus `latest_item_excludes`, or the `parent_id`
+    /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
+    /// and over-fetched to `limit * 5` rows; a tvshows/music parent takes the
+    /// grouped-threshold query instead ([`ItemRepository::get_latest_item_list`]).
+    /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
+    /// → series, track → music album, photo → photo album; folders and every
+    /// other kind stand alone) in first-seen order, stopping once `limit`
+    /// groups exist.
+    ///
+    /// Each tuple is the C# `Tuple<BaseItem, List<BaseItem>>`: the container
+    /// (`None` for an ungrouped row) and the rows that fell under it. Virtual
+    /// items are always excluded, matching upstream.
+    ///
+    /// [`ItemRepository::get_latest_item_list`]: crate::persistence::ItemRepository::get_latest_item_list
     async fn get_latest_items(
         &self,
         query: &crate::options::LatestItemsQuery,
         options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError>;
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError>;
 }
 
 fn _assert_object_safe_user_view_manager(_: &dyn UserViewManager) {}

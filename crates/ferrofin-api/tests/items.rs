@@ -464,7 +464,7 @@ impl UserViewManager for OkUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         unimplemented!()
     }
 }
@@ -849,9 +849,9 @@ impl UserViewManager for StubUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         Ok(vec![(
-            item_entity(ROOT_ID, "Movies", BaseItemKind::CollectionFolder),
+            None,
             vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
         )])
     }

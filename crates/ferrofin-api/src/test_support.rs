@@ -611,7 +611,7 @@ impl UserViewManager for FakeUserViews {
         &self,
         _query: &ferrofin_traits::options::LatestItemsQuery,
         _options: &DtoOptions,
-    ) -> Result<Vec<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+    ) -> Result<Vec<(Option<BaseItemEntity>, Vec<BaseItemEntity>)>, ServiceError> {
         unimplemented!("fake")
     }
 }
