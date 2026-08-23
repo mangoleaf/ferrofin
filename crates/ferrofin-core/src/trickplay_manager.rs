@@ -696,7 +696,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
         }
         // One query for the page's resolutions, grouped into a per-item manifest
         // (media-source id = the item's own id, as the single-item form does).
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()

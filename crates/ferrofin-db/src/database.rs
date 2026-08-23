@@ -253,7 +253,7 @@ impl Database {
         ids: &[String],
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -283,7 +283,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -314,7 +314,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()

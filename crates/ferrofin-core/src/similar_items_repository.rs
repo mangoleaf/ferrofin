@@ -131,7 +131,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for chunk in values.chunks(500) {
+        for chunk in values.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (2..=chunk.len() + 1)
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()

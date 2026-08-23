@@ -51,6 +51,14 @@ pub trait AttachmentIo: Send + Sync {
     /// Returns whether `path` names an existing file.
     fn file_exists(&self, path: &str) -> bool;
 
+    /// Creates `path` (and its parents) if absent — C# `Directory.CreateDirectory`,
+    /// which the extractor runs before ffmpeg writes into the cache folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when the directory cannot be created.
+    async fn create_directory(&self, path: &str) -> Result<(), String>;
+
     /// Reads the bytes of `path`.
     ///
     /// # Errors
@@ -59,12 +67,20 @@ pub trait AttachmentIo: Send + Sync {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, String>;
 
     /// Runs ffmpeg with `args` (using the resolved `ffmpeg_path`) to extract
-    /// attachments, returning the process exit code.
+    /// attachments, returning the process exit code. `working_dir` is the
+    /// process's current directory when set — the batch dump
+    /// (`-dump_attachment:t ""`) writes each file relative to it, which is why
+    /// C# sets `WorkingDirectory = outputFolder`.
     ///
     /// # Errors
     ///
     /// Returns an error string when the process cannot be spawned.
-    async fn run_ffmpeg(&self, ffmpeg_path: &str, args: &str) -> Result<i32, String>;
+    async fn run_ffmpeg(
+        &self,
+        ffmpeg_path: &str,
+        args: &str,
+        working_dir: Option<&str>,
+    ) -> Result<i32, String>;
 }
 
 /// A no-op [`AttachmentIo`] for tests that never touch the disk or ffmpeg.
@@ -85,11 +101,20 @@ impl AttachmentIo for NoopAttachmentIo {
         false
     }
 
+    async fn create_directory(&self, _path: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
 
-    async fn run_ffmpeg(&self, _ffmpeg_path: &str, _args: &str) -> Result<i32, String> {
+    async fn run_ffmpeg(
+        &self,
+        _ffmpeg_path: &str,
+        _args: &str,
+        _working_dir: Option<&str>,
+    ) -> Result<i32, String> {
         Ok(0)
     }
 }
@@ -175,6 +200,11 @@ where
             if input_path.is_empty() {
                 return Err(ServiceError::invalid_input("empty input path"));
             }
+            // `Directory.CreateDirectory(Path.GetDirectoryName(outputPath))`.
+            self.io
+                .create_directory(&folder)
+                .await
+                .map_err(MediaEncodingError::process)?;
             let has_av = Self::has_video_or_audio(media_source);
             let tail = if has_av { "-t 0 -f null null" } else { "" };
             let args = format!(
@@ -189,7 +219,7 @@ where
 
             let exit_code = self
                 .io
-                .run_ffmpeg(&self.media_encoder.encoder_path(), &args)
+                .run_ffmpeg(&self.media_encoder.encoder_path(), &args, None)
                 .await
                 .map_err(MediaEncodingError::process)?;
 
@@ -281,7 +311,9 @@ where
         let lock = self.lock_for(&folder);
         let _guard = lock.lock().await;
 
-        // Skip extraction when every extractable attachment file already exists.
+        // Skip extraction when every extractable attachment file already exists
+        // (C#: only attachments WITH a file name count — the batch dump names its
+        // output after the `filename` tag, so a nameless one can never be found).
         let missing: Vec<&MediaAttachment> = media_source
             .media_attachments
             .iter()
@@ -290,6 +322,7 @@ where
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case("mjpeg"))
             })
+            .filter(|a| a.file_name.is_some())
             .filter(|a| {
                 let index_name = a.index.to_string();
                 let file_name = a.file_name.as_deref().unwrap_or(&index_name);
@@ -314,6 +347,13 @@ where
         } else {
             ""
         };
+        // `Directory.CreateDirectory(outputFolder)`, then ffmpeg runs INSIDE it
+        // (`WorkingDirectory = outputFolder`): the batch dump writes each
+        // attachment to its own `filename` relative to the current directory.
+        self.io
+            .create_directory(&folder)
+            .await
+            .map_err(MediaEncodingError::process)?;
         let has_av = Self::has_video_or_audio(media_source);
         let tail = if has_av { "-t 0 -f null null" } else { "" };
         let args = format!("-dump_attachment:t \"\" -y {concat} -i {input_path} {tail}")
@@ -323,7 +363,7 @@ where
 
         let exit_code = self
             .io
-            .run_ffmpeg(&self.media_encoder.encoder_path(), &args)
+            .run_ffmpeg(&self.media_encoder.encoder_path(), &args, Some(&folder))
             .await
             .map_err(MediaEncodingError::process)?;
 
@@ -430,6 +470,8 @@ mod tests {
         existing: bool,
         exit_code: i32,
         last_args: Mutex<Option<String>>,
+        created_dir: Mutex<Option<String>>,
+        working_dir: Mutex<Option<String>>,
     }
 
     #[async_trait]
@@ -445,11 +487,21 @@ mod tests {
             // failure check passes.
             self.existing || self.last_args.lock().unwrap().is_some()
         }
+        async fn create_directory(&self, path: &str) -> Result<(), String> {
+            *self.created_dir.lock().unwrap() = Some(path.to_owned());
+            Ok(())
+        }
         async fn read_file(&self, _path: &str) -> Result<Vec<u8>, String> {
             Ok(b"FONT".to_vec())
         }
-        async fn run_ffmpeg(&self, _ffmpeg_path: &str, args: &str) -> Result<i32, String> {
+        async fn run_ffmpeg(
+            &self,
+            _ffmpeg_path: &str,
+            args: &str,
+            working_dir: Option<&str>,
+        ) -> Result<i32, String> {
             *self.last_args.lock().unwrap() = Some(args.to_owned());
+            *self.working_dir.lock().unwrap() = working_dir.map(str::to_owned);
             Ok(self.exit_code)
         }
     }
@@ -487,6 +539,8 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let ex = extractor(Some(source_with_attachment()), io);
         let out = ex
@@ -495,6 +549,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.data, b"FONT");
         assert_eq!(out.attachment.index, 3);
+        // The cache folder is created before ffmpeg writes into it
+        // (`Directory.CreateDirectory`); the single dump names its full output
+        // path, so no working directory is needed.
+        assert_eq!(ex.io.created_dir.lock().unwrap().as_deref(), Some("/cache"));
+        assert_eq!(ex.io.working_dir.lock().unwrap().as_deref(), None);
     }
 
     #[tokio::test]
@@ -506,6 +565,8 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let ex = extractor(Some(source), io);
         let err = ex
@@ -522,6 +583,8 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let ex = extractor(Some(source_with_attachment()), io);
         let err = ex
@@ -538,6 +601,8 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let ex = extractor(Some(source_with_attachment()), io);
         let err = ex.get_attachment(Uuid::nil(), "   ", 3).await.unwrap_err();
@@ -551,6 +616,8 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let source = source_with_attachment();
         let ex = extractor(Some(source.clone()), io);
@@ -568,13 +635,16 @@ mod tests {
             existing: false,
             exit_code: 0,
             last_args: Mutex::new(None),
+            created_dir: Mutex::new(None),
+            working_dir: Mutex::new(None),
         };
         let source = source_with_attachment();
         let ex = extractor(Some(source.clone()), io);
         ex.extract_all_attachments("/media/movie.mkv", &source)
             .await
             .unwrap();
-        // Extraction dumped to the cache with the batch flag.
+        // Extraction dumped to the cache with the batch flag, from INSIDE the
+        // (freshly created) cache folder: the batch dump writes cwd-relative.
         let ex_io = &ex.io;
         assert!(
             ex_io
@@ -585,5 +655,7 @@ mod tests {
                 .unwrap()
                 .contains("-dump_attachment:t")
         );
+        assert_eq!(ex_io.created_dir.lock().unwrap().as_deref(), Some("/cache"));
+        assert_eq!(ex_io.working_dir.lock().unwrap().as_deref(), Some("/cache"));
     }
 }

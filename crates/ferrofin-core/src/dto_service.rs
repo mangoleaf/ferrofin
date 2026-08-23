@@ -91,6 +91,8 @@ struct Prefetched {
     /// the `MediaSources` field is requested), so a page builds them in one
     /// query instead of N. Read three times — see [`take_or_clone`].
     media_streams: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaStream>>,
+    /// Media attachments per item id (when `MediaSources` is requested).
+    media_attachments: HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaAttachment>>,
     /// Provider-id maps per item id (populated when EITHER the `ProviderIds`
     /// or the `ExternalUrls` field is requested — the "Links" row is built from
     /// the same ids, so one batch read serves both).
@@ -625,8 +627,7 @@ impl FerrofinDtoService {
         item_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::with_capacity(item_ids.len());
-        // 500 stays far below SQLite's conservative 999-host-variable floor.
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -677,7 +678,8 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let keys: Vec<(i32, String)> = want.into_iter().collect();
-        for chunk in keys.chunks(500) {
+        // Two host variables per key.
+        for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
             let ph = (0..chunk.len())
                 .map(|_| "(?, ?)")
                 .collect::<Vec<_>>()
@@ -1057,9 +1059,16 @@ impl FerrofinDtoService {
                 .get(&item_id)
                 .cloned()
                 .unwrap_or_default();
+            let attachments = prefetched
+                .media_attachments
+                .get(&item_id)
+                .cloned()
+                .unwrap_or_default();
             let mut sources = vec![
                 crate::media_source_manager::FerrofinMediaSourceManager::static_source(
-                    item, streams,
+                    item,
+                    streams,
+                    attachments,
                 ),
             ];
             // Merged alternate versions report as additional selectable sources
@@ -1070,10 +1079,16 @@ impl FerrofinDtoService {
                     .get(&row_id(alt))
                     .cloned()
                     .unwrap_or_default();
+                let alt_attachments = prefetched
+                    .media_attachments
+                    .get(&row_id(alt))
+                    .cloned()
+                    .unwrap_or_default();
                 sources.push(
                     crate::media_source_manager::FerrofinMediaSourceManager::static_source(
                         alt,
                         alt_streams,
+                        alt_attachments,
                     ),
                 );
             }
@@ -1510,7 +1525,7 @@ impl FerrofinDtoService {
         if item_ids.is_empty() {
             return Ok(map);
         }
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -1973,18 +1988,38 @@ impl FerrofinDtoService {
         // per item for each — costly on the 2-connection pool).
         let want_streams = options.contains_field(ItemFields::MediaStreams)
             || options.contains_field(ItemFields::MediaSources);
-        let media_streams = if want_streams {
-            let stream_ids: Vec<Uuid> = ids
-                .iter()
+        let stream_ids: Vec<Uuid> = if want_streams {
+            ids.iter()
                 .copied()
                 .chain(alternates.values().flatten().map(row_id))
-                .collect();
-            self.media_sources
-                .get_media_streams_batch(&stream_ids)
-                .await?
+                .collect()
         } else {
-            HashMap::new()
+            Vec::new()
         };
+        // A source lists its attachments too (C# `MediaAttachments =
+        // MediaSourceManager.GetMediaAttachments(item.Id)` on every static source);
+        // both relations load concurrently so `MediaSources` costs one round-trip.
+        let want_attachments = options.contains_field(ItemFields::MediaSources);
+        let (media_streams, media_attachments) = tokio::try_join!(
+            async {
+                if want_streams {
+                    self.media_sources
+                        .get_media_streams_batch(&stream_ids)
+                        .await
+                } else {
+                    Ok(HashMap::new())
+                }
+            },
+            async {
+                if want_attachments {
+                    self.media_sources
+                        .get_media_attachments_batch(&stream_ids)
+                        .await
+                } else {
+                    Ok(HashMap::new())
+                }
+            }
+        )?;
         // An id listed here is another page item's alternate, so its streams are
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> =
@@ -2266,6 +2301,7 @@ impl FerrofinDtoService {
             images,
             user_data,
             media_streams,
+            media_attachments,
             provider_ids,
             series_display_order,
             photo_album_names,
@@ -3011,9 +3047,17 @@ mod tests {
         }
         async fn get_media_attachments(
             &self,
-            _item_id: Uuid,
+            item_id: Uuid,
         ) -> Result<Vec<MediaAttachment>, ServiceError> {
-            Ok(vec![])
+            // One canned font per item, tagged with the item it belongs to, so a
+            // projection that handed a primary's attachments to its alternate (or
+            // vice versa) would be caught.
+            Ok(vec![MediaAttachment {
+                index: 3,
+                codec: Some("ttf".to_owned()),
+                file_name: Some(format!("{}.ttf", item_id.simple())),
+                ..MediaAttachment::default()
+            }])
         }
         async fn get_playback_media_sources(
             &self,
@@ -4752,6 +4796,20 @@ mod tests {
         let batch_sources = batch[0].media_sources.as_ref().expect("batch sources");
         assert_eq!(batch_sources.len(), 2);
         assert_eq!(batch_sources[1].path.as_deref(), Some("/media/alt.mkv"));
+
+        // Every source carries ITS OWN attachments (C# `MediaAttachments =
+        // MediaSourceManager.GetMediaAttachments(item.Id)`), on both paths.
+        let own = |s: &MediaSourceInfo| {
+            s.media_attachments
+                .iter()
+                .map(|a| a.file_name.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        let alt_id = Uuid::parse_str(sources[1].id.as_deref().unwrap()).unwrap();
+        assert_eq!(own(&sources[0]), [format!("{}.ttf", id.simple())]);
+        assert_eq!(own(&sources[1]), [format!("{}.ttf", alt_id.simple())]);
+        assert_eq!(own(&batch_sources[0]), [format!("{}.ttf", id.simple())]);
+        assert_eq!(own(&batch_sources[1]), [format!("{}.ttf", alt_id.simple())]);
     }
 
     // The two book kinds project the fields Jellyfin's DtoService gives them —

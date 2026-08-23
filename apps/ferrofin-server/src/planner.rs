@@ -49,6 +49,7 @@ use ferrofin_traits::media_encoding::{
     HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths as _;
+use uuid::Uuid;
 
 /// The default HLS segment length, in seconds.
 ///
@@ -218,8 +219,16 @@ impl FerrofinStreamStatePlanner {
             .get_static_media_sources(request.item_id, false, None)
             .await?;
 
+        // `StreamingHelpers.GetStreamingState`: match the requested id, else when the
+        // "media source id" is really the item id, the first source.
         let chosen = match request.media_source_id.as_deref() {
-            Some(id) => sources.into_iter().find(|s| s.id.as_deref() == Some(id)),
+            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
+                Some(i) => sources.into_iter().nth(i),
+                None if Uuid::parse_str(id).is_ok_and(|g| g == request.item_id) => {
+                    sources.into_iter().next()
+                }
+                None => None,
+            },
             None => sources.into_iter().next(),
         };
 
@@ -1815,6 +1824,41 @@ mod tests {
         let p = planner(vec![src]);
         let result = p.plan(&request("nope"), false, None).await;
         assert!(matches!(result, Err(ServiceError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn plan_matches_a_guid_media_source_id_in_any_spelling() {
+        // The source advertises the "N" form; clients (and Jellyfin-DB adopters
+        // holding the DB's upper-case hyphenated text) may echo any spelling back.
+        let src = source(
+            "d37ecb9d75b0c0a8e9ecb0a864ec670e",
+            vec![video_stream("h264"), audio_stream("aac")],
+        );
+        let p = planner(vec![src]);
+        for id in [
+            "d37ecb9d75b0c0a8e9ecb0a864ec670e",
+            "D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E",
+            "d37ecb9d-75b0-c0a8-e9ec-b0a864ec670e",
+        ] {
+            let plan = p.plan(&request(id), false, None).await.unwrap();
+            assert_eq!(plan.media_path, "/media/movie.mkv", "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_falls_back_to_the_first_source_when_the_id_is_the_item_id() {
+        // `StreamingHelpers`: a MediaSourceId equal to the item id selects the first source.
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let plan = p
+            .plan(
+                &request(&Uuid::from_u128(1).simple().to_string()),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.media_path, "/media/movie.mkv");
     }
 
     #[tokio::test]

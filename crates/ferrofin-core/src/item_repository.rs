@@ -603,8 +603,7 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(Vec::new());
         };
         let mut rows = Vec::new();
-        // 500 stays far below SQLite's conservative 999-host-variable floor.
-        for chunk in ids.chunks(500) {
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             // The anonymous `?` list must come FIRST: SQLite gives an
             // anonymous parameter the next index after the largest assigned so
             // far, so an explicit `?N` ahead of the list pushes every `?` in it
@@ -757,8 +756,7 @@ impl ItemRepository for FerrofinItemRepository {
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<BaseItemEntity>> = HashMap::new();
-        // 500 stays far below SQLite's conservative 999-host-variable floor.
-        for chunk in primary_ids.chunks(500) {
+        for chunk in primary_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = format!(
                 r#"SELECT * FROM "BaseItems"
                    WHERE "PrimaryVersionId" IN ({}) AND "Id" <> ?{}"#,

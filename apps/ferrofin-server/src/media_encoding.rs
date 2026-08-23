@@ -313,9 +313,8 @@ impl MediaEncoder for DynMediaEncoder {
 ///
 /// Port of the `IMediaSourceManager.GetPlaybackMediaSources` call inside
 /// `GetAttachment`: resolves `(item_id, media_source_id)` to a
-/// [`MediaSourceInfo`] with its attachments populated (the static source list
-/// carries streams but not attachments, so the attachment rows are fetched and
-/// merged here).
+/// [`MediaSourceInfo`]; each static source already carries its own attachment
+/// rows (so a merged alternate version resolves to ITS attachments).
 struct MediaSourceManagerResolver {
     media_sources: Arc<dyn MediaSourceManager>,
 }
@@ -331,16 +330,7 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
             .media_sources
             .get_static_media_sources(item_id, false, None)
             .await?;
-        let Some(mut source) = sources
-            .into_iter()
-            .find(|s| s.id.as_deref() == Some(media_source_id))
-        else {
-            return Ok(None);
-        };
-        // The static source carries streams but not attachments; fill them from
-        // the attachment repository so `get_attachment` can locate the row.
-        source.media_attachments = self.media_sources.get_media_attachments(item_id).await?;
-        Ok(Some(source))
+        Ok(sources.into_iter().find(|s| s.id_matches(media_source_id)))
     }
 }
 
@@ -361,13 +351,37 @@ impl AttachmentIo for FfmpegAttachmentIo {
     }
 
     fn attachment_path(&self, media_source_id: &str, file_name: &str) -> String {
+        // The path manager refuses a file name that is not a plain leaf
+        // (`..`, separators). Such a name came from the file's own `filename`
+        // tag, so it must never reach the command line as-is: fall back to a
+        // sanitized leaf inside the cache folder rather than the raw name.
         self.path_manager
             .attachment_path(media_source_id, file_name)
+            .or_else(|| {
+                let leaf: String = file_name
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                self.path_manager
+                    .attachment_path(media_source_id, leaf.trim_matches('.'))
+            })
             .unwrap_or_else(|| file_name.to_owned())
     }
 
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
+    }
+
+    async fn create_directory(&self, path: &str) -> Result<(), String> {
+        tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|e| format!("create {path}: {e}"))
     }
 
     async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
@@ -376,12 +390,21 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .map_err(|e| format!("read {path}: {e}"))
     }
 
-    async fn run_ffmpeg(&self, ffmpeg_path: &str, args: &str) -> Result<i32, String> {
+    async fn run_ffmpeg(
+        &self,
+        ffmpeg_path: &str,
+        args: &str,
+        working_dir: Option<&str>,
+    ) -> Result<i32, String> {
         // `args` is a pre-built ffmpeg command line (a single space-joined
         // string, matching the C# `arguments` string); split it into parts while
         // honouring the double-quoted attachment-output path.
         let parts = split_ffmpeg_args(args);
-        let status = tokio::process::Command::new(ffmpeg_path)
+        let mut command = tokio::process::Command::new(ffmpeg_path);
+        if let Some(dir) = working_dir {
+            command.current_dir(dir);
+        }
+        let status = command
             .args(&parts)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -681,17 +704,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attachment_path_never_lets_a_traversal_file_name_leave_the_cache_folder() {
+        // The name comes from the file's own `filename` tag; the path manager
+        // refuses anything but a plain leaf, and the fallback must stay inside
+        // the cache folder rather than hand the raw name to ffmpeg.
+        let (_, paths) = config_and_paths();
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
+        };
+        let id = "d37ecb9d75b0c0a8e9ecb0a864ec670e";
+        let folder = io.attachment_folder_path(id).expect("guid folder");
+        for evil in ["../../etc/passwd", "a/b.ttf", "..\\x.ttf"] {
+            let path = io.attachment_path(id, evil);
+            assert!(path.starts_with(&folder), "{evil} -> {path}");
+            // A plain leaf: no separator after the folder, so `..` is inert.
+            assert!(
+                !path[folder.len() + 1..].contains(['/', '\\']),
+                "{evil} -> {path}"
+            );
+        }
+        assert_eq!(
+            io.attachment_path(id, "font.ttf"),
+            format!("{folder}/font.ttf")
+        );
+    }
+
     #[tokio::test]
-    async fn resolver_finds_source_and_merges_attachments() {
+    async fn resolver_finds_the_source_with_its_own_attachments() {
         let attachment = MediaAttachment {
             index: 1,
             file_name: Some("font.ttf".to_owned()),
             ..MediaAttachment::default()
         };
+        let mut primary = source("abc");
+        primary.media_attachments = vec![attachment];
+        let alternate = source("alt");
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
-                sources: vec![source("abc")],
-                attachments: vec![attachment],
+                sources: vec![primary, alternate],
+                attachments: Vec::new(),
             }),
         };
         let outcome = resolver
@@ -700,8 +752,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.id.as_deref(), Some("abc"));
-        // The attachment rows are merged in from get_media_attachments.
         assert_eq!(outcome.media_attachments.len(), 1);
+        // A merged alternate version resolves to ITS (empty) attachment list, never
+        // the primary's.
+        let alt = resolver
+            .resolve(Uuid::from_u128(1), "ALT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(alt.media_attachments.is_empty());
     }
 
     #[tokio::test]

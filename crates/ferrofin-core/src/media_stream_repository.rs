@@ -123,7 +123,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             return Ok(map);
         }
         // One query for the whole page; rows arrive in per-item StreamIndex order.
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
@@ -154,7 +154,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         // resolves off is `FerrofinIX_MediaStreamInfos_ItemId_StreamType` and
         // not the table's primary key.
         let mut with_subs = Vec::new();
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = subtitle_probe_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(&sql)
                 .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)));

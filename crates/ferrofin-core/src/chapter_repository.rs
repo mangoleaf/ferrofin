@@ -109,7 +109,7 @@ impl ChapterRepository for FerrofinChapterRepository {
         if item_ids.is_empty() {
             return Ok(map);
         }
-        for chunk in item_ids.chunks(500) {
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = (1..=chunk.len())
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()

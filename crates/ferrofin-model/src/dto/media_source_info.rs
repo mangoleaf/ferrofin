@@ -255,6 +255,26 @@ impl Default for MediaSourceInfo {
 }
 
 impl MediaSourceInfo {
+    /// Whether `requested` names this source.
+    ///
+    /// Clients echo back whatever `Id` they were given, and Jellyfin-DB adopters
+    /// may hold ids cached in another spelling, so a guid matches in any form
+    /// (`N`, hyphenated, either case); a non-guid id must match exactly — the
+    /// upstream lookups use `OrdinalIgnoreCase` on the string.
+    #[must_use]
+    pub fn id_matches(&self, requested: &str) -> bool {
+        let Some(id) = self.id.as_deref() else {
+            return false;
+        };
+        if id.eq_ignore_ascii_case(requested) {
+            return true;
+        }
+        match (uuid::Uuid::parse_str(id), uuid::Uuid::parse_str(requested)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
     /// Gets the first video stream, if any.
     #[must_use]
     pub fn video_stream(&self) -> Option<&MediaStream> {
@@ -349,5 +369,34 @@ impl MediaSourceInfo {
             .iter()
             .find(|s| s.stream_type == MediaStreamType::Audio && !s.is_external)
             .map(|current| current.index != stream.index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaSourceInfo;
+
+    fn with_id(id: &str) -> MediaSourceInfo {
+        MediaSourceInfo {
+            id: Some(id.to_owned()),
+            ..MediaSourceInfo::default()
+        }
+    }
+
+    #[test]
+    fn guid_ids_match_in_any_spelling() {
+        let source = with_id("d37ecb9d75b0c0a8e9ecb0a864ec670e");
+        assert!(source.id_matches("d37ecb9d75b0c0a8e9ecb0a864ec670e"));
+        assert!(source.id_matches("D37ECB9D-75B0-C0A8-E9EC-B0A864EC670E"));
+        assert!(source.id_matches("d37ecb9d-75b0-c0a8-e9ec-b0a864ec670e"));
+        assert!(!source.id_matches("00000000-0000-0000-0000-000000000001"));
+    }
+
+    #[test]
+    fn non_guid_ids_match_case_insensitively_only() {
+        let source = with_id("Emby_channel-7");
+        assert!(source.id_matches("emby_channel-7"));
+        assert!(!source.id_matches("Emby_channel-8"));
+        assert!(!MediaSourceInfo::default().id_matches("anything"));
     }
 }

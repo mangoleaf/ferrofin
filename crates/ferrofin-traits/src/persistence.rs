@@ -829,6 +829,29 @@ pub trait MediaAttachmentRepository: Send + Sync {
         filter: &MediaAttachmentQuery,
     ) -> Result<Vec<AttachmentStreamInfoEntity>, ServiceError>;
 
+    /// Batch form of [`Self::get_media_attachments`] for a page of items, keyed
+    /// by item; items with no attachments are absent. The default loops the
+    /// single-item form; the concrete repository runs one `IN (…)` query.
+    async fn get_media_attachments_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<AttachmentStreamInfoEntity>>, ServiceError>
+    {
+        let mut map = std::collections::HashMap::new();
+        for &item_id in item_ids {
+            let rows = self
+                .get_media_attachments(&MediaAttachmentQuery {
+                    item_id,
+                    index: None,
+                })
+                .await?;
+            if !rows.is_empty() {
+                map.insert(item_id, rows);
+            }
+        }
+        Ok(map)
+    }
+
     /// Replaces an item's media attachments with the given set.
     async fn save_media_attachments(
         &self,

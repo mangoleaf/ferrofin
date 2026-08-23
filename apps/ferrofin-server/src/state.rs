@@ -589,6 +589,9 @@ pub async fn build_app_state(
         Arc::clone(&media_stream_repository),
         Arc::clone(&chapter_repository),
     )
+    // Embedded attachments (fonts, attached pictures) ride along with the probe,
+    // as `FFProbeVideoInfo.SaveMediaAttachments` does.
+    .with_attachments(Arc::clone(&media_attachment_repository))
     // Fetch remote artwork (TMDB) for movies/series with no local images,
     // using Jellyfin's built-in key so posters/backdrops appear with no setup.
     .with_metadata(Arc::clone(&tmdb_client), metadata_library)

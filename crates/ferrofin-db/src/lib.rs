@@ -18,4 +18,9 @@ pub mod sqlite_random;
 pub mod store;
 
 pub use database::Database;
+
+/// How many ids one `IN (…)` query binds at a time: stays far below SQLite's
+/// conservative 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old
+/// builds), so every batched lookup chunks its ids by this.
+pub const BATCH_BIND_CHUNK: usize = 500;
 pub use error::{DbError, Result};

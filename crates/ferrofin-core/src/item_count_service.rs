@@ -139,7 +139,7 @@ impl FerrofinItemCountService {
             .collect();
 
         let mut by_name: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_names.chunks(500) {
+        for chunk in distinct_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
@@ -301,7 +301,7 @@ impl ItemCountService for FerrofinItemCountService {
             .into_iter()
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_cleans.chunks(500) {
+        for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = item_value_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);

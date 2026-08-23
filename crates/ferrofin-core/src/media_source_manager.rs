@@ -158,6 +158,7 @@ impl FerrofinMediaSourceManager {
     pub(crate) fn static_source(
         item: &BaseItemEntity,
         streams: Vec<MediaStream>,
+        attachments: Vec<MediaAttachment>,
     ) -> MediaSourceInfo {
         // A video item's source reports `VideoType.VideoFile` (Jellyfin's
         // `Video.VideoType` default); audio/other sources leave it unset.
@@ -179,13 +180,19 @@ impl FerrofinMediaSourceManager {
             .map(|s| s.index);
 
         let mut source = MediaSourceInfo {
-            id: Some(item.id.clone()),
+            // C# `item.Id.ToString("N")`: the 32-hex spelling, not the DB's
+            // upper-case hyphenated text (which a client would echo back verbatim).
+            id: Some(
+                Uuid::parse_str(&item.id)
+                    .map_or_else(|_| item.id.clone(), |g| g.simple().to_string()),
+            ),
             path: item.path.clone(),
             name: item.name.clone(),
             container: container_of(item),
             size: item.size,
             run_time_ticks: item.run_time_ticks,
             media_streams: streams,
+            media_attachments: attachments,
             protocol: MediaProtocol::File,
             type_: MediaSourceType::Default,
             supports_direct_play: true,
@@ -383,6 +390,23 @@ pub(crate) fn stream_dto_to_entity(item_id: &str, s: &MediaStream) -> MediaStrea
     }
 }
 
+/// A probed attachment as the row the scan persists (C# `SaveMediaAttachments`);
+/// the inverse of [`attachment_to_dto`].
+pub(crate) fn attachment_dto_to_entity(
+    item_id: &str,
+    a: &MediaAttachment,
+) -> AttachmentStreamInfoEntity {
+    AttachmentStreamInfoEntity {
+        item_id: item_id.to_owned(),
+        index: i64::from(a.index),
+        codec: a.codec.clone(),
+        codec_tag: a.codec_tag.clone(),
+        comment: a.comment.clone(),
+        filename: a.file_name.clone(),
+        mime_type: a.mime_type.clone(),
+    }
+}
+
 /// Maps a persisted media-attachment row to the wire [`MediaAttachment`] DTO.
 fn attachment_to_dto(row: &AttachmentStreamInfoEntity) -> MediaAttachment {
     MediaAttachment {
@@ -421,6 +445,20 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     ) -> Result<Vec<Uuid>, ServiceError> {
         // Delegate to the repository's ids-only query (no stream rows load).
         self.streams.get_item_ids_with_subtitles(item_ids).await
+    }
+
+    async fn get_media_attachments_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MediaAttachment>>, ServiceError> {
+        let rows = self
+            .attachments
+            .get_media_attachments_batch(item_ids)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, rows)| (id, rows.iter().map(attachment_to_dto).collect()))
+            .collect())
     }
 
     async fn get_media_attachments(
@@ -485,14 +523,16 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         }
         let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
         let streams = self.streams_dto(item_id).await?;
-        let mut sources = vec![Self::static_source(&item, streams)];
+        let attachments = self.get_media_attachments(item_id).await?;
+        let mut sources = vec![Self::static_source(&item, streams, attachments)];
         // Append merged alternate versions' sources (C# GetStaticMediaSources includes the item's
         // LinkedAlternateVersions). After MergeVersions the alternates point at this item via
         // PrimaryVersionId, so a merged item reports all its versions as selectable sources.
         for alt in self.items.get_items_by_primary_version(item_id).await? {
             if let Ok(alt_id) = Uuid::parse_str(&alt.id) {
                 let alt_streams = self.streams_dto(alt_id).await?;
-                sources.push(Self::static_source(&alt, alt_streams));
+                let alt_attachments = self.get_media_attachments(alt_id).await?;
+                sources.push(Self::static_source(&alt, alt_streams, alt_attachments));
             }
         }
         Ok(sources)
@@ -568,6 +608,18 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             .map(|s| stream_dto_to_entity(&item.id, s))
             .collect();
         self.streams.save_media_streams(item_id, &streams).await?;
+        // Only the video prober persists attachments (`FFProbeVideoInfo`); the
+        // audio prober never writes the attachment table.
+        if !is_audio {
+            let attachments: Vec<_> = probed
+                .media_attachments
+                .iter()
+                .map(|a| attachment_dto_to_entity(&item.id, a))
+                .collect();
+            self.attachments
+                .save_media_attachments(item_id, &attachments)
+                .await?;
+        }
         Ok(())
     }
 }
@@ -1027,6 +1079,11 @@ mod tests {
             .await
             .expect("sources");
         assert_eq!(sources.len(), 1);
+        // C# `item.Id.ToString("N")`, never the DB's upper-case hyphenated text.
+        assert_eq!(
+            sources[0].id.as_deref(),
+            Some(id.simple().to_string().as_str())
+        );
         assert_eq!(sources[0].path.as_deref(), Some("/media/m.mkv"));
         assert_eq!(sources[0].container.as_deref(), Some("mkv"));
         assert_eq!(sources[0].run_time_ticks, Some(100));
@@ -1083,7 +1140,7 @@ mod tests {
             },
         ];
 
-        let source = FerrofinMediaSourceManager::static_source(&item, streams);
+        let source = FerrofinMediaSourceManager::static_source(&item, streams, Vec::new());
         assert_eq!(source.video_type, Some(VideoType::VideoFile));
         assert_eq!(source.default_audio_stream_index, Some(1));
         // Total bitrate = sum of the internal streams.
@@ -1114,7 +1171,7 @@ mod tests {
                 ..MediaStream::default()
             },
         ];
-        let source = FerrofinMediaSourceManager::static_source(&item, streams);
+        let source = FerrofinMediaSourceManager::static_source(&item, streams, Vec::new());
         assert_eq!(source.default_audio_stream_index, Some(2));
     }
 
@@ -1125,8 +1182,47 @@ mod tests {
             media_type: Some("Audio".to_owned()),
             ..Default::default()
         };
-        let source = FerrofinMediaSourceManager::static_source(&item, Vec::new());
+        let source = FerrofinMediaSourceManager::static_source(&item, Vec::new(), Vec::new());
         assert_eq!(source.video_type, None);
+    }
+
+    #[tokio::test]
+    async fn attachment_batch_maps_rows_to_dtos_per_item() {
+        use ferrofin_traits::persistence::MediaAttachmentRepository as _;
+        let db = test_db().await;
+        let (a, b) = (Uuid::from_u128(0x301), Uuid::from_u128(0x302));
+        seed_item(&db, a, BaseItemKind::Movie).await;
+        seed_item(&db, b, BaseItemKind::Movie).await;
+        FerrofinMediaAttachmentRepository::new(db.clone())
+            .save_media_attachments(
+                a,
+                &[
+                    ferrofin_db::entities::base_items::AttachmentStreamInfoEntity {
+                        item_id: String::new(),
+                        index: 3,
+                        codec: Some("ttf".to_owned()),
+                        codec_tag: None,
+                        comment: None,
+                        filename: Some("font.ttf".to_owned()),
+                        mime_type: Some("application/x-truetype-font".to_owned()),
+                    },
+                ],
+            )
+            .await
+            .expect("save");
+        let mgr = manager(&db);
+
+        let map = mgr
+            .get_media_attachments_batch(&[a, b])
+            .await
+            .expect("batch");
+        assert_eq!(map.len(), 1);
+        let dto = &map[&a][0];
+        assert_eq!((dto.index, dto.file_name.as_deref()), (3, Some("font.ttf")));
+        assert_eq!(
+            dto.mime_type.as_deref(),
+            Some("application/x-truetype-font")
+        );
     }
 
     #[tokio::test]

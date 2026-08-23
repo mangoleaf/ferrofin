@@ -1020,6 +1020,26 @@ pub trait MediaSourceManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError>;
 
+    /// Batch form of [`Self::get_media_attachments`] for a whole page, keyed by
+    /// item (items with none are absent). The default loops the single-item
+    /// form; the concrete manager runs one query.
+    async fn get_media_attachments_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, Vec<ferrofin_model::entities_media::MediaAttachment>>,
+        ServiceError,
+    > {
+        let mut map = std::collections::HashMap::new();
+        for &id in item_ids {
+            let attachments = self.get_media_attachments(id).await?;
+            if !attachments.is_empty() {
+                map.insert(id, attachments);
+            }
+        }
+        Ok(map)
+    }
+
     /// Gets the playback media sources for an item and user.
     async fn get_playback_media_sources(
         &self,

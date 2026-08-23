@@ -255,9 +255,8 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
         let mut map = std::collections::HashMap::with_capacity(item_ids.len());
-        // One IN-query per chunk instead of one query per item. 500 stays far
-        // below SQLite's conservative 999-host-variable floor.
-        for chunk in item_ids.chunks(500) {
+        // One IN-query per chunk instead of one query per item.
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (2..=chunk.len() + 1)
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()

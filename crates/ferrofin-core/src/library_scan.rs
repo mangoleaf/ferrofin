@@ -54,7 +54,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::item_type_lookup;
-use crate::media_source_manager::stream_dto_to_entity;
+use crate::media_source_manager::{attachment_dto_to_entity, stream_dto_to_entity};
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
 /// its seasons/episodes reuse that match (and its per-season episode stills).
@@ -740,6 +740,9 @@ pub struct LibraryScanner {
     people: Option<Arc<dyn ferrofin_traits::persistence::PeopleRepository>>,
     /// Where probed chapter markers are persisted (paired with the probe seam).
     chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
+    /// Where probed attachments (embedded fonts, cover art streams) are persisted —
+    /// C# `FFProbeVideoInfo` saves them right after the streams.
+    media_attachments: Option<Arc<dyn ferrofin_traits::persistence::MediaAttachmentRepository>>,
     /// Optional image processor. When present, each discovered/downloaded artwork file
     /// gets its pixel dimensions and blurhash filled in during the scan (so the DTO layer
     /// can surface Width/Height and ImageBlurHashes). Absent in unit tests.
@@ -796,6 +799,7 @@ impl LibraryScanner {
             metadata_dir: None,
             people: None,
             chapters: None,
+            media_attachments: None,
             image_processor: None,
             localization: None,
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
@@ -1008,6 +1012,18 @@ impl LibraryScanner {
         self
     }
 
+    /// Attaches the attachment repository so each probe's embedded attachments
+    /// (fonts, attached pictures) are persisted with the item, as
+    /// `FFProbeVideoInfo.SaveMediaAttachments` does after the streams.
+    #[must_use]
+    pub fn with_attachments(
+        mut self,
+        media_attachments: Arc<dyn ferrofin_traits::persistence::MediaAttachmentRepository>,
+    ) -> Self {
+        self.media_attachments = Some(media_attachments);
+        self
+    }
+
     /// Scans every configured library; returns the number of items created.
     ///
     /// # Errors
@@ -1142,8 +1158,8 @@ impl LibraryScanner {
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
             let (media_info, is_audio) = probes.take(scanned).await;
-            let (streams, chapters, tag_provider_ids) =
-                Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
+            let rows = Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
+            let tag_provider_ids = rows.provider_ids.clone();
             // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
             // metadata reader, which runs before any remote fetch. It fills
             // genres/studios/tags/overview/ratings/year from `movie.nfo` /
@@ -1226,8 +1242,7 @@ impl LibraryScanner {
                 item.id,
                 &entity,
                 ItemMedia {
-                    streams: &streams,
-                    chapters: &chapters,
+                    probe: &rows,
                     embedded_images,
                     policy,
                     locked,
@@ -1334,16 +1349,23 @@ impl LibraryScanner {
         media: ItemMedia<'_>,
         art_cache: &mut ArtworkCache,
     ) -> Result<(), ServiceError> {
-        if let (false, Some(repo)) = (media.streams.is_empty(), &self.media_streams) {
-            repo.save_media_streams(item_id, media.streams).await?;
+        let probe = media.probe;
+        if let (false, Some(repo)) = (probe.streams.is_empty(), &self.media_streams) {
+            repo.save_media_streams(item_id, &probe.streams).await?;
         }
-        self.save_chapters(item_id, media.chapters).await?;
+        // Attachments are replaced whenever a video probe ran (an empty set clears
+        // the rows of a re-muxed file); without a probe the stored rows stay.
+        if let (true, Some(repo)) = (probe.save_attachments, &self.media_attachments) {
+            repo.save_media_attachments(item_id, &probe.attachments)
+                .await?;
+        }
+        self.save_chapters(item_id, &probe.chapters).await?;
         // Artwork — locked items skip the rewrite entirely: their image rows
         // are user-owned.
         if !media.locked {
             let art = ArtworkPass {
                 entity,
-                streams: media.streams,
+                streams: &probe.streams,
                 policy: media.policy,
                 embedded_images: media.embedded_images,
             };
@@ -2066,14 +2088,9 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         probed: Option<&MediaInfo>,
         media_is_audio: bool,
-    ) -> (
-        Vec<MediaStreamInfoEntity>,
-        Vec<ChapterEntity>,
-        Vec<(String, String)>,
-    ) {
-        let empty = (Vec::new(), Vec::new(), Vec::new());
+    ) -> ProbeRows {
         let Some(probed) = probed else {
-            return empty;
+            return ProbeRows::default();
         };
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
@@ -2097,7 +2114,25 @@ impl LibraryScanner {
             .enumerate()
             .map(|(index, c)| chapter_to_entity(&entity.id, index, c))
             .collect();
-        (streams, chapters, provider_ids)
+        // Only the video prober saves attachments (`FFProbeVideoInfo`); the audio
+        // prober (`AudioFileProber`) never touches the attachment table, so an
+        // embedded cover art "attached_pic" stream stays out of it.
+        let attachments = if media_is_audio {
+            Vec::new()
+        } else {
+            source
+                .media_attachments
+                .iter()
+                .map(|a| attachment_dto_to_entity(&entity.id, a))
+                .collect()
+        };
+        ProbeRows {
+            streams,
+            chapters,
+            attachments,
+            provider_ids,
+            save_attachments: !media_is_audio,
+        }
     }
 
     /// Fetches remote artwork (TMDB) for an item that has no local images,
@@ -5560,13 +5595,27 @@ fn known_provider_ids(
     )
 }
 
+/// Everything one ffprobe result contributes beyond the item row itself.
+#[derive(Default)]
+struct ProbeRows {
+    /// The stream rows (`MediaStreamInfos`).
+    streams: Vec<MediaStreamInfoEntity>,
+    /// The chapter rows.
+    chapters: Vec<ChapterEntity>,
+    /// The attachment rows (`AttachmentStreamInfos`).
+    attachments: Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>,
+    /// Provider ids read from embedded audio tags.
+    provider_ids: Vec<(String, String)>,
+    /// Whether the attachment rows are authoritative: a probe ran and the item
+    /// is a video (`false` — no probe, or an audio file — leaves stored rows alone).
+    save_attachments: bool,
+}
+
 /// What one scanned item contributes beyond its own row — the arguments
 /// [`LibraryScanner::persist_item_media`] would otherwise take positionally.
 struct ItemMedia<'a> {
-    /// The probed media streams.
-    streams: &'a [ferrofin_db::entities::base_items::MediaStreamInfoEntity],
-    /// The probed chapters.
-    chapters: &'a [ferrofin_db::entities::base_items::ChapterEntity],
+    /// What the probe yielded (streams, chapters, attachments).
+    probe: &'a ProbeRows,
     /// Images the file itself yielded (a photo, or a book's cover).
     embedded_images: Vec<ItemImageInfo>,
     /// The library's fetcher policy for this item.
@@ -8607,6 +8656,14 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                media_attachments: vec![ferrofin_model::entities_media::MediaAttachment {
+                    index: 2,
+                    codec: Some("ttf".to_owned()),
+                    codec_tag: Some("[0][0][0][0]".to_owned()),
+                    file_name: Some("font.ttf".to_owned()),
+                    mime_type: Some("application/x-truetype-font".to_owned()),
+                    ..Default::default()
+                }],
                 ..Default::default()
             })
         }
@@ -8645,6 +8702,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_probes_media_and_persists_streams_and_duration() {
+        use ferrofin_traits::persistence::MediaAttachmentRepository as _;
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         std::fs::create_dir_all(&media).unwrap();
@@ -8670,6 +8728,9 @@ mod tests {
         .await
         .unwrap();
 
+        let attachments = Arc::new(
+            crate::media_attachment_repository::FerrofinMediaAttachmentRepository::new(db.clone()),
+        );
         let scanner =
             LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
                 .with_probe(
@@ -8678,12 +8739,13 @@ mod tests {
                     Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
                         db.clone(),
                     )),
-                );
+                )
+                .with_attachments(attachments.clone());
         scanner.scan_all().await.unwrap();
 
         // The probed duration + size land on the item row.
-        let (ticks, size): (Option<i64>, Option<i64>) = sqlx::query_as(
-            r#"SELECT "RunTimeTicks","Size" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+        let (ticks, size, movie_id): (Option<i64>, Option<i64>, String) = sqlx::query_as(
+            r#"SELECT "RunTimeTicks","Size","Id" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
         )
         .fetch_one(db.pool())
         .await
@@ -8703,6 +8765,23 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(video_codec.as_deref(), Some("h264"));
+
+        // The probed attachment is persisted with the item (`SaveMediaAttachments`),
+        // under the ffprobe stream index a client later asks /Attachments/{index} for.
+        let rows = attachments
+            .get_media_attachments(&ferrofin_traits::persistence::MediaAttachmentQuery {
+                item_id: uuid::Uuid::parse_str(&movie_id).unwrap(),
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 2);
+        assert_eq!(rows[0].filename.as_deref(), Some("font.ttf"));
+        assert_eq!(
+            rows[0].mime_type.as_deref(),
+            Some("application/x-truetype-font")
+        );
     }
 
     /// A probe that answers with a duration derived from the file it was given
@@ -8895,7 +8974,8 @@ mod tests {
                 db.clone(),
             )),
         );
-        scanner.scan_all().await.unwrap();
+        // Boxed: the scan future is over clippy's `large_futures` ceiling.
+        Box::pin(scanner.scan_all()).await.unwrap();
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
         let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(

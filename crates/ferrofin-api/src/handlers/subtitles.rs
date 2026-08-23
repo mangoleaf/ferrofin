@@ -484,7 +484,7 @@ async fn get_subtitle_playlist(
         .await?;
     let media_source = sources
         .into_iter()
-        .find(|s| s.id.as_deref() == Some(media_source_id.as_str()))
+        .find(|s| s.id_matches(&media_source_id))
         .ok_or_else(|| ApiError::NotFound(format!("media source {media_source_id}")))?;
 
     let runtime = media_source.run_time_ticks.unwrap_or(-1);
