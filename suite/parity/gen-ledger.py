@@ -219,7 +219,8 @@ def build_curated():
     if os.path.exists(sp):
         sweep_stamp = json.load(open(sp)).get("last_verified")
     # Precedence: static seed < sweep single-item diff < live curated read diff < write journeys
-    # < curated accepted classifications (later, more authoritative wins).
+    # < terminal phase < asset layer < curated accepted classifications (later, more
+    # authoritative wins).
     curated = {k: {**v, "last_verified": seed_stamp} for k, v in seed.items()}
     for k, v in sweep.items():
         if "deep_verified" in v:   # only GET 200/200 ops the sweep deep-diffed
@@ -231,6 +232,11 @@ def build_curated():
             curated[k] = {**v, "last_verified": r_stamp}
     for k, v in journeys.items():
         curated[k] = {**v, "last_verified": j_stamp}
+    # The terminal phase (restore / restart / shutdown): lifecycle effects observed on both
+    # servers, the same effect-verdict shape as the write journeys.
+    terminal, t_stamp = load_layer2("suite/parity/terminal-results.json")
+    for k, v in terminal.items():
+        curated[k] = {**v, "last_verified": t_stamp}
     # Layer-3 binary/asset differential (image/font/css): a live property/effect verdict for
     # the ops that return non-JSON bodies, applied like the other live layers so a curated
     # accepted-divergence classification can still override its auto-flag below.

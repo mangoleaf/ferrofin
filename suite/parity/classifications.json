@@ -690,21 +690,9 @@
       "category": "not-testable-this-way",
       "classification": "not-testable-this-way: pairs with LiveStreams/Open (no live-stream context on a static fixture item)."
     },
-    "POST /System/Restart": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: restarts the server process, which would tear down the running differential; destructive and unobservable via body-diff."
-    },
-    "POST /System/Shutdown": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: shuts the server down, ending the differential run; destructive and unobservable via body-diff."
-    },
     "POST /Startup/User": {
       "category": "accepted-divergence",
       "classification": "accepted-divergence: post-setup the first user already has a password and the contract is 403 (the Forbid guard upstream added in v12, ported by Ferrofin); Jellyfin 10.11.8 predates it and answers 204, silently re-setting the admin password. The journey asserts the correct contract (H=403 J=204)."
-    },
-    "POST /Backup/Restore": {
-      "category": "not-testable-this-way",
-      "classification": "not-testable-this-way: destructive host-filesystem restore from a backup archive; instance-specific and would replace live state mid-run."
     },
     "GET /Trailers": {
       "category": "instance",
