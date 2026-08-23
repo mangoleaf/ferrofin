@@ -34,7 +34,7 @@
 //! default country code and the parental-rating list derived from it.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use ferrofin_model::entities_media::{ParentalRating, ParentalRatingScore};
 use ferrofin_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
@@ -57,6 +57,65 @@ const COUNTRIES_JSON: &str = include_str!("data/countries.json");
 /// Jellyfin's bundled US parental-rating system, vendored verbatim from
 /// `Emby.Server.Implementations/Localization/Ratings/us.json` (v10.11.8).
 const RATINGS_US_JSON: &str = include_str!("data/ratings-us.json");
+
+#[path = "data/core_dictionaries.rs"]
+mod core_dictionaries;
+
+/// `LocalizationManager.DefaultCulture`.
+const DEFAULT_CULTURE: &str = "en-US";
+
+/// The parsed core dictionaries, keyed by the resource's culture code (e.g.
+/// `de`, `pt-BR`, `es_419`), each case-insensitive on the phrase key like the
+/// C# `Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)`. Built once
+/// per process (`_cultureOnlyDictionaries`).
+static CORE_DICTIONARY_DATA: LazyLock<HashMap<&'static str, HashMap<String, String>>> =
+    LazyLock::new(|| {
+        core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, json)| {
+                let parsed: HashMap<String, String> = serde_json::from_str(json)
+                    .unwrap_or_else(|e| panic!("embedded core dictionary {code}.json: {e}"));
+                let lowered = parsed
+                    .into_iter()
+                    .map(|(k, v)| (k.to_lowercase(), v))
+                    .collect();
+                (*code, lowered)
+            })
+            .collect()
+    });
+
+/// `_bcp47ToJellyfinMap`: hyphenated BCP-47 spellings of the resources that use
+/// an underscore (`ar-SA` → `ar_SA`, `es-419` → `es_419`, …), case-insensitive.
+static BCP47_TO_JELLYFIN: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
+    core_dictionaries::CORE_DICTIONARIES
+        .iter()
+        .filter(|(code, _)| code.contains('_'))
+        .map(|(code, _)| (code.replace('_', "-").to_lowercase(), *code))
+        .collect()
+});
+
+/// `GetResourceFilename` minus the `.json`: lower-case language, upper-case
+/// region, separator preserved (`pt-br` → `pt-BR`, `ES_419` → `es_419`).
+fn normalize_culture_code(culture: &str) -> String {
+    match culture.find(['-', '_']) {
+        Some(i) if i > 0 => {
+            let (lang, rest) = culture.split_at(i);
+            let (sep, region) = rest.split_at(1);
+            format!("{}{sep}{}", lang.to_lowercase(), region.to_uppercase())
+        }
+        _ => culture.to_lowercase(),
+    }
+}
+
+/// `GetLocalizationDictionary(culture)`: the parsed dictionary for a culture
+/// code, or `None` when no resource ships for it (the C# logs and falls back).
+fn core_dictionary(culture: &str) -> Option<&'static HashMap<String, String>> {
+    let file = normalize_culture_code(culture);
+    CORE_DICTIONARY_DATA
+        .iter()
+        .find(|(code, _)| **code == file)
+        .map(|(_, dict)| dict)
+}
 
 /// The fixed UI-language option list, ported verbatim from Jellyfin's
 /// `LocalizationManager.GetLocalizationOptions` (v10.11.8). `(name, value)`.
@@ -232,10 +291,14 @@ struct RatingTable {
 /// See the module docs: this stands in for the (unported) C#
 /// `ILocalizationManager` and should be fronted by a `ferrofin-traits` trait in a
 /// follow-up.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalizationManager {
     /// The server default country code for rating fallback.
     metadata_country_code: String,
+    /// `ServerConfiguration.UICulture` — the culture `GetLocalizedString`
+    /// resolves phrases in (en-US fallback), read live so an admin change
+    /// applies without a restart, as the C# config fallback does.
+    ui_culture: Arc<dyn Fn() -> String + Send + Sync>,
     /// The default country's parental-rating list, built once at construction. It
     /// depends on `metadata_country_code`, so unlike the tables above it cannot be a
     /// process-wide static — but it is still immutable for the manager's lifetime.
@@ -248,6 +311,15 @@ impl Default for LocalizationManager {
     }
 }
 
+impl std::fmt::Debug for LocalizationManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalizationManager")
+            .field("metadata_country_code", &self.metadata_country_code)
+            .field("ui_culture", &(self.ui_culture)())
+            .finish_non_exhaustive()
+    }
+}
+
 impl LocalizationManager {
     /// Builds the manager over the embedded dataset, using `metadata_country_code`
     /// (e.g. `"US"`) as the default for rating lookups.
@@ -257,8 +329,74 @@ impl LocalizationManager {
         let parental_ratings = build_parental_ratings(&metadata_country_code);
         Self {
             metadata_country_code,
+            ui_culture: Arc::new(|| DEFAULT_CULTURE.to_owned()),
             parental_ratings,
         }
+    }
+
+    /// Sets a fixed server UI culture (`ServerConfiguration.UICulture`) phrases
+    /// are localized in; empty keeps the default `en-US`.
+    #[must_use]
+    pub fn with_ui_culture(self, ui_culture: &str) -> Self {
+        let culture = if ui_culture.is_empty() {
+            DEFAULT_CULTURE.to_owned()
+        } else {
+            ui_culture.to_owned()
+        };
+        self.with_ui_culture_source(move || culture.clone())
+    }
+
+    /// Sets a live source for the server UI culture — the composition root
+    /// passes a reader over the configuration snapshot so `UICulture` edits
+    /// take effect immediately. An empty value means `en-US`.
+    #[must_use]
+    pub fn with_ui_culture_source(
+        mut self,
+        source: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.ui_culture = Arc::new(source);
+        self
+    }
+
+    /// Port of `GetLocalizedString(phrase)` / `GetServerLocalizedString`: the
+    /// phrase in the server's UI culture, falling back to `en-US`, then to the
+    /// phrase key itself.
+    #[must_use]
+    pub fn get_localized_string(&self, phrase: &str) -> String {
+        self.get_localized_string_for(phrase, &(self.ui_culture)())
+    }
+
+    /// Port of `GetLocalizedString(phrase, culture)`: an empty culture means the
+    /// server UI culture; a BCP-47 spelling of an underscore resource maps onto
+    /// it (`ar-SA` → `ar_SA`); phrase lookup is case-insensitive; a miss in the
+    /// culture falls back to `en-US`, and a miss there returns the phrase.
+    #[must_use]
+    pub fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String {
+        let server_culture;
+        let culture = if culture.is_empty() {
+            server_culture = (self.ui_culture)();
+            if server_culture.is_empty() {
+                DEFAULT_CULTURE
+            } else {
+                server_culture.as_str()
+            }
+        } else {
+            culture
+        };
+        let culture = BCP47_TO_JELLYFIN
+            .get(&culture.to_lowercase())
+            .copied()
+            .unwrap_or(culture);
+        let key = phrase.to_lowercase();
+        if let Some(value) = core_dictionary(culture).and_then(|d| d.get(&key)) {
+            return value.clone();
+        }
+        if !culture.eq_ignore_ascii_case(DEFAULT_CULTURE)
+            && let Some(value) = core_dictionary(DEFAULT_CULTURE).and_then(|d| d.get(&key))
+        {
+            return value.clone();
+        }
+        phrase.to_owned()
     }
 
     /// All known cultures (C# `GetCultures`).
@@ -598,6 +736,18 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
         LocalizationManager::get_localization_options(self)
     }
 
+    fn get_localized_string(&self, phrase: &str) -> String {
+        LocalizationManager::get_localized_string(self, phrase)
+    }
+
+    fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String {
+        LocalizationManager::get_localized_string_for(self, phrase, culture)
+    }
+
+    fn get_language_display_name(&self, language: &str) -> Option<String> {
+        LocalizationManager::get_language_display_name(self, language)
+    }
+
     fn get_rating_score(
         &self,
         rating: &str,
@@ -614,6 +764,49 @@ mod tests {
     use ferrofin_traits::localization::LocalizationManager as LocalizationManagerTrait;
 
     use super::*;
+
+    /// `GetLocalizedString`: the server UI culture, BCP-47 → resource mapping,
+    /// case-insensitive phrase keys, en-US fallback, then the phrase itself.
+    /// Expected values are the vendored `Core/*.json` entries.
+    #[test]
+    fn localized_strings_follow_the_c_sharp_lookup_rules() {
+        let en = LocalizationManager::default();
+        assert_eq!(
+            en.get_localized_string("HearingImpaired"),
+            "Hearing Impaired"
+        );
+        assert_eq!(en.get_localized_string("Default"), "Default");
+        assert_eq!(en.get_localized_string("NoSuchPhrase"), "NoSuchPhrase");
+
+        let de = LocalizationManager::default().with_ui_culture("de");
+        assert_eq!(de.get_localized_string("Default"), "Standard");
+        assert_eq!(de.get_localized_string("hearingimpaired"), "Hörgeschädigt");
+        // An explicit culture overrides the server one; empty means the server's.
+        assert_eq!(de.get_localized_string_for("Forced", "fr"), "Forcé");
+        assert_eq!(de.get_localized_string_for("Forced", ""), "Erzwungen");
+        // Region casing is normalized to the resource name.
+        assert_eq!(
+            de.get_localized_string_for("Undefined", "pt-br"),
+            "Indefinido"
+        );
+        // BCP-47 `es-419` maps onto the underscore resource `es_419`.
+        assert_eq!(
+            de.get_localized_string_for("Default", "es-419"),
+            "Por defecto"
+        );
+        // An unknown culture falls back to en-US.
+        assert_eq!(de.get_localized_string_for("Default", "xx-YY"), "Default");
+        // A phrase missing from the culture falls back to en-US, not the key:
+        // the novelty `pr` (Pirate) catalog is sparse.
+        assert_eq!(
+            LocalizationManager::default()
+                .with_ui_culture("ab")
+                .get_localized_string("HearingImpaired"),
+            "Hearing Impaired"
+        );
+        // Every embedded dictionary parses (the lazy table panics otherwise).
+        assert!(CORE_DICTIONARY_DATA.len() > 100);
+    }
 
     /// The manager as the HTTP layer actually holds it: an `Arc<dyn …>` behind the
     /// `ferrofin-traits` DI seam. The wire-order/wire-content assertions below go through

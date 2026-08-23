@@ -452,7 +452,10 @@ pub async fn build_app_state(
     let event_bus = FerrofinEventManager::new();
     let event_manager: Arc<dyn ferrofin_traits::events::EventManager> = Arc::new(event_bus.clone());
     let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> = Arc::new(
-        LocalizationManager::new(&server_config.metadata_country_code),
+        LocalizationManager::new(&server_config.metadata_country_code).with_ui_culture_source({
+            let config_mgr = Arc::clone(&config_mgr);
+            move || config_mgr.snapshot_shared().ui_culture.clone()
+        }),
     );
     let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
         vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
@@ -796,7 +799,8 @@ pub async fn build_app_state(
             Arc::clone(&media_encoder),
             Arc::clone(&providers),
         )
-        .with_live_tv(Arc::clone(&live_tv)),
+        .with_live_tv(Arc::clone(&live_tv))
+        .with_localization(Arc::clone(&localization)),
     );
 
     // ---- managers over library -------------------------------------------
